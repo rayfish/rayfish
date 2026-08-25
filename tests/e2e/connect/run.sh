@@ -3,7 +3,7 @@
 #
 # Topology:
 #   srv-a  identity U   the initiator (`ray connect`)
-#   srv-b  identity V   the recipient (`ray connections approve`)
+#   srv-b  identity V   the recipient (`ray connect approve`)
 #
 # Proves the full friend-request flow over real hosts + the public pkarr DHT:
 #   B publishes a contact id  ->  A `ray connect <id>`  ->  B sees + approves
@@ -57,7 +57,7 @@ step "3. srv-a requests a direct connection to srv-b"
 sleep 8
 CONNECT_OUT=""
 for _ in $(seq 1 6); do
-  CONNECT_OUT="$(on "$A" "ray connect $B_CID --hostname dario" 2>&1 | strip)"
+  CONNECT_OUT="$(on "$A" "ray connect $B_CID --hostname laptop" 2>&1 | strip)"
   echo "$CONNECT_OUT" | grep -qiE 'waiting for approval|connected' && break
   sleep 8
 done
@@ -72,7 +72,7 @@ fi
 step "4. srv-b sees the pending request and approves it"
 REQ=""
 for _ in $(seq 1 8); do
-  REQ="$(on "$B" 'ray connections' 2>/dev/null | strip)"
+  REQ="$(on "$B" 'ray connect' 2>/dev/null | strip)"
   echo "$REQ" | grep -qiE "${A_CID:0:8}" && break
   sleep 3
 done
@@ -84,7 +84,7 @@ else
 fi
 # Approve by srv-a's full contact id (the daemon matches it as a prefix), so we
 # don't have to parse the short id out of the table.
-APPROVE="$(on "$B" "ray connections approve $A_CID" 2>&1 | strip)"
+APPROVE="$(on "$B" "ray connect approve $A_CID" 2>&1 | strip)"
 echo "$APPROVE" | sed 's/^/   b| /'
 echo "$APPROVE" | grep -qiE 'approved|already connected' && pass "srv-b approved the request" \
   || fail "srv-b approve failed"
@@ -181,7 +181,7 @@ step "8b. firewall — unsolicited inbound TCP is denied by the secure default"
 # the result.
 FWPORT=18080
 if [[ -n "$A_IP" && -n "$B_IP" ]]; then
-  # Listener on srv-b (binds 0.0.0.0, including the TUN IP); helpers in common.sh.
+  # Listener on srv-b (binds ::, so it answers on the TUN); helpers in common.sh.
   start_tcp_listener "$B" "$FWPORT"
   # No prior outbound from srv-b, so conntrack never masks the default-deny.
   fw_denies "$A" "$B_IP" "$FWPORT" "unsolicited inbound is denied by default"

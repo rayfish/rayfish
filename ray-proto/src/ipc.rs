@@ -2,11 +2,10 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-#[cfg(windows)]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -26,7 +25,9 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::time::Instant;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
-use crate::{Action, Direction, GroupMode, Protocol, SuggestedFirewall, TransportMode};
+use crate::{
+    Action, Direction, GroupMode, NetworkKey, NodeKey, Protocol, SuggestedFirewall, TransportMode,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcMessage {
@@ -72,28 +73,25 @@ pub enum IpcMessage {
         network: String,
         peer: String,
     },
-    /// Coordinator-local: set (or clear) the per-network ephemeral policy — the
-    /// TTL after which an offline member is auto-removed. `ttl_secs = None`
-    /// disables it. Mutation (root/operator).
-    SetEphemeral {
-        network: String,
-        ttl_secs: Option<u64>,
-    },
-    /// Read the per-network ephemeral TTL (open read). Answered with
-    /// `EphemeralStatus`.
-    GetEphemeral {
-        network: String,
-    },
-    /// Response to `GetEphemeral`: the network's current TTL (`None` = off).
-    EphemeralStatus {
-        network: String,
-        ttl_secs: Option<u64>,
-    },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
     /// return its path plus a pre-filled GitHub issue title/body. Open to any
     /// local user, like `Status`.
     Report,
+    /// Read the daemon's rolling log files. `since` keeps only lines newer than
+    /// that long ago (`None` = everything since the last daily rotation);
+    /// `follow` keeps the stream open and forwards new lines as they land.
+    ///
+    /// The only multi-frame reply in the protocol: the daemon answers with a
+    /// run of [`IpcMessage::LogChunk`]s, terminated by [`IpcMessage::Ok`] when
+    /// `follow` is false and never terminated when it is true (the client hangs
+    /// up instead). Open to any local user, like `Status`.
+    Logs {
+        #[serde(default)]
+        since: Option<Duration>,
+        #[serde(default)]
+        follow: bool,
+    },
     Shutdown,
     /// Activate the VPN: bring the TUN interface up, configure system DNS, and
     /// reconnect all saved networks. Handled by the already-running daemon, so
@@ -120,19 +118,6 @@ pub enum IpcMessage {
         index: usize,
     },
     FirewallShow,
-    FirewallDefault {
-        action: Action,
-    },
-    /// Toggle "fail fast" REJECT mode (opt-in, default off): when on, a denied
-    /// packet gets a TCP RST / ICMP-unreachable reply instead of a silent drop.
-    FirewallReject {
-        enabled: bool,
-    },
-    /// Global firewall kill switch (`ray firewall on|off`). When `enabled` is
-    /// false the firewall stops enforcing and allows every packet.
-    FirewallSetEnabled {
-        enabled: bool,
-    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -150,19 +135,6 @@ pub enum IpcMessage {
     FirewallPending {
         network: String,
     },
-    /// Toggle per-network auto-accept of coordinator-suggested firewall rules.
-    /// `on` immediately installs the queued set; `off` stops future auto-install.
-    FirewallAutoAccept {
-        network: String,
-        enabled: bool,
-    },
-    /// Toggle per-network auto-accept of incoming file offers from our own
-    /// paired devices. `on` also drains any already-queued offers from own
-    /// devices; `off` stops future auto-accept.
-    FilesAutoAccept {
-        network: String,
-        enabled: bool,
-    },
     /// Accept the queued suggested rules for a network: install them (replacing
     /// the prior `Network(net)` set) and clear the queue.
     FirewallAccept {
@@ -179,12 +151,6 @@ pub enum IpcMessage {
         network: String,
         accept: Vec<FirewallRuleView>,
         deny: Vec<FirewallRuleView>,
-    },
-    /// Toggle the embedded mesh SSH server (`ray firewall ssh on|off`). When on,
-    /// the daemon listens on each mesh IP's port 22 and admits peers authorized
-    /// per-network; off stops the listeners and removes the tcp:22 passthrough.
-    FirewallSshSet {
-        enabled: bool,
     },
     /// Add (`allow=true`) or remove (`allow=false`) a peer from a network's SSH
     /// allow list. `peer` is a resolved peer EndpointId (hex) or `"*"` (any peer
@@ -376,6 +342,10 @@ pub enum IpcMessage {
     ApproveConnection {
         id: String,
     },
+    /// `ray mdns scan`: list rayfish nodes seen on the LAN over mDNS. A sighting
+    /// is not a relationship, so this is an open read.
+    /// Reply: [`IpcMessage::LanPeersList`].
+    ListLanPeers,
     /// `ray contact id`: print this node's contact id. Open read.
     ContactId,
     /// `ray contact rotate`: rotate this node's contact key (old id stops
@@ -392,50 +362,52 @@ pub enum IpcMessage {
     /// `ray netcheck`: local endpoint diagnostics (bound port, home relay,
     /// reachability). Open read.
     Netcheck,
-    /// Persist the mDNS discovery toggle (`ray mdns on|off`). Routed through the
-    /// daemon (not written client-side) so the setting always lands in the config
-    /// dir the daemon reads: on non-Linux, `config_dir()` is derived from the
-    /// process environment, so a client-side write from a different `HOME` than
-    /// the service's would silently miss the daemon's config. The daemon reads
-    /// this at startup, so it takes effect on restart. Mutation (root/operator).
-    SetMdns {
-        enabled: bool,
-    },
-    /// Set a global config key (`ray config set`, `ray auto-update on|off`). The
-    /// daemon applies it to its own config and persists it. `value` uses the same
-    /// grammar as `config::config_set`. Same routing rationale as `SetMdns`.
-    /// Mutation.
+    /// Set one settings key (`config::settings`), whatever store backs it: the
+    /// daemon dispatches on the key's scope, so this one variant serves
+    /// `ray config set`, `ray mdns`, `ray auto-update`, `ray firewall
+    /// on|off|reject|default`, `ray firewall ssh on|off` and `ray files
+    /// download-dir|download-user`. `value` is the raw word; the registry parses
+    /// it.
+    ///
+    /// Routed through the daemon rather than written client-side so the write
+    /// always lands in the config dir the daemon reads: on non-Linux,
+    /// `config_dir()` comes from the process environment, so a client-side write
+    /// from a different `HOME` than the service's would silently miss it.
+    /// Mutation (root/operator).
     ConfigSet {
-        key: String,
+        key: NodeKey,
         value: String,
+        /// Only meaningful for list-valued global keys (`relay`,
+        /// `discovery-dns`, `dns-upstreams`): append when unset, replace the
+        /// whole list when set. Firewall- and network-scoped keys ignore it,
+        /// since none of those keys are list-valued today.
         #[serde(default)]
         replace: bool,
     },
     /// Reset a global config key to its default (`ray config unset`). Mutation.
     ConfigUnset {
-        key: String,
+        key: NodeKey,
     },
     /// Read global config keys (`ray config get`), answered with `ConfigValues`.
     /// `key = None` returns every key. Open read, like `Status` — routed through
     /// the daemon so reads and writes agree on which config dir is authoritative.
     ConfigGet {
-        key: Option<String>,
+        key: Option<NodeKey>,
     },
-    /// Set (or clear, with `None`) the directory accepted files land in
-    /// (`ray files download-dir`). Same daemon-writes-its-own-config rationale as
-    /// `SetMdns`; the path is validated absolute on the client. Mutation.
-    SetDownloadDir {
-        path: Option<String>,
+    /// Set one per-network setting (`networks/<name>.toml`). The key type is
+    /// what keeps a global or firewall key out of a network file; an empty
+    /// `value` resets the key to its default, matching `ConfigUnset`.
+    NetConfigSet {
+        network: String,
+        key: NetworkKey,
+        value: String,
     },
-    /// Set (or clear, with `None`) the local UID that owns accepted files
-    /// (`ray files download-user`). The client resolves the username to a UID
-    /// (as it does for `SetOperator`) before sending. Mutation.
-    SetDownloadUser {
-        uid: Option<u32>,
+    /// Read per-network settings. `key: None` returns every `net.` key. Open
+    /// read, like `ConfigGet` and `FirewallShow`.
+    NetConfigGet {
+        network: String,
+        key: Option<NetworkKey>,
     },
-    /// Read the file-download settings (`ray files download-dir`/`download-user`
-    /// with no argument), answered with `DownloadSettings`. Open read.
-    GetDownloadSettings,
 
     // Responses
     Ok {
@@ -447,13 +419,11 @@ pub enum IpcMessage {
     Created {
         name: String,
         network_key: EndpointId,
-        my_ip: Ipv4Addr,
-        my_ipv6: Option<Ipv6Addr>,
+        my_ipv6: Ipv6Addr,
     },
     Joined {
         name: String,
-        my_ip: Ipv4Addr,
-        my_ipv6: Option<Ipv6Addr>,
+        my_ipv6: Ipv6Addr,
     },
     StatusResponse {
         endpoint_id: EndpointId,
@@ -493,6 +463,18 @@ pub enum IpcMessage {
         /// active. Shown in the UI as "waiting for approval".
         #[serde(default)]
         pending_networks: Vec<String>,
+        /// Networks saved in the daemon's config that it has not registered —
+        /// a restore that has not landed. Reported here rather than read from
+        /// config by the CLI, which resolves the *caller's* config directory
+        /// and so sees an empty one wherever the daemon's is root-owned.
+        #[serde(default)]
+        inactive_networks: Vec<InactiveNetwork>,
+        /// Nodes seen on the LAN over mDNS that we do not already share a
+        /// network with, i.e. the ones still to link up with. Peers we do share
+        /// a network with are omitted: they show in `networks` instead. Empty
+        /// when mDNS is off. `ray mdns scan` lists the full set.
+        #[serde(default)]
+        lan_peers: Vec<LanPeerInfo>,
     },
     /// Reply to `Ping`. `probes` holds one entry per probe in send order: the
     /// measured round-trip in milliseconds, or `None` if that probe timed out.
@@ -583,6 +565,20 @@ pub enum IpcMessage {
     PairedDevices {
         devices: Vec<PairedDeviceInfo>,
     },
+    /// Nodes seen on the LAN over mDNS (reply to `ListLanPeers`).
+    LanPeersList {
+        peers: Vec<LanPeerInfo>,
+        /// `false` when mDNS is off, so the client can say so instead of
+        /// reporting an empty LAN.
+        mdns_enabled: bool,
+    },
+    /// One piece of a streamed log response (reply to [`IpcMessage::Logs`]).
+    /// Raw bytes, not lines: the daemon splits on whatever boundary keeps a
+    /// frame under [`MAX_FRAME_LEN`], so a chunk is only meaningful when the
+    /// run is concatenated in order.
+    LogChunk {
+        data: Vec<u8>,
+    },
     /// A diagnostic bundle was written to `path` (a `.tgz`, owned by the caller).
     /// `issue_title`/`issue_body` pre-fill a GitHub issue; the user attaches the
     /// bundle file manually.
@@ -617,11 +613,6 @@ pub enum IpcMessage {
     /// Reply to `ConfigGet`: `(key, value)` rows as `config::config_get` renders.
     ConfigValues {
         rows: Vec<(String, String)>,
-    },
-    /// Reply to `GetDownloadSettings`: the daemon's current file-download config.
-    DownloadSettings {
-        dir: Option<String>,
-        uid: Option<u32>,
     },
 }
 
@@ -667,6 +658,51 @@ pub struct ExitNodeStatusView {
     /// Roster peers advertising `exit_node` (display strings: hostname or short
     /// id), so the user can see who is available to route through.
     pub available: Vec<String>,
+    /// The subset of `available` whose roster entry *claims* IPv6 egress. On an
+    /// IPv6-only node these are the gateways known to work, so the list has to
+    /// say which they are rather than let the user pick one that would take the
+    /// traffic and drop it.
+    ///
+    /// Not the complement of "unusable": a gateway whose entry carries no claim
+    /// at all is absent from this list and still selectable, because an absent
+    /// claim is what a coordinator too old to record it leaves behind, and
+    /// refusing on it would make exit nodes unusable on that whole network. Only
+    /// a claim that positively says IPv4-only is refused.
+    #[serde(default)]
+    pub available_v6: Vec<String>,
+    /// The subset of `available` that *this* node would refuse, with the family
+    /// it cannot carry named.
+    ///
+    /// Separate from `available_v6` because the two answer different questions
+    /// and stopped agreeing once a gateway could be IPv6-only itself: such a
+    /// gateway claims IPv6 egress (so it is in `available_v6`) and is refused by
+    /// a dual-stack client (because it cannot return IPv4). Marking it usable off
+    /// the first list alone sends the user at the one gateway that will not work.
+    /// Computed daemon-side, where the refusal rule already lives, so the CLI
+    /// never re-derives it and cannot drift from it.
+    #[serde(default)]
+    pub refused: Vec<String>,
+    /// Why the `using` selection above is not the tunnel that is actually
+    /// installed, or `None` when it is (and when nothing is selected).
+    ///
+    /// The selection is config and the tunnel is kernel state, and they are
+    /// deliberately allowed to disagree: a gateway that stops being usable does
+    /// not clear the config, so `ray exit-node status` still shows what to change.
+    /// The gap has to be visible, though. Without this the line reads `using:
+    /// <peer>` while every packet leaves directly, which is the one thing a user
+    /// who chose to tunnel needs told, and the reason can arrive without anybody
+    /// touching the selection (the gateway republishes a family claim).
+    #[serde(default)]
+    pub not_in_effect: Option<String>,
+    /// Which families the tunnel through `using` carries. A tunnel takes the
+    /// families this node's data plane routes *and* the gateway says it can
+    /// return, so it can be narrower than either: on an IPv6-only node, or
+    /// through a gateway that can only return one of the two, the other family
+    /// keeps leaving this host directly. Meaningless when `using` is `None`.
+    #[serde(default)]
+    pub tunnel_v4: bool,
+    #[serde(default)]
+    pub tunnel_v6: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -690,6 +726,23 @@ pub struct PairedDeviceInfo {
     pub hostname: Option<String>,
     /// Networks this device is currently a member of.
     pub networks: Vec<String>,
+}
+
+/// One rayfish node seen on the local network over mDNS. A sighting says only
+/// that the node exists and where it is; it carries no membership or trust.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LanPeerInfo {
+    /// The peer's transport endpoint id (what `ray connect` accepts for a
+    /// neighbour on the LAN).
+    pub endpoint_id: EndpointId,
+    /// Short id form for display.
+    pub short_id: String,
+    /// Socket addresses the peer advertised, already formatted.
+    pub addrs: Vec<String>,
+    /// Seconds since the peer was last advertised.
+    pub last_seen_secs: u64,
+    /// A network already shared with this peer, if any.
+    pub shared_network: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -738,12 +791,42 @@ pub struct PendingFileInfo {
     pub own_device: bool,
 }
 
+/// A mesh-protocol version mismatch on a network: what its signed record
+/// advertises against what this daemon speaks.
+///
+/// The network is registered from its verified roster blob (that ride is not
+/// version-gated), but the versioned mesh ALPN refuses every dial, so no peer on
+/// it is reachable until one side is upgraded. Carried per network so `ray
+/// status` can name both versions instead of just saying "incompatible".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshVersionMismatch {
+    /// Mesh protocol version the network's signed pkarr record advertises.
+    pub network: u32,
+    /// Mesh protocol version this daemon speaks.
+    pub ours: u32,
+}
+
+/// A network saved in the daemon's config that the daemon has not registered:
+/// its restore has not landed yet and keeps retrying.
+///
+/// Reported by the daemon rather than read from config by the CLI. The daemon is
+/// the only side that can read its own config directory (on macOS it is
+/// root-owned and the CLI runs as someone else) and the only side that knows why
+/// the restore is failing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InactiveNetwork {
+    pub name: String,
+    /// The last restore failure, as a one-line message. `None` before the first
+    /// attempt has failed.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub name: String,
     pub role: NetworkRole,
-    pub my_ip: Ipv4Addr,
-    pub my_ipv6: Option<Ipv6Addr>,
+    pub my_ipv6: Ipv6Addr,
     pub my_hostname: Option<String>,
     pub network_key: Option<String>,
     pub member_count: usize,
@@ -774,6 +857,12 @@ pub struct NetworkStatus {
     /// peer's exit offer but never your own.
     #[serde(default)]
     pub exit_offering: bool,
+    /// Set when this network's signed record advertises a mesh protocol version
+    /// this daemon does not speak. The network is registered (its roster came
+    /// from the verified blob) but every dial on it fails the ALPN gate, so
+    /// `ray status` marks it incompatible instead of showing it as healthy.
+    #[serde(default)]
+    pub incompatible: Option<MeshVersionMismatch>,
 }
 
 #[derive(
@@ -794,8 +883,7 @@ pub enum NetworkRole {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub endpoint_id: EndpointId,
-    pub ip: Ipv4Addr,
-    pub ipv6: Option<Ipv6Addr>,
+    pub ipv6: Ipv6Addr,
     pub hostname: Option<String>,
     pub user_identity: Option<EndpointId>,
     /// True when this peer is another of the local user's own paired devices
@@ -866,7 +954,18 @@ pub enum ConnType {
 /// Maximum IPC frame size (body). Matches the previous hand-rolled guard;
 /// `LengthDelimitedCodec` rejects anything larger so a malformed/hostile peer
 /// can't make us allocate an unbounded buffer.
-const MAX_FRAME_LEN: usize = 1_048_576;
+///
+/// Public because a multi-frame reply has to size its own frames against it:
+/// [`IpcMessage::LogChunk`] carries as much as fits and no more.
+pub const MAX_FRAME_LEN: usize = 1_048_576;
+
+/// How many log bytes one [`IpcMessage::LogChunk`] carries.
+///
+/// A quarter of [`MAX_FRAME_LEN`], not all of it: msgpack writes a `Vec<u8>`
+/// as an array of integers, and every byte over `0x7f` costs two, so the frame
+/// can be twice the payload plus the envelope. `test_log_chunk_fits_a_frame`
+/// pins the worst case.
+pub const LOG_CHUNK_BYTES: usize = MAX_FRAME_LEN / 4;
 
 /// A codec that frames msgpack-serialized `T`s using tokio's
 /// [`LengthDelimitedCodec`] (a 4-byte big-endian length prefix — the wire format
@@ -876,10 +975,16 @@ const MAX_FRAME_LEN: usize = 1_048_576;
 /// frame.
 ///
 /// Structs are serialized with `to_vec_named` (field-name maps, not positional
-/// arrays) — required for correctness when a struct uses `skip_serializing_if`:
-/// with positional arrays, skipping a field shifts later fields into the wrong
-/// slot on decode (e.g. `HostSuggestions` with `default: None` + non-empty
-/// `allows` misaligns and fails with "invalid type: map, expected a string").
+/// arrays). IPC has no version negotiation and is read by a CLI whose binary is
+/// swapped before the daemon restarts, so both sides must tolerate a field the
+/// other does not know; a named map is what makes that free, and it is why
+/// `skip_serializing_if` is still safe on the types below.
+///
+/// The network wire made the opposite choice (see CLAUDE.md): it is
+/// array-encoded, gated on an ALPN, and a `skip_serializing_if` there shifts
+/// every later field into the wrong slot. `HostSuggestions` crosses both
+/// boundaries and so carries no skips at all.
+///
 /// The decoder (`from_slice`) handles both named and unnamed representations,
 /// so it's forward-compatible with older peers.
 pub struct MsgpackCodec<T> {
@@ -1359,7 +1464,12 @@ mod tests {
                 network: "n".into(),
                 allow: vec!["*".into()],
                 using: Some("gw".into()),
-                available: vec!["gw".into()],
+                available: vec!["gw".into(), "v4only".into()],
+                available_v6: vec!["gw".into()],
+                refused: vec!["v4only".into()],
+                not_in_effect: Some("the peer is not in this network's roster".into()),
+                tunnel_v4: false,
+                tunnel_v6: true,
             }],
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
@@ -1368,18 +1478,49 @@ mod tests {
             IpcMessage::ExitNodeState { networks } => {
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].using.as_deref(), Some("gw"));
+                // `available_v6` is a subset of `available`, not a replacement:
+                // an IPv6-only client needs both lists to say "this gateway
+                // exists but cannot carry your only family".
+                assert_eq!(networks[0].available_v6, vec!["gw".to_string()]);
+                // A selection that is configured but not installed says so, or
+                // `using: gw` reads as a tunnel that is carrying traffic.
+                assert!(networks[0].not_in_effect.is_some());
             }
             other => panic!("wrong variant: {other:?}"),
         }
     }
 
+    /// `available_v6` is `#[serde(default)]`, so a reply from a daemon that
+    /// predates it still decodes: a CLI upgraded ahead of its daemon reads no
+    /// IPv6-capable gateways, which is what that daemon meant.
+    #[test]
+    fn exit_node_state_decodes_without_the_ipv6_fields() {
+        #[derive(Serialize)]
+        struct OldView {
+            network: String,
+            allow: Vec<String>,
+            using: Option<String>,
+            available: Vec<String>,
+        }
+        let bytes = rmp_serde::to_vec_named(&OldView {
+            network: "n".into(),
+            allow: vec![],
+            using: None,
+            available: vec!["gw".into()],
+        })
+        .unwrap();
+        let decoded: ExitNodeStatusView = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.available, vec!["gw".to_string()]);
+        assert!(decoded.available_v6.is_empty());
+    }
+
     #[test]
     fn firewall_suggest_roundtrips_through_named_codec() {
-        // Regression: with positional-array (`to_vec`) serialization, a
-        // `HostSuggestions` whose `default` is `None` (skipped) but whose
-        // `allows` is non-empty misaligns on decode and fails with
-        // "invalid type: map, expected a string". The codec must serialize
-        // structs as named maps so `skip_serializing_if` is safe.
+        // `HostSuggestions` reaches the CLI through this codec and the mesh
+        // through the signed blob, and the two encodings disagree about what an
+        // absent field means. It carries no `skip_serializing_if` for that
+        // reason (see `a_deny_only_suggestion_does_not_decode_as_an_allow`); this
+        // pins the IPC half, that one pins the wire half.
         use crate::policy::HostSuggestions;
         use std::collections::BTreeMap;
 
@@ -1428,8 +1569,7 @@ mod tests {
         let resp = IpcMessage::Created {
             name: "test".to_string(),
             network_key: key,
-            my_ip: Ipv4Addr::new(100, 64, 10, 5),
-            my_ipv6: None,
+            my_ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5),
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -1437,12 +1577,11 @@ mod tests {
             IpcMessage::Created {
                 name,
                 network_key,
-                my_ip,
-                ..
+                my_ipv6,
             } => {
                 assert_eq!(name, "test");
                 assert_eq!(network_key, key);
-                assert_eq!(my_ip, Ipv4Addr::new(100, 64, 10, 5));
+                assert_eq!(my_ipv6, Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5));
             }
             _ => panic!("wrong variant"),
         }
@@ -1463,6 +1602,43 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_logs_request_roundtrip() {
+        let req = IpcMessage::Logs {
+            since: Some(Duration::from_secs(9000)),
+            follow: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::Logs { since, follow } => {
+                assert_eq!(since, Some(Duration::from_secs(9000)));
+                assert!(follow);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// A `LogChunk` is a `Vec<u8>`, which msgpack writes as an array of ints:
+    /// a byte over 0x7f costs two. The daemon sizes chunks against
+    /// `MAX_FRAME_LEN` and so has to allow for that expansion, so pin the
+    /// worst case here — all-high bytes, a full chunk's worth — rather than
+    /// discovering it as a runtime "frame too large" on a log line with
+    /// non-ASCII in it.
+    #[test]
+    fn test_log_chunk_fits_a_frame() {
+        let chunk = IpcMessage::LogChunk {
+            data: vec![0xffu8; LOG_CHUNK_BYTES],
+        };
+        let mut buf = BytesMut::new();
+        MsgpackCodec::new().encode(chunk, &mut buf).unwrap();
+        assert!(
+            buf.len() <= MAX_FRAME_LEN,
+            "a full log chunk framed to {} bytes, over the {MAX_FRAME_LEN} cap",
+            buf.len()
+        );
     }
 
     #[test]
@@ -1548,7 +1724,7 @@ mod tests {
     fn test_connect_roundtrip() {
         let req = IpcMessage::Connect {
             contact_id: "contactabc".to_string(),
-            hostname: Some("dario".to_string()),
+            hostname: Some("laptop".to_string()),
         };
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -1558,7 +1734,7 @@ mod tests {
                 hostname,
             } => {
                 assert_eq!(contact_id, "contactabc");
-                assert_eq!(hostname.as_deref(), Some("dario"));
+                assert_eq!(hostname.as_deref(), Some("laptop"));
             }
             _ => panic!("wrong variant"),
         }
@@ -1566,27 +1742,32 @@ mod tests {
 
     #[test]
     fn config_mutation_messages_roundtrip() {
-        // `ray mdns off` / `ray config set` route through the daemon; the wire
-        // types must survive the named-map codec.
+        // Every single-value setting rides these three variants (`ray mdns`,
+        // `ray config set`, `ray files download-dir`, `ray firewall off`, ...);
+        // the wire types must survive the named-map codec.
         for msg in [
-            IpcMessage::SetMdns { enabled: false },
             IpcMessage::ConfigSet {
-                key: "auto-update".to_string(),
+                key: NodeKey::Global(crate::GlobalKey::AutoUpdate),
                 value: "off".to_string(),
                 replace: false,
             },
+            IpcMessage::ConfigSet {
+                key: NodeKey::Global(crate::GlobalKey::DownloadDir),
+                value: "/srv/dl".to_string(),
+                replace: false,
+            },
             IpcMessage::ConfigUnset {
-                key: "relay".to_string(),
+                key: NodeKey::Global(crate::GlobalKey::Relay),
             },
             IpcMessage::ConfigGet { key: None },
-            IpcMessage::SetDownloadDir {
-                path: Some("/srv/dl".to_string()),
+            IpcMessage::NetConfigSet {
+                network: "gaming".to_string(),
+                key: NetworkKey::EphemeralTtl,
+                value: "7200".to_string(),
             },
-            IpcMessage::SetDownloadUser { uid: Some(501) },
-            IpcMessage::GetDownloadSettings,
-            IpcMessage::DownloadSettings {
-                dir: None,
-                uid: None,
+            IpcMessage::NetConfigGet {
+                network: "gaming".to_string(),
+                key: None,
             },
         ] {
             let bytes = rmp_serde::to_vec_named(&msg).unwrap();
@@ -1632,15 +1813,13 @@ mod tests {
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,
-                my_ip: Ipv4Addr::new(100, 64, 10, 5),
-                my_ipv6: None,
+                my_ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5),
                 my_hostname: Some("alice".to_string()),
                 network_key: Some("abc123".to_string()),
                 member_count: 2,
                 peers: vec![PeerStatus {
                     endpoint_id: peer_id,
-                    ip: Ipv4Addr::new(100, 64, 10, 6),
-                    ipv6: None,
+                    ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 6),
                     hostname: None,
                     user_identity: None,
                     is_own_device: false,
@@ -1656,6 +1835,7 @@ mod tests {
                 ephemeral_ttl_secs: None,
                 my_exit_node: None,
                 exit_offering: false,
+                incompatible: None,
             }],
             packets_rx: 0,
             packets_tx: 0,
@@ -1664,6 +1844,14 @@ mod tests {
             pending_files: 0,
             pending_connects: 0,
             pending_networks: vec![],
+            inactive_networks: vec![],
+            lan_peers: vec![LanPeerInfo {
+                endpoint_id: peer_id,
+                short_id: peer_id.fmt_short().to_string(),
+                addrs: vec!["192.168.1.31:57012".to_string()],
+                last_seen_secs: 4,
+                shared_network: None,
+            }],
         };
         // The IPC codec uses `to_vec_named`; positional encoding can't survive
         // NetworkStatus's `skip_serializing_if` fields (ephemeral_ttl_secs,
@@ -1674,11 +1862,49 @@ mod tests {
             IpcMessage::StatusResponse {
                 endpoint_id,
                 networks,
+                lan_peers,
                 ..
             } => {
                 assert_eq!(endpoint_id, ep_id);
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].peers[0].endpoint_id, peer_id);
+                assert_eq!(lan_peers.len(), 1);
+                assert_eq!(lan_peers[0].endpoint_id, peer_id);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn lan_peer_messages_roundtrip() {
+        let ep_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let req = rmp_serde::to_vec_named(&IpcMessage::ListLanPeers).unwrap();
+        assert!(matches!(
+            rmp_serde::from_slice::<IpcMessage>(&req).unwrap(),
+            IpcMessage::ListLanPeers
+        ));
+
+        let resp = IpcMessage::LanPeersList {
+            peers: vec![LanPeerInfo {
+                endpoint_id: ep_id,
+                short_id: ep_id.fmt_short().to_string(),
+                addrs: vec!["192.168.1.24:41641".to_string()],
+                last_seen_secs: 3,
+                shared_network: Some("home".to_string()),
+            }],
+            mdns_enabled: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
+        match rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap() {
+            IpcMessage::LanPeersList {
+                peers,
+                mdns_enabled,
+            } => {
+                assert!(mdns_enabled);
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].endpoint_id, ep_id);
+                assert_eq!(peers[0].addrs, vec!["192.168.1.24:41641".to_string()]);
+                assert_eq!(peers[0].shared_network.as_deref(), Some("home"));
             }
             _ => panic!("wrong variant"),
         }

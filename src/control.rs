@@ -4,14 +4,14 @@
 //! Control messages manage membership (join, approve, sync) and mesh topology (hello, reconnect).
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{EndpointId, SecretKey, Signature};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
-use crate::membership::{ApprovedEntry, Member};
+use crate::membership::{ApprovedEntry, ExitFamilies, Member};
 
 /// Certificate proving a device belongs to a user identity.
 ///
@@ -76,7 +76,7 @@ pub struct PairNetwork {
     pub network_key: String,
 }
 
-/// Messages for the device pairing protocol (ALPN `rayfish/pair/1`).
+/// Messages for the device pairing protocol (ALPN `rayfish/pair/2`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairMsg {
     Request {
@@ -91,7 +91,7 @@ pub enum PairMsg {
 }
 
 /// Messages for the `ray connect` friend-request handshake (ALPN
-/// `rayfish/connect/1`). The initiator (A) dials the recipient's (B) contact
+/// `rayfish/connect/2`). The initiator (A) dials the recipient's (B) contact
 /// key, sends `Request`, and polls until `Approved`. Approval is recipient-only:
 /// only B acts, A just waits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +102,7 @@ pub enum ConnectMsg {
     Request {
         from_contact_id: EndpointId,
         from_endpoint: EndpointId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
     },
     /// B → A: queued, not yet approved. A retries with backoff.
@@ -125,18 +125,17 @@ pub enum ControlMsg {
     /// the joiner's desired hostname/device cert. The coordinator branches on the
     /// secret and the network's access mode to admit, gate, or deny.
     JoinRequest {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         invite_secret: Option<Vec<u8>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         device_cert: Option<DeviceCert>,
     },
     /// Coordinator response telling the joiner it has been queued for live
     /// approval (closed network, no invite). The joiner retries until accepted.
     JoinPending,
     JoinApproved {
-        your_ip: Ipv4Addr,
         members: Vec<Member>,
     },
     JoinDenied {
@@ -159,18 +158,16 @@ pub enum ControlMsg {
     },
     MeshHello {
         identity: EndpointId,
-        ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         device_cert: Option<DeviceCert>,
     },
     MemberApproved {
         identity: EndpointId,
-        ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         device_cert: Option<DeviceCert>,
     },
     Welcome {
@@ -184,8 +181,18 @@ pub enum ControlMsg {
         /// no separate best-effort `AdminGrant` stream that could be dropped or race
         /// the joiner's handler setup. The joiner verifies it against the network
         /// pubkey before adopting (see `admin_grant_key_valid`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         direct_key: Option<[u8; 32]>,
+        /// Exact network-key-signed record for the admitted generation above.
+        /// Present with `direct_key`, so the new co-coordinator can bind durable
+        /// authority to the complete blob without racing a second DHT resolve.
+        #[serde(default)]
+        direct_record: Option<Vec<u8>>,
+        /// Whether publication of `direct_record` was confirmed before Welcome.
+        /// False is a locally pending authoritative generation that this new
+        /// key-holder must preserve and publish before accepting another record.
+        #[serde(default)]
+        direct_record_published: bool,
     },
     /// Notify connected members that the signed group blob changed. Payload-free:
     /// a *trigger only*. Receivers reconverge from the network-key-signed pkarr
@@ -201,6 +208,20 @@ pub enum ControlMsg {
     /// [`ControlFrame`]'s `net`.
     ExitNodeOffer {
         enabled: bool,
+        /// Which families that exit node can egress (whether the offering host
+        /// has an IPv6 default route). Recorded as `Member.exit_families`, and
+        /// what lets an IPv6-only client tell a usable gateway from one that
+        /// would take its traffic and have nowhere to send it.
+        ///
+        /// Appended in mesh 3, and three-valued for the same reason the roster
+        /// field is: a gateway on a build that predates this key sends a shorter
+        /// array and we default the slot, and reading
+        /// that silence as "IPv4 only" would pin a host that may well have IPv6
+        /// as unusable for as long as it stays on that build. `enabled` above is
+        /// deliberately left a plain `bool`: it shipped in 0.3.0, and changing
+        /// how an existing field encodes breaks every peer already running it.
+        #[serde(default)]
+        exit_families: ExitFamilies,
     },
     /// Coordinator grants the per-network secret key to another member, making it
     /// a co-coordinator (can publish the signed blob / suggest firewall rules).
@@ -303,8 +324,8 @@ pub enum ControlMsg {
     KickedFromNetwork,
     /// Receiver to sender: the receiver read a control frame it could not decode,
     /// i.e. a variant from a newer build. `msg_kind` is the unknown variant's name
-    /// as it appeared on the wire (`to_vec_named` puts the name in the msgpack
-    /// map, so it survives even when the variant itself is unknown; see
+    /// as it appeared on the wire (both msgpack encodings key a payload variant
+    /// by its name, so it survives even when the variant itself is unknown; see
     /// [`FrameRead`]). Advisory and connection-level (`net: None`): nothing acts
     /// on it beyond logging, it exists so the sender can tell its user "peer X
     /// doesn't support Y" instead of features failing silently. Never sent in
@@ -334,7 +355,7 @@ pub struct NetworkHandle {
 /// ping); it is `None` for connection-level messages ([`ControlMsg::NetworkHandles`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlFrame {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub net: Option<EndpointId>,
     pub msg: ControlMsg,
 }
@@ -347,7 +368,7 @@ pub fn encode_msg(net: Option<EndpointId>, msg: &ControlMsg) -> Vec<u8> {
         net,
         msg: msg.clone(),
     };
-    let body = rmp_serde::to_vec_named(&frame).expect("serialize control frame");
+    let body = rmp_serde::to_vec(&frame).expect("serialize control frame");
     let len = (body.len() as u32).to_be_bytes();
     [len.as_slice(), &body].concat()
 }
@@ -378,19 +399,29 @@ pub enum FrameRead {
 
 /// The shape of a frame whose [`ControlMsg`] this build cannot decode: just
 /// enough structure to recover the variant name for the `NotSupported` nack.
+///
+/// It must mirror [`ControlFrame`]'s field list, `net` included, because the
+/// wire is array-encoded: a probe declaring only `msg` reads the frame's *first*
+/// slot, which is `net`, and the whole nack path goes dead. So this struct grows
+/// with `ControlFrame`; the two `unknown_*_variant_probes_its_kind` tests fail if
+/// it does not.
 #[derive(Deserialize)]
 struct FrameProbe {
+    #[allow(dead_code)]
+    net: IgnoredAny,
     msg: KindProbe,
 }
 
-/// `to_vec_named` encodes a unit variant as a bare string and a payload variant
-/// as a single-key map keyed by the variant name; either way the name survives
-/// even when the variant itself is unknown to this build.
+/// msgpack encodes a unit variant as a bare string and a payload variant as a
+/// single-key map keyed by the variant name; either way the name survives even
+/// when the variant itself is unknown to this build. True of `to_vec` as well as
+/// `to_vec_named`: only the *fields* of a struct become positional, not the
+/// variant tag, so the name is still there to read.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum KindProbe {
     Unit(String),
-    Tagged(HashMap<String, serde::de::IgnoredAny>),
+    Tagged(HashMap<String, IgnoredAny>),
 }
 
 /// Decode a control-frame body (length prefix already stripped). A body that
@@ -465,7 +496,7 @@ pub async fn recv_frame(stream: &mut RecvStream) -> Result<FrameRead> {
 /// the stream (same one-message-per-stream contract as [`send_msg`]). Used by
 /// the `ray connect` handshake (`ConnectMsg`).
 pub async fn send_framed<T: Serialize>(stream: &mut SendStream, msg: &T) -> Result<()> {
-    let body = rmp_serde::to_vec_named(msg).context("serialize framed message")?;
+    let body = rmp_serde::to_vec(msg).context("serialize framed message")?;
     let len = (body.len() as u32).to_be_bytes();
     stream
         .write_all(&[len.as_slice(), &body].concat())
@@ -536,17 +567,15 @@ mod tests {
     #[test]
     fn test_roundtrip_join_approved() {
         let msg = ControlMsg::JoinApproved {
-            your_ip: Ipv4Addr::new(100, 64, 0, 3),
             members: vec![Member {
                 identity: test_id(1),
-                ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_families: ExitFamilies::Unknown,
             }],
         };
         let bytes = encode_msg(None, &msg);
@@ -558,7 +587,6 @@ mod tests {
     fn test_roundtrip_mesh_hello() {
         let msg = ControlMsg::MeshHello {
             identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 0, 4),
             hostname: None,
             device_cert: None,
         };
@@ -569,18 +597,15 @@ mod tests {
 
     #[test]
     fn network_handles_missing_features_decodes_to_zero() {
-        // A v0.2.0 peer encodes NetworkHandles without the `features` field (it
-        // predates it). `#[serde(default)]` must decode that to `0` so we treat the
-        // peer as advertising no capabilities and never idle-close its link.
+        // A build that stops before the `features` field. `#[serde(default)]`
+        // must decode that to `0` so we treat the peer as advertising no
+        // capabilities and never idle-close its link.
         #[derive(serde::Serialize)]
         enum LegacyMsg {
             NetworkHandles { entries: Vec<NetworkHandle> },
         }
-        #[derive(serde::Serialize)]
-        struct LegacyFrame {
-            msg: LegacyMsg,
-        }
-        let legacy = LegacyFrame {
+        let legacy = FrameOf {
+            net: None,
             msg: LegacyMsg::NetworkHandles {
                 entries: vec![NetworkHandle {
                     network: test_id(2),
@@ -588,7 +613,7 @@ mod tests {
                 }],
             },
         };
-        let body = rmp_serde::to_vec_named(&legacy).unwrap();
+        let body = rmp_serde::to_vec(&legacy).unwrap();
         let frame: ControlFrame = rmp_serde::from_slice(&body).unwrap();
         match frame.msg {
             ControlMsg::NetworkHandles { features, entries } => {
@@ -609,41 +634,48 @@ mod tests {
         assert_eq!(msg, decoded.msg);
     }
 
+    /// A frame from a newer build, encoded the way that build would actually
+    /// send it: `to_vec`, with the full [`ControlFrame`] field list. Both halves
+    /// matter. A fixture built from a `msg`-only struct is a *shorter array*, so
+    /// it exercises a shape no peer emits, and it passed against a probe that
+    /// read `net` as the variant name.
+    #[derive(serde::Serialize)]
+    struct FrameOf<M> {
+        net: Option<EndpointId>,
+        msg: M,
+    }
+
     #[test]
     fn unknown_struct_variant_probes_its_kind() {
-        // A frame from a newer build carrying a struct variant this build has
-        // never heard of. Decode must not error: it reports the variant name
-        // recovered from the msgpack map so the demux can nack it.
         #[derive(serde::Serialize)]
         enum FutureMsg {
             ExitNodeTeleport { hops: u32 },
         }
-        #[derive(serde::Serialize)]
-        struct FutureFrame {
-            msg: FutureMsg,
-        }
-        let body = rmp_serde::to_vec_named(&FutureFrame {
-            msg: FutureMsg::ExitNodeTeleport { hops: 3 },
-        })
-        .unwrap();
-        match decode_frame(&body).unwrap() {
-            FrameRead::Unknown { msg_kind } => assert_eq!(msg_kind, "ExitNodeTeleport"),
-            FrameRead::Frame(f) => panic!("decoded a future variant: {f:?}"),
+        // Both `net` states: a network-scoped frame and a connection-level one.
+        // The scoped one is where a probe that misreads the first slot returns
+        // the network key as the variant name instead of failing outright.
+        for net in [None, Some(test_id(4))] {
+            let body = rmp_serde::to_vec(&FrameOf {
+                net,
+                msg: FutureMsg::ExitNodeTeleport { hops: 3 },
+            })
+            .unwrap();
+            match decode_frame(&body).unwrap() {
+                FrameRead::Unknown { msg_kind } => assert_eq!(msg_kind, "ExitNodeTeleport"),
+                FrameRead::Frame(f) => panic!("decoded a future variant: {f:?}"),
+            }
         }
     }
 
     #[test]
     fn unknown_unit_variant_probes_its_kind() {
-        // Unit variants encode as a bare string under `to_vec_named`, not a map.
+        // Unit variants encode as a bare string, not a single-key map.
         #[derive(serde::Serialize)]
         enum FutureMsg {
             Teleport,
         }
-        #[derive(serde::Serialize)]
-        struct FutureFrame {
-            msg: FutureMsg,
-        }
-        let body = rmp_serde::to_vec_named(&FutureFrame {
+        let body = rmp_serde::to_vec(&FrameOf {
+            net: Some(test_id(4)),
             msg: FutureMsg::Teleport,
         })
         .unwrap();
@@ -653,9 +685,23 @@ mod tests {
         }
     }
 
+    /// The probe must not fire on a frame this build *can* decode, and must read
+    /// the bytes `encode_msg` really produces rather than a hand-built fixture.
+    #[test]
+    fn probe_reads_a_real_compact_frame() {
+        let data = encode_msg(Some(test_id(4)), &ControlMsg::Ping { nonce: 7 });
+        match decode_frame(&data[4..]).unwrap() {
+            FrameRead::Frame(f) => {
+                assert_eq!(f.net, Some(test_id(4)));
+                assert_eq!(f.msg, ControlMsg::Ping { nonce: 7 });
+            }
+            FrameRead::Unknown { msg_kind } => panic!("known variant probed as {msg_kind}"),
+        }
+    }
+
     #[test]
     fn known_frame_decodes_as_frame() {
-        let body = rmp_serde::to_vec_named(&ControlFrame {
+        let body = rmp_serde::to_vec(&ControlFrame {
             net: None,
             msg: ControlMsg::Ping { nonce: 7 },
         })
@@ -711,7 +757,7 @@ mod tests {
             ConnectMsg::Request {
                 from_contact_id: test_id(1),
                 from_endpoint: test_id(2),
-                hostname: Some("dario".to_string()),
+                hostname: Some("laptop".to_string()),
             },
             ConnectMsg::Pending,
             ConnectMsg::Approved {
@@ -723,7 +769,7 @@ mod tests {
             },
         ];
         for msg in msgs {
-            let body = rmp_serde::to_vec_named(&msg).unwrap();
+            let body = rmp_serde::to_vec(&msg).unwrap();
             let decoded: ConnectMsg = rmp_serde::from_slice(&body).unwrap();
             assert_eq!(msg, decoded);
         }
@@ -751,7 +797,6 @@ mod tests {
     fn test_roundtrip_member_approved() {
         let msg = ControlMsg::MemberApproved {
             identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 12, 34),
             hostname: None,
             device_cert: None,
         };
@@ -766,24 +811,23 @@ mod tests {
         let msg = ControlMsg::Welcome {
             members: vec![Member {
                 identity: test_id(1),
-                ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_families: ExitFamilies::Unknown,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
-                ip: Ipv4Addr::new(100, 64, 0, 5),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
             }],
             direct_key: Some([7u8; 32]),
+            direct_record: Some(vec![1, 2, 3]),
+            direct_record_published: true,
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -895,7 +939,6 @@ mod tests {
         let cert = DeviceCert::create(&user_key, &device_key.public(), 0);
         let msg = ControlMsg::MeshHello {
             identity: device_key.public(),
-            ip: Ipv4Addr::new(100, 64, 0, 5),
             hostname: Some("alice".to_string()),
             device_cert: Some(cert),
         };
@@ -964,8 +1007,9 @@ mod tests {
 
     #[test]
     fn pair_response_networks_defaults_when_absent() {
-        // An old Response encoded without the networks field must still decode,
-        // with an empty list.
+        // An older build's Response, which stops before `networks`: on the
+        // compact wire that is a shorter array, and the trailing field takes its
+        // default.
         #[derive(serde::Serialize)]
         enum OldPairMsg {
             Response { cert: DeviceCert },
@@ -973,12 +1017,44 @@ mod tests {
         let user = SecretKey::generate();
         let device = SecretKey::generate().public();
         let cert = DeviceCert::create(&user, &device, 0);
-        let bytes = rmp_serde::to_vec_named(&OldPairMsg::Response { cert: cert.clone() }).unwrap();
+        let bytes = rmp_serde::to_vec(&OldPairMsg::Response { cert: cert.clone() }).unwrap();
 
         let decoded: PairMsg = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             PairMsg::Response { networks, .. } => assert!(networks.is_empty()),
             _ => panic!("expected Response"),
         }
+    }
+
+    /// An `ExitNodeOffer` that stops before `exit_families` reads as *no claim*
+    /// rather than as "cannot carry IPv6".
+    ///
+    /// Reading the silence as a denial would pin a gateway that may well have
+    /// IPv6 as unusable, and would make the offer permanently disagree with the
+    /// roster on the coordinator side, which is a retry loop rather than a
+    /// missing feature (see `NetworkRegistry::exit_offer_out_of_sync`).
+    ///
+    /// The ALPN bump to mesh 3 means no peer sends this shape today, so what
+    /// this pins now is the appending rule itself: the next field added at the
+    /// end of this variant has to default the same way, and there is no reverse
+    /// direction to test, since an older build cannot read the longer array at
+    /// all.
+    #[test]
+    fn exit_node_offer_families_default_to_unknown_when_absent() {
+        #[derive(serde::Serialize)]
+        enum ShortControlMsg {
+            ExitNodeOffer { enabled: bool },
+        }
+        let bytes = rmp_serde::to_vec(&ShortControlMsg::ExitNodeOffer { enabled: true })
+            .expect("serialize");
+
+        let decoded: ControlMsg = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_families: ExitFamilies::Unknown,
+            }
+        );
     }
 }

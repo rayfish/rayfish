@@ -1,6 +1,7 @@
 //! CLI file-sharing handlers: send / list / accept.
 
 use crate::*;
+use ipc::{GlobalKey, NetworkKey, NodeKey};
 
 /// `ray send <peer> <files...>`: one `SendFileFd` request per file. Each file
 /// gets its own IPC connection (the protocol is one request per connection);
@@ -68,8 +69,13 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     };
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        // Returned, not exited: [`ipc_send_files`] calls this once per file and
+        // is written to keep going, so ending the process here would drop every
+        // file after the first rejected one. The caller prints this with the
+        // file's name and still exits non-zero at the end.
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        // Returned, not exited, for the same reason as the arm above.
+        other => anyhow::bail!(unexpected_detail(&other)),
     }
     Ok(())
 }
@@ -134,6 +140,22 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read one global settings key from the daemon. A daemon-side error ends the
+/// command, so there is no "no value" case left for the caller to handle: an
+/// absent row renders as the empty string, which is how every settings key
+/// spells unset.
+async fn config_row(key: NodeKey) -> Result<String> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key: Some(key) }).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::ConfigValues { rows } => {
+            Ok(rows.into_iter().next().map(|(_, v)| v).unwrap_or_default())
+        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
+    }
+}
+
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     // These subcommands change (or read) global settings the daemon owns. They
     // route through the daemon so the write lands in the config dir the daemon
@@ -141,46 +163,56 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     match &action {
         Some(FilesAction::DownloadDir { path, clear }) => {
             if *clear {
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadDir { path: None }).await;
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigUnset {
+                    key: NodeKey::Global(GlobalKey::DownloadDir),
+                })
+                .await;
             } else if let Some(p) = path {
+                // The registry enforces this too, so it binds every writer and
+                // not just this arm. Kept here as well because the daemon's
+                // error surfaces through `print_error`, which prints a different
+                // prefix than the bail this command has always produced.
                 if !std::path::Path::new(p).is_absolute() {
                     anyhow::bail!("download-dir must be an absolute path: {p}");
                 }
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadDir {
-                    path: Some(p.clone()),
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
+                    key: NodeKey::Global(GlobalKey::DownloadDir),
+                    value: p.clone(),
+                    replace: false,
                 })
                 .await;
             }
-            let mut stream = ipc::connect().await?;
-            ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;
-            match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::DownloadSettings { dir, .. } => {
-                    println!("download-dir = {}", dir.as_deref().unwrap_or("<unset>"));
-                }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {other:?}"),
-            }
+            let dir = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await?;
+            println!(
+                "download-dir = {}",
+                if dir.is_empty() { "<unset>" } else { &dir }
+            );
             return Ok(());
         }
         Some(FilesAction::DownloadUser { user, clear }) => {
             if *clear {
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: None }).await;
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigUnset {
+                    key: NodeKey::Global(GlobalKey::DownloadUser),
+                })
+                .await;
             } else if let Some(u) = user {
+                // Resolve the username here: the daemon's key takes a numeric uid
+                // only, so it never has to read the local passwd database.
                 let uid = crate::uid_for_user(u).ok_or_else(|| {
                     anyhow::anyhow!("unknown user '{u}' (pass a valid username or uid)")
                 })?;
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: Some(uid) })
-                    .await;
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
+                    key: NodeKey::Global(GlobalKey::DownloadUser),
+                    value: uid.to_string(),
+                    replace: false,
+                })
+                .await;
             }
-            let mut stream = ipc::connect().await?;
-            ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;
-            match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::DownloadSettings { uid, .. } => match uid {
-                    Some(uid) => println!("download-user = uid {uid}"),
-                    None => println!("download-user = <unset>"),
-                },
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {other:?}"),
+            let uid = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await?;
+            if uid.is_empty() {
+                println!("download-user = <unset>");
+            } else {
+                println!("download-user = uid {uid}");
             }
             return Ok(());
         }
@@ -276,8 +308,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                         println!();
                     }
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::Accept { id, output }) => {
@@ -296,8 +328,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::Cancel { id }) => {
@@ -306,19 +338,19 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::AutoAccept { network, state }) => {
-            let enabled = match state.to_ascii_lowercase().as_str() {
-                "on" | "true" | "yes" => true,
-                "off" | "false" | "no" => false,
-                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
-            };
+            parse_on_off(&state)?;
             ipc::send(
                 &mut stream,
-                ipc::IpcMessage::FilesAutoAccept { network, enabled },
+                ipc::IpcMessage::NetConfigSet {
+                    network,
+                    key: NetworkKey::AutoAcceptFiles,
+                    value: state,
+                },
             )
             .await?;
             let resp = ipc::recv(&mut stream).await?;
@@ -326,8 +358,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         // Config-only subcommands are handled above and return early.

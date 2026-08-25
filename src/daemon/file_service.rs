@@ -12,6 +12,7 @@ use super::transfers;
 use super::*;
 #[cfg(unix)]
 use std::ffi::CString;
+use std::hint::black_box;
 use std::path::PathBuf;
 
 use futures::StreamExt;
@@ -131,13 +132,83 @@ pub(crate) struct PendingFile {
     pub(crate) blob_hash: blake3::Hash,
 }
 
+/// An open pairing session: the secret the ticket carries, and when it opened.
+/// Held rather than a bare secret so [`PAIRING_TTL`] has something to measure.
+pub(crate) struct PairingSession {
+    secret: [u8; 32],
+    opened: Instant,
+}
+
+/// Cap on the queue of unaccepted incoming file offers.
+///
+/// `FILES_ALPN` takes an offer from any dialer that knows our endpoint id, and
+/// each one appends attacker-sized `filename` and `mime_type` strings, so the
+/// queue is memory a stranger can grow one dial at a time. Same policy as the
+/// join and connect queues: at the cap the oldest unanswered offer makes way.
+///
+/// The offer is only a description; the bytes are not fetched until `ray files
+/// accept`, so an evicted entry costs nothing that was not already the sender's
+/// to retry.
+pub(crate) const MAX_PENDING_FILES: usize = 256;
+
+/// Drop the oldest queued offer when `pending` is at `cap`, returning its id.
+/// Offers are pushed in arrival order, so the oldest is the front.
+pub(crate) fn evict_oldest_file(pending: &mut Vec<PendingFile>, cap: usize) -> Option<u64> {
+    if pending.len() < cap {
+        return None;
+    }
+    let dropped = pending.remove(0);
+    tracing::warn!(
+        evicted = dropped.id,
+        from = %dropped.from.fmt_short(),
+        "pending file-offer queue full; evicted oldest offer"
+    );
+    Some(dropped.id)
+}
+
+/// How long an open pairing session stays open.
+///
+/// Nothing else closes it. A wrong secret deliberately does not (that was the bug
+/// this replaced: any dialer could end the user's pairing window), a successful
+/// pair does, and there is no cancel command, so without a deadline `ray pair` on
+/// a machine that was then interrupted would leave a standing "sign a DeviceCert
+/// for whoever presents these 32 bytes" on a public ALPN until the daemon
+/// restarted. The ticket is a QR code people screenshot and paste, so the
+/// credential outliving its session by days is the worse failure of the two.
+///
+/// Five minutes is the scan-it-now window the ticket is for.
+pub(crate) const PAIRING_TTL: Duration = Duration::from_secs(300);
+
+/// Whether two pairing secrets match, in time independent of *where* they differ.
+///
+/// Hand-rolled rather than a `subtle` dependency for one call site. The
+/// accumulate-then-compare shape is what keeps it branch-free: every byte is read
+/// on every call, and `black_box` stops the optimizer from noticing it could stop
+/// once `diff` is nonzero.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    black_box(diff) == 0
+}
+
+/// Outcome of checking a presented pairing secret. Separate from the stored value
+/// so the lock is dropped before the (slow) success path runs.
+enum PairCheck {
+    Accepted,
+    Mismatch,
+    NoSession,
+}
+
 pub(crate) struct FileService {
     /// Received file offers awaiting `ray files accept`.
-    pub(crate) pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
+    pub(crate) pending_files: Arc<Mutex<Vec<PendingFile>>>,
     /// Monotonic id source for pending offers.
     pub(crate) file_id_counter: Arc<AtomicU64>,
-    /// Active pairing secret (set by `start_pairing`, consumed by a pair request).
-    pub(crate) pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    /// Active pairing secret and when it was opened (set by `start_pairing`,
+    /// consumed by a matching pair request, and expired by [`PAIRING_TTL`]).
+    pub(crate) pairing_secret: Arc<Mutex<Option<PairingSession>>>,
     /// This node's transport secret key, used to sign device certs on pairing.
     secret_key: SecretKey,
     /// Foundation handles (endpoint + blob store) for fetching accepted files.
@@ -153,7 +224,7 @@ pub(crate) struct FileService {
     /// Outbound sends awaiting delivery (peer offline, or the offer dial
     /// failed). Flushed on every peer-connected event and by a slow sweep.
     /// Ids come from `file_id_counter`, shared with inbound pending offers.
-    outbox: Arc<std::sync::Mutex<Vec<OutboxEntry>>>,
+    outbox: Arc<Mutex<Vec<OutboxEntry>>>,
     /// Peers with a flush in flight, so a burst of connect events (or the
     /// sweep racing a connect) can't deliver the same offer twice.
     flushing: Arc<DashSet<EndpointId>>,
@@ -183,16 +254,16 @@ impl FileService {
             );
         }
         Self {
-            pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_files: Arc::new(Mutex::new(Vec::new())),
             file_id_counter: Arc::new(ids),
-            pairing_secret: Arc::new(std::sync::Mutex::new(None)),
+            pairing_secret: Arc::new(Mutex::new(None)),
             secret_key,
             transport,
             registry,
             device_cert,
             device_user_map,
             transfers,
-            outbox: Arc::new(std::sync::Mutex::new(queued)),
+            outbox: Arc::new(Mutex::new(queued)),
             flushing: Arc::new(DashSet::new()),
         }
     }
@@ -216,14 +287,18 @@ impl FileService {
                         if from == remote_id {
                             let id = counter.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
-                            pending.lock().unwrap().push(PendingFile {
-                                id,
-                                from,
-                                filename,
-                                size,
-                                mime_type,
-                                blob_hash,
-                            });
+                            {
+                                let mut queue = pending.lock().unwrap();
+                                evict_oldest_file(&mut queue, MAX_PENDING_FILES);
+                                queue.push(PendingFile {
+                                    id,
+                                    from,
+                                    filename,
+                                    size,
+                                    mime_type,
+                                    blob_hash,
+                                });
+                            }
                             // Evaluate own-device auto-accept directly: it accepts
                             // only offers from our own paired devices on an opted-in
                             // network, and no-ops otherwise, so the offer stays
@@ -890,50 +965,20 @@ impl FileService {
         }
     }
 
-    /// Toggle this node's per-network auto-accept of file offers from our own
-    /// paired devices (persisted in config). Turning it on also drains any
-    /// already-queued offers that now qualify.
-    pub(crate) async fn files_auto_accept(
-        self: &Arc<Self>,
-        network: &str,
-        enabled: bool,
-    ) -> IpcMessage {
-        if !self.registry.contains(network) {
-            return ipc_err(format!("network '{network}' not found"));
-        }
-        match config::load_network(network) {
-            Ok(Some(mut nc)) => {
-                nc.auto_accept_files = enabled;
-                if let Err(e) = config::save_network(&nc) {
-                    return ipc_err(format!("failed to persist auto-accept setting: {e}"));
-                }
-            }
-            Ok(None) => {
-                return ipc_err(format!("network '{network}' not found in config"));
-            }
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        }
-        // On enable, sweep any already-queued offers so a file that arrived
-        // before the toggle still lands.
-        if enabled {
-            let ids: Vec<u64> = self
-                .pending_files
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|f| f.id)
-                .collect();
-            for id in ids {
-                self.try_auto_accept_file(id).await;
-            }
-        }
-        IpcMessage::Ok {
-            message: format!(
-                "auto-accept files from your own devices {} for '{network}'",
-                if enabled { "enabled" } else { "disabled" }
-            ),
+    /// Sweep the queued file offers, accepting any that now qualify. Called
+    /// after `net.auto-accept-files` is turned on so a file that arrived before
+    /// the toggle still lands, instead of sitting in the queue until the sender
+    /// retries.
+    pub(crate) async fn drain_auto_acceptable(self: &Arc<Self>) {
+        let ids: Vec<u64> = self
+            .pending_files
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        for id in ids {
+            self.try_auto_accept_file(id).await;
         }
     }
 
@@ -956,7 +1001,10 @@ impl FileService {
         ticket_bytes.extend_from_slice(&secret);
         let ticket = bs58::encode(&ticket_bytes).into_string();
 
-        *self.pairing_secret.lock().unwrap() = Some(secret);
+        *self.pairing_secret.lock().unwrap() = Some(PairingSession {
+            secret,
+            opened: Instant::now(),
+        });
 
         tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
         IpcMessage::PairingTicket { ticket }
@@ -984,10 +1032,52 @@ impl FileService {
                         secret,
                         device_pubkey,
                     } => {
-                        // Verify the secret matches the stored pairing secret
-                        let stored = pairing_secret.lock().unwrap().take();
-                        match stored {
-                            Some(expected) if expected == secret => {
+                        // Certify the key that actually dialed us. The client
+                        // always sends its own endpoint id here (`mesh/files.rs`),
+                        // so requiring it costs nothing and removes the question
+                        // of what a cert for a third key would mean if a ticket
+                        // were ever relayed.
+                        if device_pubkey != remote_id {
+                            tracing::warn!(
+                                claimed = %device_pubkey.fmt_short(),
+                                actual = %remote_id.fmt_short(),
+                                "pair request asks to certify a different key; refusing"
+                            );
+                            return;
+                        }
+                        // Compare against the stored pairing secret and consume
+                        // it only on a match, both under one lock. Taking it
+                        // first meant any dialer that sent the wrong bytes (or
+                        // garbage) closed the user's pairing window from across
+                        // the internet: the ticket names our endpoint and nothing
+                        // else gates this ALPN.
+                        //
+                        // Leaving the secret in place on a mismatch is what makes
+                        // the comparison's timing matter, so it is constant-time.
+                        // A wrong guess no longer ends the session, so guesses are
+                        // now unlimited for as long as the window is open, and an
+                        // early-exiting `==` over 32 bytes would answer how much
+                        // of the prefix was right.
+                        let check = {
+                            let mut held = pairing_secret.lock().unwrap();
+                            match held.as_ref() {
+                                // Expired: clear it on the way past, so the state
+                                // does not outlive the window the user opened.
+                                Some(s) if s.opened.elapsed() >= PAIRING_TTL => {
+                                    held.take();
+                                    PairCheck::NoSession
+                                }
+                                Some(s) if ct_eq(&s.secret, &secret) => {
+                                    held.take();
+                                    PairCheck::Accepted
+                                }
+                                // Keep the window open for the real device.
+                                Some(_) => PairCheck::Mismatch,
+                                None => PairCheck::NoSession,
+                            }
+                        };
+                        match check {
+                            PairCheck::Accepted => {
                                 // Sign the device's public key
                                 // Share our saved networks so the new device can auto-join them. Only
                                 // networks with a known public key (skips freshly created, unsynced ones).
@@ -1036,10 +1126,10 @@ impl FileService {
                                     .await;
                                 tracing::info!(device = %device_pubkey.fmt_short(), "device paired successfully");
                             }
-                            Some(_) => {
+                            PairCheck::Mismatch => {
                                 tracing::warn!(peer = %remote_id.fmt_short(), "pairing secret mismatch");
                             }
-                            None => {
+                            PairCheck::NoSession => {
                                 tracing::warn!(peer = %remote_id.fmt_short(), "no pairing session active");
                             }
                         }
@@ -1059,6 +1149,8 @@ impl FileService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh_blobs::Hash;
+    use std::time::Instant;
 
     /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`
     /// must survive a JSON round trip (the file is reloaded across daemon
@@ -1118,9 +1210,32 @@ mod tests {
             .unwrap()
     }
 
-    /// Long enough for several sweeps at the interval above.
-    async fn let_gc_run() {
-        tokio::time::sleep(Duration::from_millis(600)).await;
+    /// An untagged blob, there to be collected. Its disappearance is the only
+    /// sound signal that a sweep ran to completion, so every assertion below
+    /// waits on one instead of on the clock.
+    async fn canary(store: &FsStore, dir: &std::path::Path, name: &str) -> Hash {
+        let path = dir.join(name);
+        // Past the 16 KiB inline threshold, so this is a real on-disk blob.
+        std::fs::write(&path, vec![3u8; 64 * 1024]).unwrap();
+        let temp = store.blobs().add_path(&path).temp_tag().await.unwrap();
+        temp.hash()
+    }
+
+    /// Wait for a sweep to collect `hash`. A fixed sleep here is a deadline the
+    /// test loses whenever the runner is slow enough: the sweep is a background
+    /// task on a 100ms timer, and on a loaded two-core CI box it does not always
+    /// land inside the budget a fast laptop never misses. Poll for the effect,
+    /// and keep the timeout far above any real sweep so a failure means gc is
+    /// broken rather than busy.
+    async fn collected(store: &FsStore, hash: Hash, what: &str) {
+        let start = Instant::now();
+        while store.blobs().has(hash).await.unwrap() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "gc never collected {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// The invariant the whole reclaim design rests on: a tagged blob survives
@@ -1147,18 +1262,17 @@ mod tests {
             .unwrap();
         drop(temp);
 
-        let_gc_run().await;
+        // Added after the tag, so the sweep that takes it is one that already
+        // saw the tag: surviving that sweep is the thing being asserted.
+        let canary = canary(&store, tmp.path(), "canary.bin").await;
+        collected(&store, canary, "the untagged canary").await;
         assert!(
             store.blobs().has(hash).await.unwrap(),
             "a tagged blob must survive gc"
         );
 
         store.tags().delete(&tag).await.unwrap();
-        let_gc_run().await;
-        assert!(
-            !store.blobs().has(hash).await.unwrap(),
-            "an untagged blob must be collected"
-        );
+        collected(&store, hash, "the blob whose tag was deleted").await;
     }
 
     /// `accept_file` tags the blob *before* fetching it, so for a moment the tag
@@ -1193,22 +1307,32 @@ mod tests {
         // An untagged blob, purely so the assertions below can tell "gc ran and
         // behaved" apart from "gc never ran". Without it every assertion here
         // would also hold if the sweep had silently aborted.
-        let junk = tmp.path().join("junk.bin");
-        std::fs::write(&junk, vec![3u8; 64 * 1024]).unwrap();
-        let junk_hash = {
-            let t = store.blobs().add_path(&junk).temp_tag().await.unwrap();
-            t.hash()
-        };
+        let junk_hash = canary(&store, tmp.path(), "junk.bin").await;
 
-        let_gc_run().await;
-        assert!(
-            !store.blobs().has(junk_hash).await.unwrap(),
-            "gc did not run, so this test proves nothing"
-        );
+        collected(&store, junk_hash, "the untagged canary").await;
         assert!(
             store.blobs().has(present).await.unwrap(),
             "gc must still protect tagged blobs despite a dangling tag"
         );
         assert!(!store.blobs().has(absent).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod pairing_secret_tests {
+    use super::ct_eq;
+
+    /// The comparison has to be exact wherever the difference falls, since the
+    /// whole point of the constant-time form is that it does not stop early.
+    #[test]
+    fn ct_eq_matches_equality() {
+        let a = [7u8; 32];
+        assert!(ct_eq(&a, &a));
+        for pos in [0usize, 15, 31] {
+            let mut b = a;
+            b[pos] ^= 1;
+            assert!(!ct_eq(&a, &b), "must differ at byte {pos}");
+        }
+        assert!(!ct_eq(&a, &[0u8; 32]));
     }
 }

@@ -64,7 +64,9 @@ mod android_jni {
 use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[cfg(target_os = "android")]
 use android_tun::{AndroidTunReader, AndroidTunWriter};
@@ -80,8 +82,21 @@ use rayfish::invite;
 use rayfish::ipc::{self, IpcMessage};
 use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
+use tokio::time::timeout;
 
 uniffi::setup_scaffolding!();
+
+/// How long [`Node::stop`] waits for the daemon to close before giving up. Long
+/// enough for QUIC connections to terminate cleanly and the blob store to flush,
+/// short enough that a caller on an Android main/binder thread is never held for
+/// what the system would count as an ANR.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`Node::start`] waits for the daemon to build. Generous, because a
+/// cold start does disk and network work (identity, endpoint bind, relay probe)
+/// on a phone that may be on a bad link; this is a backstop against a build that
+/// never returns at all, not a latency budget.
+const START_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Structured error surfaced across the FFI boundary.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -115,7 +130,6 @@ impl RayError {
 pub struct NetworkInfo {
     pub name: String,
     pub node_id: String,
-    pub ipv4: String,
     pub ipv6: String,
     /// True when the join was queued for coordinator approval (no IP yet).
     pub pending: bool,
@@ -145,7 +159,9 @@ impl From<ipc::PeerState> for PeerConnState {
 /// One peer in a network snapshot.
 #[derive(uniffi::Record)]
 pub struct PeerInfo {
-    pub ipv4: String,
+    /// The peer's mesh IPv6, derived from its identity. The only address it has:
+    /// the overlay carries no IPv4.
+    pub ipv6: String,
     pub node_id: String,
     pub hostname: String,
     pub state: PeerConnState,
@@ -155,7 +171,6 @@ pub struct PeerInfo {
 #[derive(uniffi::Record)]
 pub struct NetworkDetail {
     pub name: String,
-    pub ipv4: String,
     pub ipv6: String,
     pub hostname: String,
     pub is_coordinator: bool,
@@ -167,7 +182,6 @@ pub struct NetworkDetail {
 pub struct Status {
     pub running: bool,
     pub node_id: String,
-    pub ipv4: String,
     pub ipv6: String,
     pub peers: Vec<PeerInfo>,
     pub networks: Vec<NetworkDetail>,
@@ -191,7 +205,7 @@ pub struct HealthSnapshot {
     pub networks: Vec<NetworkHealth>,
     pub mesh_up: bool,
     pub node_id: String,
-    pub mesh_ipv4: String,
+    pub mesh_ipv6: String,
     pub warn_count: u64,
     pub error_count: u64,
     pub recent_errors: Vec<String>,
@@ -324,8 +338,8 @@ fn saved_networks_status() -> Status {
     let empty = Status {
         running: false,
         node_id: String::new(),
-        ipv4: String::new(),
         ipv6: String::new(),
+        // A stopped node has no data plane, so it is in no mode at all.
         peers: Vec::new(),
         networks: Vec::new(),
         pending_networks: Vec::new(),
@@ -336,39 +350,27 @@ fn saved_networks_status() -> Status {
     // Derive this device's stable identity-based fields off disk. Without a
     // persisted identity there are no saved networks to show either, so fall
     // back to the empty snapshot.
-    let (node_id, device_ipv4, device_ipv6) = match identity::load_or_create() {
+    let (node_id, device_ipv6) = match identity::load_or_create() {
         Ok(secret) => {
             let id = secret.public();
-            // Prefer the assigned per-network IPv4 (it accounts for any
-            // collision-avoidance offset); otherwise use the base derived
-            // address. IPv6 is always derived from the identity.
-            let ipv4 = cfg
-                .networks
-                .iter()
-                .find_map(|n| n.my_ip)
-                .unwrap_or_else(|| membership::derive_ip(&id));
-            (
-                id.to_string(),
-                ipv4.to_string(),
-                membership::derive_ipv6(&id).to_string(),
-            )
+            (id.to_string(), membership::derive_ipv6(&id).to_string())
         }
         Err(_) => return empty,
     };
     // Same stable alphabetical order as the live snapshot below.
     let mut sorted = cfg.networks.clone();
-    sorted.sort_by_key(|a| a.name.to_lowercase());
+    sorted.sort_by_key(|n| n.name.to_lowercase());
     let networks = sorted
         .iter()
         .map(|net| {
-            // Exclude our own roster entry (matched by our IP) so the peer list
-            // mirrors the live snapshot, which lists only the other members.
+            // Exclude our own roster entry so the peer list mirrors the live
+            // snapshot, which lists only the other members.
             let peers = net
                 .members
                 .iter()
-                .filter(|m| Some(m.ip) != net.my_ip)
+                .filter(|m| m.identity.to_string() != node_id)
                 .map(|m| PeerInfo {
-                    ipv4: m.ip.to_string(),
+                    ipv6: membership::derive_ipv6(&m.identity).to_string(),
                     node_id: m.identity.to_string(),
                     hostname: m.hostname.clone().unwrap_or_default(),
                     state: PeerConnState::Offline,
@@ -376,8 +378,7 @@ fn saved_networks_status() -> Status {
                 .collect();
             NetworkDetail {
                 name: net.name.clone(),
-                ipv4: net.my_ip.map(|ip| ip.to_string()).unwrap_or_default(),
-                ipv6: String::new(),
+                ipv6: device_ipv6.clone(),
                 hostname: net.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: net.network_secret_key.is_some(),
                 peers,
@@ -386,7 +387,6 @@ fn saved_networks_status() -> Status {
         .collect();
     Status {
         node_id,
-        ipv4: device_ipv4,
         ipv6: device_ipv6,
         networks,
         ..empty
@@ -396,16 +396,18 @@ fn saved_networks_status() -> Status {
 #[uniffi::export]
 impl Node {
     /// `config_dir` is the app-private directory (Kotlin `Context.getFilesDir()`)
-    /// where identity + config live. It is exported to the core through
-    /// `RAYFISH_CONFIG_DIR`, which `config::config_dir()` honors on Android.
+    /// where identity + config live. It is published to the core through
+    /// `config::set_config_dir_override`, which `config::config_dir()` honors
+    /// ahead of `RAYFISH_CONFIG_DIR` on every platform.
     #[uniffi::constructor]
     pub fn new(config_dir: String) -> Arc<Self> {
         // Capture the core's tracing output for Android diagnostics. Idempotent;
         // safe to call once per process (Node is a process singleton).
         diag::install();
-        // SAFETY-ish: set before any core call reads config. Single-threaded at
-        // construction time.
-        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", &config_dir) };
+        // Set before any core call reads config. Not an environment write: that
+        // is undefined behaviour once the runtime's threads are up, and it also
+        // let one test redirect another's config reads mid-test.
+        config::set_config_dir_override(PathBuf::from(&config_dir));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -419,22 +421,50 @@ impl Node {
     /// Build the headless daemon (identity, endpoint, blob store, resolver) and
     /// bring the saved networks' control plane up. Idempotent: a second call is a
     /// no-op success. Must run before `join`/`create`/`pair`/`up`.
+    ///
     pub fn start(&self) -> Result<(), RayError> {
         // Fast path: already started. Check briefly, then release the lock.
         if self.state.lock().unwrap().is_some() {
             return Ok(());
         }
 
+        // Bounded, because the one way this call can fail to return is fatal to
+        // the app: opening the blob store takes redb's exclusive lock on
+        // `blobs.db`, and a second open does not fail, it waits. So a rebuild
+        // that overlaps a store the previous daemon has not released yet would
+        // block here forever, on a thread that holds NodeHolder's monitor, and
+        // every later start/stop/up would queue behind it (the reported "the
+        // phone never came back online"). Failing is recoverable; wedging is not.
         let state = self
             .runtime
-            .block_on(build_headless(true))
+            .block_on(async { timeout(START_TIMEOUT, build_headless(true)).await })
+            .map_err(|_| {
+                tracing::error!(
+                    timeout_secs = START_TIMEOUT.as_secs(),
+                    "Node.start: building the daemon timed out"
+                );
+                RayError::Network("node start timed out".to_string())
+            })?
             .map_err(RayError::network)?;
 
         // Commit under the lock, re-checking for a racing `start` that won while
-        // we were building. If one did, keep the winner and drop ours.
-        let mut guard = self.state.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(state);
+        // we were building. If one did, keep the winner and shut ours down: a
+        // plain drop would leave a second endpoint live and, worse, a second
+        // blob store holding the exclusive redb lock on `blobs.db`, which no
+        // later `start` in this process could then reopen.
+        let loser = {
+            let mut guard = self.state.lock().unwrap();
+            match guard.is_none() {
+                true => {
+                    *guard = Some(state);
+                    None
+                }
+                false => Some(state),
+            }
+        };
+        if let Some(loser) = loser {
+            tracing::warn!("Node.start: a concurrent start won; shutting the extra daemon down");
+            self.runtime.block_on(loser.shutdown_and_close());
         }
         Ok(())
     }
@@ -463,15 +493,10 @@ impl Node {
         ));
 
         match result {
-            IpcMessage::Joined {
-                name,
-                my_ip,
-                my_ipv6,
-            } => Ok(NetworkInfo {
+            IpcMessage::Joined { name, my_ipv6 } => Ok(NetworkInfo {
                 name,
                 node_id: Self::node_id(&state),
-                ipv4: my_ip.to_string(),
-                ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                ipv6: my_ipv6.to_string(),
                 pending: false,
             }),
             // Closed network without a valid invite: queued for coordinator approval
@@ -479,7 +504,6 @@ impl Node {
             IpcMessage::Ok { .. } => Ok(NetworkInfo {
                 name: network_key,
                 node_id: Self::node_id(&state),
-                ipv4: String::new(),
                 ipv6: String::new(),
                 pending: true,
             }),
@@ -502,16 +526,10 @@ impl Node {
             .block_on(state.create_network(GroupMode::default(), name, None));
 
         match result {
-            IpcMessage::Created {
-                name,
-                my_ip,
-                my_ipv6,
-                ..
-            } => Ok(NetworkInfo {
+            IpcMessage::Created { name, my_ipv6, .. } => Ok(NetworkInfo {
                 name,
                 node_id: Self::node_id(&state),
-                ipv4: my_ip.to_string(),
-                ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                ipv6: my_ipv6.to_string(),
                 pending: false,
             }),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
@@ -582,9 +600,11 @@ impl Node {
                 "invalid hostname '{name}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
             )));
         }
-        let mut cfg = config::load().map_err(RayError::network)?;
-        cfg.default_hostname = Some(name);
-        config::save_settings(&cfg).map_err(RayError::network)?;
+        config::update_settings(|cfg| {
+            cfg.default_hostname = Some(name);
+            Ok(())
+        })
+        .map_err(RayError::network)?;
         Ok(())
     }
 
@@ -682,7 +702,7 @@ impl Node {
 
     /// Send a file to a peer. `path` is a readable file path (the core reads its
     /// bytes and adds them to the blob store); `peer` is any identifier the core
-    /// resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+    /// resolves: a hostname, mesh address, short id, or full endpoint id.
     /// Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
     /// (or auto-accepts if it is one of the sender's own paired devices). Needs
     /// only the control plane ([`Node::start`]), not the tunnel, but the peer must
@@ -1102,12 +1122,30 @@ impl Node {
         if let Some(state) = state {
             // Tear the data plane down first: abort the TUN writer + mesh tasks so
             // both dups of the Android VPN fd close and the interface comes down.
-            // `shutdown_and_close` only cancels the token + closes the endpoint;
-            // the writer never observes the token, so without this the fd would
+            // `shutdown_and_close` cancels the token, shuts the router down and
+            // closes the endpoint, but never touches the TUN tasks; the writer
+            // does not observe the token either, so without this the fd would
             // leak and the tunnel would linger after disable.
             state.detach_tun();
-            self.runtime.block_on(state.shutdown_and_close());
-            tracing::info!("Node.stop: data plane detached and endpoint closed");
+            // Bounded: this runs on an Android main/binder thread by way of
+            // NodeHolder.stopNode, so a wedged protocol handler or store actor
+            // must not hang the app. Giving up here can leave the blob store's
+            // redb lock held, in which case the next start() waits out its own
+            // timeout and reports a failure. A recoverable failure beats a frozen
+            // UI.
+            let closed = self.runtime.block_on(async {
+                timeout(SHUTDOWN_TIMEOUT, state.shutdown_and_close())
+                    .await
+                    .is_ok()
+            });
+            if closed {
+                tracing::info!("Node.stop: data plane detached and endpoint closed");
+            } else {
+                tracing::error!(
+                    timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+                    "Node.stop: shutdown timed out; the node may not restart until the app is restarted"
+                );
+            }
         } else {
             tracing::info!("Node.stop: no live state (already stopped)");
         }
@@ -1119,7 +1157,6 @@ impl Node {
         let empty = || Status {
             running: false,
             node_id: String::new(),
-            ipv4: String::new(),
             ipv6: String::new(),
             peers: Vec::new(),
             networks: Vec::new(),
@@ -1151,22 +1188,21 @@ impl Node {
                 .peers
                 .iter()
                 .map(|p| PeerInfo {
-                    ipv4: p.ip.to_string(),
+                    ipv6: rayfish::membership::derive_ipv6(&p.endpoint_id).to_string(),
                     node_id: p.endpoint_id.to_string(),
                     hostname: p.hostname.clone().unwrap_or_default(),
                     state: p.state.into(),
                 })
                 .collect();
             flat_peers.extend(peers.iter().map(|p| PeerInfo {
-                ipv4: p.ipv4.clone(),
+                ipv6: p.ipv6.clone(),
                 node_id: p.node_id.clone(),
                 hostname: p.hostname.clone(),
                 state: p.state,
             }));
             detail.push(NetworkDetail {
                 name: n.name.clone(),
-                ipv4: n.my_ip.to_string(),
-                ipv6: n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                ipv6: n.my_ipv6.to_string(),
                 hostname: n.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: n.role.is_coordinator(),
                 peers,
@@ -1174,31 +1210,14 @@ impl Node {
         }
         // Present networks in a stable alphabetical order so the UI list does
         // not shuffle between status refreshes with the core's iteration order.
-        detail.sort_by_key(|a| a.name.to_lowercase());
-        // The node's own mesh IPs are the same across networks (derived
-        // from its identity); take them from the first network if any. With no
-        // networks yet, derive the IPv4 from our identity so the tunnel still
-        // gets our real mesh address (the same value every network would use)
-        // instead of a placeholder.
-        let (ipv4, ipv6) = networks
-            .first()
-            .map(|n| {
-                (
-                    n.my_ip.to_string(),
-                    n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    rayfish::membership::derive_ip(&endpoint_id).to_string(),
-                    rayfish::membership::derive_ipv6(&endpoint_id).to_string(),
-                )
-            });
+        detail.sort_by_key(|n| n.name.to_lowercase());
+        // The node's own mesh address derives from its identity, so it needs no
+        // joined network to be known. It is what the tunnel binds.
+        let ipv6 = rayfish::membership::derive_ipv6(&endpoint_id).to_string();
 
         Status {
             running: active,
             node_id: endpoint_id.to_string(),
-            ipv4,
             ipv6,
             peers: flat_peers,
             networks: detail,
@@ -1231,7 +1250,7 @@ impl Node {
             networks,
             mesh_up: peers_online > 0,
             node_id: s.node_id.chars().take(10).collect(),
-            mesh_ipv4: s.ipv4.clone(),
+            mesh_ipv6: s.ipv6.clone(),
             warn_count: diag::warn_count(),
             error_count: diag::error_count(),
             recent_errors: diag::recent_errors(),
@@ -1273,16 +1292,27 @@ impl Node {
     }
 }
 
-// Node::new mutates the process-wide config-dir environment variable. Keep all
-// host-side Node coverage in one test so parallel Rust test workers cannot race
-// two different values through the core.
-#[cfg(all(test, not(target_os = "android")))]
-mod host_surface_tests {
+/// Process-wide lock serializing tests that construct a [`Node`], since
+/// `Node::new` points the process-wide config override at its argument and lib
+/// tests share one process across parallel threads. Without it a second
+/// `Node::new` redirects config reads out from under a test that is midway
+/// through writing and reading its own config dir, and the write lands in one
+/// directory while the read comes back empty from another.
+#[cfg(test)]
+static CONFIG_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod device_name_tests {
     use super::*;
 
     #[test]
-    fn host_node_surface_uses_one_config_dir() {
-        let dir = std::env::temp_dir().join(format!("rayfish-host-surface-{}", std::process::id()));
+    fn set_default_hostname_persists_and_rejects_invalid() {
+        // Serialize against the other test that builds a Node, so its config
+        // directory cannot bleed into the reads below.
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Isolated config dir; Node::new points the config override at it.
+        let dir = std::env::temp_dir().join(format!("rayfish-dn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let node = Node::new(dir.to_string_lossy().to_string());
@@ -1357,6 +1387,10 @@ mod tun_fd_ownership_tests {
     /// connected VPN while the app believes the tunnel is off (issue #116).
     #[test]
     fn up_closes_the_detached_fd_when_the_node_is_not_started() {
+        // Held for the whole test: Node::new below moves the config override,
+        // which another test's config reads would otherwise pick up.
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = std::env::temp_dir().join(format!("rayfish-updfd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

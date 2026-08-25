@@ -1,6 +1,6 @@
 [package]
 name = "rayfish"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
@@ -61,13 +61,18 @@ otel = [
 ]
 
 [dependencies]
-ray-proto = { path = "ray-proto", version = "0.1.9" }
+ray-proto = { path = "ray-proto", version = "0.1.10" }
 anyhow = "1"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+# `unstable-ext` is what `#[arg(add = ...)]` goes through, and is how the
+# completers in src/cli/complete.rs get attached to the arguments they answer for.
+clap = { version = "4.6.6", features = ["derive", "unstable-ext", "wrap_help"] }
 ahash = "0.8"
-clap_complete = "4"
+# `unstable-dynamic` moves completion from a generated script to the binary
+# itself, which is the only way a tab can list the networks and peers you have
+# right now rather than the ones that existed when the script was written.
+clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 # Token-bucket rate limiter guarding inbound control streams against floods
 # (src/ratelimit.rs). One per control-listener task; no shared state.
 ratelimit = "0.10"
@@ -81,6 +86,10 @@ iroh-dns = "1"
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
 iroh-mdns-address-lookup = "0.4"
 humansize = "2"
+# `ray logs`: parses `--since 2h30m`, and renders the cutoff in the exact
+# fixed-width RFC3339 the log appender writes, so a line can be compared
+# against it as a string.
+humantime = "2"
 unicode-width = "0.2"
 indicatif = "0.18"
 crossterm = "0.29"

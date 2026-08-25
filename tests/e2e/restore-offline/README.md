@@ -2,7 +2,7 @@
 
 End-to-end regression test for the bug where a member whose daemon restarts while
 its coordinator is offline silently drops the network from its running state.
-Runs over two real Scaleway hosts; shared plumbing lives in `tests/lib/`.
+Runs over two real cloud hosts; shared plumbing lives in `tests/lib/`.
 
 Background: PR #60 / issue #59.
 
@@ -52,9 +52,9 @@ binary it passes end to end.
 ## Usage
 
 ```bash
-# Requires: scw (authenticated), jq, just, cross + docker, an SSH key.
+# Requires: doctl (authenticated), jq, just, cross + docker, an SSH key.
 tests/e2e.sh restore-offline             # provision (if needed), cross-build, deploy, drive, assert
-tests/e2e.sh restore-offline provision   # create the two Scaleway instances only
+tests/e2e.sh restore-offline provision   # create the two droplets only
 tests/e2e.sh restore-offline teardown    # destroy them
 ```
 

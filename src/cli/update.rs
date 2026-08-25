@@ -6,7 +6,9 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -479,7 +481,6 @@ pub(crate) fn print_daemon_log_tail() {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn run_cmd(program: &str, args: &[&str]) {
     match Command::new(program).args(args).status() {
         Ok(status) if status.success() => {}
@@ -488,8 +489,10 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) {
     }
 }
 
-/// Run a command, ignoring its exit status (used for best-effort teardown).
-#[allow(dead_code)]
+/// Run a command, ignoring its exit status and output. For the launchd teardown
+/// in `install_and_start_service`, where unloading a job that was never loaded
+/// is both expected and noisy. macOS-only, as its one caller is.
+#[cfg(target_os = "macos")]
 pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
     let _ = Command::new(program)
         .args(args)
@@ -499,6 +502,11 @@ pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
 }
 
 pub(crate) fn cmd_uninstall_service() -> Result<()> {
+    // Take the completion stubs with it: `ray up` installed them, so an
+    // uninstall that left them behind would leave three files pointing at a
+    // binary that may be going away too.
+    complete::uninstall_system();
+
     #[cfg(target_os = "linux")]
     {
         // Tear down whatever init the unit was installed under, not just the

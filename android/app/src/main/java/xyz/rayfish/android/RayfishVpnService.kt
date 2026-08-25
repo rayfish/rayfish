@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.system.OsConstants
 import android.os.Build
 import android.os.ParcelFileDescriptor
 // Drop-in for android.util.Log: still prints to logcat (debug and release) and
@@ -19,6 +20,7 @@ import android.os.ParcelFileDescriptor
 // when the user has crash reporting opted out (Sentry stays uninitialized).
 import io.sentry.android.core.SentryLogcatAdapter as Log
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -134,7 +136,16 @@ class RayfishVpnService : VpnService() {
                 // stopTunnel and therefore sees the settled value, and corrects
                 // the notification if needed.
                 Log.i(TAG, "ACTION_STANDBY received")
-                startForegroundNotification(standby = tunnel == null)
+                // Sent with startForegroundService from a visible Activity, so
+                // the exemption is normally held and this succeeds. If it is
+                // refused anyway, stop rather than leave the service owing a
+                // foreground start it can never make (which the system answers
+                // with a ForegroundServiceDidNotStartInTimeException kill).
+                if (!startForegroundNotification(standby = tunnel == null)) {
+                    Log.w(TAG, "ACTION_STANDBY refused a foreground start; stopping (startId=$startId)")
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
                 nodeExecutor.execute {
                     // See the ACTION_STOP execute() block for why this must never
                     // let a throwable escape.
@@ -204,6 +215,73 @@ class RayfishVpnService : VpnService() {
                 // would not restart the service to serve that tunnel.
                 return START_STICKY
             }
+            ACTION_RESTART_NODE -> {
+                // A start-time setting changed. The daemon reads those once, when
+                // it is built, so the only way to apply one is to build a new
+                // daemon: stop the node and start it again. No sender today (the
+                // IPv6-only toggle this was built for is gone with the setting);
+                // kept because the next start-time setting will want it.
+                //
+                // The tunnel has to go with it. Its addressing is decided from the
+                // same setting (see startTunnelBlocking), and Node.stop() drops the
+                // forward loop that owns the fd anyway, so a surviving interface
+                // would be one Android still routes packets into with nothing on
+                // the other end.
+                //
+                // Everything runs on nodeExecutor, which is what makes "was a
+                // tunnel up?" answerable at all: `tunnel` is written only there, so
+                // a main-thread read would be stale for the whole duration of an
+                // in-flight bring-up or teardown. Serializing here also means this
+                // rebuild cannot interleave with one.
+                Log.i(TAG, "ACTION_RESTART_NODE received")
+                // Posted here to meet the foreground-service deadline, from a
+                // guess: the executor task settles the real text below.
+                if (!startForegroundNotification(standby = tunnel == null)) {
+                    Log.w(TAG, "ACTION_RESTART_NODE refused a foreground start; stopping (startId=$startId)")
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
+                nodeExecutor.execute {
+                    // See the ACTION_STOP execute() block for why this must never
+                    // let a throwable escape.
+                    try {
+                        val hadTunnel = tunnel != null
+                        // standby = false: a full stopNode, not a Node.down. The
+                        // point is to discard the daemon and build a new one, and
+                        // down() keeps the old one, mode and all.
+                        stopTunnel(standby = false)
+                        if (hadTunnel) {
+                            // Back to where the user left it. The ensureStarted
+                            // inside reads the new setting and builds the new
+                            // daemon, and the tunnel is built to match it.
+                            startTunnelBlocking(startId)
+                            if (tunnel != null) {
+                                // Correct the guess above if it read a stale null
+                                // (a teardown was still in flight when it ran).
+                                // Only upward: a rebuild that failed has already
+                                // posted its own text through handleBringUpFailure,
+                                // or stopped the service outright, and a service on
+                                // its way out must not be handed a new foreground
+                                // notification.
+                                startForegroundNotification(standby = false)
+                            }
+                        } else if (NodeHolder.isGoOfflineWhenDisabled(applicationContext)) {
+                            // No tunnel and the user asked for offline-when-off:
+                            // stopTunnel above already left the node exactly there.
+                            Log.i(TAG, "ACTION_RESTART_NODE: staying offline; calling stopSelf(startId=$startId)")
+                            stopSelf(startId)
+                        } else {
+                            // Standby, the default: the control plane comes back up
+                            // in the new mode with no tunnel.
+                            enterStandbyBlocking()
+                            startForegroundNotification(standby = true)
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "ACTION_RESTART_NODE task crashed", t)
+                    }
+                }
+                return START_STICKY
+            }
             // An action-less start intent is the normal "turn the VPN on" path
             // (see HomeScreen / RayfishApp, which both start the service with a
             // plain Intent). It must reach startTunnel(), not be mistaken for
@@ -216,7 +294,17 @@ class RayfishVpnService : VpnService() {
     private fun startTunnel(startId: Int) {
         // startForeground must be called promptly so the foreground-service
         // deadline is met; only the blocking node work goes to the executor.
-        startForegroundNotification()
+        //
+        // A refusal here is the null-intent restart path again (the Activity
+        // paths hold the exemption): we would be building a TUN for a service
+        // the OS is about to kill. Stop instead. stopSelf(startId), not the bare
+        // form, for the same reason as the ACTION_STOP path above: a newer start
+        // command that already landed must survive this one.
+        if (!startForegroundNotification()) {
+            Log.w(TAG, "tunnel bring-up refused a foreground start; stopping (startId=$startId)")
+            stopSelf(startId)
+            return
+        }
         nodeExecutor.execute {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape: an uncaught one here kills the process outright.
@@ -247,24 +335,29 @@ class RayfishVpnService : VpnService() {
         }
 
         // The mesh IP is a different matter: the node is up, so a status() that
-        // fails or has no address yet (no networks joined) is not fatal. Fall
-        // back to the CGNAT base below so the tunnel still establishes.
-        val (meshIp, meshV6) = try {
-            runBlocking {
-                val snapshot = NodeHolder.get(applicationContext).status()
-                snapshot.ipv4 to snapshot.ipv6
-            }
+        // fails or has no address yet (no networks joined) is not fatal on its
+        // own; the blank check below is what refuses.
+        val meshV6 = try {
+            runBlocking { NodeHolder.get(applicationContext).status().ipv6 }
         } catch (t: Throwable) {
             Log.e(TAG, "could not read mesh IP before tunnel build", t)
-            "" to ""
+            ""
         }
-        // Fall back to the CGNAT base if we have no networks yet, so the tunnel
-        // still establishes.
-        val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
+        if (meshV6.isBlank()) {
+            // Nothing to carry traffic: the mesh address is what the route and
+            // the resolver both hang off. Establishing anyway is the "connected
+            // VPN that moves no packets" failure this path exists to avoid.
+            Log.e(TAG, "no mesh IPv6 address; not building a tunnel")
+            handleBringUpFailure("no mesh IPv6 address for the tunnel", startId)
+            return
+        }
+        // Magic DNS lives at 200::53, already covered by the 200::/7 route below,
+        // so it needs no route of its own.
+        val magicDns = "200::53"
 
         // Point the resolver at the phone's real DNS before the tunnel captures
-        // all DNS on 100.100.100.53. Without this, non-.ray lookups are refused
-        // and public browsing breaks while the VPN is up.
+        // all DNS on the magic address. Without this, non-.ray lookups are
+        // refused and public browsing breaks while the VPN is up.
         //
         // Prefer a loopback DnsResolver.rawQuery proxy: it forwards through the
         // platform resolver, so it honors the device's Private DNS (DoT/DoH)
@@ -302,18 +395,50 @@ class RayfishVpnService : VpnService() {
         val pfd = try {
             val builder = Builder()
                 .setSession("Rayfish")
-                .addAddress(tunnelAddr, 32)
-                .addRoute("100.64.0.0", 10)
-                .addDnsServer("100.100.100.53")
+                .addDnsServer(magicDns)
                 .addSearchDomain("ray")
                 .setMtu(1280)
+                // Our mesh address and the range it lives in (mirrors the desktop
+                // 200::/7 route). The blank check above guarantees we have one.
+                .addAddress(meshV6, 128)
+                .addRoute("200::", 7)
 
-            // Route the mesh IPv6 range through the tunnel (mirrors the desktop
-            // 200::/7 route). Skipped if we have no v6 address to bind.
-            if (meshV6.isNotBlank()) {
-                builder.addAddress(meshV6, 128)
-                builder.addRoute("200::", 7)
+            // **Load-bearing on an IPv4-only network.** Chromium and bionic both
+            // gate AAAA lookups on an IPv6 reachability probe: a UDP connect() to
+            // a fixed global address, which needs a route but sends no packet.
+            // With only 200::/7 routed and no IPv6 underneath, that probe fails,
+            // Chrome drops AAAA from the query set entirely
+            // (host_resolver_manager.cc, `effective_types.Remove(DnsQueryType::AAAA)`)
+            // and asks for A alone. The overlay is IPv6-only, so every .ray name
+            // then resolves to nothing and the browser shows NXDOMAIN while the
+            // very same name resolves fine for any app that asks for AAAA.
+            // Routing the probe targets makes the probe succeed. Real IPv6
+            // destinations are deliberately left unrouted, so they keep failing
+            // instantly with ENETUNREACH from the kernel rather than blackholing
+            // in the tunnel, which is what keeps happy-eyeballs fallback prompt.
+            // Skipped when the underlay has real IPv6: the probe succeeds on its
+            // own there, and we must not sit on Google Public DNS's address for a
+            // host that can genuinely reach it.
+            if (!underlayHasGlobalIpv6()) {
+                for (probe in IPV6_PROBE_ADDRS) {
+                    try {
+                        builder.addRoute(probe, 128)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "could not add IPv6 probe route $probe", t)
+                    }
+                }
+                Log.i(TAG, "no IPv6 on the underlay; routed AAAA probe targets $IPV6_PROBE_ADDRS")
             }
+
+            // **Load-bearing.** VpnService blocks a whole address family outright
+            // when the Builder names no address, route or DNS server of it, and
+            // this tunnel names none for IPv4: the mesh has no IPv4 address, the
+            // 100.64.0.0/10 route is gone, and Magic DNS is 200::53. Without this
+            // line every app on the device loses IPv4 internet the moment the VPN
+            // comes up, while the mesh itself keeps working perfectly, so nothing
+            // in a mesh test would catch it. We route no IPv4; we are not asking
+            // to block it.
+            builder.allowFamily(OsConstants.AF_INET)
             // Exclude Rayfish itself from its own tunnel. Its sockets (the iroh
             // mesh underlay, the DnsResolver.rawQuery proxy) then use the real
             // underlying network directly, so DNS forwarding can't loop back
@@ -379,7 +504,9 @@ class RayfishVpnService : VpnService() {
         try {
             NodeHolder.get(applicationContext).up(pfd.detachFd())
             Log.i(TAG, "Node.up succeeded")
+            tunnelUp = true
             startAutoAcceptPoller()
+            rebindAfterBringUp()
         } catch (t: Throwable) {
             Log.e(TAG, "Node bring-up failed", t)
             // up() threw after detachFd() handed the fd to Rust, so this
@@ -390,6 +517,29 @@ class RayfishVpnService : VpnService() {
             // helper instead of a divergent one that leaves dnsProxy orphaned and
             // the notification claiming a tunnel that isn't there.
             handleBringUpFailure("Node.up() threw", startId)
+        }
+    }
+
+    /**
+     * Rebind the endpoint whenever Rayfish is turned on, tunnel or standby.
+     *
+     * Turning it off and on is what a user does when peers look disconnected,
+     * and until now that gesture could not possibly help: the toggle only
+     * detaches and reattaches the TUN (`Node.down` / `Node.up`), leaving the
+     * endpoint and every peer connection exactly as they were, dead sockets
+     * included. The network callback normally covers a move, but it only sees
+     * what the system reports, and a change it missed (or one that happened
+     * while the node was stopped) is precisely the case where the user reaches
+     * for the toggle. Idempotent and cheap, so an unnecessary one costs nothing.
+     *
+     * Called at the end of bring-up, not the start: the FFI call runs inline on
+     * nodeExecutor's thread, and nothing about coming up should wait on it.
+     */
+    private fun rebindAfterBringUp() {
+        try {
+            NodeHolder.get(applicationContext).networkChanged()
+        } catch (t: Throwable) {
+            Log.w(TAG, "rebind after bring-up failed", t)
         }
     }
 
@@ -427,6 +577,7 @@ class RayfishVpnService : VpnService() {
      */
     private fun handleBringUpFailure(reason: String, startId: Int) {
         tunnel = null
+        tunnelUp = false
         try {
             dnsProxy?.stop()
         } catch (t: Throwable) {
@@ -473,7 +624,20 @@ class RayfishVpnService : VpnService() {
      * so the node keeps serving files and stays visible in the mesh.
      */
     private fun enterStandby() {
-        startForegroundNotification(standby = true)
+        if (!startForegroundNotification(standby = true)) {
+            // Reached from the null-intent restart, so the app is in the
+            // background and the system refused the foreground start (see
+            // startForegroundNotification). Standby exists to keep the node
+            // alive, and a node with no foreground service is exactly the
+            // process Android kills, so there is nothing to keep alive here:
+            // stop instead of bringing a control plane up that cannot survive.
+            // The user gets standby back the next time they open the app or
+            // enable the VPN, both of which start us from the foreground.
+            // onDestroy queues the full teardown, so nothing is left running.
+            Log.w(TAG, "standby refused a foreground start; stopping instead of running unprotected")
+            stopSelf()
+            return
+        }
         nodeExecutor.execute {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape.
@@ -499,6 +663,7 @@ class RayfishVpnService : VpnService() {
         try {
             runBlocking { NodeHolder.ensureStarted(applicationContext) }
             Log.i(TAG, "standby: control plane up, no tunnel")
+            rebindAfterBringUp()
         } catch (t: Throwable) {
             Log.e(TAG, "standby bring-up failed", t)
         }
@@ -543,9 +708,11 @@ class RayfishVpnService : VpnService() {
 
     /**
      * Auto-accept own-device file offers, so a file shared to this device from one
-     * of the user's own devices lands in Downloads without the app being open, and
+     * of the user's own devices lands in Downloads without the app being open,
      * drive [TransferNotifier] so a transfer that completes while the app is closed
-     * still gets its progress/result notification. Runs in standby too: that is what
+     * still gets its progress/result notification, and drive [OfferNotifier] so a
+     * file sent by anyone else is announced instead of waiting silently for the
+     * next time the app happens to be opened. Runs in standby too: that is what
      * makes files keep working with the VPN off. Auto-accept is gated by the user's
      * opt-out toggle inside FileAutoAccept.run. Idempotent.
      */
@@ -556,6 +723,7 @@ class RayfishVpnService : VpnService() {
                 {
                     runCatching { FileAutoAccept.run(applicationContext) }
                     runCatching { TransferNotifier.poll(applicationContext) }
+                    runCatching { OfferNotifier.poll(applicationContext) }
                 },
                 4, 4, TimeUnit.SECONDS,
             )
@@ -564,8 +732,8 @@ class RayfishVpnService : VpnService() {
 
     // The IPv4 DNS servers of the underlying (non-VPN) network, deduplicated.
     // Enumerating all networks and skipping the VPN transport avoids reading our
-    // own tunnel's DNS (100.100.100.53) back, which would loop. IPv6-only
-    // resolvers are skipped: the mesh resolver forwards over IPv4.
+    // own tunnel's DNS (200::53) back, which would loop. IPv6-only resolvers are skipped: the mesh resolver forwards
+    // over IPv4, on the app's own sockets, which are outside the tunnel.
     private fun systemDnsServers(): List<String> {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
         val servers = mutableListOf<String>()
@@ -581,6 +749,42 @@ class RayfishVpnService : VpnService() {
             }
         }
         return servers
+    }
+
+    // Whether the underlying (non-VPN) network can actually carry global IPv6:
+    // a global unicast address to source from *and* a default route to send on.
+    // Both are required, which is exactly what a connect() to a global address
+    // needs, and neither alone implies the other (an address with no default
+    // route is a LAN-only prefix; a default route with no global address cannot
+    // be sourced). Same enumerate-and-skip-VPN shape as [systemDnsServers]: our
+    // own tunnel always has a 200::/7 address and would otherwise read as IPv6.
+    private fun underlayHasGlobalIpv6(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            val props = cm.getLinkProperties(network) ?: continue
+            val hasGlobalAddr = props.linkAddresses.any { la ->
+                val a = la.address
+                a is Inet6Address &&
+                    !a.isLinkLocalAddress && !a.isLoopbackAddress &&
+                    !a.isAnyLocalAddress && !a.isMulticastAddress &&
+                    !a.isSiteLocalAddress &&
+                    // Unique local (fc00::/7). Java has no predicate for it and
+                    // isSiteLocalAddress only covers the deprecated fec0::/10, so
+                    // a ULA would otherwise read as global. NAT66 is rare enough
+                    // that a ULA is no evidence of IPv6 internet, and guessing
+                    // "no IPv6" merely adds the probe routes, which is the
+                    // recoverable side of this call.
+                    (a.address[0].toInt() and 0xFE) != 0xFC
+            }
+            if (!hasGlobalAddr) continue
+            if (props.routes.any { it.isDefaultRoute && it.destination.address is Inet6Address }) {
+                return true
+            }
+        }
+        return false
     }
 
     /**
@@ -641,6 +845,7 @@ class RayfishVpnService : VpnService() {
             Log.w(TAG, "closing tunnel fd failed", t)
         }
         tunnel = null
+        tunnelUp = false
 
         // The DNS proxy exists to serve the tunnel's resolver; with no tunnel there
         // is nothing pointed at it. Torn down in both cases. Wrapped: this runs on
@@ -684,6 +889,10 @@ class RayfishVpnService : VpnService() {
         // poller is still alive, and once onDestroy has been called nothing here
         // is going to observe a transfer completing any more.
         isRunning = false
+        // Same reasoning for the tile's state: the service is going away, so the
+        // tunnel is going with it. Set here rather than left to the queued
+        // teardown below, which can sit behind a whole bring-up before it runs.
+        tunnelUp = false
         nodeExecutor.execute {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape.
@@ -704,16 +913,40 @@ class RayfishVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startForegroundNotification(standby: Boolean = false) {
+    /**
+     * Post (or update) the ongoing notification and put the service in the
+     * foreground. Returns false if the system refused the foreground start, in
+     * which case the caller must not assume the service can keep running.
+     *
+     * The refusal is real and was crashing the app: on the null-intent
+     * START_STICKY restart path the system recreates this service with the app in
+     * the background, and a background foreground-service start needs an
+     * exemption. `specialUse` (our type, see the manifest) has none. A VpnService
+     * does get one while a tunnel is established, but the standby path is
+     * precisely the case where there is no tunnel, so the start is denied and
+     * `startForeground` throws [android.app.ForegroundServiceStartNotAllowedException]
+     * on the main thread, killing the process.
+     *
+     * Caught as Throwable, not that one class: it only exists on API 31+, and the
+     * same call can also throw SecurityException (missing FGS-type permission)
+     * and InvalidForegroundServiceTypeException. None of them is worth a crash.
+     *
+     * Only the three call sites that are genuine foreground *starts* act on the
+     * result (startTunnel, enterStandby, ACTION_STANDBY). The rest just update
+     * the text of a notification this service already posted (the ACTION_STOP and
+     * onRevoke standby switches, handleBringUpFailure, the ACTION_STANDBY
+     * correction): an already-foreground service is not subject to the
+     * background-start check, so they ignore the result and let the log stand as
+     * the record if it ever does fail.
+     */
+    private fun startForegroundNotification(standby: Boolean = false): Boolean {
         val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Rayfish VPN",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply { description = "Rayfish mesh tunnel status" }
-            nm.createNotificationChannel(channel)
-        }
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Rayfish VPN",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply { description = "Rayfish mesh tunnel status" }
+        nm.createNotificationChannel(channel)
 
         val openIntent = PendingIntent.getActivity(
             this,
@@ -754,10 +987,16 @@ class RayfishVpnService : VpnService() {
 
         val notification: Notification = builder.build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIF_ID, notification)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "startForeground refused (standby=$standby); service cannot stay in the foreground", t)
+            false
         }
     }
 
@@ -792,9 +1031,25 @@ class RayfishVpnService : VpnService() {
         var isRunning: Boolean = false
             private set
 
+        // Whether a tunnel is actually established right now. Written only where
+        // the tunnel field itself is (bring-up success, every teardown and
+        // bring-up failure, onDestroy), so it says what [isRunning] cannot: the
+        // service is equally alive in standby, and NodeHolder.isEnabled is the
+        // user's intent, which stays true when a bring-up fails because another
+        // VPN app holds the slot. [TunnelTileService] reads this to decide what
+        // the quick settings tile shows and what a tap should do, on the main
+        // thread, so it must stay a plain volatile read and never an FFI call.
+        @Volatile
+        var tunnelUp: Boolean = false
+            private set
+
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
         const val ACTION_STANDBY = "xyz.rayfish.android.STANDBY"
         const val ACTION_EXIT_STANDBY = "xyz.rayfish.android.EXIT_STANDBY"
+
+        // Rebuild the node so it picks up a start-time setting the user just
+        // changed. Nothing sends this today; see the handler.
+        const val ACTION_RESTART_NODE = "xyz.rayfish.android.RESTART_NODE"
 
         // Apps that misbehave behind a VPN (casting, RCS, local-device discovery).
         // Mirrors Tailscale's default Android exclusions. Excluded so they never
@@ -805,6 +1060,16 @@ class RayfishVpnService : VpnService() {
             "com.google.android.apps.messaging",      // RCS / Jibe messaging
             "com.gopro.smarty",                       // GoPro
             "com.sonos.acr", "com.sonos.acr2",        // Sonos
+        )
+
+        // Fixed addresses the two IPv6 reachability probes on this platform aim
+        // at. Neither is ever a real destination for us: 2000:: is the reserved
+        // subnet-router anycast of 2000::/3, and while 2001:4860:4860::8888 is a
+        // live Google Public DNS resolver, we only claim it on a host with no
+        // IPv6 at all, which by definition cannot reach it. See the call site.
+        private val IPV6_PROBE_ADDRS = listOf(
+            "2001:4860:4860::8888", // Chromium, net/dns/host_resolver_manager.cc
+            "2000::",               // bionic / DnsResolver, have_ipv6()
         )
     }
 }

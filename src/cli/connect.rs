@@ -14,24 +14,24 @@ pub(crate) async fn ipc_connect(contact_id: &str, hostname: Option<String>) -> R
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Joined { name, my_ip, .. } => {
+        ipc::IpcMessage::Joined { name, my_ipv6, .. } => {
             println!(
                 "  {} connected — direct network {} ({})",
                 style::green("✓"),
                 style::value(&name),
-                style::faint(&my_ip.to_string()),
+                style::faint(&my_ipv6.to_string()),
             );
         }
-        ipc::IpcMessage::Error { message } => print_error("connect failed", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("connect failed", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
 
-pub(crate) async fn ipc_connections(action: Option<ConnectionsAction>) -> Result<()> {
-    match action.unwrap_or(ConnectionsAction::List) {
-        ConnectionsAction::List => ipc_connections_list().await,
-        ConnectionsAction::Approve { id } => ipc_connections_approve(&id).await,
+pub(crate) async fn ipc_connections(action: Option<ConnectAction>) -> Result<()> {
+    match action.unwrap_or(ConnectAction::List) {
+        ConnectAction::List => ipc_connections_list().await,
+        ConnectAction::Approve { id } => ipc_connections_approve(&id).await,
     }
 }
 
@@ -66,12 +66,12 @@ pub(crate) async fn ipc_connections_list() -> Result<()> {
                 print!("{}", table(&["id", "host", "waiting"], rows, 2));
                 println!(
                     "\n  {}",
-                    style::faint("approve with: ray connections approve <id>")
+                    style::faint("approve with: ray connect approve <id>")
                 );
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -85,8 +85,84 @@ pub(crate) async fn ipc_connections_approve(id: &str) -> Result<()> {
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
+    }
+    Ok(())
+}
+
+/// `ray mdns scan`: the rayfish nodes mDNS has seen on this LAN.
+pub(crate) async fn ipc_lan_peers() -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::ListLanPeers).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::LanPeersList {
+            peers,
+            mdns_enabled,
+        } => {
+            if json_enabled() {
+                print_json(&serde_json::json!({
+                    "mdns_enabled": mdns_enabled,
+                    "peers": peers
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "endpoint_id": p.endpoint_id.to_string(),
+                            "short_id": p.short_id,
+                            "addrs": p.addrs,
+                            "last_seen_secs": p.last_seen_secs,
+                            "shared_network": p.shared_network,
+                        }))
+                        .collect::<Vec<_>>(),
+                }));
+            } else if !mdns_enabled {
+                println!(
+                    "\n  {}\n",
+                    style::faint("mDNS discovery is off — turn it on with: ray mdns on")
+                );
+            } else if peers.is_empty() {
+                println!(
+                    "\n  {}\n",
+                    style::faint("no rayfish nodes seen on this LAN")
+                );
+            } else {
+                let rows = peers
+                    .iter()
+                    .map(|p| {
+                        let addrs = if p.addrs.is_empty() {
+                            "—".to_string()
+                        } else {
+                            p.addrs.join(", ")
+                        };
+                        let seen = format!("{}s", p.last_seen_secs);
+                        let status = match &p.shared_network {
+                            Some(net) => format!("shared: {net}"),
+                            None => "not connected".to_string(),
+                        };
+                        let status_cell = match &p.shared_network {
+                            Some(_) => style::green(&status),
+                            None => style::faint(&status),
+                        };
+                        vec![
+                            layout::Cell::new(p.short_id.clone(), style::rose(&p.short_id)),
+                            layout::Cell::new(addrs.clone(), style::value(&addrs)),
+                            layout::Cell::right(seen.clone(), style::faint(&seen)),
+                            layout::Cell::new(status, status_cell),
+                        ]
+                    })
+                    .collect();
+                println!();
+                print!(
+                    "{}",
+                    table(&["peer", "addresses", "seen", "status"], rows, 2)
+                );
+                println!(
+                    "\n  {}",
+                    style::faint("link up with: ray connect <peer> (they approve it)")
+                );
+            }
+        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -114,8 +190,8 @@ pub(crate) async fn ipc_contact(action: Option<ContactAction>) -> Result<()> {
                 );
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -208,8 +284,8 @@ pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()
                 );
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -280,8 +356,8 @@ pub(crate) async fn ipc_netcheck() -> Result<()> {
                 public_ipv6.map(|s| style::value(&s)).unwrap_or_else(na)
             );
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -329,8 +405,8 @@ pub(crate) async fn ipc_admin(network: &str, action: AdminAction) -> Result<()> 
                 println!();
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

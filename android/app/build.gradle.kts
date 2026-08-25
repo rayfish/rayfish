@@ -37,6 +37,35 @@ val rayVersionCode: Int = run {
     parts[0].toInt() * 10000 + parts[1].toInt() * 100 + parts[2].toInt()
 }
 
+// The commit this APK was built from, used as the Sentry `dist`. Sentry groups
+// events by release + dist; without this, dist defaults to versionCode, so every
+// build of a given version is indistinguishable in the dashboard. That is not
+// hypothetical: crashes fixed weeks earlier kept arriving from testers on stale
+// APKs with no way to tell them apart from a regression.
+//
+// Suffixed with "-dirty" for a build off an uncommitted tree, since the SHA
+// alone would then name a commit whose code is not what shipped. Falls back to
+// "unknown" outside a git checkout (a source tarball, say) rather than failing
+// the build: an unidentified build is bad, an unbuildable one is worse.
+fun git(vararg args: String): String? = runCatching {
+    val out = providers.exec {
+        workingDir = rootProject.projectDir
+        commandLine("git", *args)
+        // Report the failure through exitValue below instead of throwing, so a
+        // checkout with no git available degrades to "unknown" rather than
+        // taking the build down with it.
+        isIgnoreExitValue = true
+    }
+    if (out.result.get().exitValue != 0) return@runCatching null
+    out.standardOutput.asText.get().trim()
+}.getOrNull()
+
+val rayGitSha: String = run {
+    val sha = git("rev-parse", "--short", "HEAD") ?: return@run "unknown"
+    val dirty = git("status", "--porcelain")?.isNotEmpty() ?: false
+    if (dirty) "$sha-dirty" else sha
+}
+
 android {
     namespace = "xyz.rayfish.android"
     compileSdk = 36
@@ -44,7 +73,13 @@ android {
 
     defaultConfig {
         applicationId = "xyz.rayfish.android"
-        minSdk = 24
+        // 26 (Android 8.0), not lower. Every notification this app posts goes
+        // through `Notification.Builder(Context, channelId)` and a
+        // NotificationChannel, both of which are API 26: on 24/25 the builder
+        // threw NoSuchMethodError at runtime, which the surrounding runCatching
+        // swallowed, so incoming files were announced by nothing at all. The
+        // pre-O branches that were meant to cover it could not.
+        minSdk = 26
         targetSdk = 35
         versionCode = rayVersionCode
         versionName = rayVersion
@@ -68,6 +103,10 @@ android {
             "SENTRY_DSN",
             "\"https://3ace3eb4551a022cfd59fabe5b9f9c7e@o4511671603625984.ingest.de.sentry.io/4511671605198928\"",
         )
+
+        // Build provenance for telemetry: see rayGitSha above. Read by Telemetry
+        // and set as the Sentry `dist`.
+        buildConfigField("String", "GIT_SHA", "\"$rayGitSha\"")
     }
 
     signingConfigs {

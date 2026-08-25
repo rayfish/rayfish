@@ -9,14 +9,23 @@
 //! are kept private (`mod`, not `pub mod`) so only their *contents* are
 //! re-exported, avoiding a name clash with the `use rayfish::{firewall, …}`
 //! aliases in the crate root.
+//!
+//! `complete` is the one exception: its contents are generic names (`networks`,
+//! `peers`, `aliases`) that would collide the moment they were flattened, and
+//! the clap attributes in `main.rs` read better qualified anyway
+//! (`#[arg(add = complete::networks())]`), so the module itself is what's
+//! exported.
 
 mod alias;
+pub(crate) mod complete;
 mod connect;
 mod exit_node;
 mod files;
 mod firewall;
 mod gui;
+pub(crate) mod help;
 mod invite;
+mod logs;
 mod network;
 mod open;
 mod pair;
@@ -31,9 +40,30 @@ pub(crate) use files::*;
 pub(crate) use firewall::*;
 pub(crate) use gui::*;
 pub(crate) use invite::*;
+pub(crate) use logs::*;
 pub(crate) use network::*;
 pub(crate) use open::*;
 pub(crate) use pair::*;
 pub(crate) use service::*;
 pub(crate) use status::*;
 pub(crate) use update::*;
+
+/// Validate an `on|off` argument client-side, before the daemon is dialled.
+///
+/// The daemon parses the word again through the settings registry, which is the
+/// authority; this pre-check exists for two reasons the registry cannot serve.
+/// The `ray firewall` / `ray files` handlers print a daemon error and still
+/// return `Ok(())`, so a typo caught only server-side would exit 0 instead of 1.
+/// And the wording here is the one those commands have always printed, which
+/// differs from the registry's.
+///
+/// Deliberately stricter than `settings::parse_bool` (no `1`/`0`/`true`-only
+/// spellings beyond the originals): matching the old behaviour exactly means
+/// rejecting exactly what it rejected.
+pub(crate) fn parse_on_off(state: &str) -> anyhow::Result<bool> {
+    match state.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" => Ok(true),
+        "off" | "false" | "no" => Ok(false),
+        other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
+    }
+}

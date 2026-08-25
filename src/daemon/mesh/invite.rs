@@ -314,29 +314,20 @@ impl NetworkRegistry {
         };
 
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
-        let (ip, net_pubkey) = {
+        let net_pubkey = {
             let Some(handle) = self.networks.get(network) else {
                 return ipc_err(format!("network '{network}' not active"));
             };
             let net_pubkey = handle.network_key;
             let mut s = handle.state.write().unwrap();
-            // Assign authoritatively from the current roster so two coordinators
-            // accepting concurrently can be reconciled by the reconverge tiebreak.
-            let (ip, collision_index) = crate::membership::assign_ip(&s.members, &identity);
-            let members = s.members.clone();
-            let _ = s.approved.approve(
-                ApprovedEntry {
-                    identity,
-                    ip,
-                    hostname: pj.hostname.clone(),
-                    user_identity: user_id,
-                    device_cert: pj.device_cert.clone(),
-                    collision_index,
-                },
-                &members,
-            );
+            s.approved.approve(ApprovedEntry {
+                identity,
+                hostname: pj.hostname.clone(),
+                user_identity: user_id,
+                device_cert: pj.device_cert.clone(),
+            });
             s.refresh_snapshot();
-            (ip, net_pubkey)
+            net_pubkey
         };
         self.store_and_publish_group(network).await;
         broadcast_control_msg(
@@ -345,7 +336,6 @@ impl NetworkRegistry {
             network,
             &ControlMsg::MemberApproved {
                 identity,
-                ip,
                 hostname: pj.hostname.clone(),
                 device_cert: pj.device_cert.clone(),
             },

@@ -9,7 +9,17 @@
 
 use super::*;
 
-/// A pending incoming `ray connect` request, awaiting `ray connections approve`.
+/// Cap on the queue of unapproved incoming `ray connect` requests.
+///
+/// The dial that fills it is unauthenticated (a stranger needs only our contact
+/// id) and every entry is keyed by an endpoint id the requester generates, so
+/// without a bound the map is memory anyone can allocate on this daemon. Same
+/// policy and same size as [`MAX_PENDING_JOINS`](super::mesh::accept::MAX_PENDING_JOINS):
+/// at the cap the oldest unanswered request makes way, on the grounds that a
+/// request nobody approved in that long is the one least likely to be waited on.
+pub(crate) const MAX_PENDING_CONNECTS: usize = 256;
+
+/// A pending incoming `ray connect` request, awaiting `ray connect approve`.
 /// Keyed by the requester's transport endpoint id (not contact id) so it
 /// survives the requester rotating their contact key.
 #[derive(Clone)]
@@ -20,13 +30,40 @@ pub(crate) struct PendingConnect {
     pub(crate) requested_at: Instant,
 }
 
+/// Make room for a connect request from `incoming`: at the cap, drop the oldest
+/// queued request and return its id. A no-op (returns `None`) when `incoming` is
+/// already queued (a re-dial must not cost anyone their slot) or there is spare
+/// capacity. Mirrors `mesh::accept::evict_oldest_pending`, over a `DashMap`.
+///
+/// The oldest id is bound before the removal so no map reference is alive across
+/// it: `DashMap` is sharded and holding one while mutating can deadlock.
+pub(crate) fn evict_oldest_connect(
+    pending: &DashMap<EndpointId, PendingConnect>,
+    incoming: EndpointId,
+    cap: usize,
+) -> Option<EndpointId> {
+    if pending.contains_key(&incoming) || pending.len() < cap {
+        return None;
+    }
+    let oldest = pending
+        .iter()
+        .min_by_key(|e| e.value().requested_at)
+        .map(|e| *e.key())?;
+    pending.remove(&oldest);
+    tracing::warn!(
+        evicted = %oldest.fmt_short(),
+        "pending connect-request queue full; evicted oldest request"
+    );
+    Some(oldest)
+}
+
 pub(crate) struct ConnectService {
     /// `ray connect` requests received on `CONNECT_ALPN`, awaiting approval.
     /// Keyed by the requester's transport endpoint id.
     pub(crate) pending_connects: Arc<DashMap<EndpointId, PendingConnect>>,
     /// Approved connect requests: requester endpoint id → (room id, coordinator).
     /// The `CONNECT_ALPN` handler replies `Approved` from here when the requester
-    /// re-dials after `ray connections approve`.
+    /// re-dials after `ray connect approve`.
     pub(crate) approved_connects: Arc<DashMap<EndpointId, (EndpointId, EndpointId)>>,
     /// Peer endpoints we have sent an outgoing `ray connect` request to. Used by
     /// the concurrency tie-break: if both peers requested *and* approved each
@@ -57,6 +94,34 @@ impl ConnectService {
             active,
             registry,
         }
+    }
+
+    /// Turn a `ray connect` argument into the peer endpoint to dial.
+    ///
+    /// A LAN sighting wins over the DHT: if the argument names a neighbour from
+    /// `ray mdns scan` we already know where that peer is, so there is nothing
+    /// to look up. Otherwise the argument is a contact id and resolves through
+    /// pkarr as before. Contact ids and transport endpoint ids are distinct
+    /// keys, so the two cases cannot collide.
+    ///
+    /// The error is the message, not a whole `IpcMessage`: every failure here is
+    /// an `ipc_err`, and the one caller is what turns it into a reply.
+    async fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, String> {
+        let me = self.transport.endpoint.id();
+        if let Some(peer) = self.transport.lan_peers.resolve(arg, me) {
+            return Ok(peer);
+        }
+        let contact_pubkey = arg
+            .parse::<EndpointId>()
+            .map_err(|e| format!("invalid contact id: {e}"))?;
+        if contact_pubkey == self.transport.contact_public {
+            return Err("cannot connect to your own contact id".to_string());
+        }
+        let pkarr = dht::create_pkarr_client(&self.transport.endpoint)
+            .map_err(|e| format!("failed to create pkarr client: {e}"))?;
+        dht::resolve_contact(&pkarr, contact_pubkey)
+            .await
+            .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
     }
 
     /// Approve a pending `ray connect` request by contact-id prefix: mint a
@@ -103,10 +168,13 @@ impl ConnectService {
 
         // Decide our own hostname once so the network name (`<me>-<peer>`) and our
         // member hostname on it agree, instead of generating two different names.
-        let my_host = config::load()
-            .ok()
-            .and_then(|c| c.default_hostname)
-            .unwrap_or_else(crate::hostname::generate_hostname);
+        // The peer's name is the whole roster of a 2-peer network, so it is
+        // also the only thing our default can collide with, and it will when
+        // both ends are called `laptop`.
+        let my_host = crate::hostname::default_hostname(
+            config::load().ok().and_then(|c| c.default_hostname),
+            req.hostname.as_deref().as_slice(),
+        );
         let name = self
             .registry
             .direct_network_name(&my_host, req.hostname.as_deref());
@@ -139,33 +207,18 @@ impl ConnectService {
     /// `ray connect <contact-id>`: resolve the contact to an endpoint, dial it
     /// over CONNECT_ALPN, and send a request. If approved immediately we join the
     /// minted direct network; if pending we retry on a backoff.
+    ///
+    /// The argument may also be the endpoint id of a neighbour from `ray mdns
+    /// scan`; that path skips the pkarr lookup entirely, so it works on a LAN
+    /// with no internet. Approval is still recipient-only either way.
     pub(crate) async fn connect(
         self: &Arc<Self>,
         contact_id: &str,
         hostname: Option<String>,
     ) -> IpcMessage {
-        let contact_pubkey = match contact_id.parse::<EndpointId>() {
-            Ok(id) => id,
-            Err(e) => {
-                return ipc_err(format!("invalid contact id: {e}"));
-            }
-        };
-        if contact_pubkey == self.transport.contact_public {
-            return ipc_err("cannot connect to your own contact id".to_string());
-        }
-        let pkarr = match dht::create_pkarr_client(&self.transport.endpoint) {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to create pkarr client: {e}"));
-            }
-        };
-        let peer = match dht::resolve_contact(&pkarr, contact_pubkey).await {
-            Ok(id) => id,
-            Err(_) => {
-                return ipc_err(
-                    "contact offline or unknown (could not resolve contact id)".to_string(),
-                );
-            }
+        let peer = match self.resolve_connect_target(contact_id).await {
+            Ok(peer) => peer,
+            Err(message) => return ipc_err(message),
         };
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
             return IpcMessage::Ok {
@@ -245,11 +298,11 @@ impl ConnectService {
                 false,
             )
             .await;
-        if let IpcMessage::Joined { name, .. } = &resp
-            && let Ok(Some(mut n)) = config::load_network(name)
-        {
-            n.direct = true;
-            let _ = config::save_network(&n);
+        if let IpcMessage::Joined { name, .. } = &resp {
+            let _ = config::update_network(name, |net| {
+                net.direct = true;
+                Ok(())
+            });
         }
         resp
     }
@@ -343,16 +396,16 @@ impl ConnectService {
     /// Rotate this node's contact key and, if the data plane is active, republish
     /// the contact record immediately so the new id resolves.
     pub(crate) async fn rotate_contact(&self) -> IpcMessage {
-        let mut cfg = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        };
-        let secret = config::rotate_contact_secret(&mut cfg);
-        if let Err(e) = config::save_settings(&cfg) {
+        let mut rotated = None;
+        if let Err(e) = config::update_settings(|cfg| {
+            rotated = Some(config::rotate_contact_secret(cfg));
+            Ok(())
+        }) {
             return ipc_err(format!("failed to save config: {e}"));
         }
+        let Some(secret) = rotated else {
+            return ipc_err("contact key rotation did not run".to_string());
+        };
         if self.active.load(Ordering::SeqCst)
             && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
         {
@@ -365,7 +418,7 @@ impl ConnectService {
 
     /// `CONNECT_ALPN`: handle a `ray connect` friend request. Binds the request
     /// to the dialing identity, replies `Approved` if already accepted
-    /// (idempotent), else queues it as `Pending` for `ray connections approve`.
+    /// (idempotent), else queues it as `Pending` for `ray connect approve`.
     pub(crate) async fn accept_connect_request(&self, conn: Connection) {
         let pending = self.pending_connects.clone();
         let approved = self.approved_connects.clone();
@@ -407,6 +460,7 @@ impl ConnectService {
                             coordinator,
                         }
                     } else {
+                        evict_oldest_connect(&pending, from_endpoint, MAX_PENDING_CONNECTS);
                         pending.insert(
                             from_endpoint,
                             PendingConnect {
@@ -432,5 +486,68 @@ impl ConnectService {
                 tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for connect");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_connect_cap_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn queued_at(id: EndpointId, t: Instant) -> PendingConnect {
+        PendingConnect {
+            from_contact_id: id,
+            from_endpoint: id,
+            hostname: None,
+            requested_at: t,
+        }
+    }
+
+    #[test]
+    fn no_eviction_below_cap() {
+        let pending = DashMap::new();
+        pending.insert(eid(1), queued_at(eid(1), Instant::now()));
+        assert_eq!(evict_oldest_connect(&pending, eid(2), 4), None);
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// The regression. `CONNECT_ALPN` takes a request from anyone holding our
+    /// contact id, keyed by an endpoint id the requester mints, so an unbounded
+    /// queue was memory a stranger could allocate here without limit.
+    #[test]
+    fn full_queue_evicts_the_oldest() {
+        let base = Instant::now();
+        let pending = DashMap::new();
+        for s in 0..4u8 {
+            pending.insert(
+                eid(s),
+                queued_at(eid(s), base + Duration::from_millis(s as u64)),
+            );
+        }
+        assert_eq!(evict_oldest_connect(&pending, eid(99), 4), Some(eid(0)));
+        assert_eq!(pending.len(), 3);
+        assert!(!pending.contains_key(&eid(0)));
+    }
+
+    /// A requester re-dialing (the `Pending` reply tells it to) must not cost
+    /// anyone else their slot, or a patient peer could be starved by a polite one.
+    #[test]
+    fn re_dial_from_a_queued_peer_evicts_nobody() {
+        let base = Instant::now();
+        let pending = DashMap::new();
+        for s in 0..4u8 {
+            pending.insert(
+                eid(s),
+                queued_at(eid(s), base + Duration::from_millis(s as u64)),
+            );
+        }
+        assert_eq!(evict_oldest_connect(&pending, eid(1), 4), None);
+        assert_eq!(pending.len(), 4);
     }
 }

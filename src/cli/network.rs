@@ -1,6 +1,7 @@
 //! CLI handlers for network lifecycle: create / join / nuke / leave.
 
 use crate::*;
+use ipc::NetworkKey;
 
 pub(crate) async fn ipc_create(
     mode: GroupMode,
@@ -29,7 +30,6 @@ pub(crate) async fn ipc_create(
         ipc::IpcMessage::Created {
             name,
             network_key,
-            my_ip,
             my_ipv6,
         } => {
             let key_str = network_key.to_string();
@@ -38,7 +38,6 @@ pub(crate) async fn ipc_create(
             } else {
                 key_str.clone()
             };
-            let _ = my_ipv6;
             println!();
             println!(
                 "  {} {} {}",
@@ -49,7 +48,7 @@ pub(crate) async fn ipc_create(
             println!(
                 "    {}   {}   {}  {}",
                 style::label("address"),
-                style::value(&my_ip.to_string()),
+                style::value(&my_ipv6.to_string()),
                 style::faint("·"),
                 style::rose(&short),
             );
@@ -60,8 +59,8 @@ pub(crate) async fn ipc_create(
             ]);
             println!();
         }
-        ipc::IpcMessage::Error { message } => print_error("create failed", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("create failed", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -110,12 +109,7 @@ pub(crate) async fn ipc_join(
         ipc::IpcMessage::Ok { message } => {
             println!("{}", message);
         }
-        ipc::IpcMessage::Joined {
-            name,
-            my_ip,
-            my_ipv6,
-        } => {
-            let _ = my_ipv6;
+        ipc::IpcMessage::Joined { name, my_ipv6 } => {
             let dns = format!("{name}.{DNS_DOMAIN}");
             println!();
             println!(
@@ -127,7 +121,7 @@ pub(crate) async fn ipc_join(
             println!(
                 "    {}   {}   {}  {}",
                 style::label("address"),
-                style::value(&my_ip.to_string()),
+                style::value(&my_ipv6.to_string()),
                 style::faint("·"),
                 style::value(&dns),
             );
@@ -137,8 +131,8 @@ pub(crate) async fn ipc_join(
             ]);
             println!();
         }
-        ipc::IpcMessage::Error { message } => print_error("join failed", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("join failed", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -156,8 +150,8 @@ pub(crate) async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -175,8 +169,8 @@ pub(crate) async fn ipc_kick(network: &str, peer: &str) -> Result<()> {
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -193,8 +187,8 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -220,18 +214,25 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
     if arg == "show" {
         ipc::send(
             &mut stream,
-            ipc::IpcMessage::GetEphemeral {
+            ipc::IpcMessage::NetConfigGet {
                 network: network.to_string(),
+                key: Some(NetworkKey::EphemeralTtl),
             },
         )
         .await?;
         match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::EphemeralStatus { ttl_secs, .. } => match ttl_secs {
-                Some(s) => println!("ephemeral policy on '{network}': {}", format_ttl(s)),
-                None => println!("ephemeral policy on '{network}': off"),
-            },
-            ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-            other => eprintln!("Unexpected response: {:?}", other),
+            // The key renders as the TTL in seconds, or empty when the policy is off.
+            ipc::IpcMessage::ConfigValues { rows } => {
+                match rows.first().map(|(_, v)| v.as_str()).unwrap_or("") {
+                    "" => println!("ephemeral policy on '{network}': off"),
+                    ttl => match ttl.parse::<u64>() {
+                        Ok(s) => println!("ephemeral policy on '{network}': {}", format_ttl(s)),
+                        Err(_) => eprintln!("Unexpected ephemeral ttl: {ttl}"),
+                    },
+                }
+            }
+            ipc::IpcMessage::Error { message } => fail_with("error", &message),
+            other => fail_unexpected(&other),
         }
         return Ok(());
     }
@@ -248,16 +249,18 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
     };
     ipc::send(
         &mut stream,
-        ipc::IpcMessage::SetEphemeral {
+        ipc::IpcMessage::NetConfigSet {
             network: network.to_string(),
-            ttl_secs,
+            key: NetworkKey::EphemeralTtl,
+            // Empty disables the policy, matching `ConfigUnset` semantics.
+            value: ttl_secs.map(|s| s.to_string()).unwrap_or_default(),
         },
     )
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

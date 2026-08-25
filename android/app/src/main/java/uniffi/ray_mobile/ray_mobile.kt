@@ -1226,7 +1226,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_log_snapshot() != 20955.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_network_changed() != 41989.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_network_changed() != 59345.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
@@ -1250,7 +1250,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 25989.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 4927.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_start_pairing() != 51955.toShort()) {
@@ -1274,7 +1274,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_wake_peer() != 45813.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_constructor_node_new() != 39092.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_constructor_node_new() != 6194.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1815,7 +1815,7 @@ public interface NodeInterface {
     /**
      * Send a file to a peer. `path` is a readable file path (the core reads its
      * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * resolves: a hostname, mesh address, short id, or full endpoint id.
      * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
      * (or auto-accepts if it is one of the sender's own paired devices). Needs
      * only the control plane ([`Node::start`]), not the tunnel, but the peer must
@@ -1879,6 +1879,7 @@ public interface NodeInterface {
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
+
      */
     fun `start`()
     
@@ -1970,8 +1971,9 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     }
     /**
      * `config_dir` is the app-private directory (Kotlin `Context.getFilesDir()`)
-     * where identity + config live. It is exported to the core through
-     * `RAYFISH_CONFIG_DIR`, which `config::config_dir()` honors on Android.
+     * where identity + config live. It is published to the core through
+     * `config::set_config_dir_override`, which `config::config_dir()` honors
+     * ahead of `RAYFISH_CONFIG_DIR` on every platform.
      */
     constructor(`configDir`: kotlin.String) :
         this(
@@ -2436,7 +2438,7 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     /**
      * Send a file to a peer. `path` is a readable file path (the core reads its
      * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * resolves: a hostname, mesh address, short id, or full endpoint id.
      * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
      * (or auto-accepts if it is one of the sender's own paired devices). Needs
      * only the control plane ([`Node::start`]), not the tunnel, but the peer must
@@ -2579,6 +2581,7 @@ open class Node: Disposable, AutoCloseable, NodeInterface
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
+
      */
     @Throws(RayException::class)override fun `start`()
         = 
@@ -2921,7 +2924,7 @@ data class HealthSnapshot (
     var `networks`: List<NetworkHealth>, 
     var `meshUp`: kotlin.Boolean, 
     var `nodeId`: kotlin.String, 
-    var `meshIpv4`: kotlin.String, 
+    var `meshIpv6`: kotlin.String, 
     var `warnCount`: kotlin.ULong, 
     var `errorCount`: kotlin.ULong, 
     var `recentErrors`: List<kotlin.String>
@@ -2956,7 +2959,7 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
             FfiConverterSequenceTypeNetworkHealth.allocationSize(value.`networks`) +
             FfiConverterBoolean.allocationSize(value.`meshUp`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`meshIpv4`) +
+            FfiConverterString.allocationSize(value.`meshIpv6`) +
             FfiConverterULong.allocationSize(value.`warnCount`) +
             FfiConverterULong.allocationSize(value.`errorCount`) +
             FfiConverterSequenceString.allocationSize(value.`recentErrors`)
@@ -2969,7 +2972,7 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
             FfiConverterSequenceTypeNetworkHealth.write(value.`networks`, buf)
             FfiConverterBoolean.write(value.`meshUp`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`meshIpv4`, buf)
+            FfiConverterString.write(value.`meshIpv6`, buf)
             FfiConverterULong.write(value.`warnCount`, buf)
             FfiConverterULong.write(value.`errorCount`, buf)
             FfiConverterSequenceString.write(value.`recentErrors`, buf)
@@ -2983,7 +2986,6 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
  */
 data class NetworkDetail (
     var `name`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     var `hostname`: kotlin.String, 
     var `isCoordinator`: kotlin.Boolean, 
@@ -3002,7 +3004,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
         )
@@ -3010,7 +3011,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
 
     override fun allocationSize(value: NetworkDetail) = (
             FfiConverterString.allocationSize(value.`name`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterString.allocationSize(value.`hostname`) +
             FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
@@ -3019,7 +3019,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
 
     override fun write(value: NetworkDetail, buf: ByteBuffer) {
             FfiConverterString.write(value.`name`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterBoolean.write(value.`isCoordinator`, buf)
@@ -3070,7 +3069,6 @@ public object FfiConverterTypeNetworkHealth: FfiConverterRustBuffer<NetworkHealt
 data class NetworkInfo (
     var `name`: kotlin.String, 
     var `nodeId`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     /**
      * True when the join was queued for coordinator approval (no IP yet).
@@ -3090,7 +3088,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
         )
     }
@@ -3098,7 +3095,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
     override fun allocationSize(value: NetworkInfo) = (
             FfiConverterString.allocationSize(value.`name`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterBoolean.allocationSize(value.`pending`)
     )
@@ -3106,7 +3102,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
     override fun write(value: NetworkInfo, buf: ByteBuffer) {
             FfiConverterString.write(value.`name`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterBoolean.write(value.`pending`, buf)
     }
@@ -3118,7 +3113,11 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
  * One peer in a network snapshot.
  */
 data class PeerInfo (
-    var `ipv4`: kotlin.String, 
+    /**
+     * The peer's mesh IPv6, derived from its identity. The only address it has:
+     * the overlay carries no IPv4.
+     */
+    var `ipv6`: kotlin.String, 
     var `nodeId`: kotlin.String, 
     var `hostname`: kotlin.String, 
     var `state`: PeerConnState
@@ -3141,14 +3140,14 @@ public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
     }
 
     override fun allocationSize(value: PeerInfo) = (
-            FfiConverterString.allocationSize(value.`ipv4`) +
+            FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`hostname`) +
             FfiConverterTypePeerConnState.allocationSize(value.`state`)
     )
 
     override fun write(value: PeerInfo, buf: ByteBuffer) {
-            FfiConverterString.write(value.`ipv4`, buf)
+            FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterTypePeerConnState.write(value.`state`, buf)
@@ -3251,7 +3250,6 @@ public object FfiConverterTypeQueuedSend: FfiConverterRustBuffer<QueuedSend> {
 data class Status (
     var `running`: kotlin.Boolean, 
     var `nodeId`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     var `peers`: List<PeerInfo>, 
     var `networks`: List<NetworkDetail>, 
@@ -3270,7 +3268,6 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterSequenceTypeNetworkDetail.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -3280,7 +3277,6 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
     override fun allocationSize(value: Status) = (
             FfiConverterBoolean.allocationSize(value.`running`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
             FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
@@ -3290,7 +3286,6 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
     override fun write(value: Status, buf: ByteBuffer) {
             FfiConverterBoolean.write(value.`running`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
             FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)

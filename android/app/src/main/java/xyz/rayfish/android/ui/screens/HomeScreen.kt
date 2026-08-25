@@ -2,7 +2,6 @@ package xyz.rayfish.android.ui.screens
 
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import android.net.VpnService
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,7 +15,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -27,9 +25,11 @@ import uniffi.ray_mobile.Status
 import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
-import xyz.rayfish.android.RayfishVpnService
+import xyz.rayfish.android.OfferNotifier
+import xyz.rayfish.android.formatSize
 import xyz.rayfish.android.TransferKey
 import xyz.rayfish.android.TransferNotifier
+import xyz.rayfish.android.TunnelControl
 import xyz.rayfish.android.isActive
 import xyz.rayfish.android.moveToDownloads
 import xyz.rayfish.android.ui.components.*
@@ -66,9 +66,14 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     }
 
     fun startService() {
-        // Record the intent before starting so an app relaunch restores online.
-        NodeHolder.setEnabled(context, true)
-        ContextCompat.startForegroundService(context, Intent(context, RayfishVpnService::class.java))
+        // Shared with the quick settings tile, so both entry points record the
+        // same enable intent and start the service the same way. A false return
+        // means the system refused the service start outright, so there is no
+        // bring-up to be optimistic about and the toggle must stay where it is.
+        if (!TunnelControl.start(context)) {
+            onToast("Could not start the VPN service")
+            return
+        }
         vpnOn = true
         pendingVpn = true
     }
@@ -80,10 +85,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             val prep = VpnService.prepare(context)
             if (prep != null) consent.launch(prep) else startService()
         } else {
-            // Record disable intent so the launch-time restore and the status
-            // poll both keep the device offline until the user re-enables.
-            NodeHolder.setEnabled(context, false)
-            context.startService(Intent(context, RayfishVpnService::class.java).apply { action = RayfishVpnService.ACTION_STOP })
+            // Records the disable intent so the launch-time restore and the
+            // status poll both keep the device offline until the user re-enables.
+            TunnelControl.stop(context)
             vpnOn = false
             pendingVpn = false
         }
@@ -118,6 +122,10 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             // This is uncommon (standby is the default); the common case keeps the
             // control plane running in the background.
             runCatching { TransferNotifier.poll(context) }
+            // Posted even with the app open: the user may be on another tab, and
+            // an offer notification the foreground poll skipped would only appear
+            // once the background poller next ran, or never with the VPN fully off.
+            runCatching { OfferNotifier.poll(context) }
             val autoAccepting = NodeHolder.isAutoAcceptOwnDevices(context)
             files = runCatching { node.listFileOffers() }.getOrDefault(emptyList())
                 // Hide own-device offers while auto-accept is downloading or still
@@ -138,10 +146,14 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         }
     }
 
-    fun act(block: suspend () -> Unit) {
+    // `onFailure` is how a caller undoes what it staged before the call. A reject
+    // that throws leaves the offer still pending core-side, so the notification
+    // suppression taken out ahead of it has to come back off or that offer is
+    // never announced again.
+    fun act(onFailure: () -> Unit = {}, block: suspend () -> Unit) {
         scope.launch {
             try { withContext(Dispatchers.IO) { block() }; reloadNotifs() }
-            catch (t: Throwable) { onToast("Failed: ${t.message}") }
+            catch (t: Throwable) { onFailure(); onToast("Failed: ${t.message}") }
         }
     }
     // The core writes into this app-private staging dir; we then move the file to
@@ -156,6 +168,10 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     val doneFiles = remember { mutableStateMapOf<ULong, FileOffer>() }
     fun acceptFile(f: FileOffer) {
         accepting[f.id] = f
+        // Saving from the row settles the same offer the notification is
+        // advertising: take it down now rather than leaving a Save button on
+        // screen for a file that is already downloading.
+        OfferNotifier.markActedOn(context, f.id)
         val key = TransferKey(f.from, f.filename, f.size)
         // Mark pending before the blocking accept starts: the core reports the
         // transfer DONE from inside acceptFileOffer, before moveToDownloads below
@@ -188,6 +204,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 // already happened.
                 DownloadsOutcome.clearPending(key)
                 accepting.remove(f.id)
+                // Same reason as the reject path: the offer may still be pending,
+                // so stop suppressing its notification.
+                OfferNotifier.clearActedOn(f.id)
                 onToast("Failed: ${t.message}")
             }
         }
@@ -204,14 +223,12 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         StatusEyebrow(connected = vpnOn && !starting, text = banner)
         ToggleCard(
             title = "Tunnel",
-            subtitle = if (vpnOn) "running · this device ${status?.ipv4.orEmpty()}" else "stopped",
+            subtitle = if (vpnOn) "running · this device ${status?.ipv6.orEmpty()}" else "stopped",
             checked = vpnOn, onCheckedChange = { toggle(it) },
         )
         SectionCard {
             SectionLabel("This device")
-            val ip4 = status?.ipv4?.takeIf { it.isNotEmpty() }
             val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
-            KeyValueRow("IPv4", ip4 ?: "-", onClick = ip4?.let { v -> { copyToClipboard(context, "IPv4", v); onToast("Copied $v") } })
             KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
             KeyValueRow("Networks", "${nets.size} · $online peers online")
         }
@@ -225,7 +242,12 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                             title = f.filename,
                             subtitle = "file · ${formatSize(f.size)} · from ${f.from}",
                             acceptLabel = "Save", onAccept = { acceptFile(f) },
-                            onReject = { act { NodeHolder.get(context).rejectFileOffer(f.id) } },
+                            onReject = {
+                                OfferNotifier.markActedOn(context, f.id)
+                                act(onFailure = { OfferNotifier.clearActedOn(f.id) }) {
+                                    NodeHolder.get(context).rejectFileOffer(f.id)
+                                }
+                            },
                         )
                     }
                     queued.forEach { q ->
@@ -305,22 +327,15 @@ private fun FileTransferRow(filename: String, done: Boolean) {
     }
 }
 
-private fun formatSize(bytes: ULong): String {
-    val b = bytes.toDouble()
-    return when {
-        b >= 1_000_000_000 -> "%.1f GB".format(b / 1_000_000_000)
-        b >= 1_000_000 -> "%.1f MB".format(b / 1_000_000)
-        b >= 1_000 -> "%.1f KB".format(b / 1_000)
-        else -> "$bytes B"
-    }
-}
-
 @androidx.compose.ui.tooling.preview.Preview(backgroundColor = 0xFF18181B, showBackground = true)
 @Composable
 private fun HomePreview() {
     xyz.rayfish.android.ui.theme.RayfishTheme {
         HomeScreen(
-            status = Status(true, "7f3ac2e1", "100.88.0.3", "fd00::7f3a", emptyList(), emptyList(), emptyList()),
+            status = Status(
+                true, "7f3ac2e1", "200::7f3a",
+                peers = emptyList(), networks = emptyList(), pendingNetworks = emptyList(),
+            ),
             starting = false, onToast = {},
         )
     }

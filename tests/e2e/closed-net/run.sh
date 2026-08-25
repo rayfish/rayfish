@@ -61,7 +61,7 @@ if retry_until 60 "RID=\"\$(request_id '$A' '$NET' srv-b)\"; [[ -n \"\$RID\" ]]"
 else
   fail "srv-b never appeared in 'ray requests'"; summary
 fi
-on "$A" "ray accept $NET $RID" 2>&1 | strip | sed 's/^/   a| /'
+on "$A" "ray requests $NET accept $RID" 2>&1 | strip | sed 's/^/   a| /'
 wait_roster "$A" srv-b
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ if retry_until 60 "CID=\"\$(request_id '$A' '$NET' srv-c)\"; [[ -n \"\$CID\" ]]"
 else
   fail "srv-c never queued"; CID=""
 fi
-[[ -n "$CID" ]] && on "$A" "ray deny $NET $CID" 2>&1 | strip | sed 's/^/   a| /'
+[[ -n "$CID" ]] && on "$A" "ray requests $NET deny $CID" 2>&1 | strip | sed 's/^/   a| /'
 # A denied peer must not become a member. Give it a window; expect still offline.
 sleep 15
 [[ "$(peer_online "$A" srv-c "$NET")" == "0" ]] && pass "denied peer is not admitted" \
@@ -110,7 +110,7 @@ on "$A" 'ray up' >/dev/null 2>&1 || true     # bring the coordinator back
 step "6. hostname change propagates to roster + magic DNS"
 on "$B" "ray hostname $NET srv-bb" 2>&1 | strip | sed 's/^/   b| /'
 # srv-a learns the new name on reconverge (MemberSync trigger or 60s poller).
-if retry_until 90 "[[ -n \"\$(peer_ip4 '$A' srv-bb '$NET')\" ]]"; then
+if retry_until 90 "[[ -n \"\$(peer_ip '$A' srv-bb '$NET')\" ]]"; then
   pass "rename propagated — srv-a's roster shows srv-bb"
 else
   fail "rename did not propagate to srv-a's roster"
@@ -120,7 +120,7 @@ fi
 if retry_until 60 "[[ \"\$(on '$C' 'ping -c1 -W2 srv-bb.$NET.ray >/dev/null 2>&1 && echo ok || echo no')\" == ok ]]"; then
   pass "srv-bb.$NET.ray resolves + answers from srv-c"
 else
-  fail "srv-bb.$NET.ray did not resolve/answer from srv-c (ip=$(peer_ip4 "$C" srv-bb "$NET" 2>/dev/null))"
+  fail "srv-bb.$NET.ray did not resolve/answer from srv-c (ip=$(peer_ip "$C" srv-bb "$NET" 2>/dev/null))"
 fi
 
 # ---------------------------------------------------------------------------

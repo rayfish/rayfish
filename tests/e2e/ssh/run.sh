@@ -61,7 +61,8 @@ wait_roster "$A" srv-b
 SA="$(on "$A" 'ray status' | strip)"; SB="$(on "$B" 'ray status' | strip)"
 A_IP="$(own_ip "$SA")"; B_IP="$(own_ip "$SB")"
 echo "   A mesh ip=$A_IP  B mesh ip=$B_IP"
-[[ -n "$A_IP" && -n "$B_IP" ]] && pass "both have a mesh IP" || fail "missing mesh IP(s)"
+[[ -n "$A_IP" && -n "$B_IP" ]] || { fail "missing mesh IP(s)"; summary; }
+pass "both have a mesh IP"
 # Confirm baseline mesh reachability before testing SSH on top of it.
 png "$B" "$A_IP" "srv-b -> srv-a ($A_IP) baseline ping"
 

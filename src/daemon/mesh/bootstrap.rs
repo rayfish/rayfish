@@ -38,9 +38,7 @@ use crate::windows_identity;
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(600);
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
-    // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
-    #[cfg(not(target_os = "android"))]
-    check_cgnat_conflict().await?;
+    let overrides = Overrides::default();
 
     // Repair a leftover `/etc/resolv.conf` before anything reads it. A hard kill
     // or reboot leaves ours in place (nameserver = our own Magic DNS), and the
@@ -56,7 +54,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // identical construction.
     // Desktop honors the persisted `on_demand` config (default off); the mobile
     // embedder forces it on via `build_headless`.
-    let daemon = build_daemon(token.clone(), stats, None).await?;
+    let daemon = build_daemon(token.clone(), stats, overrides).await?;
 
     // Attach the real OS TUN device: create it, record its name, and spawn the
     // writer + `run_mesh` forwarding loop. On Android the packet interface is a
@@ -65,10 +63,9 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) =
-            tun::PlatformTun::create(daemon.transport.identity.local_ip(), my_ipv6)
-                .await
-                .context("failed to create TUN device")?;
+        let (tun_reader, tun_writer, tun_name) = tun::create(my_ipv6)
+            .await
+            .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
@@ -78,6 +75,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // only the data plane after this; connections persist across `down` so the
     // node stays online to peers.
     daemon.registry.connect_all_networks().await;
+    tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
     daemon.spawn_exit_reapply_listener();
     daemon.activate(None).await;
 
@@ -129,6 +127,20 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
     ]
 }
 
+/// Settings an embedder decides for itself instead of reading from
+/// `settings.toml`. `None` means "take the config value" (the desktop daemon
+/// passes [`Overrides::default`], so its behavior is entirely config-driven).
+///
+/// These exist because the config file is not the embedder's source of truth:
+/// on Android the user's choice lives in the app's own preferences and the
+/// config directory is app-private, so the value has to arrive as an argument
+/// at construction time.
+#[derive(Default)]
+struct Overrides {
+    /// Force on-demand mode (mobile always forces it on; desktop honors config).
+    on_demand: Option<bool>,
+}
+
 /// Construct a headless [`Daemon`] for an embedder (used by `ray-mobile`
 /// and future embedders). Builds the same infrastructure as `run_daemon` minus
 /// the OS TUN device and the Unix-socket IPC server: the caller supplies a
@@ -137,9 +149,13 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
 pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
     let token = CancellationToken::new();
     let stats = Arc::new(ForwardMetrics::default());
-    let daemon = build_daemon(token, stats, Some(on_demand)).await?;
+    let overrides = Overrides {
+        on_demand: Some(on_demand),
+    };
+    let daemon = build_daemon(token, stats, overrides).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
     daemon.registry.connect_all_networks().await;
+    tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
     daemon.spawn_exit_reapply_listener();
     // Control readers and the join path now run their network ops (promotion,
     // self-unpair) directly via NetworkRegistry, so a headless embedder needs no
@@ -154,10 +170,37 @@ pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
 /// receiver and metrics-server guard are stashed on the state for the caller.
 ///
 /// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
+///
+/// The endpoint is built long before the rest of the infrastructure, so every
+/// `?` after that point would drop a live endpoint (iroh logs "Endpoint dropped
+/// without calling `Endpoint::close`. Aborting ungracefully."). That is only
+/// noise for the desktop binary, which exits anyway, but an embedder retries:
+/// `Node::start` is called again on every enable, so a failing build would stack
+/// one abandoned endpoint per attempt for the life of the process. Close it here
+/// instead, on the way out.
 async fn build_daemon(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
-    on_demand_override: Option<bool>,
+    overrides: Overrides,
+) -> Result<Arc<Daemon>> {
+    let mut endpoint = None;
+    let result = build_daemon_inner(token, stats, overrides, &mut endpoint).await;
+    if result.is_err()
+        && let Some(ep) = endpoint
+    {
+        tracing::warn!("daemon build failed; closing the endpoint it had already created");
+        ep.close().await;
+    }
+    result
+}
+
+/// The body of [`build_daemon`]. `endpoint_out` is filled the moment the iroh
+/// endpoint exists, so the caller can close it if any later step fails.
+async fn build_daemon_inner(
+    token: CancellationToken,
+    stats: Arc<ForwardMetrics>,
+    overrides: Overrides,
+    endpoint_out: &mut Option<Endpoint>,
 ) -> Result<Arc<Daemon>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
@@ -170,31 +213,36 @@ async fn build_daemon(
     if let Some(ref cert) = device_cert {
         tracing::info!(user = %cert.user_identity.fmt_short(), "loaded device certificate");
     }
-    let collision_index = identity::load_collision_index()?;
-    let identity = IrohIdentityProvider::new(public_key, collision_index);
-    let my_ip = identity.local_ip();
-    // Register our mesh addresses for the userspace SSH port NAT (mesh `:22`
+    let identity = IrohIdentityProvider::new(public_key);
+    let my_ip = identity.local_ipv6();
+    // Register our mesh address for the userspace SSH port NAT (mesh `:22`
     // <-> the embedded server's listen port). Stays inactive until `ssh on`.
-    forward::init_ssh_nat(
-        my_ip,
-        derive_ipv6(&identity.local_identity()),
-        crate::forward::SSH_LISTEN_PORT,
-    );
+    forward::init_ssh_nat(my_ip, crate::forward::SSH_LISTEN_PORT);
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
-    let on_demand = on_demand_override.unwrap_or(app_config.on_demand);
+    let on_demand = overrides.on_demand.unwrap_or(app_config.on_demand);
     // Point the pkarr client at the configured discovery-DNS server (if any)
     // before any record publish/resolve happens.
     dht::set_discovery_override(&app_config.discovery_dns);
     // Lazily generate + persist this node's contact key (`ray connect`). The
     // secret stays in config; only its public id is held in `Daemon`.
-    let contact_public = config::contact_secret(&mut app_config).public();
-    if let Err(e) = config::save_settings(&app_config) {
-        tracing::warn!(error = %e, "failed to persist contact key");
+    let mut contact_public = None;
+    match config::update_settings(|cfg| {
+        contact_public = Some(config::contact_secret(cfg).public());
+        Ok(())
+    }) {
+        Ok(cfg) => app_config = cfg,
+        Err(e) => tracing::warn!(error = %e, "failed to persist contact key"),
     }
+    // The callback did not run if the update failed before it. Fall back to an
+    // in-memory key so the node still starts.
+    let contact_public = match contact_public {
+        Some(id) => id,
+        None => config::contact_secret(&mut app_config).public(),
+    };
     let alpns = initial_alpns(&app_config);
     let use_tor = app_config
         .networks
@@ -206,8 +254,10 @@ async fn build_daemon(
         use_tor,
         &app_config.relay,
         &app_config.discovery_dns,
+        &app_config.dns_upstreams,
     )
     .await?;
+    *endpoint_out = Some(ep.clone());
 
     // Built before the blob store below, because the provider event pump that
     // feeds it (a bit further down, once `blobs_proto` exists) needs the
@@ -441,10 +491,14 @@ async fn build_daemon(
         hostname_table,
         reverse_table,
         dns_resolver.clone(),
+        derive_ipv6(&identity.local_identity()),
     ));
     let mdns_enabled = app_config.mdns_enabled;
+    // Stays empty when mDNS is off, so `ray mdns scan` reports nothing rather
+    // than stale sightings from a previous run.
+    let lan_peers = Arc::new(LanPeers::new());
     if mdns_enabled {
-        spawn_mdns_discovery(&ep, token.clone());
+        spawn_mdns_discovery(&ep, token.clone(), lan_peers.clone());
     } else {
         tracing::info!("mDNS discovery disabled");
     }
@@ -460,6 +514,7 @@ async fn build_daemon(
         blob_store.clone(),
         stats.clone(),
         contact_public,
+        lan_peers,
     ));
     // The per-peer connection driver is built once here and shared by the
     // ProtocolRouter (which delegates the mesh ALPN to it) and the
@@ -600,6 +655,7 @@ async fn build_daemon(
     // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
     // stops the export); built here from the local handles so it can be a plain
     // owned field. `None` if it failed to bind.
+    #[cfg(not(target_os = "android"))]
     let metrics_server = spawn_metrics_server(
         stats.clone(),
         peers.clone(),
@@ -607,6 +663,11 @@ async fn build_daemon(
         token.clone(),
     )
     .await;
+    // A phone has no Prometheus scraper and no way to reach one, and the server
+    // brings a 60s per-peer sampling loop with it (`PeerMetrics::spawn_collector`):
+    // a wakeup a minute, forever, for an endpoint nobody reads.
+    #[cfg(target_os = "android")]
+    let metrics_server: Option<MetricsServer> = None;
 
     let auto_update = app_config.auto_update;
     let daemon = Arc::new(Daemon {
@@ -622,7 +683,7 @@ async fn build_daemon(
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),
-        exit_reconcile: tokio::sync::Mutex::new(()),
+        exit_reconcile: AsyncMutex::new(()),
         _metrics_server: metrics_server,
         router,
         files,
@@ -633,7 +694,10 @@ async fn build_daemon(
         active: active.clone(),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
+        #[cfg(feature = "desktop")]
         ssh_token: Mutex::new(None),
+        #[cfg(feature = "desktop")]
+        v4_bridge_token: Mutex::new(None),
     });
 
     // File auto-accept is evaluated inline by `FileService::accept_file_offer`
@@ -656,7 +720,7 @@ async fn build_daemon(
 /// Advertise this endpoint over mDNS (`_rayfish._udp.local`) and log LAN peer
 /// discovery events until cancellation. Non-fatal: a failure just means no
 /// local discovery.
-fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
+fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken, lan_peers: Arc<LanPeers>) {
     let mdns = match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
         .service_name("rayfish")
         .advertise(true)
@@ -686,12 +750,17 @@ fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
                             peer = %endpoint_info.endpoint_id.fmt_short(),
                             "mDNS: peer discovered on LAN"
                         );
+                        lan_peers.discovered(
+                            endpoint_info.endpoint_id,
+                            endpoint_info.ip_addrs().copied().collect(),
+                        );
                     }
                     Some(iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
                         tracing::info!(
                             peer = %endpoint_id.fmt_short(),
                             "mDNS: peer left LAN"
                         );
+                        lan_peers.expired(&endpoint_id);
                     }
                     None => break,
                     _ => {}
@@ -702,8 +771,10 @@ fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
 }
 
 /// Register rayfish counters, per-peer gauges, and iroh endpoint metrics, then
-/// start the Prometheus HTTP endpoint on `:9090`. The returned guard must be
-/// kept alive for the process lifetime; `None` means metrics export is disabled.
+/// start the Prometheus HTTP endpoint on `127.0.0.1:9090`. The returned guard
+/// must be kept alive for the process lifetime; `None` means metrics export is
+/// disabled. Not built on Android: see the call site.
+#[cfg(not(target_os = "android"))]
 async fn spawn_metrics_server(
     stats: Arc<ForwardMetrics>,
     peers: PeerTable,
@@ -717,7 +788,12 @@ async fn spawn_metrics_server(
     peer_metrics.spawn_collector(peers, token);
     registry.register_all(endpoint.metrics());
 
-    let metrics_addr: SocketAddr = ([0, 0, 0, 0], 9090).into();
+    // Loopback, not `0.0.0.0`. These counters name every peer by mesh IP along
+    // with its RTT and traffic volumes, which is a map of who this node talks to
+    // and when: not something to serve to whatever else is on the cafe Wi-Fi.
+    // Local scraping (the usual case) is unaffected; remote scraping should go
+    // over the mesh rather than the LAN.
+    let metrics_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 9090).into();
     match iroh_metrics::service::MetricsServer::spawn(metrics_addr, Arc::new(registry)).await {
         Ok(server) => {
             tracing::info!(addr = %server.local_addr(), "metrics server started");
@@ -785,6 +861,23 @@ fn set_socket_permissions(path: &std::path::Path) {
     }
 }
 
+/// Cap on an error reply that quotes the request back. Comfortably fits the
+/// longest real one (the unknown-key error names every valid key, ~300 bytes)
+/// and any socket buffer, so the write completes even if nobody reads.
+const MAX_DECODE_ERROR_LEN: usize = 512;
+
+/// Truncate on a char boundary, marking that it happened.
+fn truncate(s: &str) -> String {
+    if s.len() <= MAX_DECODE_ERROR_LEN {
+        return s.to_string();
+    }
+    let end = (0..=MAX_DECODE_ERROR_LEN)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    format!("{}... (truncated)", &s[..end])
+}
+
 #[cfg(unix)]
 async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| PeerIdentity::Unix {
@@ -793,7 +886,52 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
     });
     // The request is read fd-aware: `SendFileFd` arrives with the file as
     // SCM_RIGHTS ancillary data, which a plain framed read would drop.
-    let (req, fds) = ipc::recv_with_fds(&stream).await?;
+    let (req, fds) = match ipc::recv_with_fds(&stream).await {
+        Ok(v) => v,
+        // A request this build cannot decode (a settings key it does not know, a
+        // variant from a newer `ray`) gets the reason back rather than a bare
+        // hangup, which the client can only report as "connection closed". The
+        // send is best-effort: the common cause is a client that has already
+        // gone away.
+        //
+        // The reason is truncated once, before it reaches either sink, because
+        // it quotes the request: an unknown key is reported as `unknown config
+        // key: <what the client sent>`, and a frame may carry a megabyte of it.
+        // Unbounded, any local user (the socket is 0666 by design) could size
+        // the reply and then never read it, parking a task and an fd on a write
+        // that cannot complete, and could flood the rolling log `ray report`
+        // bundles. This bounds the one reply attacker-sized input can generate;
+        // it is not a general cap on how long a client can hold a task.
+        Err(e) => {
+            let msg = truncate(&format!("{e:#}"));
+            tracing::debug!(error = %msg, "undecodable IPC request");
+            let mut framed = ipc::framed(stream);
+            let _ = ipc::send(&mut framed, ipc_err(msg)).await;
+            return Ok(());
+        }
+    };
+    // `Logs` is the one request whose answer is a run of frames rather than a
+    // single message (a day of debug logs does not fit the frame cap, and
+    // `--follow` never ends), so it takes the stream instead of going through
+    // `handle_request`. Authorization is still the same check: it sits in the
+    // open read tier, alongside `Status` and `Report`.
+    if let IpcMessage::Logs { since, follow } = &req {
+        let (since, follow) = (*since, *follow);
+        let mut framed = ipc::framed(stream);
+        if let Some(denied) = Daemon::check_authorized(&req, peer_cred.as_ref()) {
+            let _ = ipc::send(&mut framed, denied).await;
+            return Ok(());
+        }
+        return super::diagnostics::stream_logs(
+            &crate::logdir::log_dir(),
+            &mut framed,
+            since,
+            follow,
+            &daemon.shutdown_token,
+        )
+        .await;
+    }
+
     let resp = daemon.handle_request(req, peer_cred, fds).await;
     let mut framed = ipc::framed(stream);
     ipc::send(&mut framed, resp).await?;
@@ -1143,7 +1281,7 @@ async fn auto_update_once(shutdown: &CancellationToken) -> Result<()> {
     // Restart-loop guard: refuse a repeat of the same target inside the backoff
     // window so a bad build that keeps mis-reporting its version can't tight-loop
     // download + restart.
-    let mut cfg = config::load()?;
+    let cfg = config::load()?;
     let now = unix_now();
     if !crate::update::should_attempt_target(
         &tag,
@@ -1158,9 +1296,12 @@ async fn auto_update_once(shutdown: &CancellationToken) -> Result<()> {
 
     // Record the attempt *before* swapping so a crash mid-swap still counts
     // against the backoff; it survives the restart via settings.toml.
-    cfg.auto_update_last_target = Some(tag.clone());
-    cfg.auto_update_last_attempt = Some(now);
-    if let Err(e) = config::save_settings(&cfg) {
+    let attempted = tag.clone();
+    if let Err(e) = config::update_settings(|cfg| {
+        cfg.auto_update_last_target = Some(attempted);
+        cfg.auto_update_last_attempt = Some(now);
+        Ok(())
+    }) {
         tracing::warn!(error = %e, "auto-update: failed to persist attempt marker");
     }
 
@@ -1195,4 +1336,52 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decode-error reply quotes the request, and a frame may carry up to
+    /// `MAX_FRAME_LEN` of it. Bounding the reply is what keeps a client that
+    /// sends a megabyte key and then never reads from parking a daemon task on
+    /// a write that cannot finish.
+    #[test]
+    fn a_decode_error_reply_is_bounded_however_long_the_request_was() {
+        let huge = format!("unknown config key: {}", "A".repeat(900_000));
+        let out = truncate(&huge);
+        assert!(out.len() < MAX_DECODE_ERROR_LEN + 32, "{}", out.len());
+        assert!(out.ends_with("... (truncated)"), "{out}");
+        // The useful prefix survives: the reader still learns what went wrong.
+        assert!(out.starts_with("unknown config key: AAA"), "{out}");
+    }
+
+    /// A real error is well under the cap and must come through untouched.
+    #[test]
+    fn a_normal_error_is_not_truncated() {
+        let msg = format!(
+            "decode IPC message: {}",
+            "unknown config key: bogus (mdns, relay, discovery-dns, dns-upstreams, \
+             auto-update, on-demand, ssh, download-dir, download-user, firewall.enabled, \
+             firewall.reject, firewall.default-in, net.auto-accept-firewall, \
+             net.auto-accept-files, net.ephemeral-ttl)"
+        );
+        assert!(msg.len() < MAX_DECODE_ERROR_LEN, "{}", msg.len());
+        assert_eq!(truncate(&msg), msg);
+    }
+
+    /// Truncation lands on a char boundary: a multi-byte char straddling the cap
+    /// would panic the slice.
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        // 3 bytes per char, and the cap is not a multiple of 3, so the cut
+        // lands mid-char and the backtrack has to run. A 2-byte char would
+        // leave byte 512 already on a boundary and test nothing.
+        assert_ne!(MAX_DECODE_ERROR_LEN % 3, 0);
+        let s = "€".repeat(MAX_DECODE_ERROR_LEN);
+        let out = truncate(&s);
+        assert!(out.ends_with("... (truncated)"), "{out}");
+        let kept = out.strip_suffix("... (truncated)").unwrap();
+        assert_eq!(kept.len(), MAX_DECODE_ERROR_LEN - MAX_DECODE_ERROR_LEN % 3);
+    }
 }

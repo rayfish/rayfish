@@ -5,3 +5,12 @@
 # See cross/Dockerfile.gnu.
 [target.x86_64-unknown-linux-gnu]
 dockerfile = "cross/Dockerfile.gnu"
+
+# The Android targets build the same core the app loads (`just android-check`),
+# so an Android-only compile error is caught without an NDK on the machine. The
+# stock 0.2.5 images cannot link Rust's android std; see cross/Dockerfile.android.
+[target.aarch64-linux-android]
+dockerfile = "cross/Dockerfile.android"
+
+[target.x86_64-linux-android]
+dockerfile = "cross/Dockerfile.android"

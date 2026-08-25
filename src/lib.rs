@@ -48,6 +48,15 @@ pub(crate) fn spawn_path_logger(conn: IrohConnection, label: String) {
     });
 }
 
+/// The async mutex, under a name that cannot be mistaken for the std one.
+///
+/// `Mutex` is always `std::sync::Mutex` in this crate; when a lock genuinely
+/// has to be held across an await, it is an `AsyncMutex` and says so at the
+/// field. Two types called `Mutex` distinguished only by their import is the
+/// one place that distinction is easy to get wrong, and holding the std one
+/// across an await does not fail until it deadlocks.
+pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
+
 pub mod apply;
 pub mod audit;
 pub mod config;
@@ -68,6 +77,11 @@ pub mod identity;
 pub mod init_system;
 pub mod invite;
 pub mod ipc;
+// Kernel notification of listen()/close on the host's TCP sockets, which is
+// what keeps `v4bridge` off a poll. Internal to that one caller, and desktop
+// for the same reason it is.
+#[cfg(feature = "desktop")]
+mod listen_events;
 pub mod logdir;
 pub mod membership;
 pub mod network_name;
@@ -99,3 +113,7 @@ pub mod windows_service;
 // only ever runs from the desktop daemon/CLI; it is not part of the Android lib.
 #[cfg(feature = "desktop")]
 pub mod update;
+// Bridging the host's IPv4-only listeners onto the mesh address needs to
+// enumerate those listeners, which is per-OS and has no answer on Android.
+#[cfg(feature = "desktop")]
+pub mod v4bridge;

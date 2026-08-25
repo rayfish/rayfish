@@ -140,7 +140,7 @@ impl NetworkRegistry {
     /// secret key (so any admin granted the key can suggest). Suggestions are
     /// advisory on every network; each node queues or auto-accepts them.
     pub(crate) async fn firewall_suggest(
-        &self,
+        self: &Arc<Self>,
         network: &str,
         suggestions: SuggestedFirewall,
     ) -> IpcMessage {
@@ -165,11 +165,11 @@ impl NetworkRegistry {
         }
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         // Nudge connected members to reconverge from the freshly-published signed
-        // record now, instead of waiting up to 60s for the group poller. Like the
+        // record now, instead of waiting for the group poller. Like the
         // rename flow, this is a payload-free trigger, the suggestions still come
         // exclusively from the network-key-signed blob, never from this message.
         let net_pubkey = state.read().unwrap().network_public_key;
-        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+        broadcast_member_sync(self, net_pubkey, network, None).await;
         // The coordinator is the blob's source, so the group poller's hash
         // check (local == published) short-circuits and it never re-applies its
         // own authored suggestions. Materialize them here so the coordinator is
@@ -316,31 +316,12 @@ impl NetworkRegistry {
         }
     }
 
-    /// Toggle this node's per-network auto-accept of coordinator-suggested
-    /// firewall rules (persisted in config). Turning it on immediately
-    /// re-materializes and installs the current suggestions; turning it off
-    /// leaves already-installed rules in place but stops future auto-install.
-    pub(crate) fn firewall_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
-        if !self.networks.contains_key(network) {
-            return ipc_err(format!("network '{network}' not found"));
-        }
-        // Persist the per-network flag.
-        match config::load_network(network) {
-            Ok(Some(mut nc)) => {
-                nc.auto_accept_firewall = enabled;
-                if let Err(e) = config::save_network(&nc) {
-                    return ipc_err(format!("failed to persist auto-accept setting: {e}"));
-                }
-            }
-            Ok(None) => {
-                return ipc_err(format!("network '{network}' not found in config"));
-            }
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        }
-        // Re-apply suggestions with the new consent setting. With auto-accept on
-        // this installs the queued set; with it off it just (re)queues.
+    /// Re-materialize a network's coordinator-suggested rules under this node's
+    /// current consent setting: with `net.auto-accept-firewall` on it installs
+    /// the queued set, with it off it just (re)queues. Called after the setting
+    /// is persisted so turning it on takes effect immediately rather than at the
+    /// next suggestion.
+    pub(crate) fn reapply_suggested_firewall(&self, network: &str) {
         if let Some(h) = self.networks.get(network) {
             apply_suggested_firewall(
                 &self.firewall,
@@ -349,12 +330,6 @@ impl NetworkRegistry {
                 &h.state,
             );
         }
-        IpcMessage::Ok {
-            message: format!(
-                "auto-accept firewall suggestions {} for '{network}'",
-                if enabled { "enabled" } else { "disabled" }
-            ),
-        }
     }
 
     /// `ray firewall default allow|deny` flips the **inbound** default (the
@@ -362,22 +337,13 @@ impl NetworkRegistry {
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
     pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
-        self.edit_firewall(|c| c.default_inbound = action);
-        IpcMessage::Ok {
-            message: format!("inbound default set to {action}"),
-        }
-    }
-
-    pub(crate) fn firewall_reject(&self, enabled: bool) -> IpcMessage {
-        self.edit_firewall(|c| c.reject = enabled);
-        IpcMessage::Ok {
-            message: format!("fail-fast reject {}", if enabled { "on" } else { "off" }),
-        }
+        self.firewall_config_set(FirewallKey::DefaultIn, &action.to_string())
     }
 
     /// Read-modify-write the live firewall config: clone the current snapshot,
     /// apply `edit`, swap it into the lock-free `ArcSwap`, and persist (logging on
-    /// write error). Shared by the single-field toggles.
+    /// write error). For infallible edits; [`Self::firewall_config_set`] spells
+    /// the same sequence out because its edit can fail.
     fn edit_firewall(&self, edit: impl FnOnce(&mut firewall::FirewallConfig)) {
         let mut config = (*self.firewall.get_config()).clone();
         edit(&mut config);
@@ -385,24 +351,49 @@ impl NetworkRegistry {
         save_firewall_warn(&config);
     }
 
-    /// `ray firewall on|off`: the global kill switch. `off` sets
-    /// `config.disabled = true` so `evaluate_packet` allows every packet
-    /// (rules and defaults are bypassed; the anti-spoof check upstream still
-    /// runs). Hot-swaps the live `ArcSwap`, so the effect is immediate.
-    pub(crate) fn firewall_set_enabled(&self, enabled: bool) -> IpcMessage {
+    /// Apply one firewall settings key (`ray firewall on|off|reject|default`,
+    /// or `ray config set firewall.*`).
+    ///
+    /// Hot-swaps rather than doing a load/mutate/save: the packet path reads the
+    /// config from a lock-free `ArcSwap`, so the edit has to be swapped into it
+    /// for `ray firewall off` to take effect now instead of at the next daemon
+    /// restart. It repeats [`Self::edit_firewall`]'s sequence instead of calling
+    /// it because `apply_firewall` can fail and that helper takes an infallible
+    /// closure, so a rejected value must not reach the swap. Parsing and validation belong to
+    /// the registry (`settings::apply_firewall`); this method owns the live swap,
+    /// the persist, and the per-key confirmation message.
+    pub(crate) fn firewall_config_set(&self, key: FirewallKey, value: &str) -> IpcMessage {
         let mut config = (*self.firewall.get_config()).clone();
-        config.disabled = !enabled;
+        if let Err(e) = settings::apply_firewall(&mut config, key, value) {
+            return ipc_err(e.to_string());
+        }
         self.firewall.update(config.clone());
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        save_firewall_warn(&config);
         IpcMessage::Ok {
-            message: if enabled {
-                "firewall on (enforcing rules and defaults)".to_string()
-            } else {
-                "firewall off (all packets allowed on this device)".to_string()
-            },
+            message: firewall_set_message(&config, key),
         }
+    }
+
+    /// Render one firewall settings key from the live config.
+    pub(crate) fn firewall_config_get(&self, key: FirewallKey) -> IpcMessage {
+        IpcMessage::ConfigValues {
+            rows: self.firewall_config_rows(Some(key)),
+        }
+    }
+
+    /// Firewall settings as `(key, value)` rows, read from the live config so a
+    /// get agrees with what the packet path is enforcing. `None` renders every
+    /// key, which is how the bare `ray config get` picks them up alongside the
+    /// globals.
+    pub(crate) fn firewall_config_rows(&self, key: Option<FirewallKey>) -> Vec<(String, String)> {
+        let config = self.firewall.get_config();
+        let keys: Vec<FirewallKey> = match key {
+            Some(k) => vec![k],
+            None => FirewallKey::ALL.to_vec(),
+        };
+        keys.into_iter()
+            .map(|k| (k.name().to_string(), settings::render_firewall(&config, k)))
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -440,21 +431,44 @@ impl Daemon {
         self.registry.firewall_default(action)
     }
 
-    /// Toggle the embedded mesh SSH server. Persists `ssh_enabled`, seeds/removes
+    /// Apply the `ssh` settings key (`ray firewall ssh on|off`, `ray config set
+    /// ssh <on|off>`), which is more than a config write: it also seeds/removes
     /// the `allow in tcp:22` passthrough so SSH packets reach the listener under
     /// the deny-inbound default, and starts/stops the listeners if the data plane
-    /// is active.
-    pub(crate) fn firewall_ssh_set(self: &Arc<Self>, enabled: bool) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        };
-        app_config.ssh_enabled = enabled;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to persist ssh setting: {e}"));
+    /// is active. The key is served here, not by the generic `config_apply` path,
+    /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
+    /// on its own leaves the node advertising SSH with nothing listening.
+    pub(crate) fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        // There is no Windows SSH server to start, so turning it on would write
+        // `ssh_enabled = true` and open port 22 for a listener that never
+        // arrives. Rejected before anything is persisted, so the config and the
+        // firewall stay consistent with what the daemon can actually do.
+        // `off` still goes through, so a config carried over from another
+        // platform can be turned back off here.
+        #[cfg(windows)]
+        if settings::parse_bool(value, false).unwrap_or(false) {
+            return ipc_err(
+                "the embedded SSH server is not available on Windows; nothing was changed",
+            );
         }
+        // The registry parses and writes the field; everything below is the side
+        // effects it deliberately does not do.
+        let mut parse_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = settings::apply_global(cfg, GlobalKey::Ssh, value, false) {
+                parse_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = parse_err {
+            return ipc_err(e);
+        }
+        let app_config = match saved {
+            Ok(cfg) => cfg,
+            Err(e) => return ipc_err(format!("failed to persist ssh setting: {e}")),
+        };
+        let enabled = app_config.ssh_enabled;
         // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
         let fw = self.registry.firewall.set_ssh_passthrough(enabled);
         if let Err(e) = firewall::save_firewall(&fw) {
@@ -503,6 +517,52 @@ impl Daemon {
         IpcMessage::Ok { message }
     }
 
+    /// Write the `v4-bridge` setting and make the running bridge follow it.
+    ///
+    /// A plain config write would leave the listeners up until the next restart,
+    /// which is the `ssh` bug in a second place, so this key gets its own setter
+    /// for the same reason that one does.
+    pub(crate) fn v4_bridge_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        let mut parse_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = settings::apply_global(cfg, GlobalKey::V4Bridge, value, false) {
+                parse_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = parse_err {
+            return ipc_err(e);
+        }
+        let enabled = match saved {
+            Ok(cfg) => cfg.v4_bridge,
+            Err(e) => return ipc_err(format!("failed to persist v4-bridge setting: {e}")),
+        };
+        // Reflect immediately if the data plane is up (else activate() starts it).
+        #[cfg(feature = "desktop")]
+        if self.active.load(Ordering::SeqCst) {
+            if enabled {
+                self.start_v4_bridge();
+            } else {
+                self.stop_v4_bridge();
+            }
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "IPv4 listener bridge {}. {}",
+                if enabled { "on" } else { "off" },
+                if enabled {
+                    "A service listening on 0.0.0.0 now answers at this node's mesh \
+                     address, for the peers the firewall allows. Services bound to \
+                     127.0.0.1 are not bridged."
+                } else {
+                    "Services that listen on IPv4 only are no longer reachable over \
+                     the mesh."
+                }
+            ),
+        }
+    }
+
     /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
     /// peer on the network) or a name/ip/short-id resolved to a user identity.
     /// On allow, `users` is the set of local accounts the peer may log in as
@@ -515,15 +575,12 @@ impl Daemon {
         users: Vec<String>,
         allow: bool,
     ) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
+        let ssh_enabled = match config::load() {
+            Ok(c) => c.ssh_enabled,
             Err(e) => {
                 return ipc_err(format!("failed to load config: {e}"));
             }
         };
-        if !app_config.networks.iter().any(|n| n.name == network) {
-            return ipc_err(format!("no such network: {network}"));
-        }
         // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
         // resolve to the peer's **user identity** hex. `resolve_peer_name` may
         // return a transport endpoint id (for a connected peer) which differs
@@ -540,33 +597,31 @@ impl Daemon {
                 }
             }
         };
-        let net = app_config
-            .networks
-            .iter_mut()
-            .find(|n| n.name == network)
-            .expect("network presence checked above");
-        if allow {
-            // Normalize: a `*` collapses the list to just `*` (any incl. root);
-            // otherwise dedupe. Empty = the non-root default.
-            let users = normalize_ssh_users(users);
-            match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
-                Some(r) => r.users = users,
-                None => net.ssh_allow.push(config::SshRule {
-                    peer: entry.clone(),
-                    users,
-                }),
+        let net = match config::update_network(network, |net| {
+            if allow {
+                // Normalize: a `*` collapses the list to just `*` (any incl. root);
+                // otherwise dedupe. Empty = the non-root default.
+                let users = normalize_ssh_users(users);
+                match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
+                    Some(r) => r.users = users,
+                    None => net.ssh_allow.push(config::SshRule {
+                        peer: entry.clone(),
+                        users,
+                    }),
+                }
+            } else {
+                net.ssh_allow.retain(|r| r.peer != entry);
             }
-        } else {
-            net.ssh_allow.retain(|r| r.peer != entry);
-        }
-        let net = net.clone();
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to persist network config: {e}"));
-        }
+            Ok(())
+        }) {
+            Ok(Some(net)) => net,
+            Ok(None) => return ipc_err(format!("no such network: {network}")),
+            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
+        };
         // Push the change to any live listener.
         #[cfg(feature = "desktop")]
         self.rebuild_ssh_authz();
-        let detail = if allow {
+        let mut detail = if allow {
             let r = net.ssh_allow.iter().find(|r| r.peer == entry);
             let as_users = match r.map(|r| r.users.as_slice()) {
                 Some([]) | None => " as any non-root user".to_string(),
@@ -577,6 +632,15 @@ impl Daemon {
         } else {
             format!("ssh deny {peer} on {network}")
         };
+        // Mirror of the `ssh on` nudge: a rule with the server off looks like it
+        // took effect, but `:22` still falls through to the host sshd (which
+        // asks for a password), so the failure doesn't point back here.
+        if allow && !ssh_enabled {
+            detail.push_str(
+                "\n\nmesh SSH is off, so this rule is not in effect yet. \
+                 Start the server with `ray firewall ssh on`.",
+            );
+        }
         IpcMessage::Ok { message: detail }
     }
 
@@ -607,6 +671,25 @@ impl Daemon {
     }
 }
 
+/// The confirmation line for a firewall key, rendered from the config
+/// as it stands after the write. Each key keeps the exact string its old handler
+/// produced. Note the absence of the global keys' "Restart the daemon" clause:
+/// these edits are live the moment the `ArcSwap` swap lands, so claiming
+/// otherwise would be false.
+fn firewall_set_message(config: &firewall::FirewallConfig, key: FirewallKey) -> String {
+    match key {
+        FirewallKey::Enabled if config.disabled => {
+            "firewall off (all packets allowed on this device)".to_string()
+        }
+        FirewallKey::Enabled => "firewall on (enforcing rules and defaults)".to_string(),
+        FirewallKey::Reject => format!(
+            "fail-fast reject {}",
+            if config.reject { "on" } else { "off" }
+        ),
+        FirewallKey::DefaultIn => format!("inbound default set to {}", config.default_inbound),
+    }
+}
+
 /// Normalize an SSH allow rule's user list: a `*` (any user incl. root) collapses
 /// the whole list to just `*`; otherwise sort + dedupe. An empty list is left
 /// empty, meaning "any non-root user" (the secure default).
@@ -617,6 +700,78 @@ fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
     users.sort();
     users.dedup();
     users
+}
+
+#[cfg(test)]
+mod firewall_message_tests {
+    use super::*;
+
+    /// Pinned byte-for-byte: these strings used to live in `firewall_reject`,
+    /// `firewall_set_enabled` and `firewall_default`, and the settings-registry
+    /// migration was not allowed to change what the user reads. See the matching
+    /// test in `daemon::confirmation_message_tests` for the global keys.
+    fn disabled(v: bool) -> firewall::FirewallConfig {
+        firewall::FirewallConfig {
+            disabled: v,
+            ..Default::default()
+        }
+    }
+
+    fn reject(v: bool) -> firewall::FirewallConfig {
+        firewall::FirewallConfig {
+            reject: v,
+            ..Default::default()
+        }
+    }
+
+    fn default_in(v: firewall::Action) -> firewall::FirewallConfig {
+        firewall::FirewallConfig {
+            default_inbound: v,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn firewall_keys_keep_the_exact_wording_their_handlers_printed() {
+        assert_eq!(
+            firewall_set_message(&disabled(false), FirewallKey::Enabled),
+            "firewall on (enforcing rules and defaults)"
+        );
+        assert_eq!(
+            firewall_set_message(&disabled(true), FirewallKey::Enabled),
+            "firewall off (all packets allowed on this device)"
+        );
+
+        assert_eq!(
+            firewall_set_message(&reject(true), FirewallKey::Reject),
+            "fail-fast reject on"
+        );
+        assert_eq!(
+            firewall_set_message(&reject(false), FirewallKey::Reject),
+            "fail-fast reject off"
+        );
+
+        assert_eq!(
+            firewall_set_message(&default_in(firewall::Action::Deny), FirewallKey::DefaultIn),
+            "inbound default set to deny"
+        );
+        assert_eq!(
+            firewall_set_message(&default_in(firewall::Action::Allow), FirewallKey::DefaultIn),
+            "inbound default set to allow"
+        );
+    }
+
+    /// A firewall edit hot-swaps the `ArcSwap` the packet path reads, so it is
+    /// in force before the reply is written. Telling the user to restart would
+    /// be false, and would also mask a regression back to load/mutate/save.
+    #[test]
+    fn firewall_messages_never_claim_a_restart_is_needed() {
+        let fw = firewall::FirewallConfig::default();
+        for &key in FirewallKey::ALL {
+            let msg = firewall_set_message(&fw, key);
+            assert!(!msg.contains("Restart"), "{key}: {msg}");
+        }
+    }
 }
 
 #[cfg(test)]

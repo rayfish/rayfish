@@ -51,6 +51,72 @@ proptest! {
         assert_info_eq(&info, &spec.expected())?;
     }
 
+    /// A fragment-free extension-header chain is transparent: the parser walks it
+    /// and reports the same protocol, ports and flags it would have without one.
+    ///
+    /// This is the property the conntrack key depends on. Reading byte 6 as the
+    /// protocol instead made every chained packet `(44, 0, 0)`, a single wildcard
+    /// entry that an outbound fragment opened and any inbound packet could then
+    /// walk through.
+    #[test]
+    fn an_extension_header_chain_is_transparent(
+        spec in packet_spec(),
+        links in common::ext_chain_strategy(),
+    ) {
+        let Some(pkt) = spec.encode_behind(&links) else {
+            return Ok(()); // IPv4 has no chain to walk
+        };
+        let info = parse_packet_info(&pkt).expect("a chain must be walked, not refused");
+        assert_info_eq(&info, &spec.expected())?;
+    }
+
+    /// A fragment is refused at every offset, including the first, and wherever
+    /// in the chain it sits.
+    ///
+    /// The later ones have no ports to read, and guessing zero is what rebuilt
+    /// the wildcard entry. The first one does carry them, but the datagram it
+    /// starts cannot be delivered while its siblings are refused, so classifying
+    /// it only earns the right to put an uncompletable packet on the wire and
+    /// open a conntrack entry for it.
+    #[test]
+    fn a_fragmented_packet_is_refused(
+        spec in packet_spec(),
+        links in common::ext_chain_strategy(),
+        at in 0usize..4,
+        offset in 0u16..8192,
+    ) {
+        let mut chain = links;
+        let at = at.min(chain.len());
+        chain.insert(at, common::IPV6_FRAGMENT);
+        let Some(mut pkt) = spec.encode_behind(&chain) else {
+            return Ok(());
+        };
+        // Every link this strategy emits is 8 octets, so the fragment header's
+        // own offset field is at 40 + 8*at, plus 2 for the offset/flags word.
+        let fo = 40 + 8 * at + 2;
+        pkt[fo..fo + 2].copy_from_slice(&(offset << 3).to_be_bytes());
+        prop_assert!(
+            parse_packet_info(&pkt).is_none(),
+            "a fragment at offset {} in chain position {} must be refused",
+            offset,
+            at,
+        );
+    }
+
+    /// The same protocol numbers are ordinary upper-layer protocols in IPv4,
+    /// which has no extension headers at all, so nothing there may be walked.
+    #[test]
+    fn ipv4_does_not_walk_ipv6_extension_headers(
+        nh in prop::sample::select(&rayfish::firewall::IPV6_EXTENSION_HEADERS[..]),
+        spec in packet_spec(),
+    ) {
+        prop_assume!(!spec.v6);
+        let mut pkt = spec.encode();
+        pkt[9] = nh;
+        let info = parse_packet_info(&pkt).expect("an IPv4 packet has no chain to refuse");
+        prop_assert_eq!(info.protocol, nh);
+    }
+
     /// The version nibble is the parser's dispatch key: anything other than 4
     /// or 6 has no defined layout and must be rejected outright.
     #[test]

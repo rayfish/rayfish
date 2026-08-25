@@ -38,8 +38,8 @@ That's the whole idea. The rest of this README is the details.
 Each machine runs a small daemon (comparable to Tailscale's `tailscaled`) that creates a TUN device, captures IP packets, and tunnels them over iroh's QUIC connections. Everything else (`create`, `join`, `status`, file sharing) is an unprivileged command that talks to the daemon over a local socket.
 
 1. **Create.** One peer starts a network and becomes its coordinator. The network's public key is its **room id**: it lets others discover the network but, on a closed network, is not enough to get in.
-2. **Join.** On a closed network a peer gets in with a one-time invite code (`ray invite`) or by requesting approval (`ray requests` / `ray accept`). The coordinator is the gatekeeper.
-3. **Mesh.** Every peer derives its own stable virtual IPv4 (`100.64.0.0/10`) and IPv6 (`200::/7`) from its identity, then connects directly to every other peer.
+2. **Join.** On a closed network a peer gets in with a one-time invite code (`ray invite`) or by requesting approval (`ray requests`). The coordinator is the gatekeeper.
+3. **Mesh.** Every peer derives its own stable virtual IPv6 (`200::/7`) from its identity, then connects directly to every other peer.
 4. **Use it.** Any TCP/UDP app works, addressed by IP or by `name.network.ray`.
 
 ## Features
@@ -114,20 +114,19 @@ sudo ray update --nightly        # track the rolling nightly (rebuilt on every c
 sudo ray update --version 0.1.0  # install a specific release (downgrades allowed)
 
 sudo ray install --auto-update   # enable automatic stable updates at install time
-ray auto-update on               # or toggle it any time (takes effect on `sudo ray restart`)
+ray config set auto-update on    # or toggle it any time (takes effect on `sudo ray restart`)
 ```
 
 `ray update` fetches a release from GitHub, verifies its SHA-256, atomically replaces the running `ray` binary, and (if the system service is installed) restarts the daemon onto the new version. By default it tracks the latest stable release; `--nightly` follows the rolling pre-release built from every commit, and `--version X` pins a specific release. There is no persisted channel: each run picks its target from the flag. It needs root when the installed binary lives in a system path (so use `sudo ray update`); `ray --version`, `ray update --check`, and `ray update --list` do not.
 
-**Automatic updates** are opt-in (off by default). Enable them with `sudo ray install --auto-update` or `ray auto-update on`: the daemon then checks for a newer **stable** release about every 6 hours and, when one exists, downloads + verifies + swaps the binary and restarts itself onto it. Nightlies are never auto-installed. Because applying an update restarts the daemon, it briefly drops the VPN (peers reconnect automatically), so it stays opt-in. `ray status` shows when auto-update is on.
+**Automatic updates** are opt-in (off by default). Enable them with `sudo ray install --auto-update` or `ray config set auto-update on`: the daemon then checks for a newer **stable** release about every 6 hours and, when one exists, downloads + verifies + swaps the binary and restarts itself onto it. Nightlies are never auto-installed. Because applying an update restarts the daemon, it briefly drops the VPN (peers reconnect automatically), so it stays opt-in. `ray status` shows when auto-update is on.
 
 ### 2. Create a network
 
 ```bash
 ray create --hostname alice          # closed by default; add --open for a public network
 # ✓ network created  gentle-amber-fox
-#   IPv4  100.64.23.142
-#   IPv6  200:ab3f:d92c:1e4a::1
+#   address  200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16
 ```
 
 ### 3. Invite someone
@@ -146,8 +145,7 @@ Hand the code to a friend. On a closed network they can also run `ray join <room
 ```bash
 ray join <invite-code> --name gaming --hostname bob
 # ✓ joined gaming
-#   IPv4  100.64.7.201
-#   IPv6  200:7c10:5e8b:33a1::1
+#   address  200:7c10:5e8b:33a1:2d94:6ae0:1f77:b3c8
 ```
 
 ### 5. Reach each other
@@ -156,7 +154,7 @@ ray join <invite-code> --name gaming --hostname bob
 ray status               # networks, peers, and traffic
 ping alice.gaming.ray    # by name
 ping bob.ray             # flat lookup
-ping 100.64.23.142       # or just the IP
+ping 200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16    # or just the address
 ray ping alice           # mesh probe: RTT, loss, and direct-vs-relay path
 ray netcheck             # your own bound port, relay, and reachability
 ```
@@ -175,9 +173,9 @@ row telling you the exact command to deal with it:
 ```text
   rayfish  ● up      mDNS on      endpoint k7f2…9abc
 
-  gentle-amber-fox  coordinator   alice   100.64.23.142   members 2/3
-    ● bob      100.64.7.201   direct   12ms   ↑ 1.2 MB   ↓ 3.4 MB
-    ○ carol    100.64.9.14
+  gentle-amber-fox  coordinator   alice   200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16   members 2/3
+    ● bob      200:7c10:5e8b:33a1:2d94:6ae0:1f77:b3c8   direct   12ms   ↑ 1.2 MB   ↓ 3.4 MB
+    ○ carol    200:5d31:9f04:c7e2:44ab:8102:e6d9:37f5
     join  <room-id>
 
   pending
@@ -208,6 +206,34 @@ Prefer buttons and forms? Run `ray gui` to open a local browser GUI. It wraps
 the same CLI commands, so anything available in `ray --help` is available there
 too; commands that need root still need the GUI to be launched with `sudo`.
 
+### Tab completion
+
+Installed for you: the installer and `sudo ray up` write the completion scripts
+into the directories bash, zsh and fish already search, so there is nothing to
+source and no rc file to edit. Open a new shell and press tab.
+
+It is not a static script. Each tab asks the running `ray`, so the answers are
+the networks and peers you have right now:
+
+```
+$ ray leave <TAB>
+gaming  homelab
+
+$ ray ping <TAB>
+alice   200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16, active
+nas     200:5d31:9f04:c7e2:44ab:8102:e6d9:37f5, idle
+
+$ ray exit-node use homelab <TAB>
+gateway 200:1e77:b0c3:95da:6f28:31ac:d740:5b92, active
+```
+
+A tab never starts the daemon and never blocks: with the service stopped it
+answers from your saved config where it can, and offers nothing where it can't.
+
+If you installed the binary by hand, `ray completions --install` sets it up
+(system-wide under `sudo`, otherwise for your user only). `ray completions zsh`
+prints the script instead, for placing yourself.
+
 ## Managing your network
 
 Once a network exists, running it is a handful of commands. Here are the ones
@@ -232,18 +258,18 @@ you're happy to leave the door open on. The three ways into a private network
 ### Adding and removing people
 
 ```bash
-ray invite <network>          # mint a one-time code to hand to one person
-ray requests <network>        # see who's asking to join
-ray accept <network> <id>     # let them in   (ray deny <id> to refuse)
-ray kick <network> <member>   # remove someone for good; they drop mesh-wide
-ray ephemeral <network> 7d    # auto-remove members offline longer than 7d
+ray invite <network>                 # mint a one-time code to hand to one person
+ray requests <network>               # see who's asking to join
+ray requests <network> accept <id>   # let them in ("deny <id>" to refuse)
+ray kick <network> <member>          # remove someone for good; they drop mesh-wide
+ray ephemeral <network> 7d           # auto-remove members offline longer than 7d
 ```
 
 `ray kick` is the one to reach for when someone should lose access: it removes
 them from the network's signed roster and every other member disconnects them.
-`ray invite`, `ray requests`, `ray accept`, and `ray kick` are coordinator
-actions, so you run them on the machine that created the network (or on any
-co-coordinator you've added with `ray admin add`).
+`ray invite`, `ray requests`, and `ray kick` are coordinator actions, so you run
+them on the machine that created the network (or on any co-coordinator you've
+added with `ray admin add`).
 
 ### Pairing your own devices
 
@@ -277,7 +303,7 @@ The **room id** (a network's public key) is a discovery key. It's published so p
 - **Closed (default)** has three ways in:
   - **Invite code.** `ray invite <network>` mints a single-use, expiring code. The holder runs `ray join <code>`; the coordinator verifies and burns it. Manage with `ray invite <network> list` / `revoke <id>`.
   - **Reusable key.** `ray invite <network> --reusable` mints a multi-use, expiring key for unattended fleets. Its hash rides the network's signed record, so it admits many machines and `revoke` propagates to every key-holder. A server joins non-interactively with `ray join <key> --hostname web --auto-accept-firewall`. The name isn't authoritative, so two servers asking for `web` become `web` and `web-1`. For stable per-host names give each a unique `--hostname` (e.g. a cloud instance id), and prefer the `*` wildcard subject for fleet firewall suggestions (a rule keyed to one hostname can retarget as servers come and go). Key expiry is not member expiry: expiry/revoke only blocks new joins; machines already admitted stay members.
-  - **Live approval.** The holder of just the room id runs `ray join <room-id>` and lands in a queue. The coordinator runs `ray requests <network>`, then `ray accept <network> <id>` (or `ray deny`).
+  - **Live approval.** The holder of just the room id runs `ray join <room-id>` and lands in a queue. The coordinator runs `ray requests <network>`, then `ray requests <network> accept <id>` (or `deny <id>`).
 - **Open** (`ray create --open`) lets anyone with the room id join directly. Good for public or community networks.
 
 Either gate runs through a coordinator. The full coordinator set is published in the network's signed record (`Member.is_coordinator`), so a fresh joiner dials the invite minter first, then falls back across the other coordinators. Admission survives any one coordinator being offline. Once admitted, a member reconnects by cryptographic identity and no coordinator needs to be online.
@@ -288,11 +314,33 @@ To link up with one person, skip room ids and invite codes entirely. Everyone ha
 
 ```bash
 ray connect <their-contact-id>     # ask to connect; you wait, pending
-ray connections                    # they see the request…
-ray connections approve <id>       # …and approve it
+ray connect                        # they see the request…
+ray connect approve <id>           # …and approve it
 ```
 
 Approval creates a private **2-peer network** automatically (shown as `[direct]` in `ray status`). It's a real network, so firewall rules, Magic DNS, and the mesh all work the same. Approval is recipient-only: the requester consents by asking, the recipient consents by approving. Rotate your contact id anytime with `ray contact rotate` to stop new requests (existing links keep working). To stay unreachable, don't share the id.
+
+### Finding peers on your LAN
+
+Nodes on the same local network announce themselves over mDNS (on by default,
+`ray mdns on|off`). That normally just keeps connections direct instead of
+relayed, but you can also look at what it found:
+
+```bash
+ray mdns scan                      # rayfish nodes seen on this LAN
+ray connect <peer>                 # link up with one, using the id from the scan
+```
+
+`ray status` also lists LAN neighbours you're not connected to yet, under
+**nearby**, so you don't have to go looking.
+
+A sighting grants nothing. The scan marks which neighbours you already share a
+network with, and connecting to one still needs their `ray connect approve`.
+Because the scan gives you an id you can dial directly, the pair does not need
+the DHT: two machines can link up on a LAN with no internet. The flip side is
+that anyone on your LAN can send you a connect request without knowing your
+contact id, so `ray contact rotate` doesn't stop local requests (your approval
+still does).
 
 ## Firewall
 
@@ -330,12 +378,23 @@ with a stock client:
 
 ```bash
 ssh user@host.ray
+scp file user@host.ray:            # scp and sftp need an sftp-server on the host
+ssh -L 8080:localhost:80 host.ray  # forwarding works in both directions, -A too
 ```
 
 The peer is authenticated by its mesh identity, so there are no `authorized_keys`
-to distribute (the same model as Tailscale SSH). One limitation to know: an
-authorized peer may currently log in as **any** local user, so only enable it on
-networks whose members you trust at that level.
+to distribute (the same model as Tailscale SSH). An allow rule grants any
+non-root user by default; `-u <users>` names the accounts a peer may log in as,
+and `-u '*'` includes root.
+
+Sessions, `scp`/`sftp`, port and unix-socket forwarding (`-L`, `-D`, `-R`,
+`ProxyJump`) and agent forwarding (`-A`) all work with a stock client. X11
+forwarding does not.
+
+Interactive sessions are handed to the host's `login(1)`, so PAM applies (a
+locked or expired account is refused), the session shows up in `who` / `last` /
+`loginctl`, and you get the motd. Root sessions and `ssh host <cmd>` spawn the
+shell directly, since `login` won't take a root session on a pseudo-terminal.
 
 ## Declarative provisioning
 
@@ -436,18 +495,95 @@ ray config unset relay                        # back to defaults
 ```
 
 Keys: `relay`, `discovery-dns`, `dns-upstreams`. Values are a comma list of
-presets (`rayfish`, `n0`), URLs, or IPv4 addresses. By default custom servers are
-added alongside the defaults; `--replace` swaps them out (a bad custom server
-with no fallback can isolate the node). Settings are saved to `settings.toml` and
-take effect on `sudo ray restart`.
+presets (`rayfish`, `n0`), URLs, or IP addresses (`dns-upstreams` takes IPv6 ones
+too, which is what an exit-node tunnel forwards through). By default custom
+servers are added alongside the defaults; `--replace` swaps them out (a bad
+custom server with no fallback can isolate the node). Settings are saved to
+`settings.toml` and take effect on `sudo ray restart`.
+
+## Running alongside another VPN
+
+Nothing to configure. Rayfish's overlay is IPv6-only, in `200::/7`, and it never
+claims `100.64.0.0/10` at all. Tailscale (and anything else built on CGNAT
+space) can have that range to itself, and the two coexist without either of
+them stepping aside.
+
+Peers, mesh SSH, file transfer, and `.ray` names all work over IPv6. `.ray`
+answers AAAA only: an A query for a mesh name is NODATA, because there is no
+IPv4 address to give. Magic DNS is at `200::53`.
+
+`ray exit-node use` tunnels IPv6 and leaves your IPv4 internet traffic leaving
+directly, which `ray exit-node use` and `ray exit-node status` both say out
+loud. Two things follow:
+
+- The gateway needs an IPv6 uplink of its own. Ones that report having it are
+  marked `(IPv6)` in `ray exit-node status`, and picking one that reports the
+  opposite is refused rather than left to time out. A gateway that reports
+  nothing either way is still selectable: that is what a network whose
+  coordinator predates this feature looks like, and refusing there would rule
+  out every gateway on it. `ray exit-node use` says so when it happens.
+- The daemon's own DNS forwarder is pointed at an IPv6 resolver while the tunnel
+  is up, so the lookups it makes go through the exit rather than around it. Name
+  one yourself with `ray config set dns-upstreams` (IPv6 addresses are accepted);
+  otherwise Cloudflare and Google's IPv6 resolvers are used.
+
+  This only covers applications' lookups on a host where rayfish is the whole
+  of DNS. On systemd-resolved or resolvconf, rayfish registers `~ray` as its
+  only routing domain, so everything else goes to the host's other DNS servers,
+  over IPv4, which the tunnel does not carry: those lookups still leave
+  directly. Sharing `/etc/resolv.conf` with another VPN (below) has the same
+  effect, since rayfish declines names outside `.ray` there and the system
+  resolver asks that VPN's server itself. The daemon logs a warning when either
+  applies. macOS has no such gap, since it switches to a catch-all match domain
+  while the tunnel is up. Giving Linux the same switch is not done yet.
+
+The other VPN's own routes are copied into the tunnel's routing table before the
+default goes in, and a rule sends its destinations there, so it keeps working:
+without that our catch-all rule sits above its rules (Tailscale's are at
+priority 5210-5270) and its prefixes live in a table of its own, not `main`, so
+it would be black-holed the moment the tunnel came up. The rule matters as much
+as the copy, and covers a case the copy alone does not: an SSH session that came
+*in* over that VPN has replies sourced from its address, and those take a
+higher-priority rule that looks up `main`, where the prefix isn't.
+
+NetworkManager's DNS backend is not used at all: it can only carry an IPv4
+nameserver, and rayfish's resolver is IPv6. The next backend down takes over.
+
+If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
+shares the file rather than fighting over it or giving it up. It writes its own
+resolver in first, keeps the other VPN's behind it, and keeps both sets of
+search domains. It answers `.ray` and declines everything else, so your system
+resolver moves straight on to the other VPN's server, whose own DNS setup then
+applies as usual. Both meshes resolve, in either start order, and it holds
+whichever way the two write the file. Rayfish rewrites at most once a minute, so
+the two daemons can't spin against each other, and once the other VPN is gone it
+goes back to managing the file alone.
+
+Shutting rayfish down removes only its own lines and leaves the other VPN's
+DNS as it found it. `dig @200::53 <host>.ray` answers throughout, since Magic
+DNS is reached through the tunnel and not through `resolv.conf`.
+
+With `resolvconf` in the path both VPNs do get to register, but the system
+tries the resolvers in order and stops at the first that answers, so whichever
+sorts second never sees its own names. rayfish says which resolver is ahead of
+it in the log if that happens; fix it by giving rayfish's stanza priority in
+resolvconf's interface order.
+
+On Android the same holds, and there is nothing to switch: a carrier handing the
+phone a `100.64.x.x` address of its own is simply not a conflict any more.
 
 ## Troubleshooting
 
 ```bash
+ray logs                 # today's daemon log, in your pager
+ray logs --since 2h30m   # just the last two and a half hours
+ray logs -f              # keep streaming new lines, like tail -f
 ray report               # bundle logs + metrics, open a pre-filled GitHub issue
 ```
 
-The daemon writes rolling logs to `/var/log/rayfish/` (Linux) or `/Library/Logs/rayfish/` (macOS). `ray report` collects those logs, current metrics, and a **sanitized** status snapshot (no private keys) into a `.tgz`, then opens a pre-filled GitHub issue for you to attach. The bundle is written locally first, so you can review it before sharing.
+The daemon writes rolling logs to `/var/log/rayfish/` (Linux) or `/Library/Logs/rayfish/` (macOS). They're root-owned, so `ray logs` reads them through the daemon rather than off disk: no `sudo`, and it pages through `$PAGER` on a terminal but writes straight through when piped or following (`ray logs | grep peer`).
+
+`ray report` collects those logs, current metrics, and a **sanitized** status snapshot (no private keys) into a `.tgz`, then opens a pre-filled GitHub issue for you to attach. The bundle is written locally first, so you can review it before sharing.
 
 ## How it compares
 

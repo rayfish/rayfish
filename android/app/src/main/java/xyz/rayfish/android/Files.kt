@@ -126,6 +126,23 @@ internal fun moveToDownloads(context: Context, src: File, displayName: String, m
 }
 
 /**
+ * Byte count as a short human-readable string. Decimal units, matching what
+ * Android's own Downloads UI shows. One definition, shared by the offer rows in
+ * the app and by [OfferNotifier]'s notification text: two of these disagreeing on
+ * units would print different sizes for the same file depending on where the user
+ * looked at it.
+ */
+internal fun formatSize(bytes: ULong): String {
+    val b = bytes.toDouble()
+    return when {
+        b >= 1_000_000_000 -> "%.1f GB".format(b / 1_000_000_000)
+        b >= 1_000_000 -> "%.1f MB".format(b / 1_000_000)
+        b >= 1_000 -> "%.1f KB".format(b / 1_000)
+        else -> "$bytes B"
+    }
+}
+
+/**
  * Resolve a content [uri]'s user-visible file name (OpenableColumns.DISPLAY_NAME),
  * falling back to the last path segment or a generated name. Sanitized to a plain
  * file name (no path separators) so it is safe to use as a leaf file name.

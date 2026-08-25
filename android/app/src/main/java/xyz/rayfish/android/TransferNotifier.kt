@@ -111,7 +111,6 @@ object TransferNotifier {
      * the id range (our own notifications are all >= NOTIF_BASE; SendService's
      * ids are below it). */
     private fun cancelStaleOngoingNotifications(context: Context) {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
         val nm = context.getSystemService(NotificationManager::class.java)
         runCatching {
             for (sbn in nm.activeNotifications) {
@@ -340,10 +339,6 @@ object TransferNotifier {
      * reuses it instead of declaring its own. */
     internal fun ensureChannel(context: Context) {
         if (channelEnsured) return
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) {
-            channelEnsured = true
-            return
-        }
         val channel = NotificationChannel(
             CHANNEL_ID,
             "File transfers",

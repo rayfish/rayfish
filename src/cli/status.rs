@@ -30,6 +30,45 @@ pub(crate) fn print_error(title: &str, detail: &str, hint: Option<&str>) {
     }
 }
 
+/// [`print_error`] for a daemon-side `IpcMessage::Error`, which ends the command
+/// non-zero.
+///
+/// The daemon rejecting a request is a failed command, and a CLI that says so on
+/// stderr alone is one no script can check: `ray join` on a spent invite, or
+/// `ray exit-node use` on a gateway that cannot carry IPv6, printed the reason
+/// and exited 0 exactly like a success. Returns `!`, so it drops into a match arm
+/// of any type.
+pub(crate) fn fail_with(title: &str, detail: &str) -> ! {
+    print_error(title, detail, None);
+    std::process::exit(1);
+}
+
+/// [`fail_with`] for a reply the command does not know how to read.
+///
+/// Reaching this arm means the CLI and the daemon disagree about the protocol,
+/// and IPC has no version negotiation to catch it: the binary is swapped before
+/// the service restarts, so the window is routine rather than exotic. Printing to
+/// stderr and returning 0 told the caller the command worked, which is the same
+/// failure [`fail_with`] exists to stop, one match arm over.
+pub(crate) fn fail_unexpected(reply: &impl std::fmt::Debug) -> ! {
+    print_error(
+        "unexpected reply from the daemon",
+        &unexpected_detail(reply),
+        Some("the CLI and the daemon are probably different versions: sudo ray restart"),
+    );
+    std::process::exit(1);
+}
+
+/// The same complaint as [`fail_unexpected`] as a string, for the two callers
+/// that must not exit: they sit in loops written to attempt every item, so
+/// ending the process would abandon the rest of the work the user asked for.
+pub(crate) fn unexpected_detail(reply: &impl std::fmt::Debug) -> String {
+    format!(
+        "unexpected reply from the daemon: {reply:?}\n    \
+         the CLI and the daemon are probably different versions"
+    )
+}
+
 /// Map a daemon error message to an actionable hint, best-effort.
 pub(crate) fn infer_hint(message: &str) -> Option<String> {
     let m = message.to_lowercase();
@@ -104,8 +143,10 @@ pub(crate) fn pluralize(n: usize, noun: &str) -> String {
 
 pub(crate) async fn ipc_status() -> Result<()> {
     let Ok(mut stream) = ipc::connect().await else {
-        // Daemon not running, show saved config
-        let app_config = config::load()?;
+        // Daemon not running, so its config is all there is to show. Read-only:
+        // `config::load` would create the directory it resolves, and this process
+        // is not the daemon.
+        let app_config = config::load_for_read()?;
         println!();
         println!("  {}", style::red("✗ daemon not running"));
         if app_config.networks.is_empty() {
@@ -115,14 +156,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
         }
         println!("  {}", style::faint("saved networks:"));
         for net in &app_config.networks {
-            let ip_str = net
-                .my_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "?".to_string());
+            // No address here: it derives from our identity, which this path
+            // deliberately does not load (the daemon is down and the config is
+            // all we have). The name and member count are what the listing is
+            // for; `ray status` with the daemon up prints the address.
             println!(
-                "    {} {}  {}",
+                "    {}  {}",
                 style::value(&net.name),
-                style::faint(&format!("({ip_str})")),
                 style::faint(&format!("{} members", net.members.len()))
             );
         }
@@ -147,17 +187,29 @@ pub(crate) async fn ipc_status() -> Result<()> {
             bytes_tx,
             pending_files,
             pending_connects,
+            inactive_networks,
+            lan_peers,
             ..
         } => {
             if json_enabled() {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
+                    "lan_peers": lan_peers
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "endpoint_id": p.endpoint_id.to_string(),
+                            "short_id": p.short_id,
+                            "addrs": p.addrs,
+                            "last_seen_secs": p.last_seen_secs,
+                        }))
+                        .collect::<Vec<_>>(),
                     "auto_update": auto_update,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
                     "networks": networks,
+                    "inactive_networks": inactive_networks,
                     "traffic": {
                         "packets_rx": packets_rx, "packets_tx": packets_tx,
                         "bytes_rx": bytes_rx, "bytes_tx": bytes_tx,
@@ -218,24 +270,16 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 }
             }
 
-            // Show inactive networks from config that the daemon didn't restore
-            let active_names: std::collections::HashSet<&str> =
-                networks.iter().map(|n| n.name.as_str()).collect();
-            if let Ok(app_config) = config::load() {
-                let inactive: Vec<_> = app_config
-                    .networks
-                    .iter()
-                    .filter(|n| !active_names.contains(n.name.as_str()))
-                    .collect();
-                for net in &inactive {
-                    println!();
-                    println!(
-                        "  {}  {}",
-                        style::faint(&net.name),
-                        style::marker("inactive")
-                    );
-                }
+            // Saved networks the daemon never registered. The list comes from the
+            // daemon: reading config here resolves the *calling user's* config
+            // directory, which is empty (and gets created) wherever the daemon's
+            // is root-owned, so every failed restore rendered as no mention at all.
+            for net in &inactive_networks {
+                println!();
+                print!("{}", inactive_network_block(net));
             }
+
+            print_nearby(&lan_peers);
 
             print_pending_summary(&networks, pending_files, pending_connects);
 
@@ -259,37 +303,126 @@ pub(crate) async fn ipc_status() -> Result<()> {
             }
             println!();
         }
-        ipc::IpcMessage::Error { message } => print_error("status failed", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("status failed", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
+}
+
+/// How many LAN neighbours `ray status` lists before deferring to `ray mdns
+/// scan`. A busy office LAN shouldn't push your networks off the screen.
+const NEARBY_SHOWN: usize = 5;
+
+/// Render the "nearby" block: rayfish nodes seen on this LAN that we are not
+/// already on a network with. Prints nothing when there are none, so the common
+/// case (no strangers around) leaves status exactly as it was.
+fn print_nearby(peers: &[ipc::LanPeerInfo]) {
+    if peers.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "  {}  {}",
+        style::bold("nearby"),
+        style::faint("(on this LAN, not connected)")
+    );
+    let rows = peers
+        .iter()
+        .take(NEARBY_SHOWN)
+        .map(|p| {
+            let addrs = if p.addrs.is_empty() {
+                "—".to_string()
+            } else {
+                p.addrs.join(", ")
+            };
+            let seen = format!("{}s", p.last_seen_secs);
+            vec![
+                layout::Cell::new(p.short_id.clone(), style::rose(&p.short_id)),
+                layout::Cell::new(addrs.clone(), style::value(&addrs)),
+                layout::Cell::right(seen.clone(), style::faint(&seen)),
+            ]
+        })
+        .collect();
+    print!("{}", table(&["peer", "addresses", "seen"], rows, 4));
+    if peers.len() > NEARBY_SHOWN {
+        println!(
+            "    {}",
+            style::faint(&format!(
+                "and {} more — see them with: ray mdns scan",
+                peers.len() - NEARBY_SHOWN
+            ))
+        );
+    }
+    println!(
+        "    {}",
+        style::faint("link up with: ray connect <peer> (they approve it)")
+    );
 }
 
 /// Render one network block: header (name · role · dns · ip · member count),
 /// the aligned peer table, and the shareable join code (suppressed for direct
 /// `ray connect` networks).
-fn print_network(net: &ipc::NetworkStatus) {
+/// The block for one saved network the daemon has not registered, ending in a
+/// newline.
+///
+/// The marker alone reads like a setting rather than a fault. This state is
+/// always a failed restore: the network is saved but the daemon never registered
+/// it, so peers on it are unreachable and their packets are dropped as an unknown
+/// network. Say that, say the daemon is working on it, and give the reason when
+/// the daemon has one, so this doesn't read as something the user has to go fix.
+fn inactive_network_block(net: &ipc::InactiveNetwork) -> String {
+    let mut out = format!(
+        "  {}  {}\n",
+        style::faint(&net.name),
+        style::marker("inactive")
+    );
+    out.push_str(&format!(
+        "    {}\n",
+        style::faint(
+            "saved but not connected: peers on it are unreachable. The daemon keeps retrying."
+        )
+    ));
+    if let Some(ref reason) = net.reason {
+        out.push_str(&format!(
+            "    {} {}\n",
+            style::label("reason"),
+            style::faint(reason)
+        ));
+    }
+    out
+}
+
+/// A network's header block: the name/role/address line, plus the line that says
+/// why nothing on it works when the network runs a mesh protocol version this
+/// build does not speak.
+///
+/// Built as a string rather than printed so the flags can be tested, the way the
+/// peer rows already are.
+fn network_header(net: &ipc::NetworkStatus) -> String {
+    use std::fmt::Write as _;
+
     let role = net.role.to_string();
-    // Just the hostname: the network name is already the block header, so the
-    // `.{network}.ray` suffix would only repeat it.
-    let dns_name = net.my_hostname.clone();
     // member count (self excluded) belongs on the network header row. Reachable =
     // active + idle (everything not confirmed offline); on-demand nodes hold no
     // connections when idle, so counting only live connections would read "0/N".
     let reachable = net.peers.iter().filter(|p| !p.state.is_offline()).count();
-    println!();
-    print!("  {}  {}", style::bold(&net.name), style::marker(&role));
-    if let Some(ref dns) = dns_name {
-        print!("   {}", style::value(dns));
+    let mut out = format!("  {}  {}", style::bold(&net.name), style::marker(&role));
+    // Just the hostname: the network name is already the block header, so the
+    // `.{network}.ray` suffix would only repeat it.
+    if let Some(ref dns) = net.my_hostname {
+        let _ = write!(out, "   {}", style::value(dns));
     }
-    print!("   {}", style::faint(&net.my_ip.to_string()));
-    print!(
+    let my_addr = net.my_ipv6.to_string();
+    let _ = write!(out, "   {}", style::faint(&my_addr));
+    let _ = write!(
+        out,
         "   {} {}",
         style::label("members"),
         style::value(&format!("{reachable}/{}", net.peers.len())),
     );
     if let Some(ttl) = net.ephemeral_ttl_secs {
-        print!(
+        let _ = write!(
+            out,
             "   {} {}",
             style::label("ephemeral"),
             style::value(&format_ttl(ttl)),
@@ -298,12 +431,34 @@ fn print_network(net: &ipc::NetworkStatus) {
     // Both exit-node roles are worth seeing at a glance: the peer carrying our
     // internet traffic, and whether we are carrying someone else's.
     if let Some(ref gw) = net.my_exit_node {
-        print!("   {} {}", style::label("exit via"), style::value(gw));
+        let _ = write!(out, "   {} {}", style::label("exit via"), style::value(gw));
     }
     if net.exit_offering {
-        print!("   {}", style::marker("exit node"));
+        let _ = write!(out, "   {}", style::marker("exit node"));
     }
+    // A version-incompatible network is registered but carries nothing: its
+    // roster came from the signed blob, and the versioned mesh ALPN refuses
+    // every dial on it. The marker mirrors the one on an incompatible peer row,
+    // and the line under it names both versions, since "incompatible" alone
+    // doesn't say which side is behind.
+    if let Some(ref m) = net.incompatible {
+        let _ = write!(out, "   {}", style::red("incompatible"));
+        let _ = write!(
+            out,
+            "\n    {}",
+            style::faint(&format!(
+                "runs mesh protocol v{}, this build speaks v{}: no peer on it is reachable. \
+                 Run `ray update` so both sides match.",
+                m.network, m.ours
+            )),
+        );
+    }
+    out
+}
+
+fn print_network(net: &ipc::NetworkStatus) {
     println!();
+    println!("{}", network_header(net));
 
     // Invert the local alias map (alias -> identity) for identity -> alias
     // lookups when rendering peers.
@@ -535,7 +690,12 @@ fn device_row(
     up_w: usize,
     down_w: usize,
 ) -> Vec<layout::Cell> {
-    let base = peer.hostname.clone().unwrap_or_else(|| peer.ip.to_string());
+    // The address column is the peer's mesh IPv6, which is the only address it
+    // can be reached on and the one people copy into `ssh` and `ping`. It is
+    // three times the width of the dotted quad it replaces: wider rows are the
+    // price, a wrong address is not.
+    let addr = peer.ipv6.to_string();
+    let base = peer.hostname.clone().unwrap_or_else(|| addr.clone());
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
         None => base,
@@ -558,7 +718,7 @@ fn device_row(
         format!("{prefix}{glyph_plain} {host}"),
         format!("{prefix}{glyph_styled} {}", host_style(&host)),
     );
-    let ip = layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string()));
+    let ip = layout::Cell::new(addr.clone(), style::faint(&addr));
     let mut cells = match &peer.connection {
         Some(ci) => {
             let via = match ci.conn_type {
@@ -665,7 +825,7 @@ fn print_pending_summary(
         pending.push((
             pending_connects,
             pluralize(pending_connects, "connection request"),
-            "ray connections".to_string(),
+            "ray connect".to_string(),
         ));
     }
     if pending.is_empty() {
@@ -696,8 +856,8 @@ pub(crate) async fn ipc_down() -> Result<()> {
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -736,8 +896,8 @@ pub(crate) async fn ipc_report() -> Result<()> {
                 println!("\nCouldn't open a browser. Open this URL manually:\n{url}");
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -770,15 +930,14 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod grouping_tests {
-    use std::net::Ipv4Addr;
 
     use super::*;
 
@@ -804,8 +963,7 @@ mod grouping_tests {
     ) -> ipc::PeerStatus {
         ipc::PeerStatus {
             endpoint_id: iroh::SecretKey::generate().public(),
-            ip: Ipv4Addr::new(100, 64, 0, 2),
-            ipv6: None,
+            ipv6: "200::2".parse().unwrap(),
             hostname: Some(host.to_string()),
             user_identity: user,
             is_own_device: own,
@@ -828,8 +986,7 @@ mod grouping_tests {
         ipc::NetworkStatus {
             name: "n".to_string(),
             role: ipc::NetworkRole::Coordinator,
-            my_ip: Ipv4Addr::new(100, 64, 0, 1),
-            my_ipv6: None,
+            my_ipv6: "200::1".parse().unwrap(),
             my_hostname: Some(my_hostname.to_string()),
             network_key: None,
             member_count: peers.len(),
@@ -840,6 +997,7 @@ mod grouping_tests {
             ephemeral_ttl_secs: None,
             my_exit_node: None,
             exit_offering: false,
+            incompatible: None,
         }
     }
 
@@ -852,7 +1010,7 @@ mod grouping_tests {
         let me = iroh::SecretKey::generate().public();
         // Two of my devices (one online, one offline) plus a standalone member.
         let net = net(
-            "dario",
+            "laptop",
             vec![
                 peer("phone", Some(me), true, true, false),
                 peer("tablet", Some(me), true, false, false),
@@ -861,15 +1019,29 @@ mod grouping_tests {
         );
         let out = render(&net);
         // Parent row labelled by my hostname with a rollup, and a tree branch.
-        assert!(out.contains("dario"), "{out}");
+        assert!(out.contains("laptop"), "{out}");
         assert!(out.contains("2 devices, 1 online"), "{out}");
         assert!(out.contains("└─"), "{out}");
         // Parent sits before its devices; connected device before the offline one.
         let at = |s: &str| out.find(s).unwrap();
-        assert!(at("dario") < at("phone"));
+        assert!(at("laptop") < at("phone"));
         assert!(at("phone") < at("tablet"));
         // Standalone member still renders flat.
         assert!(out.contains("server"));
+    }
+
+    /// The address column has to be one this node can send to, and the mesh
+    /// IPv6 is the only one there is. It is also the column people copy into
+    /// `ssh`, so a stale IPv4 here would be worse than a wide row.
+    #[test]
+    fn peer_rows_carry_the_reachable_address() {
+        let mut p = peer("dev", None, false, true, false);
+        p.ipv6 = "200::9".parse().unwrap();
+        let net = net("laptop", vec![p]);
+
+        let out = render(&net);
+        assert!(out.contains("200::9"), "{out}");
+        assert!(!out.contains("100.64."), "{out}");
     }
 
     #[test]
@@ -877,13 +1049,12 @@ mod grouping_tests {
         // Viewing a *foreign* user whose primary device is itself a visible member
         // (endpoint id == user identity) plus one paired secondary. The primary
         // must anchor the group on its own row, not appear once flat and once as a
-        // separate rollup header (the `dario ... / dario ...` duplication bug).
-        let dario = iroh::SecretKey::generate().public();
+        // separate rollup header (the `laptop ... / laptop ...` duplication bug).
+        let laptop = iroh::SecretKey::generate().public();
         let primary = ipc::PeerStatus {
-            endpoint_id: dario,
-            ip: Ipv4Addr::new(100, 64, 0, 3),
-            ipv6: None,
-            hostname: Some("dario".to_string()),
+            endpoint_id: laptop,
+            ipv6: "200::3".parse().unwrap(),
+            hostname: Some("laptop".to_string()),
             user_identity: None,
             is_own_device: false,
             incompatible: false,
@@ -892,17 +1063,17 @@ mod grouping_tests {
             exit_node: false,
             exit_in_use: false,
         };
-        let secondary = peer("sm-f966b", Some(dario), false, false, false);
+        let secondary = peer("sm-f966b", Some(laptop), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);
         let out = render(&net);
 
-        // "dario" is named exactly once, and there is no synthetic rollup header.
-        assert_eq!(out.matches("dario").count(), 1, "{out}");
+        // "laptop" is named exactly once, and there is no synthetic rollup header.
+        assert_eq!(out.matches("laptop").count(), 1, "{out}");
         assert!(!out.contains("device"), "unexpected rollup header:\n{out}");
         // The secondary nests under the primary's row.
         assert!(out.contains("└─"), "{out}");
         let at = |s: &str| out.find(s).unwrap();
-        assert!(at("dario") < at("sm-f966b"), "{out}");
+        assert!(at("laptop") < at("sm-f966b"), "{out}");
     }
 
     #[test]
@@ -916,7 +1087,7 @@ mod grouping_tests {
         in_use.exit_node = true;
         in_use.exit_in_use = true;
         let plain = peer("srv", None, false, true, false);
-        let out = render(&net("dario", vec![offering, in_use, plain]));
+        let out = render(&net("laptop", vec![offering, in_use, plain]));
         let row = |host: &str| {
             out.lines()
                 .find(|l| l.contains(host))
@@ -935,7 +1106,7 @@ mod grouping_tests {
 
     #[test]
     fn flags_incompatible_offline_peer() {
-        let net = net("dario", vec![peer("oldbox", None, false, false, true)]);
+        let net = net("laptop", vec![peer("oldbox", None, false, false, true)]);
         let out = render(&net);
         assert!(out.contains("oldbox"));
         assert!(out.contains("incompatible"), "{out}");
@@ -943,10 +1114,65 @@ mod grouping_tests {
         assert!(!out.contains("offline"), "{out}");
     }
 
+    /// A network whose record advertises a mesh version this build doesn't speak
+    /// registers from its signed blob but carries nothing, so the header has to
+    /// say so. Rendering it as an ordinary network is how a mesh that moved on
+    /// without you looks exactly like one that works.
+    #[test]
+    fn flags_an_incompatible_network() {
+        let mut n = net("laptop", vec![peer("oldbox", None, false, false, true)]);
+        n.incompatible = Some(ipc::MeshVersionMismatch {
+            network: 2,
+            ours: 4,
+        });
+        let out = network_header(&n);
+        assert!(out.contains("incompatible"), "{out}");
+        // Both versions, so the reader can tell which side is behind.
+        assert!(out.contains("v2"), "{out}");
+        assert!(out.contains("v4"), "{out}");
+        assert!(out.contains("ray update"), "{out}");
+    }
+
+    /// The same header on a healthy network carries none of that.
+    #[test]
+    fn a_compatible_network_header_carries_no_version_flag() {
+        let out = network_header(&net("laptop", vec![peer("srv", None, false, true, false)]));
+        assert!(!out.contains("incompatible"), "{out}");
+        assert!(!out.contains("ray update"), "{out}");
+    }
+
+    /// A saved network the daemon never registered still has to appear. The
+    /// daemon reports it (the CLI cannot read the daemon's config: on macOS it
+    /// is root-owned and `ray status` runs as someone else), and the reason it
+    /// carries is what the reader would otherwise have to go find in the log.
+    #[test]
+    fn lists_a_saved_network_the_daemon_never_registered() {
+        let out = inactive_network_block(&ipc::InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: Some("runs mesh protocol v2, this build speaks v4".to_string()),
+        });
+        assert!(out.contains("homelab"), "{out}");
+        assert!(out.contains("inactive"), "{out}");
+        assert!(out.contains("peers on it are unreachable"), "{out}");
+        assert!(out.contains("runs mesh protocol v2"), "{out}");
+    }
+
+    /// Before the first attempt fails there is no reason to give, and an empty
+    /// `reason` line would read as one.
+    #[test]
+    fn an_inactive_network_without_a_reason_prints_no_reason_line() {
+        let out = inactive_network_block(&ipc::InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: None,
+        });
+        assert!(out.contains("homelab"), "{out}");
+        assert!(!out.contains("reason"), "{out}");
+    }
+
     #[test]
     fn single_device_group_reads_singular() {
         let me = iroh::SecretKey::generate().public();
-        let net = net("dario", vec![peer("phone", Some(me), true, true, false)]);
+        let net = net("laptop", vec![peer("phone", Some(me), true, true, false)]);
         let out = render(&net);
         assert!(out.contains("1 device, 1 online"), "{out}");
     }

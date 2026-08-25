@@ -60,7 +60,7 @@ on "$B" "ray join $INV_B --hostname srv-b" 2>&1 | strip | sed 's/^/   b| /'
 on "$C" "ray join $INV_C --hostname srv-c --auto-accept-firewall" 2>&1 | strip | sed 's/^/   c| /'
 wait_roster "$A" srv-b srv-c
 
-A_IP="$(my_ip4 "$A" "$NET")"; B_IP="$(my_ip4 "$B" "$NET")"; C_IP="$(my_ip4 "$C" "$NET")"
+A_IP="$(my_ip "$A" "$NET")"; B_IP="$(my_ip "$B" "$NET")"; C_IP="$(my_ip "$C" "$NET")"
 echo "   A_IP=$A_IP  B_IP=$B_IP  C_IP=$C_IP"
 [[ -n "$A_IP" && -n "$B_IP" && -n "$C_IP" ]] || { fail "missing a VPN ip"; summary; }
 

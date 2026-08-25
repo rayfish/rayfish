@@ -2,11 +2,15 @@ package xyz.rayfish.android
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Node
@@ -52,9 +56,8 @@ object NodeHolder {
     // Standby is now the default: disabling Rayfish drops the data plane (TUN,
     // VPN slot) but keeps the control plane connected, so file send and receive
     // keep working and the device stays visible in the mesh. The motivating case
-    // is running another VPN (Android allows only one VpnService at a time, and
-    // our tunnel claims the same 100.64.0.0/10 range Tailscale uses), so the
-    // tunnel goes away and only the data plane goes with it.
+    // is running another VPN (Android allows only one VpnService at a time), so
+    // the tunnel goes away and only the data plane goes with it.
     //
     // This key is an escape hatch for a user who wants disabling Rayfish to take
     // the device fully offline instead. Default false (standby). This is a NEW
@@ -66,15 +69,55 @@ object NodeHolder {
     // SharedPreferences is inert.
     private const val KEY_GO_OFFLINE_WHEN_DISABLED = "go_offline_when_disabled"
 
+    /**
+     * The one prefs file this app uses. Held once rather than looked up per call:
+     * the first getSharedPreferences in a process parses the XML off disk
+     * synchronously, and several of the call sites below run on the main thread.
+     */
+    fun prefs(context: Context) =
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    // The two flags [RayfishVpnService.onStartCommand] and onRevoke read on the
+    // main thread, cached in memory.
+    //
+    // Worth being precise about what this does and does not buy, because the
+    // obvious claim is wrong: it is NOT what keeps the disk read off the main
+    // thread. Application.onCreate reads this same prefs file (crash reporting
+    // has to be initialized before anything can crash), and getBoolean blocks on
+    // the file's load latch, so the one synchronous load is already paid on the
+    // main thread at process start, before any service can run. By the time
+    // onStartCommand reads these, the framework's own cache is warm.
+    //
+    // What it does buy: the service paths stop depending on that ordering
+    // holding, and [warm] gives the load a chance to happen on a background
+    // thread first. A read that beats the warm-up falls through to disk and is
+    // correct, just slower, so this is only ever an optimisation.
+    //
+    // Safe to cache because this process is the only writer (MODE_PRIVATE, single
+    // process) and every write goes through the setters below, which update the
+    // cache in the same call.
+    @Volatile
+    private var enabledCache: Boolean? = null
+
+    @Volatile
+    private var goOfflineCache: Boolean? = null
+
+    /**
+     * Load the main-thread-read prefs into memory. Does disk I/O, so call it off
+     * the main thread; [RayfishApplication] does at process start. Idempotent.
+     */
+    fun warm(context: Context) {
+        val p = prefs(context)
+        enabledCache = p.getBoolean(KEY_ENABLED, false)
+        goOfflineCache = p.getBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, false)
+    }
+
     fun isEnabled(context: Context): Boolean =
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_ENABLED, false)
+        enabledCache ?: prefs(context).getBoolean(KEY_ENABLED, false).also { enabledCache = it }
 
     fun setEnabled(context: Context, value: Boolean) {
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_ENABLED, value).apply()
+        enabledCache = value
+        prefs(context).edit().putBoolean(KEY_ENABLED, value).apply()
     }
 
     fun isAutoAcceptOwnDevices(context: Context): Boolean =
@@ -89,14 +132,13 @@ object NodeHolder {
     }
 
     fun isGoOfflineWhenDisabled(context: Context): Boolean =
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, false)
+        goOfflineCache
+            ?: prefs(context).getBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, false)
+                .also { goOfflineCache = it }
 
     fun setGoOfflineWhenDisabled(context: Context, value: Boolean) {
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, value).apply()
+        goOfflineCache = value
+        prefs(context).edit().putBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, value).apply()
     }
 
     fun isCrashReportingEnabled(context: Context): Boolean =
@@ -164,10 +206,21 @@ object NodeHolder {
         withContext(Dispatchers.IO) {
             synchronized(this@NodeHolder) {
                 if (!started) {
-                    // Register Android's trust store before start(): building the
-                    // iroh endpoint sets up TLS, which fails without it.
-                    RustlsInit.ensureInitialized(context)
-                    get(context).start()
+                    try {
+                        // Register Android's trust store before start(): building
+                        // the iroh endpoint sets up TLS, which fails without it.
+                        RustlsInit.ensureInitialized(context)
+                        get(context).start()
+                    } catch (t: Throwable) {
+                        // A node that will not start leaves the device offline in
+                        // the mesh with nothing in the UI to say why, and every
+                        // caller here only logs and moves on. Report it (throttled,
+                        // and only if crash reporting is on) so it is visible
+                        // without the user having to send diagnostics by hand.
+                        Log.e(TAG, "node start failed", t)
+                        runCatching { Telemetry.captureStartFailure(context, t) }
+                        throw t
+                    }
                     seedDeviceName(context)
                     registerNetworkCallback(context)
                     started = true
@@ -190,6 +243,13 @@ object NodeHolder {
      * Lives with the node's lifecycle, so it also covers standby, where the
      * control plane is the only thing running and nothing else would notice.
      * networkChanged() is idempotent and cheap, so the callback stays dumb.
+     *
+     * onAvailable/onLost alone are not enough, which is what made a phone that
+     * had moved stay disconnected: the default Network object survives a Wi-Fi
+     * roam between access points, a DHCP renew, an IPv6 prefix change and
+     * captive-portal validation, so none of those fire either callback. They
+     * fire onLinkPropertiesChanged / onCapabilitiesChanged instead, and the
+     * addresses under the endpoint have changed all the same.
      */
     private fun registerNetworkCallback(context: Context) {
         if (networkCallback != null) return
@@ -198,11 +258,13 @@ object NodeHolder {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) = notifyCore("available", network)
             override fun onLost(network: Network) = notifyCore("lost", network)
+            override fun onLinkPropertiesChanged(network: Network, props: LinkProperties) =
+                notifyCore("link properties changed", network)
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+                notifyCore("capabilities changed", network)
             private fun notifyCore(event: String, network: Network) {
                 Log.i(TAG, "default network $event ($network); notifying core")
-                // The FFI call blocks briefly on the core runtime; keep it off
-                // Android's connectivity thread.
-                netScope.launch { runCatching { node?.networkChanged() } }
+                scheduleNotify()
             }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb) }
@@ -210,7 +272,45 @@ object NodeHolder {
             .onFailure { Log.w(TAG, "network callback registration failed", it) }
     }
 
+    /**
+     * Coalesce a burst of callbacks into one rebind. A single network switch
+     * fires several of them within a few hundred milliseconds (available, then
+     * capabilities, then link properties, often more than once as validation
+     * completes), and each networkChanged() is a full endpoint rebind and path
+     * re-probe. The last one in the burst is the one that sees the settled
+     * addresses, so waiting for the burst to stop is both cheaper and more
+     * accurate than acting on the first.
+     *
+     * The delay also keeps this off Android's connectivity thread, which the FFI
+     * call must never block.
+     */
+    private const val NETWORK_DEBOUNCE_MS = 400L
+
+    /**
+     * Guards [notifyJob] only. Deliberately not this object's own monitor: these
+     * callbacks arrive on Android's connectivity thread, and [ensureStarted] /
+     * [stopNode] hold that monitor across blocking FFI calls, so sharing it would
+     * park a system thread behind a node start.
+     */
+    private val notifyLock = Any()
+
+    private var notifyJob: Job? = null
+
+    private fun scheduleNotify() {
+        synchronized(notifyLock) {
+            notifyJob?.cancel()
+            notifyJob = netScope.launch {
+                delay(NETWORK_DEBOUNCE_MS)
+                runCatching { node?.networkChanged() }
+            }
+        }
+    }
+
     private fun unregisterNetworkCallback(context: Context) {
+        synchronized(notifyLock) {
+            notifyJob?.cancel()
+            notifyJob = null
+        }
         val cb = networkCallback ?: return
         networkCallback = null
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
@@ -223,9 +323,10 @@ object NodeHolder {
      * [ensureStarted] rebuilds a fresh daemon. Safe to call when never started.
      *
      * The reset calls below deliberately run after the monitor is released:
-     * [TransferNotifier.reset] and [FileAutoAccept.reset] take their own locks,
-     * and neither is ever called from inside this object's monitor, so there is
-     * no path back into this monitor from theirs to deadlock against.
+     * [TransferNotifier.reset], [OfferNotifier.reset] and [FileAutoAccept.reset]
+     * take their own locks, and none of them is ever called from inside this
+     * object's monitor, so there is no path back into this monitor from theirs
+     * to deadlock against.
      */
     fun stopNode(context: Context) {
         synchronized(this) {
@@ -238,6 +339,7 @@ object NodeHolder {
         // transfer or offer landing on a reused id is never muted (or, for a
         // given-up offer, wrongly left un-hidden) by a stale entry.
         TransferNotifier.reset(context)
+        OfferNotifier.reset(context)
         FileAutoAccept.reset()
     }
 

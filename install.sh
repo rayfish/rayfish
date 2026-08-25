@@ -5,9 +5,10 @@
 #   curl -fsSL https://rayfish.xyz/install.sh | sh
 #
 # Options (env vars):
-#   INSTALL_DIR      target dir (default: /usr/local/bin)
-#   RAY_VERSION      pin a release tag, e.g. v0.1.0 (default: latest)
-#   RAY_SKIP_VERIFY  set to 1 to install without checksum verification
+#   INSTALL_DIR           target dir (default: /usr/local/bin)
+#   RAY_VERSION           pin a release tag, e.g. v0.1.0 (default: latest)
+#   RAY_SKIP_VERIFY       set to 1 to install without checksum verification
+#   RAY_SKIP_COMPLETIONS  set to 1 to leave shell completions alone
 #
 # This file is the canonical copy. rayfish.xyz serves a byte-identical copy from
 # the public-www repo, and its CI fails if the two drift.
@@ -24,6 +25,7 @@ BIN="ray"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${RAY_VERSION:-latest}"
 SKIP_VERIFY="${RAY_SKIP_VERIFY:-0}"
+SKIP_COMPLETIONS="${RAY_SKIP_COMPLETIONS:-0}"
 
 if [ -t 1 ]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -137,6 +139,24 @@ existing_ancestor() {
   echo "$d"
 }
 
+# Set up tab completion, so it is there before anyone runs `sudo ray up`.
+#
+# The binary knows every path involved, so this is one call rather than a list
+# of directories that would then have to be kept in step with the Rust side.
+# With the sudo we already took ($1), it writes the system-wide files every
+# shell searches by default; without one, the per-user files. Best-effort
+# either way: nobody ran an installer to get tab completion, and a read-only
+# /usr must not turn a working install into a failed one.
+install_completions() {
+  if [ "$SKIP_COMPLETIONS" = "1" ]; then
+    return 0
+  fi
+  if $1 "$INSTALL_DIR/$BIN" completions --install >/dev/null 2>&1; then
+    ok "tab completion installed"
+  fi
+  return 0
+}
+
 main() {
   local asset base url sudo=""
   detect_asset
@@ -189,6 +209,8 @@ Refusing to install an unverified binary. Set RAY_SKIP_VERIFY=1 to override."
   $sudo install -m 0755 "$TMP/$BIN" "$INSTALL_DIR/$BIN"
 
   ok "Installed $("$INSTALL_DIR/$BIN" --version 2>/dev/null || echo "$BIN") to $INSTALL_DIR/$BIN"
+
+  install_completions "$sudo"
 
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;

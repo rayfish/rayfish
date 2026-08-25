@@ -26,6 +26,8 @@ jobs:
           shared-key: "ci"
           cache-on-failure: true
 
+      # `--workspace`: ray-proto and ray-mobile are members, and a root-package
+      # build never compiles their tests, so one of them had already gone stale.
       - name: Check
         run: cargo check --workspace --all-targets --locked
 
@@ -34,3 +36,86 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  # Same gap the Android job closes, for the other platform whose code no Linux
+  # build compiles: the TUN/route/DNS backends are per-OS `cfg` branches, and
+  # macOS was only ever built on release, where a break costs a failed tag.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "macos-ci"
+          cache-on-failure: true
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # The APK is built on release, which is too late: the Android half of the tree
+  # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
+  # neither is compiled by the job above, so a PR could go green and break the
+  # tag build. This is the cheap version of that: no APK, no release link, no NDK
+  # download (the runner ships one), just the two things that actually broke.
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "android-ci"
+          cache-on-failure: true
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # The Android-only code paths (the VpnService TUN) compile nowhere else.
+      - name: Check the Android target
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk -t arm64-v8a check -p ray-mobile --locked
+
+      - name: Regenerate the UniFFI bindings
+        run: |
+          cargo build -p ray-mobile
+          cargo run -p ray-mobile --bin uniffi-bindgen -- generate \
+            --library target/debug/libray_mobile.so \
+            --language kotlin \
+            --out-dir android/app/src/main/java
+
+      # A stale committed copy means the app compiles here and not from a fresh
+      # checkout of the same commit, so it is a failure, not a fixup.
+      - name: Bindings are up to date
+        run: git diff --exit-code android/app/src/main/java/uniffi/ray_mobile/ray_mobile.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # `-x cargoNdkBuild` skips the native cross-build: the .so is not linked
+      # into anything here, and the step above already compiled that code.
+      - name: Compile the app
+        working-directory: android
+        run: ./gradlew :app:compileDebugKotlin -x cargoNdkBuild

@@ -1,0 +1,22 @@
+# Cross build container for the Android targets, on cross's pinned 0.2.5 images
+# rather than the moving `:main` tag, so a build here is reproducible.
+#
+# Those images carry NDK r21 (clang 9), which predates the NDK's own libunwind:
+# it ships unwinding in libgcc instead. Rust's android std has linked `-lunwind`
+# since 1.68, so every link fails with `cannot find -lunwind` before reaching our
+# code. Point that name at libgcc with a one-line linker script, the same fix the
+# NDK itself used during the r23 transition.
+#
+# `CROSS_BASE_IMAGE` is set by cross per target, so one file serves both ABIs
+# (arm64-v8a and x86_64, matching the APK's `abiFilters`).
+ARG CROSS_BASE_IMAGE
+FROM $CROSS_BASE_IMAGE
+
+RUN set -eu; \
+    found=0; \
+    for dir in /android-ndk/lib*/gcc/*/4.9.x; do \
+        [ -f "$dir/libgcc.a" ] || continue; \
+        echo 'INPUT(-lgcc)' > "$dir/libunwind.a"; \
+        found=1; \
+    done; \
+    [ "$found" = 1 ] || { echo "no NDK gcc lib dir to shim libunwind into"; exit 1; }

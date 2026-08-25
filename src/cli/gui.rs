@@ -48,6 +48,10 @@ pub(crate) fn cmd_gui(port: u16, no_open: bool) -> Result<()> {
         let exe = exe.clone();
         match stream {
             Ok(stream) => {
+                // Loopback, so Nagle costs far less here than it does on the
+                // mesh, but this serves small request/response HTTP the same
+                // way and there is no reason to wait on a coalescing timer.
+                let _ = stream.set_nodelay(true);
                 std::thread::spawn(move || {
                     if let Err(err) = handle_client(stream, &token, &exe) {
                         eprintln!("gui request failed: {err:#}");
@@ -108,8 +112,12 @@ fn prepare_ray_args(mut args: Vec<String>, json: bool) -> Result<Vec<String>> {
     if matches!(command, Some("gui" | "daemon")) {
         anyhow::bail!("the GUI cannot run `{}`", command.unwrap());
     }
-    if json && !args.iter().any(|arg| arg == "--json") {
-        args.insert(0, "--json".into());
+    // Appended, not prepended: `--json` is declared per-command now, so the
+    // leading `ray --json <cmd>` form no longer parses. It is also only accepted
+    // by the commands that render JSON, so a command that takes none is left
+    // alone rather than handed a flag that would fail to parse.
+    if json && command.is_some_and(help::supports_json) && !args.iter().any(|arg| arg == "--json") {
+        args.push("--json".into());
     }
     Ok(args)
 }
@@ -274,9 +282,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepare_args_strips_binary_name_and_inserts_json() {
+    fn prepare_args_strips_binary_name_and_appends_json() {
         let args = prepare_ray_args(vec!["ray".into(), "status".into()], true).unwrap();
-        assert_eq!(args, ["--json", "status"]);
+        assert_eq!(args, ["status", "--json"]);
+    }
+
+    /// `--json` is declared per-command, so it has to trail the subcommand: the
+    /// old leading form this used to build is now a parse error.
+    #[test]
+    fn prepare_args_appends_json_after_a_nested_action() {
+        let args = prepare_ray_args(vec!["firewall".into(), "show".into()], true).unwrap();
+        assert_eq!(args, ["firewall", "show", "--json"]);
+    }
+
+    /// A command that renders no JSON must be left alone. Handing it `--json`
+    /// would now fail to parse instead of being quietly ignored.
+    #[test]
+    fn prepare_args_leaves_json_off_commands_that_do_not_take_it() {
+        let args = prepare_ray_args(vec!["up".into()], true).unwrap();
+        assert_eq!(args, ["up"]);
     }
 
     #[test]

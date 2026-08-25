@@ -21,17 +21,18 @@ IP (the multi-homed-peer model). The test pings and `ray send`s between srv-c an
 
 ## Prerequisites
 
-- `scw` authenticated (`scw account project list` should work).
+- `doctl` authenticated (`doctl account get` should work).
 - `jq` installed.
 - Docker running (used by `cross` for the x86_64-linux build behind `just deploy`).
-- Your `~/.ssh/id_ed25519` public key registered in the Scaleway account (so the
-  instances accept `root@<ip>`). Override the key with `SSH_KEY=...`.
+- An SSH key on the DigitalOcean account (so the droplets accept `root@<ip>`).
+  The provisioner attaches every key on the account; override the key the runner
+  connects with via `SSH_KEY=...`.
 
 ## Run
 
 ```bash
 tests/e2e.sh device-cert            # provision (if needed) + deploy + pair + create/join + assert
-tests/e2e.sh device-cert provision  # just create 3 DEV1-S Ubuntu instances in fr-par-1
+tests/e2e.sh device-cert provision  # just create 3 Ubuntu droplets in fra1
 tests/e2e.sh device-cert teardown   # destroy the instances when done (manual)
 ```
 
@@ -63,9 +64,9 @@ can also invoke `tests/e2e/device-cert/run.sh` directly once `.servers` exists.
 
 | Var      | Default      | Meaning                         |
 |----------|--------------|---------------------------------|
-| `ZONE`   | `fr-par-1`   | Scaleway zone                   |
-| `TYPE`   | `DEV1-S`     | instance type                   |
-| `IMAGE`  | `ubuntu_jammy` | instance image label          |
+| `REGION` | `fra1`       | droplet region                  |
+| `SIZE`   | `s-1vcpu-1gb` | droplet size slug              |
+| `IMAGE`  | `ubuntu-22-04-x64` | droplet image slug        |
 | `SSH_KEY`| `~/.ssh/id_ed25519` | private key for `root@<ip>` |
 
 ## What it asserts

@@ -1,7 +1,6 @@
 //! Pure decision helpers for the join/gossip paths: coordinator dial order,
-//! gossip targets, dial-fallback outcome selection, persisted-roster fallback,
-//! and connection-path classification. No I/O, so these are unit-tested directly
-//! (see the tests in `daemon/mod.rs`).
+//! gossip targets, and connection-path classification. No I/O, so these are unit
+//! tested directly (see the tests in `daemon/mod.rs`).
 
 use super::super::*;
 
@@ -37,32 +36,6 @@ pub(crate) fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<Endpoint
         .filter(|m| m.is_coordinator && m.identity != me)
         .map(|m| m.identity)
         .collect()
-}
-
-/// Last-known roster from persisted config. Used only as a fallback when the
-/// signed pkarr record is briefly unreachable during a reconnect, never trusts
-/// peer-supplied membership.
-pub(crate) fn persisted_roster(network_name: &str) -> Vec<Member> {
-    config::load()
-        .ok()
-        .and_then(|c| c.networks.into_iter().find(|n| n.name == network_name))
-        .map(|n| {
-            n.members
-                .into_iter()
-                .map(|m| Member {
-                    identity: m.identity,
-                    ip: m.ip,
-                    is_coordinator: m.is_coordinator,
-                    hostname: m.hostname,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                    last_seen: None,
-                    exit_node: false,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Rebuild a network's DNS entries from its member roster (the single source of

@@ -8,8 +8,8 @@
 # Open networks form a full mesh: once everyone has joined, every pair holds a
 # direct QUIC connection. We then probe every unordered pair in BOTH directions,
 # over two paths:
-#   - direct   : the host's PUBLIC IP (raw Scaleway link, the baseline)
-#   - rayfish  : the peer's 100.64.x.x TUN IP (iroh QUIC datagrams over the VPN)
+#   - direct   : the host's PUBLIC IP (raw provider link, the baseline)
+#   - rayfish  : the peer's 200::/7 TUN IP (iroh QUIC datagrams over the VPN)
 #
 # Three probes per direction, each run over both paths:
 #   - ICMP burst : ping -c $PING_COUNT  -i 0.01      (100 pps)
@@ -125,7 +125,7 @@ ROOM="$(echo "$CREATE" | sed -n 's/.*ray join \([A-Za-z0-9]\{20,\}\).*/\1/p' | h
 
 # Join without --name so the joiner keeps the coordinator's network name
 # ($NET); --hostname sets the roster/DNS identity. (--name would locally rename
-# the network and break `my_ip4 <ip> $NET` lookups below.)
+# the network and break `my_ip <ip> $NET` lookups below.)
 for i in 1 2 3; do
   L="${HOSTS[$i]}"
   on "${PUBS[$i]}" "ray join $ROOM --hostname $L" 2>&1 | strip | sed "s/^/   ${L#srv-}| /"
@@ -138,9 +138,9 @@ for i in "${!HOSTS[@]}"; do
   wait_roster "${PUBS[$i]}" "${others[@]}"
 done
 
-# Resolve every node's own VPN IPv4 (the address peers reach it at over the TUN).
+# Resolve every node's own mesh IPv6 (the address peers reach it at over the TUN).
 for i in "${!HOSTS[@]}"; do
-  VPNS[$i]="$(my_ip4 "${PUBS[$i]}" "$NET")"
+  VPNS[$i]="$(my_ip "${PUBS[$i]}" "$NET")"
   echo "   ${HOSTS[$i]}  public=${PUBS[$i]}  vpn=${VPNS[$i]}"
   [[ -n "${VPNS[$i]}" ]] || { fail "could not resolve VPN ip for ${HOSTS[$i]}"; summary; }
 done
@@ -198,7 +198,7 @@ REPORT="$RESDIR/$STAMP.md"
 {
   echo "# Rayfish reliability — $STAMP"
   echo
-  echo "Four Scaleway instances, OPEN network full mesh."
+  echo "Four droplets, OPEN network full mesh."
   echo "Loss % per probe; a probe fails when rayfish exceeds direct by > ${MARGIN}pp."
   echo "icmp = ping -c $PING_COUNT -i 0.01; flood = ping -f -c $FLOOD_COUNT; udp = iperf3 -u -b $RATE -t ${DURATION}s."
   echo

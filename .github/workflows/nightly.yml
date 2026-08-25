@@ -112,10 +112,17 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # Per-target key, matching release.yml (which is also what lets the two
+      # workflows share one cache per target). rust-cache's key carries the
+      # runner's os and arch but not the target triple, so the legs that share a
+      # runner (both macOS targets, gnu and musl on each Linux arch) would
+      # otherwise land on one key: whichever saved first serves the pair, and its
+      # sibling restores a target dir with nothing for its own triple and
+      # rebuilds every dependency, every run.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release"
+          shared-key: "release-${{ matrix.target }}"
           cache-on-failure: true
 
       - name: Build binary

@@ -1,3 +1,14 @@
 <resources>
     <style name="Theme.Rayfish" parent="android:Theme.Material.NoActionBar" />
+
+    <!-- VpnConsentActivity has no UI of its own: it only hosts the system VPN
+         consent dialog. Without a translucent window it would flash a blank
+         screen over whatever the user was looking at when they tapped the tile. -->
+    <style name="Theme.Rayfish.Invisible" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
 </resources>

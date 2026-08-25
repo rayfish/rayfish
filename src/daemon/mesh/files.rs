@@ -50,12 +50,6 @@ impl Daemon {
         self.files.accept_file(id, output, peer_cred).await
     }
 
-    /// Toggle per-network own-device file auto-accept (delegates to
-    /// [`FileService`]).
-    pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
-        self.files.files_auto_accept(network, enabled).await
-    }
-
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// mint a pairing ticket for this device (delegates to [`FileService`]).
     pub fn start_pairing(&self) -> IpcMessage {

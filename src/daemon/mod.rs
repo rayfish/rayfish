@@ -39,10 +39,10 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::fs::{File, OpenOptions};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -61,8 +61,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::AsyncMutex;
 use crate::audit;
 use crate::config;
+use crate::config::settings::{self, FirewallKey, GlobalKey, NetworkKey, NodeKey};
+use crate::config::{AppConfig, NetworkConfig};
 use crate::control::{self, ControlMsg};
 use crate::dht;
 use crate::dns;
@@ -71,11 +74,12 @@ use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
 use crate::ipc::{
-    self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerState, PeerStatus, ipc_err,
+    self, FirewallRuleView, InactiveNetwork, IpcMessage, LanPeerInfo, MeshVersionMismatch,
+    NetworkRole, NetworkStatus, PeerState, PeerStatus, ipc_err,
 };
 use crate::membership::{
-    ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
-    MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
+    ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IdentityProvider, IrohIdentityProvider,
+    Member, MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
@@ -84,7 +88,7 @@ use crate::transport;
 // The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
 // where the packet interface is a `VpnService` fd supplied from Kotlin.
 #[cfg(not(target_os = "android"))]
-use crate::tun::{self, check_cgnat_conflict};
+use crate::tun;
 use ray_proto::SuggestedFirewall;
 use smol_str::SmolStr;
 
@@ -201,7 +205,7 @@ pub(crate) use mesh_connection::MeshConnection;
 
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
-pub(crate) use network_registry::{DialTarget, NetworkRegistry};
+pub(crate) use network_registry::{DialTarget, NetworkRegistry, missing_networks};
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `Daemon` as fields rather than loose on the core. See each module.
@@ -217,13 +221,17 @@ pub mod transfers;
 mod connect_service;
 pub(crate) use connect_service::ConnectService;
 
+// Nodes seen on the local network over mDNS (`ray mdns scan`).
+mod lan_discovery;
+pub(crate) use lan_discovery::LanPeers;
+
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
 /// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
+const PAIR_ALPN: &[u8] = b"rayfish/pair/2";
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
@@ -280,7 +288,6 @@ impl MeshCtx {
             exit: crate::exit_node::ExitContext {
                 server: self.registry.exit_server.clone(),
                 client: self.registry.exit_client.clone(),
-                my_v4: self.identity.local_ip(),
                 my_v6: derive_ipv6(&self.identity.local_identity()),
             },
         }
@@ -297,15 +304,14 @@ impl MeshCtx {
         &self,
         conn: &Connection,
         peer_id: EndpointId,
-        ip: Ipv4Addr,
         network: &str,
     ) -> bool {
         let ipv6 = derive_ipv6(&peer_id);
         // Keep the roster route map current with every peer we connect to, so a
         // later idle teardown can re-dial it on demand (reconverge covers the
         // roster-wide sync + removals; this is the incremental add).
-        self.route_map.sync_add(network, ip, ipv6, peer_id);
-        self.peers.add(ip, ipv6, conn.clone(), peer_id, network)
+        self.route_map.sync_add(network, ipv6, peer_id);
+        self.peers.add(ipv6, conn.clone(), peer_id, network)
     }
 }
 
@@ -317,7 +323,7 @@ impl MeshCtx {
 pub(crate) async fn announce_network_handles(
     peers: &PeerTable,
     conn: &Connection,
-    peer_ip: Ipv4Addr,
+    peer_ip: Ipv6Addr,
 ) {
     let entries: Vec<control::NetworkHandle> = peers
         .outbound_handles(&peer_ip)
@@ -356,7 +362,6 @@ pub(crate) fn to_member_entries<'a>(
         .into_iter()
         .map(|m| config::MemberEntry {
             identity: m.identity,
-            ip: m.ip,
             is_coordinator: m.is_coordinator,
             hostname: m.hostname.clone(),
         })
@@ -371,7 +376,6 @@ pub(crate) fn to_approved_entries<'a>(
         .into_iter()
         .map(|a| config::ApprovedConfigEntry {
             identity: a.identity,
-            ip: a.ip,
             hostname: a.hostname.clone(),
         })
         .collect()
@@ -387,13 +391,48 @@ struct GroupSnapshot {
 /// publisher, poller, and cleanup tasks for that network.
 pub(crate) type SharedNetworkState = Arc<RwLock<NetworkState>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingSnapshotDurability {
+    hash: blake3::Hash,
+    /// Whether the exact generation came from a verified published record.
+    published: bool,
+}
+
 pub(crate) struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
     snapshot: Option<GroupSnapshot>,
+    /// Serializes durable snapshot-pointer updates with DHT publication for this
+    /// network. Clone the Arc under the state read lock, then await it separately.
+    snapshot_commit: Arc<AsyncMutex<()>>,
+    /// The hash of the signed record this state is converged on, which is not
+    /// always the hash of [`Self::snapshot`].
+    ///
+    /// The snapshot is *our* encoding of the group, and on a coordinator that is
+    /// exactly what it publishes, so the two agree. On a member they need not:
+    /// applying a fetched blob re-encodes it from local state, and a publisher on
+    /// a build whose `Member` has a different field set (or the map encoding that
+    /// preceded the compact one, which rmp-serde still reads) produces bytes ours
+    /// cannot reproduce. Comparing the record against the snapshot hash then says
+    /// "a different blob" forever: every poll refetches and reapplies, and the
+    /// steady-state work on the converged branch (the self-nullify check, a
+    /// pending rename, the exit-offer sync) never runs at all.
+    ///
+    /// So convergence is tracked as what we last accepted, and the snapshot stays
+    /// what we would publish.
+    converged_hash: Option<blake3::Hash>,
+    /// The current generation's config rename may have landed but its durability
+    /// barrier failed. No generation can be published or welcomed until an exact
+    /// retry succeeds; durably persisting a newer current generation supersedes
+    /// and clears an older ambiguity.
+    unconfirmed_durable_hash: Option<PendingSnapshotDurability>,
     network_secret_key: Option<SecretKey>,
     network_public_key: EndpointId,
+    /// Local config/runtime alias used to index this network on this device.
     network_name: Option<String>,
+    /// Name carried by the signed GroupBlob. It must not be replaced by a local
+    /// join alias, because a later promotion may make this node a publisher.
+    group_name: Option<String>,
     /// Access mode (open auto-admits; restricted gates unknown joiners). Only the
     /// coordinator's accept path consults this; members default to `Restricted`.
     mode: GroupMode,
@@ -414,6 +453,24 @@ pub(crate) struct NetworkState {
     /// on every reconverge. Enforcement (admission, MeshHello, prune) rejects a
     /// cert whose device key is listed.
     nullifiers: BTreeSet<EndpointId>,
+    /// Author timestamp (microseconds since the epoch) of the most recent signed
+    /// pkarr record applied to this state, and the floor every later one has to
+    /// clear.
+    ///
+    /// A signature proves who wrote a record, never when: an old record for this
+    /// network stays valid forever and its hash differs from the current one, so
+    /// hash inequality alone reads a rollback as a change and applies it. That
+    /// re-seats kicked members, restores devices the blob nullified, and reverts
+    /// the suggested firewall, and the record it takes is one the DHT served
+    /// publicly to anyone holding the room id. The timestamp lives inside the
+    /// signed bytes (`SignedPacket::timestamp`), so it cannot be edited to clear
+    /// the floor, and ordering on it is what pkarr relays themselves do.
+    ///
+    /// In memory only, so a restart starts from `None` and takes the first record
+    /// it sees. That is the DHT's copy, which relays keep at the highest
+    /// timestamp, and any later legitimate republish outranks a replay anyway, so
+    /// the gap is a race at startup rather than a standing hole.
+    last_record_timestamp: Option<u64>,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
@@ -458,7 +515,7 @@ impl NetworkState {
             &self.members,
             &self.approved,
             &self.suggested_firewall,
-            self.network_name.as_deref(),
+            self.group_name.as_deref(),
             &self.reusable_keys,
             &self.nullifiers,
         );
@@ -467,6 +524,22 @@ impl NetworkState {
             hash,
             msgpack_bytes: bytes,
         });
+        // Our own encoding is by definition what we are converged on. An apply
+        // from a fetched blob overwrites this with the record's hash right after,
+        // since that is the one the network agreed on.
+        self.converged_hash = Some(hash);
+    }
+
+    /// Whether a signed record naming `signed` is one this state has not applied.
+    ///
+    /// The single answer to "do we need to reconverge", for the group poller and
+    /// the trigger-driven path alike. It exists as a method because those two open
+    /// -coded the same comparison against different fields and drifted: one moved
+    /// to [`Self::converged_hash`] and the other kept reading the snapshot's,
+    /// which is our own re-encoding and need not equal what the publisher wrote.
+    /// A member whose bytes differ then treats every poll as a change, forever.
+    pub(crate) fn needs_reconverge(&self, signed: blake3::Hash) -> bool {
+        crate::membership::trusted_reconverge_hash(self.converged_hash, signed).is_some()
     }
 }
 
@@ -475,12 +548,10 @@ impl NetworkState {
 /// when the network is left or the VPN is put on standby. The persisted config
 /// (in `networks.toml`) outlives this handle: standby tears down the handle
 /// but keeps the config so `activate` can rebuild it.
-#[allow(dead_code)]
 pub struct NetworkHandle {
     name: String,
     network_key: EndpointId,
     role: NetworkRole,
-    my_ip: Ipv4Addr,
     state: SharedNetworkState,
     /// DHT republish trigger; `Some` only on the coordinator (the sole publisher).
     /// Lets `set_hostname` re-publish the group blob on a coordinator self-rename.
@@ -494,11 +565,14 @@ pub struct NetworkHandle {
     /// Serializes invite-ledger reads/writes (mint, redeem, revoke) so concurrent
     /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
     /// Shared with this network's [`CoordinatorAcceptState`].
-    invite_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Disconnect channel for this network's accept handlers, kept so a member
-    /// promoted to coordinator (via `AdminGrant`) can re-register a
-    /// [`CoordinatorAcceptState`] on the live channel without rebuilding it.
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    invite_lock: Arc<AsyncMutex<()>>,
+    /// Set when this network's signed record advertises a mesh protocol version
+    /// this build does not speak. The handle exists because the roster blob is
+    /// not version-gated and registers fine; every dial on it is refused by the
+    /// versioned ALPN, so the flag is what stops `ray status` from showing the
+    /// network as healthy. Cleared by construction: the restore loop replaces
+    /// the whole handle once the coordinator republishes at a version we speak.
+    incompatible: Option<MeshVersionMismatch>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -550,9 +624,10 @@ pub struct Daemon {
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
     dns: Arc<DnsService>,
     mdns_enabled: bool,
-    /// Whether this node opted into automatic stable updates (`ray auto-update
-    /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
-    /// spawns the periodic update task. Echoed back in `ray status`.
+    /// Whether this node opted into automatic stable updates
+    /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
+    /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
+    /// back in `ray status`.
     auto_update: bool,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
@@ -570,14 +645,16 @@ pub struct Daemon {
     /// other's intermediate state, after which teardown "restores" forwarding to
     /// on. One reconcile at a time. Tokio's mutex because the critical section
     /// awaits (blocking-pool `ip`/`nft`/`pfctl` children, offer broadcasts).
-    pub(crate) exit_reconcile: tokio::sync::Mutex<()>,
+    pub(crate) exit_reconcile: AsyncMutex<()>,
     /// Prometheus metrics-server guard. Owned so it lives for the daemon's whole
     /// lifetime (dropping it stops the export); `None` if the server failed to bind.
     _metrics_server: Option<MetricsServer>,
     /// The iroh protocol [`Router`](iroh::protocol::Router): owns the endpoint
     /// accept loop and dispatches each inbound connection by ALPN to its handler.
     /// Owned for the daemon's whole lifetime (it aborts on drop); `run_daemon`
-    /// `shutdown()`s it on exit (which also closes the endpoint).
+    /// (desktop) and [`Daemon::shutdown_and_close`] (embedders) `shutdown()` it
+    /// on exit, which drains the protocol handlers (releasing the blob store's
+    /// redb lock) and closes the endpoint.
     router: iroh::protocol::Router,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
@@ -604,12 +681,17 @@ pub struct Daemon {
     #[cfg(feature = "desktop")]
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
-    /// standby). Set by [`Daemon::start_ssh`], cleared by `stop_ssh`.
-    // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
-    // `--no-default-features` (Android) build the field is inert; silence the
-    // resulting dead-code warning there rather than dropping the field.
-    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    /// standby). Set by [`Daemon::start_ssh`], cleared by `stop_ssh`, which are
+    /// the only readers and are desktop-only, so the field does not exist on an
+    /// Android build at all.
+    #[cfg(feature = "desktop")]
     ssh_token: Mutex<Option<CancellationToken>>,
+    /// Cancellation token for the IPv4 listener bridge (`None` when off / on
+    /// standby). Same shape and same reason as `ssh_token`: it binds the mesh
+    /// address, so it lives and dies with the data plane. See
+    /// [`crate::v4bridge`].
+    #[cfg(feature = "desktop")]
+    v4_bridge_token: Mutex<Option<CancellationToken>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -675,27 +757,31 @@ impl Daemon {
     /// embedders (mobile) that rebuild a fresh daemon on re-enable: without it
     /// the old endpoint's connections outlive `stop`, so a coordinator keeps the
     /// stale session while the rebuilt endpoint (same node key) comes up and the
-    /// device shows offline until the race clears. Mirrors the shutdown tail of
-    /// `run_daemon`. After this the `Daemon` is spent; build a new one to
-    /// come back online.
+    /// device shows offline until the race clears.
+    ///
+    /// Shutting the protocol router down first is what releases the blob store,
+    /// and it is not optional for an embedder either: `Router::shutdown` is the
+    /// only thing that drives `BlobsProtocol::shutdown` -> `Store::shutdown`,
+    /// which is what drops the store's redb `Database` and with it the exclusive
+    /// file lock on `blobs/blobs.db`. Without it the lock outlives this call, and
+    /// a second open does not fail, it waits: the next `build_headless` in the
+    /// same process then blocks until whatever eventually drops the old store
+    /// does, if anything does, which on mobile is how a disabled node never comes
+    /// back. The explicit `endpoint.close()` after it is the same idempotent
+    /// backstop the desktop tail keeps.
+    ///
+    /// After this the `Daemon` is spent; build a new one to come back online.
     pub async fn shutdown_and_close(&self) {
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
+        let _ = self.router.shutdown().await;
         self.transport.endpoint.close().await;
-        tracing::info!("shutdown: endpoint closed");
+        tracing::info!("shutdown: router stopped, blob store released, endpoint closed");
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
     /// handlers and background tasks. Every field is a cheap `Clone`.
-    /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
-    /// contact id). Extracted services depend on this `Arc<Transport>` rather
-    /// than the whole daemon. First consumed in M2.
-    #[allow(dead_code)]
-    pub(crate) fn transport(&self) -> Arc<Transport> {
-        self.transport.clone()
-    }
-
     /// Part of the embedding API (used by `ray-mobile`): the host OS observed a
     /// network change (Wi-Fi/cellular switch, roam, airplane mode). On desktop,
     /// netwatch sees route changes itself; on Android its route monitor is a
@@ -705,6 +791,13 @@ impl Daemon {
     pub async fn network_changed(&self) {
         tracing::info!("host reported a network change; rebinding endpoint");
         self.transport.endpoint.network_change().await;
+        // Re-resolve every network's signed record too. Anything a coordinator
+        // tried to push while we were between networks was delivered to an
+        // address that had stopped working, and a battery-powered node would
+        // otherwise carry that gap until its next long-interval tick. This is
+        // also the cheapest moment to ask: the radio is already up for the
+        // rebind.
+        self.registry.poll_nudge.notify_waiters();
     }
 
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
@@ -843,6 +936,7 @@ impl Daemon {
             req,
             IpcMessage::Status
                 | IpcMessage::Report
+                | IpcMessage::Logs { .. }
                 | IpcMessage::FirewallShow
                 | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::FirewallPending { .. }
@@ -850,14 +944,17 @@ impl Daemon {
                 | IpcMessage::ExitNodeStatus { .. }
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
+                // The queue `ray requests <net> accept` reads its id out of,
+                // and the same shape as `Connections` right above it.
+                | IpcMessage::Requests { .. }
                 | IpcMessage::ContactId
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
-                | IpcMessage::GetEphemeral { .. }
                 | IpcMessage::ListPairedDevices
+                | IpcMessage::ListLanPeers
                 | IpcMessage::ConfigGet { .. }
-                | IpcMessage::GetDownloadSettings
+                | IpcMessage::NetConfigGet { .. }
         ) {
             return None;
         }
@@ -905,14 +1002,10 @@ impl Daemon {
     /// Persist the operator UID so that user can run mutating `ray` commands
     /// without root. Authorization (root-only) is enforced in `check_authorized`.
     pub(crate) fn set_operator(&self, uid: u32) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        };
-        app_config.operator_uid = Some(uid);
-        if let Err(e) = config::save_settings(&app_config) {
+        if let Err(e) = config::update_settings(|cfg| {
+            cfg.operator_uid = Some(uid);
+            Ok(())
+        }) {
             return ipc_err(format!("failed to save config: {e}"));
         }
         IpcMessage::Ok {
@@ -920,114 +1013,177 @@ impl Daemon {
         }
     }
 
-    /// Persist the mDNS discovery toggle (`ray mdns on|off`). The daemon reads
-    /// `mdns_enabled` at startup, so this takes effect on the next restart. Done
-    /// here rather than client-side so the write lands in the config dir the
-    /// daemon actually reads (see `IpcMessage::SetMdns`).
-    pub(crate) fn set_mdns(&self, enabled: bool) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
-        app_config.mdns_enabled = enabled;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
-        IpcMessage::Ok {
-            message: format!(
-                "mDNS discovery {}. Restart the daemon for changes to take effect.",
-                if enabled { "enabled" } else { "disabled" }
-            ),
+    /// The nodes mDNS has seen on this LAN, newest sighting first, each marked
+    /// with a network already shared with it (if any). Shared by `ray mdns scan`
+    /// and the nearby block in `ray status`, so the two never disagree.
+    pub(crate) fn lan_peer_infos(&self) -> Vec<LanPeerInfo> {
+        let me = self.transport.endpoint.id();
+        let mut peers: Vec<LanPeerInfo> = self
+            .transport
+            .lan_peers
+            .snapshot()
+            .into_iter()
+            .filter(|(id, _)| *id != me)
+            .map(|(id, peer)| LanPeerInfo {
+                endpoint_id: id,
+                short_id: id.fmt_short().to_string(),
+                addrs: peer.addrs.iter().map(|a| a.to_string()).collect(),
+                last_seen_secs: peer.last_seen.elapsed().as_secs(),
+                shared_network: self.registry.network_shared_with(&id),
+            })
+            .collect();
+        peers.sort_by_key(|p| p.last_seen_secs);
+        peers
+    }
+
+    /// `ray mdns scan`: every LAN sighting, connected or not.
+    pub(crate) fn list_lan_peers(&self) -> IpcMessage {
+        IpcMessage::LanPeersList {
+            peers: self.lan_peer_infos(),
+            mdns_enabled: self.mdns_enabled,
         }
     }
 
-    /// Apply a global config key change and persist it (`ray config set|unset`
-    /// and the `ray auto-update` alias). `reset` selects the "unset" wording; an
-    /// empty `value` (as `ConfigUnset` sends) resets the key to its default.
-    fn config_apply(&self, key: &str, value: &str, replace: bool, reset: bool) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+    /// Apply one settings key and persist it. Serves `ray config set|unset` and
+    /// every single-value command that used to carry its own IPC variant
+    /// (`ray mdns`, `ray firewall on|off|reject|default`, `ray firewall ssh
+    /// on|off`, `ray files download-dir|download-user`, and the hidden
+    /// `ray auto-update`, whose only spelling is now the key itself).
+    ///
+    /// Dispatch is on the key's store, because the two a [`NodeKey`] can name
+    /// are not interchangeable: a firewall key writes the live `ArcSwap` the
+    /// packet path reads (a load/mutate/save there would silently turn `ray
+    /// firewall off` into "restart required"), and `ssh` carries listener +
+    /// passthrough side effects. Only a plain global key takes the
+    /// load/mutate/save below. A per-network key cannot reach here: `ConfigSet`
+    /// carries a `NodeKey`, which has no variant for one.
+    fn config_apply(
+        self: &Arc<Self>,
+        key: NodeKey,
+        value: &str,
+        replace: bool,
+        reset: bool,
+    ) -> IpcMessage {
+        let key = match key {
+            NodeKey::Firewall(k) => return self.registry.firewall_config_set(k, value),
+            // Not a plain config write: see `Daemon::ssh_config_set`.
+            NodeKey::Global(GlobalKey::Ssh) => return self.ssh_config_set(value),
+            // Likewise: the bridge's listeners follow the setting live.
+            NodeKey::Global(GlobalKey::V4Bridge) => return self.v4_bridge_config_set(value),
+            // Spelled out rather than caught by `_`, so a new global key cannot
+            // land here by default. Falling through silently is precisely the
+            // `ssh` bug: a key whose write needs a live side effect, getting
+            // none, with nothing to notice it. Adding a variant breaks this
+            // match and forces the choice.
+            NodeKey::Global(
+                k @ (GlobalKey::Mdns
+                | GlobalKey::Relay
+                | GlobalKey::DiscoveryDns
+                | GlobalKey::DnsUpstreams
+                | GlobalKey::AutoUpdate
+                | GlobalKey::OnDemand
+                | GlobalKey::DownloadDir
+                | GlobalKey::DownloadUser),
+            ) => k,
         };
-        if let Err(e) = config::config_set(&mut app_config, key, value, replace) {
-            return ipc_err(e.to_string());
+        let mut set_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = config::config_set(cfg, key, value, replace) {
+                set_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = set_err {
+            return ipc_err(e);
         }
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
-        let action = if reset {
-            format!("Reset {key} to default")
-        } else {
-            format!("Set {key}")
+        let app_config = match saved {
+            Ok(cfg) => cfg,
+            Err(e) => return ipc_err(format!("failed to save config: {e}")),
         };
         IpcMessage::Ok {
-            message: format!("{action}. Restart the daemon for changes to take effect."),
+            message: global_set_message(&app_config, key, reset),
         }
     }
 
-    /// Read global config rows for `ray config get` from the daemon's own config.
-    fn config_get(&self, key: Option<&str>) -> IpcMessage {
+    /// Read node config rows for `ray config get` from the daemon's own config.
+    /// Firewall-scoped keys are read from the live config, not from disk, so a
+    /// get always agrees with what the packet path is enforcing.
+    ///
+    /// Without a key this lists both stores, globals first: the two live in
+    /// different files behind different handlers, but the user typed one
+    /// command and expects every node setting back.
+    fn config_get(&self, key: Option<NodeKey>) -> IpcMessage {
+        let key = match key {
+            Some(NodeKey::Firewall(k)) => return self.registry.firewall_config_get(k),
+            Some(NodeKey::Global(k)) => Some(k),
+            None => None,
+        };
         let app_config = match config::load() {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
         };
-        match config::config_get(&app_config, key) {
-            Ok(rows) => IpcMessage::ConfigValues { rows },
-            Err(e) => ipc_err(e.to_string()),
+        let mut rows = config::config_get(&app_config, key);
+        if key.is_none() {
+            rows.extend(self.registry.firewall_config_rows(None));
         }
+        IpcMessage::ConfigValues { rows }
     }
 
-    /// Set/clear the accepted-files download directory (`ray files download-dir`)
-    /// and persist it to the daemon's own config. Takes effect at the next start.
-    fn set_download_dir(&self, path: Option<String>) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+    /// Apply one per-network setting and persist just that network's file, then
+    /// run whatever live re-materialization the key implies (the registry's
+    /// `apply_network` is pure and deliberately does none of it).
+    async fn net_config_apply(
+        self: &Arc<Self>,
+        network: &str,
+        key: NetworkKey,
+        value: &str,
+    ) -> IpcMessage {
+        let mut validation_error = None;
+        let updated = config::update_network(network, |net| {
+            settings::apply_network(net, key, value).inspect_err(|e| {
+                validation_error = Some(e.to_string());
+            })
+        });
+        let net = match updated {
+            Ok(Some(net)) => net,
+            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Err(_) if validation_error.is_some() => {
+                return ipc_err(validation_error.unwrap());
+            }
+            Err(e) => return ipc_err(format!("failed to save config: {e}")),
         };
-        let cleared = path.is_none();
-        app_config.download_dir = path;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
+        // Run the live re-materialization the key implies, then confirm.
+        match key {
+            NetworkKey::AutoAcceptFirewall => self.registry.reapply_suggested_firewall(network),
+            NetworkKey::AutoAcceptFiles if net.auto_accept_files => {
+                self.files.drain_auto_acceptable().await
+            }
+            // The pruner re-reads the TTL each tick, so there is nothing to do
+            // beyond the write.
+            NetworkKey::AutoAcceptFiles | NetworkKey::EphemeralTtl => {}
         }
         IpcMessage::Ok {
-            message: if cleared {
-                "download-dir cleared. Restart the daemon for changes to take effect.".to_string()
-            } else {
-                "download-dir set. Restart the daemon for changes to take effect.".to_string()
-            },
+            message: net_set_message(&net, network, key),
         }
     }
 
-    /// Set/clear the accepted-files owner UID (`ray files download-user`) and
-    /// persist it. The client resolves the username to a UID before sending.
-    fn set_download_user(&self, uid: Option<u32>) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+    /// Read one or every per-network setting.
+    fn net_config_get(&self, network: &str, key: Option<NetworkKey>) -> IpcMessage {
+        let net = match config::load_network(network) {
+            Ok(Some(n)) => n,
+            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Err(e) => return ipc_err(format!("failed to load network: {e}")),
         };
-        let cleared = uid.is_none();
-        app_config.download_user = uid;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
-        IpcMessage::Ok {
-            message: if cleared {
-                "download-user cleared. Restart the daemon for changes to take effect.".to_string()
-            } else {
-                "download-user set. Restart the daemon for changes to take effect.".to_string()
-            },
-        }
-    }
-
-    /// Read the file-download settings for `ray files download-dir`/`download-user`.
-    fn get_download_settings(&self) -> IpcMessage {
-        match config::load() {
-            Ok(c) => IpcMessage::DownloadSettings {
-                dir: c.download_dir,
-                uid: c.download_user,
-            },
-            Err(e) => ipc_err(format!("failed to load config: {e}")),
-        }
+        let keys: Vec<NetworkKey> = match key {
+            Some(k) => vec![k],
+            None => NetworkKey::ALL.to_vec(),
+        };
+        let rows = keys
+            .into_iter()
+            .map(|k| (k.name().to_string(), settings::render_network(&net, k)))
+            .collect();
+        IpcMessage::ConfigValues { rows }
     }
 
     pub(crate) async fn handle_request(
@@ -1071,10 +1227,6 @@ impl Daemon {
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
             IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
-            IpcMessage::SetEphemeral { network, ttl_secs } => {
-                self.registry.set_ephemeral(&network, ttl_secs).await
-            }
-            IpcMessage::GetEphemeral { network } => self.registry.get_ephemeral(&network),
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
@@ -1106,11 +1258,6 @@ impl Daemon {
             }
             IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
             IpcMessage::FirewallShow => self.registry.firewall_show(),
-            IpcMessage::FirewallDefault { action } => self.registry.firewall_default(action),
-            IpcMessage::FirewallReject { enabled } => self.registry.firewall_reject(enabled),
-            IpcMessage::FirewallSetEnabled { enabled } => {
-                self.registry.firewall_set_enabled(enabled)
-            }
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
@@ -1128,21 +1275,6 @@ impl Daemon {
             } => self
                 .registry
                 .firewall_resolve_suggestions(&network, &accept, &deny),
-            IpcMessage::FirewallAutoAccept { network, enabled } => {
-                self.registry.firewall_auto_accept(&network, enabled)
-            }
-            IpcMessage::FilesAutoAccept { network, enabled } => {
-                self.files_auto_accept(&network, enabled).await
-            }
-            IpcMessage::FirewallSshSet { enabled } => {
-                #[cfg(windows)]
-                if enabled {
-                    return ipc_err(
-                        "embedded SSH/PTY is not supported on Windows; no firewall or config state was changed",
-                    );
-                }
-                self.firewall_ssh_set(enabled)
-            }
             IpcMessage::FirewallSshAllow {
                 network,
                 peer,
@@ -1215,17 +1347,20 @@ impl Daemon {
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
             IpcMessage::Unpair { device } => self.unpair(&device).await,
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
-            IpcMessage::SetMdns { enabled } => self.set_mdns(enabled),
+            IpcMessage::ListLanPeers => self.list_lan_peers(),
             IpcMessage::ConfigSet {
                 key,
                 value,
                 replace,
-            } => self.config_apply(&key, &value, replace, false),
-            IpcMessage::ConfigUnset { key } => self.config_apply(&key, "", false, true),
-            IpcMessage::ConfigGet { key } => self.config_get(key.as_deref()),
-            IpcMessage::SetDownloadDir { path } => self.set_download_dir(path),
-            IpcMessage::SetDownloadUser { uid } => self.set_download_user(uid),
-            IpcMessage::GetDownloadSettings => self.get_download_settings(),
+            } => self.config_apply(key, &value, replace, false),
+            IpcMessage::ConfigUnset { key } => self.config_apply(key, "", false, true),
+            IpcMessage::ConfigGet { key } => self.config_get(key),
+            IpcMessage::NetConfigSet {
+                network,
+                key,
+                value,
+            } => self.net_config_apply(&network, key, &value).await,
+            IpcMessage::NetConfigGet { network, key } => self.net_config_get(&network, key),
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,
@@ -1281,9 +1416,8 @@ impl Daemon {
             return ipc_err("invalid hostname (lowercase ASCII, 1-63 chars)".to_string());
         }
 
-        let (my_ip, is_coord, state, dht_notify) = match self.registry.networks.get(network) {
+        let (is_coord, state, dht_notify) = match self.registry.networks.get(network) {
             Some(h) => (
-                h.my_ip,
                 h.role.is_coordinator(),
                 h.state.clone(),
                 h.dht_notify.clone(),
@@ -1318,7 +1452,7 @@ impl Daemon {
             &self.dns.hostname_table,
             &self.dns.reverse_table,
             network,
-            my_ip,
+            derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
         dns::update_hostname(
@@ -1326,7 +1460,6 @@ impl Daemon {
             &self.dns.reverse_table,
             network,
             &new_hostname,
-            my_ip,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -1335,15 +1468,15 @@ impl Daemon {
         // pending intent so it keeps being delivered to a coordinator across
         // reconnects/restarts until the signed blob confirms it; a coordinator
         // publishes authoritatively, so it clears any pending intent.
-        if let Ok(Some(mut net)) = config::load_network(network) {
+        let _ = config::update_network(network, |net| {
             net.my_hostname = Some(new_hostname.clone());
             net.pending_hostname = if is_coord {
                 None
             } else {
                 Some(new_hostname.clone())
             };
-            let _ = config::save_network(&net);
-        }
+            Ok(())
+        });
 
         // Fast-path the rename to connected peers via `MeshHello`, regardless of
         // role. A peer *coordinator* only learns a self-rename this way: it acts
@@ -1352,7 +1485,7 @@ impl Daemon {
         // `BlobUpdated` trigger, and coordinators don't run the group poller. So
         // without this, a co-coordinator's rename never reached its peer
         // coordinators (roster + `.ray` DNS both stayed stale on them).
-        self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
+        self.announce_rename_to_peers(network, my_identity, &new_hostname)
             .await;
         if is_coord {
             // Authoritative: republish the signed blob so members reconverge from
@@ -1364,7 +1497,7 @@ impl Daemon {
             );
             update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
             let net_pubkey = state.read().unwrap().network_public_key;
-            broadcast_member_sync(&self.registry.peers, net_pubkey, network, None).await;
+            broadcast_member_sync(&self.registry, net_pubkey, network, None).await;
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
@@ -1381,7 +1514,6 @@ impl Daemon {
         &self,
         network: &str,
         my_identity: EndpointId,
-        my_ip: Ipv4Addr,
         new_hostname: &str,
     ) {
         let peers = self.registry.peers.peers_for_network_with_conn(network);
@@ -1397,7 +1529,6 @@ impl Daemon {
             if let Ok((mut send, _recv)) = conn.open_bi().await {
                 let msg = ControlMsg::MeshHello {
                     identity: my_identity,
-                    ip: my_ip,
                     hostname: Some(new_hostname.to_string()),
                     device_cert: self.current_device_cert(),
                 };
@@ -1418,6 +1549,303 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Invite + join-request handlers (coordinator only)
     // -----------------------------------------------------------------------
+}
+
+/// The confirmation line for a global key, rendered from the config as it
+/// stands after the write. `reset` is set by `ConfigUnset`.
+///
+/// The keys that used to own an IPC variant keep the exact string their handler
+/// produced: collapsing the handlers was the point of this refactor, changing
+/// what the user reads was not. The rest get the generic wording `ray config
+/// set` has always used.
+///
+/// The "Restart the daemon" clause on `download-dir`/`download-user` is
+/// inherited verbatim and is not actually true (`resolve_download_target` reads
+/// the config on every accept, so both take effect immediately). Correcting it
+/// is a user-visible improvement and belongs in its own change, not smuggled
+/// into a refactor whose whole constraint is that nothing user-visible moves.
+fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
+    let restart = "Restart the daemon for changes to take effect.";
+    match key {
+        GlobalKey::Mdns => format!(
+            "mDNS discovery {}. {restart}",
+            if cfg.mdns_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        // "cleared" vs "set" keys off the resulting value, not off `reset`, so
+        // `config set download-dir ""` reads the same as `--clear`.
+        GlobalKey::DownloadDir if cfg.download_dir.is_none() => {
+            format!("download-dir cleared. {restart}")
+        }
+        GlobalKey::DownloadDir => format!("download-dir set. {restart}"),
+        GlobalKey::DownloadUser if cfg.download_user.is_none() => {
+            format!("download-user cleared. {restart}")
+        }
+        GlobalKey::DownloadUser => format!("download-user set. {restart}"),
+        // Spelled out rather than caught by `_`, so a new global key cannot
+        // inherit this generic wording (and its "Restart the daemon" claim) by
+        // default. `Ssh` and `V4Bridge` never reach here (`config_apply` routes
+        // them to their own setters); they are listed only to keep the match
+        // exhaustive.
+        k @ (GlobalKey::Relay
+        | GlobalKey::DiscoveryDns
+        | GlobalKey::DnsUpstreams
+        | GlobalKey::AutoUpdate
+        | GlobalKey::OnDemand
+        | GlobalKey::Ssh
+        | GlobalKey::V4Bridge) => {
+            if reset {
+                format!("Reset {k} to default. {restart}")
+            } else {
+                format!("Set {k}. {restart}")
+            }
+        }
+    }
+}
+
+/// The confirmation line for a per-network key, rendered from the network
+/// config as it stands after the write. Each key keeps the exact string its old
+/// handler produced, and, as with the firewall keys, without a "restart" clause:
+/// all three take effect immediately.
+fn net_set_message(net: &NetworkConfig, network: &str, key: NetworkKey) -> String {
+    let on_off = |v: bool| if v { "enabled" } else { "disabled" };
+    match key {
+        NetworkKey::AutoAcceptFirewall => format!(
+            "auto-accept firewall suggestions {} for '{network}'",
+            on_off(net.auto_accept_firewall)
+        ),
+        NetworkKey::AutoAcceptFiles => format!(
+            "auto-accept files from your own devices {} for '{network}'",
+            on_off(net.auto_accept_files)
+        ),
+        NetworkKey::EphemeralTtl => match net.ephemeral_ttl_secs {
+            Some(s) => format!("ephemeral policy on '{network}' set to {s}s"),
+            None => format!("ephemeral policy on '{network}' disabled"),
+        },
+    }
+}
+
+/// Every confirmation line a migrated command prints, pinned byte-for-byte.
+///
+/// Collapsing fourteen IPC variants onto the settings registry was allowed to
+/// delete handlers; it was not allowed to change a single character the user
+/// reads. These strings used to live in the deleted handlers, where nothing
+/// guarded them, and the first pass of this refactor did silently regress five
+/// of them to the generic "Set {key}." wording. Anyone editing a `*_set_message`
+/// function should have to update this test on purpose.
+#[cfg(test)]
+mod confirmation_message_tests {
+    use super::*;
+
+    fn mdns(v: bool) -> AppConfig {
+        AppConfig {
+            mdns_enabled: v,
+            ..Default::default()
+        }
+    }
+
+    fn download_dir(v: Option<&str>) -> AppConfig {
+        AppConfig {
+            download_dir: v.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn download_user(v: Option<u32>) -> AppConfig {
+        AppConfig {
+            download_user: v,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn global_keys_keep_the_exact_wording_their_handlers_printed() {
+        assert_eq!(
+            global_set_message(&mdns(true), GlobalKey::Mdns, false),
+            "mDNS discovery enabled. Restart the daemon for changes to take effect."
+        );
+        assert_eq!(
+            global_set_message(&mdns(false), GlobalKey::Mdns, false),
+            "mDNS discovery disabled. Restart the daemon for changes to take effect."
+        );
+
+        assert_eq!(
+            global_set_message(
+                &download_dir(Some("/srv/inbox")),
+                GlobalKey::DownloadDir,
+                false
+            ),
+            "download-dir set. Restart the daemon for changes to take effect."
+        );
+        assert_eq!(
+            global_set_message(&download_dir(None), GlobalKey::DownloadDir, true),
+            "download-dir cleared. Restart the daemon for changes to take effect."
+        );
+
+        assert_eq!(
+            global_set_message(&download_user(Some(501)), GlobalKey::DownloadUser, false),
+            "download-user set. Restart the daemon for changes to take effect."
+        );
+        assert_eq!(
+            global_set_message(&download_user(None), GlobalKey::DownloadUser, true),
+            "download-user cleared. Restart the daemon for changes to take effect."
+        );
+
+        // A key that never had a handler of its own keeps `ray config set`'s
+        // generic wording, set and unset.
+        let cfg = AppConfig::default();
+        assert_eq!(
+            global_set_message(&cfg, GlobalKey::Relay, false),
+            "Set relay. Restart the daemon for changes to take effect."
+        );
+        assert_eq!(
+            global_set_message(&cfg, GlobalKey::Relay, true),
+            "Reset relay to default. Restart the daemon for changes to take effect."
+        );
+    }
+
+    /// `cleared` follows the resulting value, not the `reset` flag, so setting
+    /// an empty value reads the same as `--clear`.
+    #[test]
+    fn download_keys_report_cleared_whenever_the_value_ends_up_unset() {
+        let cfg = AppConfig::default();
+        assert!(cfg.download_dir.is_none());
+        assert_eq!(
+            global_set_message(&cfg, GlobalKey::DownloadDir, false),
+            "download-dir cleared. Restart the daemon for changes to take effect."
+        );
+    }
+
+    #[test]
+    fn network_keys_keep_the_exact_wording_their_handlers_printed() {
+        let mut net = config::empty_network_config("gaming");
+        net.auto_accept_firewall = true;
+        assert_eq!(
+            net_set_message(&net, "gaming", NetworkKey::AutoAcceptFirewall),
+            "auto-accept firewall suggestions enabled for 'gaming'"
+        );
+        net.auto_accept_firewall = false;
+        assert_eq!(
+            net_set_message(&net, "gaming", NetworkKey::AutoAcceptFirewall),
+            "auto-accept firewall suggestions disabled for 'gaming'"
+        );
+
+        net.auto_accept_files = true;
+        assert_eq!(
+            net_set_message(&net, "gaming", NetworkKey::AutoAcceptFiles),
+            "auto-accept files from your own devices enabled for 'gaming'"
+        );
+        net.auto_accept_files = false;
+        assert_eq!(
+            net_set_message(&net, "gaming", NetworkKey::AutoAcceptFiles),
+            "auto-accept files from your own devices disabled for 'gaming'"
+        );
+
+        net.ephemeral_ttl_secs = Some(7200);
+        assert_eq!(
+            net_set_message(&net, "gaming", NetworkKey::EphemeralTtl),
+            "ephemeral policy on 'gaming' set to 7200s"
+        );
+        net.ephemeral_ttl_secs = None;
+        assert_eq!(
+            net_set_message(&net, "gaming", NetworkKey::EphemeralTtl),
+            "ephemeral policy on 'gaming' disabled"
+        );
+    }
+
+    /// None of the live-effect keys may claim a restart is needed: the firewall
+    /// ones hot-swap the `ArcSwap` and the network ones are read on next use.
+    #[test]
+    fn live_keys_never_claim_a_restart_is_needed() {
+        let net = config::empty_network_config("gaming");
+        for &key in NetworkKey::ALL {
+            let msg = net_set_message(&net, "gaming", key);
+            assert!(!msg.contains("Restart"), "{key}: {msg}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod net_config_authz_tests {
+    use super::*;
+
+    /// A global or firewall key reaching the per-network handlers would write a
+    /// key into `networks/<name>.toml` that nothing ever reads back, and (for
+    /// the firewall keys) skip the live `ArcSwap` swap entirely. `NetConfigSet`
+    /// carries a `NetworkKey`, which has no variant for either, so the mistake
+    /// is unrepresentable rather than rejected at runtime; the parse that
+    /// rejects the name (and names the command that does serve it) is tested in
+    /// `ray-proto`.
+    #[test]
+    fn a_node_key_cannot_be_parsed_as_a_per_network_one() {
+        for key in ["mdns", "ssh", "download-dir", "firewall.enabled"] {
+            assert!(key.parse::<NetworkKey>().is_err(), "{key}");
+        }
+        assert_eq!(
+            "net.ephemeral-ttl".parse::<NetworkKey>().unwrap(),
+            NetworkKey::EphemeralTtl
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn net_config_set_is_a_mutation_and_net_config_get_is_an_open_read() {
+        let unprivileged = PeerIdentity::Unix {
+            uid: 1000,
+            gid: 1000,
+        };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        let set = IpcMessage::NetConfigSet {
+            network: "gaming".into(),
+            key: NetworkKey::AutoAcceptFiles,
+            value: "off".into(),
+        };
+        // Non-root, non-operator UID: mutations are refused, reads are not.
+        assert!(Daemon::check_authorized(&set, Some(&unprivileged)).is_some());
+        assert!(Daemon::check_authorized(&set, Some(&root)).is_none());
+
+        let get = IpcMessage::NetConfigGet {
+            network: "gaming".into(),
+            key: None,
+        };
+        assert!(Daemon::check_authorized(&get, Some(&unprivileged)).is_none());
+    }
+
+    /// The Windows half of the same rule, which has no root to fall back on: an
+    /// unelevated client that is not the stored operator gets refused, and each
+    /// of the three ways to be authorized is enough on its own.
+    #[cfg(windows)]
+    #[test]
+    fn windows_authorization_accepts_operator_system_and_elevated_admin_only() {
+        let peer = |sid: &str, system: bool, admin: bool| PeerIdentity::Windows {
+            sid: sid.to_owned(),
+            is_local_system: system,
+            is_elevated_admin: admin,
+        };
+        let operator = "S-1-5-21-1-2-3-1001";
+        let stranger = peer("S-1-5-21-1-2-3-1002", false, false);
+
+        assert!(!windows_peer_authorized(None, Some(operator)));
+        assert!(!windows_peer_authorized(Some(&stranger), Some(operator)));
+        // No operator claimed yet: only the elevated bootstrap gets in.
+        assert!(!windows_peer_authorized(Some(&stranger), None));
+
+        assert!(windows_peer_authorized(
+            Some(&peer(operator, false, false)),
+            Some(operator)
+        ));
+        assert!(windows_peer_authorized(
+            Some(&peer("S-1-5-18", true, false)),
+            None
+        ));
+        assert!(windows_peer_authorized(
+            Some(&peer("S-1-5-21-1-2-3-500", false, true)),
+            None
+        ));
+    }
 }
 
 pub(crate) fn guess_mime_type(filename: &str) -> String {
@@ -1475,20 +1903,138 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Write `files` as a gzipped tar archive at `path`. Each entry is `(name, bytes)`.
-fn write_bundle(path: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
-    let file = File::create(path)?;
-    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    let mut builder = tar::Builder::new(enc);
-    for (name, data) in files {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        // `append_data` sets the path and recomputes the checksum.
-        builder.append_data(&mut header, name, data.as_slice())?;
+/// Write `files` as a gzipped tar archive at a new, non-symlink `path`.
+/// Each entry is `(name, bytes)`.
+///
+/// The bundle stays 0600 for its whole life when there is an `owner` to hand it
+/// to: it packs the root daemon's `rayfish=debug` logs, status dump, peer ids
+/// and mesh IPs, and `IpcMessage::Report` is an open read, so a world-readable
+/// copy sitting in `/tmp` is those logs handed to every other local user. It
+/// widens to 0644 only when the file is still root-owned and would otherwise be
+/// unreadable by the very caller that asked for it.
+fn write_bundle(
+    path: &Path,
+    files: &[(String, Vec<u8>)],
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let result = (|| {
+        let enc = flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            // `append_data` sets the path and recomputes the checksum.
+            builder.append_data(&mut header, name, data.as_slice())?;
+        }
+        builder.into_inner()?.finish()?;
+        file.sync_all()?;
+        let given_to_requester = match owner {
+            Some((uid, gid)) => {
+                let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
+                if rc == 0 {
+                    true
+                } else {
+                    // Best-effort, as it was before the fd move: a daemon
+                    // without CAP_CHOWN, or a /tmp on a mount that refuses
+                    // ownership changes, would otherwise have its finished
+                    // archive deleted by the cleanup below and report
+                    // "Operation not permitted" with nothing to attach.
+                    tracing::warn!(
+                        error = %std::io::Error::last_os_error(),
+                        "could not hand the report bundle to the requester"
+                    );
+                    false
+                }
+            }
+            None => false,
+        };
+        if !given_to_requester {
+            // Still root-owned, so the caller needs the wider mode to read it
+            // at all. This is the only path that exposes the bundle.
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
     }
-    builder.into_inner()?.finish()?;
-    Ok(())
+    result
+}
+
+/// Delete `uid`'s earlier bundles in `dir`.
+///
+/// The old fixed `rayfish-report-{ts}.tgz` was truncated and reused within the
+/// same second, which bounded a flood at one file. An unpredictable name closed
+/// the symlink hole but took that bound away, and `IpcMessage::Report` is in the
+/// open-reads arm of `check_authorized`: without this, any local account can
+/// loop `ray report` and have the root daemon leave a fresh gzip of up to seven
+/// days of debug logs in `/tmp` every time, forever.
+///
+/// `/tmp` is world-writable and this runs as root, so the unlink is deliberately
+/// narrow: `symlink_metadata` does not follow a planted link, and only a regular
+/// file owned by the same uid whose name matches the bundle pattern is removed.
+/// A reader holding one open keeps it until they close it.
+fn sweep_prior_bundles(dir: &Path, uid: u32) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("rayfish-report-") || !name.ends_with(".tgz") {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(md) = std::fs::symlink_metadata(&path)
+            && md.is_file()
+            && md.uid() == uid
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Create a report under `dir` with an unpredictable, exclusively-created name.
+fn create_report_bundle(
+    dir: &Path,
+    files: &[(String, Vec<u8>)],
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<PathBuf> {
+    // Reclaim the caller's previous bundles first; the new one replaces them.
+    sweep_prior_bundles(
+        dir,
+        owner
+            .map(|(uid, _)| uid)
+            .unwrap_or(unsafe { libc::geteuid() }),
+    );
+    for _ in 0..16 {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let nonce: u64 = rand::random();
+        let path = dir.join(format!("rayfish-report-{timestamp}-{nonce:016x}.tgz"));
+        match write_bundle(&path, files, owner) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique report path",
+    ))
 }
 
 // Process bootstrap + IPC server live in `mesh/bootstrap.rs`; background tasks +
@@ -1514,24 +2060,110 @@ async fn respond_pong(conn: &Connection, nonce: u64) {
     let _ = open_and_send(conn, None, &ControlMsg::Pong { nonce }).await;
 }
 
+/// How long to leave a roster member alone after a failed dial before trying it
+/// again, so a network carrying genuinely offline devices doesn't pay a dial
+/// timeout for each of them on every roster edit.
+const ABSENT_DIAL_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
 /// Broadcast a `MemberSync` trigger for one network to every peer that shares it,
 /// tagged with the network's public key so each receiver routes it correctly.
 /// A single mesh connection carries several networks now, so this filters to the
 /// network's own peers rather than blasting every connection.
+///
+/// Members holding no live connection are dialed in the background. "Not
+/// connected" stopped meaning "unreachable" once on-demand peers began
+/// idle-closing their links: a phone keeps its home relay open and stays dialable
+/// the whole time it looks absent here. Without the dial it would learn about a
+/// kick or a firewall change only at its next group poll, which is precisely the
+/// poll we slow down on battery-powered nodes.
 async fn broadcast_member_sync(
-    peers: &PeerTable,
+    registry: &Arc<NetworkRegistry>,
     net_pubkey: EndpointId,
     network_name: &str,
-    exclude_ip: Option<Ipv4Addr>,
+    exclude_ip: Option<Ipv6Addr>,
 ) {
-    for (_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
+    let mut reached: HashSet<EndpointId> = HashSet::new();
+    for (id, ip, conn) in registry.peers.peers_for_network_with_conn(network_name) {
         if Some(ip) == exclude_ip {
             continue;
         }
+        reached.insert(id);
         if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
             tracing::warn!(peer_ip = %ip, error = %e, "failed to sync members");
         }
     }
+    spawn_absent_member_sync(registry, net_pubkey, network_name, exclude_ip, reached);
+}
+
+/// The roster members a trigger did not reach over a live connection and that
+/// are worth dialing: not us, not the excluded peer, not already reached, and
+/// not known-offline. Split out from [`spawn_absent_member_sync`] so the choice
+/// of who gets dialed is testable without a live registry.
+fn absent_member_ips(
+    roster: &[Member],
+    my_id: EndpointId,
+    exclude_ip: Option<Ipv6Addr>,
+    reached: &HashSet<EndpointId>,
+    is_offline: impl Fn(&EndpointId) -> bool,
+) -> Vec<Ipv6Addr> {
+    roster
+        .iter()
+        .map(|m| (m, derive_ipv6(&m.identity)))
+        .filter(|(m, _)| m.identity != my_id && !reached.contains(&m.identity))
+        .filter(|(_, v6)| Some(*v6) != exclude_ip)
+        .filter(|(m, _)| !is_offline(&m.identity))
+        .map(|(_, v6)| v6)
+        .collect()
+}
+
+/// Dial the roster members [`broadcast_member_sync`] could not reach over an
+/// existing connection and deliver the trigger there. Spawned rather than
+/// awaited: a coordinator's `ray kick` must not block on dialing every device on
+/// the roster, and the trigger is a hint whose only cost when late is a slower
+/// reconverge.
+fn spawn_absent_member_sync(
+    registry: &Arc<NetworkRegistry>,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    exclude_ip: Option<Ipv6Addr>,
+    reached: HashSet<EndpointId>,
+) {
+    let my_id = registry.transport.identity.local_identity();
+    let absent: Vec<peers::RouteTarget> = absent_member_ips(
+        &registry.roster(network_name),
+        my_id,
+        exclude_ip,
+        &reached,
+        // A member whose last dial failed recently is offline for real rather
+        // than idle-closed, so leave it to its own poll.
+        |id| registry.reachability.is_offline(id, ABSENT_DIAL_COOLDOWN),
+    )
+    .into_iter()
+    .filter_map(|ip| registry.resolve_route(IpAddr::V6(ip)))
+    .collect();
+    if absent.is_empty() {
+        return;
+    }
+    let registry = registry.clone();
+    let network_name = network_name.to_string();
+    tokio::spawn(async move {
+        tracing::debug!(
+            network = %network_name,
+            peers = absent.len(),
+            "dialing absent members to deliver MemberSync"
+        );
+        for target in absent {
+            if !registry.dial_target(&target).await {
+                continue;
+            }
+            let Some(conn) = registry.peers.conn_for_ip(&target.ipv6) else {
+                continue;
+            };
+            if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
+                tracing::debug!(peer_ip = %target.ipv6, error = %e, "failed to sync dialed member");
+            }
+        }
+    });
 }
 
 /// Broadcast a network-scoped control message to every peer that shares the
@@ -1558,13 +2190,12 @@ async fn broadcast_control_msg(
 
 #[cfg(test)]
 mod report_tests {
-    use super::{collect_recent_logs, write_bundle};
+    use super::{collect_recent_logs, create_report_bundle, write_bundle};
 
     #[test]
     fn test_write_bundle_is_valid_targz() {
-        let dir = std::env::temp_dir().join(format!("rayfish-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bundle.tgz");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
         let files = vec![
             ("sysinfo.txt".to_string(), b"rayfish 0.1.0\n".to_vec()),
             (
@@ -1572,7 +2203,7 @@ mod report_tests {
                 b"hello log\n".to_vec(),
             ),
         ];
-        write_bundle(&path, &files).unwrap();
+        write_bundle(&path, &files, None).unwrap();
 
         // Re-read it back through the gzip+tar decoders to prove it's well-formed.
         let f = std::fs::File::open(&path).unwrap();
@@ -1585,13 +2216,196 @@ mod report_tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["logs/rayfish.log.2026-06-23", "sysinfo.txt"]);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_bundle_refuses_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("bundle.tgz");
+        std::fs::write(&target, b"do not overwrite").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let result = write_bundle(
+            &path,
+            &[("status.txt".to_string(), b"sensitive report".to_vec())],
+            None,
+        );
+
+        assert!(result.is_err(), "a report destination symlink was followed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite");
+    }
+
+    /// The bundle used to be widened to 0644 even on the path that chowns it to
+    /// the requester. `Report` is an open read and the archive packs the root
+    /// daemon's debug logs, so that left any other local user free to read them
+    /// out of `/tmp`.
+    #[test]
+    fn a_bundle_handed_to_its_requester_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
+        let files = vec![("status.txt".to_string(), b"peer ids and mesh ips".to_vec())];
+        // chowning a file to the uid/gid that already owns it is permitted for
+        // an unprivileged owner, so this takes the success branch off root too.
+        let me = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+
+        write_bundle(&path, &files, Some(me)).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "report bundle is readable by other local users"
+        );
+    }
+
+    /// The fallback: with nobody to give it to the bundle stays root-owned, so
+    /// it has to be readable or the caller cannot collect what it asked for.
+    #[test]
+    fn an_unowned_bundle_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
+
+        write_bundle(&path, &[("status.txt".to_string(), b"x".to_vec())], None).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    /// The existing symlink test points at a file that exists, which `O_EXCL`
+    /// alone refuses. A dangling link is the case that would let a planted path
+    /// be created at the target, and it must be refused too. Neither test can
+    /// isolate `O_NOFOLLOW` while the open also carries `O_EXCL`, which fails on
+    /// any symlink: the flag is there for a future helper that opens this path
+    /// without it.
+    #[test]
+    fn test_write_bundle_refuses_a_dangling_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("not-there-yet");
+        let path = dir.path().join("bundle.tgz");
+        symlink(&target, &path).unwrap();
+
+        let result = write_bundle(
+            &path,
+            &[("status.txt".to_string(), b"sensitive report".to_vec())],
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "a dangling destination symlink was followed"
+        );
+        assert!(!target.exists(), "the symlink target was created");
+    }
+
+    /// A random name per call closed the symlink hole but removed the only
+    /// bound on `/tmp`: nothing ever deleted a bundle again, and `Report` is an
+    /// open read, so an unprivileged caller could loop it to fill the disk.
+    #[test]
+    fn a_new_bundle_reclaims_the_requesters_earlier_ones() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("rayfish-report-1-aaaaaaaaaaaaaaaa.tgz");
+        let unrelated = dir.path().join("someone-elses.tgz");
+        let victim = dir.path().join("victim");
+        let planted = dir.path().join("rayfish-report-2-bbbbbbbbbbbbbbbb.tgz");
+        std::fs::write(&stale, b"old bundle").unwrap();
+        std::fs::write(&unrelated, b"not ours").unwrap();
+        std::fs::write(&victim, b"do not delete").unwrap();
+        // A symlink wearing the bundle name: /tmp is world-writable and this
+        // runs as root, so the sweep must not follow it.
+        symlink(&victim, &planted).unwrap();
+        let me = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+
+        let fresh = create_report_bundle(
+            dir.path(),
+            &[("status.txt".to_string(), b"report".to_vec())],
+            Some(me),
+        )
+        .unwrap();
+
+        assert!(!stale.exists(), "the caller's previous bundle was kept");
+        assert!(fresh.exists(), "the new bundle is missing");
+        assert!(unrelated.exists(), "an unrelated file was deleted");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"do not delete",
+            "the sweep followed a planted symlink"
+        );
     }
 
     #[test]
     fn test_collect_recent_logs_missing_dir_is_empty() {
         // The log dir may not exist in CI / non-root test runs; must not panic.
         let _ = collect_recent_logs();
+    }
+}
+
+#[cfg(test)]
+mod absent_member_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn member(seed: u8) -> Member {
+        Member {
+            identity: id(seed),
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }
+    }
+
+    /// The whole point of the dial fallback: a member that holds no live
+    /// connection is a dial candidate, because on-demand peers idle-close their
+    /// links while staying reachable.
+    #[test]
+    fn unconnected_member_is_a_dial_candidate() {
+        let roster = vec![member(1), member(2)];
+        let reached: HashSet<EndpointId> = [id(1)].into_iter().collect();
+        let got = absent_member_ips(&roster, id(9), None, &reached, |_| false);
+        assert_eq!(got, vec![derive_ipv6(&id(2))]);
+    }
+
+    /// Self, the excluded peer, and anyone already reached over a live
+    /// connection must never be dialed: the first is nonsense, the second is
+    /// the peer the caller deliberately skipped, the third already got it.
+    #[test]
+    fn self_excluded_and_reached_are_skipped() {
+        let roster = vec![member(1), member(2), member(3), member(4)];
+        let reached: HashSet<EndpointId> = [id(3)].into_iter().collect();
+        let got = absent_member_ips(&roster, id(1), Some(derive_ipv6(&id(2))), &reached, |_| {
+            false
+        });
+        assert_eq!(got, vec![derive_ipv6(&id(4))]);
+    }
+
+    /// A member whose last dial failed recently is offline for real, not
+    /// idle-closed. Re-dialing it on every roster edit would cost a timeout per
+    /// edit and teach us nothing.
+    #[test]
+    fn known_offline_member_is_not_redialed() {
+        let roster = vec![member(1), member(2)];
+        let offline = id(1);
+        let got = absent_member_ips(&roster, id(9), None, &HashSet::new(), |i| *i == offline);
+        assert_eq!(got, vec![derive_ipv6(&id(2))]);
     }
 }
 
@@ -1609,16 +2423,181 @@ mod accept_handler_tests {
             members: MemberList::new(),
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
+            converged_hash: None,
+            unconfirmed_durable_hash: None,
             network_secret_key: None,
             network_public_key: net_pub,
             network_name: Some("test-net".to_string()),
+            group_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            last_record_timestamp: None,
         }))
+    }
+
+    #[test]
+    fn local_network_alias_never_rewrites_the_signed_group_name() {
+        let state = make_network_state();
+        let bytes = {
+            let mut state = state.write().unwrap();
+            state.network_name = Some("my-local-alias".to_string());
+            state.group_name = Some("signed-network-name".to_string());
+            state.refresh_snapshot();
+            state.snapshot.as_ref().unwrap().msgpack_bytes.clone()
+        };
+
+        let blob = crate::membership::decode_group_blob(&bytes).unwrap();
+        assert_eq!(blob.name.as_deref(), Some("signed-network-name"));
+    }
+
+    /// Convergence is tracked as the hash we accepted, not the hash of our own
+    /// re-encoding, and the two differ whenever the publisher writes bytes we
+    /// would not.
+    ///
+    /// The case that produces it is an upgrade: rmp-serde reads a struct from a
+    /// map as well as an array, so a node on this build converges fine from a
+    /// coordinator still writing the old named blob, and then re-encodes it
+    /// compactly. Comparing the record against the snapshot hash there says "a
+    /// different blob" on every poll forever, which refetches, reapplies, and
+    /// skips the converged branch's steady-state work (self-nullify check,
+    /// pending rename, exit-offer sync) for as long as the skew lasts.
+    #[test]
+    fn convergence_is_tracked_as_the_hash_we_accepted() {
+        let state = make_network_state();
+        let mut s = state.write().unwrap();
+        let member_id = SecretKey::from_bytes(&[9u8; 32]).public();
+        s.members = MemberList::from_members(vec![seated(member_id)]);
+        s.refresh_snapshot();
+
+        // The mismatch this exists for needs no version skew: `network_name` is
+        // hashed into the blob and is a *local* string, so a member that joined
+        // with `ray join <code> --name <alias>` re-encodes a name the coordinator
+        // never published and can never match its record.
+        let published = canonical_group_bytes(
+            &s.members,
+            &s.approved,
+            &s.suggested_firewall,
+            Some("what the coordinator published"),
+            &s.reusable_keys,
+            &s.nullifiers,
+        );
+        assert_ne!(
+            blake3::hash(&published),
+            s.snapshot.as_ref().unwrap().hash,
+            "a local alias alone puts our re-encoding out of step with the record"
+        );
+
+        // Our own encoding is what we are converged on, so a coordinator (which
+        // publishes exactly these bytes) sees the two agree.
+        let ours = s.snapshot.as_ref().unwrap().hash;
+        assert_eq!(s.converged_hash, Some(ours));
+
+        // Applying a record whose bytes we cannot reproduce: the snapshot stays
+        // what we would publish, and convergence follows the record.
+        let published = blake3::hash(b"the publisher's bytes, not ours");
+        s.converged_hash = Some(published);
+        assert_eq!(
+            s.snapshot.as_ref().unwrap().hash,
+            ours,
+            "the snapshot is still our own encoding, which is what we would publish"
+        );
+
+        // The decision every caller actually makes. This is the assertion that
+        // fails if `needs_reconverge` reads the snapshot: polling the record we
+        // just applied has to read as converged, or the poller refetches and
+        // reapplies the whole roster on every tick for as long as the two
+        // encodings differ.
+        assert!(
+            !s.needs_reconverge(published),
+            "the record we applied is not a change"
+        );
+        assert!(
+            s.needs_reconverge(blake3::hash(b"a genuinely newer blob")),
+            "a record we have not applied still is one"
+        );
+    }
+
+    /// The live state and context behind a handler, whichever role it is. Lets a
+    /// test seat members and device bindings on a handler it just built.
+    fn handler_parts(h: &AcceptHandler) -> (&SharedNetworkState, &MeshCtx) {
+        match h {
+            AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
+            AcceptHandler::Member(s) => (&s.state, &s.ctx),
+        }
+    }
+
+    fn seated(id: EndpointId) -> Member {
+        Member {
+            identity: id,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }
+    }
+
+    /// The demux wall: a peer on the roster may speak for this network.
+    #[tokio::test]
+    async fn knows_sender_accepts_a_seated_member() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let member = SecretKey::from_bytes(&[9u8; 32]).public();
+        state.write().unwrap().members.add(seated(member));
+        assert!(h.knows_sender(member));
+    }
+
+    /// A peer approved but not yet seated is still accounted for: it is mid-join
+    /// and its `MeshHello` is what completes the admission.
+    #[tokio::test]
+    async fn knows_sender_accepts_an_approved_peer() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let peer = SecretKey::from_bytes(&[10u8; 32]).public();
+        {
+            let mut s = state.write().unwrap();
+            s.approved.approve(ApprovedEntry {
+                identity: peer,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+            });
+        }
+        assert!(h.knows_sender(peer));
+    }
+
+    /// The branch the doc comment calls out: a paired peer can be on the roster
+    /// under its *user* identity while its frames arrive under a device key, so
+    /// the lookup has to try the resolved identity too.
+    #[tokio::test]
+    async fn knows_sender_resolves_a_device_to_its_roster_user() {
+        let h = sample_coordinator_handler().await;
+        let (state, ctx) = handler_parts(&h);
+        let user = SecretKey::from_bytes(&[11u8; 32]).public();
+        let device = SecretKey::from_bytes(&[12u8; 32]).public();
+        state.write().unwrap().members.add(seated(user));
+        // Unmapped, the device key is a stranger.
+        assert!(!h.knows_sender(device));
+        ctx.device_user_map.insert(device, user);
+        assert!(h.knows_sender(device));
+    }
+
+    /// The case the wall exists for: knowing the room id is not being in the room.
+    #[tokio::test]
+    async fn knows_sender_refuses_a_stranger() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let member = SecretKey::from_bytes(&[13u8; 32]).public();
+        state.write().unwrap().members.add(seated(member));
+        let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
+        assert!(!h.knows_sender(stranger));
     }
 
     /// Throwaway [`MeshCtx`] for accept-handler tests: a fresh blob store and
@@ -1654,16 +2633,16 @@ mod accept_handler_tests {
         let my_id = my_key.public();
         let registry = sample_registry(
             sample_test_endpoint().await,
-            IrohIdentityProvider::new(my_id, 0),
+            IrohIdentityProvider::new(my_id),
             blob_store.clone(),
             my_id,
         );
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store, registry),
+            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id), blob_store, registry),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             dht_notify: None,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock: Arc::new(AsyncMutex::new(())),
         }))
     }
 
@@ -1681,6 +2660,7 @@ mod accept_handler_tests {
             blob_store,
             Arc::new(ForwardMetrics::default()),
             contact,
+            Arc::new(LanPeers::new()),
         ));
         let hostname_table = dns::new_hostname_table();
         let reverse_table = dns::new_reverse_table();
@@ -1688,7 +2668,14 @@ mod accept_handler_tests {
             hostname_table.clone(),
             reverse_table.clone(),
         ));
-        let dns = Arc::new(DnsService::new(hostname_table, reverse_table, dns_resolver));
+        let dns = Arc::new(DnsService::new(
+            hostname_table,
+            reverse_table,
+            dns_resolver,
+            // No OS-DNS configuration runs in these tests, so the address the
+            // macOS backend would publish is never read.
+            std::net::Ipv6Addr::UNSPECIFIED,
+        ));
         let (disconnect_tx, _disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(1);
         let (placeholder_tx, _placeholder_rx) = mpsc::channel::<Bytes>(1);
         Arc::new(NetworkRegistry::new(
@@ -1718,24 +2705,23 @@ mod accept_handler_tests {
         let endpoint = sample_test_endpoint().await;
         let registry = sample_registry(
             endpoint.clone(),
-            IrohIdentityProvider::new(my_id, 0),
+            IrohIdentityProvider::new(my_id),
             blob_store.clone(),
             my_id,
         );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(my_id, 0),
+                IrohIdentityProvider::new(my_id),
                 blob_store.clone(),
                 registry.clone(),
             ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
-            token: CancellationToken::new(),
             net_pubkey: SecretKey::from_bytes(&[1u8; 32]).public(),
             my_identity: my_id,
             endpoint,
             registry,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock: Arc::new(AsyncMutex::new(())),
             reconverge_notify: Arc::new(tokio::sync::Notify::new()),
         }))
     }
@@ -1759,7 +2745,7 @@ mod accept_handler_tests {
         // roles: it once reached only the Member dispatch, so a plain
         // coordinator (the one node that can record the offer on the signed
         // roster) silently discarded it and no exit node was ever advertised.
-        use crate::membership::{Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member};
         for handler in [
             sample_coordinator_handler().await,
             sample_member_handler().await,
@@ -1773,50 +2759,54 @@ mod accept_handler_tests {
             {
                 let mut s = state.write().unwrap();
                 s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-                s.members
-                    .add(Member {
-                        identity: sender,
-                        ip: derive_ip(&sender),
-                        is_coordinator: false,
-                        hostname: None,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                        last_seen: None,
-                        exit_node: false,
-                    })
-                    .unwrap();
+                s.members.add(Member {
+                    identity: sender,
+                    is_coordinator: false,
+                    hostname: None,
+                    user_identity: None,
+                    device_cert: None,
+                    last_seen: None,
+                    exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
+                });
             }
-            let (disconnect_tx, _disconnect_rx) = mpsc::channel(1);
             registry.networks.insert(
                 "test-net".to_string(),
                 NetworkHandle {
                     name: "test-net".to_string(),
                     network_key: state.read().unwrap().network_public_key,
                     role: NetworkRole::Coordinator,
-                    my_ip: Ipv4Addr::new(100, 64, 0, 1),
                     state: state.clone(),
                     dht_notify: None,
                     cancel: CancellationToken::new(),
                     tasks: Vec::new(),
-                    invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                    disconnect_tx,
+                    invite_lock: Arc::new(AsyncMutex::new(())),
+                    incompatible: None,
                 },
             );
             assert!(
-                handler.handle_common(sender, &ControlMsg::ExitNodeOffer { enabled: true }),
+                handler.handle_common(
+                    sender,
+                    &ControlMsg::ExitNodeOffer {
+                        enabled: true,
+                        exit_families: ExitFamilies::Dual,
+                    },
+                ),
                 "ExitNodeOffer must be consumed by the role-independent dispatch"
             );
             // The recording runs off the demux loop; wait for it to land.
             let mut recorded = false;
             for _ in 0..100 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                // Both halves of the offer: the IPv6 claim rides the same message
+                // and has to reach the signed roster with it, or an IPv6-only
+                // client sees a gateway it will refuse to select.
                 let done = state
                     .read()
                     .unwrap()
                     .members
                     .get(&sender)
-                    .is_some_and(|m| m.exit_node);
+                    .is_some_and(|m| m.exit_node && m.exit_families.carries_v6());
                 if done {
                     recorded = true;
                     break;
@@ -1839,7 +2829,7 @@ mod accept_handler_tests {
         // recording path and flip the member's roster `exit_node` flag. Before the
         // fix the coordinator's accept handler dropped the frame on its catch-all,
         // so nothing was recorded and no exit node was ever advertised.
-        use crate::membership::{Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -1870,7 +2860,7 @@ mod accept_handler_tests {
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let registry = sample_registry(
             coord_ep.clone(),
-            IrohIdentityProvider::new(coord_id, 0),
+            IrohIdentityProvider::new(coord_id),
             blob_store.clone(),
             coord_id,
         );
@@ -1879,34 +2869,29 @@ mod accept_handler_tests {
         {
             let mut s = state.write().unwrap();
             s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-            s.members
-                .add(Member {
-                    identity: member_id,
-                    ip: derive_ip(&member_id),
-                    is_coordinator: false,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                    last_seen: None,
-                    exit_node: false,
-                })
-                .unwrap();
+            s.members.add(Member {
+                identity: member_id,
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
         }
-        let (disconnect_tx, _drx) = mpsc::channel(1);
         registry.networks.insert(
             "test-net".to_string(),
             NetworkHandle {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                my_ip: Ipv4Addr::new(100, 64, 0, 1),
                 state: state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                disconnect_tx,
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
             },
         );
 
@@ -1915,7 +2900,7 @@ mod accept_handler_tests {
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(coord_id, 0),
+                IrohIdentityProvider::new(coord_id),
                 blob_store.clone(),
                 registry.clone(),
             ),
@@ -1926,14 +2911,14 @@ mod accept_handler_tests {
             net_pubkey,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
                 ctx: sample_mesh_ctx(
-                    IrohIdentityProvider::new(coord_id, 0),
+                    IrohIdentityProvider::new(coord_id),
                     blob_store.clone(),
                     registry.clone(),
                 ),
                 network_name: "test-net".to_string(),
                 state: state.clone(),
                 dht_notify: None,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             })),
         );
 
@@ -1962,7 +2947,10 @@ mod accept_handler_tests {
         control::send_msg(
             &mut send,
             Some(net_pubkey),
-            &ControlMsg::ExitNodeOffer { enabled: true },
+            &ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_families: ExitFamilies::V4,
+            },
         )
         .await
         .unwrap();
@@ -1998,7 +2986,7 @@ mod accept_handler_tests {
         // ConnectionManager owns); the earlier bug dialed a throwaway connection
         // and dropped it, so the frame never flushed and the coordinator's
         // roster never changed even though the sender logged "delivered".
-        use crate::membership::{Member, derive_ip, derive_ipv6};
+        use crate::membership::{ExitFamilies, Member, derive_ipv6};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2008,7 +2996,6 @@ mod accept_handler_tests {
 
         let coord_key = SecretKey::from_bytes(&[7u8; 32]);
         let coord_id = coord_key.public();
-        let coord_ip = derive_ip(&coord_id);
         let coord_ep = Endpoint::builder(presets::N0)
             .secret_key(coord_key)
             .alpns(vec![alpn.clone()])
@@ -2018,7 +3005,6 @@ mod accept_handler_tests {
             .unwrap();
         let member_key = SecretKey::from_bytes(&[8u8; 32]);
         let member_id = member_key.public();
-        let member_ip = derive_ip(&member_id);
         let member_ep = Endpoint::builder(presets::N0)
             .secret_key(member_key)
             .alpns(vec![alpn.clone()])
@@ -2032,25 +3018,23 @@ mod accept_handler_tests {
             vec![
                 Member {
                     identity: coord_id,
-                    ip: coord_ip,
                     is_coordinator: true,
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
                 },
                 Member {
                     identity: member_id,
-                    ip: member_ip,
                     is_coordinator: false,
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
                 },
             ]
         };
@@ -2060,7 +3044,7 @@ mod accept_handler_tests {
         let coord_blobs = FsStore::load(coord_tmp.path()).await.unwrap();
         let coord_reg = sample_registry(
             coord_ep.clone(),
-            IrohIdentityProvider::new(coord_id, 0),
+            IrohIdentityProvider::new(coord_id),
             coord_blobs.clone(),
             coord_id,
         );
@@ -2070,26 +3054,24 @@ mod accept_handler_tests {
             s.network_secret_key = Some(net_secret.clone());
             s.members = MemberList::from_members(roster());
         }
-        let (ctx_tx, _ctx_rx) = mpsc::channel(1);
         coord_reg.networks.insert(
             "test-net".to_string(),
             NetworkHandle {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                my_ip: coord_ip,
                 state: coord_state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                disconnect_tx: ctx_tx,
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
             },
         );
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(coord_id, 0),
+                IrohIdentityProvider::new(coord_id),
                 coord_blobs.clone(),
                 coord_reg.clone(),
             ),
@@ -2100,14 +3082,14 @@ mod accept_handler_tests {
             net_pubkey,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
                 ctx: sample_mesh_ctx(
-                    IrohIdentityProvider::new(coord_id, 0),
+                    IrohIdentityProvider::new(coord_id),
                     coord_blobs.clone(),
                     coord_reg.clone(),
                 ),
                 network_name: "test-net".to_string(),
                 state: coord_state.clone(),
                 dht_notify: None,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             })),
         );
         let accept = {
@@ -2129,7 +3111,7 @@ mod accept_handler_tests {
         let member_blobs = FsStore::load(member_tmp.path()).await.unwrap();
         let member_reg = sample_registry(
             member_ep.clone(),
-            IrohIdentityProvider::new(member_id, 0),
+            IrohIdentityProvider::new(member_id),
             member_blobs.clone(),
             member_id,
         );
@@ -2139,20 +3121,18 @@ mod accept_handler_tests {
             s.network_secret_key = None; // plain member
             s.members = MemberList::from_members(roster());
         }
-        let (mtx, _mrx) = mpsc::channel(1);
         member_reg.networks.insert(
             "test-net".to_string(),
             NetworkHandle {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Member,
-                my_ip: member_ip,
                 state: member_state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                disconnect_tx: mtx,
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
             },
         );
         // Offering an exit, and the data plane is up so sync is enabled.
@@ -2170,7 +3150,6 @@ mod accept_handler_tests {
             .await
             .expect("member dials coordinator");
         member_reg.peers.add(
-            coord_ip,
             derive_ipv6(&coord_id),
             member_conn.clone(),
             coord_id,
@@ -2260,7 +3239,7 @@ mod accept_handler_tests {
 #[cfg(test)]
 mod coordinator_dial_order_tests {
     use super::*;
-    use crate::membership::{Member, derive_ip};
+    use crate::membership::{ExitFamilies, Member};
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -2274,14 +3253,13 @@ mod coordinator_dial_order_tests {
         let (a, b, c, me) = (test_id(1), test_id(2), test_id(3), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
@@ -2293,14 +3271,13 @@ mod coordinator_dial_order_tests {
         let (a, b, me) = (test_id(1), test_id(2), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
         };
 
         // No coordinators in the roster ⇒ empty order (caller bails).
@@ -2354,14 +3331,13 @@ mod coordinator_dial_order_tests {
         let (a, b, c) = (test_id(1), test_id(2), test_id(3));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
         let me = a;
@@ -2374,14 +3350,13 @@ mod coordinator_dial_order_tests {
         let me = test_id(1);
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.
         let members = vec![mk(me, true), mk(test_id(2), false)];
@@ -2468,11 +3443,180 @@ mod headless_tests {
         assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
     }
 
+    /// `net_config_apply` gates on the network's presence ON DISK, not in the
+    /// live network map: the old `NetworkRegistry::contains` check it replaced
+    /// gated on the live map instead, so a saved-but-inactive network used to
+    /// error here. That drift was reviewed and kept deliberately (the daemon
+    /// connects every saved network at startup, so "on disk" and "live" agree
+    /// in practice); this test pins the disk-presence semantics so any future
+    /// change to that gate is a deliberate decision, not an accident.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn net_config_apply_gates_on_the_network_existing_on_disk() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
+
+        // No network saved yet: not-found, matching the old live-map check.
+        let msg = daemon
+            .net_config_apply("gaming", NetworkKey::AutoAcceptFiles, "off")
+            .await;
+        assert!(
+            matches!(&msg, IpcMessage::Error { message } if message.contains("not found")),
+            "{msg:?}"
+        );
+
+        // Save the network to disk without registering it in the live map
+        // (nothing here calls `create_network`/`join_network`), i.e. exactly
+        // the "saved but inactive" case the review flagged.
+        config::save_network(&config::empty_network_config("gaming")).unwrap();
+
+        let msg = daemon
+            .net_config_apply("gaming", NetworkKey::AutoAcceptFiles, "off")
+            .await;
+        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+
+        let msg = daemon
+            .net_config_apply("gaming", NetworkKey::EphemeralTtl, "3599")
+            .await;
+        assert!(
+            matches!(&msg, IpcMessage::Error { message }
+                if message == "ttl must be at least 3600 seconds (1 hour)"),
+            "validation errors must not be mislabeled as save failures: {msg:?}"
+        );
+    }
+
+    /// A stopped node must be rebuildable in the same process, which is the
+    /// mobile disable/enable cycle (`Node::stop` then `Node::start`, both in one
+    /// app process).
+    ///
+    /// What makes this sharp: two `FsStore`s over the same directory do not
+    /// error, they *block*. redb waits for the lock on `blobs/blobs.db` rather
+    /// than returning `DatabaseAlreadyOpen`, so a rebuild that overlaps a store
+    /// the previous daemon has not released yet never returns at all, and on
+    /// Android that wedges the thread `Node::start` was called on for the life of
+    /// the process. Before `shutdown_and_close` shut the protocol router down,
+    /// nothing in it released the store: the release happened later, if at all,
+    /// when the router's accept task noticed the closed endpoint and dropped its
+    /// handlers. This asserts the router is shut down before the call returns
+    /// (which is what drives `BlobsProtocol::shutdown` -> `Store::shutdown`) and
+    /// then reopens the store immediately, with the daemon `Arc` still held.
+    ///
+    /// See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
+    /// only serializes tests and guards no data across the awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_close_releases_the_blob_store_for_a_rebuild() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // One config dir throughout: sharing `blobs/blobs.db` is the whole point,
+        // so a per-build tempdir would pass even with the bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let first = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("first build_headless should not hang")
+            .expect("first build_headless should succeed");
+        tokio::time::timeout(Duration::from_secs(30), first.shutdown_and_close())
+            .await
+            .expect("shutdown_and_close should not hang");
+        assert!(
+            first.router.is_shutdown(),
+            "shutdown_and_close must shut the protocol router down, which is what \
+             releases the blob store, rather than leaving it to the accept task"
+        );
+
+        // Still holding `first`, and reopening on the very next line. Waiting for
+        // the last `Arc` to drop is not something a caller can arrange
+        // (background tasks hold their own clones and wind down on their own
+        // schedule), so releasing the store has to be something the call itself
+        // guarantees before it returns.
+        let blobs_dir = config::config_dir().unwrap().join("blobs");
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(10),
+            iroh_blobs::store::fs::FsStore::load(&blobs_dir),
+        )
+        .await
+        .expect("the blob store is still locked after shutdown_and_close")
+        .expect("reopening the blob store should succeed");
+        let _ = reopened.shutdown().await;
+
+        // And the whole rebuild works, which is what the app actually does.
+        tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("rebuild should not hang")
+            .expect("rebuilding after shutdown_and_close should succeed");
+    }
+
+    // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
+    // only serializes tests and guards no data across the awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lan_peers_reach_status_and_the_scan_reply() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
+
+        // Nothing seen yet: the scan reply is empty and status counts nothing.
+        match daemon.list_lan_peers() {
+            IpcMessage::LanPeersList { peers, .. } => assert!(peers.is_empty()),
+            other => panic!("expected LanPeersList, got {other:?}"),
+        }
+
+        // Feed the map the way the mDNS browse loop does.
+        let peer = SecretKey::from_bytes(&[42u8; 32]).public();
+        let addr = SocketAddr::from(([192, 168, 1, 24], 41641));
+        daemon.transport.lan_peers.discovered(peer, vec![addr]);
+
+        match daemon.list_lan_peers() {
+            IpcMessage::LanPeersList {
+                peers,
+                mdns_enabled: _,
+            } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].endpoint_id, peer);
+                assert_eq!(peers[0].addrs, vec![addr.to_string()]);
+                // We share no network with this sighting, so it is connectable.
+                assert_eq!(peers[0].shared_network, None);
+            }
+            other => panic!("expected LanPeersList, got {other:?}"),
+        }
+
+        // The same sighting is listed in `ray status`, with its addresses.
+        match daemon.status() {
+            IpcMessage::StatusResponse { lan_peers, .. } => {
+                assert_eq!(lan_peers.len(), 1);
+                assert_eq!(lan_peers[0].endpoint_id, peer);
+                assert_eq!(lan_peers[0].addrs, vec![addr.to_string()]);
+            }
+            other => panic!("expected StatusResponse, got {other:?}"),
+        }
+
+        // An expiry clears it from both.
+        daemon.transport.lan_peers.expired(&peer);
+        match daemon.status() {
+            IpcMessage::StatusResponse { lan_peers, .. } => assert!(lan_peers.is_empty()),
+            other => panic!("expected StatusResponse, got {other:?}"),
+        }
+    }
+
     /// In-memory TUN writer that records every written packet into a shared
     /// buffer, so a test can observe which writer the data plane routed to.
     #[derive(Clone, Default)]
     struct FakeTunWriter {
-        written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl crate::tun::TunWrite for FakeTunWriter {
@@ -2503,7 +3647,7 @@ mod headless_tests {
     /// failure fails fast instead of hanging; the short poll interval leaves room
     /// for the cross-thread wakeup of the writer task without a fixed sleep that
     /// would either flake (too short) or slow the suite (too long).
-    async fn wait_for_len(sink: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
+    async fn wait_for_len(sink: &Arc<Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
         for _ in 0..400 {
             if sink.lock().unwrap().len() >= want {
                 return true;

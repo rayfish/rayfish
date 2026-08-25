@@ -43,18 +43,199 @@ fn owner_admits(device_cert: Option<&control::DeviceCert>, own_identity: Endpoin
     device_cert.map(|c| c.user_identity) == Some(own_identity)
 }
 
+/// Whether a signed record authored at `record_ts` may replace what we hold,
+/// given the timestamp of the last record applied (`floor`).
+///
+/// Strictly greater, because equal timestamps with different contents are two
+/// records we have no ordering for, and keeping ours costs at most one republish
+/// interval while taking theirs costs whatever the older one said. `None` accepts
+/// anything: we have applied nothing yet, so there is no rollback to prevent.
+pub(crate) fn record_is_newer(record_ts: u64, floor: Option<u64>) -> bool {
+    match floor {
+        Some(seen) => record_ts > seen,
+        None => true,
+    }
+}
+
+/// Whether a peer this network's roster does not account for may send `msg`.
+///
+/// A control frame reaches a per-network handler on the strength of the network
+/// public key in its envelope, and that key is a discovery key: it is in every
+/// invite code and it *is* the pkarr address, so anyone can name it. Without this
+/// list, "knows the room id" and "is in the room" were the same thing as far as
+/// the handlers were concerned, and the messages meant for members were reachable
+/// by anyone who had ever seen an invite.
+///
+/// Three messages have to survive the filter, because each one is how a peer that
+/// is legitimately not on our roster yet talks to us:
+///
+/// - `JoinRequest` is the whole point of a stranger dialing us.
+/// - `MeshHello` is a joiner announcing itself to the rest of the roster right
+///   after admission (`connect_to_roster_peers`), which reaches members that have
+///   not reconverged yet, and is also an older client's no-invite join.
+/// - `SignedRecord` carries a network-key-signed packet that is verified against
+///   the network key before anything is applied, so it needs no sender authority
+///   at all. It is also precisely the message that repairs a roster too stale to
+///   recognize its own coordinator, so gating it on that roster would be circular.
+///
+/// Everything else is either a coordinator's word (checked again in the arm), a
+/// member's statement about itself, or a trigger whose cost is a DHT resolve and
+/// a blob fetch. None of those are things to do on a stranger's say-so.
+/// Written as a full match with no `_` arm on purpose: a new `ControlMsg` variant
+/// then fails to compile until someone decides which side of the wall it belongs
+/// on, which is the same reason the settings enums are matched exhaustively.
+pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
+    match msg {
+        ControlMsg::JoinRequest { .. }
+        | ControlMsg::MeshHello { .. }
+        | ControlMsg::SignedRecord { .. } => true,
+
+        // Coordinator authority. Each is checked again in its own arm.
+        ControlMsg::MemberApproved { .. }
+        | ControlMsg::AdminGrant { .. }
+        | ControlMsg::InviteShare { .. }
+        | ControlMsg::InviteUsed { .. }
+        | ControlMsg::KickedFromNetwork
+        | ControlMsg::Welcome { .. }
+        | ControlMsg::JoinApproved { .. }
+        | ControlMsg::JoinPending
+        | ControlMsg::JoinDenied { .. } => false,
+
+        // Cheap to send, a DHT resolve plus a blob fetch to honor.
+        ControlMsg::MemberSync | ControlMsg::BlobUpdated => false,
+
+        // A member's statements about itself, and its departure.
+        ControlMsg::ExitNodeOffer { .. } | ControlMsg::LeaveNetwork => false,
+
+        // Connection-level: the demux handles these before it ever resolves a
+        // per-network handler, so they never reach this decision. Listed rather
+        // than caught by a wildcard so the exhaustiveness holds.
+        ControlMsg::NetworkHandles { .. }
+        | ControlMsg::Ping { .. }
+        | ControlMsg::Pong { .. }
+        | ControlMsg::Unpaired
+        | ControlMsg::CertRefresh { .. }
+        | ControlMsg::RequestUnpair
+        | ControlMsg::NotSupported { .. }
+        | ControlMsg::FileOffer { .. } => false,
+    }
+}
+
+/// Whether admitting `joiner` onto this network should also hand it the network
+/// secret key (co-coordinator), the `ray connect` direct-link grant.
+///
+/// A direct link is symmetric, so its one intended peer coordinates it too. The
+/// grant therefore follows the *peer* recorded when the link was minted, not the
+/// network's `direct` flag, which any later `ray requests accept` would ride
+/// into a key it was never offered.
+///
+/// `direct_peer` is `None` on links minted before it was recorded, so those fall
+/// back to the old rule but only while we are still the sole member: that is the
+/// state a direct network sits in until its one peer arrives, and it keeps an
+/// in-flight `ray connect` from an older build working, while still refusing a
+/// third peer on an already-formed link.
+pub(crate) fn grants_direct_key(
+    net: &config::NetworkConfig,
+    joiner: EndpointId,
+    state: &SharedNetworkState,
+) -> bool {
+    if !net.direct {
+        return false;
+    }
+    match net.direct_peer {
+        Some(peer) => peer == joiner,
+        None => {
+            let state = state.read().unwrap();
+            state.members.all().len() <= 1
+                || state
+                    .members
+                    .get(&joiner)
+                    .is_some_and(|member| member.is_coordinator)
+        }
+    }
+}
+
+/// What a `MeshHello`'s identity claim earns its sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelloIdentity {
+    /// Accept the hello. `Some(user)` is a device→user binding good enough to
+    /// record in the `device_user_map`; `None` means the peer speaks only for
+    /// its own transport key.
+    Accept(Option<EndpointId>),
+    /// Refuse the frame: the cert does not hold up, or it does not back the
+    /// identity the sender claimed.
+    Reject,
+}
+
+/// Decide what a `MeshHello` proved about who is sending it.
+///
+/// The `device_user_map` this feeds is daemon-wide and is what the inbound
+/// firewall (`forward::evaluate_inbound`), mesh SSH (`ssh::resolve_user_policy`),
+/// own-device file auto-accept, and member-leave pruning all authorize on. So a
+/// cert only ever earns a binding here after its signature is checked and after
+/// it is confirmed to name *this* transport key: a peer that presents a cert it
+/// did not receive must not inherit the rights of the identity that signed it.
+///
+/// The two rules are independent, which is what the earlier version of this code
+/// missed. Verifying the cert is not conditional on the sender claiming a
+/// *different* identity: a sender claiming its own transport key still hands us a
+/// `user_identity` we would otherwise store on its word alone.
+///
+/// A nullified device (`ray unpair`) keeps its valid signature forever, so the
+/// revocation has to be applied here too: its binding is dropped, and a claim
+/// that rests on it is refused outright. `revoked` is asked across every network
+/// this node runs, because the binding it guards is daemon-wide.
+pub(crate) fn check_hello_identity(
+    transport_id: EndpointId,
+    peer_identity: EndpointId,
+    cert: Option<&control::DeviceCert>,
+    revoked: bool,
+) -> HelloIdentity {
+    let binding = match cert {
+        // A presented cert must verify and must bind the key that actually
+        // dialed us. Anything else is a forgery attempt, not a peer without a
+        // cert, so refuse the frame rather than quietly continuing without it.
+        Some(c) if !c.verify() || c.device_key != transport_id => return HelloIdentity::Reject,
+        // Verified, but revoked: worth nothing.
+        Some(_) if revoked => None,
+        Some(c) => Some(c.user_identity),
+        None => None,
+    };
+    if peer_identity != transport_id && binding != Some(peer_identity) {
+        // Claiming to be someone else takes a live binding that names them.
+        return HelloIdentity::Reject;
+    }
+    HelloIdentity::Accept(binding)
+}
+
 pub(crate) struct CoordinatorAcceptState {
     pub(crate) ctx: MeshCtx,
     pub(crate) network_name: String,
     pub(crate) state: SharedNetworkState,
     pub(crate) dht_notify: Option<Arc<tokio::sync::Notify>>,
     /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
-    pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) invite_lock: Arc<AsyncMutex<()>>,
+}
+
+fn restore_displaced_member(
+    members: &mut MemberList,
+    tentative: &Member,
+    displaced: Option<Member>,
+) -> bool {
+    if members.get(&tentative.identity) != Some(tentative) {
+        return false;
+    }
+    if let Some(member) = displaced {
+        members.add(member);
+    } else {
+        members.remove(&tentative.identity);
+    }
+    true
 }
 
 impl CoordinatorAcceptState {
     /// Dispatch one control frame arriving on a mesh connection this coordinator
-    /// accepts. Returns the peer's mesh IPv4 once it is a registered member on this
+    /// accepts. Returns the peer's mesh address once it is a registered member on this
     /// network (so the per-connection demux can announce our handle table to it),
     /// else `None`. Ping/Pong/`NetworkHandles` are connection-level and handled by
     /// the demux before it ever reaches here.
@@ -64,7 +245,7 @@ impl CoordinatorAcceptState {
         send: iroh::endpoint::SendStream,
         peer_id: EndpointId,
         msg: ControlMsg,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         match msg {
             ControlMsg::JoinRequest {
                 invite_secret,
@@ -83,7 +264,7 @@ impl CoordinatorAcceptState {
             } => {
                 let is_member = self.state.read().unwrap().members.is_member(&peer_id);
                 if is_member {
-                    self.handle_member_hello(conn, peer_id, hostname, device_cert)
+                    self.handle_member_hello(conn, send, peer_id, hostname, device_cert)
                         .await
                 } else {
                     self.handle_join_request(conn, send, peer_id, None, hostname, device_cert)
@@ -129,7 +310,7 @@ impl CoordinatorAcceptState {
         invite_secret: Option<Vec<u8>>,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         // Verify a device certificate if presented, and record the transport-key →
         // user-identity binding so paired devices resolve.
         if let Some(ref cert) = device_cert {
@@ -156,13 +337,24 @@ impl CoordinatorAcceptState {
                 .insert(remote_id, cert.user_identity);
         }
 
+        // Admission may already have committed and published before the Welcome
+        // reached a direct peer. Treat a repeated fresh JoinRequest from any
+        // seated member as a reconnect; for the intended direct peer this replays
+        // the same signed key grant instead of queueing it as an unknown join.
+        if self.state.read().unwrap().members.is_member(&remote_id) {
+            return self
+                .handle_member_hello(conn, send, remote_id, hostname, device_cert)
+                .await;
+        }
+
         // A peer pre-approved via `ray accept` is admitted directly.
         let is_approved = self.state.read().unwrap().approved.is_approved(&remote_id);
         if is_approved {
             // Live-approved name is joiner-chosen, not authoritative.
             return self
                 .admit_peer(conn, send, remote_id, hostname, device_cert, true, false)
-                .await;
+                .await
+                .into_ip();
         }
 
         // Unknown peer presenting an invite secret: verify and burn it.
@@ -176,17 +368,18 @@ impl CoordinatorAcceptState {
         // the request for live operator approval (`ray accept`).
         let mode = self.state.read().unwrap().mode;
         match mode {
-            GroupMode::Open => {
-                self.admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
-                    .await
-            }
+            GroupMode::Open => self
+                .admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
+                .await
+                .into_ip(),
             GroupMode::Restricted => {
                 // A device cert signed by this coordinator's own owner identity is
                 // one of our own paired devices: admit directly (no approval step).
                 if owner_admits(device_cert.as_ref(), self.ctx.identity.local_identity()) {
                     return self
                         .admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
-                        .await;
+                        .await
+                        .into_ip();
                 }
                 // Queue for live operator approval, bounded by MAX_PENDING_JOINS
                 // (oldest-evicted) so a peer churning fresh identities can't grow
@@ -229,35 +422,127 @@ impl CoordinatorAcceptState {
     /// A known member re-announced over a (re)established connection: register its
     /// route + data reader, refresh its device cert, and apply any rename
     /// authoritatively (resolve collisions, update roster + DNS, republish the blob
-    /// and broadcast `MemberSync` on a real change). Returns the member's mesh v4.
+    /// and broadcast `MemberSync` on a real change). Returns the member's mesh IPv6.
     async fn handle_member_hello(
         &self,
         conn: &Connection,
+        send: iroh::endpoint::SendStream,
         remote_id: EndpointId,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
-        let peer_ip = self
+    ) -> Option<Ipv6Addr> {
+        if self
             .state
             .read()
             .unwrap()
-            .members
-            .get(&remote_id)
-            .map(|m| m.ip)?;
+            .unconfirmed_durable_hash
+            .is_some()
+        {
+            let mut send = send;
+            let _ = control::send_msg(&mut send, Some(self.net_pubkey()), &ControlMsg::JoinPending)
+                .await;
+            return None;
+        }
+        let grant_direct = config::load_network(&self.network_name)
+            .ok()
+            .flatten()
+            .is_some_and(|net| grants_direct_key(&net, remote_id, &self.state));
+        // A peer that is seated as a direct co-coordinator but has not durably
+        // received the key must never be finalized as an ordinary member. If we
+        // cannot reproduce the exact signed grant yet, make this attempt fail so
+        // the restore/join supervisor retries it.
+        let record = self
+            .ctx
+            .registry
+            .current_signed_record(&self.network_name)
+            .await;
+        if grant_direct && record.is_none() {
+            self.deny(
+                conn,
+                send,
+                "direct coordinator grant is temporarily unavailable; retrying".to_string(),
+            )
+            .await;
+            return None;
+        }
+        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
+        let stable_welcome = {
+            let state = self.state.read().unwrap();
+            let record_is_current = record
+                .as_ref()
+                .is_none_or(|signed| state.converged_hash == Some(signed.hash));
+            if state.unconfirmed_durable_hash.is_some() || !record_is_current {
+                None
+            } else {
+                state.members.get(&remote_id).map(|member| {
+                    let membership = record
+                        .as_ref()
+                        .map(|signed| (signed.members.clone(), signed.approved.clone()))
+                        .unwrap_or_else(|| (state.roster(), state.approved_snapshot()));
+                    (derive_ipv6(&member.identity), membership)
+                })
+            }
+        };
+        drop(commit_guard);
+        let Some((peer_ip, (members, approved))) = stable_welcome else {
+            let mut send = send;
+            let _ = control::send_msg(&mut send, Some(self.net_pubkey()), &ControlMsg::JoinPending)
+                .await;
+            return None;
+        };
+
+        let mut send = send;
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
+            .register_peer_conn(conn, remote_id, &self.network_name);
+
+        // Reply on the request stream before any further reconnect work. This is
+        // the durable replay path for a direct peer that was admitted and marked
+        // coordinator in the signed roster but crashed before persisting its key.
+        let direct_key = grant_direct
+            .then(|| record.as_ref().map(|signed| signed.key.to_bytes()))
+            .flatten();
+        let direct_record = grant_direct
+            .then(|| record.as_ref().map(|signed| signed.packet.clone()))
+            .flatten();
+        let direct_record_published =
+            grant_direct && record.as_ref().is_some_and(|signed| signed.published);
+        if control::send_msg(
+            &mut send,
+            Some(self.net_pubkey()),
+            &ControlMsg::Welcome {
+                members,
+                approved,
+                direct_key,
+                direct_record,
+                direct_record_published,
+            },
+        )
+        .await
+        .is_err()
+        {
+            return None;
+        }
 
         // Hand this (re)connecting member our current signed record over the mesh
         // so it converges to the live roster in ~1s instead of waiting out a stale
-        // DHT lookup plus the 60s group poll. Only a coordinator holds the network
+        // DHT lookup plus the group poll. Only a coordinator holds the network
         // key, so only we can originate it; the member verifies the record against
         // the network key before applying (see `MemberAcceptState::handle_frame`).
-        if let Some(record) = self.ctx.registry.current_signed_record(&self.network_name) {
-            let msg = ControlMsg::SignedRecord { packet: record };
+        if let Some(record) = record {
+            let msg = ControlMsg::SignedRecord {
+                packet: record.packet,
+            };
             if let Err(e) = open_and_send(conn, Some(self.net_pubkey()), &msg).await {
                 tracing::debug!(peer = %remote_id.fmt_short(), error = %e, "failed to hand signed record to reconnecting member");
             }
+        }
+
+        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
+        if !self.state.read().unwrap().members.is_member(&remote_id) {
+            return None;
         }
 
         // Verify and store device cert if present, unless the device key is
@@ -319,13 +604,17 @@ impl CoordinatorAcceptState {
                 m.hostname = Some(final_hostname.clone());
             }
         }
+        if changed {
+            commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+        }
+        drop(commit_guard);
 
         // Re-assert this peer's DNS entry (idempotent).
         dns::remove_hostname_by_ip(
             &self.ctx.hostname_table,
             &self.ctx.reverse_table,
             &self.network_name,
-            peer_ip,
+            derive_ipv6(&remote_id),
         )
         .await;
         dns::update_hostname(
@@ -333,16 +622,19 @@ impl CoordinatorAcceptState {
             &self.ctx.reverse_table,
             &self.network_name,
             &final_hostname,
-            peer_ip,
             derive_ipv6(&remote_id),
         )
         .await;
 
         if changed {
             tracing::info!(peer = %remote_id.fmt_short(), network = %self.network_name, hostname = %final_hostname, "peer hostname changed; republishing blob + broadcasting MemberSync");
-            update_snapshot_and_publish(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
-            broadcast_member_sync(&self.ctx.peers, self.net_pubkey(), &self.network_name, None)
-                .await;
+            broadcast_member_sync(
+                &self.ctx.registry,
+                self.net_pubkey(),
+                &self.network_name,
+                None,
+            )
+            .await;
         }
         Some(peer_ip)
     }
@@ -387,10 +679,10 @@ impl CoordinatorAcceptState {
     }
 
     /// Admit (or reject) an unknown peer that presented an invite `secret`.
-    /// Tries the local single-use ledger first (burns on success; un-burns if
-    /// admission is then denied by a collision, and gossips `InviteUsed` to the
-    /// other coordinators on success), then the verified blob's reusable keys
-    /// (no burn). Denies if neither matches.
+    /// Tries the local single-use ledger first (burns on success; un-burns only
+    /// on definite admission denial, and gossips `InviteUsed` when admitted or
+    /// retained pending a durability retry), then the verified blob's reusable
+    /// keys (no burn). Denies if neither matches.
     async fn redeem_invite_and_admit(
         &self,
         conn: &Connection,
@@ -399,7 +691,7 @@ impl CoordinatorAcceptState {
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
         secret: Vec<u8>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         let redeemed = {
             let _guard = self.invite_lock.lock().await;
             match crate::invite::InviteStore::load(&self.network_name) {
@@ -427,8 +719,11 @@ impl CoordinatorAcceptState {
                     )
                     .await;
                 // Admission can still be denied (hostname/IP collision) after
-                // the secret was burned; un-burn so the holder can retry.
-                if admitted.is_none() {
+                // the secret was burned; un-burn only a definite denial. If a
+                // post-rename directory sync left durability ambiguous, the
+                // retained generation already seats the peer, so the invite must
+                // stay spent and be gossiped just as for a completed admission.
+                if !admitted.keeps_invite_spent() {
                     let _guard = self.invite_lock.lock().await;
                     if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
                         let _ = store.restore(&secret);
@@ -450,7 +745,7 @@ impl CoordinatorAcceptState {
                     )
                     .await;
                 }
-                admitted
+                admitted.into_ip()
             }
             Err(single_use_err) => {
                 // Not a single-use invite, it may be a reusable key, which
@@ -471,6 +766,7 @@ impl CoordinatorAcceptState {
                     // collision → suffix.
                     self.admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
                         .await
+                        .into_ip()
                 } else {
                     tracing::warn!(peer = %remote_id.fmt_short(), error = %single_use_err, "invite rejected");
                     self.deny(conn, send, format!("invite rejected: {single_use_err}"))
@@ -493,13 +789,14 @@ impl CoordinatorAcceptState {
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
     }
 
-    /// Admit a non-member peer into the network: assign hostname/IP, add to the
-    /// member list, broadcast `MemberApproved`, reply `Welcome` on the joiner's
+    /// Admit a non-member peer into the network: settle its hostname, add it to
+    /// the member list, broadcast `MemberApproved`, reply `Welcome` on the joiner's
     /// stream, and start forwarding. Shared by the invite, open-mode, and
     /// live-approval admission paths.
-    /// Returns `Some(ip)` with the admitted peer's mesh v4, or `None` if the join
-    /// was denied (hostname or IP collision). Callers that burned a credential to
-    /// get here (an invite) restore it on `None` so the holder isn't locked out.
+    /// Returns `Admitted(ip)` after completing admission, `PendingDurability` if
+    /// the peer is retained in a generation whose directory sync is still
+    /// ambiguous, or `Denied` for a definite rejection. A caller that burned a
+    /// single-use credential restores it only for `Denied`.
     #[allow(clippy::too_many_arguments)]
     async fn admit_peer(
         &self,
@@ -513,49 +810,158 @@ impl CoordinatorAcceptState {
         // Authoritative names are rejected on collision (no silent rename), so no
         // peer can claim another's name to take its suggested firewall rules.
         authoritative: bool,
-    ) -> Option<Ipv4Addr> {
-        let (peer_ip, collision_index, final_hostname) =
-            match self.validate_admission(remote_id, hostname, authoritative) {
-                Ok(plan) => plan,
-                Err(reason) => {
-                    self.deny(conn, send, reason).await;
-                    return None;
-                }
-            };
+    ) -> AdmissionResult {
+        let Admission {
+            peer_ip,
+            hostname: final_hostname,
+        } = match self.validate_admission(remote_id, hostname, authoritative) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                self.deny(conn, send, reason).await;
+                return AdmissionResult::Denied;
+            }
+        };
 
         // A direct (`ray connect`) network is a symmetric 2-peer link, so the
         // pre-approved requester is made a co-coordinator: marked coordinator in
         // the roster here and granted the network key over its connection below.
+        //
+        // Pinned to the peer the link was minted for (`direct_peer`), not to the
+        // network's `direct` flag: the flag says the *network* is a direct link,
+        // so on its own it handed the network key to anyone ever approved here,
+        // and a later `ray requests accept` on that network would give the key
+        // away without saying so.
         let grant_direct = was_approved
             && config::load_network(&self.network_name)
                 .ok()
                 .flatten()
-                .is_some_and(|n| n.direct);
+                .is_some_and(|n| grants_direct_key(&n, remote_id, &self.state));
 
+        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
         let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
-        let snap_bytes = {
-            let mut s = self.state.write().unwrap();
-            if was_approved {
-                s.approved.remove(&remote_id);
-            }
-            s.pending.remove(&remote_id);
-            let _ = s.members.add(Member {
-                identity: remote_id,
-                ip: peer_ip,
-                is_coordinator: grant_direct,
-                hostname: final_hostname.clone(),
-                user_identity: user_id_opt,
-                device_cert: device_cert.clone(),
-                collision_index,
-                last_seen: Some(crate::membership::now_secs()),
-                exit_node: false,
-            });
-            s.refresh_snapshot();
-            s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+        let tentative_member = Member {
+            identity: remote_id,
+            is_coordinator: grant_direct,
+            hostname: final_hostname.clone(),
+            user_identity: user_id_opt,
+            device_cert: device_cert.clone(),
+            last_seen: Some(crate::membership::now_secs()),
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
         };
-        if let Some(bytes) = snap_bytes {
-            let _ = self.ctx.blob_store.blobs().add_slice(&bytes).await;
+        let (displaced_member, removed_approved, removed_pending) = {
+            let mut s = self.state.write().unwrap();
+            let displaced_member = s.members.get(&remote_id).cloned();
+            let removed_approved = if was_approved {
+                s.approved.remove(&remote_id)
+            } else {
+                None
+            };
+            let removed_pending = s.pending.remove(&remote_id);
+            s.members.add(tentative_member.clone());
+            (displaced_member, removed_approved, removed_pending)
+        };
+        let committed =
+            commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+        if !committed {
+            {
+                let mut s = self.state.write().unwrap();
+                if restore_displaced_member(&mut s.members, &tentative_member, displaced_member) {
+                    if let Some(approved) = removed_approved {
+                        s.approved.approve(approved);
+                    }
+                    if let Some(pending) = removed_pending {
+                        s.pending.insert(remote_id, pending);
+                    }
+                    s.refresh_snapshot();
+                }
+            }
+            let rollback_durable =
+                commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+            if rollback_durable {
+                drop(commit_guard);
+                self.deny(
+                    conn,
+                    send,
+                    "failed to durably commit the updated network roster".to_string(),
+                )
+                .await;
+                return AdmissionResult::Denied;
+            }
+
+            // The failed H2 write may have renamed H2 before its directory sync
+            // failed, while the failed rollback may have left that file in place.
+            // Keep live state on H2 and retry its durable commit; denying while
+            // disk might recover H2 would later grant a supposedly denied peer.
+            {
+                let mut s = self.state.write().unwrap();
+                s.approved.remove(&remote_id);
+                s.pending.remove(&remote_id);
+                s.members.add(tentative_member.clone());
+                s.refresh_snapshot();
+                s.unconfirmed_durable_hash =
+                    s.converged_hash.map(|hash| PendingSnapshotDurability {
+                        hash,
+                        published: false,
+                    });
+            }
+            if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await {
+                if let Some(notify) = &self.dht_notify {
+                    notify.notify_one();
+                }
+                drop(commit_guard);
+                let mut send = send;
+                let _ =
+                    control::send_msg(&mut send, Some(self.net_pubkey()), &ControlMsg::JoinPending)
+                        .await;
+                tracing::warn!(
+                    network = %self.network_name,
+                    peer = %remote_id.fmt_short(),
+                    "admission commit remained ambiguous; retained it live and asked the peer to retry"
+                );
+                return AdmissionResult::PendingDurability;
+            }
         }
+        let target = {
+            let s = self.state.read().unwrap();
+            s.network_secret_key.clone().zip(s.converged_hash)
+        };
+        let published_record = match target {
+            Some((key, hash)) => {
+                self.ctx
+                    .registry
+                    .publish_group_hash(&self.network_name, &key, hash)
+                    .await
+            }
+            None => None,
+        };
+        if published_record.is_none() {
+            // The complete generation and unpublished pointer are already
+            // durable. Keep the admission live and let the tracked publisher
+            // retry. This also conservatively covers a successful DHT write whose
+            // publication-marker config write failed: rolling back there would
+            // deny a peer the signed record has already admitted.
+            tracing::warn!(
+                network = %self.network_name,
+                peer = %remote_id.fmt_short(),
+                "admission publication was not confirmed; retaining its durable pending generation"
+            );
+        }
+        let direct_record_published = grant_direct && published_record.is_some();
+        let direct_record = if grant_direct {
+            published_record.clone().or_else(|| {
+                let s = self.state.read().unwrap();
+                let key = s.network_secret_key.as_ref()?;
+                let hash = s.converged_hash?;
+                dht::encode_network_record(key, &hash, &[self.ctx.registry.transport.endpoint.id()])
+                    .ok()
+                    .map(|packet| packet.as_bytes().to_vec())
+            })
+        } else {
+            None
+        };
+        drop(commit_guard);
 
         if let Some(ref h) = final_hostname {
             dns::update_hostname(
@@ -563,7 +969,6 @@ impl CoordinatorAcceptState {
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                peer_ip,
                 derive_ipv6(&remote_id),
             )
             .await;
@@ -576,7 +981,6 @@ impl CoordinatorAcceptState {
             &self.network_name,
             &ControlMsg::MemberApproved {
                 identity: remote_id,
-                ip: peer_ip,
                 hostname: final_hostname.clone(),
                 device_cert: device_cert.clone(),
             },
@@ -603,59 +1007,53 @@ impl CoordinatorAcceptState {
                 members: members.clone(),
                 approved,
                 direct_key,
+                direct_record,
+                direct_record_published,
             },
         )
         .await;
-
-        if let Some(notify) = &self.dht_notify {
-            notify.notify_one();
-        }
 
         // Register the peer's route + start its single data reader (the accept-side
         // demux already owns this connection's control loop).
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
+            .register_peer_conn(conn, remote_id, &self.network_name);
 
         broadcast_member_sync(
-            &self.ctx.peers,
+            &self.ctx.registry,
             net_pubkey,
             &self.network_name,
-            Some(peer_ip),
+            Some(derive_ipv6(&remote_id)),
         )
         .await;
 
         // The key rode the Welcome above (see `direct_key`). Record the grant
         // locally (mirrors `admin_add`) so our own `ray admin list` shows the peer
         // as a co-coordinator too.
-        if grant_direct
-            && let Ok(Some(mut net)) = config::load_network(&self.network_name)
-            && !net.admins.contains(&remote_id)
-        {
-            net.admins.push(remote_id);
-            let _ = config::save_network(&net);
+        if grant_direct {
+            let _ = config::update_network(&self.network_name, |net| {
+                if !net.admins.contains(&remote_id) {
+                    net.admins.push(remote_id);
+                }
+                Ok(())
+            });
         }
-        Some(peer_ip)
+        AdmissionResult::Admitted(peer_ip)
     }
 
-    /// Decide a joiner's authoritative IP + hostname from the current roster, or
-    /// return a denial reason. The IP is the lowest free collision index (not the
-    /// peer-suggested address) so two coordinators admitting at index 0 produce a
-    /// roster the reconverge tiebreak resolves deterministically. An invite-bound
-    /// (`authoritative`) hostname already held by a different identity is rejected
-    /// (no silent rename); a joiner-chosen name keeps collision resolution
-    /// (`name` → `name-1` → …). An IP collision with a different identity is also
-    /// rejected.
+    /// Decide a joiner's hostname against the current roster, or return a denial
+    /// reason. The address needs no deciding: it is derived from the identity, so
+    /// two coordinators admitting the same peer arrive at the same one and there is
+    /// nothing to collide. An invite-bound (`authoritative`) hostname already held
+    /// by a different identity is rejected (no silent rename); a joiner-chosen name
+    /// keeps collision resolution (`name`, then `name-1`, and so on).
     fn validate_admission(
         &self,
         remote_id: EndpointId,
         hostname: Option<String>,
         authoritative: bool,
-    ) -> std::result::Result<(Ipv4Addr, u32, Option<String>), String> {
-        let (peer_ip, collision_index) = {
-            let s = self.state.read().unwrap();
-            crate::membership::assign_ip(&s.members, &remote_id)
-        };
+    ) -> Result<Admission, String> {
+        let peer_ip = crate::membership::derive_ipv6(&remote_id);
         let final_hostname = if let Some(desired) = hostname {
             let taken = {
                 let s = self.state.read().unwrap();
@@ -678,41 +1076,63 @@ impl CoordinatorAcceptState {
         } else {
             None
         };
-        let collision = {
-            let s = self.state.read().unwrap();
-            if let Some(existing) = s.members.get_by_ip(peer_ip) {
-                existing.identity != remote_id
-            } else if let Some(existing) = s.approved.get_by_ip(peer_ip) {
-                existing.identity != remote_id
-            } else {
-                false
-            }
-        };
-        if collision {
-            return Err(format!("IP collision: {peer_ip} already assigned"));
-        }
-        Ok((peer_ip, collision_index, final_hostname))
+        // No collision check: the address is blake3 of the identity, so two
+        // different members cannot claim the same one.
+        Ok(Admission {
+            peer_ip,
+            hostname: final_hostname,
+        })
     }
+}
+
+/// The coordinator's durable outcome for an attempted admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionResult {
+    Admitted(Ipv6Addr),
+    /// The retained generation seats the peer, but its directory sync must be
+    /// retried before it can be welcomed or published.
+    PendingDurability,
+    Denied,
+}
+
+impl AdmissionResult {
+    fn into_ip(self) -> Option<Ipv6Addr> {
+        match self {
+            Self::Admitted(ip) => Some(ip),
+            Self::PendingDurability | Self::Denied => None,
+        }
+    }
+
+    fn keeps_invite_spent(self) -> bool {
+        self != Self::Denied
+    }
+}
+
+/// What a coordinator settled for a joiner it is about to seat.
+struct Admission {
+    /// Derived from the joiner's identity, not chosen here.
+    peer_ip: Ipv6Addr,
+    /// The name it ends up with, which is not always the one it asked for.
+    hostname: Option<String>,
 }
 
 pub(crate) struct MemberAcceptState {
     pub(crate) ctx: MeshCtx,
     pub(crate) network_name: String,
     pub(crate) state: SharedNetworkState,
-    pub(crate) token: CancellationToken,
     /// This network's public key, so an `AdminGrant` can be checked against it and
     /// control frames tagged for the peer.
     pub(crate) net_pubkey: EndpointId,
     /// Our own identity, recorded on the roster when we are promoted.
     pub(crate) my_identity: EndpointId,
-    /// The shared endpoint, needed to spin up a lazy publisher on promotion.
+    /// The shared endpoint, used to preflight publisher creation on promotion.
     pub(crate) endpoint: Endpoint,
     /// The network-owning service. On an `AdminGrant` this reader promotes itself
     /// by calling `registry.promote_to_coordinator` directly (was the `promote_tx`
     /// hand-off to the daemon loop).
     pub(crate) registry: Arc<NetworkRegistry>,
     /// Serializes single-use invite ledger access for the gossip arms.
-    pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) invite_lock: Arc<AsyncMutex<()>>,
     /// Kicks the debounced reconverge worker on a `MemberSync`/`BlobUpdated`
     /// trigger (the roster comes only from the signed pkarr record).
     pub(crate) reconverge_notify: Arc<tokio::sync::Notify>,
@@ -722,7 +1142,7 @@ impl MemberAcceptState {
     /// Dispatch one control frame arriving on a mesh connection this member
     /// participates in. Coordinator broadcasts (`MemberApproved`/`MemberSync`/
     /// `BlobUpdated`/`AdminGrant`) and other members' `MeshHello`s all arrive here.
-    /// Returns the peer's mesh v4 when the frame registered it (so the demux can
+    /// Returns the peer's mesh IPv6 when the frame registered it (so the demux can
     /// announce our handle table), else `None`.
     pub(crate) async fn handle_frame(
         &self,
@@ -730,34 +1150,38 @@ impl MemberAcceptState {
         send: iroh::endpoint::SendStream,
         peer_id: EndpointId,
         msg: ControlMsg,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         match msg {
             ControlMsg::MeshHello {
                 identity,
-                ip,
                 hostname,
                 device_cert,
             } => {
-                self.handle_mesh_hello(conn, send, peer_id, identity, ip, hostname, device_cert)
+                self.handle_mesh_hello(conn, send, peer_id, identity, hostname, device_cert)
                     .await
             }
+            // Only a coordinator admits, so only a coordinator may say who was
+            // admitted. Without this check the message was an unauthenticated
+            // write into our approved list, and an entry there is not inert: the
+            // sender's next `MeshHello` takes the `is_approved` branch below
+            // straight into `admit_approved_member`, which seats it as a member
+            // at the IP *this message* chose, writes its `.ray` name, and
+            // registers its route. Same gate as `InviteShare`/`KickedFromNetwork`.
             ControlMsg::MemberApproved {
-                identity,
-                ip,
-                hostname,
-                ..
+                identity, hostname, ..
             } => {
+                if !sender_is_coordinator(&self.state, peer_id) {
+                    tracing::warn!(peer = %peer_id.fmt_short(), "ignoring MemberApproved from non-coordinator");
+                    return None;
+                }
                 let entry = ApprovedEntry {
                     identity,
-                    ip,
                     hostname,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                 };
                 let mut s = self.state.write().unwrap();
-                let members = s.members.clone();
-                let _ = s.approved.approve(entry, &members);
+                s.approved.approve(entry);
                 None
             }
             // Triggers only: the roster/firewall come exclusively from the
@@ -831,12 +1255,19 @@ impl MemberAcceptState {
     }
 
     /// Apply a signed network record a coordinator handed us over the mesh (the
-    /// `SignedRecord` fast path). Verify it against this network's key, and if it
-    /// names a newer blob than we hold, fetch + apply it directly. This bypasses a
-    /// fresh DHT resolve (which can serve a stale record for ~60-90s right after a
-    /// restart), so a reconnecting member converges to the live roster in ~1s. The
-    /// trust model is unchanged: the record is network-key-signed and verified
-    /// here, exactly like the DHT copy; the peer is only its transport.
+    /// `SignedRecord` fast path). Verify it against this network's key, check it is
+    /// newer than the last record we applied, and if it names a different blob,
+    /// fetch + apply it directly. This bypasses a fresh DHT resolve (which can
+    /// serve a stale record for ~60-90s right after a restart), so a reconnecting
+    /// member converges to the live roster in ~1s. The trust model is unchanged:
+    /// the record is network-key-signed and verified here, exactly like the DHT
+    /// copy; the peer is only its transport.
+    ///
+    /// This message is deliberately exempt from the demux's roster wall (see
+    /// `stranger_may_send`), which is exactly why the freshness check belongs
+    /// here: a signature says who wrote a record, not when, so without it anyone
+    /// holding the room id could hand us a record the DHT served publicly last
+    /// week and roll the roster back to it.
     async fn apply_signed_record(&self, packet_bytes: &[u8]) {
         let packet = match dht::verify_network_record(packet_bytes, self.net_pubkey) {
             Ok(p) => p,
@@ -852,14 +1283,28 @@ impl MemberAcceptState {
                 return;
             }
         };
-        let current_hash = {
+        let record_ts = packet.timestamp().as_micros();
+        let (current_hash, floor, needs) = {
             let s = self.state.read().unwrap();
-            s.snapshot.as_ref().map(|snap| snap.hash)
+            (
+                s.converged_hash,
+                s.last_record_timestamp,
+                s.needs_reconverge(remote_hash),
+            )
         };
-        if current_hash == Some(remote_hash) {
+        if !needs {
+            return;
+        }
+        if !record_is_newer(record_ts, floor) {
+            tracing::warn!(
+                record_ts,
+                floor,
+                "rejecting a signed record older than the last one applied (replay)"
+            );
             return;
         }
         tracing::info!(old = ?current_hash, new = %remote_hash, "applying signed record handed by coordinator");
+        self.state.write().unwrap().last_record_timestamp = Some(record_ts);
         fetch_and_apply_blob(
             &self.endpoint,
             &self.ctx.blob_store,
@@ -884,29 +1329,37 @@ impl MemberAcceptState {
         send: iroh::endpoint::SendStream,
         transport_id: EndpointId,
         peer_identity: EndpointId,
-        ip: Ipv4Addr,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
-        // Verify identity: either the transport key matches, or a valid device
-        // cert binds the transport key to the claimed user identity.
-        if peer_identity != transport_id {
-            match device_cert {
-                Some(ref cert)
-                    if cert.verify()
-                        && cert.device_key == transport_id
-                        && cert.user_identity == peer_identity => {}
-                _ => {
-                    tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
-                    return None;
-                }
+    ) -> Option<Ipv6Addr> {
+        // Verify the cert and the identity claim together, before anything is
+        // recorded. See `check_hello_identity`: the binding this stores is what
+        // the firewall and mesh SSH later authorize on, so it is never taken on
+        // the sender's word.
+        // Nullifiers from every network, not just this one: the binding this
+        // writes is daemon-wide, so a device revoked anywhere must not re-earn it
+        // by saying hello on a network that has not heard about the revocation.
+        let revoked = device_cert
+            .as_ref()
+            .is_some_and(|c| self.registry.is_nullified_anywhere(&c.device_key));
+        let binding = match check_hello_identity(
+            transport_id,
+            peer_identity,
+            device_cert.as_ref(),
+            revoked,
+        ) {
+            HelloIdentity::Accept(binding) => binding,
+            HelloIdentity::Reject => {
+                tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
+                return None;
             }
+        };
+        if let Some(user_identity) = binding {
+            self.ctx.device_user_map.insert(transport_id, user_identity);
         }
-        if let Some(ref cert) = device_cert {
-            self.ctx
-                .device_user_map
-                .insert(transport_id, cert.user_identity);
-        }
+        // A cert that earned no binding (revoked on this network) is not written
+        // to the roster either, matching the coordinator's `handle_member_hello`.
+        let device_cert = binding.and(device_cert);
         let (is_member, is_approved) = {
             let s = self.state.read().unwrap();
             (
@@ -924,20 +1377,11 @@ impl MemberAcceptState {
 
         if is_approved {
             return self
-                .admit_approved_member(conn, send, peer_identity, ip, final_hostname, device_cert)
+                .admit_approved_member(conn, send, peer_identity, final_hostname, device_cert)
                 .await;
         }
         if is_member {
-            // Register the member at its authoritative roster IP (not the
-            // peer-supplied `ip`), so the data reader routes it correctly.
-            let member_ip = self
-                .state
-                .read()
-                .unwrap()
-                .members
-                .get(&peer_identity)
-                .map(|m| m.ip)
-                .unwrap_or(ip);
+            let member_ip = derive_ipv6(&peer_identity);
             if let Some(h) = &final_hostname {
                 {
                     let mut s = self.state.write().unwrap();
@@ -950,13 +1394,12 @@ impl MemberAcceptState {
                     &self.ctx.reverse_table,
                     &self.network_name,
                     h,
-                    member_ip,
                     derive_ipv6(&peer_identity),
                 )
                 .await;
             }
             self.ctx
-                .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
+                .register_peer_conn(conn, peer_identity, &self.network_name);
             return Some(member_ip);
         }
         None
@@ -971,30 +1414,44 @@ impl MemberAcceptState {
         conn: &Connection,
         mut send: iroh::endpoint::SendStream,
         peer_identity: EndpointId,
-        ip: Ipv4Addr,
         final_hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
+        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
+        let pending = { self.state.read().unwrap().unconfirmed_durable_hash };
+        if let Some(pending) = pending
+            && !persist_group_hash_locked(
+                &self.state,
+                &self.ctx.blob_store,
+                &self.network_name,
+                pending.hash,
+                pending.published,
+            )
+            .await
+        {
+            drop(commit_guard);
+            let _ =
+                control::send_msg(&mut send, Some(self.net_pubkey), &ControlMsg::JoinPending).await;
+            return None;
+        }
         let (snap_bytes, member_ip) = {
             let mut s = self.state.write().unwrap();
-            let approved_entry = s.approved.remove(&peer_identity);
+            s.approved.remove(&peer_identity);
             let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
-            // Trust the authoritative IP + collision index recorded when the
-            // peer was approved, not the peer-supplied MeshHello.ip.
-            let (member_ip, member_idx) = approved_entry
-                .as_ref()
-                .map(|e| (e.ip, e.collision_index))
-                .unwrap_or((ip, 0));
-            let _ = s.members.add(Member {
+            // The address is derived from the identity that dialed, so there is
+            // nothing left for a peer to claim and nothing to cross-check it
+            // against: the approved entry and the hello agree by construction.
+            let member_ip = derive_ipv6(&peer_identity);
+            s.members.add(Member {
                 identity: peer_identity,
-                ip: member_ip,
                 is_coordinator: false,
                 hostname: final_hostname.clone(),
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
-                collision_index: member_idx,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
+                exit_families: ExitFamilies::Unknown,
             });
             s.refresh_snapshot();
             (
@@ -1005,13 +1462,13 @@ impl MemberAcceptState {
         if let Some(bytes) = snap_bytes {
             let _ = self.ctx.blob_store.blobs().add_slice(&bytes).await;
         }
+        drop(commit_guard);
         if let Some(ref h) = final_hostname {
             dns::update_hostname(
                 &self.ctx.hostname_table,
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                member_ip,
                 derive_ipv6(&peer_identity),
             )
             .await;
@@ -1029,16 +1486,18 @@ impl MemberAcceptState {
                 // Reconnect path: a returning co-coordinator already holds the key
                 // (persisted in its config); only fresh direct admissions grant it.
                 direct_key: None,
+                direct_record: None,
+                direct_record_published: false,
             },
         )
         .await;
         self.ctx
-            .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
+            .register_peer_conn(conn, peer_identity, &self.network_name);
         broadcast_member_sync(
-            &self.ctx.peers,
+            &self.ctx.registry,
             self.net_pubkey,
             &self.network_name,
-            Some(member_ip),
+            Some(derive_ipv6(&peer_identity)),
         )
         .await;
         Some(member_ip)
@@ -1064,35 +1523,78 @@ impl MemberAcceptState {
             return;
         }
         let key = SecretKey::from(secret_key);
-        if let Ok(Some(mut net)) = config::load_network(&self.network_name) {
-            net.network_secret_key = Some(key.clone());
-            let _ = config::save_network(&net);
-        }
-        {
+        let pkarr_client = match dht::create_pkarr_client(&self.endpoint) {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(network = %self.network_name, error = %e, "cannot accept admin grant without a network publisher");
+                return;
+            }
+        };
+        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
+        let previous_authority = {
             let mut s = self.state.write().unwrap();
-            s.network_secret_key = Some(key.clone());
+            let previous_key = s.network_secret_key.replace(key.clone());
+            let previous_coordinator = s
+                .members
+                .get(&self.my_identity)
+                .is_some_and(|m| m.is_coordinator);
             if let Some(m) = s.members.get_mut(&self.my_identity) {
                 m.is_coordinator = true;
             }
+            (previous_key, previous_coordinator)
+        };
+        // The promoted roster must be recoverable before this node can author a
+        // record. In particular, do not let the lazy publisher race ahead of the
+        // blob-store write and recovery-pointer update.
+        if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await {
+            let (previous_key, previous_coordinator) = previous_authority;
+            let mut s = self.state.write().unwrap();
+            s.network_secret_key = previous_key;
+            if let Some(m) = s.members.get_mut(&self.my_identity) {
+                m.is_coordinator = previous_coordinator;
+            }
             s.refresh_snapshot();
-        }
-        if let Ok(client) = dht::create_pkarr_client(&self.endpoint) {
-            spawn_lazy_publisher(
-                client,
-                key,
-                self.state.clone(),
-                self.endpoint.id(),
-                self.ctx.peers.clone(),
-                self.network_name.clone(),
-                self.token.clone(),
+            tracing::warn!(
+                network = %self.network_name,
+                "promoted roster was not durably committed; rolled back admin grant"
             );
-            tracing::info!(network = %self.network_name, "promoted to co-coordinator; lazy publisher started");
+            return;
         }
-        // Swap ourselves to a coordinator accept handler directly (was a
-        // `promote_tx` hand-off to the daemon loop). The registry owns the
-        // ConnectionManager + networks map; we supply our own daemon-wide ctx.
+        let key_saved = match config::update_network(&self.network_name, |net| {
+            net.network_secret_key = Some(key.clone());
+            Ok(())
+        }) {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::warn!(network = %self.network_name, "admin grant arrived after network config was deleted");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(network = %self.network_name, error = %e, "failed to persist admin grant");
+                false
+            }
+        };
+        if !key_saved {
+            let (previous_key, previous_coordinator) = previous_authority;
+            {
+                let mut s = self.state.write().unwrap();
+                s.network_secret_key = previous_key;
+                if let Some(m) = s.members.get_mut(&self.my_identity) {
+                    m.is_coordinator = previous_coordinator;
+                }
+                s.refresh_snapshot();
+            }
+            commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await;
+            return;
+        }
+        drop(commit_guard);
+        // The registry owns the exactly-once transition: the winner of concurrent
+        // grants installs one notify-driven publisher in NetworkHandle.tasks and
+        // swaps the accept handler. Losers observe the Coordinator role and do
+        // nothing, so no detached duplicate publisher survives teardown.
         self.registry
-            .promote_to_coordinator(&self.ctx, &self.network_name);
+            .promote_to_coordinator(&self.ctx, &self.network_name, key, pkarr_client);
     }
 }
 
@@ -1106,6 +1608,26 @@ impl AcceptHandler {
     #[cfg(test)]
     pub(crate) fn is_coordinator(&self) -> bool {
         matches!(self, AcceptHandler::Coordinator(_))
+    }
+
+    /// Whether this network's roster accounts for `peer_id` at all: a seated
+    /// member, or a peer approved and not yet seated.
+    ///
+    /// Checked against both the transport key and the user identity it resolves
+    /// to. Admission seats a member under the key that dialed (`admit_peer`), so
+    /// the resolved lookup is normally redundant; it is defense in depth for the
+    /// roster shapes that do key a member by user identity, and it costs one map
+    /// read.
+    pub(crate) fn knows_sender(&self, peer_id: EndpointId) -> bool {
+        let (state, ctx) = match self {
+            AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
+            AcceptHandler::Member(s) => (&s.state, &s.ctx),
+        };
+        let user_id = ctx.device_user_map.resolve(&peer_id);
+        let s = state.read().unwrap();
+        [peer_id, user_id]
+            .iter()
+            .any(|id| s.members.is_member(id) || s.approved.is_approved(id))
     }
 
     /// The local name of the network this handler serves. Used by the demux to map
@@ -1135,13 +1657,18 @@ impl AcceptHandler {
             // exit node. Only a network-key holder records it on the sender's
             // roster entry and republishes (`record_exit_offer` no-ops
             // otherwise). Off the demux loop: signing + DHT publish are slow.
-            ControlMsg::ExitNodeOffer { enabled } => {
+            ControlMsg::ExitNodeOffer {
+                enabled,
+                exit_families,
+            } => {
                 let registry = self.registry().clone();
                 let Some(network) = self.network_name() else {
                     return true;
                 };
                 tokio::spawn(async move {
-                    registry.record_exit_offer(&network, peer_id, enabled).await;
+                    registry
+                        .record_exit_offer(&network, peer_id, enabled, exit_families)
+                        .await;
                 });
                 true
             }
@@ -1149,15 +1676,15 @@ impl AcceptHandler {
         }
     }
 
-    /// Process one network-scoped control frame, returning the peer's mesh v4 if it
-    /// is now a registered member on this network (else `None`).
+    /// Process one network-scoped control frame, returning the peer's mesh IPv6 if
+    /// it is now a registered member on this network (else `None`).
     pub(crate) async fn handle_frame(
         &self,
         conn: &Connection,
         send: iroh::endpoint::SendStream,
         peer_id: EndpointId,
         msg: ControlMsg,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         if self.handle_common(peer_id, &msg) {
             return None;
         }
@@ -1323,6 +1850,406 @@ impl ProtocolRouter {
             .clone()
             .drive_mesh_connection(conn, pre_registered)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod admission_rollback_tests {
+    use super::*;
+
+    fn member(identity: EndpointId, hostname: &str) -> Member {
+        Member {
+            identity,
+            is_coordinator: false,
+            hostname: Some(hostname.to_string()),
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }
+    }
+
+    #[test]
+    fn durability_pending_admission_keeps_a_single_use_invite_spent() {
+        assert!(AdmissionResult::PendingDurability.keeps_invite_spent());
+        assert!(!AdmissionResult::Denied.keeps_invite_spent());
+    }
+
+    #[test]
+    fn durability_pending_admission_does_not_report_a_joined_ip() {
+        assert_eq!(AdmissionResult::PendingDurability.into_ip(), None);
+    }
+
+    #[test]
+    fn failed_readmission_restores_the_displaced_member() {
+        let identity = SecretKey::generate().public();
+        let old = member(identity, "old-name");
+        let tentative = member(identity, "new-name");
+        let mut members = MemberList::from_members(vec![tentative.clone()]);
+
+        assert!(restore_displaced_member(
+            &mut members,
+            &tentative,
+            Some(old.clone())
+        ));
+
+        assert_eq!(members.get(&identity), Some(&old));
+    }
+
+    #[test]
+    fn failed_first_admission_removes_the_tentative_member() {
+        let identity = SecretKey::generate().public();
+        let tentative = member(identity, "new-name");
+        let mut members = MemberList::from_members(vec![tentative.clone()]);
+
+        assert!(restore_displaced_member(&mut members, &tentative, None));
+
+        assert!(members.get(&identity).is_none());
+    }
+
+    #[test]
+    fn failed_admission_does_not_overwrite_a_concurrent_member_update() {
+        let identity = SecretKey::generate().public();
+        let tentative = member(identity, "tentative-name");
+        let concurrent = member(identity, "concurrent-name");
+        let displaced = member(identity, "old-name");
+        let mut members = MemberList::from_members(vec![concurrent.clone()]);
+
+        assert!(!restore_displaced_member(
+            &mut members,
+            &tentative,
+            Some(displaced)
+        ));
+
+        assert_eq!(members.get(&identity), Some(&concurrent));
+    }
+}
+
+#[cfg(test)]
+mod record_freshness_tests {
+    use super::*;
+
+    /// Nothing applied yet, so there is no rollback to refuse.
+    #[test]
+    fn any_record_passes_an_empty_floor() {
+        assert!(record_is_newer(1, None));
+        assert!(record_is_newer(0, None));
+    }
+
+    /// The replay this guards. A signature says who authored a record, never
+    /// when, so an old record for this network stays valid forever and its hash
+    /// differs from the current one, which is all the previous check compared. It
+    /// would re-seat kicked members, restore devices the blob nullified, and
+    /// revert the suggested firewall.
+    #[test]
+    fn an_older_record_is_refused() {
+        assert!(!record_is_newer(500, Some(1_000)));
+    }
+
+    /// Equal timestamps with different contents give no ordering, so we keep
+    /// what we have and wait for the next republish rather than guess.
+    #[test]
+    fn an_equal_timestamp_is_refused() {
+        assert!(!record_is_newer(1_000, Some(1_000)));
+    }
+
+    #[test]
+    fn a_newer_record_is_taken() {
+        assert!(record_is_newer(1_001, Some(1_000)));
+    }
+}
+
+#[cfg(test)]
+mod stranger_policy_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    /// The three ways a peer our roster does not list may legitimately speak.
+    #[test]
+    fn only_the_pre_membership_messages_pass() {
+        for msg in [
+            ControlMsg::JoinRequest {
+                invite_secret: None,
+                hostname: None,
+                device_cert: None,
+            },
+            ControlMsg::MeshHello {
+                identity: eid(1),
+                hostname: None,
+                device_cert: None,
+            },
+            ControlMsg::SignedRecord { packet: vec![] },
+        ] {
+            assert!(stranger_may_send(&msg), "{msg:?} must reach a coordinator");
+        }
+    }
+
+    /// Everything a member says, a stranger may not. Listed one by one rather
+    /// than by negation so that adding a `ControlMsg` variant is a decision made
+    /// here, not a default inherited silently.
+    #[test]
+    fn member_messages_are_refused_from_a_stranger() {
+        for msg in [
+            // Coordinator authority.
+            ControlMsg::MemberApproved {
+                identity: eid(1),
+                hostname: None,
+                device_cert: None,
+            },
+            ControlMsg::AdminGrant {
+                network_pubkey: eid(1),
+                secret_key: [0u8; 32],
+            },
+            ControlMsg::InviteShare {
+                id: "ab".into(),
+                secret_hash: vec![],
+                expires: 0,
+            },
+            ControlMsg::InviteUsed {
+                secret_hash: vec![],
+            },
+            ControlMsg::KickedFromNetwork,
+            // Triggers: cheap to send, a DHT resolve plus a blob fetch to honor.
+            ControlMsg::MemberSync,
+            ControlMsg::BlobUpdated,
+            // A member's statements about itself, and its departure.
+            ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_families: ExitFamilies::Dual,
+            },
+            ControlMsg::LeaveNetwork,
+        ] {
+            assert!(!stranger_may_send(&msg), "{msg:?} must need membership");
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_grant_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn state_with_members(ids: &[EndpointId]) -> SharedNetworkState {
+        let mut list = MemberList::new();
+        for (i, id) in ids.iter().enumerate() {
+            list.add(Member {
+                identity: *id,
+                is_coordinator: i == 0,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
+        }
+        Arc::new(RwLock::new(NetworkState {
+            members: list,
+            approved: ApprovedList::new(),
+            snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
+            converged_hash: None,
+            unconfirmed_durable_hash: None,
+            network_secret_key: None,
+            network_public_key: eid(200),
+            network_name: Some("team-alex".to_string()),
+            group_name: Some("team-alex".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+            last_record_timestamp: None,
+        }))
+    }
+
+    fn direct_net(peer: Option<EndpointId>) -> config::NetworkConfig {
+        let mut net = config::empty_network_config("team-alex");
+        net.direct = true;
+        net.direct_peer = peer;
+        net
+    }
+
+    /// The peer the link was minted for gets the network key: that is the whole
+    /// point of a direct link being symmetric.
+    #[test]
+    fn the_minted_for_peer_is_granted() {
+        let (me, peer) = (eid(1), eid(2));
+        let state = state_with_members(&[me]);
+        assert!(grants_direct_key(&direct_net(Some(peer)), peer, &state));
+    }
+
+    /// The regression. A direct network approving a *second* peer later (via
+    /// `ray requests accept`) used to hand it the network key too, because the
+    /// grant keyed on the network being `direct` rather than on who the link was
+    /// for. Nothing tells the user they just made a stranger a co-coordinator.
+    #[test]
+    fn a_later_approved_peer_is_not_granted() {
+        let (me, peer, third) = (eid(1), eid(2), eid(3));
+        let state = state_with_members(&[me, peer]);
+        assert!(!grants_direct_key(&direct_net(Some(peer)), third, &state));
+    }
+
+    /// An ordinary mesh never grants, approved or not.
+    #[test]
+    fn a_normal_network_never_grants() {
+        let (me, peer) = (eid(1), eid(2));
+        let state = state_with_members(&[me]);
+        let mut net = direct_net(Some(peer));
+        net.direct = false;
+        assert!(!grants_direct_key(&net, peer, &state));
+    }
+
+    #[test]
+    fn legacy_link_replays_the_grant_to_its_seated_coordinator() {
+        let (me, peer) = (eid(1), eid(2));
+        let state = state_with_members(&[me, peer]);
+        state
+            .write()
+            .unwrap()
+            .members
+            .get_mut(&peer)
+            .unwrap()
+            .is_coordinator = true;
+
+        assert!(grants_direct_key(&direct_net(None), peer, &state));
+    }
+
+    /// Links minted before `direct_peer` was recorded keep working while we are
+    /// still alone on them, which is the state they sit in until their one peer
+    /// arrives.
+    #[test]
+    fn legacy_link_grants_only_while_unformed() {
+        let (me, peer, third) = (eid(1), eid(2), eid(3));
+        let alone = state_with_members(&[me]);
+        assert!(grants_direct_key(&direct_net(None), peer, &alone));
+        // Once the link has both ends, a third peer gets nothing.
+        let formed = state_with_members(&[me, peer]);
+        assert!(!grants_direct_key(&direct_net(None), third, &formed));
+    }
+}
+
+#[cfg(test)]
+mod hello_identity_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn key(seed: u8) -> SecretKey {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b)
+    }
+
+    /// The regression this whole helper exists for. A peer claiming its own
+    /// transport key used to skip cert verification entirely, and the very next
+    /// line recorded the cert's `user_identity` in the daemon-wide
+    /// `device_user_map`. That map is what the inbound firewall and mesh SSH
+    /// authorize on, so an unsigned cert naming a victim handed the sender the
+    /// victim's rules on this node. An unverifiable cert must buy nothing.
+    #[test]
+    fn unsigned_cert_claiming_own_key_is_refused() {
+        let attacker = key(1).public();
+        let victim = key(2).public();
+        // Signed by the attacker's *own* key but asserting the victim as the
+        // user identity: `verify()` fails because the signature does not check
+        // out against the claimed `user_identity`.
+        let forged = control::DeviceCert {
+            user_identity: victim,
+            device_key: attacker,
+            generation: 0,
+            signature: key(1).sign(attacker.as_bytes()),
+        };
+        assert!(!forged.verify(), "test fixture must be an invalid cert");
+        assert_eq!(
+            check_hello_identity(attacker, attacker, Some(&forged), false),
+            HelloIdentity::Reject,
+        );
+    }
+
+    /// A cert that verifies but names a *different* device is someone else's,
+    /// replayed. Binding it to whoever presented it is the same escalation by
+    /// another route.
+    #[test]
+    fn valid_cert_for_another_device_is_refused() {
+        let user = key(1);
+        let real_device = key(2).public();
+        let attacker = key(3).public();
+        let cert = control::DeviceCert::create(&user, &real_device, 0);
+        assert!(cert.verify());
+        assert_eq!(
+            check_hello_identity(attacker, attacker, Some(&cert), false),
+            HelloIdentity::Reject,
+        );
+    }
+
+    /// The legitimate case: a cert signed by the user over this very device key
+    /// binds it, whether or not the sender also claims the user identity.
+    #[test]
+    fn valid_cert_binds_its_own_device() {
+        let user = key(1);
+        let device = key(2).public();
+        let cert = control::DeviceCert::create(&user, &device, 0);
+        // Speaking as itself.
+        assert_eq!(
+            check_hello_identity(device, device, Some(&cert), false),
+            HelloIdentity::Accept(Some(user.public())),
+        );
+        // Speaking as its user identity, which the cert backs.
+        assert_eq!(
+            check_hello_identity(device, user.public(), Some(&cert), false),
+            HelloIdentity::Accept(Some(user.public())),
+        );
+    }
+
+    /// No cert at all is fine, it just proves nothing beyond the transport key.
+    /// Claiming another identity without one is not.
+    #[test]
+    fn certless_hello_speaks_only_for_itself() {
+        let peer = key(1).public();
+        let other = key(2).public();
+        assert_eq!(
+            check_hello_identity(peer, peer, None, false),
+            HelloIdentity::Accept(None),
+        );
+        assert_eq!(
+            check_hello_identity(peer, other, None, false),
+            HelloIdentity::Reject,
+        );
+    }
+
+    /// `ray unpair` cannot invalidate a signature, so the nullifier set is the
+    /// only thing standing between a revoked device and the user's rights. A
+    /// still-valid revoked cert earns no binding, and a claim resting on it is
+    /// refused rather than downgraded.
+    #[test]
+    fn nullified_device_earns_no_binding() {
+        let user = key(1);
+        let device = key(2).public();
+        let cert = control::DeviceCert::create(&user, &device, 0);
+        // Asked across every network this node runs, not just the one the hello
+        // arrived on, since the binding it guards is daemon-wide.
+        assert_eq!(
+            check_hello_identity(device, device, Some(&cert), true),
+            HelloIdentity::Accept(None),
+        );
+        assert_eq!(
+            check_hello_identity(device, user.public(), Some(&cert), true),
+            HelloIdentity::Reject,
+        );
     }
 }
 

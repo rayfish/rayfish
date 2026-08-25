@@ -9,6 +9,8 @@ use super::super::*;
 use std::net::IpAddr;
 use std::sync::RwLock;
 
+use super::create_join::{RestoredGroupBlob, mesh_version_is_speakable};
+
 /// How long `ray exit-node use` waits for the exit peer to answer through the
 /// finished tunnel before returning anyway. Long enough to cover a re-punch after
 /// the routing change (the netwatch-driven rebind lands a few seconds in), short
@@ -23,112 +25,129 @@ const NUDGE_REPLY_WAIT: Duration = Duration::from_millis(500);
 /// First and last backoff step for the member-network restore retry loop.
 const RESTORE_RETRY_MIN: Duration = Duration::from_secs(2);
 const RESTORE_RETRY_MAX: Duration = Duration::from_secs(60);
+/// How often the restore supervisor re-checks that every saved network is live.
+/// Matches [`RESTORE_RETRY_MAX`]: a network being restored is already retrying
+/// at that rate, so sweeping faster only re-reads the config for nothing.
+const RESTORE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Minimum spacing between two peer-triggered sweeps. See
+/// [`NetworkRegistry::run_restore_supervisor`].
+const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// The membership a coordinator restores at startup, sourced from the signed
-/// `GroupBlob` (authoritative) or the stale config roster as a fallback.
+/// Whether the member-restore loop runs another attempt or is done.
+enum RestoreNext {
+    Retry,
+    Stop,
+}
+
+/// The membership a coordinator restores at startup from the authoritative,
+/// network-key-signed `GroupBlob`.
 struct RestoredRoster {
     members: MemberList,
     approved: ApprovedList,
+    group_name: Option<String>,
     suggested_firewall: SuggestedFirewall,
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
     nullifiers: BTreeSet<EndpointId>,
+    source_hash: blake3::Hash,
+    source_published: bool,
+}
+
+/// Turn a complete content-addressed blob into coordinator state, reconciling the
+/// one authority the blob cannot revoke: possession of the network secret key.
+/// Existing signed metadata is preserved; only the local key-holder role and its
+/// online timestamp are local facts refreshed at boot.
+fn materialize_coordinator_roster(
+    restored: RestoredGroupBlob,
+    local_identity: EndpointId,
+    persisted_hostname: Option<String>,
+) -> RestoredRoster {
+    let RestoredGroupBlob {
+        blob: data,
+        hash: source_hash,
+        published: source_published,
+    } = restored;
+    let mut members = MemberList::from_members(data.members);
+    match members.get_mut(&local_identity) {
+        Some(local) => {
+            local.is_coordinator = true;
+            local.last_seen = None;
+        }
+        None => members.add(Member {
+            identity: local_identity,
+            is_coordinator: true,
+            hostname: persisted_hostname,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }),
+    }
+    RestoredRoster {
+        members,
+        approved: ApprovedList::from_entries(data.approved),
+        group_name: data.name,
+        suggested_firewall: data.suggested_firewall,
+        reusable_keys: data.reusable_keys,
+        nullifiers: data.nullifiers,
+        source_hash,
+        source_published,
+    }
+}
+
+fn apply_coordinator_restore_to_config(
+    config: &mut config::NetworkConfig,
+    mode: GroupMode,
+    members: &MemberList,
+    approved: &ApprovedList,
+    net_secret_key: &SecretKey,
+    last_group_hash: Option<blake3::Hash>,
+    last_group_hash_published: bool,
+) {
+    config.group_mode = mode;
+    config.pending_hostname = None;
+    config.members = to_member_entries(members.all());
+    config.approved = to_approved_entries(approved.all());
+    config.network_secret_key = Some(net_secret_key.clone());
+    config.network_public_key = Some(net_secret_key.public());
+    if let Some(hash) = last_group_hash {
+        config.last_group_hash = Some(hash);
+        config.last_group_hash_published = last_group_hash_published;
+    }
 }
 
 impl NetworkRegistry {
-    /// Rebuild a network's roster for a coordinator restart. Prefers the
-    /// published, network-key-signed `GroupBlob` (members + approved + suggested
-    /// firewall + reusable keys); if the DHT is unreachable, falls back to the
-    /// last-persisted config roster (which may be stale). Always ensures this
-    /// node is present as a coordinator member.
+    /// Rebuild a network's roster for a coordinator restart from the published,
+    /// network-key-signed `GroupBlob` (members + approved + suggested firewall +
+    /// reusable keys). A transient resolve/fetch failure is an error so the
+    /// restore supervisor retries without publishing stale local config.
     async fn restore_member_roster(
         &self,
         name: &str,
         net_public_key: EndpointId,
-        net_config: Option<&config::NetworkConfig>,
-        my_ip: Ipv4Addr,
-        persisted_hostname: &Option<String>,
-    ) -> RestoredRoster {
-        let mut member_list = MemberList::new();
-        let mut approved_list = ApprovedList::new();
-        // `suggested_firewall` is authoritative in the signed blob; fall back to
-        // an empty set only if the blob can't be fetched.
-        let mut suggested_firewall = SuggestedFirewall::default();
-        // Reusable join keys are authoritative in the signed blob too.
-        let mut reusable_keys = BTreeMap::new();
-        let mut nullifiers = BTreeSet::new();
-        match self.restore_roster_from_blob(net_public_key).await {
-            Ok(data) => {
-                suggested_firewall = data.suggested_firewall.clone();
-                reusable_keys = data.reusable_keys.clone();
-                nullifiers = data.nullifiers.clone();
-                for m in &data.members {
-                    let _ = member_list.add(m.clone());
-                }
-                for a in &data.approved {
-                    let _ = approved_list.approve(a.clone(), &member_list);
-                }
-                tracing::info!(
-                    network = %name,
-                    members = member_list.all().len(),
-                    "restored roster from published group blob"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    network = %name,
-                    error = %e,
-                    "could not restore roster from DHT blob; falling back to config (may be stale)"
-                );
-                if let Some(nc) = net_config {
-                    for entry in &nc.members {
-                        let _ = member_list.add(Member {
-                            identity: entry.identity,
-                            ip: entry.ip,
-                            is_coordinator: entry.is_coordinator,
-                            hostname: entry.hostname.clone(),
-                            user_identity: None,
-                            device_cert: None,
-                            collision_index: 0,
-                            last_seen: None,
-                            exit_node: false,
-                        });
-                    }
-                    for entry in &nc.approved {
-                        let ae = ApprovedEntry {
-                            identity: entry.identity,
-                            ip: entry.ip,
-                            hostname: entry.hostname.clone(),
-                            user_identity: None,
-                            device_cert: None,
-                            collision_index: 0,
-                        };
-                        let _ = approved_list.approve(ae, &member_list);
-                    }
-                }
-            }
-        }
-        if !member_list.is_member(&self.transport.identity.local_identity()) {
-            member_list
-                .add(Member {
-                    identity: self.transport.identity.local_identity(),
-                    ip: my_ip,
-                    is_coordinator: true,
-                    hostname: persisted_hostname.clone(),
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                    last_seen: None,
-                    exit_node: false,
-                })
-                .expect("self-add cannot collide");
-        }
-        RestoredRoster {
-            members: member_list,
-            approved: approved_list,
-            suggested_firewall,
-            reusable_keys,
-            nullifiers,
-        }
+        net_config: &config::NetworkConfig,
+    ) -> Result<RestoredRoster> {
+        let persisted_peers: Vec<_> = net_config.members.iter().map(|m| m.identity).collect();
+        let data = self
+            .restore_roster_from_blob(
+                net_public_key,
+                net_config.last_group_hash,
+                net_config.last_group_hash_published,
+                &persisted_peers,
+            )
+            .await
+            .with_context(|| format!("restore complete roster for '{name}'"))?;
+        let restored = materialize_coordinator_roster(
+            data,
+            self.transport.identity.local_identity(),
+            net_config.my_hostname.clone(),
+        );
+        tracing::info!(
+            network = %name,
+            members = restored.members.all().len(),
+            "restored roster from complete group blob"
+        );
+        Ok(restored)
     }
 
     /// Restores a coordinator network from saved config (uses the existing name).
@@ -143,23 +162,24 @@ impl NetworkRegistry {
             }
         }
 
-        let my_ip = self.transport.identity.local_ip();
+        let my_ip = self.transport.identity.local_ipv6();
 
-        // Load persisted network secret key from config
-        let app_config = config::load()?;
-        let net_config = app_config.networks.iter().find(|n| n.name == name);
+        // Load persisted network secret key from config.
+        let net_config = config::load_network(name)?.context("network is no longer saved")?;
         let net_secret_key = net_config
-            .and_then(|nc| nc.network_secret_key.clone())
+            .network_secret_key
+            .clone()
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
-        let persisted_hostname = net_config.and_then(|nc| nc.my_hostname.clone());
+        let persisted_hostname = net_config.my_hostname.clone();
 
         // Restore membership from the authoritative published GroupBlob. The blob
         // (members + approved) is signed by the per-network key and published
         // to DHT, so it is the source of truth and survives a daemon restart. The
         // local blob store still holds the bytes we published before going down, so
         // we read them back by the hash in the pkarr record (falling back to a seed
-        // peer, then to the stale config roster only if the DHT is unreachable).
+        // peer. If neither source has it, restoration fails and is retried without
+        // publishing anything.
         // Restoring from the blob is also what prevents a clobber: the rebuilt
         // snapshot hashes identical to the published record, so the periodic
         // re-publish becomes a no-op instead of overwriting the roster with a
@@ -167,80 +187,74 @@ impl NetworkRegistry {
         let RestoredRoster {
             members: member_list,
             approved: approved_list,
+            group_name,
             suggested_firewall,
             reusable_keys,
             nullifiers,
+            source_hash,
+            source_published,
         } = self
-            .restore_member_roster(name, net_public_key, net_config, my_ip, &persisted_hostname)
-            .await;
+            .restore_member_roster(name, net_public_key, &net_config)
+            .await?;
 
         let mut net_state = NetworkState {
             members: member_list,
             approved: approved_list,
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
+            converged_hash: None,
+            unconfirmed_durable_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
+            group_name,
             mode,
             suggested_firewall,
             reusable_keys,
             nullifiers,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            // A key holder authors records rather than applying them, so it keeps
+            // no replay floor.
+            last_record_timestamp: None,
         };
 
-        self.seal_and_publish(&mut net_state, &net_secret_key).await;
+        let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
+        let restored_hash_was_published = source_published && last_group_hash == source_hash;
 
-        // Update config
-        let member_entries = to_member_entries(net_state.members.all());
-        let approved_entries = to_approved_entries(net_state.approved.all());
-        config::save_network(&config::NetworkConfig {
-            name: name.to_string(),
-            group_mode: mode,
-            my_ip: Some(my_ip),
-            my_hostname: persisted_hostname.clone(),
-            // Coordinators publish renames directly, so they never carry a
-            // pending intent.
-            pending_hostname: None,
-            members: member_entries,
-            approved: approved_entries,
-            network_secret_key: Some(net_secret_key.clone()),
-            network_public_key: Some(net_public_key),
-            transport: None,
-            // Preserve the persisted consent flag + admin roster across a
-            // restart; only the roster (members/approved) is authoritative
-            // from the blob.
-            auto_accept_firewall: net_config
-                .map(|nc| nc.auto_accept_firewall)
-                .unwrap_or(false),
-            auto_accept_files: net_config.map(|nc| nc.auto_accept_files).unwrap_or(false),
-            admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
-            direct: net_config.map(|nc| nc.direct).unwrap_or(false),
-            ssh_allow: net_config
-                .map(|nc| nc.ssh_allow.clone())
-                .unwrap_or_default(),
-            aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
-            ephemeral_ttl_secs: None,
-            // Local exit-node policy survives restarts (server allow-list and the
-            // client's selected exit peer); neither rides the signed blob.
-            exit_allow: net_config
-                .map(|nc| nc.exit_allow.clone())
-                .unwrap_or_default(),
-            exit_node_use: net_config.and_then(|nc| nc.exit_node_use.clone()),
+        // Replace only the blob-derived projection on the latest saved config.
+        // Everything else in this file is node-local policy and must survive
+        // both a coordinator restart and writes made while restoration awaited.
+        let updated = config::update_network(name, |latest| {
+            apply_coordinator_restore_to_config(
+                latest,
+                mode,
+                &net_state.members,
+                &net_state.approved,
+                &net_secret_key,
+                Some(last_group_hash),
+                restored_hash_was_published,
+            );
+            Ok(())
         })?;
+        anyhow::ensure!(updated.is_some(), "network is no longer saved");
+        let restored_record = self
+            .publish_group_hash(name, &net_secret_key, last_group_hash)
+            .await;
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(RwLock::new(net_state));
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let invite_lock = Arc::new(AsyncMutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let ctx = self.mesh_ctx();
-        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+        let tasks = self.spawn_coordinator_background_tasks(
             &ctx,
             name,
             &net_secret_key,
             &state,
             &dht_notify,
             &cancel,
+            restored_record.as_ref().map(|_| last_group_hash),
         );
 
         self.register_coordinator_handler(
@@ -262,17 +276,16 @@ impl NetworkRegistry {
                     .filter_map(|m| {
                         m.hostname
                             .as_ref()
-                            .map(|h| (h.clone(), m.ip, derive_ipv6(&m.identity)))
+                            .map(|h| (h.clone(), derive_ipv6(&m.identity)))
                     })
                     .collect()
             };
-            for (hostname, ip, ipv6) in members_snapshot {
+            for (hostname, ipv6) in members_snapshot {
                 dns::update_hostname(
                     &self.dns.hostname_table,
                     &self.dns.reverse_table,
                     name,
                     &hostname,
-                    ip,
                     ipv6,
                 )
                 .await;
@@ -291,21 +304,7 @@ impl NetworkRegistry {
         // any member that has since been idle-closed, before the first reconverge
         // (self excluded).
         self.seed_route_map(name, &members_to_dial);
-        // Eager-connect the roster at startup (all nodes): a failed dial marks a peer
-        // offline immediately, so status distinguishes offline from idle from boot.
-        // On-demand nodes then idle-close these links per connection and re-dial
-        // lazily; the route map above is what lets them come back.
-        self.dial_all_members(
-            &members_to_dial,
-            net_public_key,
-            name,
-            self.transport.identity.local_identity(),
-            my_ip,
-            persisted_hostname.clone(),
-        )
-        .await;
-
-        // Register the network from its restored local state *before* dialing
+        // Register the network from its restored local state before dialing
         // peers, so `ray status` / IPC sees it the instant the local restore
         // finishes. `dial_all_members` awaits a handshake per peer; when it gated
         // this insert, a freshly (re)started daemon answered `status` with "no
@@ -314,39 +313,42 @@ impl NetworkRegistry {
             name: name.to_string(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
-            my_ip,
             state,
             dht_notify: Some(dht_notify),
             cancel: cancel.clone(),
             tasks,
             invite_lock,
-            disconnect_tx: disconnect_tx.clone(),
+            // A coordinator holds the network key and publishes the record, so
+            // the version it advertises is this build's by construction.
+            incompatible: None,
         };
         self.networks.insert(name.to_string(), handle);
         self.refresh_search_domains().await;
 
         // Full mesh: proactively dial every known member in the background so a
         // restarting coordinator/co-coordinator reconnects to peers that haven't
-        // (yet) dialed in, without blocking restore on peer connectivity. Without
-        // the dial, a co-coordinator that comes back up only learns about peers
-        // that connect *to it*, so two co-coordinators restarting together each
-        // show the other offline until one is disturbed. The accept handler is
-        // already registered so return traffic is handled, and the reconnect loop
-        // retries anything still unreachable.
-        {
-            let me = Arc::clone(self);
-            let network_name = name.to_string();
-            tokio::spawn(async move {
-                me.dial_all_members(
+        // (yet) dialed in, without blocking restore on peer connectivity. Track
+        // the task on the handle and stop it with the network token so leave/nuke
+        // cannot let a stale restore dial recreate routes after teardown.
+        let me = Arc::clone(self);
+        let network_name = name.to_string();
+        let dial_cancel = cancel.clone();
+        let dial_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = dial_cancel.cancelled() => {}
+                _ = me.dial_all_members(
                     &members_to_dial,
                     net_public_key,
                     &network_name,
                     me.transport.identity.local_identity(),
-                    my_ip,
                     persisted_hostname,
-                )
-                .await;
-            });
+                ) => {}
+            }
+        });
+        if let Some(mut handle) = self.networks.get_mut(name) {
+            handle.tasks.push(dial_task);
+        } else {
+            dial_task.abort();
         }
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network restored (coordinator)");
@@ -354,8 +356,7 @@ impl NetworkRegistry {
         Ok(IpcMessage::Created {
             name: name.to_string(),
             network_key: net_public_key,
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
         })
     }
 
@@ -423,7 +424,7 @@ impl NetworkRegistry {
     /// drops the target mesh-wide (`prune_departed_peers`); the coordinator also
     /// closes its own link to the target immediately. Refused on open networks
     /// (the target would auto-re-join) and against coordinators / self.
-    pub(crate) async fn kick_member(&self, network: &str, peer: &str) -> IpcMessage {
+    pub(crate) async fn kick_member(self: &Arc<Self>, network: &str, peer: &str) -> IpcMessage {
         let (state, dht_notify, has_key, mode) = match self.networks.get(network) {
             Some(h) => {
                 let (has_key, mode) = {
@@ -458,7 +459,7 @@ impl NetworkRegistry {
             }
         };
         let candidate_user = self.device_user_map.resolve(&candidate);
-        let (member_id, member_ip, is_coord, display) = {
+        let (member_id, _member_ip, is_coord, display) = {
             let s = state.read().unwrap();
             match s
                 .members
@@ -468,7 +469,7 @@ impl NetworkRegistry {
             {
                 Some(m) => (
                     m.identity,
-                    m.ip,
+                    derive_ipv6(&m.identity),
                     m.is_coordinator,
                     m.hostname
                         .clone()
@@ -489,83 +490,24 @@ impl NetworkRegistry {
             ));
         }
 
-        // Prune the roster + approved list, then republish the signed blob so the
-        // removal is authoritative, and drop the target's DNS entries.
-        {
-            let mut s = state.write().unwrap();
-            s.members.remove(&member_id);
-            s.approved.remove(&member_id);
-        }
-        dns::remove_hostname_by_ip(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            network,
-            member_ip,
-        )
-        .await;
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-        let net_pubkey = state.read().unwrap().network_public_key;
-        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
-
-        // Sever our own link(s) to the target now, rather than waiting for it to
-        // time out. Other members drop it when they reconverge from the freshly
-        // published record (`prune_departed_peers`).
-        for (pid, ip, _conn) in self.peers.peers_for_network_with_conn(network) {
-            if pid == member_id || self.device_user_map.resolve(&pid) == member_id {
-                // Only close the shared connection if this was the peer's last
-                // network with us; otherwise just drop this network's route so a
-                // peer we share other networks with stays reachable there.
-                if let Some(conn) =
-                    self.peers
-                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
-                {
-                    conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
-                }
-            }
-        }
+        // The two calls the ephemeral pruner makes, which is what
+        // `remove_member_roster_only`'s doc has always claimed the manual kick
+        // shared with it. It did not: this path closed the victim's connection
+        // with `KICK_CODE` instead, and a close code cannot name a network, so it
+        // is not a kick the victim can act on. `confirm_kick_and_leave` runs off
+        // the in-band, network-scoped `ControlMsg::KickedFromNetwork`, which only
+        // `finalize_removal` sends; without it the victim learned of its own
+        // removal from the group poll, whose `Departed` outcome does nothing but
+        // stop polling, leaving the network in `ray status` with a roster frozen
+        // at the kick. `finalize_removal` also deliberately leaves the connection
+        // open, so the message cannot lose a race with its own teardown.
+        let ctx = self.mesh_ctx();
+        remove_member_roster_only(&ctx, network, &state, member_id, derive_ipv6(&member_id)).await;
+        finalize_removal(&ctx, network, &state, &dht_notify, &[member_id]).await;
 
         tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
         IpcMessage::Ok {
             message: format!("kicked '{display}' from '{network}'"),
-        }
-    }
-
-    /// Set or clear the per-network ephemeral policy (coordinator-local). A
-    /// `None` TTL disables it. Persisted to the network's config; the pruner
-    /// re-reads it each tick, so no restart is needed.
-    pub(crate) async fn set_ephemeral(&self, network: &str, ttl_secs: Option<u64>) -> IpcMessage {
-        let mut cfg = match config::load_network(network) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                return ipc_err(format!("network '{network}' not found"));
-            }
-            Err(e) => {
-                return ipc_err(format!("failed to load network '{network}': {e}"));
-            }
-        };
-        cfg.ephemeral_ttl_secs = ttl_secs;
-        if let Err(e) = config::save_network(&cfg) {
-            return ipc_err(format!("failed to save network '{network}': {e}"));
-        }
-        match ttl_secs {
-            Some(s) => IpcMessage::Ok {
-                message: format!("ephemeral policy on '{network}' set to {s}s"),
-            },
-            None => IpcMessage::Ok {
-                message: format!("ephemeral policy on '{network}' disabled"),
-            },
-        }
-    }
-
-    /// Read the per-network ephemeral TTL (open read).
-    pub(crate) fn get_ephemeral(&self, network: &str) -> IpcMessage {
-        match config::load_network(network) {
-            Ok(Some(c)) => IpcMessage::EphemeralStatus {
-                network: network.to_string(),
-                ttl_secs: c.ephemeral_ttl_secs,
-            },
-            Ok(None) => ipc_err(format!("network '{network}' not found")),
-            Err(e) => ipc_err(format!("failed to load network '{network}': {e}")),
         }
     }
 
@@ -593,6 +535,28 @@ impl NetworkRegistry {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            // A network already registered as version-incompatible was built from
+            // its signed blob alone: it is visible and marked in `ray status`, but
+            // no peer on it is reachable until its coordinator republishes at a
+            // version this build speaks. Re-running the join would only be refused
+            // as "already in network", so watch the record instead and rebuild
+            // only once it matches. Leaving the registration untouched meanwhile
+            // is the point: tearing it down each retry would put the network back
+            // to invisible between attempts.
+            let stuck = match self.incompatible_registration(&name) {
+                Some(mismatch) => {
+                    !self
+                        .mesh_version_recovered(&name, &net_pubkey, &mismatch)
+                        .await
+                }
+                None => false,
+            };
+            if stuck {
+                match self.after_attempt(&name, &mut delay, attempt).await {
+                    RestoreNext::Retry => continue,
+                    RestoreNext::Stop => return,
+                }
+            }
             match self
                 .join_network_inner(
                     &net_pubkey,
@@ -606,14 +570,54 @@ impl NetworkRegistry {
                 )
                 .await
             {
-                Ok(TryJoin::Joined(IpcMessage::Joined { name, my_ip, .. })) => {
-                    tracing::info!(network = %name, ip = %my_ip, attempt, "restored member network");
-                    return;
+                // The reply is boxed (`TryJoin::Joined`), so the two Joined cases
+                // are told apart inside the arm rather than by pattern.
+                Ok(TryJoin::Joined(resp)) => match *resp {
+                    IpcMessage::Joined {
+                        ref name, my_ipv6, ..
+                    } => {
+                        // Registered, but possibly only from the blob because the
+                        // record advertises a mesh version we don't speak. That is
+                        // not the end of the restore: stay in the loop so a
+                        // coordinator republish promotes it.
+                        match self.incompatible_registration(name) {
+                            Some(m) => {
+                                self.restore_errors.insert(
+                                    name.clone(),
+                                    format!(
+                                        "runs mesh protocol v{}, this build speaks v{}",
+                                        m.network, m.ours
+                                    ),
+                                );
+                                tracing::warn!(network = %name, ip = %my_ipv6, attempt, network_version = m.network, our_version = m.ours, "registered member network as version-incompatible; waiting for the coordinator to republish");
+                            }
+                            None => {
+                                self.restore_errors.remove(name);
+                                tracing::info!(network = %name, ip = %my_ipv6, attempt, "restored member network");
+                                return;
+                            }
+                        }
+                    }
+                    // Not reachable today (a reconnect handshake only ever returns
+                    // `Admitted`), and that is exactly why it must not be a silent
+                    // `return`: a saved network that never registers is invisible
+                    // except as a faint `inactive` marker in `ray status`.
+                    ref other => {
+                        tracing::warn!(network = %name, attempt, response = ?other, retry_in = ?delay, "unexpected response restoring network, retrying");
+                    }
+                },
+                // Queued for live approval on a closed network. `TryJoin::Pending`
+                // and `dial_reconnect` both document that the caller retries until
+                // `ray accept` lets us in, so retry: settling here strands the
+                // network until someone notices and restarts the daemon.
+                Ok(TryJoin::Pending) => {
+                    tracing::warn!(network = %name, attempt, retry_in = ?delay, "restore queued for approval on a closed network, retrying");
                 }
-                // Pending approval on a closed network: a settled state that no
-                // amount of retrying improves.
-                Ok(_) => return,
                 Err(e) => {
+                    // Keep the reason where `ray status` can read it: a saved
+                    // network that never registers otherwise renders as a bare
+                    // "inactive" with the explanation only in the daemon log.
+                    self.restore_errors.insert(name.clone(), format!("{e:#}"));
                     // The first failure is worth flagging; the rest are just the
                     // shape of waiting for connectivity, so keep them at debug.
                     if attempt == 1 {
@@ -624,24 +628,229 @@ impl NetworkRegistry {
                 }
             }
 
-            tokio::select! {
-                _ = self.shutdown_token.cancelled() => return,
-                _ = tokio::time::sleep(delay) => {}
+            match self.after_attempt(&name, &mut delay, attempt).await {
+                RestoreNext::Retry => {}
+                RestoreNext::Stop => return,
             }
-
-            // Stop quietly if the network registered by another path while we
-            // waited (an inbound handshake), or if it was left/nuked meanwhile.
-            if self.networks.contains_key(&name) {
-                return;
-            }
-            if let Ok(cfg) = config::load()
-                && !cfg.networks.iter().any(|n| n.name == name)
-            {
-                tracing::debug!(network = %name, "network no longer saved, giving up restore");
-                return;
-            }
-            delay = (delay * 2).min(RESTORE_RETRY_MAX);
         }
+    }
+
+    /// The version mismatch a registered network is flagged with. `None` covers
+    /// both "not registered" and "registered and healthy".
+    fn incompatible_registration(&self, name: &str) -> Option<MeshVersionMismatch> {
+        self.networks.get(name).and_then(|h| h.incompatible.clone())
+    }
+
+    /// Sleep out one restore backoff step, then say whether the loop goes on.
+    ///
+    /// Every exit from the restore loop has to be greppable, otherwise a network
+    /// that is saved but not live has no explanation anywhere. A registration
+    /// flagged version-incompatible is not an exit: it holds the network open
+    /// (and marked) in `ray status` while the loop waits for its coordinator to
+    /// republish at a version this build speaks.
+    async fn after_attempt(&self, name: &str, delay: &mut Duration, attempt: u32) -> RestoreNext {
+        tokio::select! {
+            _ = self.shutdown_token.cancelled() => return RestoreNext::Stop,
+            _ = tokio::time::sleep(*delay) => {}
+        }
+        *delay = (*delay * 2).min(RESTORE_RETRY_MAX);
+
+        if self.networks.contains_key(name) && self.incompatible_registration(name).is_none() {
+            tracing::debug!(network = %name, attempt, "network registered by another path, ending restore");
+            self.restore_errors.remove(name);
+            return RestoreNext::Stop;
+        }
+        if let Ok(cfg) = config::load()
+            && !cfg.networks.iter().any(|n| n.name == name)
+        {
+            tracing::debug!(network = %name, "network no longer saved, giving up restore");
+            self.restore_errors.remove(name);
+            return RestoreNext::Stop;
+        }
+        RestoreNext::Retry
+    }
+
+    /// The mesh protocol version a network's signed record advertises. `Ok(None)`
+    /// means the record predates the field; `Err` means it could not be read at
+    /// all, which says nothing about the version.
+    async fn record_mesh_version(&self, net_pubkey: &str) -> Result<Option<u32>> {
+        let net_pubkey: EndpointId = net_pubkey.parse().context("invalid network key")?;
+        let client = dht::create_pkarr_client(&self.transport.endpoint)?;
+        let record = dht::resolve_network_packet(&client, net_pubkey).await?;
+        Ok(dht::mesh_version_from_record(&record))
+    }
+
+    /// Re-read a version-incompatible network's record and, if the coordinator
+    /// has since republished at a version this build speaks, drop the blob-only
+    /// registration so the caller can run a real restore over it. Returns whether
+    /// it did.
+    ///
+    /// Tearing down is the only thing this touches, and only on a version that
+    /// now matches: a mismatch that still holds must leave the registration
+    /// exactly where it is, or each retry would take the network out of
+    /// `ray status` and put it back.
+    async fn mesh_version_recovered(
+        &self,
+        name: &str,
+        net_pubkey: &str,
+        mismatch: &MeshVersionMismatch,
+    ) -> bool {
+        let record_version = match self.record_mesh_version(net_pubkey).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(network = %name, error = %e, "could not re-read the network record; keeping the incompatible registration");
+                return false;
+            }
+        };
+        if !mesh_version_is_speakable(record_version, transport::MESH_PROTOCOL_VERSION) {
+            return false;
+        }
+        tracing::info!(
+            network = %name,
+            was = mismatch.network,
+            now = ?record_version,
+            "network republished at a mesh version this build speaks; rebuilding the registration"
+        );
+        self.teardown_network_runtime(name).await;
+        true
+    }
+
+    /// Start a member network's restore loop, unless one is already running for
+    /// it. The [`restoring`](NetworkRegistry::restoring) guard is what lets the
+    /// startup path and the supervisor's sweep both call this freely.
+    fn spawn_member_restore(self: &Arc<Self>, net: &config::NetworkConfig) {
+        let Some(net_pubkey) = net.network_public_key.map(|k| k.to_string()) else {
+            tracing::warn!(network = %net.name, "no network public key in config, skipping restore");
+            return;
+        };
+        if !self.restoring.insert(net.name.clone()) {
+            return;
+        }
+        let me = Arc::clone(self);
+        let name = net.name.clone();
+        let guard = net.name.clone();
+        let persisted_hostname = net.my_hostname.clone();
+        let auto_accept_firewall = net.auto_accept_firewall;
+        let auto_accept_files = net.auto_accept_files;
+        tokio::spawn(async move {
+            Arc::clone(&me)
+                .restore_member_network(
+                    name,
+                    net_pubkey,
+                    persisted_hostname,
+                    auto_accept_firewall,
+                    auto_accept_files,
+                )
+                .await;
+            me.restoring.remove(&guard);
+        });
+    }
+
+    /// Start a coordinator network's restore, unless one is already running for
+    /// it. Returns the handle so startup can await it as a barrier; the sweep
+    /// drops it. Unlike the member path this is a single attempt, so the sweep's
+    /// tick is what retries it.
+    fn spawn_coordinator_restore(
+        self: &Arc<Self>,
+        net: &config::NetworkConfig,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.restoring.insert(net.name.clone()) {
+            return None;
+        }
+        let me = Arc::clone(self);
+        let name = net.name.clone();
+        let mode = net.group_mode;
+        Some(tokio::spawn(async move {
+            match me.restore_coordinator_network(&name, mode).await {
+                Ok(IpcMessage::Created { .. }) => {
+                    tracing::info!(network = %name, "restored coordinator network");
+                }
+                Ok(IpcMessage::Error { message }) => {
+                    tracing::warn!(network = %name, error = %message, "failed to restore network");
+                }
+                Err(e) => {
+                    tracing::warn!(network = %name, error = %e, "failed to restore network");
+                }
+                _ => {}
+            }
+            me.restoring.remove(&name);
+        }))
+    }
+
+    /// Keep every saved network live. Sweeps on a tick and whenever a peer sends
+    /// traffic for a network we have saved but not registered, restarting the
+    /// restore for anything missing.
+    ///
+    /// The startup restore alone is not enough: it can end (a member loop that
+    /// gives up because the network registered by another path, a coordinator
+    /// restore that failed once) and nothing revisits the decision, leaving a
+    /// network that is saved but dead until someone notices and restarts the
+    /// daemon. A node in that state looks healthy: it stays connected to its
+    /// peers and answers `ray ping`, while every packet for the missing network
+    /// is dropped as belonging to an unknown one.
+    pub(crate) async fn run_restore_supervisor(self: Arc<Self>) {
+        loop {
+            let nudged = tokio::select! {
+                _ = self.shutdown_token.cancelled() => return,
+                _ = tokio::time::sleep(RESTORE_SWEEP_INTERVAL) => false,
+                _ = self.restore_nudge.notified() => true,
+            };
+            self.sweep_missing_networks();
+            // A nudge comes from peer traffic, so its rate is the peer's to
+            // choose. Hold the floor after serving one: `Notify` collapses
+            // everything that arrives meanwhile into a single pending wake-up, so
+            // a peer spraying frames for an unknown network costs one sweep per
+            // debounce window rather than one per frame.
+            if nudged {
+                tokio::select! {
+                    _ = self.shutdown_token.cancelled() => return,
+                    _ = tokio::time::sleep(NUDGE_DEBOUNCE) => {}
+                }
+            }
+        }
+    }
+
+    /// One pass: start a restore for every saved network that is neither live
+    /// nor already being restored.
+    fn sweep_missing_networks(self: &Arc<Self>) {
+        let app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to load config during restore sweep");
+                return;
+            }
+        };
+        let missing = missing_networks(
+            &app_config.networks,
+            |name| self.networks.contains_key(name),
+            |name| self.restoring.contains(name),
+        );
+        for m in missing {
+            let Some(net) = app_config.networks.iter().find(|n| n.name == m.name) else {
+                continue;
+            };
+            // Debug, not info: this repeats every sweep for as long as a network
+            // stays unrestorable. The restore it starts logs its own outcome
+            // (info on success, warn on failure), which is the part worth seeing.
+            tracing::debug!(network = %m.name, "saved network is not live, restoring it");
+            if m.coordinator_mode.is_some() {
+                self.spawn_coordinator_restore(net);
+            } else {
+                self.spawn_member_restore(net);
+            }
+        }
+    }
+
+    /// Ask the restore supervisor to sweep now. Called from the control demux
+    /// when a peer sends a frame for a network we have saved but not live: the
+    /// peer is back, so there is no reason to sit out the rest of the tick.
+    ///
+    /// Deliberately does no work of its own (no config read, no map scan) beyond
+    /// waking the supervisor: it runs per dropped frame, at a rate the peer
+    /// chooses. The supervisor decides whether anything actually needs restoring
+    /// and rate-limits itself.
+    pub(crate) fn nudge_restore(&self) {
+        self.restore_nudge.notify_one();
     }
 
     /// Connect to every saved network (control plane). Run once at daemon
@@ -662,44 +871,10 @@ impl NetworkRegistry {
             count += 1;
             if net.network_secret_key.is_some() {
                 // We hold the secret key, restore as coordinator.
-                let name = net.name.clone();
-                let mode = net.group_mode;
-                let daemon_c = Arc::clone(self);
-                coordinator_restores.push(tokio::spawn(async move {
-                    match daemon_c.restore_coordinator_network(&name, mode).await {
-                        Ok(IpcMessage::Created { name, .. }) => {
-                            tracing::info!(network = %name, "restored coordinator network");
-                        }
-                        Ok(IpcMessage::Error { message }) => {
-                            tracing::warn!(network = %name, error = %message, "failed to restore network");
-                        }
-                        Err(e) => {
-                            tracing::warn!(network = %name, error = %e, "failed to restore network");
-                        }
-                        _ => {}
-                    }
-                }));
+                coordinator_restores.extend(self.spawn_coordinator_restore(net));
             } else {
                 // We're a member, rejoin via DHT lookup.
-                let name = net.name.clone();
-                let persisted_hostname = net.my_hostname.clone();
-                let net_auto_accept = net.auto_accept_firewall;
-                let net_auto_accept_files = net.auto_accept_files;
-                let net_pubkey = match &net.network_public_key {
-                    Some(k) => k.to_string(),
-                    None => {
-                        tracing::warn!(network = %name, "no network public key in config, skipping restore");
-                        continue;
-                    }
-                };
-                let daemon_c = Arc::clone(self);
-                tokio::spawn(daemon_c.restore_member_network(
-                    name,
-                    net_pubkey,
-                    persisted_hostname,
-                    net_auto_accept,
-                    net_auto_accept_files,
-                ));
+                self.spawn_member_restore(net);
             }
         }
 
@@ -776,16 +951,42 @@ impl Daemon {
         *guard = Some(token.clone());
         drop(guard);
         self.rebuild_ssh_authz();
-        let my_v4 = self.transport.identity.local_ip();
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
         let server = crate::ssh::SshServer::new(
             self.registry.peers.clone(),
             self.registry.device_user_map.clone(),
             self.ssh_authz.clone(),
         );
-        server.spawn(vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)], token);
+        // The overlay carries no IPv4, so there is one address to bind and it is
+        // the derived mesh IPv6.
+        let binds = vec![IpAddr::V6(my_v6)];
+        server.spawn(binds, token);
         // Turn on the userspace port NAT so mesh `:22` reaches the listener.
         crate::forward::set_ssh_nat_active(true);
+    }
+
+    /// Start the IPv4 listener bridge, if not already running. Idempotent.
+    /// Bound to the data plane for the same reason as the SSH listeners: it
+    /// binds this node's mesh address, which goes down with the TUN.
+    #[cfg(feature = "desktop")]
+    pub(crate) fn start_v4_bridge(self: &Arc<Self>) {
+        let mut guard = self.v4_bridge_token.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        *guard = Some(token.clone());
+        drop(guard);
+        let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
+        crate::v4bridge::V4Bridge::new(my_v6).spawn(token);
+    }
+
+    /// Stop the IPv4 listener bridge if running. Idempotent.
+    #[cfg(feature = "desktop")]
+    pub(crate) fn stop_v4_bridge(&self) {
+        if let Some(t) = self.v4_bridge_token.lock().unwrap().take() {
+            t.cancel();
+        }
     }
 
     /// Stop the SSH listeners if running. Idempotent.
@@ -815,24 +1016,25 @@ impl Daemon {
                     "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
                 ));
             }
-            match config::load() {
-                Ok(mut app_config) => {
-                    app_config.default_hostname = Some(h);
-                    if let Err(e) = config::save_settings(&app_config) {
-                        tracing::warn!(error = %e, "failed to persist default hostname");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load config to set default hostname")
-                }
+            if let Err(e) = config::update_settings(|cfg| {
+                cfg.default_hostname = Some(h);
+                Ok(())
+            }) {
+                tracing::warn!(error = %e, "failed to persist default hostname");
             }
         }
 
         if self.active.swap(true, Ordering::SeqCst) {
             return IpcMessage::Ok {
-                message: "already up".into(),
+                message: "already up".to_string(),
             };
         }
+
+        // Re-resolve every network's signed record now. A battery-powered node
+        // polls on a long interval, so a device coming up after a spell on
+        // standby would otherwise route from whatever the roster looked like
+        // when it went down.
+        self.registry.poll_nudge.notify_waiters();
 
         // Non-fatal problems hit while activating. The daemon stays up, but we
         // return these to the client so `ray up` can tell the user something is
@@ -845,9 +1047,8 @@ impl Daemon {
         #[cfg(not(target_os = "android"))]
         {
             let tun_name = self.tun_name.load().as_str().to_owned();
-            let my_v4 = self.transport.identity.local_ip();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
-            if let Err(e) = tun::PlatformTun::set_link_up(&tun_name).await {
+            if let Err(e) = tun::set_link_up(&tun_name).await {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
             }
@@ -865,12 +1066,11 @@ impl Daemon {
             // link-up: on Linux the kernel won't install an IPv6 connected route
             // while the link is down, so without this peer traffic leaks out the
             // default route.
-            if let Err(e) = tun::PlatformTun::route_peer_range(&tun_name).await {
+            // `200::/7` also delivers `dns::MAGIC_DNS_V6`, so the resolver needs
+            // no host route of its own.
+            if let Err(e) = tun::route_peer_range(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
-            }
-            if let Err(e) = tun::PlatformTun::route_magic_dns(&tun_name).await {
-                tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
 
             // Loop our own addresses back through lo0 so self-traffic (e.g.
@@ -878,7 +1078,7 @@ impl Daemon {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
+            if let Err(e) = tun::route_self_loopback(my_v6).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
             }
@@ -908,6 +1108,15 @@ impl Daemon {
             }
         }
 
+        // Bridge the host's IPv4-only listeners onto the mesh address. Same
+        // lifetime as the SSH server and for the same reason: it binds that
+        // address. What it exposes is what `0.0.0.0` already exposes, and the
+        // firewall still decides who reaches it (see `crate::v4bridge`).
+        #[cfg(feature = "desktop")]
+        if config::load().map(|c| c.v4_bridge).unwrap_or(true) {
+            self.start_v4_bridge();
+        }
+
         // From here until `deactivate()`, the roster's exit-offer flag is kept in
         // sync with the loaded gateway policy (see `sync_exit_offers`).
         self.registry
@@ -918,10 +1127,10 @@ impl Daemon {
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
-                message: "VPN up".into(),
+                message: "VPN up".to_string(),
             }
         } else {
-            let mut message = String::from("VPN up, but some things need attention:");
+            let mut message = "VPN up. Some things need attention:".to_string();
             for w in &warnings {
                 message.push_str("\n  - ");
                 message.push_str(w);
@@ -950,6 +1159,15 @@ impl Daemon {
         let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
         let served = started.elapsed();
         let client = self.apply_exit_client(&tun_name).await;
+        // What the kernel accepted, for `ray exit-node status`: a failed install
+        // rolls back its own rules and leaves the selection standing, so the
+        // selection alone cannot say whether anything is being tunnelled.
+        self.registry
+            .exit_install_error
+            .store(client.clone().map(Arc::new));
+        // `None` from `apply_exit_client` means the install succeeded (or that
+        // there was nothing to install, in which case the selection is inactive).
+        self.apply_exit_dns(self.registry.exit_client.is_active() && client.is_none());
         let clients = started.elapsed();
         // Advertise what actually survived the reconcile: a failed enable cleared
         // the offers, so this also withdraws a stale advertisement rather than
@@ -1018,6 +1236,71 @@ impl Daemon {
         }
     }
 
+    /// Which families the tunnel currently selected would carry, or
+    /// [`ExitFamilies::Neither`] when nothing is selected.
+    ///
+    /// One reader for the routing install, the socket pin and the DNS override,
+    /// so the three cannot end up describing different tunnels.
+    fn tunnel_carries(&self) -> ExitFamilies {
+        self.registry
+            .exit_client
+            .selection()
+            .map(|s| s.carries)
+            .unwrap_or(ExitFamilies::Neither)
+    }
+
+    /// Point the Magic DNS forwarder at upstreams the tunnel can actually reach,
+    /// or put the captured ones back when no tunnel is up.
+    ///
+    /// Only a tunnel that carries IPv6 and not IPv4 needs this: every upstream the
+    /// desktop capture produces is IPv4, so without an override the exit node
+    /// would carry the traffic while each lookup that steered it went out the
+    /// physical link. See [`exit_node::tunnel_upstreams`].
+    /// `installed` is whether the tunnel actually went in, not merely whether one
+    /// is selected. A failed install rolls the routing back but leaves the
+    /// selection active, and pointing the forwarder at a public IPv6 resolver with
+    /// no tunnel to reach it through is worse than leaving DNS alone: a host in
+    /// this mode usually has no native IPv6 at all (the mode is about an IPv4
+    /// conflict, not about having v6 transit), so every lookup would SERVFAIL on a
+    /// host whose DNS worked a moment earlier.
+    fn apply_exit_dns(&self, installed: bool) {
+        let over = installed.then(|| {
+            let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+            crate::exit_node::tunnel_upstreams(self.tunnel_carries(), &configured)
+        });
+        // `None` from either level means "no override": no tunnel, or a tunnel
+        // whose own family already carries the captured upstreams.
+        let over = over.flatten();
+        // The override only moves the daemon's *own* forwarder. Whether an app's
+        // query ever reaches that forwarder is the OS backend's decision, and on
+        // Linux only the direct-resolv.conf backend sends us everything: the
+        // split-DNS backends register `~ray` as the sole routing domain, so
+        // non-`.ray` lookups go to the host's other links, over IPv4, which this
+        // mode deliberately does not tunnel. macOS has no such gap, because
+        // `apply_exit_client` re-asserts a catch-all match domain while the tunnel
+        // is up. Giving Linux the same flip is the real fix and is not done here.
+        //
+        // Sharing `/etc/resolv.conf` with another mesh is the same gap by a
+        // different route: we are the first nameserver and get every name, but a
+        // name outside `.ray` is answered REFUSED so the stub asks the next line,
+        // which is that mesh's resolver. The forwarder is out of the path either
+        // way, and this is the host the mode is for, so it is worth saying.
+        #[cfg(target_os = "linux")]
+        if over.is_some()
+            && let Some(backend) = self.dns.backend_name()
+            && (backend != "direct-resolv.conf" || self.dns.resolver.defers_off_mesh())
+        {
+            tracing::warn!(
+                backend,
+                shared_resolv_conf = self.dns.resolver.defers_off_mesh(),
+                "IPv6-only full tunnel is up, but non-`.ray` lookups do not reach \
+                 rayfish's forwarder on this host, so they still leave over IPv4, \
+                 outside the exit node"
+            );
+        }
+        self.dns.resolver.set_tunnel_upstreams(over);
+    }
+
     /// Install or remove the client full-tunnel routing to match the selection.
     /// The kernel plumbing spawns a series of `ip`/`nft` children and waits on
     /// them, so it runs on the blocking pool rather than stalling a runtime
@@ -1025,13 +1308,14 @@ impl Daemon {
     #[cfg(target_os = "linux")]
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let install = self.registry.exit_client.is_active();
+        let carries = self.tunnel_carries();
         let tun_name = tun_name.to_owned();
         let result = tokio::task::spawn_blocking(move || {
             if !install {
                 crate::exit_node::teardown_client_routing();
                 return Ok(());
             }
-            crate::exit_node::install_client_routing(&tun_name).inspect_err(|_| {
+            crate::exit_node::install_client_routing(&tun_name, carries).inspect_err(|_| {
                 // A partial install must not stay live: rules that went in before
                 // the failure (say v4's, with `ipv6.disable=1` failing the v6 half)
                 // would keep routing traffic into a tunnel that was never fully set
@@ -1066,7 +1350,7 @@ impl Daemon {
             tun::unroute_default_via_tun(tun_name).await;
             crate::exit_node::remove_tunnel_exclusions();
             crate::exit_node::clear_physical_defaults();
-            if crate::exit_node::set_full_tunnel(false) {
+            if crate::exit_node::set_full_tunnel(false, false) {
                 self.transport.endpoint.network_change().await;
                 // The rebind that releases the pin drops every direct path too.
                 self.nudge_all_peers();
@@ -1077,7 +1361,7 @@ impl Daemon {
             // relay servers (resolved now, while DNS is still split) and, below,
             // the exit peer's direct addresses.
             let relay_ips = self.relay_underlay_ips().await;
-            crate::exit_node::exclude_from_tunnel(&relay_ips);
+            crate::exit_node::exclude_from_tunnel(&self.tunnel_relevant(relay_ips));
             // Snapshot the physical default interfaces while the routing table is
             // still clean. Once the split defaults are in, a live lookup answers
             // "the tunnel" for any family without a default route of its own, and
@@ -1086,7 +1370,9 @@ impl Daemon {
             // Pin and rebind before the routes go in: `network_change` rebinds
             // iroh's UDP socket to apply the pin, and until it has, the transport
             // has nothing keeping it out of the tunnel.
-            if !crate::exit_node::set_full_tunnel(true) {
+            // Rebind whenever the pin state changed, which now includes the tunnel
+            // narrowing or widening under a live selection, not just coming up.
+            if crate::exit_node::set_full_tunnel(true, self.tunnel_carries().carries_v4()) {
                 self.transport.endpoint.network_change().await;
             }
             let conn = self.exit_peer_conn().await;
@@ -1096,7 +1382,9 @@ impl Daemon {
             // blackholes, iroh spends ~20s failing over, and only the relay (which
             // does have a host route) carries traffic.
             if let Some(conn) = &conn {
-                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                crate::exit_node::exclude_from_tunnel(
+                    &self.tunnel_relevant(peer_underlay_ips(conn)),
+                );
             }
             let failure = self.route_default_or_rollback(tun_name).await;
             if failure.is_none() {
@@ -1126,7 +1414,7 @@ impl Daemon {
     /// blocking on, which [`warm_exit_peer`](Self::warm_exit_peer) does.
     #[cfg(target_os = "macos")]
     fn nudge_all_peers(&self) {
-        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv4);
+        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv6);
         for (ip, conn) in self.registry.peers.all_connections() {
             if Some(ip) == exit_ip {
                 continue; // warmed synchronously below
@@ -1145,17 +1433,36 @@ impl Daemon {
         // the two ends settle on different connections: we send every exit packet
         // down ours while the gateway reads its own, and nothing crosses in either
         // direction. Same gate the on-demand data path and `ray ping` use.
-        if let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) {
+        if let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv6) {
             return Some(conn);
         }
-        // Dial only when there is no live connection. Dialing on top of one opens a
-        // *second* QUIC connection to the same peer, and with one reader per peer
-        // the two ends settle on different connections: we send every exit packet
-        // down ours while the gateway reads its own, and nothing crosses in either
-        // direction. Same gate the on-demand data path and `ray ping` use.
-        let target = self.registry.resolve_route(IpAddr::V4(sel.ipv4))?;
+        let target = self.registry.resolve_route(IpAddr::V6(sel.ipv6))?;
         self.registry.dial_target(&target).await;
-        self.registry.peers.conn_for_ip(&sel.ipv4)
+        self.registry.peers.conn_for_ip(&sel.ipv6)
+    }
+
+    /// Narrow underlay addresses to the families the tunnel actually captures.
+    ///
+    /// The exclusions exist to keep iroh's own traffic off the split default. For a
+    /// family the tunnel does not carry there is no default of ours to route
+    /// around, so a host route is not just wasted work: it pins that address to the
+    /// physical gateway, carving it out of whichever co-resident VPN owns that
+    /// family on this Mac.
+    ///
+    /// Reads [`Self::tunnel_carries`], the same fact the routing install and the
+    /// socket pin read. It used to read this node's mode, which was the same answer
+    /// only until the gateway's claim could narrow a tunnel too: a dual-stack Mac
+    /// through a gateway that can only return IPv6 has no IPv4 default of ours and
+    /// was still excluding IPv4 addresses from it.
+    #[cfg(target_os = "macos")]
+    fn tunnel_relevant(&self, ips: Vec<IpAddr>) -> Vec<IpAddr> {
+        let carries = self.tunnel_carries();
+        ips.into_iter()
+            .filter(|ip| match ip {
+                IpAddr::V4(_) => carries.carries_v4() || carries.is_unknown(),
+                IpAddr::V6(_) => carries.carries_v6() || carries.is_unknown(),
+            })
+            .collect()
     }
 
     /// Block until the exit peer answers over the finished tunnel, so
@@ -1175,7 +1482,9 @@ impl Daemon {
                 // Re-check every round: hole-punching discovers new candidate
                 // addresses as it goes, and one that appears without a host route
                 // around the tunnel is a path that will blackhole.
-                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                crate::exit_node::exclude_from_tunnel(
+                    &self.tunnel_relevant(peer_underlay_ips(conn)),
+                );
                 if nudge_holepunch(&self.protocol_router, conn).await {
                     break;
                 }
@@ -1197,7 +1506,7 @@ impl Daemon {
     /// around the full tunnel. Resolved via the system resolver, so call this
     /// while DNS is still split (before the tunnel's DNS catch-all goes in).
     #[cfg(target_os = "macos")]
-    async fn relay_underlay_ips(&self) -> Vec<std::net::Ipv4Addr> {
+    async fn relay_underlay_ips(&self) -> Vec<IpAddr> {
         // The configured relay set (custom override + n0 default fallback), the
         // same the endpoint dials. Excluding the whole set (a handful of host
         // routes) covers whichever relay it is actually homed on.
@@ -1212,10 +1521,8 @@ impl Daemon {
             let port = url.port_or_known_default().unwrap_or(443);
             if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
                 for a in addrs {
-                    if let IpAddr::V4(v4) = a.ip()
-                        && !ips.contains(&v4)
-                    {
-                        ips.push(v4);
+                    if !ips.contains(&a.ip()) {
+                        ips.push(a.ip());
                     }
                 }
             }
@@ -1228,11 +1535,11 @@ impl Daemon {
     /// not blackhole traffic.
     #[cfg(target_os = "macos")]
     async fn route_default_or_rollback(&self, tun_name: &str) -> Option<String> {
-        match tun::route_default_via_tun(tun_name).await {
+        match tun::route_default_via_tun(tun_name, self.tunnel_carries()).await {
             Ok(()) => None,
             Err(e) => {
                 tun::unroute_default_via_tun(tun_name).await;
-                if crate::exit_node::set_full_tunnel(false) {
+                if crate::exit_node::set_full_tunnel(false, false) {
                     self.transport.endpoint.network_change().await;
                 }
                 tracing::warn!(error = %e, "failed to install exit-node client routing");
@@ -1267,9 +1574,12 @@ impl Daemon {
             };
         }
 
-        // The SSH listeners bind the mesh IPs, which go down with the data plane.
+        // The SSH listeners and the IPv4 bridge bind the mesh IPs, which go down
+        // with the data plane.
         #[cfg(feature = "desktop")]
         self.stop_ssh();
+        #[cfg(feature = "desktop")]
+        self.stop_v4_bridge();
 
         // Clone the TUN name out of the lock before awaiting (see `activate`);
         // the DnsService reverts system DNS and clears the TUN search domains.
@@ -1277,12 +1587,12 @@ impl Daemon {
         self.dns.revert(&tun_name).await;
 
         #[cfg(target_os = "windows")]
-        if let Err(e) = tun::PlatformTun::unroute_peer_range(&tun_name).await {
+        if let Err(e) = tun::unroute_peer_range(&tun_name).await {
             tracing::warn!(error = %e, "failed to remove Windows TUN routes");
         }
 
         #[cfg(not(target_os = "android"))]
-        if let Err(e) = tun::PlatformTun::set_link_down(&tun_name).await {
+        if let Err(e) = tun::set_link_down(&tun_name).await {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }
 
@@ -1312,6 +1622,14 @@ impl Daemon {
         // pinning). Teardown never reports a problem.
         self.registry.exit_client.set(None);
         let _ = self.apply_exit_client(&tun_name).await;
+        // Standby is not a failed install: leaving the last one recorded would
+        // have `ray exit-node status` blame it for a tunnel that is down because
+        // the user put it down.
+        self.registry.exit_install_error.store(None);
+        // With the tunnel gone this drops any DNS override, so standby does not
+        // leave the forwarder pointed at a resolver chosen for a tunnel that no
+        // longer exists.
+        self.apply_exit_dns(false);
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {
@@ -1363,22 +1681,181 @@ async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) -> bool {
     answered
 }
 
-/// The exit peer's own underlay IPv4 addresses, as iroh currently knows them.
+/// The exit peer's own underlay addresses, as iroh currently knows them.
 ///
 /// These are the addresses our QUIC packets to the exit peer are actually sent to,
 /// so they are exactly what must be routed around the full tunnel. Relay paths are
 /// skipped: the relay servers are excluded separately, by name, before DNS moves
 /// into the tunnel.
+///
+/// Both families. Which one a peer's *underlay* is reachable over is not ours to
+/// pick, and the tunnel carries IPv6, so an IPv6 underlay path is precisely the one
+/// that would otherwise be swallowed by the tunnel it is carrying.
 #[cfg(target_os = "macos")]
-fn peer_underlay_ips(conn: &Connection) -> Vec<std::net::Ipv4Addr> {
+fn peer_underlay_ips(conn: &Connection) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     for path in conn.paths().iter() {
         if let iroh::TransportAddr::Ip(addr) = path.remote_addr()
-            && let IpAddr::V4(v4) = addr.ip()
-            && !ips.contains(&v4)
+            && !ips.contains(&addr.ip())
         {
-            ips.push(v4);
+            ips.push(addr.ip());
         }
     }
     ips
+}
+
+#[cfg(test)]
+mod coordinator_restore_tests {
+    use super::*;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        SecretKey::from(bytes).public()
+    }
+
+    fn member(identity: EndpointId, coordinator: bool) -> Member {
+        Member {
+            identity,
+            is_coordinator: coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: Some(42),
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }
+    }
+
+    fn blob(members: Vec<Member>) -> crate::membership::GroupBlob {
+        crate::membership::GroupBlob {
+            members,
+            approved: Vec::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some("signed-name".to_string()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        }
+    }
+
+    fn restored(blob: crate::membership::GroupBlob) -> RestoredGroupBlob {
+        RestoredGroupBlob {
+            blob,
+            hash: blake3::hash(b"source"),
+            published: true,
+        }
+    }
+
+    #[test]
+    fn restore_repairs_an_existing_key_holder() {
+        let me = id(1);
+        let mut existing = member(me, false);
+        existing.hostname = Some("signed-host".to_string());
+        existing.exit_node = true;
+        existing.exit_families = ExitFamilies::V6;
+
+        let restored = materialize_coordinator_roster(restored(blob(vec![existing])), me, None);
+        let mine = restored.members.get(&me).unwrap();
+
+        assert!(mine.is_coordinator);
+        assert_eq!(mine.hostname.as_deref(), Some("signed-host"));
+        assert!(mine.exit_node);
+        assert_eq!(mine.exit_families, ExitFamilies::V6);
+        assert_eq!(mine.last_seen, None);
+    }
+
+    #[test]
+    fn restore_inserts_an_absent_key_holder_without_dropping_the_roster() {
+        let me = id(1);
+        let peer = id(2);
+
+        let restored = materialize_coordinator_roster(
+            restored(blob(vec![member(peer, true)])),
+            me,
+            Some("local-host".to_string()),
+        );
+
+        assert_eq!(restored.members.all().len(), 2);
+        assert!(restored.members.get(&peer).is_some());
+        let mine = restored.members.get(&me).unwrap();
+        assert!(mine.is_coordinator);
+        assert_eq!(mine.hostname.as_deref(), Some("local-host"));
+    }
+
+    #[test]
+    fn restore_preserves_complete_blob_policy_state() {
+        let me = id(1);
+        let approved_id = id(2);
+        let nullified = id(3);
+        let (key_hash, key) = crate::membership::ReusableKey::from_secret(b"key", 10, 20);
+        let approved = ApprovedEntry {
+            identity: approved_id,
+            hostname: Some("waiting".to_string()),
+            user_identity: None,
+            device_cert: None,
+        };
+        let mut source = blob(vec![member(me, true)]);
+        source.approved.push(approved.clone());
+        source.reusable_keys.insert(key_hash.clone(), key.clone());
+        source.nullifiers.insert(nullified);
+
+        let restored = materialize_coordinator_roster(restored(source), me, None);
+
+        assert_eq!(restored.approved.all(), vec![&approved]);
+        assert_eq!(restored.reusable_keys.get(&key_hash), Some(&key));
+        assert_eq!(restored.nullifiers, BTreeSet::from([nullified]));
+    }
+
+    #[test]
+    fn restore_changes_only_blob_derived_config_fields() {
+        let me = id(1);
+        let key = SecretKey::generate();
+        let hash = blake3::hash(b"complete snapshot");
+        let mut members = MemberList::new();
+        members.add(member(me, true));
+        let mut config = config::NetworkConfig {
+            name: "local-name".to_string(),
+            pending_hostname: Some("queued-rename".to_string()),
+            transport: Some(config::TransportMode::Tor),
+            auto_accept_firewall: true,
+            ephemeral_ttl_secs: Some(7_200),
+            exit_allow: vec!["*".to_string()],
+            ..Default::default()
+        };
+
+        apply_coordinator_restore_to_config(
+            &mut config,
+            GroupMode::Restricted,
+            &members,
+            &ApprovedList::new(),
+            &key,
+            Some(hash),
+            true,
+        );
+
+        assert_eq!(config.name, "local-name");
+        assert_eq!(config.transport, Some(config::TransportMode::Tor));
+        assert!(config.auto_accept_firewall);
+        assert_eq!(config.ephemeral_ttl_secs, Some(7_200));
+        assert_eq!(config.exit_allow, vec!["*"]);
+        assert_eq!(config.pending_hostname, None);
+        assert_eq!(config.last_group_hash, Some(hash));
+        assert!(config.last_group_hash_published);
+        assert_eq!(config.network_public_key, Some(key.public()));
+
+        apply_coordinator_restore_to_config(
+            &mut config,
+            GroupMode::Restricted,
+            &members,
+            &ApprovedList::new(),
+            &key,
+            None,
+            false,
+        );
+        assert_eq!(
+            config.last_group_hash,
+            Some(hash),
+            "a failed replacement snapshot write must retain the recovery pointer"
+        );
+    }
 }

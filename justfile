@@ -1,5 +1,10 @@
 target := "x86_64-unknown-linux-gnu"
 musl_target := "x86_64-unknown-linux-musl"
+# Cross builds keep their own target dir, for the same reason `android-check`
+# does: the cross image (Ubuntu 22.04) cannot execute build scripts a modern
+# host compiled, so sharing `target/` fails on a glibc version mismatch the
+# moment anyone runs a native `just release` first.
+cross_dir := "target/cross"
 binary := "ray"
 user := "root"
 
@@ -19,6 +24,21 @@ apk:
     cargo -q run -p ray-mobile --bin uniffi-bindgen -- generate --library target/debug/libray_mobile.{{lib_ext}} --language kotlin --out-dir android/app/src/main/java
     cd android && ./gradlew :app:assembleDebug
     @echo "APK: android/app/build/outputs/apk/debug/app-debug.apk"
+
+# The sibling repos in this tree name this recipe `android`, so accept both.
+alias android := apk
+
+# Compile the Android core for both APK ABIs without an NDK on this machine:
+# cross builds it in a container (see cross/Dockerfile.android). Catches the
+# `#[cfg(target_os = "android")]` code that no desktop build ever sees. `just
+# apk` is still what produces an installable APK.
+#
+# The target dir is separate on purpose: cross's Android images are old enough
+# (Ubuntu 16.04) that they cannot execute build scripts a modern host compiled,
+# and sharing `target/` would have each run rebuild what the other just cached.
+android-check:
+    CARGO_TARGET_DIR=target/android cross -q build -p ray-mobile --target aarch64-linux-android
+    CARGO_TARGET_DIR=target/android cross -q build -p ray-mobile --target x86_64-linux-android
 
 release:
     cargo -q build --release
@@ -46,34 +66,47 @@ fmt-changed:
     rustfmt --edition 2024 $files
 
 cross:
-    cross -q build --release --target {{target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --release --target {{target}}
 
 # Static musl build: one binary that runs on any Linux regardless of glibc
 # version (deps are musl-clean: ring + hickory, no C/dlopen dependencies).
 cross-musl:
-    cross -q build --release --target {{musl_target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --release --target {{musl_target}}
 
 # Build both the glibc and static-musl release binaries.
 cross-all: cross cross-musl
 
+# The restart is not redundant: with the service already running, `ray up` is
+# only an IPC call, so it neither re-execs the new binary nor applies a
+# start-time setting like ipv6-only. `up` first (it installs the unit when it
+# is missing, and persists the flags), then restart onto the new binary.
+
+# Install this checkout as the local daemon (args go to `ray up`, e.g. --ipv6-only).
+local-dev *args:
+    cargo -q build --release
+    sudo install -m 755 target/release/{{binary}} /usr/local/bin/{{binary}}
+    sudo {{binary}} up {{args}}
+    sudo {{binary}} restart
+    @echo "Installed /usr/local/bin/{{binary}} and restarted the local daemon"
+
 deploy ip:
-    cross -q build --release --target {{target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --release --target {{target}}
     just scp {{ip}}
 
 # Copy an already-built release binary to a host + (re)start the daemon. No build.
 # Use after `just cross` when deploying the same binary to several hosts.
 scp ip:
-    rsync -az --progress target/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
+    rsync -az --progress {{cross_dir}}/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
     ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}}"
 
 deploy-dev ip:
-    cross -q build --target {{target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --target {{target}}
     just scp-dev {{ip}}
 
 # Debug counterpart of `scp`: copy an already-built debug binary, no build.
 scp-dev ip:
-    rsync -az --progress target/{{target}}/debug/{{binary}} {{user}}@{{ip}}:/tmp/
+    rsync -az --progress {{cross_dir}}/{{target}}/debug/{{binary}} {{user}}@{{ip}}:/tmp/
     ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}} (debug build)"
 

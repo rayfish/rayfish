@@ -1,10 +1,17 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+// Only the test-only `CONFIG_ENV_LOCK` holds one.
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,29 +24,15 @@ use crate::membership::GroupMode;
 /// frontends); re-exported here so existing `crate::config::TransportMode` paths work.
 pub use ray_proto::TransportMode;
 
-#[allow(dead_code)]
 mod secret_key_hex {
     use iroh::SecretKey;
-    use serde::de::Error;
-    use serde::{self, Deserialize, Deserializer, Serializer};
+    use serde::{self, Serializer};
 
     pub fn serialize<S>(key: &SecretKey, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(key.to_bytes()))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SecretKey, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes: [u8; 32] = hex::decode(&s)
-            .map_err(Error::custom)?
-            .try_into()
-            .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
-        Ok(SecretKey::from(bytes))
     }
 }
 
@@ -80,7 +73,6 @@ mod option_secret_key_hex {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberEntry {
     pub identity: EndpointId,
-    pub ip: Ipv4Addr,
     #[serde(default)]
     pub is_coordinator: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,21 +83,21 @@ pub struct MemberEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovedConfigEntry {
     pub identity: EndpointId,
-    pub ip: Ipv4Addr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
 }
 
 /// A single saved network membership.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is for tests that care about two or three fields: the struct has
+/// twenty, and spelling them all out buries what a case is actually about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Human-friendly network alias (local only, not used for discovery).
     pub name: String,
     /// Membership mode: open or restricted.
     #[serde(default)]
     pub group_mode: GroupMode,
-    /// Our assigned IP in this network (None if coordinator, Some if member).
-    pub my_ip: Option<Ipv4Addr>,
     /// Our hostname in this network (persisted so it survives daemon restarts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_hostname: Option<String>,
@@ -127,6 +119,19 @@ pub struct NetworkConfig {
     pub network_secret_key: Option<SecretKey>,
     #[serde(default)]
     pub network_public_key: Option<EndpointId>,
+    /// Hash of the last complete GroupBlob this node verified or authored.
+    /// Coordinator restore uses it only when the signed pkarr record is
+    /// unreachable, so an expired record can be republished without rebuilding
+    /// the roster from the deliberately lossy `members` config projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_group_hash: Option<blake3::Hash>,
+    /// Whether `last_group_hash` has been confirmed published. `false` marks a
+    /// locally authored generation durably stored before its pkarr write; restore
+    /// must prefer that hash over an older live record after a crash. Existing
+    /// configs default to `true` because their pointers predate this marker and
+    /// were written only by already-running publishers/reconvergence.
+    #[serde(default = "default_true")]
+    pub last_group_hash_published: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportMode>,
     /// This node auto-installs coordinator-suggested firewall rules without a
@@ -152,6 +157,21 @@ pub struct NetworkConfig {
     /// and suppress its (non-shareable) room id.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
+    /// The one peer this direct network was minted for, recorded at
+    /// `ray connect approve` time.
+    ///
+    /// Admission hands the network *secret key* to a pre-approved peer on a
+    /// direct network, because a direct link is symmetric and both ends
+    /// coordinate it. `direct` alone is a property of the network, so that rule
+    /// read as "any peer ever approved here becomes a co-coordinator", and a
+    /// later `ray requests accept` on the same network would silently give away
+    /// the key.
+    /// Naming the peer keeps the grant to the link it was meant for.
+    ///
+    /// `None` on networks minted before this field existed. See the fallback in
+    /// `admit_peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_peer: Option<EndpointId>,
     /// Peers authorized to SSH into this node over this network's mesh link
     /// (`ray firewall ssh allow <net> <peer>`). Only consulted when the global
     /// `ssh_enabled` toggle is on. Empty = no peer may SSH in.
@@ -164,8 +184,10 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
     /// Coordinator-local ephemeral policy: auto-remove a member offline
-    /// longer than this many seconds. `None` = off (default). A 1-hour floor
-    /// is enforced at the CLI. Local only (only the coordinator enforces);
+    /// longer than this many seconds. `None` = off (default). The 1-hour floor
+    /// is enforced by the settings registry (`settings::apply_network`), so it
+    /// binds every writer; the CLI's duration parser rejects it earlier only to
+    /// give a nicer message. Local only (only the coordinator enforces);
     /// never rides the signed blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_ttl_secs: Option<u64>,
@@ -206,8 +228,9 @@ fn default_true() -> bool {
 
 /// In-memory aggregate of the on-disk config. Reads assemble this from
 /// `settings.toml` (globals) + one `networks/<name>.toml` per network; writes
-/// are targeted (`save_settings` / `save_network` / `delete_network`) so a write
-/// to one network can never clobber another. See the storage section below.
+/// are targeted (`update_settings` / `save_network` / `delete_network`) so a
+/// write to one network can never clobber another. See the storage section
+/// below.
 /// A global server override (relay / discovery-DNS / DNS-upstreams). `servers`
 /// holds preset keywords (`rayfish`, `n0`) or literal URLs/IPs as the user typed
 /// them; an empty list means unset (use the iroh n0 defaults). `replace` swaps
@@ -246,7 +269,7 @@ fn validate_http_url(s: &str) -> Result<()> {
 
 /// Resolve one relay/discovery entry: the `rayfish` keyword maps to `preset`,
 /// anything else must be a valid http(s) URL (returned as-is).
-fn resolve_url_entry(entry: &str, preset: &str) -> Result<String> {
+pub(crate) fn resolve_url_entry(entry: &str, preset: &str) -> Result<String> {
     match entry {
         "rayfish" => Ok(preset.to_string()),
         other => {
@@ -276,20 +299,50 @@ pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
 /// Merge configured DNS upstreams with the system-captured ones. `replace`
 /// drops the captured set; otherwise custom upstreams are tried first, then the
 /// captured ones. Unset returns the captured set unchanged.
+///
+/// IPv4 only, and deliberately so: the captured set this merges with comes from
+/// the OS DNS backends, every one of which reads an IPv4 nameserver. A configured
+/// IPv6 entry is not dropped so much as handled elsewhere, by
+/// [`crate::exit_node::tunnel_upstreams`], which is the one caller that has a
+/// path to reach it (an IPv6-only full tunnel, where the IPv4 ones are the
+/// unreachable half).
 pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
     if o.servers.is_empty() {
         return captured;
     }
     let custom: Vec<Ipv4Addr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
     if o.replace {
+        // `dns_upstreams` takes any `IpAddr` since IPv6-only tunnels needed it, so
+        // an all-IPv6 `--replace` narrows to nothing here. Returning that empty
+        // list would leave both consumers with no server at all: the forwarder
+        // SERVFAILs every non-`.ray` name, and `control_plane_nameservers` falls
+        // back to iroh's own resolv.conf reader, which is the #111 circle. Keep
+        // the captured ones instead: the IPv6 entries are still honoured, by
+        // `exit_node::tunnel_upstreams`, which is the caller that can reach them.
+        if custom.is_empty() {
+            return captured;
+        }
         custom
     } else {
         custom.into_iter().chain(captured).collect()
     }
 }
 
+/// Whether `o` contributes anything to [`resolve_upstreams`], i.e. names at least
+/// one server the captured-upstream path can actually use.
+///
+/// Beside `resolve_upstreams` because it has to narrow the same way: this is what
+/// lets an operator's setting waive the refusal to take over `/etc/resolv.conf`
+/// with no verified upstream (`DnsConfigurator::operator_upstreams`), and waiving
+/// it on entries that then get filtered out would take the host's DNS down
+/// instead of saving it. A bare `!servers.is_empty()` was exactly that bug once
+/// `dns_upstreams` started accepting IPv6.
+pub fn has_usable_upstream(o: &ServerOverride) -> bool {
+    o.servers.iter().any(|s| s.parse::<Ipv4Addr>().is_ok())
+}
+
 /// Parse a comma list of entries (trimmed, empties dropped).
-fn parse_entries(value: &str) -> Vec<String> {
+pub(crate) fn parse_entries(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(|s| s.trim().to_string())
@@ -297,83 +350,51 @@ fn parse_entries(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
-/// the lone keyword `n0` resets the key to its default (iroh n0). Validates
-/// every entry, so a bad URL/IP or unknown preset is rejected before persist.
-/// The recognized `ray config` keys, for error messages. The list values
-/// (relay/discovery-dns/dns-upstreams) are set via `config set`; the on/off
-/// toggles (auto-update/on-demand) via their own `config` subcommands.
-const CONFIG_KEYS: &str = "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
+pub mod settings;
 
-pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
-    let entries = parse_entries(value);
-    let reset = entries.is_empty() || entries == ["n0"];
-    match key {
-        "relay" => {
-            if reset {
-                cfg.relay = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    resolve_url_entry(e, RELAY_PRESET_RAYFISH)?;
-                }
-                cfg.relay = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        "discovery-dns" => {
-            if reset {
-                cfg.discovery_dns = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    resolve_url_entry(e, DISCOVERY_PRESET_RAYFISH)?;
-                }
-                cfg.discovery_dns = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        "dns-upstreams" => {
-            if entries.is_empty() {
-                cfg.dns_upstreams = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    e.parse::<Ipv4Addr>()
-                        .with_context(|| format!("invalid IPv4 address: {e}"))?;
-                }
-                cfg.dns_upstreams = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        // On/off toggles: `set <key> on|off`, or `unset <key>` (empty value) to
-        // return to the default. `--replace` is meaningless here and ignored.
-        "auto-update" => cfg.auto_update = parse_bool_setting(value, false)?,
-        "on-demand" => cfg.on_demand = parse_bool_setting(value, true)?,
-        other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
-    }
-    Ok(())
-}
-
-/// Parse an on/off config value. An empty value (from `config unset`) resets to
-/// `default`.
-fn parse_bool_setting(value: &str, default: bool) -> Result<bool> {
-    let v = value.trim();
-    if v.is_empty() {
-        return Ok(default);
-    }
-
-    match v.to_ascii_lowercase().as_str() {
-        "on" | "true" | "yes" | "1" => Ok(true),
-        "off" | "false" | "no" | "0" => Ok(false),
-        other => anyhow::bail!("'{other}' is not a valid on/off value (use 'on' or 'off')"),
+/// A minimal saved network, for tests that need a `NetworkConfig` to apply
+/// settings to or render messages from. Every field is at its default; only the
+/// name is meaningful.
+#[cfg(test)]
+pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
+    NetworkConfig {
+        name: name.to_string(),
+        group_mode: GroupMode::Open,
+        my_hostname: None,
+        pending_hostname: None,
+        members: vec![],
+        approved: vec![],
+        network_secret_key: None,
+        network_public_key: None,
+        last_group_hash: None,
+        last_group_hash_published: true,
+        transport: None,
+        auto_accept_firewall: false,
+        auto_accept_files: true,
+        admins: vec![],
+        direct: false,
+        direct_peer: None,
+        ssh_allow: vec![],
+        aliases: BTreeMap::new(),
+        ephemeral_ttl_secs: None,
+        exit_allow: vec![],
+        exit_node_use: None,
     }
 }
 
-fn render_override(o: &ServerOverride) -> String {
+/// Apply a `ray config set`/`unset` to the in-memory config. Delegates to the
+/// settings registry; kept as a thin wrapper so existing callers don't need to
+/// know about `settings::apply_global`.
+pub fn config_set(
+    cfg: &mut AppConfig,
+    key: settings::GlobalKey,
+    value: &str,
+    replace: bool,
+) -> Result<()> {
+    settings::apply_global(cfg, key, value, replace)
+}
+
+pub(crate) fn render_override(o: &ServerOverride) -> String {
     if o.is_unset() {
         "<default>".to_string()
     } else {
@@ -382,30 +403,16 @@ fn render_override(o: &ServerOverride) -> String {
     }
 }
 
-/// Render config settings as `(key, value)` rows for `ray config get`. With a
-/// key, returns just that one (error on unknown key); without, all three.
-pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
-    let on_off = |v: bool| if v { "on" } else { "off" }.to_string();
-    let row = |k: &str| -> Result<(String, String)> {
-        let v = match k {
-            "relay" => render_override(&cfg.relay),
-            "discovery-dns" => render_override(&cfg.discovery_dns),
-            "dns-upstreams" => render_override(&cfg.dns_upstreams),
-            "auto-update" => on_off(cfg.auto_update),
-            "on-demand" => on_off(cfg.on_demand),
-            other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
-        };
-        Ok((k.to_string(), v))
-    };
+/// Render global settings as `(key, value)` rows for `ray config get`. With a
+/// key, returns just that one; without, every global key. Driven off
+/// `GlobalKey::ALL` rather than a hand-kept list, so a new key shows up here
+/// the moment it exists instead of being silently unlistable.
+pub fn config_get(cfg: &AppConfig, key: Option<settings::GlobalKey>) -> Vec<(String, String)> {
+    use settings::GlobalKey;
+    let row = |k: GlobalKey| (k.name().to_string(), settings::render_global(cfg, k));
     match key {
-        Some(k) => Ok(vec![row(k)?]),
-        None => Ok(vec![
-            row("relay")?,
-            row("discovery-dns")?,
-            row("dns-upstreams")?,
-            row("auto-update")?,
-            row("on-demand")?,
-        ]),
+        Some(k) => vec![row(k)],
+        None => GlobalKey::ALL.iter().copied().map(row).collect(),
     }
 }
 
@@ -454,6 +461,13 @@ pub struct AppConfig {
     /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
     #[serde(default)]
     pub ssh_enabled: bool,
+    /// Global toggle for bridging this host's IPv4-only listeners onto the mesh
+    /// address (`ray config set v4-bridge off`). On by default: the mesh
+    /// firewall still denies inbound by default, so the only ports it changes
+    /// are ones a rule already opened and which silently did not answer. See
+    /// `crate::v4bridge`.
+    #[serde(default = "default_true")]
+    pub v4_bridge: bool,
     /// On-demand connection mode (battery-minimizing, Tailscale-style). When on,
     /// the node does not eagerly dial peers at startup: it restores memberships and
     /// the roster locally, dials a peer lazily on the first outgoing packet that
@@ -469,7 +483,7 @@ pub struct AppConfig {
     pub idle_timeout_secs: Option<u64>,
     /// Opt-in automatic updates: when on, the daemon periodically checks for a
     /// newer stable release, swaps the binary, and restarts itself onto it. Off
-    /// by default; enable via `ray install --auto-update` or `ray auto-update on`.
+    /// by default; enable via `ray install --auto-update` or `ray config set auto-update on`.
     #[serde(default)]
     pub auto_update: bool,
     /// Last release tag the auto-updater attempted (e.g. `v0.2.0`). Persisted so a
@@ -520,6 +534,7 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
+            v4_bridge: true,
             on_demand: true,
             idle_timeout_secs: None,
             auto_update: false,
@@ -595,6 +610,49 @@ const LEGACY_FILE: &str = "networks.toml";
 const SETTINGS_FILE: &str = "settings.toml";
 const NETWORKS_SUBDIR: &str = "networks";
 
+/// Process-wide transaction boundary for network shards. Public per-network
+/// reads take a shared guard; save, update, migration, and delete take an
+/// exclusive guard so a stale whole-file write cannot overwrite another task's
+/// fields or resurrect a deleted network.
+static NETWORK_CONFIG_LOCK: RwLock<()> = RwLock::new(());
+
+thread_local! {
+    /// Tripwire for the non-reentrant update callback contract. The process
+    /// lock deliberately remains the real transaction boundary.
+    static IN_NETWORK_CONFIG_UPDATE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct NetworkUpdateScope;
+
+impl NetworkUpdateScope {
+    fn enter() -> Result<Self> {
+        IN_NETWORK_CONFIG_UPDATE.with(|active| {
+            anyhow::ensure!(
+                !active.get(),
+                "network config update callbacks must not call network config APIs"
+            );
+            active.set(true);
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for NetworkUpdateScope {
+    fn drop(&mut self) {
+        IN_NETWORK_CONFIG_UPDATE.with(|active| active.set(false));
+    }
+}
+
+fn ensure_not_in_network_update() -> Result<()> {
+    IN_NETWORK_CONFIG_UPDATE.with(|active| {
+        anyhow::ensure!(
+            !active.get(),
+            "network config update callbacks must not call network config APIs"
+        );
+        Ok(())
+    })
+}
+
 /// Globals persisted to `settings.toml` (everything in [`AppConfig`] except the
 /// per-network entries, which live in their own files).
 ///
@@ -619,6 +677,8 @@ struct Settings {
     dns_upstreams: ServerOverride,
     #[serde(default)]
     ssh_enabled: bool,
+    #[serde(default = "default_true")]
+    v4_bridge: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -701,8 +761,97 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// common shell accident and must not resolve the config tree to the current
 /// directory. Split out from [`config_dir`] so it is testable without touching
 /// the real platform path.
-fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+fn config_dir_override(raw: Option<OsString>) -> Option<PathBuf> {
     raw.filter(|d| !d.is_empty()).map(PathBuf::from)
+}
+
+/// Config directory published by an embedder rather than by the environment.
+///
+/// `ray-mobile`'s `Node::new` passes Android's `Context.getFilesDir()` here. It
+/// used to write that path into `RAYFISH_CONFIG_DIR` instead, which is a
+/// mutation of the process environment: undefined behaviour once any other
+/// thread is running, and in the lib tests it redirected a concurrent test's
+/// config reads between its own write and read. The directory is fixed for the
+/// life of the process, so a process-wide cell holds it without threading a
+/// handle through every [`config_dir`] caller (as `dht::PKARR_OVERRIDE` does
+/// for the discovery server).
+static CONFIG_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Point every config read at `dir`, ahead of `RAYFISH_CONFIG_DIR`.
+///
+/// For embedders that know their config location at startup; the CLI and the
+/// daemon use the environment variable. Must run before any config or identity
+/// read, and takes precedence because the environment write it replaces did.
+pub fn set_config_dir_override(dir: PathBuf) {
+    *CONFIG_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(dir);
+}
+
+/// Pick between the two override sources: the embedder's first, then the
+/// environment's. `None` means the platform default applies, and an empty path
+/// from either source is "no override" rather than the current directory.
+///
+/// Split out from [`effective_override`], the way [`config_dir_override`] is
+/// split out of [`config_dir`], so the precedence is testable without mutating
+/// the process environment (which is what this whole override exists to avoid).
+fn resolve_override(embedder: Option<PathBuf>, env: Option<OsString>) -> Option<PathBuf> {
+    embedder
+        .filter(|d| !d.as_os_str().is_empty())
+        .or_else(|| config_dir_override(env))
+}
+
+/// The override in effect: the embedder's [`set_config_dir_override`] first,
+/// then `RAYFISH_CONFIG_DIR`. `None` means the platform default applies.
+fn effective_override() -> Option<PathBuf> {
+    resolve_override(
+        CONFIG_DIR_OVERRIDE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        std::env::var_os("RAYFISH_CONFIG_DIR"),
+    )
+}
+
+/// The platform's config location, before the `RAYFISH_CONFIG_DIR` override and
+/// without creating anything.
+///
+/// This is always the *daemon's* directory, never the calling process's. macOS
+/// is where the difference bites: the daemon runs as root under launchd, so its
+/// config lives under `/var/root`, and resolving `dirs::config_dir()` in an
+/// unprivileged `ray` would name an empty directory in that user's home instead
+/// (and, through [`config_dir`], create it).
+fn platform_config_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let dir = PathBuf::from("/etc/rayfish");
+    #[cfg(target_os = "freebsd")]
+    let dir = PathBuf::from("/usr/local/etc/rayfish");
+    // Android without the override falls back to a fixed app-private path so the
+    // library still compiles/runs standalone.
+    #[cfg(target_os = "android")]
+    let dir = PathBuf::from("/data/local/tmp/rayfish");
+    #[cfg(target_os = "macos")]
+    let dir = PathBuf::from("/var/root/Library/Application Support/rayfish");
+    // Machine-wide, for the same reason macOS is: the daemon is a LocalSystem
+    // service, and `dirs::config_dir()` would name that account's roaming
+    // profile under `C:\Windows\system32\config\systemprofile` for the daemon
+    // and the operator's own `%APPDATA%` for `ray`.
+    #[cfg(target_os = "windows")]
+    let dir = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("rayfish");
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
+    let dir = dirs::config_dir()
+        .context("could not determine config directory")?
+        .join("rayfish");
+    Ok(dir)
 }
 
 /// Base directory for all rayfish config + state. Created if missing.
@@ -714,38 +863,32 @@ fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
 ///
 /// Platform defaults: Linux `/etc/rayfish` (system service location,
 /// root:rayfish), FreeBSD `/usr/local/etc/rayfish`, macOS the daemon's
-/// `~/.config/rayfish` (root-only under `/var/root`), Android the app's
-/// `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through this
-/// same var).
+/// `/var/root/Library/Application Support/rayfish` (root-only; under launchd
+/// root's home is `/var/root`, not the home of whoever ran `sudo`), Android the
+/// app's `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through
+/// [`set_config_dir_override`], which outranks the variable).
+///
+/// Use [`config_dir_for_read`] from anything that only reads: creating the tree
+/// is the daemon's job, and a reader that does it can end up reporting the
+/// directory it just made as the daemon's config.
 pub fn config_dir() -> Result<PathBuf> {
-    if let Some(dir) = config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")) {
-        ensure_dir(&dir)?;
-        return Ok(dir);
-    }
-    #[cfg(target_os = "linux")]
-    let dir = PathBuf::from("/etc/rayfish");
-    #[cfg(target_os = "freebsd")]
-    let dir = PathBuf::from("/usr/local/etc/rayfish");
-    // Android without the override falls back to a fixed app-private path so the
-    // library still compiles/runs standalone.
-    #[cfg(target_os = "android")]
-    let dir = PathBuf::from("/data/local/tmp/rayfish");
-    #[cfg(target_os = "windows")]
-    let dir = std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::data_dir().unwrap_or_else(|| PathBuf::from(r"C:\ProgramData")))
-        .join("rayfish");
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows"
-    )))]
-    let dir = dirs::config_dir()
-        .context("could not determine config directory")?
-        .join("rayfish");
+    let dir = match effective_override() {
+        Some(dir) => dir,
+        None => platform_config_dir()?,
+    };
     ensure_dir(&dir)?;
     Ok(dir)
+}
+
+/// [`config_dir`] for a reader: same directory, never created.
+///
+/// A missing directory is not an error here — it reads as an empty config, which
+/// is what a reader wants to say about a daemon that has saved nothing.
+pub fn config_dir_for_read() -> Result<PathBuf> {
+    match effective_override() {
+        Some(dir) => Ok(dir),
+        None => platform_config_dir(),
+    }
 }
 
 #[cfg(windows)]
@@ -873,53 +1016,125 @@ fn validate_net_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Atomically write `bytes` to `path`: write a sibling temp file, set its
-/// perms/owner, then rename over the target. The rename is atomic on POSIX, so
-/// a concurrent reader sees either the old file or the new one, never a torn
-/// one. `secret` selects 0600 root:root vs 0640 root:rayfish.
+/// Serial number for temp file names, so two writers in this process never
+/// share one. See [`write_file`].
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Re-establish the durability barrier for a file already in place: fsync the
+/// file, then the directory entry naming it. A [`write_file`] that failed
+/// ambiguously may have installed the bytes anyway, so a no-op retry still has
+/// to prove the result is on disk before anything is allowed to point at it.
+fn sync_file_and_parent(path: &Path) -> Result<()> {
+    let dir = path.parent().context("config path has no parent")?;
+    std::fs::File::open(path)
+        .with_context(|| format!("opening {} to sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing {}", path.display()))?;
+    sync_dir(dir)
+}
+
+/// Atomically and durably write `bytes` to `path`: write a sibling temp file,
+/// set its perms/owner, then rename over the target. The rename is atomic on
+/// POSIX, so a concurrent reader sees either the old file or the new one, never
+/// a torn one. `secret` selects 0600 root:root vs 0640 root:rayfish.
+///
+/// Returning `Ok` means the bytes are on disk and reachable under `path` after
+/// a power loss, not just in the page cache: the contents are fsynced before
+/// the rename and the directory entry after it, and a failure of either is an
+/// error rather than a shrug. Callers that persist a pointer to something else
+/// (the coordinator recovery hash) depend on that barrier being exact.
 ///
 /// Public so every rayfish config writer (identity key, invite ledger, etc.)
 /// shares the same atomic + restrictive-perms guarantees under the config tree.
 pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
-    #[cfg(windows)]
-    let _ = secret;
     let dir = path.parent().context("config path has no parent")?;
     ensure_dir(dir)?;
     let fname = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config");
+    // The pid keeps two processes apart and the counter keeps two threads of
+    // this one apart. A temp path shared by two writers of the same file lets
+    // one rename a file the other has only half filled.
+    //
+    // Windows uses a random nonce instead: the stage file is created with
+    // `CREATE_NEW` and an explicit DACL, so an unpredictable name means nothing
+    // can be sitting on the path we are about to claim.
     #[cfg(windows)]
     let tmp = windows_config_stage_path(dir, fname);
     #[cfg(not(windows))]
-    let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
+    let tmp = {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()))
+    };
+    let staged = stage_temp(&tmp, bytes, secret).and_then(|()| {
+        // Refuse to rename over something that is not a plain file we own: on
+        // Windows the target could have been swapped for a reparse point
+        // between the last write and this one.
+        #[cfg(all(windows, not(test)))]
+        validate_existing_windows_config_child(path)?;
+        std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
+    });
+    if staged.is_err() {
+        // Clean up on any failure so we don't litter: the temp path is ours
+        // alone, so nothing else can be waiting on it.
+        let _ = std::fs::remove_file(&tmp);
+        return staged;
+    }
+    sync_dir(dir)
+}
+
+/// Fill `tmp` with `bytes` and give it the target's perms/owner, leaving it
+/// ready to rename into place.
+fn stage_temp(tmp: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     {
         use std::io::Write;
         #[cfg(windows)]
-        let mut f = create_windows_config_stage(&tmp)?;
+        let mut f = create_windows_config_stage(tmp)?;
         #[cfg(not(windows))]
         let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all().ok();
+        // Discarding this used to report a write as saved while the bytes were
+        // still only in the page cache, so a crash could roll the file back to
+        // its previous contents with nothing having failed.
+        f.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
     }
+    // Windows has no mode bits to set here. `create_windows_config_stage` gave
+    // the file an explicit SYSTEM + Administrators DACL with inheritance off at
+    // creation, which is stricter than either Unix mode, so `secret` has
+    // nothing left to select between.
+    #[cfg(windows)]
+    let _ = secret;
     #[cfg(unix)]
     {
         let mode = if secret { 0o600 } else { 0o640 };
-        let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
+        let _ = std::fs::set_permissions(tmp, Permissions::from_mode(mode));
     }
     #[cfg(target_os = "linux")]
-    set_owner(&tmp, secret);
-    #[cfg(all(windows, not(test)))]
-    validate_existing_windows_config_child(path)?;
-    let renamed = std::fs::rename(&tmp, path);
-    if renamed.is_err() {
-        // Clean up the temp file on a failed rename so we don't litter.
-        let _ = std::fs::remove_file(&tmp);
-    }
-    renamed.with_context(|| format!("renaming into {}", path.display()))?;
+    set_owner(tmp, secret);
     Ok(())
+}
+
+/// fsync a directory, so a rename into it survives a power loss. Without this
+/// the new file's contents are durable but the name is not, and the target can
+/// come back as the old file or as nothing at all.
+fn sync_dir(dir: &Path) -> Result<()> {
+    // Windows has no equivalent: a directory cannot be opened as a file for the
+    // flush, and there is no API that commits a rename the way fsync does. The
+    // stage file's own `sync_all` is the whole barrier available there.
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    std::fs::File::open(dir)
+        .with_context(|| format!("opening {} to sync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing {}", dir.display()))
 }
 
 #[cfg(windows)]
@@ -982,15 +1197,15 @@ pub fn restrict_perms(path: &Path, secret: bool) {
 /// everything under the daemon's `~/.config/rayfish` (i.e. `/root/.config`); this
 /// moves `secret_key`, `networks.toml`, `firewall.toml`, `invites/`, etc. over so
 /// the node keeps its identity and networks. No-op on macOS (location unchanged)
-/// and once `/etc/rayfish` is populated, and skipped entirely when
-/// `RAYFISH_CONFIG_DIR` is set. Must run before any config/identity read
+/// and once `/etc/rayfish` is populated, and skipped entirely when the config
+/// location is set explicitly. Must run before any config/identity read
 /// (called at the top of `build_daemon`).
 pub fn migrate_location() {
     #[cfg(target_os = "linux")]
     {
-        // An explicit `RAYFISH_CONFIG_DIR` is a deliberate location, not an
-        // upgrade in progress: never pull `/root/.config/rayfish` into it.
-        if config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")).is_some() {
+        // An explicit config location (env var or embedder) is deliberate, not
+        // an upgrade in progress: never pull `/root/.config/rayfish` into it.
+        if effective_override().is_some() {
             return;
         }
         let Ok(new) = config_dir() else { return };
@@ -1052,7 +1267,7 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
 
     save_settings_in(dir, &old)?;
     for net in &old.networks {
-        save_network_in(dir, net)?;
+        save_network_unlocked(dir, net)?;
     }
 
     let bak = dir.join("networks.toml.bak");
@@ -1066,9 +1281,29 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
 /// Returns a default config if nothing is stored yet. Runs the legacy migration
 /// on first call after an upgrade.
 pub fn load() -> Result<AppConfig> {
+    ensure_not_in_network_update()?;
     let dir = config_dir()?;
-    migrate_legacy(&dir)?;
+    {
+        let _guard = NETWORK_CONFIG_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        migrate_legacy(&dir)?;
+    }
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     load_in(&dir)
+}
+
+/// [`load`] for a process that only reads the daemon's config (the CLI when the
+/// daemon is down). Creates nothing and runs no migration; a config tree that
+/// isn't there, or isn't readable by this user, reads as an empty config.
+pub fn load_for_read() -> Result<AppConfig> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_in(&config_dir_for_read()?)
 }
 
 fn load_in(dir: &Path) -> Result<AppConfig> {
@@ -1118,6 +1353,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
+        v4_bridge: settings.v4_bridge,
         on_demand: settings.on_demand,
         idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
@@ -1132,12 +1368,49 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
     })
 }
 
-/// Persist the global settings (`settings.toml`) only. Does not touch networks.
-pub fn save_settings(config: &AppConfig) -> Result<()> {
-    save_settings_in(&config_dir()?, config)
+/// Atomically load, synchronously mutate, and save the globals. The read and the
+/// write happen under one exclusive guard, so two tasks changing different
+/// globals cannot lose each other's field the way a `load` + `save_settings`
+/// pair does. Returns the saved config.
+///
+/// Same contract as [`update_network`]: the callback must not call another
+/// config API, and the guard is deliberately never held across an await.
+pub fn update_settings(update: impl FnOnce(&mut AppConfig) -> Result<()>) -> Result<AppConfig> {
+    update_settings_in(&config_dir()?, update)
+}
+
+fn update_settings_in(
+    dir: &Path,
+    update: impl FnOnce(&mut AppConfig) -> Result<()>,
+) -> Result<AppConfig> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut config = load_in(dir)?;
+    let before = settings_toml(&config)?;
+    let update_scope = NetworkUpdateScope::enter()?;
+    let applied = update(&mut config);
+    drop(update_scope);
+    applied?;
+    // A callback that decided there was nothing to do must not cost a write:
+    // every save fsyncs the file and its directory entry.
+    if settings_toml(&config)? != before {
+        save_settings_in(dir, &config)?;
+    }
+    Ok(config)
 }
 
 fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
+    let path = dir.join(SETTINGS_FILE);
+    let contents = settings_toml(config)?;
+    // Secret-bearing: holds the contact key.
+    write_atomic(&path, &contents, true)
+}
+
+/// The `settings.toml` projection of `config`, serialized. Also the change
+/// detector for [`update_settings`]: identical text means nothing to write.
+fn settings_toml(config: &AppConfig) -> Result<String> {
     let settings = Settings {
         mdns_enabled: config.mdns_enabled,
         operator_uid: config.operator_uid,
@@ -1147,6 +1420,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
+        v4_bridge: config.v4_bridge,
         on_demand: config.on_demand,
         idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,
@@ -1158,10 +1432,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         cert_generation: config.cert_generation,
         revoked_devices: config.revoked_devices.clone(),
     };
-    let path = dir.join(SETTINGS_FILE);
-    let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
-    // Secret-bearing: holds the contact key.
-    write_atomic(&path, &contents, true)
+    toml::to_string_pretty(&settings).context("serializing settings")
 }
 
 /// Record a queued join so its background retry survives a daemon restart.
@@ -1200,13 +1471,19 @@ fn remove_pending_join_in(dir: &Path, network_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist a single network to `networks/<name>.toml`. Touches only that file,
-/// so concurrent saves of distinct networks can never clobber one another.
+/// Persist a single network to `networks/<name>.toml`. Direct full-record
+/// writes share the same transaction boundary as updates and deletes.
 pub fn save_network(net: &NetworkConfig) -> Result<()> {
-    save_network_in(&config_dir()?, net)
+    ensure_not_in_network_update()?;
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    save_network_unlocked(&dir, net)
 }
 
-fn save_network_in(dir: &Path, net: &NetworkConfig) -> Result<()> {
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn save_network_unlocked(dir: &Path, net: &NetworkConfig) -> Result<()> {
     validate_net_name(&net.name)?;
     let ndir = dir.join(NETWORKS_SUBDIR);
     let path = ndir.join(format!("{}.toml", net.name));
@@ -1217,10 +1494,16 @@ fn save_network_in(dir: &Path, net: &NetworkConfig) -> Result<()> {
 
 /// Load a single network's config, if present.
 pub fn load_network(name: &str) -> Result<Option<NetworkConfig>> {
-    load_network_in(&config_dir()?, name)
+    ensure_not_in_network_update()?;
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_network_unlocked(&dir, name)
 }
 
-fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn load_network_unlocked(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     validate_net_name(name)?;
     let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
     if !path.exists() {
@@ -1233,12 +1516,113 @@ fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     ))
 }
 
-/// Delete a single network's config file. Returns true if it existed.
-pub fn delete_network(name: &str) -> Result<bool> {
-    delete_network_in(&config_dir()?, name)
+/// Atomically load, synchronously mutate, and save an existing network's latest
+/// config. The callback must not call another network-config API; the lock is
+/// deliberately never held across an await. Returns `None` when the network was
+/// deleted or never existed.
+pub fn update_network(
+    name: &str,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<Option<NetworkConfig>> {
+    update_network_in(&config_dir()?, name, update)
 }
 
-fn delete_network_in(dir: &Path, name: &str) -> Result<bool> {
+fn update_network_in(
+    dir: &Path,
+    name: &str,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<Option<NetworkConfig>> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut net) = load_network_unlocked(dir, name)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(&net).context("serializing network config")?;
+    let update_scope = NetworkUpdateScope::enter()?;
+    update(&mut net)?;
+    drop(update_scope);
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(&net).context("serializing network config")?;
+    if after != before {
+        save_network_unlocked(dir, &net)?;
+    } else {
+        // A prior atomic write may have installed this exact file and then
+        // reported an ambiguous parent-directory sync failure. A no-op retry is
+        // still a durability barrier, not merely a serialization optimization.
+        let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
+        sync_file_and_parent(&path)?;
+    }
+    Ok(Some(net))
+}
+
+/// Atomically update the latest network config, inserting `initial` only when
+/// the network is absent. This is the fresh-join counterpart to
+/// [`update_network`]; existing node-local fields remain available to `update`.
+pub fn update_network_or_insert(
+    name: &str,
+    initial: NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<NetworkConfig> {
+    update_network_or_insert_in(&config_dir()?, name, initial, update)
+}
+
+fn update_network_or_insert_in(
+    dir: &Path,
+    name: &str,
+    initial: NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<NetworkConfig> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let existing = load_network_unlocked(dir, name)?;
+    let inserting = existing.is_none();
+    let mut net = existing.unwrap_or(initial);
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(&net).context("serializing network config")?;
+    let update_scope = NetworkUpdateScope::enter()?;
+    update(&mut net)?;
+    drop(update_scope);
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(&net).context("serializing network config")?;
+    if inserting || after != before {
+        save_network_unlocked(dir, &net)?;
+    }
+    Ok(net)
+}
+
+/// Delete a single network's config file. Returns true if it existed.
+pub fn delete_network(name: &str) -> Result<bool> {
+    ensure_not_in_network_update()?;
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    delete_network_unlocked(&dir, name)
+}
+
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn delete_network_unlocked(dir: &Path, name: &str) -> Result<bool> {
     validate_net_name(name)?;
     let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
     match std::fs::remove_file(&path) {
@@ -1270,12 +1654,53 @@ pub fn remove_network(config: &mut AppConfig, name: &str) -> bool {
 /// run on parallel threads. Shared across test modules (`identity`, `daemon`)
 /// so none of them observe a `RAYFISH_CONFIG_DIR` value set by a concurrent test.
 #[cfg(test)]
-pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use iroh::EndpointId;
+
+    /// `ray-mobile` used to publish its config directory by writing
+    /// `RAYFISH_CONFIG_DIR`, which mutates the process environment and so is
+    /// undefined behaviour once other threads run. The embedder override
+    /// replaces that write, so it has to win over the variable the way the
+    /// overwrite did. `ray-mobile`'s own tests cover the wiring end to end;
+    /// this is the precedence on its own, with nothing global touched.
+    #[test]
+    fn the_embedder_override_beats_the_env_var() {
+        let from_env = OsString::from("/srv/rayfish-from-env");
+        let from_code = PathBuf::from("/srv/rayfish-from-code");
+
+        assert_eq!(
+            resolve_override(None, Some(from_env.clone())),
+            Some(PathBuf::from("/srv/rayfish-from-env"))
+        );
+        assert_eq!(
+            resolve_override(Some(from_code.clone()), Some(from_env)),
+            Some(from_code.clone())
+        );
+        // Still in effect with no variable at all: the platform default is what
+        // the override exists to displace on Android.
+        assert_eq!(
+            resolve_override(Some(from_code.clone()), None),
+            Some(from_code)
+        );
+        assert_eq!(resolve_override(None, None), None);
+    }
+
+    /// An embedder handing over an empty path is the same accident the env var
+    /// already guards against, and must not resolve config to the process's
+    /// current directory. It falls through to the variable, then the default.
+    #[test]
+    fn an_empty_embedder_override_is_no_override() {
+        assert_eq!(resolve_override(Some(PathBuf::new()), None), None);
+        assert_eq!(
+            resolve_override(Some(PathBuf::new()), Some(OsString::from("/srv/rayfish"))),
+            Some(PathBuf::from("/srv/rayfish"))
+        );
+    }
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -1283,10 +1708,20 @@ mod tests {
         SecretKey::from(key_bytes).public()
     }
 
+    /// A bare `ray config get` used to print a hand-kept list of five keys, so a
+    /// new setting was reachable but invisible. It now lists the whole enum.
+    #[test]
+    fn the_bare_listing_covers_every_global_key() {
+        let rows = config_get(&AppConfig::default(), None);
+        let names: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        for k in settings::GlobalKey::ALL {
+            assert!(names.contains(&k.name()), "{} not listed", k.name());
+        }
+        assert_eq!(rows.len(), settings::GlobalKey::ALL.len());
+    }
+
     #[test]
     fn config_dir_override_ignores_unset_and_empty() {
-        use std::ffi::OsString;
-
         assert_eq!(config_dir_override(None), None);
         // An exported-but-empty var must not resolve the tree to `""` (which
         // `create_dir_all` would reject) or to the process's cwd.
@@ -1320,17 +1755,14 @@ mod tests {
                 NetworkConfig {
                     name: "gaming".to_string(),
                     group_mode: GroupMode::Open,
-                    my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                     members: vec![
                         MemberEntry {
                             identity: test_id(2),
-                            ip: Ipv4Addr::new(100, 64, 5, 3),
                             is_coordinator: true,
                             hostname: None,
                         },
                         MemberEntry {
                             identity: test_id(3),
-                            ip: Ipv4Addr::new(100, 64, 10, 5),
                             is_coordinator: false,
                             hostname: None,
                         },
@@ -1338,6 +1770,8 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1345,6 +1779,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1354,11 +1789,12 @@ mod tests {
                 NetworkConfig {
                     name: "work".to_string(),
                     group_mode: GroupMode::Restricted,
-                    my_ip: None,
                     members: vec![],
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1366,6 +1802,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1396,11 +1833,12 @@ mod tests {
         let net = NetworkConfig {
             name: "test".to_string(),
             group_mode: GroupMode::Open,
-            my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            last_group_hash: None,
+            last_group_hash_published: true,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1408,6 +1846,7 @@ mod tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -1426,11 +1865,12 @@ mod tests {
             networks: vec![NetworkConfig {
                 name: "test".to_string(),
                 group_mode: GroupMode::Restricted,
-                my_ip: None,
                 members: vec![],
                 approved: vec![],
                 network_secret_key: None,
                 network_public_key: None,
+                last_group_hash: None,
+                last_group_hash_published: true,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1438,6 +1878,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1449,11 +1890,12 @@ mod tests {
         let updated = NetworkConfig {
             name: "test".to_string(),
             group_mode: GroupMode::Open,
-            my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            last_group_hash: None,
+            last_group_hash_published: true,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1461,6 +1903,7 @@ mod tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -1470,10 +1913,6 @@ mod tests {
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.networks[0].group_mode, GroupMode::Open);
-        assert_eq!(
-            config.networks[0].my_ip,
-            Some(Ipv4Addr::new(100, 64, 10, 5))
-        );
     }
 
     #[test]
@@ -1483,11 +1922,12 @@ mod tests {
                 NetworkConfig {
                     name: "keep".to_string(),
                     group_mode: GroupMode::Restricted,
-                    my_ip: None,
                     members: vec![],
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1495,6 +1935,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1504,11 +1945,12 @@ mod tests {
                 NetworkConfig {
                     name: "remove-me".to_string(),
                     group_mode: GroupMode::Restricted,
-                    my_ip: None,
                     members: vec![],
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1516,6 +1958,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1544,20 +1987,19 @@ mod tests {
             networks: vec![NetworkConfig {
                 name: "gaming".to_string(),
                 group_mode: GroupMode::Restricted,
-                my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                 members: vec![MemberEntry {
                     identity: id1,
-                    ip: Ipv4Addr::new(100, 64, 5, 3),
                     is_coordinator: true,
                     hostname: None,
                 }],
                 approved: vec![ApprovedConfigEntry {
                     identity: id2,
-                    ip: Ipv4Addr::new(100, 64, 12, 34),
                     hostname: None,
                 }],
                 network_secret_key: None,
                 network_public_key: None,
+                last_group_hash: None,
+                last_group_hash_published: true,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1565,6 +2007,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1587,11 +2030,12 @@ mod tests {
             networks: vec![NetworkConfig {
                 name: "gaming".to_string(),
                 group_mode: GroupMode::Restricted,
-                my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                 members: vec![],
                 approved: vec![],
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
+                last_group_hash: None,
+                last_group_hash_published: true,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1599,6 +2043,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1637,7 +2082,7 @@ mod tests {
     fn test_direct_flag_default_false() {
         let toml_str = r#"
 [[networks]]
-name = "dario-alice"
+name = "team-alice"
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.networks[0].direct);
@@ -1671,22 +2116,40 @@ name = "test"
         assert_eq!(minimal.ephemeral_ttl_secs, None);
     }
 
+    #[test]
+    fn last_group_hash_roundtrips_and_defaults_none() {
+        let hash = blake3::hash(b"complete signed roster");
+        let mut n = net("cached");
+        n.last_group_hash = Some(hash);
+        n.last_group_hash_published = false;
+        let text = toml::to_string(&n).unwrap();
+        let back: NetworkConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.last_group_hash, Some(hash));
+        assert!(!back.last_group_hash_published);
+
+        let minimal: NetworkConfig = toml::from_str("name = \"x\"").unwrap();
+        assert_eq!(minimal.last_group_hash, None);
+        assert!(minimal.last_group_hash_published);
+    }
+
     fn net(name: &str) -> NetworkConfig {
         NetworkConfig {
             name: name.to_string(),
             group_mode: GroupMode::Restricted,
-            my_ip: None,
             my_hostname: None,
             pending_hostname: None,
             members: vec![],
             approved: vec![],
             network_secret_key: Some(SecretKey::generate()),
             network_public_key: None,
+            last_group_hash: None,
+            last_group_hash_published: true,
             transport: None,
             auto_accept_firewall: false,
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -1700,12 +2163,12 @@ name = "test"
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        save_network_in(dir, &net("homelab")).unwrap();
-        save_network_in(dir, &net("genesis")).unwrap();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+        save_network_unlocked(dir, &net("genesis")).unwrap();
         save_settings_in(
             dir,
             &AppConfig {
-                default_hostname: Some("dario".into()),
+                default_hostname: Some("laptop".into()),
                 ..Default::default()
             },
         )
@@ -1713,15 +2176,15 @@ name = "test"
 
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.networks.len(), 2);
-        assert_eq!(loaded.default_hostname.as_deref(), Some("dario"));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Single-network load.
-        assert!(load_network_in(dir, "homelab").unwrap().is_some());
-        assert!(load_network_in(dir, "absent").unwrap().is_none());
+        assert!(load_network_unlocked(dir, "homelab").unwrap().is_some());
+        assert!(load_network_unlocked(dir, "absent").unwrap().is_none());
 
         // Deleting one leaves the other untouched.
-        assert!(delete_network_in(dir, "homelab").unwrap());
-        assert!(!delete_network_in(dir, "homelab").unwrap());
+        assert!(delete_network_unlocked(dir, "homelab").unwrap());
+        assert!(!delete_network_unlocked(dir, "homelab").unwrap());
         let after = load_in(dir).unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].name, "genesis");
@@ -1743,6 +2206,23 @@ name = "test"
         assert_eq!(loaded.download_user, Some(1000));
     }
 
+    /// The IPv6-only cutover deleted the `ipv6-only` setting, and the release
+    /// notes promise a `settings.toml` still carrying it upgrades rather than
+    /// failing to parse. Nothing in `Settings` names the key any more, so what
+    /// keeps that promise is the absence of `deny_unknown_fields`, which is
+    /// exactly the kind of thing a later tidy-up adds without noticing.
+    #[test]
+    fn a_stale_ipv6_only_key_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(SETTINGS_FILE),
+            "mdns_enabled = false\nipv6_only = true\n",
+        )
+        .unwrap();
+        let loaded = load_in(tmp.path()).expect("a settings.toml from an older build still loads");
+        assert!(!loaded.mdns_enabled, "the keys we do know are still read");
+    }
+
     #[test]
     fn settings_download_fields_default_none() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1761,8 +2241,8 @@ name = "test"
         let mut n = net("homelab");
         n.aliases.insert("alice".into(), "id-alice".into());
         n.aliases.insert("bob".into(), "id-bob".into());
-        save_network_in(dir, &n).unwrap();
-        let loaded = load_network_in(dir, "homelab").unwrap().unwrap();
+        save_network_unlocked(dir, &n).unwrap();
+        let loaded = load_network_unlocked(dir, "homelab").unwrap().unwrap();
         assert_eq!(
             loaded.aliases.get("alice").map(String::as_str),
             Some("id-alice")
@@ -1888,29 +2368,107 @@ name = "test"
         assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
     }
 
+    /// `dns-upstreams` takes IPv6 since the IPv6-only tunnel needed it, so an
+    /// all-IPv6 `--replace` narrows to nothing here. Returning that empty list
+    /// would leave the forwarder with no server and hand `control_plane_nameservers`
+    /// an empty set, putting the endpoint back on iroh's resolv.conf reader (#111).
     #[test]
-    fn config_set_unknown_key_errors() {
-        let mut cfg = AppConfig::default();
-        assert!(config_set(&mut cfg, "bogus", "rayfish", false).is_err());
-        assert!(config_get(&cfg, Some("bogus")).is_err());
+    fn replace_with_only_ipv6_keeps_the_captured_upstreams() {
+        let captured = vec![Ipv4Addr::new(192, 168, 1, 1)];
+        let v6_only = ServerOverride {
+            servers: vec!["2606:4700:4700::1111".into()],
+            replace: true,
+        };
+        assert_eq!(resolve_upstreams(&v6_only, captured.clone()), captured);
+
+        // One usable IPv4 entry and `replace` still means replace: the guard is
+        // for "nothing survived the narrowing", not "some entries were dropped".
+        let mixed = ServerOverride {
+            servers: vec!["2606:4700:4700::1111".into(), "1.1.1.1".into()],
+            replace: true,
+        };
+        assert_eq!(
+            resolve_upstreams(&mixed, captured),
+            vec![Ipv4Addr::new(1, 1, 1, 1)]
+        );
+    }
+
+    /// `has_usable_upstream` has to agree with what `resolve_upstreams` keeps.
+    ///
+    /// It waives the refusal to take over `/etc/resolv.conf` with no verified
+    /// upstream of our own. Answering yes on a setting that then narrows to
+    /// nothing would take the file, install the re-assert watcher, and leave the
+    /// forwarder with an empty list: the host loses every name outside `.ray`,
+    /// and repairing the file by hand is undone by the watcher. That is worse
+    /// than the refusal it bypassed, so the two must not disagree.
+    #[test]
+    fn only_a_usable_upstream_waives_the_takeover_guard() {
+        let captured: Vec<Ipv4Addr> = Vec::new();
+        for (servers, usable) in [
+            (vec!["2606:4700:4700::1111"], false),
+            (vec!["2606:4700:4700::1111", "2001:4860:4860::8888"], false),
+            (vec!["1.1.1.1"], true),
+            (vec!["2606:4700:4700::1111", "1.1.1.1"], true),
+            (vec!["not-an-address"], false),
+            (vec![], false),
+        ] {
+            for replace in [false, true] {
+                let o = ServerOverride {
+                    servers: servers.iter().map(|s| s.to_string()).collect(),
+                    replace,
+                };
+                assert_eq!(has_usable_upstream(&o), usable, "{servers:?}");
+                // The claim this guard makes, stated the other way round: saying
+                // yes must mean the forwarder actually gets a server.
+                assert_eq!(
+                    !resolve_upstreams(&o, captured.clone()).is_empty(),
+                    usable,
+                    "{servers:?} replace={replace}"
+                );
+            }
+        }
     }
 
     #[test]
     fn config_set_n0_resets() {
         let mut cfg = AppConfig::default();
-        config_set(&mut cfg, "relay", "rayfish", true).unwrap();
+        config_set(&mut cfg, settings::GlobalKey::Relay, "rayfish", true).unwrap();
         assert!(!cfg.relay.is_unset());
-        config_set(&mut cfg, "relay", "n0", false).unwrap();
+        config_set(&mut cfg, settings::GlobalKey::Relay, "n0", false).unwrap();
         assert!(cfg.relay.is_unset());
     }
 
     #[test]
     fn config_set_dns_upstreams_rejects_non_ip() {
         let mut cfg = AppConfig::default();
-        assert!(config_set(&mut cfg, "dns-upstreams", "1.1.1.1", false).is_ok());
-        assert!(config_set(&mut cfg, "dns-upstreams", "not-an-ip", false).is_err());
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "1.1.1.1",
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "not-an-ip",
+                false
+            )
+            .is_err()
+        );
         // rayfish is not a valid upstream keyword.
-        assert!(config_set(&mut cfg, "dns-upstreams", "rayfish", false).is_err());
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "rayfish",
+                false
+            )
+            .is_err()
+        );
     }
 
     // Regression for the bug that prompted this change: concurrent saves of
@@ -1926,7 +2484,7 @@ name = "test"
             for i in 0..N {
                 let dir = dir.clone();
                 s.spawn(move || {
-                    save_network_in(&dir, &net(&format!("net-{i}"))).unwrap();
+                    save_network_unlocked(&dir, &net(&format!("net-{i}"))).unwrap();
                 });
             }
         });
@@ -1939,6 +2497,163 @@ name = "test"
         );
     }
 
+    /// The network shards got a transaction boundary but `settings.toml` did
+    /// not, so the ten `load()` -> mutate one global -> `save_settings()` sites
+    /// still raced: each wrote back the whole file, reverting whatever another
+    /// task had changed in between.
+    #[test]
+    fn concurrent_settings_updates_preserve_unrelated_globals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                update_settings_in(&dir, |cfg| {
+                    cfg.operator_uid = Some(1234);
+                    Ok(())
+                })
+                .unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                update_settings_in(&dir, |cfg| {
+                    cfg.default_hostname = Some("umbrel".into());
+                    Ok(())
+                })
+                .unwrap();
+            });
+            barrier.wait();
+        });
+
+        let loaded = load_in(&dir).unwrap();
+        assert_eq!(loaded.operator_uid, Some(1234));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("umbrel"));
+    }
+
+    /// A failing callback must leave the file as it was, not write a
+    /// half-applied config.
+    #[test]
+    fn a_failed_settings_update_saves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        update_settings_in(&dir, |cfg| {
+            cfg.operator_uid = Some(7);
+            Ok(())
+        })
+        .unwrap();
+
+        let err = update_settings_in(&dir, |cfg| {
+            cfg.operator_uid = Some(9);
+            anyhow::bail!("callback failed")
+        });
+
+        assert!(err.is_err());
+        assert_eq!(load_in(&dir).unwrap().operator_uid, Some(7));
+    }
+
+    #[test]
+    fn concurrent_same_network_updates_preserve_unrelated_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        save_network_unlocked(&dir, &net("homelab")).unwrap();
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                update_network_in(&dir, "homelab", |net| {
+                    net.aliases.insert("alice".into(), "id-alice".into());
+                    Ok(())
+                })
+                .unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                update_network_in(&dir, "homelab", |net| {
+                    net.last_group_hash = Some(blake3::hash(b"latest group"));
+                    net.auto_accept_files = false;
+                    Ok(())
+                })
+                .unwrap();
+            });
+            barrier.wait();
+        });
+
+        let loaded = load_network_unlocked(&dir, "homelab").unwrap().unwrap();
+        assert_eq!(
+            loaded.aliases.get("alice").map(String::as_str),
+            Some("id-alice")
+        );
+        assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"latest group")));
+        assert!(!loaded.auto_accept_files);
+    }
+
+    #[test]
+    fn update_or_insert_uses_initial_only_when_network_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut initial = net("homelab");
+        initial.aliases.insert("local".into(), "first".into());
+
+        update_network_or_insert_in(dir, "homelab", initial, |net| {
+            net.last_group_hash = Some(blake3::hash(b"first group"));
+            net.auto_accept_firewall = true;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut stale_initial = net("homelab");
+        stale_initial.aliases.insert("local".into(), "stale".into());
+        update_network_or_insert_in(dir, "homelab", stale_initial, |net| {
+            net.my_hostname = Some("latest".into());
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load_network_unlocked(dir, "homelab").unwrap().unwrap();
+        assert_eq!(
+            loaded.aliases.get("local").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"first group")));
+        assert!(loaded.auto_accept_firewall);
+        assert_eq!(loaded.my_hostname.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn network_update_reentry_is_rejected_before_locking() {
+        let _scope = NetworkUpdateScope::enter().unwrap();
+        let error = ensure_not_in_network_update().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("network config update callbacks must not call network config APIs")
+        );
+    }
+
+    #[test]
+    fn failed_network_update_does_not_persist_partial_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+
+        let result = update_network_in(dir, "homelab", |net| {
+            net.aliases.insert("alice".into(), "id-alice".into());
+            anyhow::bail!("reject update")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            load_network_unlocked(dir, "homelab")
+                .unwrap()
+                .unwrap()
+                .aliases
+                .is_empty()
+        );
+    }
+
     #[test]
     fn migrate_legacy_splits_and_backs_up() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1946,7 +2661,7 @@ name = "test"
 
         // Write a legacy single-file config (the pre-shard format).
         let legacy = AppConfig {
-            default_hostname: Some("dario".into()),
+            default_hostname: Some("laptop".into()),
             networks: vec![net("homelab"), net("genesis")],
             ..Default::default()
         };
@@ -1965,7 +2680,7 @@ name = "test"
         // Both networks + globals are now in the sharded layout.
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.networks.len(), 2);
-        assert_eq!(loaded.default_hostname.as_deref(), Some("dario"));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Idempotent: a second migrate (no legacy file) is a no-op.
         migrate_legacy(dir).unwrap();
@@ -1976,8 +2691,8 @@ name = "test"
     fn rejects_unsafe_network_names() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        assert!(save_network_in(dir, &net("../escape")).is_err());
-        assert!(load_network_in(dir, "a/b").is_err());
+        assert!(save_network_unlocked(dir, &net("../escape")).is_err());
+        assert!(load_network_unlocked(dir, "a/b").is_err());
     }
 
     #[test]
@@ -2014,5 +2729,39 @@ name = "test"
 
         remove_pending_join_in(dir, "abc123").unwrap();
         assert!(load_in(dir).unwrap().pending_joins.is_empty());
+    }
+
+    /// The temp file was named `.{fname}.tmp.{pid}`: one path per file per
+    /// process, so two threads writing the same config opened the same temp
+    /// file and one could rename a file the other was still filling. The
+    /// survivor's content was then whatever the two writers had interleaved.
+    #[test]
+    fn concurrent_writes_to_one_path_never_mix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let candidates = ["a".repeat(4096), "b".repeat(16384), "c".repeat(65536)];
+
+        for _ in 0..25 {
+            std::thread::scope(|s| {
+                for c in &candidates {
+                    s.spawn(|| write_file(&path, c.as_bytes(), false).unwrap());
+                }
+            });
+            let got = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                candidates.contains(&got),
+                "torn file: {} bytes, starts {:?}",
+                got.len(),
+                &got[..got.len().min(8)]
+            );
+        }
+
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(left.is_empty(), "temp files left behind: {left:?}");
     }
 }

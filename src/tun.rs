@@ -7,21 +7,29 @@
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+use crate::membership::ExitFamilies;
 #[cfg(target_os = "linux")]
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
+
 #[cfg(not(target_os = "android"))]
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
+// Windows drives the interface through PowerShell (`windows_process`), not a
+// synchronous `Command`, so nothing here needs the blocking spawn.
 #[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 
+// `Result` is the CGNAT preflight's too, which Android has its own version of;
+// `Context` is only used by the desktop setup below.
 #[cfg(not(target_os = "android"))]
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
+use anyhow::Result;
 // The desktop TUN device (the `tun-rs` crate) only exists off Android, where the
 // packet interface is a `VpnService` fd instead.
 #[cfg(not(target_os = "android"))]
@@ -98,123 +106,22 @@ pub struct TunWriter {
     dev: Arc<AsyncDevice>,
 }
 
+/// Creates a TUN device with this node's mesh address and shares it between
+/// independent read/write halves. The device gets our own `/128` and nothing
+/// else; the `200::/7` peer range is routed in separately by [`route_peer_range`]
+/// after link-up, because the kernel does not reliably install an IPv6 connected
+/// route while the link is down.
+///
+/// No IPv4 is assigned at all. `100.64.0.0/10` belongs to whatever other VPN
+/// shares the host, and the overlay carries no IPv4 to put there.
 #[cfg(not(target_os = "android"))]
-fn is_cgnat(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    octets[0] == 100 && (octets[1] & 0xC0) == 64
-}
-
-#[cfg(target_os = "windows")]
-const WINDOWS_TUN_NAME: &str = "rayfish";
-
-#[cfg(target_os = "windows")]
-const WINDOWS_CGNAT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-#[cfg(target_os = "windows")]
-const WINDOWS_CGNAT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-
-#[cfg(target_os = "windows")]
-const WINDOWS_CGNAT_QUERY: &str = "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { [string]::Concat($_.InterfaceAlias, [char]9, $_.IPAddress) }";
-
-#[cfg(target_os = "windows")]
-fn windows_cgnat_conflicts(output: &str) -> Vec<(String, Ipv4Addr)> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let (alias, value) = line.split_once('\t')?;
-            let ip = value.trim().parse::<Ipv4Addr>().ok()?;
-            let alias = alias.trim();
-            (is_cgnat(ip) && !alias.eq_ignore_ascii_case(WINDOWS_TUN_NAME))
-                .then(|| (alias.to_owned(), ip))
-        })
-        .collect()
-}
-
-#[cfg(not(target_os = "android"))]
-pub async fn check_cgnat_conflict() -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        let deadline = tokio::time::Instant::now() + WINDOWS_CGNAT_RELEASE_TIMEOUT;
-        loop {
-            let output = windows_powershell(WINDOWS_CGNAT_QUERY).await?;
-            let conflicts = windows_cgnat_conflicts(&output);
-            if conflicts.is_empty() {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let conflicts = conflicts
-                    .iter()
-                    .map(|(alias, ip)| format!("{alias} ({ip})"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                bail!(
-                    "Windows interfaces {conflicts} are using the 100.64.0.0/10 range. Disable the conflicting VPN before starting rayfish."
-                );
-            }
-            tokio::time::sleep(WINDOWS_CGNAT_POLL_INTERVAL).await;
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let output = Command::new("ifconfig").output();
-
-        let output = match output {
-            Ok(o) => o,
-            Err(_) => return Ok(()),
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut current_iface = String::new();
-
-        for line in stdout.lines() {
-            if !line.starts_with('\t')
-                && !line.starts_with(' ')
-                && let Some(name) = line.split(':').next()
-            {
-                current_iface = name.to_string();
-            }
-            if line.contains("inet ") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(pos) = parts.iter().position(|&p| p == "inet")
-                    && let Some(ip_str) = parts.get(pos + 1)
-                    && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
-                    && is_cgnat(ip)
-                {
-                    bail!(
-                        "interface {} already has CGNAT address {} — another VPN \
-                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
-                     Disable it before starting rayfish.",
-                        current_iface,
-                        ip
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Creates a TUN device with the given virtual IPs and shares it between
-/// independent read/write halves. IPv4 gets a /10 (100.64.0.0/10); IPv6 gets our
-/// own /128 address. The `200::/7` peer range is routed in separately by
-/// [`route_peer_range`] after link-up (the kernel does not reliably install an
-/// IPv6 connected route while the link is down), mirroring how the IPv4 /10 works.
-#[cfg(not(target_os = "android"))]
-pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
-    let gateway = Ipv4Addr::new(100, 64, 0, 1);
-    // `10` is the /10 prefix (was the (255,192,0,0) netmask); `Some(gateway)` is
-    // the point-to-point destination. `ipv6(v6, 128)` assigns just our own
-    // address (a /128, no connected route) cross-platform, replacing the old
-    // netlink/`ifconfig` `configure_ipv6` shell-out. `enable(true)` brings the
-    // link up at creation (as the old `.up()` did); `set_link_up` and the
-    // peer-range route helpers still run later on activate.
-    let builder = DeviceBuilder::new()
-        .ipv4(v4, 10, Some(gateway))
-        .ipv6(v6, 128)
-        .mtu(TUN_MTU)
-        .enable(true);
+pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
+    // `ipv6(v6, 128)` assigns just our own address (a /128, no connected route)
+    // cross-platform. `enable(true)` brings the link up at creation (as the old
+    // `.up()` did); `set_link_up` and the peer-range route helpers still run
+    // later on activate. No IPv4 is assigned at all: the overlay is IPv6-only,
+    // and `100.64.0.0/10` belongs to whatever else may be sharing the host.
+    let builder = DeviceBuilder::new().ipv6(v6, 128).mtu(TUN_MTU).enable(true);
     #[cfg(target_os = "windows")]
     let builder = builder
         .name(WINDOWS_TUN_NAME)
@@ -223,7 +130,7 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     let device = builder.build_async().context("create tun-rs device")?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
-    tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, "TUN device created");
+    tracing::info!(ipv6 = %v6, tun = %tun_name, "TUN device created");
 
     // `recv`/`send` take `&self`, so both halves share one device via `Arc`
     // instead of splitting into independent read/write objects.
@@ -238,6 +145,11 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     ))
 }
 
+/// Wintun adapter name. Fixed rather than generated, so a restart reattaches to
+/// the adapter this daemon created instead of leaving a second one behind.
+#[cfg(target_os = "windows")]
+const WINDOWS_TUN_NAME: &str = "rayfish";
+
 #[cfg(target_os = "windows")]
 fn wintun_library_path() -> PathBuf {
     std::env::current_exe()
@@ -247,8 +159,12 @@ fn wintun_library_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("wintun.dll"))
 }
 
+/// The overlay range, routed into the Wintun adapter. IPv6 only: the mesh
+/// carries no IPv4, and `100.64.0.0/10` belongs to whatever else shares the
+/// host. `::` is the on-link next hop, matching the interface-scoped routes the
+/// other platforms install.
 #[cfg(target_os = "windows")]
-const WINDOWS_PEER_ROUTES: [(&str, &str); 2] = [("100.64.0.0/10", "0.0.0.0"), ("200::/7", "::")];
+const WINDOWS_PEER_ROUTES: [(&str, &str); 1] = [("200::/7", "::")];
 
 #[cfg(target_os = "windows")]
 fn windows_link_args(tun_name: &str, up: bool) -> [String; 5] {
@@ -288,39 +204,6 @@ fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> Str
         index,
         next_hop
     )
-}
-
-/// Platform seam for desktop packet acquisition and privileged interface ops.
-/// The Windows implementation delegates packet I/O to `tun-rs`/Wintun while
-/// keeping the existing `TunRead`/`TunWrite` forwarding path unchanged.
-#[cfg(not(target_os = "android"))]
-pub struct PlatformTun;
-
-#[cfg(not(target_os = "android"))]
-impl PlatformTun {
-    pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
-        create(v4, v6).await
-    }
-
-    pub async fn set_link_up(name: &str) -> Result<()> {
-        set_link_up(name).await
-    }
-
-    pub async fn set_link_down(name: &str) -> Result<()> {
-        set_link_down(name).await
-    }
-
-    pub async fn route_peer_range(name: &str) -> Result<()> {
-        route_peer_range(name).await
-    }
-
-    pub async fn route_magic_dns(name: &str) -> Result<()> {
-        route_magic_dns(name).await
-    }
-
-    pub async fn unroute_peer_range(name: &str) -> Result<()> {
-        unroute_peer_range(name).await
-    }
 }
 
 /// Run `f` with a netlink handle and the interface index of `tun_name`.
@@ -381,14 +264,12 @@ pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
     .await
 }
 
-/// Routes the peer ranges into the TUN. Must be called *after* the interface is
-/// up (see [`set_link_up`]). On Linux only the IPv6 `200::/7` route needs adding:
-/// the kernel does not reliably install an IPv6 connected route while the link is
-/// down (peer traffic would otherwise leak out the host's default IPv6 route),
-/// whereas it re-installs the IPv4 `100.64.0.0/10` connected route from the /10
-/// netmask automatically on link-up. On macOS the point-to-point utun installs
-/// neither range reliably, so *both* `100.64.0.0/10` and `200::/7` are added
-/// explicitly. Idempotent, safe to call on every `up` cycle.
+/// Routes the peer range into the TUN. Must be called *after* the interface is
+/// up (see [`set_link_up`]): the kernel does not reliably install an IPv6
+/// connected route while the link is down, and peer traffic would otherwise leak
+/// out the host's default IPv6 route. `200::/7` is the whole range, magic DNS
+/// (`dns::MAGIC_DNS_V6`) included, so nothing else needs a host route.
+/// Idempotent, safe to call on every `up` cycle.
 #[cfg(target_os = "linux")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     use rtnetlink::RouteMessageBuilder;
@@ -412,13 +293,12 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     // utun is point-to-point, so the address prefix alone does not reliably
-    // create the range route, we add both families explicitly. The IPv4 `/10`
-    // is only installed implicitly by the `tun` crate at device creation and
-    // macOS drops it across an `up`/`down` cycle, so (like the IPv6 `/7`) we
-    // re-add it on every activate or peers become unreachable over IPv4 while
-    // IPv6 still works. `route add` fails if the route already exists (e.g. an
-    // earlier `up`), so delete any stale entry first and ignore its result.
-    for (family, net) in [("-inet", "100.64.0.0/10"), ("-inet6", "200::/7")] {
+    // create the range route; macOS also drops it across an `up`/`down` cycle,
+    // so it is re-added on every activate. `route add` fails if the route
+    // already exists (e.g. an earlier `up`), so delete any stale entry first and
+    // ignore its result. `200::/7` covers `dns::MAGIC_DNS_V6` too.
+    let ranges: &[(&str, &str)] = &[("-inet6", "200::/7")];
+    for (family, net) in ranges.iter().copied() {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
             .status();
@@ -485,26 +365,77 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
 /// across re-applies. The caller is responsible for loop prevention *before*
 /// this goes in: from here on, everything the routing table decides, including
 /// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
+///
+/// Only the halves of the families the tunnel actually carries go in
+/// (`ExitFamilies::tunnelled`: what this node's data plane routes, intersected
+/// with what the gateway says it can return). That is `::/1` + `8000::/1`, or
+/// nothing at all: the overlay carries no IPv4, so IPv4 egress stays with
+/// whoever owns `100.64.0.0/10` here. Unlike Linux, no hole has to be
+/// punched for that VPN's own prefixes: the split default lives in the one routing
+/// table, where its more specific routes already win.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
-    for (family, net) in SPLIT_DEFAULT {
-        let _ = Command::new("route")
-            .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
-            .status();
+pub async fn route_default_via_tun(tun_name: &str, carries: ExitFamilies) -> Result<()> {
+    for step in split_default_plan(carries, tun_name) {
+        let _ = Command::new("route").args(&step.delete).status();
+        let Some(add) = &step.add else { continue };
         let status = Command::new("route")
-            .args(["-n", "add", family, "-net", net, "-interface", tun_name])
+            .args(add)
             .status()
-            .with_context(|| format!("run route add {family} {net}"))?;
+            .with_context(|| format!("run route {}", add.join(" ")))?;
         anyhow::ensure!(
             status.success(),
-            "route add {family} {net} failed with {status}"
+            "route {} failed with {status}",
+            add.join(" ")
         );
     }
     Ok(())
 }
 
+/// What one [`SPLIT_DEFAULT`] entry costs: always a delete, and an add only if
+/// this tunnel carries that family.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+struct SplitDefaultStep {
+    delete: Vec<String>,
+    add: Option<Vec<String>>,
+}
+
+/// The `route` invocations an install makes, as data, so the shape is pinned by a
+/// test instead of by reading the loop.
+///
+/// Every entry is deleted whatever the answer, and only the carried ones are added
+/// back. That asymmetry is the point: this is an install, and an install has to be
+/// as family-symmetric as a teardown. `carries` follows the gateway's claim, so a
+/// live tunnel can narrow (the gateway loses its IPv6 uplink and republishes a
+/// narrower claim) and the re-apply arrives with one family fewer. Skipping the
+/// dropped family entirely would leave its half-space routes pointing at a utun
+/// that is still up, so that family keeps entering a tunnel whose far end cannot
+/// return it while the daemon tells the user it is leaving directly.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn split_default_plan(carries: ExitFamilies, tun_name: &str) -> [SplitDefaultStep; 4] {
+    SPLIT_DEFAULT.map(|(family, net)| {
+        let args = |verb: &str| {
+            ["-n", verb, family, "-net", net, "-interface", tun_name]
+                .map(str::to_string)
+                .to_vec()
+        };
+        // `Unknown` is not a `tunnelled()` output; read as both families, which is
+        // what an absent claim meant before the field existed.
+        let wanted = match family {
+            "-inet" => carries.carries_v4() || carries.is_unknown(),
+            _ => carries.carries_v6() || carries.is_unknown(),
+        };
+        SplitDefaultStep {
+            delete: args("delete"),
+            add: wanted.then(|| args("add")),
+        }
+    })
+}
+
 /// Removes the full-tunnel half-space routes. Best-effort and idempotent: routes
 /// that are already gone (never installed, or dropped with the utun) are fine.
+///
+/// Always both families, whatever mode installed them, so a daemon restarted into
+/// the other one still clears what the last left behind.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn unroute_default_via_tun(tun_name: &str) {
     for (family, net) in SPLIT_DEFAULT {
@@ -514,72 +445,8 @@ pub async fn unroute_default_via_tun(tun_name: &str) {
     }
 }
 
-/// Routes the magic-DNS virtual IP (`dns::MAGIC_DNS_V4`) into the TUN as a `/32`
-/// host route so that packets from the kernel addressed to that IP are delivered
-/// to the TUN device (and thus intercepted by our DNS server) rather than going
-/// out the host's default gateway. The IP is **never** assigned as a local
-/// interface address, it is a route-only entry. Idempotent across `up`/`down`.
-#[cfg(target_os = "linux")]
-pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    use rtnetlink::RouteMessageBuilder;
-
-    with_tun_link(tun_name, async |handle, index| {
-        let route = RouteMessageBuilder::<Ipv4Addr>::new()
-            .destination_prefix(crate::dns::MAGIC_DNS_V4, 32)
-            .output_interface(index)
-            .build();
-        handle
-            .route()
-            .add(route)
-            .replace()
-            .execute()
-            .await
-            .context("add magic-DNS /32 route via netlink")
-    })
-    .await
-}
-
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    let ip = crate::dns::MAGIC_DNS_V4.to_string();
-    let _ = Command::new("route")
-        .args([
-            "-n",
-            "delete",
-            "-inet",
-            "-host",
-            &ip,
-            "-interface",
-            tun_name,
-        ])
-        .status();
-    let status = Command::new("route")
-        .args(["-n", "add", "-inet", "-host", &ip, "-interface", tun_name])
-        .status()
-        .context("run route add magic dns")?;
-    anyhow::ensure!(status.success(), "route add magic dns failed with {status}");
-    Ok(())
-}
-
-#[cfg(all(
-    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")),
-    not(target_os = "android"),
-    not(target_os = "windows")
-))]
-pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name).await?;
-    let prefix = format!("{}/32", crate::dns::MAGIC_DNS_V4);
-    windows_powershell(&windows_replace_route_script(&prefix, index, "0.0.0.0")).await?;
-    Ok(())
-}
-
 /// Install host routes for our *own* dual-stack addresses via the loopback
-/// interface so traffic to ourselves (e.g. `ping dario.field.ray` resolving to
+/// interface so traffic to ourselves (e.g. `ping laptop.field.ray` resolving to
 /// our own IP) is short-circuited locally instead of being sent out the TUN,
 /// where the forwarding loop would drop it as "no peer for dst".
 ///
@@ -593,8 +460,9 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
 /// `local` route in the `local` table that already delivers self-traffic via
 /// loopback, so pinging your own TUN address works out of the box.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
-    for (family, addr) in [("-inet", v4.to_string()), ("-inet6", v6.to_string())] {
+pub async fn route_self_loopback(v6: Ipv6Addr) -> Result<()> {
+    let families = [("-inet6", v6.to_string())];
+    for (family, addr) in families {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-host", &addr, "-interface", "lo0"])
             .status();
@@ -615,7 +483,7 @@ pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
     not(target_os = "android"),
     not(target_os = "freebsd")
 ))]
-pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
+pub async fn route_self_loopback(_v6: Ipv6Addr) -> Result<()> {
     // Linux installs the loopback `local` route automatically on address
     // assignment; self-traffic already works without an explicit route.
     Ok(())
@@ -721,46 +589,82 @@ impl TunWrite for TunWriter {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
-    use super::{
-        WINDOWS_PEER_ROUTES, WINDOWS_TUN_NAME, windows_cgnat_conflicts,
-        windows_interface_query_script, windows_link_args, windows_remove_route_script,
-        windows_replace_route_script, wintun_library_path,
-    };
-
+    /// A narrowing tunnel must delete the family it stopped carrying.
+    ///
+    /// `carries` follows the gateway's claim, so it changes under a live tunnel:
+    /// the gateway republishes a claim with no IPv6 in it, and the re-apply
+    /// arrives with one family fewer. The utun is still up, so nothing reaps the
+    /// dropped family's half-space routes on their own, and that family keeps
+    /// entering a tunnel whose far end cannot return it while
+    /// `ray exit-node status` says it is leaving directly.
+    ///
+    /// `tunnelled` narrows to `V6` or `Neither`, but the plan is written against
+    /// the whole enum because the claim rides the signed roster and is decoded
+    /// as well as written.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
-    fn windows_cgnat_preflight_covers_zero_one_many_and_owned_adapter() {
-        assert!(windows_cgnat_conflicts("").is_empty());
-        assert!(windows_cgnat_conflicts("rayfish\t100.94.119.67\n").is_empty());
-        assert!(windows_cgnat_conflicts("RAYFISH\t100.94.119.67\n").is_empty());
+    fn the_split_default_plan_visits_every_family_and_adds_only_what_it_carries() {
+        use crate::membership::ExitFamilies::{Dual, Neither, Unknown, V4, V6};
 
-        let conflicts = windows_cgnat_conflicts(
-            "Ethernet\t192.168.1.2\nTailscale\t100.64.1.2\ntun0\t100.127.255.254\n",
-        );
+        let deletes = |carries| -> Vec<String> {
+            super::split_default_plan(carries, "utun9")
+                .into_iter()
+                .map(|s| s.delete.join(" "))
+                .collect()
+        };
+        let adds = |carries| -> Vec<String> {
+            super::split_default_plan(carries, "utun9")
+                .into_iter()
+                .filter_map(|s| s.add.map(|a| a.join(" ")))
+                .collect()
+        };
+
+        // Every family is deleted whatever the tunnel carries. This is the half
+        // that a narrowing tunnel depends on, and the half that reads as dead code
+        // if you only look at the family it is installing.
+        let all_four = [
+            "-n delete -inet -net 0.0.0.0/1 -interface utun9",
+            "-n delete -inet -net 128.0.0.0/1 -interface utun9",
+            "-n delete -inet6 -net ::/1 -interface utun9",
+            "-n delete -inet6 -net 8000::/1 -interface utun9",
+        ];
+        for carries in [Dual, V6, V4, Neither, Unknown] {
+            assert_eq!(deletes(carries), all_four, "{carries:?}");
+        }
+
+        // And only the carried family is added back. `V6` and `Neither` are the
+        // two a real selection produces.
         assert_eq!(
-            conflicts,
-            vec![
-                ("Tailscale".to_owned(), "100.64.1.2".parse().unwrap()),
-                ("tun0".to_owned(), "100.127.255.254".parse().unwrap()),
+            adds(V6),
+            [
+                "-n add -inet6 -net ::/1 -interface utun9",
+                "-n add -inet6 -net 8000::/1 -interface utun9",
             ]
         );
-    }
-
-    #[test]
-    fn windows_cgnat_preflight_ignores_malformed_and_range_boundaries() {
-        let conflicts = windows_cgnat_conflicts(
-            "missing delimiter\nedge-low\t100.64.0.0\nedge-high\t100.127.255.255\noutside\t100.128.0.0\ninvalid\tnot-an-ip\n",
+        assert!(adds(Neither).is_empty(), "nothing to carry, nothing to add");
+        assert_eq!(
+            adds(V4),
+            [
+                "-n add -inet -net 0.0.0.0/1 -interface utun9",
+                "-n add -inet -net 128.0.0.0/1 -interface utun9",
+            ]
         );
-        assert_eq!(conflicts.len(), 2);
-        assert_eq!(conflicts[0].0, "edge-low");
-        assert_eq!(conflicts[1].0, "edge-high");
-        assert_eq!(WINDOWS_TUN_NAME, "rayfish");
+        assert_eq!(adds(Dual).len(), 4);
+        // An absent claim predates the field, so it is read as both families.
+        assert_eq!(adds(Unknown).len(), 4);
     }
 
+    /// The Wintun adapter is configured by generated PowerShell, so the
+    /// generators are what there is to pin without a Windows host: an
+    /// apostrophe in an adapter name must not end the quoted argument, and the
+    /// route script must scope itself to our interface index rather than
+    /// touching the machine's routing table at large.
+    #[cfg(target_os = "windows")]
     #[test]
     fn windows_link_args_cover_up_down_and_name_boundary() {
-        let up = windows_link_args("Rayfish Tunnel", true);
+        let up = super::windows_link_args("Rayfish Tunnel", true);
         assert_eq!(
             up,
             [
@@ -772,46 +676,53 @@ mod tests {
             ]
         );
 
-        let down = windows_link_args("O'Brien", false);
+        let down = super::windows_link_args("O'Brien", false);
         assert_eq!(down[3], "name=O'Brien");
         assert_eq!(down[4], "admin=disabled");
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn windows_interface_query_quotes_powershell_boundaries() {
-        let script = windows_interface_query_script("O'Brien");
+        let script = super::windows_interface_query_script("O'Brien");
         assert!(script.contains("Name -eq 'O''Brien'"));
         assert!(script.contains("ExpandProperty ifIndex"));
     }
 
+    /// The overlay is IPv6-only. A `100.64.0.0/10` entry here would put a route
+    /// for another VPN's range into our adapter.
+    #[cfg(target_os = "windows")]
     #[test]
-    fn windows_peer_route_matrix_is_dual_stack_and_ordered() {
-        assert_eq!(WINDOWS_PEER_ROUTES.len(), 2);
-        assert_eq!(WINDOWS_PEER_ROUTES[0], ("100.64.0.0/10", "0.0.0.0"));
-        assert_eq!(WINDOWS_PEER_ROUTES[1], ("200::/7", "::"));
+    fn windows_peer_routes_are_the_overlay_range_only() {
+        assert_eq!(super::WINDOWS_PEER_ROUTES, [("200::/7", "::")]);
+        assert_eq!(super::WINDOWS_TUN_NAME, "rayfish");
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn windows_route_scripts_are_scoped_and_idempotent() {
-        let remove = windows_remove_route_script("100.64.0.0/10", 17);
+        let remove = super::windows_remove_route_script("200::/7", 17);
         assert!(remove.contains("Remove-NetRoute"));
         assert!(remove.contains("-InterfaceIndex 17"));
         assert!(remove.contains("-ErrorAction SilentlyContinue"));
 
-        let replace = windows_replace_route_script("200::/7", 17, "::");
-        let remove_v6 = windows_remove_route_script("200::/7", 17);
-        assert!(replace.starts_with(&remove_v6));
-        assert!(replace.contains("Remove-NetRoute"));
+        // Replace is remove-then-add, so re-running it is a no-op rather than a
+        // duplicate route.
+        let replace = super::windows_replace_route_script("200::/7", 17, "::");
+        assert!(replace.starts_with(&remove));
         assert!(replace.contains("New-NetRoute"));
         assert!(replace.contains("-DestinationPrefix '200::/7'"));
         assert!(replace.contains("-NextHop '::'"));
         assert!(replace.contains("-PolicyStore ActiveStore"));
     }
 
+    /// `tun-rs` loads Wintun by path, so the wrong name here is a runtime
+    /// failure with no compile-time signal.
+    #[cfg(target_os = "windows")]
     #[test]
     fn wintun_library_contract_ends_in_dll() {
         assert_eq!(
-            wintun_library_path()
+            super::wintun_library_path()
                 .file_name()
                 .and_then(|name| name.to_str()),
             Some("wintun.dll")

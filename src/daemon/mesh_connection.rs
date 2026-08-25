@@ -116,8 +116,8 @@ impl MeshConnection {
                 .and_then(|s| {
                     self.ctx
                         .peers
-                        .v4_for_id(&self.peer_id)
-                        .map(|v4| v4 == s.ipv4)
+                        .ipv6_for_id(&self.peer_id)
+                        .map(|v6| v6 == s.ipv6)
                 })
                 .unwrap_or(false);
             let sleep_for = (self.ctx.registry.on_demand
@@ -195,7 +195,7 @@ impl MeshConnection {
             // chatter (pings, roster-sync/blob-update triggers) hold a connection open
             // forever, defeating on-demand teardown. A control exchange racing the idle
             // close is safe: frames are atomic and control is only ever a trigger, so a
-            // dropped push re-forms on the next lazy dial or the 60s poll reconverge.
+            // dropped push re-forms on the next lazy dial or the group poll reconverge.
             match self.gate.check() {
                 crate::ratelimit::Verdict::Allow => {}
                 crate::ratelimit::Verdict::Drop => continue,
@@ -293,12 +293,34 @@ impl MeshConnection {
             };
             let Some(handler) = self.manager.handler_for(&net_pubkey) else {
                 tracing::debug!(peer = %self.peer_id.fmt_short(), net = %net_pubkey.fmt_short(), "control frame for unknown network; ignoring");
+                // A peer talking to us about a network we have saved but never
+                // registered means our restore of it is still owed: the network
+                // is plainly reachable, since its traffic just arrived. Nudge the
+                // supervisor to retry now rather than at its next tick. This
+                // frame is still dropped (there is no handler to give it to), but
+                // the peer's own reconnect loop will be back.
+                self.ctx.registry.nudge_restore();
                 continue;
             };
+            // The reachability wall for the control plane, mirroring what
+            // `resolve_inbound_by_id` does for datagrams: a frame is dispatched
+            // to a network's handler on the strength of the network id it names,
+            // and that id is public, so the sender has to be someone this
+            // network's roster accounts for. The exceptions are the messages by
+            // which a peer that is legitimately not on the roster yet reaches us;
+            // see `stranger_may_send`.
+            if !stranger_may_send(&frame.msg) && !handler.knows_sender(self.peer_id) {
+                tracing::debug!(
+                    peer = %self.peer_id.fmt_short(),
+                    net = %net_pubkey.fmt_short(),
+                    "control frame from a peer this network's roster does not list; ignoring"
+                );
+                continue;
+            }
             drop(recv); // one message per stream; the reply rides `send`
             // `handle_frame` registers the peer (route) as a side effect and
-            // returns its mesh v4 once it is a member on this network.
-            if let Some(ip) = handler
+            // returns its mesh address once it is a member on this network.
+            if let Some(peer_ip) = handler
                 .handle_frame(&self.conn, send, self.peer_id, frame.msg)
                 .await
             {
@@ -306,8 +328,12 @@ impl MeshConnection {
                 // registered: a later drop must be reported.
                 registered = true;
                 // (Re)announce our outbound handle table so the peer can decode
-                // datagrams we tag for this (possibly newly-shared) network.
-                announce_network_handles(&self.ctx.peers, &self.conn, ip).await;
+                // datagrams we tag for this (possibly newly-shared) network. Look
+                // it up by the address `handle_frame` registered it under, not by
+                // one derived from the transport key: a device whose `MeshHello`
+                // claims a cert-bound identity is keyed on *that* identity's
+                // address, and a recompute would find an empty handle table.
+                announce_network_handles(&self.ctx.peers, &self.conn, peer_ip).await;
             }
         }
     }
@@ -327,23 +353,17 @@ impl MeshConnection {
     }
 
     /// Report this connection's drop to the daemon-wide supervisor. The peer's
-    /// collision-aware v4 comes from its roster entry (falling back to the index-0
-    /// derivation if it was pruned already); `conn_stable_id` lets the supervisor's
-    /// ABA guard ignore this event if the peer has since reconnected.
+    /// mesh address is derived from its identity, so it needs no roster lookup;
+    /// `conn_stable_id` lets the supervisor's ABA guard ignore this event if the
+    /// peer has since reconnected.
     async fn report_disconnect(&self, reason: forward::CloseReason) {
-        let ip = self
-            .ctx
-            .peers
-            .v4_for_id(&self.peer_id)
-            .unwrap_or_else(|| crate::membership::derive_ip(&self.peer_id));
         let ipv6 = crate::membership::derive_ipv6(&self.peer_id);
-        tracing::warn!(peer = %self.peer_id.fmt_short(), ip = %ip, reason = ?reason, "peer connection lost");
+        tracing::warn!(peer = %self.peer_id.fmt_short(), ip = %ipv6, reason = ?reason, "peer connection lost");
         let _ = self
             .ctx
             .disconnect_tx
             .send(forward::DisconnectEvent {
                 endpoint_id: self.peer_id,
-                ip,
                 ipv6,
                 reason,
                 conn_stable_id: Some(self.conn.stable_id()),

@@ -8,6 +8,607 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Services that listen on IPv4 only are reachable over the mesh.** The mesh is
+  IPv6-only, so a peer reaches a service at `[<mesh ip>]:<port>` and a program
+  listening on `0.0.0.0` never saw the connection: the port was open in `ray
+  firewall`, the name resolved, and the connection was refused with nothing
+  saying why. The daemon now answers on the mesh address for those ports itself
+  and hands the connection to the local service over IPv4, so
+  `curl http://box.ray:4000` works against a server that only speaks IPv4. On
+  Linux a port becomes reachable the moment the service starts listening,
+  because the kernel says so; on other systems it is picked up within a few
+  seconds.
+  Nothing new is exposed by it: only a service already listening on every
+  interface (`0.0.0.0`) is bridged, one bound to `127.0.0.1` is left alone, and
+  the firewall decides who reaches it exactly as before. The service sees the
+  connection coming from `127.0.0.1` rather than from the peer, so keep
+  per-peer rules in `ray firewall` rather than in the application. Turn it off
+  with `ray config set v4-bridge off`.
+- **Exit nodes tunnel IPv6.** `ray exit-node use` routes your IPv6 internet
+  traffic through the gateway and leaves your IPv4 traffic leaving directly,
+  which both `ray exit-node use` and `ray exit-node status` say out loud rather
+  than leaving you to find out from a leak test. The mesh carries no IPv4, so
+  there is no IPv4 for a tunnel to source transit from; claiming your IPv4
+  default would take it from whatever else is using the box and send it into a
+  hole. Offering an exit node is unaffected.
+- **A gateway that cannot carry IPv6 is refused, with a reason.** Gateways report
+  whether they have an IPv6 uplink, and ones that do are marked `(IPv6)` in
+  `ray exit-node status`. Picking one that reports otherwise is refused rather
+  than left to time out. The check runs on every re-apply, not only when you
+  pick, so a gateway that loses its uplink stops tunnelling with a message
+  instead of silently carrying nothing, and picks the tunnel back up by itself
+  when it reports one again. A gateway on a network whose coordinator predates
+  this feature reports nothing either way: it stays selectable, since refusing
+  would rule out every gateway on such a network, and `ray exit-node use` tells
+  you the claim is unverified.
+- **DNS follows the tunnel.** While a tunnel is up, the daemon's own DNS
+  forwarder is pointed at an IPv6 resolver, so its lookups go through the exit
+  rather than around it. On Linux hosts using systemd-resolved or resolvconf,
+  applications' non-`.ray` lookups still leave directly, and the daemon logs a
+  warning saying so. If you pinned your own resolvers with `ray config set
+  dns-upstreams … --replace` and none of them are IPv6, yours are kept rather
+  than swapped for public ones: they stay reachable over the IPv4 a tunnel
+  leaves direct, so those lookups go around the exit instead of to a resolver
+  you did not choose.
+- **`ray config set dns-upstreams` takes IPv6 addresses.** Naming only IPv6
+  servers no longer lets rayfish take over `/etc/resolv.conf` on a host where it
+  found no working resolver of its own: those entries are reachable only through
+  the tunnel, so counting them would have taken the file and left the machine
+  unable to resolve anything.
+- **Android notifies you when someone sends you a file.** An incoming file from
+  another peer used to arrive in silence: notifications only covered transfers
+  that were already under way, and a file waiting on your decision has no
+  transfer behind it yet, so the only place it appeared was the app's own list.
+  Sent while the app was closed, it sat there unannounced until you next opened
+  it. There is now a notification naming the file, who sent it and how big it
+  is, with Save and Reject on it so you can take the file without opening the
+  app at all. Files from your own paired devices are unaffected: those are still
+  saved automatically and reported as they download.
+- **`ray logs`: read the daemon's log without hunting for the files.** The logs
+  are root-owned under `/var/log/rayfish` (`/Library/Logs/rayfish` on macOS),
+  so until now looking at them meant `sudo cat` and knowing which file, or
+  `ray report`, which bundles a week of them into a tarball meant for sharing.
+  `ray logs` prints today's, from the daemon over IPC, so it needs no root:
+
+  ```bash
+  ray logs                 # everything since the last daily rotation
+  ray logs --since 2h30m   # only the last two and a half hours
+  ray logs -f              # keep streaming new lines, like tail -f
+  ray logs --since 5m -f   # the last five minutes, then keep streaming
+  ```
+
+  Output goes through `$PAGER` (`less`) on a terminal and straight through
+  when piped or following, so `ray logs | grep peer` and `ray logs -f` both
+  behave the way you would expect.
+- **Tab completion covers the ids you copy out of a listing.** `ray requests
+  <net> accept`, `ray requests <net> deny`, `ray connect approve`, `ray invite
+  <net> revoke`, `ray files accept`, `ray files cancel` and `ray firewall
+  remove` now complete their argument from what is actually waiting, each
+  candidate carrying who or what it refers to, so an id printed one line up no
+  longer has to be retyped. `ray requests <net>` joins the other listings in
+  being readable by any local user, so the tab answers without sudo; admitting
+  still needs root or the operator.
+
+### Changed
+
+- **A join with no `--hostname` takes this machine's name.** `ray create` and
+  `ray join` used to fall back to a random noun, so `ray status` on a fleet read
+  as a list of animals nobody could match to a box. They now use the machine's
+  own hostname, folded into a mesh name (`Alice's MacBook.local` becomes
+  `alice-s-macbook`). A random name is still used when the machine has nothing
+  usable to offer (`localhost`, which is what Android reports) and when the name
+  is already on the network you are joining, since `laptop-1` would read as the
+  name of the `laptop` that is already there. `ray up --hostname <name>` still
+  wins over both, and naming one explicitly is unaffected.
+
+- **Rayfish is IPv6-only. Mesh IPv4 is gone.** Every peer had two mesh addresses:
+  an IPv4 in `100.64.0.0/10` and an IPv6 in `200::/7`. Only the IPv6 remains.
+  It is blake3 of the peer's identity, so it is collision-free, never rotates,
+  and is derived locally by every node rather than carried on the wire. `ray
+  status`, `ray ping`, Magic DNS, the exit node and the Android app all use it.
+  A `.ray` name answers AAAA only; an A query returns NODATA, because there is
+  no IPv4 address to give.
+
+  Two consequences worth knowing before you upgrade:
+
+  - **Every node must upgrade together.** The mesh protocol goes to 5 and peers
+    on different versions cannot connect at all, so a node left behind stops
+    seeing the network rather than degrading. `ray status` marks such a peer
+    incompatible, and a join against a network on another version fails naming
+    both.
+  - **Check what your services listen on.** `0.0.0.0` is the IPv4 wildcard, not
+    "any address", so a service bound there has no IPv6 socket and peers can no
+    longer reach it. Bind `::` instead, which accepts both families on Linux.
+    Go and Node already do this; nginx needs `listen [::]:80;` adding, and
+    `--bind 0.0.0.0` defaults and Docker published ports need the flag changed.
+    `ss -tlnp` shows which is which: `0.0.0.0:port` is affected, `[::]:port` is
+    not.
+
+- **`ipv6-only` is gone as a setting.** `ray config set ipv6-only` and `ray up
+  --ipv6-only` no longer exist, and neither does the startup scan behind them.
+  There is nothing left to choose: the overlay never claims `100.64.0.0/10`, so
+  sharing a host with Tailscale needs no mode and no configuration. A stale
+  `ipv6_only` key in `settings.toml` is ignored rather than an error.
+- **Magic DNS answers at `200::53` only.** The old `100.100.100.53` is not used;
+  an upgrade strips it from `/etc/resolv.conf` on the way through. Use
+  `dig @200::53 <host>.ray`.
+- **NetworkManager is no longer used to configure DNS.** Its D-Bus interface can
+  only carry an IPv4 nameserver, so it cannot point the system at an IPv6
+  resolver. The detection ladder falls through to resolvconf or a direct
+  `/etc/resolv.conf`, both of which take either family.
+- **The wire is more compact.** Control frames, pairing, `ray connect`, file
+  transfer and the signed roster are array-encoded, taking a bit under 30% off
+  the largest thing on the wire (a 50-member roster drops from 5194 to 3764
+  bytes). Dropping the mesh IPv4 and its collision index takes more off again.
+  This is part of what the protocol bump above covers. Nothing on disk changes,
+  so upgrading in place keeps your networks, identity and pairings.
+
+- **`ray firewall --help` is grouped, and every help page reads in one pass.**
+  The firewall's 13 actions are now listed under Rules, Mode, Coordinator
+  suggestions and Mesh SSH, the way `ray --help` has been grouped for a while.
+  Everywhere else, a command's one-line summary is now actually one line:
+  descriptions that ran to a full paragraph on a single unwrapped line have
+  been cut back to a summary, with the detail moved into
+  `ray help <command> <action>`, which now wraps to your terminal instead of
+  printing one very long line.
+- **Four commands moved next to the thing they act on.** `ray connections` is
+  now `ray connect` (bare, it lists incoming requests) and `ray connections
+  approve <id>` is `ray connect approve <id>`. `ray accept <net> <id>` and
+  `ray deny <net> <id>` are now `ray requests <net> accept <id>` and
+  `ray requests <net> deny <id>`. `ray auto-update on|off` is now
+  `ray config set auto-update on|off`. The old spellings all still work, so
+  existing scripts are unaffected; they no longer appear in `ray --help` or in
+  tab completion. `ray open` (the `rayfish://` link handler, which nobody types)
+  is hidden for the same reason.
+- **Android 8.0 (API 26) is now the minimum.** Every notification the app posts
+  goes through a notification channel, which is an 8.0 API, so on 7.x the calls
+  threw and were swallowed: transfers and incoming files were announced by
+  nothing at all, on a build that otherwise looked like it worked. Rather than
+  keep a tier where the app is quietly half-functional, 7.x is dropped. Android
+  8.0 and later are unaffected.
+- **The address on the mobile app's rows is readable again.** A node's only
+  address is now a full mesh IPv6, which did not fit on one line beside its
+  label, so it was ellipsised in the middle: unreadable, and impossible to check
+  against `ray status`. Those rows wrap to a second line instead.
+- **The mobile app stops waking the radio every minute.** Every node used to
+  re-resolve each network's signed record once a minute, whether or not
+  anything had changed, which on a phone is a wakeup per network per minute for
+  a day at a time. On Android that poll now runs every 15 minutes and is a
+  backstop rather than the mechanism: coordinators push membership changes to
+  members directly, and the poll runs immediately when the VPN comes up, so a
+  kick, a firewall suggestion or a new member still lands right away. Desktop
+  and server nodes keep the 60-second poll.
+
+### Fixed
+
+- **Tab completion works on Debian and Ubuntu.** The zsh stub was installed to
+  `/usr/share/zsh/site-functions`, which Arch and Fedora search but Debian and
+  Ubuntu do not: those build zsh with its site directory under `/usr/local` and
+  give packages `/usr/share/zsh/vendor-completions`. The file was written, the
+  install reported success, and pressing tab did nothing, with nothing anywhere
+  saying why. The install now reads the real `fpath` off the zsh on the box
+  instead of assuming one path fits every distribution, and a stub an earlier
+  version left somewhere zsh ignores is cleared out by the next `sudo ray up`
+  or `ray update`. Installing for one user (`ray completions zsh --install`)
+  writes to a directory no zsh searches by default, so it now checks and says
+  so, with the two lines to add to `~/.zshrc`, rather than leaving it to be
+  discovered by pressing tab.
+- **Two settings changed at the same moment no longer undo each other.** Every
+  writer of `settings.toml` read the whole file, changed its one field and wrote
+  the whole file back, so a setting saved while another was in flight was
+  reverted a moment later by a copy that predated it. Turning on SSH could put
+  back the operator uid you had just cleared, and neither command reported
+  anything wrong. Reads and writes of the globals now happen under the same
+  transaction the per-network files already used.
+- **`ray report` no longer fills `/tmp`.** Each report wrote a fresh archive
+  under a new name and nothing ever removed the old ones, so a machine that had
+  run it often was holding a gzip of a week of debug logs for every run. A new
+  report now reclaims that user's previous ones.
+- **A saved config survives a power loss.** Writing a config file reported
+  success once the bytes reached the operating system, which is not the same as
+  reaching the disk: a machine that lost power seconds later came back with the
+  file's previous contents, or with the file missing entirely, and nothing had
+  failed anywhere to say so. The write now waits for the file and its directory
+  entry to be durable, and reports an error if either cannot be.
+- **Two settings saved at the same moment no longer corrupt each other.** Every
+  config write goes to a temporary file that is then renamed into place, and the
+  temporary name was shared by everything writing that file in the daemon. Two
+  saves landing together wrote into the same temporary file and renamed each
+  other's half-written copy over the real one, so a config could come back as a
+  mixture of two saves or fail with a missing-file error.
+- **Per-network settings survive a restart and a reconnect.** The ephemeral TTL
+  set with `ray net config <net> ephemeral-ttl` silently stopped applying after
+  the daemon restarted, and a network's admin list was cleared every time a
+  member reconnected. Both were rewritten wholesale each time the mesh saved a
+  network, so anything set on the node was replaced by whatever the reconnect
+  happened to carry. A save now touches only the fields it owns.
+- **A co-coordinator is no longer demoted by reconnecting.** The saved network
+  key was overwritten with the key from the handshake, so a node that had been
+  granted co-coordinator lost the grant on its next reconnect. Nothing was said
+  at the time; the powers were simply gone. The saved key is now kept until a
+  fresh grant replaces it.
+- **Android: `.ray` names now open in Chrome on an IPv4-only network.** The
+  browser showed `DNS_PROBE_FINISHED_NXDOMAIN` for a name that every other app
+  on the phone resolved fine. Chrome only asks for an IPv6 address once it has
+  checked that IPv6 works, by connecting to a fixed global address, and on a
+  Wi-Fi with no IPv6 that check failed. It then asked for an IPv4 address alone,
+  which the mesh does not have and never will, so nothing on the mesh was
+  reachable by name from the browser. The tunnel now carries a route for that
+  check, and only on networks with no IPv6 of their own. Real IPv6 traffic is
+  untouched.
+- **Android: "Send diagnostics" now actually sends the diagnostics.** The button
+  reported success and delivered an empty report: the log snapshot, the node
+  health block, and the install and transport tags were all attached to the
+  event in a way the Sentry SDK dropped on the way out, so every report for the
+  past month arrived as a bare "rayfish diagnostics" line with nothing in it.
+  There was no way to tell from the app, since the report itself went through.
+  The same loss applied to the automatic report a node sends when it fails to
+  start, which is the one report nobody is around to notice is empty. Both now
+  carry their logs. A report that Sentry refuses also says "Diagnostics
+  unavailable" instead of claiming it was sent.
+
+- **A network running a different mesh protocol version no longer disappears
+  from `ray status`.** Rejoining a saved network stopped at the version check, so
+  a network whose coordinator had moved to a newer (or older) protocol was never
+  registered and was listed nowhere at all: it read as gone, not as out of step.
+  Such a network now appears marked `incompatible`, saying which version it runs
+  and which your build speaks, with the same `ray update` nudge an incompatible
+  peer already gets. Its peers stay unreachable, since the version gate is what
+  it always was, and the daemon keeps watching: the network goes back to normal
+  on its own once its coordinator republishes at a version you speak. A
+  first-time `ray join` against such a network still fails with the version
+  message, because there is no way for its coordinator to admit you.
+
+- **`ray status` shows saved networks the daemon never brought up.** It looked
+  for them in the config directory of whoever ran it, which on macOS is not the
+  daemon's (the daemon runs as root, so its config lives under `/var/root`), and
+  found an empty one it had just created. Any network whose restore was failing
+  was therefore missing from the output entirely rather than listed as inactive.
+  The daemon now reports them itself, along with why the last restore attempt
+  failed, so the reason is on screen instead of only in the log.
+
+- **A kicked member now actually leaves the network.** `ray kick` removed the
+  member from the roster and cut its connection, but never told it *which*
+  network it had been removed from: a connection close code cannot name one. The
+  kicked node fell back to noticing at its next group poll, and all that does is
+  stop polling, so the network stayed in `ray status` and on disk with the roster
+  frozen at the moment of the kick: joined-looking, carrying no traffic, and
+  needing a manual `ray leave` to clear. It now receives the same in-band,
+  network-scoped notice the automatic (`ray ephemeral`) removal has always sent,
+  confirms it against the signed record, and leaves that one network on its own.
+  Other members were never affected: they reconverge from the published roster.
+
+- **`ray` exits non-zero when a command fails.** Every command that talks to the
+  daemon printed a rejection to stderr and then exited 0, so `ray join` on a
+  spent invite, `ray exit-node use` on a gateway that cannot carry IPv6, and
+  forty-odd others reported success to whatever ran them. They now exit 1.
+  Scripts that only checked the exit status were being told every command
+  worked; scripts that deliberately relied on the old behaviour will need
+  updating. A reply the CLI does not recognise, which is what a `ray` binary
+  and a daemon on different versions produce, exits non-zero for the same
+  reason and now names the version skew as the likely cause.
+- **Taking over `/etc/resolv.conf` no longer breaks DNS on a NetworkManager
+  host that runs its own resolver.** With NetworkManager in `dns=dnsmasq` mode,
+  the server rayfish found in `resolv.conf` is NetworkManager's own local
+  forwarder, and telling NetworkManager to stop managing DNS is exactly what
+  stops it. Rayfish checked for a working upstream *before* that, took the file
+  over on the strength of a resolver it then shut down, and left the host unable
+  to resolve anything outside `.ray`. The check now runs on both sides of that
+  step, and the difference between them is the verdict: if servers that were
+  answering a moment earlier stop, rayfish hands the file back and refuses the
+  takeover with the reason, leaving the host with working DNS and no Magic DNS.
+  A host with no working DNS to begin with (mid-boot, a link still associating)
+  is an ordinary retry rather than that verdict, and the verdict itself has to
+  hold twice before rayfish stops trying, so a passing failure no longer costs
+  you Magic DNS until the next restart.
+- **macOS: `ray down` no longer leaves the machine pointed at a dead resolver.**
+  Bringing the data plane down removed rayfish's DNS configuration and then
+  immediately wrote part of it back, so the Mac was left with a resolver entry
+  naming an address that stops answering the moment the tunnel interface goes.
+  With an exit node selected it was worse: the entry it restored was the
+  catch-all one, so every name on the machine went to it, not just `.ray`.
+- **macOS: a host that both offers and uses an exit node no longer advertises
+  IPv6 it cannot carry.** Checking for an IPv6 uplink asked the routing table,
+  which by then answered with the machine's own tunnel. It published itself as
+  IPv6-capable on the strength of that, and clients that believed it got a
+  tunnel with nowhere to send their traffic.
+- **Offering an exit node no longer turns the host into an IPv4 router.**
+  `ray exit-node allow` enabled IPv4 forwarding and installed an IPv4 NAT rule
+  for `100.64.0.0/10` alongside the IPv6 ones. The mesh carries no IPv4, so
+  there was nothing of ours for either to act on. On macOS and FreeBSD the NAT
+  rule matched on the uplink rather than on the rayfish interface, so the only
+  traffic it could still have caught belonged to another VPN sharing the host.
+  Both are gone; teardown still restores the IPv4 forwarding setting, so a host
+  that enabled it under an older release is put back as before.
+- **Re-applying an exit node no longer lets traffic out around the tunnel while
+  it rebuilds.** Every `ray exit-node` command, and every roster change that
+  reaches a live tunnel, rebuilds the routing rules. The catch-all that sends
+  traffic into the tunnel was torn down first and re-added last, so anything
+  sent in between left the physical uplink with the host's own address. It now
+  stays in place across the rebuild.
+- **Using an exit node no longer cuts off another VPN on the same host.** The
+  full tunnel's routing rules sit above the ones Tailscale (and anything else
+  doing policy routing) installs, and their routes live in a table of their own
+  rather than the main one, so turning our tunnel on black-holed them entirely.
+  Their routes are now copied into the tunnel's own table, and their
+  destinations are directed there, so that VPN keeps working. This covers
+  connections that arrived over it too: an SSH session into this host over its
+  Tailscale address used to die the moment `ray exit-node use` ran, because the
+  replies are sourced from that address and took a rule that looks up the main
+  routing table, where the route isn't.
+- **`ray exit-node status` says when the exit node you picked is not actually
+  carrying anything.** The selection is config and the tunnel is kernel state,
+  and they are allowed to differ: a gateway that stops being usable does not
+  clear your selection, so you can still see what to change. But the line read
+  `using: <peer>` either way, while every packet left directly. It now says the
+  selection is not in effect and why (the routing rules would not install, the
+  data plane is down, the peer is not in the roster yet, or the gateway cannot
+  carry the family this node tunnels).
+- **A coordinator restart can no longer erase a healthy network roster.** If
+  the signed membership blob was temporarily unavailable at startup, a
+  coordinator fell back to its stale config copy and immediately published it
+  as authoritative; that copy could contain only the coordinator, making every
+  member disappear. Coordinator restore now republishes only a complete blob:
+  an authored snapshot whose publication was interrupted, the current signed
+  record, or its last cached content hash.
+- **`.ray` names now resolve alongside another VPN that manages
+  `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
+  the resolution path), Rayfish and a VPN like Tailscale both want that file.
+  Rayfish used to refuse it and `.ray` names stopped resolving for anything
+  that goes through the system resolver, and in the other start order the two
+  overwrote each other every few milliseconds. Rayfish now shares the file
+  instead: its resolver goes in ahead of the other VPN's, the other VPN's stays
+  behind it as the next nameserver, both sets of search domains are kept, and
+  everything outside `.ray` is forwarded to it. Both meshes resolve, whichever
+  VPN wrote the file last. Rayfish writes at most once a minute, so the two
+  cannot spin against each other, and it goes back to managing the file alone
+  once the other VPN leaves.
+- **The other VPN's names keep resolving too.** Sharing `/etc/resolv.conf`
+  means Rayfish is asked first for every name on the host, including the other
+  VPN's. Rather than relay those, Rayfish declines anything outside `.ray`, and
+  the system resolver asks the next server in the file, which is the other
+  VPN's. Its own DNS behaviour applies unchanged, nothing is proxied through
+  Rayfish, and the two cannot end up forwarding to each other in a circle.
+- **DNS comes back when the other VPN leaves.** Neither VPN overwrites a
+  `/etc/resolv.conf` the other is holding, so one that shuts down leaves its
+  resolver named in a file nobody will correct. Rayfish now notices that
+  resolver has stopped answering and releases DNS, so the host regenerates the
+  file and Rayfish takes it over again, instead of the machine being left
+  pointed at a server that is gone.
+- **Shutting down no longer takes the other VPN's DNS with it.** When Rayfish
+  shares `/etc/resolv.conf`, `ray down` (and a crash, and a restart) removes
+  only the lines Rayfish added, leaving the other VPN's resolver and search
+  domains in place, rather than restoring a snapshot of the file from before
+  either VPN was on the host.
+- **Bare hostnames now resolve on hosts without a DNS manager.** `ping box`
+  and `ssh box` worked through systemd-resolved but not on a machine where
+  Rayfish manages `/etc/resolv.conf` or registers with `resolvconf`: the
+  `<network>.ray` and `ray` search domains were only ever handed to
+  systemd-resolved, so on those hosts only the full `box.homelab.ray` resolved.
+  They are now written wherever DNS actually lives, and follow every join and
+  leave.
+- **Rayfish says so when another VPN's resolver outranks it.** With
+  `resolvconf` in the path, both VPNs register a resolver and the system tries
+  them in order, stopping at the first that answers. Second place never sees a
+  `.ray` query, and Rayfish reported success anyway. It now logs which resolver
+  is ahead of it and what to do about it.
+- **The metrics endpoint no longer answers the local network.** The Prometheus
+  exporter bound `0.0.0.0:9090`, so any device on the same Wi-Fi could read
+  it. Its counters name every peer by mesh IP with per-peer round-trip times
+  and traffic volumes, which is a usable picture of who a node talks to and
+  when. It now binds `127.0.0.1:9090`. Scraping from the same machine is
+  unaffected; if you scraped a node remotely, reach it over the mesh.
+- **The mobile app no longer runs a metrics collector.** The Prometheus
+  exporter and its per-peer sampling loop were started on Android too, waking
+  the app every 60 seconds to measure connections for an endpoint that
+  nothing on a phone can scrape. Neither is started there now.
+- **Membership changes reach devices that aren't currently connected.** A
+  coordinator's kick, firewall suggestion or roster edit was only delivered to
+  peers holding a live connection at that moment. Phones and other on-demand
+  nodes drop their links after a couple of idle minutes while remaining
+  reachable, so they routinely missed the notification and worked from a stale
+  roster until their next poll. Coordinators now dial those members to deliver
+  it. Devices that are genuinely offline are left alone for five minutes
+  between attempts rather than being re-dialed on every change.
+
+### Security
+
+- **Unprivileged report requests can no longer overwrite root-owned files.**
+  Diagnostic bundles now use unpredictable, exclusively created paths and set
+  ownership through the open file descriptor, so a symlink planted in `/tmp`
+  cannot redirect the root daemon's report output.
+- **A diagnostic bundle is no longer readable by other users on the machine.**
+  `ray report` packs the daemon's debug logs, status dump, peer ids and mesh
+  IPs, and anyone with a local account can ask for one. The finished archive
+  was left world-readable in `/tmp`, so one user running `ray report` handed
+  all of that to every other user on the box. The bundle is now owned by
+  whoever asked for it and readable by them alone.
+- **Android: a device identifier no longer leaks onto unrelated crash reports.**
+  The install id and network transport meant for diagnostics reports were being
+  written somewhere longer-lived than the report itself, and turned up on an
+  unrelated crash captured seconds later. They are now attached to the one event
+  they belong to and to nothing else.
+
+- **A peer could get past the inbound firewall with a fragmented IPv6 packet.**
+  The packet parser read the protocol and ports at fixed offsets, so any packet
+  carrying an IPv6 extension header (a fragment, hop-by-hop, routing or
+  destination-options header) was recorded as protocol 44 with no ports. That is
+  a single connection-tracking entry matching *every* such packet from that peer,
+  so one ordinary outbound fragment (any UDP send larger than the 1280-byte
+  tunnel MTU) opened a 30-second window in which that peer could reach any local
+  port, whatever the firewall said. The parser now walks the header chain to the
+  real protocol, so a chained packet is classified on its own ports. Fragments
+  are refused outright, first one included: a fragment after the first carries no
+  transport header to classify, and forwarding the first one alone would only put
+  a datagram on the wire that the peer can never reassemble. So a datagram large
+  enough to be fragmented does not cross the mesh. Lower your application's
+  datagram size or let TCP
+  handle it. Refusals are counted as `malformed` drops in `ray status`, so
+  traffic that stops this way is visible rather than silent.
+- **An exit node no longer gives its clients a route onto its own network.** A
+  gateway refused to forward traffic into private IPv4 ranges, loopback and
+  link-local, but an IPv6 LAN is normally a *global* prefix handed out by the
+  ISP, which none of those checks can recognise. A client of the exit node could
+  therefore reach every other machine on the gateway's LAN. The gateway now reads
+  the prefixes it is directly attached to and refuses transit into them, which is
+  what the IPv4 side already had for free.
+- **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
+  control message is addressed to a network by its public key, and that key is
+  a discovery key by design: it is in every invite code and it is the address
+  the network publishes under. Nothing checked that the sender of such a
+  message was actually in the network it named, so anyone who had ever seen an
+  invite could reach the handlers meant for members. They are now refused
+  unless the sender is on that network's roster, apart from the three messages
+  by which a peer that is not on it yet legitimately makes contact (a join
+  request, a hello, and a network-signed record, which is verified against the
+  network key regardless of who carried it).
+- **A device certificate is verified before it can speak for its user.**
+  Certificates bind a device key to a user identity, and that binding is what
+  the inbound firewall, mesh SSH authorization, and own-device file
+  auto-accept match on. A peer that presented a certificate under its own key
+  had that certificate recorded without its signature being checked, so an
+  unsigned one naming somebody else handed the sender that person's firewall
+  rules and SSH access on the receiving node. Certificates are now verified on
+  every path, and one revoked with `ray unpair` grants nothing even though its
+  signature stays valid forever.
+- **Only a coordinator can say who was admitted.** The message announcing a new
+  member was accepted from any sender. Acting on it seats the named peer at an
+  address the message chose, publishes its `.ray` name, and routes to it, so an
+  entry in a node's `.ray` DNS was something a stranger could place there until
+  the next roster sync. It is now honored only from a coordinator.
+- **A signed membership record cannot be rolled back to an older one.** A
+  signature says who wrote a record, never when, and an old record for a network
+  stays valid forever. Nodes compared only whether a record differed from the
+  one they held, so replaying a copy the network had published earlier (which
+  anyone holding the room id could have fetched) re-seated removed members,
+  restored revoked devices, and reverted the suggested firewall. Records are now
+  accepted only if they were authored after the last one applied, on both the
+  mesh and the lookup path.
+- **A pairing ticket now expires.** Opening a pairing session and never
+  completing it left the daemon willing to certify a new device for whoever
+  presented the ticket, indefinitely. Tickets are good for five minutes.
+- **A `ray connect` link hands its key to the one peer it was made for.**
+  Approving a direct connection makes the other peer a co-coordinator, since
+  the link is symmetric. That rule keyed on the network rather than the peer,
+  so anyone approved onto that network afterwards silently received the network
+  key as well. The grant now follows the peer the link was created for.
+- **A wrong guess no longer closes an open pairing window.** The pairing secret
+  was consumed before it was compared, so any dial carrying the wrong bytes
+  ended the pairing session and the real device had to start over. The secret
+  now survives a mismatch, and the comparison is constant-time.
+- **Queues a stranger could grow without limit are now bounded.** Incoming
+  `ray connect` requests and incoming file offers are both capped the way
+  pending join requests already were, dropping the oldest unanswered entry
+  rather than growing forever on a dial anyone can make.
+- **A leave from a peer that was never a member costs nothing.** Such a message
+  still made a coordinator re-sign and republish its membership record and
+  notify every member, each of whom answered with a lookup of their own. It is
+  now ignored.
+
+## [0.3.0] - 2026-08-15
+
+Peers on 0.2.x still connect: the mesh protocol is unchanged (`rayfish/mesh/2`),
+and the signed roster only gained an optional field older builds ignore. Two
+things do break across versions. `--json` goes after the command now
+(`ray status --json`, not `ray --json status`), and an invite code minted by
+this build cannot be redeemed by a peer still on 0.2.x.
+
+### Added
+
+- **Run alongside Tailscale (or any VPN on `100.64.0.0/10`), without setting
+  anything up.** Both claim that range, so until now one of the two lost its
+  IPv4 half and the daemon refused to start. It now notices the other VPN at
+  startup and runs the data plane over `200::/7` only, leaving the CGNAT range
+  to it, saying so in the log and marking it `ipv6-only on (auto)` in
+  `ray status`. Everything keeps working over IPv6: peers, mesh SSH, file
+  transfer, and `.ray` names, which answer AAAA only so nothing hands an app an
+  address that goes nowhere. Peers are told, too, so they stop handing out
+  yours. Exit nodes are the exception; `ray exit-node use` says so.
+
+  The mode ends when the other VPN does, since nothing is written to your
+  config. To pin it either way: `ray config set ipv6-only on` keeps it on
+  regardless, and `off` restores the old behaviour of refusing to start on such
+  a host. `auto` (the default) hands the decision back to the daemon.
+
+- **IPv6-only mode on Android**, under **You**, as Auto / On / Off with Auto the
+  default. The case there is not another VPN (Android runs one at a time) but a
+  carrier that hands the phone a `100.64.x.x` address of its own, which the
+  tunnel would otherwise swallow whole. On Auto the app checks the device's own
+  addresses each time the node starts and switches only when it finds one, so
+  the mode follows the network you are on: the card says which way it went.
+  Changing it reconnects, because the tunnel's addressing is fixed when it is
+  built, so the node is rebuilt and the VPN comes back if it was on.
+
+- **Tab completion, already installed.** The installer and `sudo ray up` write
+  completion scripts for bash, zsh and fish into the directories those shells
+  already search, so there is nothing to source and no rc file to edit: open a
+  new shell and press tab. Completion is live rather than a frozen script, so it
+  offers the networks and peers you actually have (`ray leave <TAB>`,
+  `ray ping <TAB>`, `ray exit-node use <net> <TAB>`), scoped to the network you
+  already named on the line, with each peer's mesh IP and state alongside it.
+  Fixed-choice arguments (`in`/`out`, `allow`/`deny`, `on`/`off`, protocols)
+  complete too. `ray config set <TAB>` lists every settings key with its
+  one-line description, and `ray config set <key> <TAB>` offers that key's
+  values where it has a fixed set (`on`/`off`, `allow`/`deny`) and stays out of
+  the way where it doesn't. A tab never starts the daemon and gives up rather
+  than blocking your shell if it is wedged. `ray uninstall` removes the
+  scripts; `ray completions --install` sets them up on a binary-only install.
+
+- **Mesh SSH supports port forwarding.** `ssh -L`, `ssh -D` and `ProxyJump`
+  through a mesh host work now. Before, the embedded SSH server had no handler
+  for forwarded connections, so every one of them was refused with "channel N:
+  open failed: administratively prohibited" while the shell on the same
+  connection kept working. Any peer allowed to log in can forward; the target
+  socket is opened by the daemon on the remote host, so it reaches loopback-only
+  services there, the same as a shell on that host.
+
+- **Mesh SSH supports reverse forwarding, unix sockets and agent forwarding.**
+  `ssh -R` publishes a port (or a unix socket) from your machine on the remote
+  one, `ssh -L <port>:/path/to.sock` reaches a socket like docker's or
+  gpg-agent's, and `ssh -A` gives the session an `SSH_AUTH_SOCK` that talks back
+  to your agent, so keys stay on your machine. Reverse forwards bind loopback on
+  the remote host, matching sshd's default `GatewayPorts no`. A socket forward
+  is allowed only where the account you logged in as could have used or created
+  that socket itself, so the root daemon doing the work grants nothing extra.
+
+- **A mesh SSH login is a real login now.** An interactive session goes through
+  the host's `login(1)`, so it gets what a directly-spawned shell skipped: the
+  PAM account check (a locked or expired account is refused instead of let in),
+  a proper PAM/logind session with its `XDG_RUNTIME_DIR` and resource limits,
+  the utmp/wtmp records behind `who` and `last`, `/etc/nologin`, and the motd.
+  Root sessions and non-interactive commands still spawn the shell directly:
+  `login` refuses root on a pseudo-terminal, by hanging rather than failing.
+  Set `RAYFISH_SSH_NO_LOGIN=1` on the daemon to turn the handoff off.
+
+- **Sessions know they are remote.** `SSH_CONNECTION`, `SSH_CLIENT` and (on a
+  terminal) `SSH_TTY` are set, so prompts, `screen`, and scripts that check
+  whether they are running over SSH behave the way they do everywhere else.
+
+- **Mesh SSH passes locale environment variables and signals.** `SendEnv` /
+  `SetEnv` of `LANG`, `LC_*`, `TZ`, `TERM` and `COLORTERM` reach the session
+  (anything else is refused, since it would let the other side steer your login
+  shell), a client's signal request reaches the running process, and a process
+  killed by a signal is reported as that signal instead of a made-up exit code.
+  X11 forwarding is still not supported, but `ssh -X` now says so instead of
+  waiting on a reply that never came.
+
+- **`ray mdns scan` lists the rayfish nodes on your LAN.** mDNS discovery has
+  always run in the background, but it only fed the connection layer: there was
+  no way to see what it found. The scan shows each neighbour's id, addresses,
+  how long ago it was seen, and whether you already share a network with it.
+  `ray status` grew a "nearby" block listing the ones you are not connected to
+  (up to five, then it points at the scan), so a new machine on the LAN is
+  visible without knowing the command exists. Seeing a node grants it nothing:
+  it is a sighting, not a relationship.
+
+- **`ray connect` accepts a LAN neighbour's id.** Passing an id from `ray mdns
+  scan` dials that peer straight over the local network, skipping the DHT
+  contact lookup, so two machines can link up on a LAN with no internet.
+  Approval is unchanged: the other side still has to run `ray connections
+  approve`. Note this means anyone on your LAN can send you a connect request
+  without knowing your contact id, so rotating that id no longer stops local
+  requests. They still cannot link to you without your approval.
+
 - **Service management works on Linux without systemd.** `ray up`, `install`,
   `start`, `stop`, `restart` and `uninstall` now detect the host's init system
   and install the matching service: a systemd unit, an OpenRC service (Alpine,
@@ -18,10 +619,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of leaving you to guess. Under SysV init nothing supervises the daemon, so
   `ray up` says so: a crash stays down until the next `ray start`.
 
-- **Windows x64 desktop build path.** The daemon now has a LocalSystem service,
-  SID-authorized named-pipe IPC, signed Wintun/MSI packaging, Windows route/DNS
-  integration, and bounded in-band file transfer. Windows SSH/PTY remains
-  explicitly unsupported in this first port.
+- **Windows x64 support.** Rayfish installs from an MSI as a LocalSystem
+  service and runs the same commands as on Linux and macOS. IPC is a named pipe
+  authorized by Windows SID, the tunnel is Wintun (pinned and signature-checked
+  at build time), and routes, DNS and search domains are set up on the Rayfish
+  adapter only, leaving the rest of the machine's configuration alone. `ray
+  update` upgrades in place through the MSI. Two gaps in this first port: `ray
+  firewall ssh` is not available on Windows, and the MSI is not yet
+  code-signed, so the first install goes through a SmartScreen warning.
+
+- **Android: toggle the tunnel from quick settings.** Rayfish now offers a
+  quick settings tile, so the tunnel goes on and off from the shade without
+  opening the app. Turning it off there does exactly what the app's toggle and
+  the notification's "Disable" button do, so files keep working with the VPN
+  off unless you asked to go fully offline when disabled. The tile shows
+  whether the tunnel is actually up, not just whether it was asked for. On a
+  device that has not granted the VPN yet, the first tap raises the system
+  consent dialog and then brings the tunnel up; after that the tile does its
+  work without opening anything.
 
 - **The Android app can cancel a queued send.** A send waiting on a peer that
   hasn't picked it up now shows under Notifications with a Cancel button, the
@@ -36,6 +651,72 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   manage from `ray firewall`.
 
 ### Changed
+
+- **`ray config get`/`set` now reaches every single-value setting**, not just
+  the relay/DNS ones: `firewall.enabled`, `firewall.reject`,
+  `firewall.default-in`, `ssh`, `mdns`, `download-dir` and `download-user` are
+  all settable by name. The dedicated commands (`ray firewall off`,
+  `ray firewall ssh on`, `ray files download-dir`, `ray mdns off`, …) are
+  unchanged and still the recommended spelling; they now share one code path
+  with `ray config`, so a setting behaves the same whichever way you write it.
+  A bare `ray config get` prints all twelve, and `ray config set --help` lists
+  each key with a one-line description, so nothing is reachable only by
+  guessing its name.
+
+- **`ray firewall default ALLOW` is accepted**, matching
+  `ray config set firewall.default-in ALLOW`. The two spellings of the same
+  setting disagreed on capitalisation.
+
+- **A mistyped config key is reported by name, even with the daemon stopped.**
+  `ray config get|set|unset <key>` checks the key before it connects, so a typo
+  reads as "unknown config key: …" with the list of valid ones instead of
+  "rayfish daemon is not running". A request the daemon cannot decode at all now
+  comes back as an error rather than a closed connection, which the client could
+  only report as "connection closed".
+
+- **`ray -h` groups its commands instead of listing all 44 in one run.** The
+  list is now broken into Networks, Members & access, Devices & links, Files,
+  Policy, Service, Diagnostics and Setup, so you can find the command you want
+  by looking in the obvious place rather than reading the whole page. Each
+  command is described in one line that fits an 80-column terminal, where
+  several used to be full paragraphs that wrapped; the detail they carried moved
+  to `ray help <command>`, which the foot of the page now points at.
+
+- **`--json` is only accepted by the commands that produce JSON.** It used to be
+  accepted everywhere and honoured by 16 commands, so `ray version --json` and
+  `ray up --json` printed their usual text and gave no hint that the flag did
+  nothing. Those now report an unknown argument, and `--json` is listed only in
+  the help of commands that support it. **This is a breaking change** if you
+  wrote the flag before the command: `ray --json status` no longer parses, and
+  becomes `ray status --json` (the form the docs already used, and the one the
+  error message suggests). Writing it after a subcommand's action, as in
+  `ray firewall show --json`, is unaffected.
+
+- **Magic DNS falls back to your normal DNS for any name the mesh doesn't
+  hold.** A network named `dev` used to be registered with the OS as its own
+  domain, so every lookup under it, `zed.dev` included, was captured by rayfish
+  and answered NXDOMAIN instead of going to the real internet. Rayfish now
+  answers only names its roster actually has, and hands everything else to the
+  system resolver: `zed.dev` reaches the real site, while a peer named `box` on
+  network `dev` still resolves as `box`, `box.ray`, `box.dev` and
+  `box.dev.ray`. The `.ray` suffix itself stays rayfish's either way: a name
+  under it that no peer holds is failed here rather than asked of a public
+  resolver, so it starts resolving the moment the peer appears instead of
+  staying cached as missing for up to a day. Bare network names are no longer
+  registered with the OS, so
+  the suffix-less `<host>.<network>` form works where rayfish sees all your
+  queries (the resolv.conf backend, an active exit node, Android) and `.ray`
+  works everywhere. One consequence worth knowing: if a peer's name matches the
+  public name you wanted (a peer literally called `zed` on network `dev`), the
+  peer wins; use the public FQDN or rename the peer.
+
+- **Android crash reports now say how the app died when it dies silently.** A
+  low-memory kill or a background stall used to leave either nothing at all or a
+  report with no indication of what was stuck, which is the difference between a
+  bug that can be fixed and one that can only be guessed at. Reports now carry
+  Android's own record of the exit, including which component was busy. Still
+  covered by the crash reporting toggle in You: turn it off and nothing is read
+  or sent.
 
 - **Android transfer notifications show the percentage next to the progress
   bar.** A bar on its own says something is moving but not how far along it is,
@@ -65,6 +746,149 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peer on a build older than this one cannot redeem them.
 
 ### Fixed
+
+- **A host whose own DNS is broken no longer takes Rayfish down with it.** The
+  daemon looked up the relay and the discovery server through whatever
+  `/etc/resolv.conf` named, so a machine whose nameserver had stopped answering
+  got no relay connection, no record publishing, and a `ray join` that failed
+  with a DNS error there was nothing to do about. It now keeps its own short
+  list of resolvers for those two names: your configured `dns_upstreams` first,
+  then the host's, then a public resolver as a last resort, so the node still
+  reaches the network while the host's DNS is down. Only Rayfish's own
+  infrastructure names go there, never anything from the mesh or from your
+  traffic, and `ray config set dns-upstreams <ip> --replace` pins it to servers
+  you name. This also settles a chicken-and-egg case: a daemon that started
+  while its own Magic DNS address was still listed in `resolv.conf` (after a
+  crash, or a restart before the file was restored) used to wait for the tunnel
+  it was trying to bring up.
+
+- **A network a peer has left no longer blocks traffic to that peer.** Where you
+  shared two networks with someone and they left one without you hearing about
+  it — they were offline, or you hold the network so nothing corrects your
+  roster — every packet to them was stamped with the network they had left, and
+  they dropped all of it. Their `.ray` names still resolved, so it looked like
+  the mesh was up and the connection simply timed out both ways, and deleting
+  the leftover network fixed it instantly. Traffic is now attributed to a
+  network the peer agrees you share, and the log names the one that fell away.
+
+- **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh <host>.<net>.ray`
+  failed with "nodename nor servname provided" on a Mac sharing the host with
+  another VPN, while `dig` against the same resolver answered instantly: macOS
+  was never asking us for AAAA records, and AAAA is the only answer that mode
+  has. It asks for both families now. The mesh range being `200::/7` had nothing
+  to do with it; macOS was declining to ask because our resolver's service
+  published no default route and so did not count as having IPv6 at all. The
+  service now says it has one, while ranking itself so it can never become the
+  primary route or take over the host's IPv6 traffic. Another VPN's DNS, routes
+  and search domains are untouched.
+
+- **Direct connections over IPv6.** The daemon bound a UDP socket for IPv4 only,
+  so a peer on an IPv6-only network could be reached through a relay and never
+  directly, and this node offered no IPv6 address for others to try. Both
+  families are bound now, on any interface. A host with IPv6 disabled is
+  unaffected: that bind is allowed to fail.
+
+- **A tailnet address is no longer published in your public record.** A host
+  running Rayfish next to Tailscale advertised its `fd7a:115c:a1e0::/48` address
+  as a way to reach it. No peer could route to it, and it told anyone reading
+  the record that the tailnet exists.
+
+- **Two VPNs no longer fight over `/etc/resolv.conf`.** Where Rayfish manages
+  that file directly and re-asserts it on every write, another VPN doing the
+  same thing meant the pair rewrote each other and the host's DNS came and went.
+  Rayfish now leaves the file to whoever holds it and says what to do instead.
+
+- **A clash on `100.64.0.0/10` is now detected on a stock server.** The startup
+  check shelled out to `ifconfig` and treated a missing binary as "no clash", so
+  on hosts without net-tools (most of them) Rayfish started anyway and quietly
+  lost its IPv4 half to the other VPN. It reads the kernel's address list now.
+
+- **The host-firewall warning now reads the ruleset that actually applies.** It
+  always checked `iptables`, but in IPv6-only mode mesh SSH listens on IPv6, so
+  a host with a default-DROP `ip6tables` policy was told everything was fine and
+  `ssh` hung with no explanation. It reads `ip6tables` in that mode, and the
+  command it prints opens the right family.
+
+- **An exit node no longer masquerades another VPN's traffic.** The NAT rule
+  matched any packet sourced from `100.64.0.0/10`, a range Rayfish does not own
+  exclusively, so a host acting as both a Rayfish exit node and a Tailscale
+  subnet router NAT'd the other's forwarded traffic too. It now matches only
+  what arrived on the Rayfish interface.
+
+- **On Android, Rayfish comes back after being turned off with "go fully
+  offline when disabled" set.** Turning it back on could leave the phone
+  offline for good: the previous node released its blob store only after the
+  fact, if at all, and a start that overlapped it waited for a database lock
+  that was never coming, with nothing in the app to say so. Stopping now
+  releases the store before it returns, starting gives up rather than waiting
+  forever, and a start that does fail is reported instead of passing in
+  silence.
+
+- **On Android, moving between networks no longer leaves the phone on dead
+  sockets.** Only a full network switch was forwarded to the core, so a Wi-Fi
+  roam between access points, a DHCP renew or an address change on the same
+  network went unnoticed and the phone stayed invisible to its peers. Those
+  changes now rebind, and turning Rayfish off and on does too, so the obvious
+  thing to try when peers look disconnected actually recovers it.
+
+- **A mesh SSH terminal session can no longer go silent while its shell keeps
+  running.** If the program on the far end closed and reopened its terminal
+  while starting up, the daemon's read of the pseudo-terminal ended there and
+  nothing it printed after that reached you, with the session apparently hung.
+
+- **A dropped mesh SSH connection no longer leaves your login shell running.**
+  When a session channel closed, or the whole connection went away, whatever was
+  running under it kept running on the remote host. It now gets hung up, the way
+  a stock sshd does.
+
+- **Mesh SSH serves every session on a multiplexed connection, not just the
+  first.** With `ControlMaster` (`ssh -M`, and every tool that reuses one
+  connection, such as Zed remote development) only the first command ran: each
+  later one hung forever with no output, no exit status, and no error on either
+  side. The server kept the login and channel state in one slot per connection,
+  so the first session consumed it and the rest quietly started nothing.
+  Sessions are now tracked per channel, concurrent channels no longer take over
+  each other's PTY or output, and a session that cannot start closes its channel
+  with an error instead of hanging.
+
+- **`scp` and `sftp` work over mesh SSH.** Both hung with no output and no
+  error until you interrupted them. OpenSSH 9.0 and newer `scp` copies files
+  over the SFTP protocol rather than the old rcp one, and the mesh SSH server
+  had no handler for the `sftp` subsystem, so it never answered the request and
+  the client waited forever. It now serves the subsystem using the host's
+  sftp-server, picking up the path and flags from the host's own sshd config.
+  On a host with no sftp-server installed the client is told so straight away
+  instead of hanging, and the daemon log names the package to install.
+  Interactive `ssh` was unaffected.
+
+- **`ray firewall ssh allow` now tells you when the SSH server is off.** The
+  rule was saved and reported as if it had taken effect, but with the server off
+  a connection falls through to the host's own sshd and asks for a password,
+  which looks like the rule was ignored rather than never applied. Both `allow`
+  and `ssh show` now say the rules are inactive and point at
+  `ray firewall ssh on`.
+
+- **A saved network no longer stays dead until you restart the daemon.** A
+  network that failed to connect at startup stayed in your config but was never
+  restored: peers on it were unreachable and their packets were dropped as
+  belonging to an unknown network, while the node otherwise looked healthy. The
+  daemon now re-checks every minute that each saved network is actually
+  connected and restarts the ones that aren't, and a peer sending traffic for a
+  network in that state triggers the retry immediately instead of waiting for
+  the next check. This covers coordinator networks too, which previously got one
+  attempt at startup and no retry at all. `ray status` spells out what the
+  `inactive` marker means (saved, not connected, peers unreachable, being
+  retried) instead of leaving it as a one-word footnote, and the daemon log
+  records why a restore stopped rather than ending it silently.
+
+- **The Android app no longer crashes when Android restarts it in the
+  background.** After the system killed the app to reclaim memory, it would
+  restart the Rayfish service to put it back in standby (VPN off, files and mesh
+  visibility still working). Android refuses that kind of background start unless
+  a tunnel is up, and the refusal took the whole app down: a crash report, and a
+  device that quietly dropped off the mesh instead of coming back. The refusal is
+  now handled: the app stops cleanly and restores standby the next time you open
+  it or turn the VPN on.
 
 - **Android no longer leaves a VPN connected after a failed tunnel start.** When
   bringing the tunnel up failed partway (the mesh node had not started yet, say),
@@ -195,6 +1019,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   version.
 
 ### Performance
+
+- **Mesh SSH commands start faster.** The sockets carrying SSH left Nagle on, so
+  every small request/response exchange waited on the Nagle/delayed-ACK standoff
+  instead of going out at once. Over a 34 ms link, opening a session channel on
+  an established connection cost 117 ms, roughly 3.4 round trips where 1-2 is
+  the floor. Ansible, which opens a channel per task, paid that on every one.
+  Forwarded connections in both directions and the local `ray gui` server got
+  the same treatment.
 
 - **Cheaper per-packet receive.** Every datagram arriving from a peer re-resolved
   the TUN writer through two atomic reference-count operations. Readers now keep
@@ -970,7 +1802,8 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rayfish/rayfish/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rayfish/rayfish/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rayfish/rayfish/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/rayfish/rayfish/compare/v0.1.3...v0.1.4

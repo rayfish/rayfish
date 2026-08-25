@@ -77,9 +77,14 @@ wait_roster "$A" srv-b srv-c
 SB="$(on "$B" 'ray status' | strip)"; SC="$(on "$C" 'ray status' | strip)"
 B_IP="$(own_ip "$SB")"; C_IP="$(own_ip "$SC")"
 echo "   B_IP=$B_IP  C_IP=$C_IP"
+# Hard stop, not a skipped probe. Step 5 asserts revocation by pinging $B_IP and
+# reads an empty target as "no route", so a missing address here does not skip
+# that assertion, it passes it: `ping` prints usage, the loss parse comes back
+# empty, and the run reports a severed peer it never reached in the first place.
+[[ -n "$B_IP" && -n "$C_IP" ]] || { fail "could not read srv-b/srv-c mesh IPv6"; summary; }
 
 # Baseline: C can reach B before revocation.
-[[ -n "$C_IP" && -n "$B_IP" ]] && png "$C" "$B_IP" "baseline: srv-c -> srv-b reachable"
+png "$C" "$B_IP" "baseline: srv-c -> srv-b reachable"
 
 # ---------------------------------------------------------------------------
 step "3. srv-a lists its paired devices (ray pair list)"
