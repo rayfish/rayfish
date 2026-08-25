@@ -304,15 +304,27 @@ mod tests {
         assert!(timeout.to_string().contains("timed out"));
     }
 
+    /// The timeout is the whole test: the tree is killed by it, not by anything
+    /// the script does. So it has to be long enough for the parent to publish
+    /// the descendant's pid first, and everything before that write is on the
+    /// clock: spawning powershell.exe suspended, resuming it, and then the
+    /// engine's own start. That last term is the one that moves. It is under a
+    /// second on an idle machine and several on a loaded CI runner, which is
+    /// where a three-second budget used to lose the race and fail here on a
+    /// missing pid file rather than on the descendant it means to test.
+    const PUBLISH_AND_KILL: Duration = Duration::from_secs(12);
+
     #[tokio::test]
     async fn ddd_job_close_kills_descendants_and_releases_inherited_pipes() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("descendant.pid");
         let quoted_path = pid_file.to_string_lossy().replace('\'', "''");
+        // Both sleeps outlast the timeout by a wide margin, so a descendant that
+        // is gone afterwards was killed and did not simply finish.
         let script = format!(
-            "$child=Start-Process powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru; Set-Content -LiteralPath '{quoted_path}' -Value $child.Id; Start-Sleep -Seconds 30"
+            "$child=Start-Process powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60') -WindowStyle Hidden -PassThru; Set-Content -LiteralPath '{quoted_path}' -Value $child.Id; Start-Sleep -Seconds 60"
         );
-        let error = WindowsProcessRunner::with_timeout(Duration::from_secs(3))
+        let error = WindowsProcessRunner::with_timeout(PUBLISH_AND_KILL)
             .powershell(&script, "spawn descendant tree")
             .await
             .unwrap_err();
@@ -324,7 +336,11 @@ mod tests {
         );
 
         let pid: u32 = std::fs::read_to_string(&pid_file)
-            .expect("parent must publish descendant pid before timeout")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "parent must publish the descendant pid within {PUBLISH_AND_KILL:?}: {error}"
+                )
+            })
             .trim()
             .parse()
             .unwrap();
