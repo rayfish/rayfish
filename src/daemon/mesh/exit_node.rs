@@ -238,10 +238,6 @@ impl NetworkRegistry {
         peer: &str,
         allow: bool,
     ) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
         // Resolve to a stored allow-entry: `*` stays literal, otherwise the peer's
         // **user identity** hex, so a paired multi-device peer matches on any of
         // its devices (same normalization the SSH allow-list uses).
@@ -253,21 +249,21 @@ impl NetworkRegistry {
                 None => return ipc_err(format!("could not resolve peer: {peer}")),
             }
         };
-        let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) else {
-            return ipc_err(format!("no such network: {network}"));
-        };
-        if allow {
-            if !net.exit_allow.iter().any(|p| p == &entry) {
-                net.exit_allow.push(entry.clone());
+        let net = match config::update_network(network, |net| {
+            if allow {
+                if !net.exit_allow.iter().any(|p| p == &entry) {
+                    net.exit_allow.push(entry.clone());
+                }
+            } else {
+                net.exit_allow.retain(|p| p != &entry);
             }
-        } else {
-            net.exit_allow.retain(|p| p != &entry);
-        }
+            Ok(())
+        }) {
+            Ok(Some(net)) => net,
+            Ok(None) => return ipc_err(format!("no such network: {network}")),
+            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
+        };
         let offering = !net.exit_allow.is_empty();
-        let net = net.clone();
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to persist network config: {e}"));
-        }
         // Not advertised from here: the roster flag must reflect a gateway that
         // actually forwards, so [`Self::sync_exit_offers`] publishes it only once
         // the reconcile has the kernel state in place (now if the daemon is up,
@@ -292,10 +288,6 @@ impl NetworkRegistry {
     /// over IPv4 alone would receive this node's traffic and have no uplink to
     /// masquerade it onto. Refusing here turns a silent black hole into a sentence.
     pub(crate) async fn exit_node_use(&self, network: &str, peer: Option<String>) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
         // Validate the selection against the live roster before persisting.
         // Set when the gateway is allowed on an absent IPv6 claim rather than a
         // positive one, so the reply can say so: a log line is not where someone
@@ -329,13 +321,13 @@ impl NetworkRegistry {
             }
             None => None,
         };
-        let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) else {
-            return ipc_err(format!("no such network: {network}"));
-        };
-        net.exit_node_use = selection;
-        let net = net.clone();
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to persist network config: {e}"));
+        match config::update_network(network, |net| {
+            net.exit_node_use = selection;
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            Ok(None) => return ipc_err(format!("no such network: {network}")),
+            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
         }
         // "All traffic" would be a lie: the mesh carries no IPv4, so the tunnel
         // takes IPv6 and leaves the host's IPv4 egress where it already was. Say

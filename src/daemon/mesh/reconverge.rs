@@ -517,7 +517,7 @@ pub(crate) async fn apply_roster_to_dns(
         .find(|m| m.identity == my_identity)
         .and_then(|m| m.hostname.clone());
 
-    if let Ok(Some(mut net)) = config::load_network(network_name) {
+    let _ = config::update_network(network_name, |net| {
         match net.pending_hostname.clone() {
             // A locally-requested rename is in flight. Until the blob confirms
             // it, keep showing/persisting the requested name and don't let a
@@ -538,13 +538,11 @@ pub(crate) async fn apply_roster_to_dns(
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);
-                    let _ = config::save_network(&net);
                 }
             }
             // Either the rename landed, or there was none: follow the blob and
             // clear any (now-confirmed) pending intent.
             pending => {
-                let mut dirty = false;
                 if let Some(p) = &pending {
                     tracing::info!(
                         network = %network_name,
@@ -553,21 +551,16 @@ pub(crate) async fn apply_roster_to_dns(
                         "rename confirmed by signed blob; clearing pending intent"
                     );
                     net.pending_hostname = None;
-                    dirty = true;
                 }
                 if let Some(mine) = blob_self.clone()
                     && net.my_hostname.as_deref() != Some(mine.as_str())
                 {
                     net.my_hostname = Some(mine);
-                    dirty = true;
-                }
-                if dirty {
-                    let _ = config::save_network(&net);
                 }
             }
         }
-    }
-
+        Ok(())
+    });
     dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
 }
 

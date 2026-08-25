@@ -155,6 +155,7 @@ pub(crate) async fn join_mesh_shared(
         auto_accept_firewall,
         auto_accept_files,
         direct_key.as_ref(),
+        initial,
     )?;
 
     let remote_id = initial_conn.remote_id();
@@ -277,59 +278,61 @@ fn persist_join_config(
     // network key so we survive a restart as a key-holder (a plain member persists
     // `None`).
     direct_key: Option<&SecretKey>,
+    initial: bool,
 ) -> Result<()> {
     let persisted_hostname = members
         .iter()
         .find(|m| m.identity == my_identity)
         .and_then(|m| m.hostname.clone())
         .or(my_hostname.clone());
-    // Preserve across reconnects/restores state the just-fetched blob doesn't
-    // carry: the direct-connection flag, a queued rename intent, the SSH allow
-    // list, node-local aliases, and the local exit-node policy (server
-    // allow-list + selected exit peer). Anything node-local left out of this
-    // list is silently erased on every member daemon restart.
-    let prev = config::load_network(network_name)?;
-    let (direct, direct_peer, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) = prev
-        .as_ref()
-        .map(|n| {
-            (
-                n.direct,
-                n.direct_peer,
-                n.pending_hostname.clone(),
-                n.ssh_allow.clone(),
-                n.aliases.clone(),
-                n.auto_accept_files,
-            )
-        })
-        .unwrap_or((false, None, None, vec![], BTreeMap::new(), false));
-    let (exit_allow, exit_node_use) = prev
-        .map(|n| (n.exit_allow, n.exit_node_use))
-        .unwrap_or((vec![], None));
-    // The toggle command (`ray files auto-accept`) is authoritative, so preserve
-    // a previously-persisted value; the join-time `--auto-accept-files` seed only
-    // needs to take effect on the first join (no prior config).
-    let auto_accept_files = prev_auto_accept_files || auto_accept_files;
-    config::save_network(&config::NetworkConfig {
+    // Reconnects replace only data learned from the join. Node-local policy is
+    // updated against the latest saved config so an unrelated concurrent write
+    // cannot be lost; a fresh join inserts these defaults atomically.
+    let member_entries = to_member_entries(members.iter());
+    let approved_entries = to_approved_entries(approved.iter());
+    let initial_config = config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
-        my_hostname: persisted_hostname,
-        pending_hostname,
-        members: to_member_entries(members.iter()),
-        approved: to_approved_entries(approved.iter()),
+        my_hostname: persisted_hostname.clone(),
+        members: member_entries.clone(),
+        approved: approved_entries.clone(),
         network_secret_key: direct_key.cloned(),
         network_public_key: Some(net_pubkey),
-        transport: None,
         auto_accept_firewall,
         auto_accept_files,
-        admins: vec![],
-        direct,
-        direct_peer,
-        ssh_allow,
-        aliases,
-        ephemeral_ttl_secs: None,
-        exit_allow,
-        exit_node_use,
-    })
+        ..Default::default()
+    };
+    let update = |net: &mut config::NetworkConfig| {
+        net.group_mode = GroupMode::Restricted;
+        // A rename requested while the handshake was in flight is newer than
+        // the roster projection we just received.
+        if net.pending_hostname.is_none() {
+            net.my_hostname = persisted_hostname;
+        }
+        net.members = member_entries;
+        net.approved = approved_entries;
+        if let Some(key) = direct_key {
+            net.network_secret_key = Some(key.clone());
+        } else if initial {
+            net.network_secret_key = None;
+        }
+        net.network_public_key = Some(net_pubkey);
+        if initial {
+            net.auto_accept_firewall = auto_accept_firewall;
+            net.auto_accept_files |= auto_accept_files;
+        }
+        Ok(())
+    };
+    if initial {
+        config::update_network_or_insert(network_name, initial_config, update)?;
+    } else {
+        let updated = config::update_network(network_name, update)?;
+        anyhow::ensure!(
+            updated.is_some(),
+            "network config was deleted while reconnecting"
+        );
+    }
+    Ok(())
 }
 
 /// Build the in-memory `NetworkState` cell for a joined member from the admitted
@@ -654,22 +657,23 @@ mod persist_config_tests {
         // Pre-existing config: this node offers an exit (`*`) and routes its own
         // traffic through a chosen peer. This is the state a restart must keep.
         let exit_peer = id(3).to_string();
+        let admin_key = SecretKey::generate();
         config::save_network(&NetworkConfig {
             name: "homelab".to_string(),
             group_mode: GroupMode::Restricted,
-            my_hostname: Some("umbrel".to_string()),
-            pending_hostname: None,
+            my_hostname: Some("new-name".to_string()),
+            pending_hostname: Some("new-name".to_string()),
             members: vec![MemberEntry {
                 identity: me,
                 is_coordinator: false,
                 hostname: Some("umbrel".to_string()),
             }],
             approved: vec![],
-            network_secret_key: None,
+            network_secret_key: Some(admin_key.clone()),
             network_public_key: Some(net_pubkey),
             transport: None,
-            auto_accept_firewall: false,
-            auto_accept_files: false,
+            auto_accept_firewall: true,
+            auto_accept_files: true,
             admins: vec![],
             direct: false,
             direct_peer: None,
@@ -693,6 +697,7 @@ mod persist_config_tests {
             false,
             false,
             None,
+            false,
         )
         .unwrap();
 
@@ -707,6 +712,75 @@ mod persist_config_tests {
             Some(exit_peer),
             "selected exit peer must survive a reconnect"
         );
+        assert!(after.auto_accept_firewall);
+        assert!(after.auto_accept_files);
+        assert_eq!(
+            after.network_secret_key.as_ref().map(SecretKey::to_bytes),
+            Some(admin_key.to_bytes()),
+            "a reconnect without a direct key must not demote a saved co-coordinator"
+        );
+        assert_eq!(after.my_hostname.as_deref(), Some("new-name"));
+        assert_eq!(after.pending_hostname.as_deref(), Some("new-name"));
+
+        persist_join_config(
+            "homelab",
+            &[member(2, false), member(4, true)],
+            &[],
+            me,
+            net_pubkey,
+            &Some("umbrel".to_string()),
+            false,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let after_fresh_join = config::load_network("homelab").unwrap().unwrap();
+        assert!(
+            !after_fresh_join.auto_accept_firewall,
+            "a fresh join's firewall-consent flag must replace a saved value"
+        );
+        assert!(
+            after_fresh_join.auto_accept_files,
+            "a fresh join must not turn off an existing file-auto-accept opt-in"
+        );
+        assert!(
+            after_fresh_join.network_secret_key.is_none(),
+            "a fresh member join must clear a stale coordinator key"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_does_not_recreate_a_deleted_network_config() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let result = persist_join_config(
+            "homelab",
+            &[member(2, false), member(4, true)],
+            &[],
+            me,
+            net_pubkey,
+            &Some("umbrel".to_string()),
+            false,
+            false,
+            None,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert!(config::load_network("homelab").unwrap().is_none());
 
         unsafe {
             match prev {
