@@ -5,6 +5,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
 use std::sync::Mutex;
@@ -829,23 +830,33 @@ fn validate_net_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Serial number for temp file names, so two writers in this process never
+/// share one. See [`write_file`].
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Re-establish the durability barrier for a file already in place: fsync the
+/// file, then the directory entry naming it. A [`write_file`] that failed
+/// ambiguously may have installed the bytes anyway, so a no-op retry still has
+/// to prove the result is on disk before anything is allowed to point at it.
 fn sync_file_and_parent(path: &Path) -> Result<()> {
     let dir = path.parent().context("config path has no parent")?;
     std::fs::File::open(path)
-        .with_context(|| format!("opening {} for sync", path.display()))?
+        .with_context(|| format!("opening {} to sync", path.display()))?
         .sync_all()
         .with_context(|| format!("syncing {}", path.display()))?;
-    std::fs::File::open(dir)
-        .with_context(|| format!("opening config directory {} for sync", dir.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing config directory {}", dir.display()))?;
-    Ok(())
+    sync_dir(dir)
 }
 
-/// Atomically write `bytes` to `path`: write a sibling temp file, set its
-/// perms/owner, then rename over the target. The rename is atomic on POSIX, so
-/// a concurrent reader sees either the old file or the new one, never a torn
-/// one. `secret` selects 0600 root:root vs 0640 root:rayfish.
+/// Atomically and durably write `bytes` to `path`: write a sibling temp file,
+/// set its perms/owner, then rename over the target. The rename is atomic on
+/// POSIX, so a concurrent reader sees either the old file or the new one, never
+/// a torn one. `secret` selects 0600 root:root vs 0640 root:rayfish.
+///
+/// Returning `Ok` means the bytes are on disk and reachable under `path` after
+/// a power loss, not just in the page cache: the contents are fsynced before
+/// the rename and the directory entry after it, and a failure of either is an
+/// error rather than a shrug. Callers that persist a pointer to something else
+/// (the coordinator recovery hash) depend on that barrier being exact.
 ///
 /// Public so every rayfish config writer (identity key, invite ledger, etc.)
 /// shares the same atomic + restrictive-perms guarantees under the config tree.
@@ -856,36 +867,53 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config");
-    let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
-    let mode = if secret { 0o600 } else { 0o640 };
-    let prepared = (|| -> Result<()> {
+    // The pid keeps two processes apart and the counter keeps two threads of
+    // this one apart. A temp path shared by two writers of the same file lets
+    // one rename a file the other has only half filled.
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+    let staged = stage_temp(&tmp, bytes, secret).and_then(|()| {
+        std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
+    });
+    if staged.is_err() {
+        // Clean up on any failure so we don't litter: the temp path is ours
+        // alone, so nothing else can be waiting on it.
+        let _ = std::fs::remove_file(&tmp);
+        return staged;
+    }
+    sync_dir(dir)
+}
+
+/// Fill `tmp` with `bytes` and give it the target's perms/owner, leaving it
+/// ready to rename into place.
+fn stage_temp(tmp: &Path, bytes: &[u8], secret: bool) -> Result<()> {
+    {
         use std::io::Write;
         let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
-        let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
-        #[cfg(target_os = "linux")]
-        set_owner(&tmp, secret);
+        // Discarding this used to report a write as saved while the bytes were
+        // still only in the page cache, so a crash could roll the file back to
+        // its previous contents with nothing having failed.
         f.sync_all()
             .with_context(|| format!("syncing {}", tmp.display()))?;
-        Ok(())
-    })();
-    if let Err(e) = prepared {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
     }
-    let renamed = std::fs::rename(&tmp, path);
-    if renamed.is_err() {
-        // Clean up the temp file on a failed rename so we don't litter.
-        let _ = std::fs::remove_file(&tmp);
-    }
-    renamed.with_context(|| format!("renaming into {}", path.display()))?;
-    std::fs::File::open(dir)
-        .with_context(|| format!("opening config directory {} for sync", dir.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing config directory {}", dir.display()))?;
+    let mode = if secret { 0o600 } else { 0o640 };
+    let _ = std::fs::set_permissions(tmp, Permissions::from_mode(mode));
+    #[cfg(target_os = "linux")]
+    set_owner(tmp, secret);
     Ok(())
+}
+
+/// fsync a directory, so a rename into it survives a power loss. Without this
+/// the new file's contents are durable but the name is not, and the target can
+/// come back as the old file or as nothing at all.
+fn sync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .with_context(|| format!("opening {} to sync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing {}", dir.display()))
 }
 
 fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
@@ -2138,6 +2166,7 @@ name = "test"
                 barrier.wait();
                 update_network_in(&dir, "homelab", |net| {
                     net.last_group_hash = Some(blake3::hash(b"latest group"));
+                    net.auto_accept_files = false;
                     Ok(())
                 })
                 .unwrap();
@@ -2151,6 +2180,7 @@ name = "test"
             Some("id-alice")
         );
         assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"latest group")));
+        assert!(!loaded.auto_accept_files);
     }
 
     #[test]
@@ -2162,6 +2192,7 @@ name = "test"
 
         update_network_or_insert_in(dir, "homelab", initial, |net| {
             net.last_group_hash = Some(blake3::hash(b"first group"));
+            net.auto_accept_firewall = true;
             Ok(())
         })
         .unwrap();
@@ -2180,6 +2211,7 @@ name = "test"
             Some("first")
         );
         assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"first group")));
+        assert!(loaded.auto_accept_firewall);
         assert_eq!(loaded.my_hostname.as_deref(), Some("latest"));
     }
 
@@ -2290,5 +2322,39 @@ name = "test"
 
         remove_pending_join_in(dir, "abc123").unwrap();
         assert!(load_in(dir).unwrap().pending_joins.is_empty());
+    }
+
+    /// The temp file was named `.{fname}.tmp.{pid}`: one path per file per
+    /// process, so two threads writing the same config opened the same temp
+    /// file and one could rename a file the other was still filling. The
+    /// survivor's content was then whatever the two writers had interleaved.
+    #[test]
+    fn concurrent_writes_to_one_path_never_mix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let candidates = ["a".repeat(4096), "b".repeat(16384), "c".repeat(65536)];
+
+        for _ in 0..25 {
+            std::thread::scope(|s| {
+                for c in &candidates {
+                    s.spawn(|| write_file(&path, c.as_bytes(), false).unwrap());
+                }
+            });
+            let got = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                candidates.contains(&got),
+                "torn file: {} bytes, starts {:?}",
+                got.len(),
+                &got[..got.len().min(8)]
+            );
+        }
+
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(left.is_empty(), "temp files left behind: {left:?}");
     }
 }
