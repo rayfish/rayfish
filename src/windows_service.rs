@@ -270,10 +270,13 @@ fn start_transition(state: ServiceState) -> StartTransition {
 /// MSI installs the service itself and never runs `ray install`.
 fn apply_own_failure_actions() -> Result<()> {
     let scm = manager(ServiceManagerAccess::CONNECT)?;
+    // `update_failure_actions` needs CHANGE_CONFIG, and the SCM requires
+    // QUERY_CONFIG alongside it for the failure-action calls specifically.
+    // Nothing here starts or stops anything, so it asks for no more than that.
     let service = scm
         .open_service(
             SERVICE_NAME,
-            ServiceAccess::START | ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
         )
         .context("open the rayfish service to configure its restart policy")?;
     configure_failure_actions(&service)
