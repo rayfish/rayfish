@@ -14,7 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   firewall`, the name resolved, and the connection was refused with nothing
   saying why. The daemon now answers on the mesh address for those ports itself
   and hands the connection to the local service over IPv4, so
-  `curl http://box.ray:4000` works against a server that only speaks IPv4.
+  `curl http://box.ray:4000` works against a server that only speaks IPv4. On
+  Linux a port becomes reachable the moment the service starts listening,
+  because the kernel says so; on other systems it is picked up within a few
+  seconds.
   Nothing new is exposed by it: only a service already listening on every
   interface (`0.0.0.0`) is bridged, one bound to `127.0.0.1` is left alone, and
   the firewall decides who reaches it exactly as before. The service sees the

@@ -19,6 +19,7 @@ table and a real peer to test at all.
 | 8-9 | The bridge **follows the service**: stop it and the port is released, start it and the port comes back. |
 | 10 | **`ray config set v4-bridge off`/`on`** takes effect on a live daemon, no restart. |
 | 11 | The bridge **lives and dies with the data plane**: `ray down` releases the port (it binds an address that goes down with the TUN), `ray up` restores it. |
+| 12 | **The kernel reports the listener, a timer does not find it.** Where `sock:inet_sock_set_state` is readable the timer is only a 300s backstop, so taking a new port within seconds can have come from nothing else. On a host without tracefs the same step asserts the timer fallback instead, and says so rather than reporting the event path as covered. |
 
 Reachability is probed with the shared `fw_allows`/`fw_denies` helpers, so a
 probe is a real TCP handshake over the TUN. "Is it bridged" is answered
@@ -38,6 +39,13 @@ E2E_BACKEND=docker ./tests/e2e.sh v4bridge   # local containers
 ./tests/e2e.sh v4bridge teardown
 ```
 
-Ports `8400` (wildcard) and `8401` (loopback) on `srv-b`. Allow ~3 minutes of
-run time after provisioning: several steps wait out a 15s rescan, and step 7
-deliberately waits two.
+Ports `8400` (wildcard), `8401` (loopback) and `8402` (wildcard, bound late to
+time the pickup) on `srv-b`. Allow ~3 minutes of run time after provisioning:
+the waits are ceilings sized for a host with no listen events, and step 7
+deliberately sits through two of them.
+
+**Backend note.** Step 12's event path runs on droplets and not under docker: a
+privileged container has `/sys/kernel/tracing` as an empty directory with
+tracefs not mounted, so the daemon finds no tracepoint and stays on its timer.
+The host's tracefs is deliberately not mounted in, since tracefs is not
+namespaced and both nodes would then contend for one instance directory.

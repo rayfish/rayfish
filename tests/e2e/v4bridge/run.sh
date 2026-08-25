@@ -42,9 +42,17 @@ NET=v4br
 V4_PORT=8400
 # Bound `127.0.0.1` on srv-b: deliberately local, and never bridged.
 LO_PORT=8401
-# One rescan is 15s (`v4bridge::RESCAN_INTERVAL`), so a change the bridge has to
-# notice takes up to that long; give a reconcile two of them plus slack.
+# Bound `0.0.0.0` late, in step 12, to time how long the bridge takes to notice.
+EV_PORT=8402
+# A host with no listen events falls back to a 15s timer
+# (`v4bridge::RESCAN_INTERVAL`), so a change takes up to that long to notice;
+# give a reconcile two of them plus slack. A host that has them is far quicker,
+# and every wait below is a ceiling rather than a duration.
 SETTLE=40
+# What counts as "the kernel told us" in step 12. Each check is an ssh round
+# trip, so this is generous against that noise while staying 30x under the 300s
+# backstop that is the only other way the port could have been taken.
+EVENT_PICKUP=10
 
 # serve <host> <port> <bind-addr> : detached HTTP server on one address.
 # `--bind 0.0.0.0` is the point of this scenario: the shared
@@ -63,6 +71,21 @@ unserve(){ on "$1" "pkill -f 'http.server $2'" >/dev/null 2>&1 || true; }
 bridged(){
   on "$1" "ss -ltnpH 2>/dev/null | grep -F '[$2]:$3 ' | grep -c '\"ray\"' || true" \
     2>/dev/null | strip | tr -d '[:space:]'
+}
+
+# seconds_until_bridged <host> <mesh-ip> <port> <limit> : wall-clock seconds
+# until the daemon holds that port, or <limit> if it never does. Measured from
+# $SECONDS rather than counted in iterations, since each check is an ssh round
+# trip of its own and would otherwise be counted as free.
+seconds_until_bridged(){
+  local host=$1 ip=$2 port=$3 limit=$4 start=$SECONDS
+  while (( SECONDS - start < limit )); do
+    if [[ "$(bridged "$host" "$ip" "$port")" == 1 ]]; then
+      echo $(( SECONDS - start )); return 0
+    fi
+    sleep 1
+  done
+  echo "$limit"; return 1
 }
 
 # fetch <host> <url> : the HTTP status code the host gets, or 000.
@@ -216,6 +239,37 @@ if retry_until "$SETTLE" "[[ \"\$(bridged '$B' '$B_IP' $V4_PORT)\" == 1 ]]"; the
   pass "'ray up' brought the bridge back"
 else
   fail "the bridge did not return after 'ray up'"
+fi
+
+# ---------------------------------------------------------------------------
+step "12. a new listener is picked up from the kernel, not from a timer"
+# Where the kernel reports listen changes (`src/listen_events.rs`), the timer
+# drops to a 300s backstop, so anything close to immediate can only have come
+# from an event. That is what makes this assertion non-vacuous: it is not
+# "faster than the poll" by a margin someone has to trust, it is a whole order
+# of magnitude below the only other thing that could have caused it.
+if on "$B" '[ -d /sys/kernel/tracing/events/sock/inet_sock_set_state ]' >/dev/null 2>&1; then
+  serve "$B" "$EV_PORT" 0.0.0.0
+  took="$(seconds_until_bridged "$B" "$B_IP" "$EV_PORT" 60)"
+  if (( took <= EVENT_PICKUP )); then
+    pass "bridged [$B_IP]:$EV_PORT in ${took}s (backstop is 300s)"
+  else
+    fail "took ${took}s to bridge: the listen events are not arriving"
+  fi
+  unserve "$B" "$EV_PORT"
+else
+  # The docker backend lands here: a privileged container has
+  # /sys/kernel/tracing as an empty directory with tracefs not mounted, so the
+  # daemon finds no events and stays on its 15s timer. Assert the fallback
+  # rather than skipping, but do not claim to have covered the event path.
+  serve "$B" "$EV_PORT" 0.0.0.0
+  if retry_until "$SETTLE" "[[ \"\$(bridged '$B' '$B_IP' $EV_PORT)\" == 1 ]]"; then
+    pass "no tracefs here: the timer fallback bridged [$B_IP]:$EV_PORT"
+  else
+    fail "the timer fallback did not bridge [$B_IP]:$EV_PORT"
+  fi
+  unserve "$B" "$EV_PORT"
+  echo "   note: the kernel-event path is NOT covered on this backend"
 fi
 
 # Leave the hosts in a clean state for a re-run.

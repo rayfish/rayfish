@@ -37,18 +37,37 @@ use std::time::Duration;
 
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::forward::{SSH_LISTEN_PORT, SSH_PORT};
+use crate::listen_events;
 use crate::ssh::bind_listener;
 
-/// How often the host's listening sockets are re-enumerated. A service can
-/// start long after `ray up`, so this cannot be a one-shot at activation. On
-/// macOS a rescan spawns `netstat`, which is why it is seconds and not
-/// sub-second.
+/// How often the host's listening sockets are re-enumerated where nothing
+/// reports a change. A service can start long after `ray up`, so this cannot be
+/// a one-shot at activation, and with no notification to wait on the interval
+/// is also the worst case for how late the bridge can be. On macOS a rescan
+/// spawns `netstat`, which is why it is seconds and not sub-second.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The same, on a host where [`listen_events`] reports changes as they happen.
+///
+/// It is a backstop and not the mechanism: the events carry the latency, and
+/// this only bounds how long a missed one can go unnoticed. Something has to,
+/// because the ways it can be missed are all silent, and both directions are
+/// invisible until someone tries the port. A dropped open leaves a service
+/// unreachable exactly as it was before any of this existed; a dropped close
+/// leaves us holding a port whose service has moved to an address we cannot
+/// reach, which is worse than not bridging it at all.
+const BACKSTOP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How long to let a burst of listen events settle before rescanning. Restarting
+/// a service is a close and an open, and binding the mesh address in front of it
+/// is a third event of our own; one scan answers all of them.
+const EVENT_SETTLE: Duration = Duration::from_millis(200);
 
 /// How long a connection to the local service may take before the bridged
 /// connection is dropped.
@@ -83,6 +102,9 @@ impl V4Bridge {
     /// stops every listener it opened (they hold child tokens).
     pub fn spawn(self, token: CancellationToken) {
         tokio::spawn(async move {
+            // A host that will tell us when its listeners change; `None` leaves
+            // this on its timer alone.
+            let mut events = listen_events::watch(&token);
             let mut ports: HashMap<u16, PortState> = HashMap::new();
             loop {
                 // The ports we hold on the mesh address, so the enumeration can
@@ -99,9 +121,21 @@ impl V4Bridge {
                     // wrong guess about the host's sockets costs more than none.
                     None => debug!("v4 bridge: cannot enumerate local listeners here"),
                 }
+                // Recomputed each pass: a watcher that stops (a read error, not
+                // shutdown) has to put the timer back to being the mechanism.
+                let interval = match events {
+                    Some(_) => BACKSTOP_INTERVAL,
+                    None => RESCAN_INTERVAL,
+                };
                 tokio::select! {
                     _ = token.cancelled() => break,
-                    _ = tokio::time::sleep(RESCAN_INTERVAL) => {}
+                    _ = tokio::time::sleep(interval) => {}
+                    Some(()) = next_event(&mut events) => {
+                        tokio::time::sleep(EVENT_SETTLE).await;
+                        // Whatever else the burst carried is answered by the
+                        // scan this pass is about to do.
+                        drain(&mut events);
+                    }
                 }
             }
             debug!("v4 bridge stopped");
@@ -154,6 +188,30 @@ impl V4Bridge {
                 "v4 bridge: IPv4-only listener now reachable on the mesh address"
             );
         }
+    }
+}
+
+/// The next listen-change trigger, or a future that never completes on a host
+/// with no watcher. A watcher that has stopped clears the option, so the caller
+/// puts its timer back rather than waiting on a channel nobody will send on.
+async fn next_event(events: &mut Option<Receiver<()>>) -> Option<()> {
+    match events {
+        Some(rx) => {
+            let got = rx.recv().await;
+            if got.is_none() {
+                *events = None;
+            }
+            got
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Discard whatever else is queued. Only ever called immediately before a scan,
+/// which is the one thing any of those triggers would have asked for.
+fn drain(events: &mut Option<Receiver<()>>) {
+    if let Some(rx) = events {
+        while rx.try_recv().is_ok() {}
     }
 }
 
