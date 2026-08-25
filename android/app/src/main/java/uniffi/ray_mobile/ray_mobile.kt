@@ -1274,7 +1274,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_wake_peer() != 45813.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_constructor_node_new() != 39092.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_constructor_node_new() != 6194.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1971,8 +1971,9 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     }
     /**
      * `config_dir` is the app-private directory (Kotlin `Context.getFilesDir()`)
-     * where identity + config live. It is exported to the core through
-     * `RAYFISH_CONFIG_DIR`, which `config::config_dir()` honors on Android.
+     * where identity + config live. It is published to the core through
+     * `config::set_config_dir_override`, which `config::config_dir()` honors
+     * ahead of `RAYFISH_CONFIG_DIR` on every platform.
      */
     constructor(`configDir`: kotlin.String) :
         this(

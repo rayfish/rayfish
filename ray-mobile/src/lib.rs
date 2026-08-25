@@ -62,6 +62,7 @@ mod android_jni {
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -392,16 +393,18 @@ fn saved_networks_status() -> Status {
 #[uniffi::export]
 impl Node {
     /// `config_dir` is the app-private directory (Kotlin `Context.getFilesDir()`)
-    /// where identity + config live. It is exported to the core through
-    /// `RAYFISH_CONFIG_DIR`, which `config::config_dir()` honors on Android.
+    /// where identity + config live. It is published to the core through
+    /// `config::set_config_dir_override`, which `config::config_dir()` honors
+    /// ahead of `RAYFISH_CONFIG_DIR` on every platform.
     #[uniffi::constructor]
     pub fn new(config_dir: String) -> Arc<Self> {
         // Capture the core's tracing output for Android diagnostics. Idempotent;
         // safe to call once per process (Node is a process singleton).
         diag::install();
-        // SAFETY-ish: set before any core call reads config. Single-threaded at
-        // construction time.
-        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", &config_dir) };
+        // Set before any core call reads config. Not an environment write: that
+        // is undefined behaviour once the runtime's threads are up, and it also
+        // let one test redirect another's config reads mid-test.
+        config::set_config_dir_override(PathBuf::from(&config_dir));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1267,13 +1270,26 @@ impl Node {
     }
 }
 
+/// Process-wide lock serializing tests that construct a [`Node`], since
+/// `Node::new` points the process-wide config override at its argument and lib
+/// tests share one process across parallel threads. Without it a second
+/// `Node::new` redirects config reads out from under a test that is midway
+/// through writing and reading its own config dir, and the write lands in one
+/// directory while the read comes back empty from another.
+#[cfg(test)]
+static CONFIG_DIR_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod device_name_tests {
     use super::*;
 
     #[test]
     fn set_default_hostname_persists_and_rejects_invalid() {
-        // Isolated config dir; Node::new points RAYFISH_CONFIG_DIR at it.
+        // Serialize against the other test that builds a Node, so its config
+        // directory cannot bleed into the reads below.
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Isolated config dir; Node::new points the config override at it.
         let dir = std::env::temp_dir().join(format!("rayfish-dn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1343,6 +1359,10 @@ mod tun_fd_ownership_tests {
     /// connected VPN while the app believes the tunnel is off (issue #116).
     #[test]
     fn up_closes_the_detached_fd_when_the_node_is_not_started() {
+        // Held for the whole test: Node::new below moves the config override,
+        // which another test's config reads would otherwise pick up.
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = std::env::temp_dir().join(format!("rayfish-updfd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
@@ -745,8 +746,56 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// common shell accident and must not resolve the config tree to the current
 /// directory. Split out from [`config_dir`] so it is testable without touching
 /// the real platform path.
-fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+fn config_dir_override(raw: Option<OsString>) -> Option<PathBuf> {
     raw.filter(|d| !d.is_empty()).map(PathBuf::from)
+}
+
+/// Config directory published by an embedder rather than by the environment.
+///
+/// `ray-mobile`'s `Node::new` passes Android's `Context.getFilesDir()` here. It
+/// used to write that path into `RAYFISH_CONFIG_DIR` instead, which is a
+/// mutation of the process environment: undefined behaviour once any other
+/// thread is running, and in the lib tests it redirected a concurrent test's
+/// config reads between its own write and read. The directory is fixed for the
+/// life of the process, so a process-wide cell holds it without threading a
+/// handle through every [`config_dir`] caller (as `dht::PKARR_OVERRIDE` does
+/// for the discovery server).
+static CONFIG_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Point every config read at `dir`, ahead of `RAYFISH_CONFIG_DIR`.
+///
+/// For embedders that know their config location at startup; the CLI and the
+/// daemon use the environment variable. Must run before any config or identity
+/// read, and takes precedence because the environment write it replaces did.
+pub fn set_config_dir_override(dir: PathBuf) {
+    *CONFIG_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(dir);
+}
+
+/// Pick between the two override sources: the embedder's first, then the
+/// environment's. `None` means the platform default applies, and an empty path
+/// from either source is "no override" rather than the current directory.
+///
+/// Split out from [`effective_override`], the way [`config_dir_override`] is
+/// split out of [`config_dir`], so the precedence is testable without mutating
+/// the process environment (which is what this whole override exists to avoid).
+fn resolve_override(embedder: Option<PathBuf>, env: Option<OsString>) -> Option<PathBuf> {
+    embedder
+        .filter(|d| !d.as_os_str().is_empty())
+        .or_else(|| config_dir_override(env))
+}
+
+/// The override in effect: the embedder's [`set_config_dir_override`] first,
+/// then `RAYFISH_CONFIG_DIR`. `None` means the platform default applies.
+fn effective_override() -> Option<PathBuf> {
+    resolve_override(
+        CONFIG_DIR_OVERRIDE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        std::env::var_os("RAYFISH_CONFIG_DIR"),
+    )
 }
 
 /// The platform's config location, before the `RAYFISH_CONFIG_DIR` override and
@@ -792,13 +841,13 @@ fn platform_config_dir() -> Result<PathBuf> {
 /// `/var/root/Library/Application Support/rayfish` (root-only; under launchd
 /// root's home is `/var/root`, not the home of whoever ran `sudo`), Android the
 /// app's `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through
-/// this same var).
+/// [`set_config_dir_override`], which outranks the variable).
 ///
 /// Use [`config_dir_for_read`] from anything that only reads: creating the tree
 /// is the daemon's job, and a reader that does it can end up reporting the
 /// directory it just made as the daemon's config.
 pub fn config_dir() -> Result<PathBuf> {
-    let dir = match config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")) {
+    let dir = match effective_override() {
         Some(dir) => dir,
         None => platform_config_dir()?,
     };
@@ -811,7 +860,7 @@ pub fn config_dir() -> Result<PathBuf> {
 /// A missing directory is not an error here — it reads as an empty config, which
 /// is what a reader wants to say about a daemon that has saved nothing.
 pub fn config_dir_for_read() -> Result<PathBuf> {
-    match config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")) {
+    match effective_override() {
         Some(dir) => Ok(dir),
         None => platform_config_dir(),
     }
@@ -936,15 +985,15 @@ pub fn restrict_perms(path: &Path, secret: bool) {
 /// everything under the daemon's `~/.config/rayfish` (i.e. `/root/.config`); this
 /// moves `secret_key`, `networks.toml`, `firewall.toml`, `invites/`, etc. over so
 /// the node keeps its identity and networks. No-op on macOS (location unchanged)
-/// and once `/etc/rayfish` is populated, and skipped entirely when
-/// `RAYFISH_CONFIG_DIR` is set. Must run before any config/identity read
+/// and once `/etc/rayfish` is populated, and skipped entirely when the config
+/// location is set explicitly. Must run before any config/identity read
 /// (called at the top of `build_daemon`).
 pub fn migrate_location() {
     #[cfg(target_os = "linux")]
     {
-        // An explicit `RAYFISH_CONFIG_DIR` is a deliberate location, not an
-        // upgrade in progress: never pull `/root/.config/rayfish` into it.
-        if config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")).is_some() {
+        // An explicit config location (env var or embedder) is deliberate, not
+        // an upgrade in progress: never pull `/root/.config/rayfish` into it.
+        if effective_override().is_some() {
             return;
         }
         let Ok(new) = config_dir() else { return };
@@ -1397,8 +1446,49 @@ pub(crate) static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use iroh::EndpointId;
+
+    /// `ray-mobile` used to publish its config directory by writing
+    /// `RAYFISH_CONFIG_DIR`, which mutates the process environment and so is
+    /// undefined behaviour once other threads run. The embedder override
+    /// replaces that write, so it has to win over the variable the way the
+    /// overwrite did. `ray-mobile`'s own tests cover the wiring end to end;
+    /// this is the precedence on its own, with nothing global touched.
+    #[test]
+    fn the_embedder_override_beats_the_env_var() {
+        let from_env = OsString::from("/srv/rayfish-from-env");
+        let from_code = PathBuf::from("/srv/rayfish-from-code");
+
+        assert_eq!(
+            resolve_override(None, Some(from_env.clone())),
+            Some(PathBuf::from("/srv/rayfish-from-env"))
+        );
+        assert_eq!(
+            resolve_override(Some(from_code.clone()), Some(from_env)),
+            Some(from_code.clone())
+        );
+        // Still in effect with no variable at all: the platform default is what
+        // the override exists to displace on Android.
+        assert_eq!(
+            resolve_override(Some(from_code.clone()), None),
+            Some(from_code)
+        );
+        assert_eq!(resolve_override(None, None), None);
+    }
+
+    /// An embedder handing over an empty path is the same accident the env var
+    /// already guards against, and must not resolve config to the process's
+    /// current directory. It falls through to the variable, then the default.
+    #[test]
+    fn an_empty_embedder_override_is_no_override() {
+        assert_eq!(resolve_override(Some(PathBuf::new()), None), None);
+        assert_eq!(
+            resolve_override(Some(PathBuf::new()), Some(OsString::from("/srv/rayfish"))),
+            Some(PathBuf::from("/srv/rayfish"))
+        );
+    }
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -1420,8 +1510,6 @@ mod tests {
 
     #[test]
     fn config_dir_override_ignores_unset_and_empty() {
-        use std::ffi::OsString;
-
         assert_eq!(config_dir_override(None), None);
         // An exported-but-empty var must not resolve the tree to `""` (which
         // `create_dir_all` would reject) or to the process's cwd.
