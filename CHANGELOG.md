@@ -181,6 +181,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A saved config survives a power loss.** Writing a config file reported
+  success once the bytes reached the operating system, which is not the same as
+  reaching the disk: a machine that lost power seconds later came back with the
+  file's previous contents, or with the file missing entirely, and nothing had
+  failed anywhere to say so. The write now waits for the file and its directory
+  entry to be durable, and reports an error if either cannot be.
+- **Two settings saved at the same moment no longer corrupt each other.** Every
+  config write goes to a temporary file that is then renamed into place, and the
+  temporary name was shared by everything writing that file in the daemon. Two
+  saves landing together wrote into the same temporary file and renamed each
+  other's half-written copy over the real one, so a config could come back as a
+  mixture of two saves or fail with a missing-file error.
+- **Per-network settings survive a restart and a reconnect.** The ephemeral TTL
+  set with `ray net config <net> ephemeral-ttl` silently stopped applying after
+  the daemon restarted, and a network's admin list was cleared every time a
+  member reconnected. Both were rewritten wholesale each time the mesh saved a
+  network, so anything set on the node was replaced by whatever the reconnect
+  happened to carry. A save now touches only the fields it owns.
+- **A co-coordinator is no longer demoted by reconnecting.** The saved network
+  key was overwritten with the key from the handshake, so a node that had been
+  granted co-coordinator lost the grant on its next reconnect. Nothing was said
+  at the time; the powers were simply gone. The saved key is now kept until a
+  fresh grant replaces it.
 - **Android: `.ray` names now open in Chrome on an IPv4-only network.** The
   browser showed `DNS_PROBE_FINISHED_NXDOMAIN` for a name that every other app
   on the phone resolved fine. Chrome only asks for an IPv6 address once it has
