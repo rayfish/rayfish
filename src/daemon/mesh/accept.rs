@@ -796,12 +796,13 @@ impl CoordinatorAcceptState {
         // The key rode the Welcome above (see `direct_key`). Record the grant
         // locally (mirrors `admin_add`) so our own `ray admin list` shows the peer
         // as a co-coordinator too.
-        if grant_direct
-            && let Ok(Some(mut net)) = config::load_network(&self.network_name)
-            && !net.admins.contains(&remote_id)
-        {
-            net.admins.push(remote_id);
-            let _ = config::save_network(&net);
+        if grant_direct {
+            let _ = config::update_network(&self.network_name, |net| {
+                if !net.admins.contains(&remote_id) {
+                    net.admins.push(remote_id);
+                }
+                Ok(())
+            });
         }
         Some(peer_ip)
     }
@@ -1245,9 +1246,19 @@ impl MemberAcceptState {
             return;
         }
         let key = SecretKey::from(secret_key);
-        if let Ok(Some(mut net)) = config::load_network(&self.network_name) {
+        match config::update_network(&self.network_name, |net| {
             net.network_secret_key = Some(key.clone());
-            let _ = config::save_network(&net);
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(network = %self.network_name, "admin grant arrived after network config was deleted");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(network = %self.network_name, error = %e, "failed to persist admin grant");
+                return;
+            }
         }
         {
             let mut s = self.state.write().unwrap();

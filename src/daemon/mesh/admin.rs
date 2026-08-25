@@ -90,12 +90,12 @@ impl NetworkRegistry {
         self.store_and_publish_group(network).await;
 
         // Record the grant locally (coordinator's record; not verifiable).
-        if let Ok(Some(mut net)) = config::load_network(network)
-            && !net.admins.contains(&identity)
-        {
-            net.admins.push(identity);
-            let _ = config::save_network(&net);
-        }
+        let _ = config::update_network(network, |net| {
+            if !net.admins.contains(&identity) {
+                net.admins.push(identity);
+            }
+            Ok(())
+        });
         IpcMessage::Ok {
             message: format!("granted network key to {}", identity.fmt_short()),
         }

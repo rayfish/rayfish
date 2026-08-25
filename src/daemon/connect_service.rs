@@ -295,11 +295,11 @@ impl ConnectService {
                 false,
             )
             .await;
-        if let IpcMessage::Joined { name, .. } = &resp
-            && let Ok(Some(mut n)) = config::load_network(name)
-        {
-            n.direct = true;
-            let _ = config::save_network(&n);
+        if let IpcMessage::Joined { name, .. } = &resp {
+            let _ = config::update_network(name, |net| {
+                net.direct = true;
+                Ok(())
+            });
         }
         resp
     }

@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
 use std::sync::Mutex;
@@ -580,6 +582,49 @@ const LEGACY_FILE: &str = "networks.toml";
 const SETTINGS_FILE: &str = "settings.toml";
 const NETWORKS_SUBDIR: &str = "networks";
 
+/// Process-wide transaction boundary for network shards. Public per-network
+/// reads take a shared guard; save, update, migration, and delete take an
+/// exclusive guard so a stale whole-file write cannot overwrite another task's
+/// fields or resurrect a deleted network.
+static NETWORK_CONFIG_LOCK: RwLock<()> = RwLock::new(());
+
+thread_local! {
+    /// Tripwire for the non-reentrant update callback contract. The process
+    /// lock deliberately remains the real transaction boundary.
+    static IN_NETWORK_CONFIG_UPDATE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct NetworkUpdateScope;
+
+impl NetworkUpdateScope {
+    fn enter() -> Result<Self> {
+        IN_NETWORK_CONFIG_UPDATE.with(|active| {
+            anyhow::ensure!(
+                !active.get(),
+                "network config update callbacks must not call network config APIs"
+            );
+            active.set(true);
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for NetworkUpdateScope {
+    fn drop(&mut self) {
+        IN_NETWORK_CONFIG_UPDATE.with(|active| active.set(false));
+    }
+}
+
+fn ensure_not_in_network_update() -> Result<()> {
+    IN_NETWORK_CONFIG_UPDATE.with(|active| {
+        anyhow::ensure!(
+            !active.get(),
+            "network config update callbacks must not call network config APIs"
+        );
+        Ok(())
+    })
+}
+
 /// Globals persisted to `settings.toml` (everything in [`AppConfig`] except the
 /// per-network entries, which live in their own files).
 ///
@@ -884,7 +929,7 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
 
     save_settings_in(dir, &old)?;
     for net in &old.networks {
-        save_network_in(dir, net)?;
+        save_network_unlocked(dir, net)?;
     }
 
     let bak = dir.join("networks.toml.bak");
@@ -898,8 +943,17 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
 /// Returns a default config if nothing is stored yet. Runs the legacy migration
 /// on first call after an upgrade.
 pub fn load() -> Result<AppConfig> {
+    ensure_not_in_network_update()?;
     let dir = config_dir()?;
-    migrate_legacy(&dir)?;
+    {
+        let _guard = NETWORK_CONFIG_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        migrate_legacy(&dir)?;
+    }
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     load_in(&dir)
 }
 
@@ -907,6 +961,10 @@ pub fn load() -> Result<AppConfig> {
 /// daemon is down). Creates nothing and runs no migration; a config tree that
 /// isn't there, or isn't readable by this user, reads as an empty config.
 pub fn load_for_read() -> Result<AppConfig> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     load_in(&config_dir_for_read()?)
 }
 
@@ -1039,13 +1097,19 @@ fn remove_pending_join_in(dir: &Path, network_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist a single network to `networks/<name>.toml`. Touches only that file,
-/// so concurrent saves of distinct networks can never clobber one another.
+/// Persist a single network to `networks/<name>.toml`. Direct full-record
+/// writes share the same transaction boundary as updates and deletes.
 pub fn save_network(net: &NetworkConfig) -> Result<()> {
-    save_network_in(&config_dir()?, net)
+    ensure_not_in_network_update()?;
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    save_network_unlocked(&dir, net)
 }
 
-fn save_network_in(dir: &Path, net: &NetworkConfig) -> Result<()> {
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn save_network_unlocked(dir: &Path, net: &NetworkConfig) -> Result<()> {
     validate_net_name(&net.name)?;
     let ndir = dir.join(NETWORKS_SUBDIR);
     let path = ndir.join(format!("{}.toml", net.name));
@@ -1056,10 +1120,16 @@ fn save_network_in(dir: &Path, net: &NetworkConfig) -> Result<()> {
 
 /// Load a single network's config, if present.
 pub fn load_network(name: &str) -> Result<Option<NetworkConfig>> {
-    load_network_in(&config_dir()?, name)
+    ensure_not_in_network_update()?;
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_network_unlocked(&dir, name)
 }
 
-fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn load_network_unlocked(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     validate_net_name(name)?;
     let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
     if !path.exists() {
@@ -1072,12 +1142,107 @@ fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     ))
 }
 
-/// Delete a single network's config file. Returns true if it existed.
-pub fn delete_network(name: &str) -> Result<bool> {
-    delete_network_in(&config_dir()?, name)
+/// Atomically load, synchronously mutate, and save an existing network's latest
+/// config. The callback must not call another network-config API; the lock is
+/// deliberately never held across an await. Returns `None` when the network was
+/// deleted or never existed.
+pub fn update_network(
+    name: &str,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<Option<NetworkConfig>> {
+    update_network_in(&config_dir()?, name, update)
 }
 
-fn delete_network_in(dir: &Path, name: &str) -> Result<bool> {
+fn update_network_in(
+    dir: &Path,
+    name: &str,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<Option<NetworkConfig>> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut net) = load_network_unlocked(dir, name)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(&net).context("serializing network config")?;
+    let _update_scope = NetworkUpdateScope::enter()?;
+    update(&mut net)?;
+    drop(_update_scope);
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(&net).context("serializing network config")?;
+    if after != before {
+        save_network_unlocked(dir, &net)?;
+    }
+    Ok(Some(net))
+}
+
+/// Atomically update the latest network config, inserting `initial` only when
+/// the network is absent. This is the fresh-join counterpart to
+/// [`update_network`]; existing node-local fields remain available to `update`.
+pub fn update_network_or_insert(
+    name: &str,
+    initial: NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<NetworkConfig> {
+    update_network_or_insert_in(&config_dir()?, name, initial, update)
+}
+
+fn update_network_or_insert_in(
+    dir: &Path,
+    name: &str,
+    initial: NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<NetworkConfig> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let existing = load_network_unlocked(dir, name)?;
+    let inserting = existing.is_none();
+    let mut net = existing.unwrap_or(initial);
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(&net).context("serializing network config")?;
+    let _update_scope = NetworkUpdateScope::enter()?;
+    update(&mut net)?;
+    drop(_update_scope);
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(&net).context("serializing network config")?;
+    if inserting || after != before {
+        save_network_unlocked(dir, &net)?;
+    }
+    Ok(net)
+}
+
+/// Delete a single network's config file. Returns true if it existed.
+pub fn delete_network(name: &str) -> Result<bool> {
+    ensure_not_in_network_update()?;
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    delete_network_unlocked(&dir, name)
+}
+
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn delete_network_unlocked(dir: &Path, name: &str) -> Result<bool> {
     validate_net_name(name)?;
     let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
     match std::fs::remove_file(&path) {
@@ -1527,8 +1692,8 @@ name = "test"
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        save_network_in(dir, &net("homelab")).unwrap();
-        save_network_in(dir, &net("genesis")).unwrap();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+        save_network_unlocked(dir, &net("genesis")).unwrap();
         save_settings_in(
             dir,
             &AppConfig {
@@ -1543,12 +1708,12 @@ name = "test"
         assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Single-network load.
-        assert!(load_network_in(dir, "homelab").unwrap().is_some());
-        assert!(load_network_in(dir, "absent").unwrap().is_none());
+        assert!(load_network_unlocked(dir, "homelab").unwrap().is_some());
+        assert!(load_network_unlocked(dir, "absent").unwrap().is_none());
 
         // Deleting one leaves the other untouched.
-        assert!(delete_network_in(dir, "homelab").unwrap());
-        assert!(!delete_network_in(dir, "homelab").unwrap());
+        assert!(delete_network_unlocked(dir, "homelab").unwrap());
+        assert!(!delete_network_unlocked(dir, "homelab").unwrap());
         let after = load_in(dir).unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].name, "genesis");
@@ -1605,8 +1770,8 @@ name = "test"
         let mut n = net("homelab");
         n.aliases.insert("alice".into(), "id-alice".into());
         n.aliases.insert("bob".into(), "id-bob".into());
-        save_network_in(dir, &n).unwrap();
-        let loaded = load_network_in(dir, "homelab").unwrap().unwrap();
+        save_network_unlocked(dir, &n).unwrap();
+        let loaded = load_network_unlocked(dir, "homelab").unwrap().unwrap();
         assert_eq!(
             loaded.aliases.get("alice").map(String::as_str),
             Some("id-alice")
@@ -1848,7 +2013,7 @@ name = "test"
             for i in 0..N {
                 let dir = dir.clone();
                 s.spawn(move || {
-                    save_network_in(&dir, &net(&format!("net-{i}"))).unwrap();
+                    save_network_unlocked(&dir, &net(&format!("net-{i}"))).unwrap();
                 });
             }
         });
@@ -1858,6 +2023,103 @@ name = "test"
             loaded.networks.len(),
             N,
             "all concurrent saves must survive"
+        );
+    }
+
+    #[test]
+    fn concurrent_same_network_updates_preserve_unrelated_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        save_network_unlocked(&dir, &net("homelab")).unwrap();
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                update_network_in(&dir, "homelab", |net| {
+                    net.aliases.insert("alice".into(), "id-alice".into());
+                    Ok(())
+                })
+                .unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                update_network_in(&dir, "homelab", |net| {
+                    net.auto_accept_files = false;
+                    Ok(())
+                })
+                .unwrap();
+            });
+            barrier.wait();
+        });
+
+        let loaded = load_network_unlocked(&dir, "homelab").unwrap().unwrap();
+        assert_eq!(
+            loaded.aliases.get("alice").map(String::as_str),
+            Some("id-alice")
+        );
+        assert!(!loaded.auto_accept_files);
+    }
+
+    #[test]
+    fn update_or_insert_uses_initial_only_when_network_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut initial = net("homelab");
+        initial.aliases.insert("local".into(), "first".into());
+
+        update_network_or_insert_in(dir, "homelab", initial, |net| {
+            net.auto_accept_firewall = true;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut stale_initial = net("homelab");
+        stale_initial.aliases.insert("local".into(), "stale".into());
+        update_network_or_insert_in(dir, "homelab", stale_initial, |net| {
+            net.my_hostname = Some("latest".into());
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load_network_unlocked(dir, "homelab").unwrap().unwrap();
+        assert_eq!(
+            loaded.aliases.get("local").map(String::as_str),
+            Some("first")
+        );
+        assert!(loaded.auto_accept_firewall);
+        assert_eq!(loaded.my_hostname.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn network_update_reentry_is_rejected_before_locking() {
+        let _scope = NetworkUpdateScope::enter().unwrap();
+        let error = ensure_not_in_network_update().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("network config update callbacks must not call network config APIs")
+        );
+    }
+
+    #[test]
+    fn failed_network_update_does_not_persist_partial_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+
+        let result = update_network_in(dir, "homelab", |net| {
+            net.aliases.insert("alice".into(), "id-alice".into());
+            anyhow::bail!("reject update")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            load_network_unlocked(dir, "homelab")
+                .unwrap()
+                .unwrap()
+                .aliases
+                .is_empty()
         );
     }
 
@@ -1898,8 +2160,8 @@ name = "test"
     fn rejects_unsafe_network_names() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        assert!(save_network_in(dir, &net("../escape")).is_err());
-        assert!(load_network_in(dir, "a/b").is_err());
+        assert!(save_network_unlocked(dir, &net("../escape")).is_err());
+        assert!(load_network_unlocked(dir, "a/b").is_err());
     }
 
     #[test]

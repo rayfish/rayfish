@@ -203,43 +203,18 @@ impl NetworkRegistry {
 
         self.seal_and_publish(&mut net_state, &net_secret_key).await;
 
-        // Update config
-        let member_entries = to_member_entries(net_state.members.all());
-        let approved_entries = to_approved_entries(net_state.approved.all());
-        config::save_network(&config::NetworkConfig {
-            name: name.to_string(),
-            group_mode: mode,
-            my_hostname: persisted_hostname.clone(),
-            // Coordinators publish renames directly, so they never carry a
-            // pending intent.
-            pending_hostname: None,
-            members: member_entries,
-            approved: approved_entries,
-            network_secret_key: Some(net_secret_key.clone()),
-            network_public_key: Some(net_public_key),
-            transport: None,
-            // Preserve the persisted consent flag + admin roster across a
-            // restart; only the roster (members/approved) is authoritative
-            // from the blob.
-            auto_accept_firewall: net_config
-                .map(|nc| nc.auto_accept_firewall)
-                .unwrap_or(false),
-            auto_accept_files: net_config.map(|nc| nc.auto_accept_files).unwrap_or(false),
-            admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
-            direct: net_config.map(|nc| nc.direct).unwrap_or(false),
-            direct_peer: net_config.and_then(|nc| nc.direct_peer),
-            ssh_allow: net_config
-                .map(|nc| nc.ssh_allow.clone())
-                .unwrap_or_default(),
-            aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
-            ephemeral_ttl_secs: None,
-            // Local exit-node policy survives restarts (server allow-list and the
-            // client's selected exit peer); neither rides the signed blob.
-            exit_allow: net_config
-                .map(|nc| nc.exit_allow.clone())
-                .unwrap_or_default(),
-            exit_node_use: net_config.and_then(|nc| nc.exit_node_use.clone()),
+        // Replace only the roster-derived projection on the latest saved config.
+        // Node-local policy may have changed while restoration awaited.
+        let updated = config::update_network(name, |latest| {
+            latest.group_mode = mode;
+            latest.pending_hostname = None;
+            latest.members = to_member_entries(net_state.members.all());
+            latest.approved = to_approved_entries(net_state.approved.all());
+            latest.network_secret_key = Some(net_secret_key.clone());
+            latest.network_public_key = Some(net_public_key);
+            Ok(())
         })?;
+        anyhow::ensure!(updated.is_some(), "network is no longer saved");
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(RwLock::new(net_state));

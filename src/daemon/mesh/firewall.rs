@@ -514,15 +514,12 @@ impl Daemon {
         users: Vec<String>,
         allow: bool,
     ) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
+        let ssh_enabled = match config::load() {
+            Ok(c) => c.ssh_enabled,
             Err(e) => {
                 return ipc_err(format!("failed to load config: {e}"));
             }
         };
-        if !app_config.networks.iter().any(|n| n.name == network) {
-            return ipc_err(format!("no such network: {network}"));
-        }
         // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
         // resolve to the peer's **user identity** hex. `resolve_peer_name` may
         // return a transport endpoint id (for a connected peer) which differs
@@ -539,29 +536,27 @@ impl Daemon {
                 }
             }
         };
-        let net = app_config
-            .networks
-            .iter_mut()
-            .find(|n| n.name == network)
-            .expect("network presence checked above");
-        if allow {
-            // Normalize: a `*` collapses the list to just `*` (any incl. root);
-            // otherwise dedupe. Empty = the non-root default.
-            let users = normalize_ssh_users(users);
-            match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
-                Some(r) => r.users = users,
-                None => net.ssh_allow.push(config::SshRule {
-                    peer: entry.clone(),
-                    users,
-                }),
+        let net = match config::update_network(network, |net| {
+            if allow {
+                // Normalize: a `*` collapses the list to just `*` (any incl. root);
+                // otherwise dedupe. Empty = the non-root default.
+                let users = normalize_ssh_users(users);
+                match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
+                    Some(r) => r.users = users,
+                    None => net.ssh_allow.push(config::SshRule {
+                        peer: entry.clone(),
+                        users,
+                    }),
+                }
+            } else {
+                net.ssh_allow.retain(|r| r.peer != entry);
             }
-        } else {
-            net.ssh_allow.retain(|r| r.peer != entry);
-        }
-        let net = net.clone();
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to persist network config: {e}"));
-        }
+            Ok(())
+        }) {
+            Ok(Some(net)) => net,
+            Ok(None) => return ipc_err(format!("no such network: {network}")),
+            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
+        };
         // Push the change to any live listener.
         #[cfg(feature = "desktop")]
         self.rebuild_ssh_authz();
@@ -579,7 +574,7 @@ impl Daemon {
         // Mirror of the `ssh on` nudge: a rule with the server off looks like it
         // took effect, but `:22` still falls through to the host sshd (which
         // asks for a password), so the failure doesn't point back here.
-        if allow && !app_config.ssh_enabled {
+        if allow && !ssh_enabled {
             detail.push_str(
                 "\n\nmesh SSH is off, so this rule is not in effect yet. \
                  Start the server with `ray firewall ssh on`.",

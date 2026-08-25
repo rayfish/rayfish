@@ -786,11 +786,16 @@ impl NetworkRegistry {
             let _ = self.transport.blob_store.blobs().add_slice(&bytes).await;
         }
 
-        // Save config with network public key (use display_name for config)
-        if let Ok(Some(mut net)) = config::load_network(display_name) {
+        // Save the network public key without replacing settings that may have
+        // changed while the join was in flight.
+        let updated = config::update_network(display_name, |net| {
             net.network_public_key = Some(net_pubkey);
-            let _ = config::save_network(&net);
-        }
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            updated.is_some(),
+            "network config was deleted while joining"
+        );
 
         // Membership poller
         if let Ok(poller_client) = dht::create_pkarr_client(&self.transport.endpoint) {
