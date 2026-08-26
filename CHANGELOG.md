@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Android: an inbound firewall rule can name a peer.** "+ Allow inbound" only
+  asked for a protocol and a port, so every rule the app could write applied to
+  the whole network. It now has a peer picker listing the network's members,
+  defaulting to any peer, and the rule list names the peer a rule is scoped to
+  instead of showing its short id.
+
 ## [0.4.0] - 2026-08-26
 
 Every node upgrades together. The mesh protocol goes from 2 to 5 and peers on

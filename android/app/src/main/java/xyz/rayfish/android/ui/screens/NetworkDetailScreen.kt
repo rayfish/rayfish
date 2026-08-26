@@ -26,6 +26,8 @@ import xyz.rayfish.android.isActive
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 
+private const val ANY_PEER = "any peer"
+
 @Composable
 fun NetworkDetailScreen(
     detail: NetworkDetail, onBack: () -> Unit, onToast: (String) -> Unit,
@@ -120,7 +122,12 @@ fun NetworkDetailScreen(
                         Text("${r.action} ${r.protocol}${if (r.port != "*") ":" + r.port else ""}",
                             fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
                         Spacer(Modifier.weight(1f))
-                        Text(r.peer, fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
+                        // The daemon renders a rule's peer as a short id; name it
+                        // when one of this network's peers carries that prefix.
+                        val named = detail.peers.firstOrNull { it.nodeId.startsWith(r.peer) }
+                            ?.hostname?.takeIf { it.isNotEmpty() }
+                        val peerName = if (r.peer == "any") ANY_PEER else named ?: r.peer
+                        Text(peerName, fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
                         Spacer(Modifier.width(8.dp))
                         TextButton(onClick = {
                             scope.launch {
@@ -181,24 +188,35 @@ fun NetworkDetailScreen(
     if (showAddRule) {
         var proto by remember { mutableStateOf("tcp") }
         var port by remember { mutableStateOf("") }
+        // Label shown in the dropdown -> what firewallAdd matches on. The node id
+        // is the unambiguous form: a peer may have no hostname set, and the
+        // daemon resolves a full endpoint id for offline members too.
+        val peerChoices = remember(detail.peers) {
+            listOf(ANY_PEER to null as String?) + detail.peers.map { p ->
+                "${p.hostname.ifEmpty { p.ipv6 }} · ${p.nodeId.take(4)}" to p.nodeId
+            }
+        }
+        var peerLabel by remember { mutableStateOf(ANY_PEER) }
         AlertDialog(
             onDismissRequest = { showAddRule = false },
             containerColor = Rf.Sheet,
             title = { Text("Allow inbound", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    RayfishDropdown(peerLabel, peerChoices.map { it.first }, { peerLabel = it }, "peer")
                     RayfishDropdown(proto, listOf("tcp", "udp", "icmp", "any"), { proto = it }, "protocol")
                     RayfishTextField(port, { port = it.trim() }, "port (blank for any), e.g. 22")
                 }
             },
             confirmButton = {
                 TextButton(onClick = {
+                    val peer = peerChoices.firstOrNull { it.first == peerLabel }?.second
                     scope.launch {
                         try {
                             withContext(Dispatchers.IO) {
                                 NodeHolder.get(context).firewallAdd(
                                     "in", "allow", proto,
-                                    port.ifBlank { null }, null, detail.name,
+                                    port.ifBlank { null }, peer, detail.name,
                                 )
                             }
                             reloadFirewall(); onToast("Rule added"); showAddRule = false
