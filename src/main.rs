@@ -568,6 +568,19 @@ pub(crate) enum Command {
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
     },
+    /// Internal detached Windows MSI updater helper.
+    #[cfg(windows)]
+    #[command(name = "windows-update-helper", hide = true)]
+    WindowsUpdateHelper {
+        #[arg(long)]
+        msi: std::path::PathBuf,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        sha256: String,
+        #[arg(long)]
+        parent_pid: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1097,6 +1110,9 @@ pub(crate) enum FilesAction {
 }
 
 fn check_root() {
+    #[cfg(windows)]
+    return;
+    #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("rayfish requires root privileges to create TUN devices. Run with sudo.");
         std::process::exit(1);
@@ -1409,6 +1425,10 @@ async fn run() -> Result<()> {
         Command::Daemon => {
             check_root();
             install_panic_hook();
+            #[cfg(windows)]
+            if rayfish::windows_service::run_if_service()? {
+                return Ok(());
+            }
             let token = shutdown::token();
             let stats = Arc::new(stats::ForwardMetrics::default());
             stats.spawn_logger(token.clone());
@@ -1515,6 +1535,13 @@ async fn run() -> Result<()> {
             list,
             version,
         } => cmd_update(force, check, nightly, list, version).await,
+        #[cfg(windows)]
+        Command::WindowsUpdateHelper {
+            msi,
+            identity,
+            sha256,
+            parent_pid,
+        } => rayfish::update::run_msi_update_helper(&msi, &identity, &sha256, parent_pid).await,
     }
 }
 
@@ -1640,31 +1667,52 @@ fn parse_node_key(key: &str) -> ipc::NodeKey {
 
 /// Resolve a username to its UID, falling back to parsing a numeric UID.
 pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
-    use std::ffi::CString;
-    let cname = CString::new(user).ok()?;
-    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-    if !pw.is_null() {
-        return Some(unsafe { (*pw).pw_uid });
+    #[cfg(windows)]
+    return user.parse::<u32>().ok();
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let cname = CString::new(user).ok()?;
+        let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+        if !pw.is_null() {
+            return Some(unsafe { (*pw).pw_uid });
+        }
+        user.parse::<u32>().ok()
     }
-    user.parse::<u32>().ok()
 }
 
 /// `ray set-operator <user>`: authorize a local user to run mutating ray
 /// commands without sudo (Tailscale's `--operator` model). The daemon enforces
 /// that this call itself comes from root.
 async fn cmd_set_operator(user: &str) -> Result<()> {
-    let uid = uid_for_user(user)
-        .ok_or_else(|| anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)"))?;
-    let mut stream = ipc::connect()
-        .await
-        .context("rayfish daemon is not running; start it with: sudo ray up")?;
-    ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
+    // Windows writes the operator SID itself instead of asking the daemon. The
+    // daemon has no Windows equivalent of the root check that authorizes
+    // `SetOperator` over IPC, so the check that matters (an elevated
+    // Administrator) happens here, in the process that has the caller's token.
+    // This is the recovery path when the claim `ray up` makes goes to the wrong
+    // account; the normal case never runs it.
+    #[cfg(windows)]
+    {
+        let sid = rayfish::windows_service::set_operator_account(std::ffi::OsStr::new(user))?;
+        println!("operator set to {user} ({sid})");
+        Ok(())
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        let uid = uid_for_user(user).ok_or_else(|| {
+            anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)")
+        })?;
+        let mut stream = ipc::connect()
+            .await
+            .context("rayfish daemon is not running; start it with: sudo ray up")?;
+        ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
+        match ipc::recv(&mut stream).await? {
+            ipc::IpcMessage::Ok { message } => println!("{message}"),
+            ipc::IpcMessage::Error { message } => fail_with("error", &message),
+            other => fail_unexpected(&other),
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,11 +1811,15 @@ mod tests {
             release_asset_name("macos", "aarch64").unwrap(),
             "ray-macos-aarch64"
         );
+        assert_eq!(
+            release_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.msi"
+        );
     }
 
     #[test]
     fn release_asset_name_rejects_unsupported_platforms() {
-        assert!(release_asset_name("windows", "x86_64").is_err());
+        assert!(release_asset_name("windows", "aarch64").is_err());
         assert!(release_asset_name("linux", "riscv64").is_err());
     }
 

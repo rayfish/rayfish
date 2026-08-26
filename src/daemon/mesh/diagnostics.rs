@@ -6,7 +6,18 @@ use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::super::*;
-use crate::ipc::{IpcFramed, LOG_CHUNK_BYTES};
+use crate::ipc::{LOG_CHUNK_BYTES, MsgpackCodec};
+use std::future::Future;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::Framed;
+
+/// The daemon's end of one IPC connection, framed.
+///
+/// Generic rather than [`crate::ipc::IpcFramed`], which names the *client* half
+/// on Windows: the daemon serves a `NamedPipeServer` there and a `UnixStream`
+/// on Unix, and `ray logs` is the one command that keeps hold of the connection
+/// instead of handing back a single reply.
+type ServedFramed<S> = Framed<S, MsgpackCodec<IpcMessage>>;
 
 /// How recent a failed reach must be to render a peer `Offline` in `ray status`.
 /// Older failures decay back to `Idle` (the optimistic default) so a peer that was
@@ -276,8 +287,10 @@ impl Daemon {
     /// Sanitization: the bundle is built only from already-public material: the
     /// `StatusResponse` (which never carries secret keys), counters, and the log
     /// files. It never touches `secret_key` or `network_secret_key`.
-    pub(crate) fn build_report(&self, peer_cred: Option<(u32, u32)>) -> IpcMessage {
+    pub(crate) fn build_report(&self, peer: Option<&PeerIdentity>) -> IpcMessage {
         use std::fmt::Write as _;
+
+        let requester = peer.map(PeerIdentity::report_requester);
 
         // --- sysinfo.txt ---
         let version = env!("CARGO_PKG_VERSION");
@@ -329,10 +342,17 @@ impl Daemon {
         let has_panics = files.iter().any(|(name, _)| name == "logs/panic.log");
 
         // --- write the gzipped tarball ---
-        // The daemon is root and `/tmp` is attacker-controlled, so allocation,
-        // writes, permissions, and ownership all stay on one exclusively-created
-        // file descriptor. A random name also prevents same-second collisions.
-        let path = match create_report_bundle(std::path::Path::new("/tmp"), &files, peer_cred) {
+        // The daemon is root and the temp directory is attacker-controlled, so
+        // allocation, writes, permissions, and ownership all stay on one
+        // exclusively-created file descriptor. A random name also prevents
+        // same-second collisions.
+        #[cfg(unix)]
+        let dir = std::path::PathBuf::from("/tmp");
+        // No fixed `/tmp` on Windows, and the service account's own temp
+        // directory is where a LocalSystem process may write.
+        #[cfg(windows)]
+        let dir = std::env::temp_dir();
+        let path = match create_report_bundle(&dir, &files, requester.as_ref()) {
             Ok(path) => path,
             Err(e) => return ipc_err(format!("failed to write report bundle: {e}")),
         };
@@ -652,9 +672,9 @@ const FOLLOW_POLL: Duration = Duration::from_millis(500);
 /// over the 1 MiB frame cap, and `--follow` has no end at all. A one-shot read
 /// closes with an [`IpcMessage::Ok`] sentinel; a followed one runs until the
 /// client hangs up or the daemon shuts down.
-pub(crate) async fn stream_logs(
+pub(crate) async fn stream_logs<S: Hangup>(
     dir: &Path,
-    framed: &mut IpcFramed,
+    framed: &mut ServedFramed<S>,
     since: Option<Duration>,
     follow: bool,
     token: &CancellationToken,
@@ -772,8 +792,8 @@ fn select_log_files(dir: &Path, cutoff: Option<&str>, today: &str) -> Vec<PathBu
 /// A trailing partial line is left where it is: the daemon writes into this
 /// same file, so a read can land mid-line, and forwarding half of one would
 /// both garble it and make the next poll repeat it.
-async fn stream_file(
-    framed: &mut IpcFramed,
+async fn stream_file<S: Hangup>(
+    framed: &mut ServedFramed<S>,
     path: &Path,
     cutoff: Option<&str>,
     from: u64,
@@ -815,7 +835,7 @@ async fn stream_file(
 }
 
 /// Drain `buf` into `LogChunk` frames, none bigger than the frame cap allows.
-async fn send_chunks(framed: &mut IpcFramed, buf: &mut Vec<u8>) -> Result<()> {
+async fn send_chunks<S: Hangup>(framed: &mut ServedFramed<S>, buf: &mut Vec<u8>) -> Result<()> {
     for piece in buf.chunks(LOG_CHUNK_BYTES) {
         ipc::send(
             framed,
@@ -877,11 +897,43 @@ fn day_of(t: SystemTime) -> String {
     rfc3339_micros(t)[..DAY_LEN].to_string()
 }
 
-/// Resolves once the client's end of the socket is gone.
+/// A served IPC transport that can be watched for the client hanging up.
+///
+/// `readable`/`try_read` are inherent methods on both `UnixStream` and
+/// `NamedPipeServer` with the same shapes, but they belong to no shared trait,
+/// and `AsyncRead` alone cannot express "tell me about EOF without consuming a
+/// read the framing owns". So the two are named here, which is also what makes
+/// [`stream_logs`] servable on both.
+pub(crate) trait Hangup: AsyncRead + AsyncWrite + Unpin {
+    fn readable(&self) -> impl Future<Output = std::io::Result<()>>;
+    fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+#[cfg(unix)]
+impl Hangup for tokio::net::UnixStream {
+    fn readable(&self) -> impl Future<Output = std::io::Result<()>> {
+        Self::readable(self)
+    }
+    fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Self::try_read(self, buf)
+    }
+}
+
+#[cfg(windows)]
+impl Hangup for tokio::net::windows::named_pipe::NamedPipeServer {
+    fn readable(&self) -> impl Future<Output = std::io::Result<()>> {
+        Self::readable(self)
+    }
+    fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Self::try_read(self, buf)
+    }
+}
+
+/// Resolves once the client's end of the connection is gone.
 ///
 /// The client sends nothing after its request, so any readability is either
 /// EOF (it hung up) or noise to discard.
-async fn client_gone(stream: &UnixStream) -> std::io::Result<()> {
+async fn client_gone<S: Hangup>(stream: &S) -> std::io::Result<()> {
     let mut scratch = [0u8; 64];
     loop {
         stream.readable().await?;
@@ -997,7 +1049,10 @@ mod log_tests {
 /// The streaming half of `ray logs`, driven over a real socket pair: the
 /// filtering and file-selection units above say what *should* go out, these
 /// say what actually comes back on the wire.
-#[cfg(test)]
+///
+/// Unix only, for want of a `NamedPipeServer::pair()`: naming a pipe would make
+/// these tests share process-wide state with anything else running.
+#[cfg(all(test, unix))]
 mod log_stream_tests {
     use super::*;
 
@@ -1024,7 +1079,7 @@ mod log_stream_tests {
     }
 
     /// Read the next frame off the client end, failing rather than hanging.
-    async fn next_chunk(framed: &mut IpcFramed) -> String {
+    async fn next_chunk(framed: &mut crate::ipc::IpcFramed) -> String {
         let msg = tokio::time::timeout(PATIENCE, ipc::recv(framed))
             .await
             .expect("no frame arrived")
@@ -1034,7 +1089,7 @@ mod log_stream_tests {
 
     /// Drain the client end until the `Ok` sentinel and return what the chunks
     /// concatenate to. `None` for `Error`, which is a different answer.
-    async fn drain(framed: &mut IpcFramed) -> Option<String> {
+    async fn drain(framed: &mut crate::ipc::IpcFramed) -> Option<String> {
         let mut out = Vec::new();
         loop {
             match ipc::recv(framed).await.unwrap() {
@@ -1050,8 +1105,8 @@ mod log_stream_tests {
         dir: &Path,
         since: Option<Duration>,
         follow: bool,
-    ) -> (IpcFramed, tokio::task::JoinHandle<Result<()>>) {
-        let (client, server) = UnixStream::pair().unwrap();
+    ) -> (crate::ipc::IpcFramed, tokio::task::JoinHandle<Result<()>>) {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
         let dir = dir.to_path_buf();
         let task = tokio::spawn(async move {
             let mut framed = ipc::framed(server);

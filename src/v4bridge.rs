@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::forward::{SSH_LISTEN_PORT, SSH_PORT};
 use crate::listen_events;
-use crate::ssh::bind_listener;
+use crate::listener::bind_listener;
 
 /// How often the host's listening sockets are re-enumerated where nothing
 /// reports a change. A service can start long after `ray up`, so this cannot be

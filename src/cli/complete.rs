@@ -569,6 +569,19 @@ fn starts_with(candidate: &CompletionCandidate, current: &OsStr) -> bool {
 /// that its shell reads without being told to.
 const INSTALLABLE: [Shell; 3] = [Shell::Bash, Shell::Zsh, Shell::Fish];
 
+/// Whether this platform has directories every shell on the box already
+/// searches, which is what the system-wide install writes into.
+///
+/// Windows does not. The three shells above are found through a package layout
+/// (`/usr/share/...`) it has no counterpart to, and PowerShell, the shell that
+/// is actually there, loads completions from a profile script rather than a
+/// directory. Left unchecked, an elevated `ray up` re-rooted those POSIX paths
+/// on the system drive: it created `\usr\share\bash-completion\completions` and
+/// two more like it, wrote stubs no shell would ever read, and reported tab
+/// completion as installed. So install nothing there, and let the per-user path
+/// in [`user_path`] be the only target.
+const HAS_SYSTEM_DIRS: bool = cfg!(unix);
+
 /// Write the shell's side of this: a stub that calls back here.
 pub(crate) fn registration(shell: Shell, out: &mut dyn Write) -> Result<()> {
     let name = shell.to_string();
@@ -619,6 +632,9 @@ fn system_path(shell: Shell) -> Option<PathBuf> {
 /// `system_path` with the root spelled out, so the tests can point the whole
 /// install at a temp directory without touching a process-wide env var.
 fn system_path_under(root: &Path, shell: Shell) -> Option<PathBuf> {
+    if !HAS_SYSTEM_DIRS {
+        return None;
+    }
     if shell == Shell::Zsh {
         return Some(under(root, &zsh_system_dir().join("_ray")));
     }
@@ -779,8 +795,22 @@ fn user_path(shell: Shell) -> Option<PathBuf> {
     })
 }
 
+/// Whether this process may write the system-wide completion directories.
+///
+/// Only consulted where there are such directories, so the Windows arm is there
+/// to compile rather than to decide anything: [`HAS_SYSTEM_DIRS`] is false and
+/// short-circuits ahead of every call. It answers the same question `ray up`
+/// asks before touching the service, since an elevated Administrator is what
+/// corresponds to root on a platform with no euid.
 fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        rayfish::windows_identity::is_current_process_elevated_admin()
+    }
 }
 
 /// Write one stub, or leave the file alone when it already says this.
@@ -816,6 +846,9 @@ pub(crate) fn install_system() -> Vec<PathBuf> {
 }
 
 fn install_system_under(root: &Path) -> Vec<PathBuf> {
+    if !HAS_SYSTEM_DIRS {
+        return Vec::new();
+    }
     remove_our_stubs(Shell::Zsh, &stale_zsh_paths(root));
     INSTALLABLE
         .iter()
@@ -848,6 +881,9 @@ pub(crate) fn uninstall_system() {
 }
 
 fn uninstall_system_under(root: &Path) {
+    if !HAS_SYSTEM_DIRS {
+        return;
+    }
     for shell in INSTALLABLE {
         if let Some(path) = system_path_under(root, shell) {
             let _ = std::fs::remove_file(path);
@@ -865,7 +901,7 @@ fn uninstall_system_under(root: &Path) {
 /// a read-only `/usr` or a distro with no `bash-completion` must not turn a
 /// working service install into a failure.
 pub(crate) fn install_with_service() {
-    if !is_root() {
+    if !HAS_SYSTEM_DIRS || !is_root() {
         return;
     }
     let written = install_system();
@@ -884,8 +920,9 @@ pub(crate) fn cmd_completions(shell: Option<Shell>, install: bool) -> Result<()>
     }
 
     // Root and no shell named: every shell, system-wide, where they are found
-    // without anyone editing an rc file.
-    if is_root() && shell.is_none() {
+    // without anyone editing an rc file. Skipped where there is no such
+    // directory, so that this does not report an install it did not do.
+    if HAS_SYSTEM_DIRS && is_root() && shell.is_none() {
         let written = install_system();
         if written.is_empty() {
             println!("tab completion is already installed and up to date");
@@ -903,7 +940,7 @@ pub(crate) fn cmd_completions(shell: Option<Shell>, install: bool) -> Result<()>
 
     // A named shell under root still means system-wide: that is where root can
     // write, and where the file is found without configuration.
-    let path = match is_root() {
+    let path = match HAS_SYSTEM_DIRS && is_root() {
         true => system_path(shell),
         false => user_path(shell),
     };
@@ -930,7 +967,7 @@ pub(crate) fn cmd_completions(shell: Option<Shell>, install: bool) -> Result<()>
             );
         }
     }
-    if !is_root() {
+    if HAS_SYSTEM_DIRS && !is_root() {
         println!("`sudo ray completions --install` installs for every shell and every user.");
     }
     println!(
@@ -1047,19 +1084,20 @@ mod tests {
         }
     }
 
-    /// The bug this detection exists for: on Debian and Ubuntu,
-    /// `/usr/share/zsh/site-functions` is on no zsh's `fpath`, so the stub that
-    /// was written there was never autoloaded and tab completion did nothing.
+    /// The guard on the system-wide install, from both sides: a platform with
+    /// those directories writes a stub for every shell, and one without writes
+    /// nothing at all. Windows is the second, and gets the whole assertion
+    /// rather than a skip, because the bug being kept out is silent. The POSIX
+    /// paths re-rooted cleanly there, so the install reported success while
+    /// leaving `\usr\share\bash-completion\completions\ray` on the system drive
+    /// for a shell that would never look.
     #[test]
-    fn the_zsh_directory_is_one_zsh_actually_searches() {
-        let dir = zsh_system_dir();
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(is_zsh_site_dir(&dir), "{}", dir.display());
-
-        // Only assertable where there is a zsh to ask; CI images without one
-        // take the fallback, which is what the previous code always did.
-        if let Some(searched) = zsh_searches(&dir) {
-            assert!(searched, "zsh does not search {}", dir.display());
+    fn a_system_install_writes_only_where_a_shell_would_read_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let written = install_system_under(root.path());
+        assert_eq!(!written.is_empty(), HAS_SYSTEM_DIRS, "{written:?}");
+        for shell in INSTALLABLE {
+            assert_eq!(system_path(shell).is_some(), HAS_SYSTEM_DIRS, "{shell}");
         }
     }
 
@@ -1076,6 +1114,35 @@ mod tests {
         assert!(is_zsh_site_dir(Path::new(
             "/usr/share/zsh/vendor-completions"
         )));
+    }
+}
+
+/// What the system-wide install does once it has somewhere to install to, which
+/// is a POSIX package layout and nowhere else. Every path here is absolute in
+/// the way only a POSIX host reads as absolute: on Windows `Path::is_absolute`
+/// wants a drive letter or a UNC share, so `/usr/share/...` is a relative path
+/// and there is no equivalent for these three shells to rewrite it to. The
+/// platform side of it is asserted in
+/// [`tests::a_system_install_writes_only_where_a_shell_would_read_it`], which
+/// runs everywhere.
+#[cfg(all(test, unix))]
+mod system_install_tests {
+    use super::*;
+
+    /// The bug this detection exists for: on Debian and Ubuntu,
+    /// `/usr/share/zsh/site-functions` is on no zsh's `fpath`, so the stub that
+    /// was written there was never autoloaded and tab completion did nothing.
+    #[test]
+    fn the_zsh_directory_is_one_zsh_actually_searches() {
+        let dir = zsh_system_dir();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(is_zsh_site_dir(&dir), "{}", dir.display());
+
+        // Only assertable where there is a zsh to ask; CI images without one
+        // take the fallback, which is what the previous code always did.
+        if let Some(searched) = zsh_searches(&dir) {
+            assert!(searched, "zsh does not search {}", dir.display());
+        }
     }
 
     /// A stub left in the directory an older install chose is a file zsh never

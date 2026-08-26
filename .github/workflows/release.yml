@@ -1,8 +1,8 @@
 name: Release
 
 # Continuous releases: pushing a tag like `v0.1.0` cuts a release with
-# Linux + macOS binaries. Can also be run manually from the Actions tab.
-# Windows support: TODO.
+# Linux, macOS, Android, and Windows assets. Can also be run manually from the
+# Actions tab.
 on:
   push:
     tags:
@@ -156,6 +156,111 @@ jobs:
           files: |
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
+
+  windows:
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      # SignPath fetches the unsigned MSI back out as a workflow artifact.
+      actions: read
+    env:
+      # A step-level `if` cannot read the secrets context, so the token comes
+      # through the environment instead. Empty until SignPath is set up, and
+      # that is what keeps the unsigned release building in the meantime.
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-x86_64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Install WiX 3
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX candle.exe was not found after installation.'
+          }
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build Windows MSI
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          $tag = $env:RELEASE_TAG.TrimStart('v')
+          $version = ($tag -split '-', 2)[0]
+          ./scripts/build-windows-msi.ps1 -Version $version -ReleaseIdentity $tag -Channel stable -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+          Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_IDENTITY=$tag"
+
+      # SignPath signs out of band. The unsigned MSI goes up as a workflow
+      # artifact, SignPath signs the ray.exe inside it and then the MSI itself,
+      # and the signed file comes back down. The three steps skip together when
+      # the token is absent, so a release still builds before the certificate
+      # exists; the assets are simply unsigned, as they are today.
+      - name: Upload unsigned MSI for signing
+        id: unsigned
+        if: env.SIGNPATH_API_TOKEN != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ray-windows-x86_64-msi-unsigned
+          path: ${{ runner.temp }}/ray-windows-x86_64.msi
+          if-no-files-found: error
+          # Only SignPath needs it. Keeping it around would leave an unsigned
+          # installer sitting on the release run for anyone to download.
+          retention-days: 1
+
+      - name: Sign MSI
+        if: env.SIGNPATH_API_TOKEN != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signed
+
+      - name: Verify signature and rehash
+        if: env.SIGNPATH_API_TOKEN != ''
+        shell: pwsh
+        run: |
+          $msi = "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+          Copy-Item -LiteralPath "$env:RUNNER_TEMP\signed\ray-windows-x86_64.msi" -Destination $msi -Force
+          # Valid, not merely signed: a release certificate has to chain to a
+          # trusted root, and anything less would ship a warning to every user.
+          $signature = Get-AuthenticodeSignature -FilePath $msi
+          if ($signature.Status -ne 'Valid') {
+            throw "Signed MSI did not verify: $($signature.Status)."
+          }
+          Write-Host "Signed by $($signature.SignerCertificate.Subject)"
+          ./scripts/write-msi-sidecars.ps1 -MsiPath $msi -ReleaseIdentity $env:RELEASE_IDENTITY
+
+      - name: Upload Windows release assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            ${{ runner.temp }}/ray-windows-x86_64.msi
+            ${{ runner.temp }}/ray-windows-x86_64.msi.sha256
+            ${{ runner.temp }}/ray-windows-x86_64.msi.version
 
   android:
     needs: create-release

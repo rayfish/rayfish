@@ -439,6 +439,18 @@ impl Daemon {
     /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
     /// on its own leaves the node advertising SSH with nothing listening.
     pub(crate) fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        // There is no Windows SSH server to start, so turning it on would write
+        // `ssh_enabled = true` and open port 22 for a listener that never
+        // arrives. Rejected before anything is persisted, so the config and the
+        // firewall stay consistent with what the daemon can actually do.
+        // `off` still goes through, so a config carried over from another
+        // platform can be turned back off here.
+        #[cfg(windows)]
+        if settings::parse_bool(value, false).unwrap_or(false) {
+            return ipc_err(
+                "the embedded SSH server is not available on Windows; nothing was changed",
+            );
+        }
         // The registry parses and writes the field; everything below is the side
         // effects it deliberately does not do.
         let mut parse_err = None;
