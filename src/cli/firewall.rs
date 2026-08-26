@@ -249,7 +249,13 @@ fn render_ssh_state(
     if !enabled {
         println!("\nThese rules are not in effect: mesh SSH is off.");
         println!("Start the server with `ray firewall ssh on`.");
+        return;
     }
+    // Self-traffic is delivered over loopback and never enters the TUN, so the
+    // port rewrite that makes mesh `:22` land on the server never runs and the
+    // connection is refused. Cheaper to say than to diagnose from an RST.
+    println!("\nThis node cannot mesh-SSH to itself; `ssh <this node>` is refused.");
+    println!("Use `ssh localhost` on the box itself.");
 }
 
 /// Print a JSON value as one compact line to stdout (jq-friendly).

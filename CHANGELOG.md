@@ -29,6 +29,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   defaulting to any peer, and the rule list names the peer a rule is scoped to
   instead of showing its short id.
 
+### Changed
+
+- **`ray firewall ssh show` says a node cannot SSH to itself.** Connecting to
+  your own mesh address from the box it belongs to is refused: the kernel
+  delivers self-traffic over loopback, so it never reaches the mesh SSH server,
+  and nothing else is listening on `:22`. The output now says so and points at
+  `ssh localhost`, instead of leaving a bare "connection refused" to explain
+  itself.
+
 ### Security
 
 - **Android no longer sends your keys to Google's backup.** The app allowed

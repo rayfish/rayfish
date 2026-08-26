@@ -42,6 +42,17 @@
 //! Authorization is evaluated once, when the connection is accepted, so
 //! `ray firewall ssh allow/deny` changes apply to *new* sessions; an
 //! already-established session is not torn down by a later `deny`.
+//!
+//! A connection from this host to its own mesh address never arrives here. The
+//! kernel short-circuits self-traffic over loopback (see
+//! [`crate::tun::route_self_loopback`]), so it never enters the TUN, and the
+//! port rewrite that makes mesh `:22` reach the internal listen port lives in
+//! that forwarding path. The connection lands on `<mesh ip>:22`, where nothing
+//! is bound, and the kernel refuses it. Binding `:22` as well would not fix
+//! that: the `none` auth method is safe only because the mesh link proves who
+//! the peer is, and a loopback connection proves nothing beyond "some account
+//! on this box", so admitting it would hand every local user a root shell. On
+//! the host itself, use the host sshd (`ssh localhost`), which authenticates.
 
 use std::collections::HashMap;
 use std::io::Error;
