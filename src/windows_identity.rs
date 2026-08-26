@@ -10,8 +10,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFre
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, DuplicateToken, GetTokenInformation,
-    LookupAccountNameW, RevertToSelf, SecurityIdentification, TOKEN_DUPLICATE, TOKEN_QUERY,
-    TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+    LookupAccountNameW, RevertToSelf, SecurityIdentification, SidTypeUser, TOKEN_DUPLICATE,
+    TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
 };
 use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
 use windows_sys::Win32::System::Threading::{
@@ -146,14 +146,14 @@ pub fn is_current_process_elevated_admin() -> bool {
 }
 
 pub fn account_sid(account: &OsStr) -> Result<String> {
-    let account: Vec<u16> = account.encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = account.encode_wide().chain(std::iter::once(0)).collect();
     let mut sid_size = 0u32;
     let mut domain_size = 0u32;
     let mut sid_use = 0;
     unsafe {
         let _ = LookupAccountNameW(
             std::ptr::null(),
-            account.as_ptr(),
+            wide.as_ptr(),
             std::ptr::null_mut(),
             &mut sid_size,
             std::ptr::null_mut(),
@@ -172,7 +172,7 @@ pub fn account_sid(account: &OsStr) -> Result<String> {
     let ok = unsafe {
         LookupAccountNameW(
             std::ptr::null(),
-            account.as_ptr(),
+            wide.as_ptr(),
             sid.as_mut_ptr().cast(),
             &mut sid_size,
             domain.as_mut_ptr(),
@@ -183,6 +183,15 @@ pub fn account_sid(account: &OsStr) -> Result<String> {
     anyhow::ensure!(ok != 0, "account lookup failed (Win32 error {})", unsafe {
         GetLastError()
     });
+    // The operator is one person, and the SID goes straight into the pipe DACL.
+    // A group name resolves here just as happily as a user, so `set-operator
+    // Users` would otherwise grant mutation rights to every account on the
+    // machine, which is the opposite of what naming an operator is for.
+    anyhow::ensure!(
+        sid_use == SidTypeUser,
+        "{} is not a user account; the operator must be a single user, not a group",
+        account.to_string_lossy()
+    );
     sid_to_string(sid.as_mut_ptr().cast()).context("account lookup returned an invalid SID")
 }
 
@@ -224,6 +233,15 @@ mod tests {
     fn current_account_round_trips_through_lookup() {
         let account = std::env::var_os("USERNAME").expect("USERNAME");
         assert_eq!(account_sid(&account).unwrap(), current_user_sid().unwrap());
+    }
+
+    #[test]
+    fn a_group_is_not_accepted_as_the_operator() {
+        // `LookupAccountNameW` resolves a group name as readily as a user's, and
+        // the SID it returns would go into the pipe DACL. Localized Windows calls
+        // this group something else, where the lookup fails instead; either way
+        // the call must not succeed.
+        assert!(account_sid(OsStr::new("Administrators")).is_err());
     }
 
     #[test]
