@@ -74,7 +74,13 @@ $extractRoot = Join-Path $tempRoot 'wintun'
 $msiBinDir = Join-Path $tempRoot 'bin'
 $stagedDll = Join-Path $msiBinDir 'wintun.dll'
 
-New-Item -ItemType Directory -Force -Path $tempRoot, $outputDir | Out-Null
+New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+# -Force does not make New-Item accept a drive root: an -OutputPath directly on
+# C:\ leaves $outputDir as "C:\", and creating that throws "the path is not of a
+# legal form". Skip the directory that is already there.
+if ($outputDir -and -not (Test-Path -LiteralPath $outputDir)) {
+    New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+}
 
 try {
     Write-Host "Building ray for $Target..."
