@@ -49,6 +49,11 @@
         <!-- The first elevated `ray up` records the invoking operator SID before start. -->
         <ServiceControl Id="RayfishServiceControl" Name="rayfish"
                         Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <!-- Without this `ray` is only runnable by full path: the MSI installs
+             per-machine and nothing else puts the directory on PATH. System
+             scope, not user, to match the install scope. -->
+        <Environment Id="RayfishPath" Name="PATH" Value="[INSTALLFOLDER]"
+                     Action="set" Part="last" System="yes" Permanent="no" />
       </Component>
       <Component Id="WintunLibrary" Guid="*">
         <File Id="WintunDll" Source="$(var.CargoTargetBinDir)\wintun.dll" KeyPath="yes" />
