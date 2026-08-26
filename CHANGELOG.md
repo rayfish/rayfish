@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-26
+
+Every node upgrades together. The mesh protocol goes from 2 to 5 and peers on
+different versions do not connect at all, so a node left on 0.3.x stops seeing
+the network rather than degrading, and `ray status` marks it incompatible.
+Nothing on disk changes, so upgrading in place keeps your networks, identity
+and pairings.
+
+Two more things break across versions. The mesh has no IPv4 any more, so check
+what your services listen on before you upgrade (the note under "Rayfish is
+IPv6-only" below says what still needs `::`). And a command the daemon rejects
+now exits non-zero, where it used to print the rejection and exit 0, which is a
+change for any script that only checked the exit status.
+
 ### Added
 
 - **Services that listen on IPv4 only are reachable over the mesh.** The mesh is
@@ -16,8 +30,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and hands the connection to the local service over IPv4, so
   `curl http://box.ray:4000` works against a server that only speaks IPv4. On
   Linux a port becomes reachable the moment the service starts listening,
-  because the kernel says so; on other systems it is picked up within a few
-  seconds.
+  because the kernel says so; on macOS it is picked up within about fifteen
+  seconds. It covers TCP listeners on ports below 32768, which is what a
+  service someone dials by number is; UDP, higher ports, and hosts other than
+  Linux and macOS still need the service on `::`.
   Nothing new is exposed by it: only a service already listening on every
   interface (`0.0.0.0`) is bridged, one bound to `127.0.0.1` is left alone, and
   the firewall decides who reaches it exactly as before. The service sees the
@@ -131,8 +147,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     incompatible, and a join against a network on another version fails naming
     both.
   - **Check what your services listen on.** `0.0.0.0` is the IPv4 wildcard, not
-    "any address", so a service bound there has no IPv6 socket and peers can no
-    longer reach it. Bind `::` instead, which accepts both families on Linux.
+    "any address", so a service bound there has no IPv6 socket of its own. The
+    bridge above answers for it on Linux and macOS, for TCP ports below 32768.
+    Outside that, bind `::` instead, which accepts both families on Linux.
     Go and Node already do this; nginx needs `listen [::]:80;` adding, and
     `--bind 0.0.0.0` defaults and Docker published ports need the flag changed.
     `ss -tlnp` shows which is which: `0.0.0.0:port` is affected, `[::]:port` is
@@ -1807,7 +1824,8 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rayfish/rayfish/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rayfish/rayfish/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rayfish/rayfish/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rayfish/rayfish/compare/v0.1.4...v0.2.0
