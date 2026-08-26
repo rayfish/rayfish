@@ -1035,6 +1035,20 @@ impl Node {
         }
     }
 
+    /// Whether this device has an identity on disk yet.
+    ///
+    /// False only before anything has started the node, since the first start
+    /// mints one. That makes it the "has this person used the app" question, so
+    /// the platform can offer a restore on a fresh install and never show that
+    /// screen again, with no first-run flag of its own to keep in step.
+    ///
+    /// Reads a file. Does not need (and does not do) a [`Node::start`].
+    pub fn has_identity(&self) -> bool {
+        identity::load_existing()
+            .map(|k| k.is_some())
+            .unwrap_or(false)
+    }
+
     /// Encrypt this device's identity under `password` and return the backup
     /// code, for the platform to hand to a file picker (Drive, Files, whatever
     /// the user has) or a password manager. Format and threat model are in
@@ -1083,13 +1097,17 @@ impl Node {
             keybackup::decrypt(&code, &password).map_err(|e| RayError::BadBackup(e.to_string()))?;
         let restored = key.public().to_string();
 
-        let existing = identity::load_or_create().map_err(RayError::network)?;
-        if existing.public() == key.public() {
-            tracing::info!(id = %restored, "restore: identity already on this device");
-            return Ok(restored);
-        }
-        if !replace_existing {
-            return Err(RayError::IdentityExists(existing.public().to_string()));
+        // Deliberately not `load_or_create`: on a device with no identity yet
+        // that would mint one, and the restore would then have to ask the user
+        // for permission to overwrite a key it had just invented.
+        if let Some(existing) = identity::load_existing().map_err(RayError::network)? {
+            if existing.public() == key.public() {
+                tracing::info!(id = %restored, "restore: identity already on this device");
+                return Ok(restored);
+            }
+            if !replace_existing {
+                return Err(RayError::IdentityExists(existing.public().to_string()));
+            }
         }
 
         identity::store_secret_key(&key).map_err(RayError::network)?;

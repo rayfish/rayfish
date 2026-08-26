@@ -800,6 +800,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -842,6 +844,8 @@ fun uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound(
 fun uniffi_ray_mobile_checksum_method_node_firewall_show(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_handle_link(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_has_identity(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_health_snapshot(
 ): Short
@@ -984,6 +988,8 @@ fun uniffi_ray_mobile_fn_method_node_firewall_show(`ptr`: Pointer,uniffi_out_err
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_handle_link(`ptr`: Pointer,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_has_identity(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_ray_mobile_fn_method_node_health_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_invite(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1206,6 +1212,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_handle_link() != 17267.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_has_identity() != 63385.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_health_snapshot() != 25816.toShort()) {
@@ -1777,6 +1786,18 @@ public interface NodeInterface {
     fun `handleLink`(`uri`: kotlin.String): LinkAction
     
     /**
+     * Whether this device has an identity on disk yet.
+     *
+     * False only before anything has started the node, since the first start
+     * mints one. That makes it the "has this person used the app" question, so
+     * the platform can offer a restore on a fresh install and never show that
+     * screen again, with no first-run flag of its own to keep in step.
+     *
+     * Reads a file. Does not need (and does not do) a [`Node::start`].
+     */
+    fun `hasIdentity`(): kotlin.Boolean
+    
+    /**
      * Lightweight health vitals for auto-telemetry. Reuses `status()` for mesh
      * state and reads the diagnostics counters. Cumulative WARN/ERROR counts
      * (since process start); reading does not reset them.
@@ -2318,6 +2339,28 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_handle_link(
         it, FfiConverterString.lower(`uri`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Whether this device has an identity on disk yet.
+     *
+     * False only before anything has started the node, since the first start
+     * mints one. That makes it the "has this person used the app" question, so
+     * the platform can offer a restore on a fresh install and never show that
+     * screen again, with no first-run flag of its own to keep in step.
+     *
+     * Reads a file. Does not need (and does not do) a [`Node::start`].
+     */override fun `hasIdentity`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_has_identity(
+        it, _status)
 }
     }
     )

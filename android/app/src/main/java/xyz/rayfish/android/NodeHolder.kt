@@ -37,6 +37,15 @@ object NodeHolder {
     @Volatile
     private var started = false
 
+    /**
+     * Whether the node has been started in this process. Distinct from the
+     * user's enable/disable intent and from whether a tunnel is up: this is only
+     * "is there a live daemon behind the FFI". An identity restore reads it to
+     * decide whether to put the node back afterwards, which on a fresh install
+     * it must not, since starting is what mints the key it is trying to replace.
+     */
+    fun isStarted(): Boolean = started
+
     // The user's persisted enable/disable intent. This is the authority for
     // whether the device should be online: the status poll must never start the
     // node on its own (that resurrects a node the user just disabled), so the

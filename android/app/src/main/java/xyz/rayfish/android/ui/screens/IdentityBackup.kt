@@ -11,20 +11,16 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import uniffi.ray_mobile.RayException
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
 
 /**
- * Back up and restore this device's identity.
+ * Back up and restore this device's identity, from the You tab.
  *
  * The destination is whatever the system file picker offers: Drive, OneDrive,
  * Files, a password manager that registers as a document provider. Deliberately
@@ -43,20 +39,14 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
     var askBackupPassword by remember { mutableStateOf(false) }
     var backupPassword by remember { mutableStateOf("") }
     var backupConfirm by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var restoring by remember { mutableStateOf(false) }
 
     // The encrypted code, held only between "encrypted it" and "the user chose
     // where it goes". Cleared on both the success and the cancel path: a backup
     // code sitting in composition after the flow ends is the identity sitting
     // there, and a cancelled save is cheap to redo.
     var pendingCode by remember { mutableStateOf<String?>(null) }
-
-    var restoreCode by remember { mutableStateOf<String?>(null) }
-    var restorePassword by remember { mutableStateOf("") }
-    var askRestorePassword by remember { mutableStateOf(false) }
-    // The identity already on this device, set when the core refuses to
-    // overwrite it. Drives the confirm dialog; null means nothing to confirm.
-    var identityToReplace by remember { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
 
     // The tunnel binds the endpoint to the current key, so the identity cannot
     // change under it. Restore is offered only with Rayfish off, which is also
@@ -77,26 +67,6 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
                 }.isSuccess
             }
             onToast(if (wrote) "Backup saved" else "Could not write the backup")
-        }
-    }
-
-    val pickBackup = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
-            val text = withContext(Dispatchers.IO) {
-                runCatching {
-                    context.contentResolver.openInputStream(uri)?.use { readBounded(it) }
-                }.getOrNull()
-            }
-            if (text.isNullOrBlank()) {
-                onToast("Could not read that file")
-            } else {
-                restoreCode = text.trim()
-                restorePassword = ""
-                askRestorePassword = true
-            }
         }
     }
 
@@ -121,8 +91,8 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
             )
             OutlinePillButton(
                 "Restore",
-                enabled = !busy && !running,
-                onClick = { pickBackup.launch(arrayOf("*/*")) },
+                enabled = !busy && !running && !restoring,
+                onClick = { restoring = true },
                 modifier = Modifier.weight(1f),
             )
         }
@@ -134,6 +104,13 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
             )
         }
     }
+
+    IdentityRestoreDialogs(
+        active = restoring,
+        onDone = { restoring = false },
+        onToast = onToast,
+        onRestored = onChanged,
+    )
 
     if (askBackupPassword) {
         AlertDialog(
@@ -182,160 +159,6 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
             },
         )
     }
-
-    if (askRestorePassword) {
-        AlertDialog(
-            onDismissRequest = { askRestorePassword = false; restoreCode = null },
-            containerColor = Rf.Sheet,
-            title = { Text("Restore identity", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RayfishTextField(restorePassword, { restorePassword = it }, "backup password", password = true)
-                    Text(
-                        "The password you chose when you made this backup.",
-                        fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = restorePassword.isNotEmpty(),
-                    onClick = {
-                        askRestorePassword = false
-                        val code = restoreCode ?: return@TextButton
-                        restore(
-                            scope, context, code, restorePassword, false,
-                            onToast, onChanged,
-                            onBusy = { busy = it },
-                            onExists = { identityToReplace = it },
-                            onSettled = { restoreCode = null; restorePassword = "" },
-                        )
-                    },
-                ) { Text("Restore", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
-            },
-            dismissButton = {
-                TextButton(onClick = { askRestorePassword = false; restoreCode = null }) {
-                    Text("Cancel", color = Rf.Body, fontFamily = Chakra)
-                }
-            },
-        )
-    }
-
-    identityToReplace?.let { existing ->
-        AlertDialog(
-            onDismissRequest = { identityToReplace = null; restoreCode = null; restartNode(scope, context, onChanged) },
-            containerColor = Rf.Sheet,
-            title = { Text("Replace this identity?", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
-            text = {
-                Text(
-                    "This device already has identity ${shortId(existing)}. Restoring replaces it: " +
-                        "the old one is gone from this device, its pairing certificate is deleted, and peers " +
-                        "will see this device at a new address.",
-                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Body,
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    identityToReplace = null
-                    val code = restoreCode ?: return@TextButton
-                    restore(
-                        scope, context, code, restorePassword, true,
-                        onToast, onChanged,
-                        onBusy = { busy = it },
-                        onExists = { },
-                        onSettled = { restoreCode = null; restorePassword = "" },
-                    )
-                }) { Text("Replace", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    identityToReplace = null
-                    restoreCode = null
-                    restartNode(scope, context, onChanged)
-                }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) }
-            },
-        )
-    }
 }
-
-/**
- * Stop the node, swap the key, bring it back up. The stop is what makes the
- * swap legal (the core refuses while the endpoint is bound), so every exit from
- * here restarts, including the failures: leaving the device silently offline
- * because a password was mistyped would be the worse bug.
- *
- * `onExists` fires when the device already holds a different identity, which is
- * a question for the user rather than an error. The node stays stopped in that
- * one case, because the answer is another call to this function.
- */
-private fun restore(
-    scope: CoroutineScope,
-    context: android.content.Context,
-    code: String,
-    password: String,
-    replaceExisting: Boolean,
-    onToast: (String) -> Unit,
-    onChanged: () -> Unit,
-    onBusy: (Boolean) -> Unit,
-    onExists: (String) -> Unit,
-    onSettled: () -> Unit,
-) {
-    scope.launch {
-        onBusy(true)
-        var awaitingConfirmation = false
-        try {
-            val restored = withContext(Dispatchers.IO) {
-                NodeHolder.stopNode(context)
-                NodeHolder.get(context).restoreIdentity(code, password, replaceExisting)
-            }
-            onToast("Restored identity ${shortId(restored)}")
-        } catch (e: RayException.IdentityExists) {
-            awaitingConfirmation = true
-            onExists(e.v1)
-        } catch (e: RayException.BadBackup) {
-            onToast("Wrong password, or that file is not a backup")
-        } catch (e: RayException.NodeRunning) {
-            onToast("Turn Rayfish off before restoring")
-        } catch (t: Throwable) {
-            onToast("Restore failed: ${t.message}")
-        } finally {
-            onBusy(false)
-        }
-        if (!awaitingConfirmation) {
-            onSettled()
-            runCatching { NodeHolder.ensureStarted(context) }
-            onChanged()
-        }
-    }
-}
-
-private fun restartNode(scope: CoroutineScope, context: android.content.Context, onChanged: () -> Unit) {
-    scope.launch {
-        runCatching { NodeHolder.ensureStarted(context) }
-        onChanged()
-    }
-}
-
-/** First six of the public key, which is how the rest of the UI names one. */
-private fun shortId(publicKey: String): String =
-    if (publicKey.length > 6) publicKey.take(6) else publicKey
 
 private fun suggestedFileName(publicKey: String): String = "rayfish-identity-${shortId(publicKey)}.txt"
-
-/**
- * A backup code is about 126 characters. Reading unbounded would let a
- * mis-tapped video in the picker pull hundreds of megabytes into memory, so
- * stop well past any real code and let the decode reject what comes back.
- */
-private const val MAX_BACKUP_FILE_BYTES = 4096
-
-private fun readBounded(stream: InputStream): String {
-    val out = ByteArrayOutputStream()
-    val buf = ByteArray(1024)
-    while (out.size() < MAX_BACKUP_FILE_BYTES) {
-        val n = stream.read(buf)
-        if (n <= 0) break
-        out.write(buf, 0, n)
-    }
-    return String(out.toByteArray(), Charsets.UTF_8)
-}

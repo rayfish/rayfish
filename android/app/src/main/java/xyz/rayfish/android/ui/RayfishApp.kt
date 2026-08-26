@@ -43,6 +43,25 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
     var status by remember { mutableStateOf<Status?>(null) }
     var starting by remember { mutableStateOf(true) }
 
+    // Null until the check completes, and everything below is composed only once
+    // it is true. That ordering is the whole point: every path out of this
+    // function starts the node, and the first start mints an identity, so a
+    // first-run restore has to be offered in front of all of it. Null rather
+    // than a default of false so an existing install never flashes the welcome
+    // screen while a file is stat'ed.
+    var hasIdentity by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(Unit) {
+        hasIdentity = withContext(Dispatchers.IO) {
+            // Treating a failure as "has one" keeps a reader that cannot answer
+            // from offering to overwrite a key that may well be there.
+            runCatching { NodeHolder.get(context).hasIdentity() }.getOrDefault(true)
+        }
+    }
+    if (hasIdentity != true) {
+        if (hasIdentity == false) WelcomeScreen(onDone = { hasIdentity = true })
+        return
+    }
+
     // Observe only: never start the node here. The 2s poll used to call
     // ensureStarted(), which resurrected the node moments after the user
     // disabled it (it showed back online on the coordinator). The toggle is the

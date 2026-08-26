@@ -17,6 +17,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   has one. The file is the same backup code `ray pair backup` prints, so a
   backup made on a laptop restores onto a phone and the other way round.
 
+  A new install offers the restore up front, before the app gives the device an
+  identity of its own, so moving to a new phone is the first thing you can do
+  with it rather than something to go looking for. Choosing to start fresh, or
+  backing out of the restore, leaves the phone as it was and offers again next
+  time.
+
 - **Android: an inbound firewall rule can name a peer.** "+ Allow inbound" only
   asked for a protocol and a port, so every rule the app could write applied to
   the whole network. It now has a peer picker listing the network's members,

@@ -16,22 +16,33 @@ fn key_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("secret_key"))
 }
 
+/// Loads the secret key from disk, or `None` if this device has none yet.
+///
+/// The distinction [`load_or_create`] erases: a caller that is about to write an
+/// identity in (restore) must be able to see "no identity here" without minting
+/// one first, or it ends up asking the user for permission to overwrite a key it
+/// created a line earlier.
+pub fn load_existing() -> Result<Option<SecretKey>> {
+    let path = key_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes: [u8; 32] = std::fs::read(&path)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("corrupt secret key file"))?;
+    Ok(Some(SecretKey::from_bytes(&bytes)))
+}
+
 /// Loads the secret key from disk, or generates and persists a new one.
 pub fn load_or_create() -> Result<SecretKey> {
-    let path = key_path()?;
-    if path.exists() {
-        let bytes: [u8; 32] = std::fs::read(&path)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("corrupt secret key file"))?;
-        let key = SecretKey::from_bytes(&bytes);
+    if let Some(key) = load_existing()? {
         tracing::info!(id = %key.public().fmt_short(), "loaded identity");
-        Ok(key)
-    } else {
-        let key = SecretKey::generate();
-        crate::config::write_file(&path, &key.to_bytes(), true)?;
-        tracing::info!(id = %key.public().fmt_short(), "generated new identity");
-        Ok(key)
+        return Ok(key);
     }
+    let key = SecretKey::generate();
+    crate::config::write_file(&key_path()?, &key.to_bytes(), true)?;
+    tracing::info!(id = %key.public().fmt_short(), "generated new identity");
+    Ok(key)
 }
 
 /// Overwrite the stored identity, as `pair restore` does. The caller is
@@ -85,6 +96,40 @@ pub fn load_device_cert() -> Result<Option<DeviceCert>> {
 mod tests {
     use super::*;
     use crate::config::CONFIG_ENV_LOCK;
+
+    #[test]
+    fn load_existing_is_none_until_something_writes_one() {
+        let _env_lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path());
+        }
+
+        // The point of the function: asking must not be what creates it.
+        assert!(load_existing().unwrap().is_none());
+        assert!(load_existing().unwrap().is_none());
+
+        let created = load_or_create().unwrap();
+        let found = load_existing().unwrap().expect("present after create");
+        assert_eq!(found.to_bytes(), created.to_bytes());
+    }
+
+    #[test]
+    fn store_secret_key_replaces_what_was_there() {
+        let _env_lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path());
+        }
+
+        let first = load_or_create().unwrap();
+        let replacement = SecretKey::generate();
+        store_secret_key(&replacement).unwrap();
+
+        let loaded = load_existing().unwrap().expect("present after store");
+        assert_eq!(loaded.to_bytes(), replacement.to_bytes());
+        assert_ne!(loaded.to_bytes(), first.to_bytes());
+    }
 
     #[test]
     fn device_cert_store_then_load() {
