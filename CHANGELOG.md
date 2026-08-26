@@ -89,11 +89,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   being readable by any local user, so the tab answers without sudo; admitting
   still needs root or the operator.
 - **Windows x64 support.** Rayfish installs from an MSI as a LocalSystem
-  service and runs the same commands as on Linux and macOS. IPC is a named pipe
-  authorized by Windows SID, the tunnel is Wintun (pinned and signature-checked
-  at build time), and routes, DNS and search domains are set up on the Rayfish
-  adapter only, leaving the rest of the machine's configuration alone. `ray
-  update` upgrades in place through the MSI. Three gaps in this first port:
+  service, puts `ray` on the system PATH, and runs the same commands as on Linux
+  and macOS. IPC is a named pipe authorized by Windows SID, on the same terms as
+  the Unix socket: the listings any local user can read elsewhere are readable
+  there too, and changing anything needs an elevated Administrator or the
+  account named by `ray set-operator`. The tunnel is Wintun (pinned and
+  signature-checked at build time), and routes, DNS and search domains are set
+  up on the Rayfish adapter only, leaving the rest of the machine's
+  configuration alone. `ray update` upgrades in place through the MSI. Three
+  gaps in this first port:
   `ray firewall ssh` is not available on Windows, tab completion is not
   installed there at all (PowerShell reads completions from a profile script
   rather than from a directory a shell already searches), and the MSI is not

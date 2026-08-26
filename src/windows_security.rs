@@ -148,12 +148,54 @@ fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// Security descriptor for the IPC named pipe.
+///
+/// `AU` (Authenticated Users) gets `GRGW`: enough to open the pipe and run one
+/// request/response, and nothing else. That is the Windows spelling of the
+/// `chmod 0666` the Unix socket gets in `set_socket_permissions`, and it exists
+/// for the same reason: reaching the daemon is not authority. Every mutating
+/// request is still authorized per-connection in `Daemon::check_authorized`,
+/// which on Windows demands LocalSystem, an elevated Administrator, or an exact
+/// operator SID match.
+///
+/// Without that ACE the pipe admitted only the three principals below, so a
+/// standard user was refused at `open()` and the reads-are-open-to-everyone arm
+/// of `check_authorized` was unreachable on Windows: `ray status` did not work
+/// for anyone but an administrator, and reported the running service as down.
 pub(crate) fn pipe_descriptor(operator_sid: Option<&str>) -> Result<OwnedSecurityDescriptor> {
-    let sddl = match operator_sid {
-        Some(sid) => format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})"),
-        None => "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_owned(),
-    };
-    OwnedSecurityDescriptor::from_sddl(&sddl)
+    OwnedSecurityDescriptor::from_sddl(&pipe_sddl(operator_sid))
+}
+
+/// Split out so a test can read the ACEs back; `OwnedSecurityDescriptor` is a
+/// raw pointer with nothing to assert against.
+///
+/// The string is SDDL. One ACE is `(type;flags;rights;object;inherited;
+/// principal)`, and the DACL below is three of those with a fourth appended
+/// when an operator is configured:
+///
+/// - `O:SY` owner is LocalSystem. Stamped rather than left to default, because
+///   the default is not what it looks like: a token's owner is a separate field
+///   from its user, and on a machine where "default owner for objects created by
+///   members of the Administrators group" is set to the group, the service's own
+///   pipe comes out owned by `S-1-5-32-544`. The client checks this field to
+///   tell the real daemon from a squatter
+///   (`verify_windows_server_is_local_system` in `ray-proto/src/ipc.rs`), so it
+///   has to be a value that does not move with local policy. Nothing short of
+///   LocalSystem or `SeRestorePrivilege` can write this SID, which is the point.
+/// - `D:P` protected DACL: it inherits nothing, so what follows is the whole
+///   story for this pipe.
+/// - `(A;;GA;;;SY)` allow LocalSystem `GENERIC_ALL`. The service account.
+/// - `(A;;GA;;;BA)` allow `BUILTIN\Administrators` `GENERIC_ALL`.
+/// - `(A;;GRGW;;;AU)` allow Authenticated Users `GENERIC_READ | GENERIC_WRITE`:
+///   enough to open the pipe and run one request/response, not enough to change
+///   the pipe or rewrite its ACL. Anonymous logons are not in `AU`.
+/// - `(A;;GA;;;<sid>)` allow the operator `GENERIC_ALL`, when one is set.
+fn pipe_sddl(operator_sid: Option<&str>) -> String {
+    let mut sddl = String::from("O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)");
+    if let Some(sid) = operator_sid {
+        sddl.push_str(&format!("(A;;GA;;;{sid})"));
+    }
+    sddl
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -645,6 +687,34 @@ mod tests {
         pipe_descriptor(None).unwrap();
         pipe_descriptor(Some("S-1-5-18")).unwrap();
         assert!(pipe_descriptor(Some("not-a-sid")).is_err());
+    }
+
+    #[test]
+    fn pipe_admits_authenticated_users_for_reads_only() {
+        // The Windows counterpart of the IPC socket's 0666. Losing this ACE
+        // takes `ray status` away from every non-administrator and makes the
+        // running daemon report itself as down.
+        let operator = "S-1-5-21-1-2-3-1001";
+        assert!(pipe_sddl(None).contains("(A;;GRGW;;;AU)"));
+        assert!(pipe_sddl(Some(operator)).contains("(A;;GRGW;;;AU)"));
+        // Reaching the pipe is not authority over the daemon: full control stays
+        // with LocalSystem, Administrators and the operator, and `AU` is not one
+        // of them. `check_authorized` does the rest per request.
+        assert_eq!(pipe_sddl(None).matches("GA;;;").count(), 2);
+        assert_eq!(pipe_sddl(Some(operator)).matches("GA;;;").count(), 3);
+        assert!(pipe_sddl(Some(operator)).ends_with(&format!("(A;;GA;;;{operator})")));
+    }
+
+    #[test]
+    fn pipe_owner_is_stamped_local_system_rather_than_left_to_default() {
+        // The client tells the daemon from a squatter by this field, and the
+        // default is not LocalSystem everywhere: where the "default owner for
+        // objects created by members of the Administrators group" policy names
+        // the group, the service's own pipe comes out owned by S-1-5-32-544 and
+        // every `ray` command refuses to talk to its own daemon.
+        for sddl in [pipe_sddl(None), pipe_sddl(Some("S-1-5-21-1-2-3-1001"))] {
+            assert!(sddl.starts_with("O:SY"), "owner not stamped: {sddl}");
+        }
     }
 
     #[test]
