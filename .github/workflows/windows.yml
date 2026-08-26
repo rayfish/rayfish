@@ -2,6 +2,9 @@ name: Windows
 
 on:
   pull_request:
+    # `labeled` so applying the packaging label below starts a run on its own,
+    # without waiting for another push.
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main, master]
 
@@ -28,7 +31,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   package:
-    if: ${{ vars.RAYFISH_WINDOWS_PACKAGING == 'true' }}
+    # Half an hour of Windows runner for an installer nobody asked for, so it
+    # is opt-in on pull requests: label one `windows-packaging` to get an MSI.
+    # A label and not a configuration variable because `vars` is empty in a run
+    # triggered by a pull request from a fork, which is where the port arrived
+    # from; labels ride in the event payload and are readable there.
+    if: ${{ github.event_name != 'pull_request'
+            || contains(github.event.pull_request.labels.*.name, 'windows-packaging') }}
     runs-on: windows-latest
     needs: check
     steps:
