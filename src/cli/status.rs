@@ -141,8 +141,53 @@ pub(crate) fn pluralize(n: usize, noun: &str) -> String {
     }
 }
 
+/// Did the connection fail because this account may not have it, rather than
+/// because there was nothing to connect to?
+///
+/// Both platforms let any local user reach the daemon (`chmod 0666` on the Unix
+/// socket, an Authenticated Users ACE on the Windows pipe), so this is not the
+/// everyday case for either. It still happens: a Windows service still running
+/// an older build hands out a pipe whose DACL names only LocalSystem, the
+/// Administrators group and the operator, and refuses everyone else at `open()`.
+fn connect_was_refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+fn print_not_authorized() {
+    println!();
+    println!(
+        "  {}",
+        style::red("✗ not authorized to query the rayfish service")
+    );
+    #[cfg(windows)]
+    println!(
+        "  {}",
+        style::faint("grant access from an Administrator terminal with: ray set-operator <user>")
+    );
+    #[cfg(unix)]
+    println!(
+        "  {}",
+        style::faint("grant access with: sudo ray set-operator <user>")
+    );
+    println!();
+}
+
 pub(crate) async fn ipc_status() -> Result<()> {
-    let Ok(mut stream) = ipc::connect().await else {
+    let connected = match ipc::connect().await {
+        Ok(stream) => Some(stream),
+        // Being refused is not the same as nothing being there, and reporting a
+        // running daemon as down sends the reader after the wrong problem. The
+        // IPC layer already tells the two apart, so keep its answer rather than
+        // flattening every failure into one message.
+        Err(error) if connect_was_refused(&error) => {
+            print_not_authorized();
+            return Ok(());
+        }
+        Err(_) => None,
+    };
+    let Some(mut stream) = connected else {
         // Daemon not running, so its config is all there is to show. Read-only:
         // `config::load` would create the directory it resolves, and this process
         // is not the daemon.
