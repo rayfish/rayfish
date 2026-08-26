@@ -462,8 +462,43 @@ struct WindowsNrptRuleSnapshot {
     name: String,
     display_name: String,
     namespace: Vec<String>,
+    #[serde(deserialize_with = "deserialize_name_servers")]
     name_servers: Vec<String>,
     comment: Option<String>,
+}
+
+/// `Get-DnsClientNrptRule` hands `NameServers` back as `IPAddress` objects, not
+/// strings, so `ConvertTo-Json` writes the whole object out and the snapshot
+/// fails to parse against `Vec<String>`. The snapshot script coerces them, but
+/// accept both shapes anyway: the CIM typing has differed across Windows builds,
+/// and the failure mode is quiet enough to be worth belt and braces. A snapshot
+/// that will not parse only parses while no rule exists, which is exactly the
+/// first apply on a clean machine, so the daemon looks fine and then fails every
+/// reconcile after it, leaving stale rules and suffixes behind on leave and stop.
+#[cfg(windows)]
+fn deserialize_name_servers<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NameServer {
+        Text(String),
+        Address {
+            #[serde(rename = "IPAddressToString")]
+            address: String,
+        },
+    }
+
+    Ok(Vec::<NameServer>::deserialize(deserializer)?
+        .into_iter()
+        .map(|entry| match entry {
+            NameServer::Text(text) => text,
+            NameServer::Address { address } => address,
+        })
+        .collect())
 }
 
 #[cfg(windows)]
@@ -493,9 +528,14 @@ fn ps_array(values: &[String]) -> String {
     )
 }
 
+/// Reads the DNS state this daemon owns, as JSON, for `WindowsDnsSnapshot`.
+///
+/// The `ForEach-Object { "$_" }` over `NameServers` is load-bearing: those are
+/// `IPAddress` objects, and without it `ConvertTo-Json` writes the object rather
+/// than `200::53`. See `deserialize_name_servers`, which tolerates both.
 #[cfg(windows)]
 fn windows_dns_snapshot_script() -> &'static str {
-    "$ErrorActionPreference='Stop'; $statePath='HKLM:\\SOFTWARE\\Rayfish'; $marker=$null; if (Test-Path $statePath) { $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }; [pscustomobject]@{ nrpt_rules=@(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | ForEach-Object { [pscustomobject]@{ name=$_.Name; display_name=$_.DisplayName; namespace=@($_.Namespace); name_servers=@($_.NameServers); comment=$_.Comment } }); suffix_search_list=@((Get-DnsClientGlobalSetting).SuffixSearchList); managed_suffixes=if ($null -eq $marker) { $null } else { @($marker.ManagedDnsSuffixes) } } | ConvertTo-Json -Compress -Depth 5"
+    "$ErrorActionPreference='Stop'; $statePath='HKLM:\\SOFTWARE\\Rayfish'; $marker=$null; if (Test-Path $statePath) { $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }; [pscustomobject]@{ nrpt_rules=@(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | ForEach-Object { [pscustomobject]@{ name=$_.Name; display_name=$_.DisplayName; namespace=@($_.Namespace); name_servers=@($_.NameServers | ForEach-Object { \"$_\" }); comment=$_.Comment } }); suffix_search_list=@((Get-DnsClientGlobalSetting).SuffixSearchList); managed_suffixes=if ($null -eq $marker) { $null } else { @($marker.ManagedDnsSuffixes) } } | ConvertTo-Json -Compress -Depth 5"
 }
 
 #[cfg(windows)]
