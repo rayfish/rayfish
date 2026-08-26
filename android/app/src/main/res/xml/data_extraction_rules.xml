@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 31+ counterpart of backup_rules.xml; see that file for why getFilesDir()
+  is excluded. Keep the two in step.
+
+  device-transfer is excluded for the same reason as cloud-backup and not a
+  weaker one: a phone-to-phone transfer that carries the identity across leaves
+  both handsets holding it, which is exactly the clone the identity model has to
+  avoid. Moving an identity to a new phone is a restore from a backup code, so
+  the old device's copy is a deliberate act to keep or delete, not a silent copy.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="." />
+    </device-transfer>
+</data-extraction-rules>

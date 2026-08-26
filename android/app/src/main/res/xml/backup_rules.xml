@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android Auto Backup rules for API 26-30 (31+ uses data_extraction_rules.xml,
+  which must be kept in step with this file).
+
+  getFilesDir() is the core's config dir: the Ed25519 identity (secret_key), the
+  device cert, and the coordinator's per-network secret keys all live there in
+  the clear. Backed up, they would be uploaded to the user's Drive on a schedule
+  nobody asked for, and a restore would clone the identity onto a second device
+  while the first still holds it, giving two nodes the same EndpointId and the
+  same mesh address.
+
+  So the whole domain is excluded, not the two files by name: a secret added to
+  the config dir later is then excluded by default rather than by someone
+  remembering to come back here. The deliberate path off the device is
+  Node.backupIdentity, which encrypts under a password the user chooses.
+
+  SharedPreferences still backs up. That is what Auto Backup is good for, and
+  nothing in there is key material.
+-->
+<full-backup-content>
+    <exclude domain="file" path="." />
+</full-backup-content>

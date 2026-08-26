@@ -14,6 +14,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   defaulting to any peer, and the rule list names the peer a rule is scoped to
   instead of showing its short id.
 
+### Security
+
+- **Android no longer sends your keys to Google's backup.** The app allowed
+  Android Auto Backup with no exclusions, so the identity key, the device
+  certificate and any network you coordinate had their keys copied to the
+  account's cloud backup on Android's own schedule, and a device-to-device
+  transfer carried them across as well. Restoring that backup onto a second
+  phone also left two devices holding one identity, which the mesh cannot
+  represent: same address, same node id. The app's private storage is now
+  excluded from both cloud backup and device transfer. Settings still restore;
+  keys only move when you ask, through the new identity backup. If you have been
+  running an earlier version, take a fresh identity backup, and note that
+  Google's copy is deleted on its own schedule rather than by the upgrade.
+
 ## [0.4.0] - 2026-08-26
 
 Every node upgrades together. The mesh protocol goes from 2 to 5 and peers on
