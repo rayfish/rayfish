@@ -17,7 +17,23 @@ param(
     [string]$Target = 'x86_64-pc-windows-msvc',
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath = (Join-Path (Get-Location) 'target\ray-windows-x86_64.msi')
+    [string]$OutputPath = (Join-Path (Get-Location) 'target\ray-windows-x86_64.msi'),
+
+    # Optional Authenticode signing, for the routes where the key is reachable
+    # from the build machine: a cloud HSM through signtool's /dlib, or a test
+    # certificate. Pass both, the tool to run and its arguments, with {file}
+    # standing in for the file being signed. Left out, this builds the same
+    # unsigned MSI it always has, which is what a fork pull request gets, since
+    # those cannot see repository secrets.
+    #
+    # A service that signs out of band does not go here. SignPath takes the built
+    # artifact and hands back a signed one, so that happens after this script and
+    # the workflow rewrites the hash with scripts/write-msi-sidecars.ps1.
+    [Parameter(Mandatory = $false)]
+    [string]$SignTool,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$SignArgs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,9 +76,43 @@ function Assert-MsiVersion {
     }
 }
 
+function Invoke-Signing {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not $SignTool) {
+        return
+    }
+
+    # Plain substitution, no shell: the arguments reach the tool as an array, so
+    # a path with a space in it needs no quoting and cannot be re-split.
+    $arguments = $SignArgs | ForEach-Object { $_.Replace('{file}', $Path) }
+    Write-Host "Signing $(Split-Path -Leaf $Path)..."
+    & $SignTool @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Signing '$Path' failed with exit code $LASTEXITCODE."
+    }
+
+    # NotSigned and HashMismatch mean the signature is missing or does not cover
+    # the bytes on disk, which is always a build failure. Every other status is a
+    # question about trusting the certificate, and that belongs to the machine
+    # doing the verifying: a self-signed dry run reports UnknownError and is
+    # still a correctly signed file.
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($signature.Status -in @('NotSigned', 'HashMismatch')) {
+        throw "Authenticode verification of '$Path' returned $($signature.Status)."
+    }
+    Write-Host "  $($signature.Status): $($signature.SignerCertificate.Subject)"
+}
+
 Assert-Command 'cargo'
 Enable-WixToolset
 Assert-MsiVersion $Version
+if ([bool]$SignTool -ne [bool]$SignArgs) {
+    throw 'SignTool and SignArgs go together: pass both to sign, or neither to build unsigned.'
+}
+if ($SignTool) {
+    Assert-Command $SignTool
+}
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $targetBinDir = Join-Path $repoRoot "target\$Target\release"
@@ -118,6 +168,12 @@ try {
     Copy-Item -LiteralPath (Join-Path $targetBinDir 'ray.exe') -Destination (Join-Path $msiBinDir 'ray.exe') -Force
     Copy-Item -LiteralPath $dll.FullName -Destination $stagedDll -Force
 
+    # The staged copy, before it goes into the package. Signing only the MSI
+    # leaves the installed ray.exe unsigned, so every UAC prompt, firewall
+    # dialog and service start after the install still says unknown publisher.
+    # Wintun is already signed by its vendor and verified above; leave it alone.
+    Invoke-Signing -Path (Join-Path $msiBinDir 'ray.exe')
+
     Write-Host "Building MSI ProductVersion $Version ($Channel identity $ReleaseIdentity)..."
     Push-Location $repoRoot
     try {
@@ -143,13 +199,12 @@ try {
     if (-not (Test-Path -LiteralPath $output -PathType Leaf)) {
         throw "cargo wix completed without producing $output."
     }
-    $msiHash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()
-    $msiName = Split-Path -Leaf $output
-    Set-Content -LiteralPath "$output.sha256" -Value "$msiHash  $msiName" -Encoding ascii
-    Set-Content -LiteralPath "$output.version" -Value $ReleaseIdentity -Encoding ascii
+    Invoke-Signing -Path $output
+
+    # After signing, never before: the signature is written into the file, so a
+    # hash taken ahead of it describes something nobody will ever download.
+    & (Join-Path $PSScriptRoot 'write-msi-sidecars.ps1') -MsiPath $output -ReleaseIdentity $ReleaseIdentity
     Write-Output "MSI: $output"
-    Write-Output "SHA256: $output.sha256"
-    Write-Output "VERSION: $output.version"
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

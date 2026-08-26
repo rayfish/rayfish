@@ -58,6 +58,9 @@ jobs:
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $version = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
           ./scripts/build-windows-msi.ps1 -Version $version -ReleaseIdentity $version -Channel stable -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+      # Unsigned on purpose. This job runs on pull requests, including from
+      # forks, which cannot see the signing secrets. Signing happens in
+      # release.yml, on a tag.
       - name: Upload MSI artifacts
         uses: actions/upload-artifact@v4
         with:
