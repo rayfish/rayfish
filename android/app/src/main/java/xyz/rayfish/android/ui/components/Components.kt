@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
@@ -19,6 +20,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import xyz.rayfish.android.ui.theme.Chakra
@@ -131,10 +135,22 @@ fun DestructiveTextButton(text: String, onClick: () -> Unit) {
 }
 
 @Composable
-fun RayfishTextField(value: String, onValueChange: (String) -> Unit, label: String, modifier: Modifier = Modifier) {
+fun RayfishTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+    password: Boolean = false,
+) {
     OutlinedTextField(
         value = value, onValueChange = onValueChange, label = { Text(label, fontFamily = PlexMono, fontSize = 12.sp) },
         singleLine = true, modifier = modifier.fillMaxWidth(),
+        visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
+        keyboardOptions = if (password) {
+            KeyboardOptions(keyboardType = KeyboardType.Password)
+        } else {
+            KeyboardOptions.Default
+        },
         shape = RoundedCornerShape(11.dp),
         colors = OutlinedTextFieldDefaults.colors(
             focusedBorderColor = Rf.Rose500, unfocusedBorderColor = Rf.CardBorder,

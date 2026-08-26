@@ -77,6 +77,7 @@ pub mod identity;
 pub mod init_system;
 pub mod invite;
 pub mod ipc;
+pub mod keybackup;
 // Kernel notification of listen()/close on the host's TCP sockets, which is
 // what keeps `v4bridge` off a poll. Internal to that one caller, and desktop
 // for the same reason it is.

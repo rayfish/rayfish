@@ -80,6 +80,7 @@ use rayfish::hostname;
 use rayfish::identity;
 use rayfish::invite;
 use rayfish::ipc::{self, IpcMessage};
+use rayfish::keybackup;
 use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
@@ -117,6 +118,21 @@ pub enum RayError {
     /// unexpected protocol response.
     #[error("{0}")]
     Network(String),
+    /// A backup code would not decode, or the password was wrong. The two are
+    /// one case: the AEAD cannot tell them apart.
+    #[error("{0}")]
+    BadBackup(String),
+    /// [`Node::restore_identity`] found an identity already on the device and
+    /// was not told to replace it. Carries the existing public key so the UI can
+    /// name what it is about to overwrite. Not a failure on its own: the caller
+    /// is expected to confirm with the user and call again with
+    /// `replace_existing`.
+    #[error("device already has identity {0}")]
+    IdentityExists(String),
+    /// A restore was attempted while the node was running. The endpoint is bound
+    /// to the old key, so the identity cannot change under it; stop first.
+    #[error("stop the node before restoring an identity")]
+    NodeRunning,
 }
 
 impl RayError {
@@ -133,6 +149,18 @@ pub struct NetworkInfo {
     pub ipv6: String,
     /// True when the join was queued for coordinator approval (no IP yet).
     pub pending: bool,
+}
+
+/// An encrypted identity backup and the public key it restores to.
+#[derive(uniffi::Record)]
+pub struct IdentityBackup {
+    /// The base58 `enc1` blob. This is the secret: anyone holding it and the
+    /// password holds the identity, so it belongs in a password manager or
+    /// behind the file picker, never in a log or a share sheet preview.
+    pub code: String,
+    /// The identity the code restores to, for showing the user which one they
+    /// just wrote out.
+    pub public_key: String,
 }
 
 /// Three-state peer liveness, mirroring [`ipc::PeerState`]. `Idle` is not
@@ -1005,6 +1033,70 @@ impl Node {
                 "unexpected unpair response: {other:?}"
             ))),
         }
+    }
+
+    /// Encrypt this device's identity under `password` and return the backup
+    /// code, for the platform to hand to a file picker (Drive, Files, whatever
+    /// the user has) or a password manager. Format and threat model are in
+    /// [`keybackup`]; the same code restores on desktop with
+    /// `ray pair restore <code>`.
+    ///
+    /// Does not need [`Node::start`]: the key is read off disk, and mints one if
+    /// the device has none yet, exactly as a start would.
+    pub fn backup_identity(&self, password: String) -> Result<IdentityBackup, RayError> {
+        let backup = keybackup::backup_current_identity(&password).map_err(RayError::network)?;
+        // The public key is fine to log; the code never is.
+        tracing::info!(id = %backup.public_key, "wrote identity backup");
+        Ok(IdentityBackup {
+            code: backup.code,
+            public_key: backup.public_key,
+        })
+    }
+
+    /// Replace this device's identity with the one in `code`.
+    ///
+    /// Refuses in two cases the caller is expected to handle rather than force:
+    /// [`RayError::NodeRunning`] if the node has not been stopped (the endpoint
+    /// is bound to the old key), and [`RayError::IdentityExists`] if a different
+    /// identity is already on the device and `replace_existing` is false. Call
+    /// again with the flag once the user has confirmed.
+    ///
+    /// Restoring makes this device the primary holder of the identity, so any
+    /// device cert from a previous pairing is deleted: it attests the old key
+    /// and would otherwise sit there claiming this device is somebody's
+    /// secondary. Restoring the identity already on the device is a no-op
+    /// success.
+    ///
+    /// Returns the restored identity's public key. The caller must restart the
+    /// node afterwards for it to take effect.
+    pub fn restore_identity(
+        &self,
+        code: String,
+        password: String,
+        replace_existing: bool,
+    ) -> Result<String, RayError> {
+        if self.state.lock().unwrap().is_some() {
+            return Err(RayError::NodeRunning);
+        }
+
+        let key =
+            keybackup::decrypt(&code, &password).map_err(|e| RayError::BadBackup(e.to_string()))?;
+        let restored = key.public().to_string();
+
+        let existing = identity::load_or_create().map_err(RayError::network)?;
+        if existing.public() == key.public() {
+            tracing::info!(id = %restored, "restore: identity already on this device");
+            return Ok(restored);
+        }
+        if !replace_existing {
+            return Err(RayError::IdentityExists(existing.public().to_string()));
+        }
+
+        identity::store_secret_key(&key).map_err(RayError::network)?;
+        identity::delete_device_cert().map_err(RayError::network)?;
+
+        tracing::info!(id = %restored, "restored identity from backup");
+        Ok(restored)
     }
 
     /// Point the Magic DNS resolver at the phone's DNS so non-`.ray` queries are

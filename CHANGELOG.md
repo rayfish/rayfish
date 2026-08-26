@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Android: back up and restore your identity.** "You" now has an Identity
+  backup card. Backing up asks for a password, encrypts the key with it, and
+  hands the result to the system file picker, so it can go to Drive, OneDrive,
+  Files, or any other provider on the phone; nothing readable leaves the device,
+  and the provider never sees the key. Restoring reads the file back, asks for
+  the password, and swaps the identity in, warning first if the phone already
+  has one. The file is the same backup code `ray pair backup` prints, so a
+  backup made on a laptop restores onto a phone and the other way round.
+
 - **Android: an inbound firewall rule can name a peer.** "+ Allow inbound" only
   asked for a protocol and a port, so every rule the app could write applied to
   the whole network. It now has a peer picker listing the network's members,

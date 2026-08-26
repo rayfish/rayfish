@@ -796,6 +796,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -816,6 +820,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
 fun uniffi_ray_mobile_checksum_method_node_accept_join_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_backup_identity(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_cancel_send(
 ): Short
@@ -866,6 +872,8 @@ fun uniffi_ray_mobile_checksum_method_node_pair(
 fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_restore_identity(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_send_file(
 ): Short
@@ -954,6 +962,8 @@ fun uniffi_ray_mobile_fn_method_node_accept_join_request(`ptr`: Pointer,`network
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_approve_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_ray_mobile_fn_method_node_backup_identity(`ptr`: Pointer,`password`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_cancel_send(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1004,6 +1014,8 @@ fun uniffi_ray_mobile_fn_method_node_reject_connect_request(`ptr`: Pointer,`shor
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_reject_file_offer(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_ray_mobile_fn_method_node_restore_identity(`ptr`: Pointer,`code`: RustBuffer.ByValue,`password`: RustBuffer.ByValue,`replaceExisting`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_send_file(`ptr`: Pointer,`path`: RustBuffer.ByValue,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_default_hostname(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1163,6 +1175,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_approve_connect_request() != 47115.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_backup_identity() != 49200.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_cancel_send() != 49789.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1236,6 +1251,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_reject_file_offer() != 10539.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_restore_identity() != 41698.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_send_file() != 40644.toShort()) {
@@ -1690,6 +1708,18 @@ public interface NodeInterface {
     fun `approveConnectRequest`(`shortId`: kotlin.String)
     
     /**
+     * Encrypt this device's identity under `password` and return the backup
+     * code, for the platform to hand to a file picker (Drive, Files, whatever
+     * the user has) or a password manager. Format and threat model are in
+     * [`keybackup`]; the same code restores on desktop with
+     * `ray pair restore <code>`.
+     *
+     * Does not need [`Node::start`]: the key is read off disk, and mints one if
+     * the device has none yet, exactly as a start would.
+     */
+    fun `backupIdentity`(`password`: kotlin.String): IdentityBackup
+    
+    /**
      * Call off a queued send, by the id from [`Node::list_queued_sends`].
      * Fails if the offer has already been delivered, since there is nothing
      * left on this side to withdraw.
@@ -1846,6 +1876,26 @@ public interface NodeInterface {
      * Decline a file offer without downloading it.
      */
     fun `rejectFileOffer`(`id`: kotlin.ULong)
+    
+    /**
+     * Replace this device's identity with the one in `code`.
+     *
+     * Refuses in two cases the caller is expected to handle rather than force:
+     * [`RayError::NodeRunning`] if the node has not been stopped (the endpoint
+     * is bound to the old key), and [`RayError::IdentityExists`] if a different
+     * identity is already on the device and `replace_existing` is false. Call
+     * again with the flag once the user has confirmed.
+     *
+     * Restoring makes this device the primary holder of the identity, so any
+     * device cert from a previous pairing is deleted: it attests the old key
+     * and would otherwise sit there claiming this device is somebody's
+     * secondary. Restoring the identity already on the device is a no-op
+     * success.
+     *
+     * Returns the restored identity's public key. The caller must restart the
+     * node afterwards for it to take effect.
+     */
+    fun `restoreIdentity`(`code`: kotlin.String, `password`: kotlin.String, `replaceExisting`: kotlin.Boolean): kotlin.String
     
     fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
     
@@ -2089,6 +2139,29 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 }
     }
     
+    
+
+    
+    /**
+     * Encrypt this device's identity under `password` and return the backup
+     * code, for the platform to hand to a file picker (Drive, Files, whatever
+     * the user has) or a password manager. Format and threat model are in
+     * [`keybackup`]; the same code restores on desktop with
+     * `ray pair restore <code>`.
+     *
+     * Does not need [`Node::start`]: the key is read off disk, and mints one if
+     * the device has none yet, exactly as a start would.
+     */
+    @Throws(RayException::class)override fun `backupIdentity`(`password`: kotlin.String): IdentityBackup {
+            return FfiConverterTypeIdentityBackup.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_backup_identity(
+        it, FfiConverterString.lower(`password`),_status)
+}
+    }
+    )
+    }
     
 
     
@@ -2506,6 +2579,37 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 }
     }
     
+    
+
+    
+    /**
+     * Replace this device's identity with the one in `code`.
+     *
+     * Refuses in two cases the caller is expected to handle rather than force:
+     * [`RayError::NodeRunning`] if the node has not been stopped (the endpoint
+     * is bound to the old key), and [`RayError::IdentityExists`] if a different
+     * identity is already on the device and `replace_existing` is false. Call
+     * again with the flag once the user has confirmed.
+     *
+     * Restoring makes this device the primary holder of the identity, so any
+     * device cert from a previous pairing is deleted: it attests the old key
+     * and would otherwise sit there claiming this device is somebody's
+     * secondary. Restoring the identity already on the device is a no-op
+     * success.
+     *
+     * Returns the restored identity's public key. The caller must restart the
+     * node afterwards for it to take effect.
+     */
+    @Throws(RayException::class)override fun `restoreIdentity`(`code`: kotlin.String, `password`: kotlin.String, `replaceExisting`: kotlin.Boolean): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_restore_identity(
+        it, FfiConverterString.lower(`code`),FfiConverterString.lower(`password`),FfiConverterBoolean.lower(`replaceExisting`),_status)
+}
+    }
+    )
+    }
     
 
     
@@ -2976,6 +3080,50 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
             FfiConverterULong.write(value.`warnCount`, buf)
             FfiConverterULong.write(value.`errorCount`, buf)
             FfiConverterSequenceString.write(value.`recentErrors`, buf)
+    }
+}
+
+
+
+/**
+ * An encrypted identity backup and the public key it restores to.
+ */
+data class IdentityBackup (
+    /**
+     * The base58 `enc1` blob. This is the secret: anyone holding it and the
+     * password holds the identity, so it belongs in a password manager or
+     * behind the file picker, never in a log or a share sheet preview.
+     */
+    var `code`: kotlin.String, 
+    /**
+     * The identity the code restores to, for showing the user which one they
+     * just wrote out.
+     */
+    var `publicKey`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIdentityBackup: FfiConverterRustBuffer<IdentityBackup> {
+    override fun read(buf: ByteBuffer): IdentityBackup {
+        return IdentityBackup(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: IdentityBackup) = (
+            FfiConverterString.allocationSize(value.`code`) +
+            FfiConverterString.allocationSize(value.`publicKey`)
+    )
+
+    override fun write(value: IdentityBackup, buf: ByteBuffer) {
+            FfiConverterString.write(value.`code`, buf)
+            FfiConverterString.write(value.`publicKey`, buf)
     }
 }
 
@@ -3515,6 +3663,43 @@ sealed class RayException: kotlin.Exception() {
             get() = "v1=${ v1 }"
     }
     
+    /**
+     * A backup code would not decode, or the password was wrong. The two are
+     * one case: the AEAD cannot tell them apart.
+     */
+    class BadBackup(
+        
+        val v1: kotlin.String
+        ) : RayException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * [`Node::restore_identity`] found an identity already on the device and
+     * was not told to replace it. Carries the existing public key so the UI can
+     * name what it is about to overwrite. Not a failure on its own: the caller
+     * is expected to confirm with the user and call again with
+     * `replace_existing`.
+     */
+    class IdentityExists(
+        
+        val v1: kotlin.String
+        ) : RayException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * A restore was attempted while the node was running. The endpoint is bound
+     * to the old key, so the identity cannot change under it; stop first.
+     */
+    class NodeRunning(
+        ) : RayException() {
+        override val message
+            get() = ""
+    }
+    
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<RayException> {
         override fun lift(error_buf: RustBuffer.ByValue): RayException = FfiConverterTypeRayError.lift(error_buf)
@@ -3544,6 +3729,13 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
             5 -> RayException.Network(
                 FfiConverterString.read(buf),
                 )
+            6 -> RayException.BadBackup(
+                FfiConverterString.read(buf),
+                )
+            7 -> RayException.IdentityExists(
+                FfiConverterString.read(buf),
+                )
+            8 -> RayException.NodeRunning()
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -3574,6 +3766,20 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
+            is RayException.BadBackup -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is RayException.IdentityExists -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is RayException.NodeRunning -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
         }
     }
 
@@ -3601,6 +3807,20 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
             is RayException.Network -> {
                 buf.putInt(5)
                 FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is RayException.BadBackup -> {
+                buf.putInt(6)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is RayException.IdentityExists -> {
+                buf.putInt(7)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is RayException.NodeRunning -> {
+                buf.putInt(8)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

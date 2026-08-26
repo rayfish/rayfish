@@ -105,6 +105,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        IdentityBackupCard(status = status, onToast = onToast, onChanged = onChanged)
         // Default off: standby is the normal behavior now, so disabling Rayfish
         // keeps files working with the VPN off (that is what lets you run another
         // VPN, Tailscale say, at the same time). This toggle is the escape hatch

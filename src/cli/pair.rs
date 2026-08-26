@@ -154,13 +154,9 @@ pub(crate) async fn ipc_unpair(device: &str) -> Result<()> {
 }
 
 /// Produce the encrypted `enc1…` backup blob for the local identity, prompting
-/// for (and confirming) a backup password. Returns the blob and the identity's
-/// public key string.
-pub(crate) fn make_backup_blob() -> Result<(String, String)> {
-    use argon2::Argon2;
-    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-
-    let key = identity::load_or_create()?;
+/// for (and confirming) a backup password. The blob format lives in
+/// [`keybackup`]; this only handles the terminal side of it.
+pub(crate) fn make_backup_blob() -> Result<keybackup::Backup> {
     let password = rpassword::prompt_password("Enter backup password: ")?;
     if password.is_empty() {
         anyhow::bail!("password cannot be empty");
@@ -169,29 +165,7 @@ pub(crate) fn make_backup_blob() -> Result<(String, String)> {
     if password != confirm {
         anyhow::bail!("passwords do not match");
     }
-
-    let salt: [u8; 16] = rand::random();
-    let mut derived_key = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
-        .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
-
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
-    let nonce_bytes: [u8; 24] = rand::random();
-    let nonce = XNonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, key.to_bytes().as_ref())
-        .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
-
-    // Format: "enc1" (4) || salt (16) || nonce (24) || ciphertext (32 + 16 tag)
-    let mut backup_bytes = Vec::with_capacity(4 + 16 + 24 + ciphertext.len());
-    backup_bytes.extend_from_slice(b"enc1");
-    backup_bytes.extend_from_slice(&salt);
-    backup_bytes.extend_from_slice(&nonce_bytes);
-    backup_bytes.extend_from_slice(&ciphertext);
-
-    let backup = bs58::encode(&backup_bytes).into_string();
-    Ok((backup, key.public().to_string()))
+    keybackup::backup_current_identity(&password)
 }
 
 pub(crate) fn cmd_pair_backup(onepassword: bool, vault: Option<&str>, item: &str) -> Result<()> {
@@ -200,10 +174,10 @@ pub(crate) fn cmd_pair_backup(onepassword: bool, vault: Option<&str>, item: &str
         onepassword::op_available()?;
     }
 
-    let (backup, public_key) = make_backup_blob()?;
+    let keybackup::Backup { code, public_key } = make_backup_blob()?;
 
     if onepassword {
-        onepassword::store(vault, item, &backup, &public_key)?;
+        onepassword::store(vault, item, &code, &public_key)?;
         println!("Stored encrypted backup in 1Password item \"{}\".", item);
         println!();
         println!("To restore on a new device:");
@@ -211,10 +185,10 @@ pub(crate) fn cmd_pair_backup(onepassword: bool, vault: Option<&str>, item: &str
         return Ok(());
     }
 
-    println!("Backup code: {}", backup);
+    println!("Backup code: {}", code);
     println!();
     println!("Store this safely. To restore on a new device:");
-    println!("  rayfish pair restore {}", backup);
+    println!("  rayfish pair restore {}", code);
     Ok(())
 }
 
@@ -224,9 +198,6 @@ pub(crate) fn cmd_pair_restore(
     vault: Option<&str>,
     item: &str,
 ) -> Result<()> {
-    use argon2::Argon2;
-    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-
     let backup = if onepassword {
         if backup.is_some() {
             anyhow::bail!("provide either a backup code or --1password, not both");
@@ -239,35 +210,8 @@ pub(crate) fn cmd_pair_restore(
             .context("provide a backup code, or use --1password to read it from 1Password")?
     };
 
-    let backup_bytes = bs58::decode(&backup)
-        .into_vec()
-        .map_err(|e| anyhow::anyhow!("invalid backup code: {e}"))?;
-    if backup_bytes.len() < 4 + 16 + 24 + 32 {
-        anyhow::bail!("invalid backup code: too short");
-    }
-    if &backup_bytes[..4] != b"enc1" {
-        anyhow::bail!("invalid backup code: unknown format");
-    }
-    let salt = &backup_bytes[4..20];
-    let nonce_bytes = &backup_bytes[20..44];
-    let ciphertext = &backup_bytes[44..];
-
     let password = rpassword::prompt_password("Enter backup password: ")?;
-    let mut derived_key = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), salt, &mut derived_key)
-        .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
-
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
-    let nonce = XNonce::from_slice(nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("decryption failed: wrong password or corrupted backup"))?;
-
-    let key_bytes: [u8; 32] = plaintext
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid key data"))?;
-    let key = iroh::SecretKey::from_bytes(&key_bytes);
+    let key = keybackup::decrypt(&backup, &password)?;
 
     // Check if a key already exists
     let existing = identity::load_or_create()?;
@@ -276,10 +220,9 @@ pub(crate) fn cmd_pair_restore(
         return Ok(());
     }
 
-    // Write the restored key into the shared config tree (Linux: /etc/rayfish,
-    // root-owned, this command may need sudo there).
-    let key_path = config::config_dir()?.join("secret_key");
-    config::write_file(&key_path, &key.to_bytes(), true)?;
+    // Writes into the shared config tree (Linux: /etc/rayfish, root-owned, so
+    // this command may need sudo there).
+    identity::store_secret_key(&key)?;
 
     println!("Restored user identity: {}", key.public());
     println!("Restart the daemon for changes to take effect.");

@@ -34,6 +34,16 @@ pub fn load_or_create() -> Result<SecretKey> {
     }
 }
 
+/// Overwrite the stored identity, as `pair restore` does. The caller is
+/// responsible for having asked: this discards whatever key was there, and the
+/// old one is unrecoverable without a backup of its own.
+pub fn store_secret_key(key: &SecretKey) -> Result<()> {
+    let path = key_path()?;
+    crate::config::write_file(&path, &key.to_bytes(), true).context("write secret key")?;
+    tracing::info!(id = %key.public().fmt_short(), "stored identity");
+    Ok(())
+}
+
 fn device_cert_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("device_cert"))
 }

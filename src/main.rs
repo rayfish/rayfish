@@ -3,8 +3,8 @@
 // client built on top.
 use rayfish::term::{layout, picker, progress, style};
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, logdir,
-    membership, onepassword, shutdown, stats,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, keybackup,
+    logdir, membership, onepassword, shutdown, stats,
 };
 
 use std::sync::{Arc, atomic};
