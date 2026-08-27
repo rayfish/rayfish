@@ -282,7 +282,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "android"
+          shared-key: "release-android"
           cache-on-failure: true
 
       - name: Set up JDK 17

@@ -26,7 +26,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci"
+          shared-key: "ci-x86_64-unknown-linux-gnu"
           cache-on-failure: true
 
       # `--workspace`: ray-proto and ray-mobile are members, and a root-package
@@ -56,7 +56,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "macos-ci"
+          shared-key: "ci-aarch64-apple-darwin"
           cache-on-failure: true
 
       - name: Clippy
@@ -83,7 +83,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "android-ci"
+          shared-key: "ci-aarch64-linux-android"
           cache-on-failure: true
 
       - name: Install cargo-ndk
@@ -139,7 +139,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "windows-ci-x86_64-pc-windows-msvc"
+          shared-key: "ci-x86_64-pc-windows-msvc"
           cache-on-failure: true
 
       - name: Cross-target compile
@@ -174,7 +174,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "windows-ci-aarch64-pc-windows-msvc"
+          shared-key: "ci-aarch64-pc-windows-msvc"
           cache-on-failure: true
 
       - name: Build ray.exe
@@ -212,7 +212,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "windows-package-x86_64-pc-windows-msvc"
+          shared-key: "ci-package-x86_64-pc-windows-msvc"
           cache-on-failure: true
 
       - name: Install WiX 3
