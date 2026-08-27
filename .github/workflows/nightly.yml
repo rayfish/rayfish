@@ -199,6 +199,52 @@ jobs:
             ${{ runner.temp }}/ray-windows-x86_64.msi.sha256
             ${{ runner.temp }}/ray-windows-x86_64.msi.version
 
+  # The MSI is x86_64 only: build-windows-msi.ps1 validates that one target and
+  # pins the amd64 Wintun out of the archive it downloads. So ARM64 publishes
+  # the bare exe plus the checksum sidecar, the same shape as the Linux and
+  # macOS legs, rather than a second installer.
+  windows-arm64:
+    needs: roll-tag
+    runs-on: windows-11-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-aarch64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Build binary
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc
+
+      # `<digest>  <name>`, matching what sha256sum writes on the other legs;
+      # the updater reads the first whitespace-separated field.
+      - name: Package for release
+        shell: pwsh
+        run: |
+          $asset = 'ray-windows-aarch64.exe'
+          Copy-Item target/aarch64-pc-windows-msvc/release/ray.exe $asset
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Out-File -FilePath "$asset.sha256" -Encoding ascii
+
+      - name: Upload Windows ARM64 nightly assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          files: |
+            ray-windows-aarch64.exe
+            ray-windows-aarch64.exe.sha256
+
   android:
     needs: roll-tag
     # 24.04 (glibc 2.39): the prebuilt cargo-ndk from install-action is linked
@@ -219,7 +265,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "android"
+          shared-key: "release-android"
           cache-on-failure: true
 
       - name: Set up JDK 17

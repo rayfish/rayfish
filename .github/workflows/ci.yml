@@ -4,7 +4,10 @@ on:
   push:
     branches:
       - master
+  # `labeled` so applying the `windows-packaging` label below starts a run on
+  # its own, without waiting for another push.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,7 +26,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci"
+          shared-key: "ci-x86_64-unknown-linux-gnu"
           cache-on-failure: true
 
       # `--workspace`: ray-proto and ray-mobile are members, and a root-package
@@ -53,7 +56,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "macos-ci"
+          shared-key: "ci-aarch64-apple-darwin"
           cache-on-failure: true
 
       - name: Clippy
@@ -80,7 +83,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "android-ci"
+          shared-key: "ci-aarch64-linux-android"
           cache-on-failure: true
 
       - name: Install cargo-ndk
@@ -119,3 +122,140 @@ jobs:
       - name: Compile the app
         working-directory: android
         run: ./gradlew :app:compileDebugKotlin -x cargoNdkBuild
+
+  # Same gap the macOS and Android jobs close, for the third platform whose code
+  # no Linux build compiles: the TUN/route/DNS backends are per-OS `cfg`
+  # branches, and the service wrapper is Windows-only.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-x86_64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Cross-target compile
+        run: cargo check --locked --target x86_64-pc-windows-msvc --features desktop --bin ray
+
+      - name: Host regression tests
+        run: cargo test --workspace --locked
+
+      - name: Windows contract tests
+        run: cargo test --test windows_contracts --locked
+
+      - name: Clippy quality gate
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # install.ps1 is only ever run by a user piping it into iex, so a syntax
+      # error in it reaches them and nothing else. This is the only Windows
+      # shell in the tree that can parse it.
+      - name: Parse install.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) {
+            $errors | ForEach-Object { Write-Host $_ }
+            throw "install.ps1 has $($errors.Count) parse error(s)."
+          }
+          Write-Host 'install.ps1 parses clean.'
+
+  # Windows on ARM is its own target, not a variant of the x86_64 one: its C
+  # dependencies (ring, blake3) select different sources there, so a green
+  # x86_64 job says nothing about it. Built natively on `windows-11-arm`, which
+  # is free for public repositories. Cross-compiling the target from Linux works
+  # but needs an out-of-tree clang/lld toolchain, because ring forces the GNU
+  # clang driver on Windows/AArch64 while the MSVC CRT ships NEON headers clang
+  # cannot use.
+  windows-arm64:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-aarch64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Build ray.exe
+        run: cargo build --locked --release --target aarch64-pc-windows-msvc --features desktop --bin ray
+
+      - name: Windows contract tests
+        run: cargo test --test windows_contracts --locked
+
+      # Unsigned, like the MSI below; signing happens in release.yml, on a tag.
+      - name: Upload ray.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ray-windows-arm64
+          path: target/aarch64-pc-windows-msvc/release/ray.exe
+          if-no-files-found: error
+
+  # Half an hour of Windows runner for an installer nobody asked for, so it is
+  # opt-in on pull requests: label one `windows-packaging` to get an MSI. A
+  # label and not a configuration variable because `vars` is empty in a run
+  # triggered by a pull request from a fork, which is where the port arrived
+  # from; labels ride in the event payload and are readable there.
+  windows-package:
+    if: ${{ github.event_name != 'pull_request'
+            || contains(github.event.pull_request.labels.*.name, 'windows-packaging') }}
+    runs-on: windows-latest
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-package-x86_64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Install WiX 3
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX candle.exe was not found after installation.'
+          }
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build MSI and sidecars
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
+          ./scripts/build-windows-msi.ps1 -Version $version -ReleaseIdentity $version -Channel stable -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+
+      # Unsigned on purpose. This job runs on pull requests, including from
+      # forks, which cannot see the signing secrets. Signing happens in
+      # release.yml, on a tag.
+      - name: Upload MSI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ray-windows-x86_64-msi
+          path: ${{ runner.temp }}/ray-windows-x86_64.msi*
+          if-no-files-found: error
