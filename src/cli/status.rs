@@ -221,6 +221,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
         ipc::IpcMessage::StatusResponse {
             endpoint_id,
             mdns_enabled,
+            private_mode,
             auto_update,
             active,
             contact_id,
@@ -240,6 +241,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
+                    "private": private_mode,
                     "lan_peers": lan_peers
                         .iter()
                         .map(|p| serde_json::json!({
@@ -278,6 +280,15 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 format!("{} {}", style::label("mDNS"), style::faint("off"))
             };
+            // Shown only when on, like auto-update below: it is opt-in, and the
+            // default header stays uncluttered. Worth a chip at all because the
+            // setting is sticky across restarts, so the machine can be in it
+            // long after anyone remembers typing the flag.
+            let private = if private_mode {
+                format!("      {} {}", style::label("private"), style::green("on"))
+            } else {
+                String::new()
+            };
             // Only surface auto-update in the header when it is on (opt-in), so the
             // default line stays uncluttered.
             let auto = if auto_update {
@@ -291,10 +302,11 @@ pub(crate) async fn ipc_status() -> Result<()> {
             };
             println!();
             println!(
-                "  {}  {}      {}{}      {} {}",
+                "  {}  {}      {}{}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
+                private,
                 auto,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),

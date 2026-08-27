@@ -206,6 +206,25 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Contact only the relay and discovery servers you name, nothing else
+        ///
+        /// Needs --relay and --pkarr, unless both are already set to servers of
+        /// your own. Turns mDNS and auto-update off, since both reach past those
+        /// servers. Sticky: it survives restarts until `ray up --no-private`.
+        #[arg(long, conflicts_with = "no_private")]
+        private: bool,
+        /// Leave private mode, going back to the default servers
+        #[arg(long)]
+        no_private: bool,
+        /// Relay servers to use instead of the defaults (comma-separated)
+        #[arg(long, value_name = "URL")]
+        relay: Option<String>,
+        /// pkarr discovery server to use instead of the default
+        #[arg(long, value_name = "URL")]
+        pkarr: Option<String>,
+        /// Skip the confirmation when leaving private mode
+        #[arg(long, requires = "no_private")]
+        yes: bool,
     },
     /// Standby: take the data plane offline, staying connected to peers
     ///
@@ -1434,7 +1453,24 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up { hostname } => cmd_up(hostname).await,
+        Command::Up {
+            hostname,
+            private,
+            no_private,
+            relay,
+            pkarr,
+            yes,
+        } => {
+            cmd_up(UpOptions {
+                hostname,
+                private,
+                no_private,
+                relay,
+                pkarr,
+                yes,
+            })
+            .await
+        }
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,

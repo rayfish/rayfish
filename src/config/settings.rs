@@ -37,7 +37,32 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
     let reset = entries.is_empty() || entries == ["n0"];
     match key {
         GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
-        GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
+        // Validated here rather than in the CLI arm so every caller is bound by
+        // it, including `ray config set private on`. Private mode's whole claim
+        // is that this node contacts no infrastructure it was not given, and a
+        // node with n0's defaults still in place cannot make that claim.
+        GlobalKey::Private => {
+            let on = parse_bool(value, false)?;
+            if on {
+                own_servers_or_bail(&cfg.relay, "relay")?;
+                own_servers_or_bail(&cfg.discovery_dns, "discovery-dns")?;
+            }
+            cfg.private_mode = on;
+        }
+        // Refused rather than stored-and-ignored: private mode never spawns the
+        // update checker (it would reach GitHub from the real address), so
+        // accepting the write would leave `ray config get` claiming something
+        // untrue.
+        GlobalKey::AutoUpdate => {
+            let on = parse_bool(value, false)?;
+            if on && cfg.private_mode {
+                bail!(
+                    "auto-update reaches GitHub directly, which private mode does not allow\n    \
+                     leave private mode first: ray up --no-private"
+                );
+            }
+            cfg.auto_update = on;
+        }
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
         // caller must also seed/remove the `allow in tcp:22` passthrough and
@@ -74,12 +99,22 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             };
         }
 
+        // The two server keys are guarded while private mode is on: clearing one,
+        // or dropping it back to `augment`, would silently return this node to
+        // n0's defaults while `ray config get` still reported `private on`.
         GlobalKey::Relay => {
-            cfg.relay = server_override(entries, reset, replace, super::RELAY_PRESET_RAYFISH)?
+            let next = server_override(entries, reset, replace, super::RELAY_PRESET_RAYFISH)?;
+            if cfg.private_mode {
+                own_servers_or_bail(&next, "relay")?;
+            }
+            cfg.relay = next;
         }
         GlobalKey::DiscoveryDns => {
-            cfg.discovery_dns =
-                server_override(entries, reset, replace, super::DISCOVERY_PRESET_RAYFISH)?
+            let next = server_override(entries, reset, replace, super::DISCOVERY_PRESET_RAYFISH)?;
+            if cfg.private_mode {
+                own_servers_or_bail(&next, "discovery-dns")?;
+            }
+            cfg.discovery_dns = next;
         }
         GlobalKey::DnsUpstreams => {
             if entries.is_empty() {
@@ -102,6 +137,26 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         }
     }
     Ok(())
+}
+
+/// Whether `o` names servers of the operator's own, to the exclusion of the
+/// defaults: a non-empty list in `replace` mode.
+///
+/// `augment` is not enough and is the subtle half of this check. It keeps n0's
+/// servers alongside the configured ones, so a node in that mode still talks to
+/// them, which is exactly what private mode promises it will not do.
+pub fn is_own_servers(o: &ServerOverride) -> bool {
+    o.replace && !o.is_unset()
+}
+
+fn own_servers_or_bail(o: &ServerOverride, key: &str) -> Result<()> {
+    if is_own_servers(o) {
+        return Ok(());
+    }
+    bail!(
+        "private mode needs a {key} of your own, and only that one\n    \
+         set it with: ray config set {key} <url> --replace"
+    )
 }
 
 /// Build a `ServerOverride`, validating each entry against `preset`.
@@ -128,6 +183,7 @@ fn server_override(
 pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
+        GlobalKey::Private => on_off(cfg.private_mode),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
@@ -267,6 +323,108 @@ mod tests {
 
         apply_network(&mut net, NetworkKey::EphemeralTtl, "").unwrap();
         assert_eq!(net.ephemeral_ttl_secs, None, "unset turns the policy off");
+    }
+
+    /// Turning private mode on requires both server lists to name servers of the
+    /// operator's own. This is the check that makes the mode's promise true, so
+    /// it is tested from every direction it can be wrong.
+    #[test]
+    fn private_mode_requires_both_servers_in_replace_mode() {
+        let mut cfg = AppConfig::default();
+
+        let err = apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap_err();
+        assert!(
+            err.to_string().contains("relay"),
+            "names what is missing: {err}"
+        );
+        assert!(!cfg.private_mode, "a rejected value must not be stored");
+
+        // A relay alone is not enough: discovery is the half that publishes.
+        apply_global(&mut cfg, GlobalKey::Relay, "http://r.example", true).unwrap();
+        let err = apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap_err();
+        assert!(
+            err.to_string().contains("discovery-dns"),
+            "names the remaining one: {err}"
+        );
+
+        apply_global(&mut cfg, GlobalKey::DiscoveryDns, "http://d.example", true).unwrap();
+        apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap();
+        assert!(cfg.private_mode);
+        assert_eq!(render_global(&cfg, GlobalKey::Private), "on");
+    }
+
+    /// `augment` keeps n0's servers alongside the configured ones, so a node in
+    /// that mode still talks to them. That is exactly what private mode says it
+    /// does not do, which is why `replace` is required and not merely preferred.
+    #[test]
+    fn private_mode_rejects_augment_mode_servers() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::Relay, "http://r.example", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::DiscoveryDns, "http://d.example", false).unwrap();
+        let err = apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap_err();
+        assert!(
+            err.to_string().contains("--replace"),
+            "says how to fix it: {err}"
+        );
+        assert!(!cfg.private_mode);
+    }
+
+    /// The reverse guard: once private, the servers cannot be cleared or dropped
+    /// back to `augment` underneath it. Without this the node silently returns to
+    /// the defaults while `ray config get` still reports `private on`.
+    #[test]
+    fn private_mode_guards_the_servers_it_depends_on() {
+        let mut cfg = private_cfg();
+
+        let err = apply_global(&mut cfg, GlobalKey::Relay, "", false).unwrap_err();
+        assert!(err.to_string().contains("relay"), "{err}");
+        assert!(cfg.relay.replace, "the rejected write must not have landed");
+
+        let err = apply_global(
+            &mut cfg,
+            GlobalKey::DiscoveryDns,
+            "http://d2.example",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("discovery-dns"), "{err}");
+
+        // Swapping one own-server for another is fine: the promise is about which
+        // servers are contacted, not about never changing them.
+        apply_global(&mut cfg, GlobalKey::Relay, "http://r2.example", true).unwrap();
+        assert_eq!(cfg.relay.servers, vec!["http://r2.example".to_string()]);
+
+        // And they are free again once private mode is off.
+        apply_global(&mut cfg, GlobalKey::Private, "off", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::Relay, "", false).unwrap();
+        assert!(cfg.relay.is_unset());
+    }
+
+    /// Refused rather than stored-and-ignored: the daemon never spawns the update
+    /// checker while private, so accepting the write would leave `ray config get`
+    /// reporting something that is not true.
+    #[test]
+    fn auto_update_is_refused_while_private() {
+        let mut cfg = private_cfg();
+        let err = apply_global(&mut cfg, GlobalKey::AutoUpdate, "on", false).unwrap_err();
+        assert!(err.to_string().contains("private mode"), "{err}");
+        assert!(!cfg.auto_update);
+
+        // Off is always allowed, and on comes back once private mode is off.
+        apply_global(&mut cfg, GlobalKey::AutoUpdate, "off", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::Private, "off", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::AutoUpdate, "on", false).unwrap();
+        assert!(cfg.auto_update);
+    }
+
+    /// A config already in private mode with both servers set: the starting point
+    /// for the guards above.
+    fn private_cfg() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::Relay, "http://r.example", true).unwrap();
+        apply_global(&mut cfg, GlobalKey::DiscoveryDns, "http://d.example", true).unwrap();
+        apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap();
+        cfg
     }
 
     #[test]

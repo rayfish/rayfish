@@ -432,6 +432,22 @@ pub struct PendingJoinEntry {
 pub struct AppConfig {
     #[serde(default = "default_true")]
     pub mdns_enabled: bool,
+    /// Private mode (`ray up --private`): this node contacts no discovery or
+    /// relay infrastructure it was not explicitly given. It requires both
+    /// [`relay`](Self::relay) and [`discovery_dns`](Self::discovery_dns) in
+    /// `replace` mode, and forces mDNS and auto-update off, so nothing reaches
+    /// n0's servers, the LAN, or GitHub.
+    ///
+    /// Deliberately sticky: it survives a restart, and leaving it is an explicit
+    /// `ray up --no-private`. The failure mode of the alternative is a reboot
+    /// silently putting the node back on public infrastructure with its
+    /// addresses published.
+    ///
+    /// This is *not* anonymity on its own. The node still publishes its direct
+    /// addresses, just to the servers you named, and they still see its IP. See
+    /// `transport::bind_endpoint`.
+    #[serde(default)]
+    pub private_mode: bool,
     /// Local UID authorized to control the daemon without root (Tailscale's
     /// `--operator` model). `None` means root-only for mutating commands.
     #[serde(default)]
@@ -528,6 +544,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             mdns_enabled: true,
+            private_mode: false,
             operator_uid: None,
             default_hostname: None,
             contact_secret_key: None,
@@ -664,6 +681,8 @@ fn ensure_not_in_network_update() -> Result<()> {
 struct Settings {
     #[serde(default = "default_true")]
     mdns_enabled: bool,
+    #[serde(default)]
+    private_mode: bool,
     #[serde(default)]
     operator_uid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1349,6 +1368,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
 
     Ok(AppConfig {
         mdns_enabled: settings.mdns_enabled,
+        private_mode: settings.private_mode,
         operator_uid: settings.operator_uid,
         default_hostname: settings.default_hostname,
         contact_secret_key: settings.contact_secret_key,
@@ -1416,6 +1436,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
 fn settings_toml(config: &AppConfig) -> Result<String> {
     let settings = Settings {
         mdns_enabled: config.mdns_enabled,
+        private_mode: config.private_mode,
         operator_uid: config.operator_uid,
         default_hostname: config.default_hostname.clone(),
         contact_secret_key: config.contact_secret_key.clone(),
