@@ -206,6 +206,39 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Contact only the relay and discovery servers you name, nothing else
+        ///
+        /// Needs --relay and --pkarr, or just --pkarr with --tor, unless they are
+        /// already set to servers of your own. Turns mDNS and auto-update off,
+        /// since both reach past those servers. Sticky: it survives restarts
+        /// until `ray up --no-private`.
+        #[arg(long, conflicts_with = "no_private")]
+        private: bool,
+        /// Leave private mode, going back to the default servers
+        #[arg(long)]
+        no_private: bool,
+        /// Reach peers over Tor only: no UDP socket, no relay, nothing published
+        ///
+        /// A peer's onion address is derived from its identity, so this needs no
+        /// discovery to be reachable. Requires a Tor daemon with ControlPort 9051.
+        /// Sticky, like --private; leave it with `ray up --no-tor`.
+        #[arg(long, conflicts_with = "no_tor")]
+        tor: bool,
+        /// Leave Tor mode, going back to direct connections
+        #[arg(long)]
+        no_tor: bool,
+        /// Relay servers to use instead of the defaults (comma-separated)
+        ///
+        /// Not accepted with --tor: onion routing needs no holepunching and no
+        /// fallback, so a relay there is a server that would never be contacted.
+        #[arg(long, value_name = "URL", conflicts_with = "tor")]
+        relay: Option<String>,
+        /// pkarr discovery server to use instead of the default
+        #[arg(long, value_name = "URL")]
+        pkarr: Option<String>,
+        /// Skip the confirmation when leaving private mode
+        #[arg(long, requires = "no_private")]
+        yes: bool,
     },
     /// Standby: take the data plane offline, staying connected to peers
     ///
@@ -1434,7 +1467,28 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up { hostname } => cmd_up(hostname).await,
+        Command::Up {
+            hostname,
+            private,
+            no_private,
+            tor,
+            no_tor,
+            relay,
+            pkarr,
+            yes,
+        } => {
+            cmd_up(UpOptions {
+                hostname,
+                private,
+                no_private,
+                tor,
+                no_tor,
+                relay,
+                pkarr,
+                yes,
+            })
+            .await
+        }
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,

@@ -85,6 +85,182 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
     }
 }
 
+/// Everything `ray up` accepts. A struct rather than six parameters, so the call
+/// site names its values and the posture flags can be validated as one thing.
+pub(crate) struct UpOptions {
+    pub hostname: Option<String>,
+    pub private: bool,
+    pub no_private: bool,
+    pub tor: bool,
+    pub no_tor: bool,
+    pub relay: Option<String>,
+    pub pkarr: Option<String>,
+    pub yes: bool,
+}
+
+impl UpOptions {
+    /// Whether this invocation changes the node's posture rather than only
+    /// bringing the data plane up. The common `ray up` answers `false` and skips
+    /// the settings round trips entirely.
+    fn touches_posture(&self) -> bool {
+        self.private
+            || self.no_private
+            || self.tor
+            || self.no_tor
+            || self.relay.is_some()
+            || self.pkarr.is_some()
+    }
+}
+
+/// Write one global setting, returning the daemon's error instead of printing
+/// it. `ray up` reports a single outcome; `ipc_mutate` would print a line per
+/// key, and three "Restart the daemon" lines for one command reads like three
+/// separate things happened.
+async fn set_global(key: ipc::GlobalKey, value: &str, replace: bool) -> Result<()> {
+    let mut stream = ipc::connect()
+        .await
+        .context("rayfish daemon is not running; start it with: sudo ray up")?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::ConfigSet {
+            key: ipc::NodeKey::Global(key),
+            value: value.to_string(),
+            replace,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { .. } => Ok(()),
+        ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!(
+            "unexpected reply from the daemon: {other:?}\n    \
+             the CLI and the daemon are probably different versions"
+        ),
+    }
+}
+
+/// Apply the posture flags, in the one order that works.
+///
+/// The servers go first and `private` last, because `config::settings::
+/// apply_global` refuses to turn private mode on while either server list still
+/// points at the defaults. So `ray up --private --relay <r> --pkarr <p>` only
+/// succeeds once the two writes that satisfy that precondition have landed, and
+/// `ray up --private` on a node with nothing configured fails with the daemon's
+/// own message naming what is missing. That check lives in the daemon rather
+/// than here on purpose: it is the same one that guards `ray config set private
+/// on`, and an unprivileged CLI cannot reliably read the daemon's config to
+/// repeat it.
+async fn apply_posture(opts: &UpOptions) -> Result<()> {
+    // `replace: true`: private mode means *only* these servers. Appending them
+    // to n0's defaults would leave the node still talking to n0, which is the
+    // one thing the mode promises it does not do.
+    if let Some(relay) = &opts.relay {
+        set_global(ipc::GlobalKey::Relay, relay, true)
+            .await
+            .context("setting the relay")?;
+    }
+    if let Some(pkarr) = &opts.pkarr {
+        set_global(ipc::GlobalKey::DiscoveryDns, pkarr, true)
+            .await
+            .context("setting the discovery server")?;
+    }
+    // Tor before private, because what private mode demands depends on it: with
+    // Tor it needs only a discovery server, without it a relay as well. Sending
+    // them the other way round would reject `ray up --private --tor --pkarr <p>`
+    // for a missing relay it is about to stop needing.
+    if opts.tor {
+        set_global(ipc::GlobalKey::Tor, "on", false).await?;
+    }
+    if opts.no_tor {
+        set_global(ipc::GlobalKey::Tor, "off", false).await?;
+    }
+    if opts.private {
+        set_global(ipc::GlobalKey::Private, "on", false).await?;
+    }
+    if opts.no_private {
+        set_global(ipc::GlobalKey::Private, "off", false).await?;
+    }
+    Ok(())
+}
+
+/// Confirm leaving private mode.
+///
+/// Errors rather than prompting when there is no terminal, so a script cannot
+/// pass the gate by having nothing to answer with. `--yes` is the way through
+/// in that case, which keeps the decision explicit in the script's own text.
+fn confirm_leaving_private(yes: bool) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    if yes {
+        return Ok(());
+    }
+    let what = "this node will publish its addresses to the configured discovery \
+                server, and mDNS comes back on";
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("leaving private mode exposes this node: {what}\n    rerun with --yes");
+    }
+    println!();
+    println!("  {} leaving private mode", style::rose("!"));
+    println!("    {what}");
+    print!("  continue? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        anyhow::bail!("cancelled; still in private mode");
+    }
+    Ok(())
+}
+
+/// Say what changed and that it needs a restart.
+///
+/// Not restarted for you: `ray up` is normally unprivileged and `ray restart` is
+/// not, so an automatic bounce would work only when the caller happened to be
+/// root. Dropping every peer connection as a side effect of `ray up`, sometimes,
+/// is a worse surprise than a printed command.
+fn announce_posture(opts: &UpOptions, restarting: bool) {
+    println!();
+    if opts.private {
+        println!("  {} private mode on", style::check());
+        println!(
+            "    {}",
+            style::faint(
+                "only your relay and discovery server are contacted; mDNS and auto-update are off"
+            )
+        );
+    } else if opts.no_private {
+        println!("  {} private mode off", style::check());
+    } else if !opts.tor && !opts.no_tor {
+        println!("  {} servers updated", style::check());
+    }
+    if opts.tor {
+        println!("  {} tor mode on", style::check());
+        println!(
+            "    {}",
+            style::faint("peers are reached over Tor only; this node publishes no address")
+        );
+        // Worth saying because it is the one way a healthy-looking Tor node is
+        // still unreachable, and the wait is long enough to look like a failure.
+        println!(
+            "    {}",
+            style::faint(
+                "needs a Tor daemon with ControlPort 9051; peers can reach you ~10s after start"
+            )
+        );
+    } else if opts.no_tor {
+        println!("  {} tor mode off", style::check());
+    }
+    println!(
+        "    {}",
+        style::faint(if restarting {
+            "restarting to apply it"
+        } else {
+            "takes effect on restart: sudo ray restart"
+        })
+    );
+    println!();
+}
+
 /// `ray up`: activate the VPN.
 ///
 /// If the daemon is already running (the common case, the system service
@@ -92,11 +268,34 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
+///
+/// The posture flags (`--private`, `--relay`, `--pkarr`) are settings writes,
+/// not part of `Up`: they go over `ConfigSet` first, and are read again when the
+/// endpoint next binds. See [`apply_posture`].
+pub(crate) async fn cmd_up(opts: UpOptions) -> Result<()> {
+    if opts.no_private {
+        confirm_leaving_private(opts.yes)?;
+    }
+
     #[cfg(windows)]
     let mut operator_claim = WindowsOperatorClaim::begin()?;
     if let Ok(mut stream) = ipc::connect().await {
-        ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
+        // Posture before `Up`, on its own connections (IPC is one request, one
+        // response). A failure here stops the command: bringing the data plane
+        // up on the old posture would be the opposite of what was asked.
+        if opts.touches_posture() {
+            drop(stream);
+            apply_posture(&opts).await?;
+            announce_posture(&opts, false);
+            stream = ipc::connect().await?;
+        }
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::Up {
+                hostname: opts.hostname,
+            },
+        )
+        .await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => {
                 // The daemon accepted the request, so the operator SID this
@@ -124,7 +323,18 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service(hostname).await
+    install_and_start_service(opts.hostname.clone()).await?;
+
+    // The daemon is up and reachable now, so the posture can be written and made
+    // to take effect. Unlike the path above, this one already required root and
+    // just started the service itself, so bouncing it is neither a privilege
+    // problem nor a surprise: nothing was connected a moment ago.
+    if opts.touches_posture() {
+        apply_posture(&opts).await?;
+        announce_posture(&opts, true);
+        restart_service_and_wait().await?;
+    }
+    Ok(())
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.
@@ -467,6 +677,72 @@ pub(crate) async fn cmd_start() -> Result<()> {
             eprintln!("rayfish service was started but the daemon never became reachable.");
             print_daemon_log_tail();
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpOptions;
+
+    fn opts() -> UpOptions {
+        UpOptions {
+            hostname: None,
+            private: false,
+            no_private: false,
+            tor: false,
+            no_tor: false,
+            relay: None,
+            pkarr: None,
+            yes: false,
+        }
+    }
+
+    /// The plain `ray up` must not touch settings at all. It is the command
+    /// people run on every boot, and a settings round trip there would make a
+    /// posture change out of something that was only meant to raise the link.
+    #[test]
+    fn plain_up_touches_no_settings() {
+        assert!(!opts().touches_posture());
+        assert!(
+            !UpOptions {
+                hostname: Some("laptop".into()),
+                ..opts()
+            }
+            .touches_posture(),
+            "--hostname is not a posture flag"
+        );
+    }
+
+    #[test]
+    fn every_posture_flag_is_recognized() {
+        for o in [
+            UpOptions {
+                private: true,
+                ..opts()
+            },
+            UpOptions {
+                no_private: true,
+                ..opts()
+            },
+            UpOptions {
+                tor: true,
+                ..opts()
+            },
+            UpOptions {
+                no_tor: true,
+                ..opts()
+            },
+            UpOptions {
+                relay: Some("http://r.example".into()),
+                ..opts()
+            },
+            UpOptions {
+                pkarr: Some("http://d.example".into()),
+                ..opts()
+            },
+        ] {
+            assert!(o.touches_posture());
         }
     }
 }

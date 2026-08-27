@@ -8,6 +8,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ray up --private`: contact only the servers you name.** A rayfish node has
+  always published its addresses to n0's discovery server, with no way to turn
+  that off, so anyone holding your node's id could look up where it is without
+  connecting to it. Private mode takes the node off shared infrastructure: it
+  requires a relay and a discovery server of your own (`ray up --private --relay
+  <url> --pkarr <url>`, or set both beforehand), and refuses to start if either
+  one is missing or is merely added alongside the defaults. mDNS and auto-update
+  go off with it, since both reach past those servers, and `ray status` shows a
+  `private on` marker.
+
+  It is deliberately sticky. A reboot or a service restart keeps it, because the
+  alternative is a machine quietly going back to publishing its addresses.
+  Leaving is explicit: `ray up --no-private`, which says what it is about to
+  expose and asks before doing it (`--yes` to skip the question in a script).
+
+  This is not anonymity on its own. Your node still publishes its addresses, just
+  to the servers you chose, and those servers still see its address.
+
+- **`ray up --tor`: reach peers over Tor, and publish nothing.** Tor was already
+  a per-network option, but it only ever ran *alongside* the normal transport, so
+  a Tor node still opened a UDP socket and still published its real addresses. It
+  was "also reachable over Tor", not "reachable only over Tor". The new node-wide
+  flag is the second one: no UDP socket, no relay, and no address published
+  anywhere, because there is nothing to publish.
+
+  Nothing is lost by publishing nothing. A Tor onion address is an ed25519 public
+  key, and so is a rayfish identity, so they are the same 32 bytes in a different
+  encoding: a peer that knows who you are can already work out where you are. An
+  invite code carries the coordinator's identity, so joining with one needs no
+  lookup at all. Joining by bare network key, and `ray connect`, still ask your
+  discovery server, and those requests go through Tor too.
+
+  Combine it with `--private` to also choose whose discovery server that is:
+  `ray up --private --tor --pkarr <url>`. A relay is meaningless with `--tor` and
+  is refused rather than quietly ignored.
+
+  Needs a Tor daemon with `ControlPort 9051`, and a build with `--features tor`.
+  Expect to be reachable about ten seconds after starting, not instantly: that is
+  how long Tor takes to publish the service.
+
 - **Windows on ARM64.** Releases and nightlies now publish
   `ray-windows-aarch64.exe`, so Snapdragon and other ARM laptops get a native
   binary instead of running the x86_64 one under emulation. CI builds the

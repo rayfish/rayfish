@@ -430,6 +430,18 @@ pub enum IpcMessage {
     StatusResponse {
         endpoint_id: EndpointId,
         mdns_enabled: bool,
+        /// Whether the running daemon is in private mode (`ray up --private`):
+        /// it contacts only the relay and discovery servers it was given, with
+        /// mDNS and auto-update off. Defaulted so an older CLI/daemon pair still
+        /// deserializes; IPC is map-encoded, so this is an additive change (see
+        /// `.claude/rules/wire-protocol.md`).
+        #[serde(default)]
+        private_mode: bool,
+        /// Whether the running daemon reaches peers over Tor only. Set by the
+        /// node-wide `tor` setting or by any network joined with `--tor`, so it
+        /// reports what the endpoint actually does, not just what is configured.
+        #[serde(default)]
+        tor: bool,
         /// Whether this node opted into automatic stable updates. Reflects the
         /// running daemon's setting (which can differ from on-disk config until a
         /// restart). Defaulted so an older CLI/daemon pair still deserializes.
@@ -1867,6 +1879,8 @@ mod tests {
         let resp = IpcMessage::StatusResponse {
             endpoint_id: ep_id,
             mdns_enabled: true,
+            private_mode: false,
+            tor: false,
             auto_update: false,
             active: true,
             contact_id: Some("contact123".to_string()),

@@ -243,21 +243,42 @@ async fn build_daemon_inner(
         Some(id) => id,
         None => config::contact_secret(&mut app_config).public(),
     };
+    // Refuse to bind rather than quietly falling back to n0's servers. Both
+    // write paths (`ray up --private`, `ray config set private on`) already
+    // check this, so reaching here means `settings.toml` was hand-edited, and
+    // for a setting whose entire promise is "nothing else is contacted",
+    // starting anyway with the promise broken is the wrong failure.
+    if app_config.private_mode {
+        private_mode_servers_ok(&app_config)?;
+    }
     let alpns = initial_alpns(&app_config);
-    let use_tor = app_config
-        .networks
-        .iter()
-        .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
-    let ep = transport::create_endpoint_with_alpns(
+    // The node-wide `tor` setting, OR'd with the older per-network
+    // `TransportMode::Tor` so `ray create/join --tor` keeps working. One endpoint
+    // serves every network, so a single network asking for Tor puts the whole node
+    // in it: that was already true before the node-wide setting existed.
+    let use_tor = app_config.tor
+        || app_config
+            .networks
+            .iter()
+            .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
+    let posture = transport::NodePosture::new(app_config.private_mode, use_tor);
+    let bound = transport::create_endpoint_with_alpns(
         key.clone(),
         alpns,
-        use_tor,
+        posture,
         &app_config.relay,
         &app_config.discovery_dns,
         &app_config.dns_upstreams,
     )
     .await?;
+    // `bound` is moved into `Transport` below, which is what discharges the
+    // guard's single job: stay alive as long as the endpoint (see
+    // `transport::TransportGuard`). Everything up to there works off this clone.
+    let ep = bound.endpoint.clone();
     *endpoint_out = Some(ep.clone());
+    // Tell the record plane how it is allowed to reach the pkarr server before
+    // anything publishes or resolves (see `dht::set_posture`).
+    crate::dht::set_posture(posture);
 
     // Built before the blob store below, because the provider event pump that
     // feeds it (a bit further down, once `blobs_proto` exists) needs the
@@ -493,7 +514,11 @@ async fn build_daemon_inner(
         dns_resolver.clone(),
         derive_ipv6(&identity.local_identity()),
     ));
-    let mdns_enabled = app_config.mdns_enabled;
+    // mDNS is silenced by private mode rather than merely defaulted off: an mDNS
+    // announcement hands this node's identity to every other device on whatever
+    // LAN it is attached to, which is the one exposure a private node cannot fix
+    // by choosing its own servers.
+    let mdns_enabled = app_config.mdns_enabled && !app_config.private_mode;
     // Stays empty when mDNS is off, so `ray mdns scan` reports nothing rather
     // than stale sightings from a previous run.
     let lan_peers = Arc::new(LanPeers::new());
@@ -509,7 +534,7 @@ async fn build_daemon_inner(
     // loose `Daemon` fields below still hold the originals until the daemon
     // god object is dissolved.
     let transport = Arc::new(Transport::new(
-        ep.clone(),
+        bound,
         identity.clone(),
         blob_store.clone(),
         stats.clone(),
@@ -669,7 +694,11 @@ async fn build_daemon_inner(
     #[cfg(target_os = "android")]
     let metrics_server: Option<MetricsServer> = None;
 
-    let auto_update = app_config.auto_update;
+    // Same treatment as mDNS: the update checker reaches GitHub directly, so it
+    // does not run while private. `apply_global` also refuses to turn it on, so
+    // this is the backstop for a config that was already `on` when private mode
+    // went on.
+    let auto_update = app_config.auto_update && !app_config.private_mode;
     let daemon = Arc::new(Daemon {
         transport,
         registry,
@@ -680,6 +709,8 @@ async fn build_daemon_inner(
         protocol_router: protocol_router.clone(),
         dns,
         mdns_enabled,
+        private_mode: app_config.private_mode,
+        tor: use_tor,
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),
@@ -1391,8 +1422,66 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Private mode's precondition: both server lists name the operator's own
+/// servers and only those (`replace` mode, non-empty).
+///
+/// Split out from the check in `config::settings::apply_global` because the two
+/// answer different questions. That one rejects a bad *write*; this one rejects
+/// a bad *state*, which is what a hand-edited `settings.toml` produces.
+fn private_mode_servers_ok(cfg: &config::AppConfig) -> Result<()> {
+    use crate::config::settings::is_own_servers;
+    let missing: Vec<&str> = [("relay", &cfg.relay), ("discovery-dns", &cfg.discovery_dns)]
+        .into_iter()
+        .filter(|(_, o)| !is_own_servers(o))
+        .map(|(name, _)| name)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "private mode is on but {} {} not set to a server of your own\n    \
+         fix the config, or leave private mode: ray up --no-private",
+        missing.join(" and "),
+        if missing.len() == 1 { "is" } else { "are" },
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// The startup guard is the backstop for a hand-edited `settings.toml`: both
+    /// write paths already refuse this state, so reaching it means the file was
+    /// changed behind them, and starting anyway would leave the node claiming a
+    /// privacy it does not have.
+    #[test]
+    fn private_mode_startup_guard_names_every_missing_server() {
+        use super::private_mode_servers_ok;
+        use crate::config::{AppConfig, ServerOverride};
+
+        let own = || ServerOverride {
+            servers: vec!["http://s.example".to_string()],
+            replace: true,
+        };
+
+        let mut cfg = AppConfig {
+            private_mode: true,
+            ..AppConfig::default()
+        };
+        let err = private_mode_servers_ok(&cfg).unwrap_err().to_string();
+        assert!(err.contains("relay and discovery-dns"), "{err}");
+        assert!(err.contains("are not set"), "plural reads right: {err}");
+
+        cfg.relay = own();
+        let err = private_mode_servers_ok(&cfg).unwrap_err().to_string();
+        assert!(err.contains("discovery-dns is not set"), "singular: {err}");
+
+        cfg.discovery_dns = own();
+        assert!(private_mode_servers_ok(&cfg).is_ok());
+
+        // `augment` keeps n0's servers alongside these, so it does not satisfy it.
+        cfg.relay.replace = false;
+        assert!(private_mode_servers_ok(&cfg).is_err());
+    }
+
     use super::*;
 
     /// The decode-error reply quotes the request, and a frame may carry up to
