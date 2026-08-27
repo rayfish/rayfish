@@ -9,9 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Windows on ARM64.** CI now builds `ray.exe` for `aarch64-pc-windows-msvc`
-  on every change and attaches it to the run, so Snapdragon and other ARM
-  laptops get a native binary instead of running the x86_64 one under
-  emulation. The MSI installer is still x86_64 only.
+  on every change, and the nightly release publishes it as
+  `ray-windows-aarch64.exe`, so Snapdragon and other ARM laptops get a native
+  binary instead of running the x86_64 one under emulation. The MSI installer
+  is still x86_64 only, and so is `ray update` on Windows: the ARM64 binary is
+  a manual download for now.
 
 - **Android: back up and restore your identity.** "You" now has an Identity
   backup card. Backing up asks for a password, encrypts the key with it, and
