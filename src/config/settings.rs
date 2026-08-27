@@ -46,10 +46,20 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         GlobalKey::Private => {
             let on = parse_bool(value, false)?;
             if on {
-                own_servers_or_bail(&cfg.relay, "relay")?;
-                own_servers_or_bail(&cfg.discovery_dns, "discovery-dns")?;
+                private_servers_or_bail(cfg, cfg.tor)?;
             }
             cfg.private_mode = on;
+        }
+        // Turning Tor *on* only ever relaxes what private mode demands, since a
+        // relay is meaningless to onion routing. Turning it off re-imposes the
+        // relay requirement, so it is refused if there is no relay to fall back
+        // to: the alternative is a node that silently has no way to reach anyone.
+        GlobalKey::Tor => {
+            let on = parse_bool(value, false)?;
+            if cfg.private_mode && !on {
+                private_servers_or_bail(cfg, false)?;
+            }
+            cfg.tor = on;
         }
         GlobalKey::AutoUpdate => {
             cfg.auto_update = private_mode_forbids(cfg, value, key)?;
@@ -95,7 +105,9 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         // n0's defaults while `ray config get` still reported `private on`.
         GlobalKey::Relay => {
             let next = server_override(entries, reset, replace, super::RELAY_PRESET_RAYFISH)?;
-            if cfg.private_mode {
+            // Not guarded under Tor: the relay is unused there, so clearing it
+            // takes nothing away.
+            if cfg.private_mode && !cfg.tor {
                 own_servers_or_bail(&next, "relay")?;
             }
             cfg.relay = next;
@@ -170,6 +182,19 @@ pub fn is_own_servers(o: &ServerOverride) -> bool {
     o.replace && !o.is_unset()
 }
 
+/// Check every server list private mode requires, which depends on Tor.
+///
+/// Without Tor it needs both: a relay to hole-punch through and a discovery
+/// server to publish to. With Tor it needs only the discovery server, for the
+/// network-record plane. A relay is meaningless to onion routing, so demanding
+/// one would be asking the operator to stand up a server the node never contacts.
+fn private_servers_or_bail(cfg: &AppConfig, tor: bool) -> Result<()> {
+    if !tor {
+        own_servers_or_bail(&cfg.relay, "relay")?;
+    }
+    own_servers_or_bail(&cfg.discovery_dns, "discovery-dns")
+}
+
 fn own_servers_or_bail(o: &ServerOverride, key: &str) -> Result<()> {
     if is_own_servers(o) {
         return Ok(());
@@ -205,6 +230,7 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
         GlobalKey::Private => on_off(cfg.private_mode),
+        GlobalKey::Tor => on_off(cfg.tor),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
@@ -450,6 +476,63 @@ mod tests {
         apply_global(&mut cfg, GlobalKey::Mdns, "", false).unwrap();
         assert!(cfg.auto_update);
         assert!(cfg.mdns_enabled, "reset restores the default once allowed");
+    }
+
+    /// With Tor, private mode needs only a discovery server. Requiring a relay
+    /// as well would be asking the operator to stand up a server that onion
+    /// routing gives the node no way to use.
+    #[test]
+    fn private_with_tor_needs_no_relay() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::Tor, "on", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::DiscoveryDns, "http://d.example", true).unwrap();
+
+        apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap();
+        assert!(cfg.private_mode, "no relay is set, and none is needed");
+
+        // The discovery server is still required: it is the record plane, which
+        // Tor routes rather than replaces.
+        let mut bare = AppConfig::default();
+        apply_global(&mut bare, GlobalKey::Tor, "on", false).unwrap();
+        let err = apply_global(&mut bare, GlobalKey::Private, "on", false).unwrap_err();
+        assert!(err.to_string().contains("discovery-dns"), "{err}");
+    }
+
+    /// Leaving Tor re-imposes the relay requirement, so it is refused when there
+    /// is no relay to fall back to. Allowing it would leave a private node with
+    /// no way to reach anyone and no message saying why.
+    #[test]
+    fn leaving_tor_while_private_needs_a_relay_first() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::Tor, "on", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::DiscoveryDns, "http://d.example", true).unwrap();
+        apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap();
+
+        let err = apply_global(&mut cfg, GlobalKey::Tor, "off", false).unwrap_err();
+        assert!(err.to_string().contains("relay"), "{err}");
+        assert!(cfg.tor, "a rejected write must not have landed");
+
+        apply_global(&mut cfg, GlobalKey::Relay, "http://r.example", true).unwrap();
+        apply_global(&mut cfg, GlobalKey::Tor, "off", false).unwrap();
+        assert!(!cfg.tor);
+    }
+
+    /// The relay guard does not apply under Tor: clearing a server the node never
+    /// contacts takes nothing away.
+    #[test]
+    fn the_relay_is_unguarded_under_tor() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::Relay, "http://r.example", true).unwrap();
+        apply_global(&mut cfg, GlobalKey::DiscoveryDns, "http://d.example", true).unwrap();
+        apply_global(&mut cfg, GlobalKey::Private, "on", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::Tor, "on", false).unwrap();
+
+        apply_global(&mut cfg, GlobalKey::Relay, "", false).unwrap();
+        assert!(cfg.relay.is_unset());
+        assert!(
+            cfg.private_mode,
+            "still private, still on its own discovery"
+        );
     }
 
     /// A config already in private mode with both servers set: the starting point

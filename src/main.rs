@@ -208,16 +208,30 @@ pub(crate) enum Command {
         hostname: Option<String>,
         /// Contact only the relay and discovery servers you name, nothing else
         ///
-        /// Needs --relay and --pkarr, unless both are already set to servers of
-        /// your own. Turns mDNS and auto-update off, since both reach past those
-        /// servers. Sticky: it survives restarts until `ray up --no-private`.
+        /// Needs --relay and --pkarr, or just --pkarr with --tor, unless they are
+        /// already set to servers of your own. Turns mDNS and auto-update off,
+        /// since both reach past those servers. Sticky: it survives restarts
+        /// until `ray up --no-private`.
         #[arg(long, conflicts_with = "no_private")]
         private: bool,
         /// Leave private mode, going back to the default servers
         #[arg(long)]
         no_private: bool,
+        /// Reach peers over Tor only: no UDP socket, no relay, nothing published
+        ///
+        /// A peer's onion address is derived from its identity, so this needs no
+        /// discovery to be reachable. Requires a Tor daemon with ControlPort 9051.
+        /// Sticky, like --private; leave it with `ray up --no-tor`.
+        #[arg(long, conflicts_with = "no_tor")]
+        tor: bool,
+        /// Leave Tor mode, going back to direct connections
+        #[arg(long)]
+        no_tor: bool,
         /// Relay servers to use instead of the defaults (comma-separated)
-        #[arg(long, value_name = "URL")]
+        ///
+        /// Not accepted with --tor: onion routing needs no holepunching and no
+        /// fallback, so a relay there is a server that would never be contacted.
+        #[arg(long, value_name = "URL", conflicts_with = "tor")]
         relay: Option<String>,
         /// pkarr discovery server to use instead of the default
         #[arg(long, value_name = "URL")]
@@ -1457,6 +1471,8 @@ async fn run() -> Result<()> {
             hostname,
             private,
             no_private,
+            tor,
+            no_tor,
             relay,
             pkarr,
             yes,
@@ -1465,6 +1481,8 @@ async fn run() -> Result<()> {
                 hostname,
                 private,
                 no_private,
+                tor,
+                no_tor,
                 relay,
                 pkarr,
                 yes,

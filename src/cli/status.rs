@@ -222,6 +222,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             endpoint_id,
             mdns_enabled,
             private_mode,
+            tor,
             auto_update,
             active,
             contact_id,
@@ -242,6 +243,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
                     "private": private_mode,
+                    "tor": tor,
                     "lan_peers": lan_peers
                         .iter()
                         .map(|p| serde_json::json!({
@@ -289,6 +291,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 String::new()
             };
+            // Its own chip rather than folded into `private`: the two are
+            // independent, and `tor on` without `private` is a real state.
+            let tor_chip = if tor {
+                format!("      {} {}", style::label("tor"), style::green("on"))
+            } else {
+                String::new()
+            };
             // Only surface auto-update in the header when it is on (opt-in), so the
             // default line stays uncluttered.
             let auto = if auto_update {
@@ -302,11 +311,12 @@ pub(crate) async fn ipc_status() -> Result<()> {
             };
             println!();
             println!(
-                "  {}  {}      {}{}{}      {} {}",
+                "  {}  {}      {}{}{}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
                 private,
+                tor_chip,
                 auto,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),

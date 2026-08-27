@@ -144,17 +144,107 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) 
     out
 }
 
-/// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
-/// When `tor` is true and the `tor` feature is enabled, adds the Tor custom transport
-/// alongside the default relay transport.
+/// How this node reaches the network, from the two settings that decide it:
+/// `private` (whose servers) and `tor` (how they are reached).
+///
+/// The two are orthogonal on purpose. `private` says nothing but the operator's
+/// own relay and discovery server is contacted; `tor` says every connection goes
+/// over Tor and no UDP socket is opened at all. They compose rather than nest.
+///
+/// The Tor arms are the only ones that publish nothing. A Tor v3 onion address
+/// *is* an ed25519 public key, and so is an [`EndpointId`], so
+/// `iroh_tor_transport` derives a peer's onion address from its id with no
+/// lookup at all. There is no address to gather and none to advertise: a peer
+/// that knows who we are already knows where we are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodePosture {
+    /// The default: direct UDP plus n0's relays, addresses published to n0.
+    Open,
+    /// Tor only. No UDP socket, no relay, nothing published.
+    Tor,
+    /// Direct UDP plus the operator's own relay, addresses published only to
+    /// their own discovery server.
+    Private,
+    /// Tor only, with the network-record plane pointed at the operator's own
+    /// discovery server (and reached through Tor's SOCKS proxy).
+    PrivateTor,
+}
+
+impl NodePosture {
+    /// Derive the posture from the two settings.
+    pub fn new(private: bool, tor: bool) -> Self {
+        match (private, tor) {
+            (false, false) => Self::Open,
+            (false, true) => Self::Tor,
+            (true, false) => Self::Private,
+            (true, true) => Self::PrivateTor,
+        }
+    }
+
+    /// Whether Tor is the only transport: no UDP bind, no relay, no address
+    /// gathering, and nothing published.
+    pub fn is_tor_only(self) -> bool {
+        matches!(self, Self::Tor | Self::PrivateTor)
+    }
+
+    /// Whether this node refuses infrastructure it was not explicitly given.
+    pub fn is_private(self) -> bool {
+        matches!(self, Self::Private | Self::PrivateTor)
+    }
+}
+
+/// A handle that must outlive the endpoint.
+///
+/// Today this holds exactly one thing, and it is easy to delete by accident.
+/// `iroh_tor_transport::TorCustomTransport` registers an *ephemeral* onion
+/// service over a Tor control connection (`ADD_ONION` without `Detach`), and
+/// that service lives only as long as the control connection. The connection is
+/// owned by the `TorCustomTransport`, and `TorCustomTransport::bind` does **not**
+/// pass it to the `TorCustomEndpoint` it returns, despite the field's own doc
+/// comment saying it is shared (it is `#[allow(dead_code)]`, which is the tell).
+///
+/// So if the last `Arc` drops, tor tears the service down and the failure is
+/// silent and total: the endpoint stays bound and looks healthy, this node still
+/// believes it is reachable, and every peer that dials it gets "descriptor not
+/// found" for as long as the daemon runs. Measured, not deduced: a spike that
+/// dropped the `Arc` timed out on every dial while tor logged `No more HSDir
+/// available to query`; holding it, the same dial connected in ~9s.
+///
+/// Not `#[cfg]`-gated at the field level so call sites need no `cfg` of their
+/// own; a build without the `tor` feature simply has nothing to keep.
+#[derive(Clone, Default)]
+pub struct TransportGuard {
+    #[cfg(feature = "tor")]
+    _tor: Option<Arc<iroh_tor_transport::TorCustomTransport>>,
+}
+
+impl std::fmt::Debug for TransportGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportGuard").finish_non_exhaustive()
+    }
+}
+
+/// A bound endpoint plus whatever must stay alive alongside it.
+///
+/// A plain `Endpoint` would compile and then not work: see [`TransportGuard`].
+#[derive(Debug)]
+pub struct BoundEndpoint {
+    pub endpoint: Endpoint,
+    pub guard: TransportGuard,
+}
+
+/// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback),
+/// or, in a Tor posture, one carrying the Tor transport and nothing else.
+///
+/// **Keep the returned [`TransportGuard`] for as long as the endpoint lives.**
 pub async fn create_endpoint_with_alpns(
     secret_key: SecretKey,
     alpns: Vec<Vec<u8>>,
-    tor: bool,
+    posture: NodePosture,
     relay: &ServerOverride,
     discovery: &ServerOverride,
     dns_upstreams: &ServerOverride,
-) -> Result<Endpoint> {
+) -> Result<BoundEndpoint> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
     // it for the ephemeral fallback. Falling back to port 0 keeps the guarantee
@@ -162,14 +252,24 @@ pub async fn create_endpoint_with_alpns(
     // Read the host's resolvers once, here, rather than per bind attempt: the
     // second attempt runs after the first failed, and this must be the host's
     // configuration as it stood before anything of ours touched it.
-    let nameservers =
-        control_plane_nameservers(dns_upstreams, crate::dns::config::system_nameservers());
-    tracing::debug!(?nameservers, "control-plane DNS");
+    // A Tor-only node resolves no hostname of ours: there is no relay to find and
+    // the pkarr server is reached through the SOCKS proxy, which does its own
+    // remote DNS. Handing the endpoint an empty list means the public fallback in
+    // `control_plane_nameservers` cannot fire, so no query for our infrastructure
+    // ever leaves this machine in the clear.
+    let nameservers = if posture.is_tor_only() {
+        Vec::new()
+    } else {
+        control_plane_nameservers(dns_upstreams, crate::dns::config::system_nameservers())
+    };
+    tracing::debug!(?nameservers, ?posture, "control-plane DNS");
 
-    let ep = match bind_endpoint(
+    // The fixed-port retry only means anything when there is a UDP socket to
+    // collide over. A Tor posture binds none, so it gets one attempt.
+    let bound = match bind_endpoint(
         &secret_key,
         &alpns,
-        tor,
+        posture,
         RAYFISH_LISTEN_PORT,
         relay,
         discovery,
@@ -177,22 +277,37 @@ pub async fn create_endpoint_with_alpns(
     )
     .await
     {
-        Ok(ep) => ep,
+        Ok(bound) => bound,
+        Err(e) if posture.is_tor_only() => {
+            return Err(e).context("failed to bind iroh endpoint over Tor");
+        }
         Err(e) => {
             tracing::warn!(
                 port = RAYFISH_LISTEN_PORT,
                 error = %e,
                 "fixed UDP port unavailable; falling back to an ephemeral port"
             );
-            bind_endpoint(&secret_key, &alpns, tor, 0, relay, discovery, &nameservers)
-                .await
-                .context("failed to bind iroh endpoint")?
+            bind_endpoint(
+                &secret_key,
+                &alpns,
+                posture,
+                0,
+                relay,
+                discovery,
+                &nameservers,
+            )
+            .await
+            .context("failed to bind iroh endpoint")?
         }
     };
 
-    tracing::info!(id = %ep.id().fmt_short(), "iroh endpoint ready");
+    tracing::info!(
+        id = %bound.endpoint.id().fmt_short(),
+        ?posture,
+        "iroh endpoint ready"
+    );
 
-    Ok(ep)
+    Ok(bound)
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -209,24 +324,17 @@ pub async fn create_endpoint_with_alpns(
 async fn bind_endpoint(
     secret_key: &SecretKey,
     alpns: &[Vec<u8>],
-    tor: bool,
+    posture: NodePosture,
     port: u16,
     relay: &ServerOverride,
     discovery: &ServerOverride,
     nameservers: &[Ipv4Addr],
-) -> Result<Endpoint> {
+) -> Result<BoundEndpoint> {
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
         .alpns(alpns.to_vec())
         .clear_ip_transports()
-        .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-        .context("invalid IPv4 bind address")?
-        .bind_addr_with_opts(
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
-            BindOpts::default().set_is_required(false),
-        )
-        .context("invalid IPv6 bind address")?
         // Rayfish's data plane is a single stream of QUIC datagrams per peer
         // (TUN packets → `send_datagram`), with a few reliable control streams per
         // connection. Tune the transport config for that shape:
@@ -251,6 +359,21 @@ async fn bind_endpoint(
         // would loop the underlay back through the tunnel). Stays bound to `0.0.0.0`,
         // so multi-homing / roaming is unaffected.
         .direct_addr_filter(OverlayAddrFilter);
+
+    // A Tor posture binds no UDP socket at all. Skipping these two is what makes
+    // the node unpublishable rather than merely unpublished: with no socket there
+    // are no direct addresses to gather, so there is nothing for an address-lookup
+    // service to advertise even if one were installed.
+    if !posture.is_tor_only() {
+        builder = builder
+            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            .context("invalid IPv4 bind address")?
+            .bind_addr_with_opts(
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                BindOpts::default().set_is_required(false),
+            )
+            .context("invalid IPv6 bind address")?;
+    }
 
     // Resolve our own names (the relay, the pkarr server) against an explicit
     // list instead of iroh's default, which reads the host's resolv.conf at bind
@@ -282,14 +405,31 @@ async fn bind_endpoint(
     // tunnel it is carrying. See `exit_node::LoopPrevention`.
     builder = builder.configure_socket(crate::exit_node::LoopPrevention);
 
-    // Override the N0 preset's relay / discovery defaults when configured.
-    if let Some(mode) = build_relay_mode(relay)? {
-        builder = builder.relay_mode(mode);
+    if posture.is_tor_only() {
+        // Everything that could reach the network in the clear, removed:
+        //   - `clear_relay_transports`: a relay is a clearnet TCP connection to a
+        //     server that would see this node's address, and onion routing needs
+        //     no fallback path anyway.
+        //   - `clear_address_lookup`: this is the one that finally drops the N0
+        //     preset's `PkarrPublisher`. Until now there was no way to stop
+        //     publishing at all, because `apply_discovery` only ever swapped one
+        //     publisher for another.
+        // The Tor transport's own lookup is added below, and it resolves a peer's
+        // address from its id arithmetically, without touching the network.
+        builder = builder.clear_relay_transports().clear_address_lookup();
+    } else {
+        // Override the N0 preset's relay / discovery defaults when configured.
+        if let Some(mode) = build_relay_mode(relay)? {
+            builder = builder.relay_mode(mode);
+        }
+        builder = apply_discovery(builder, discovery)?;
     }
-    builder = apply_discovery(builder, discovery)?;
+
+    #[allow(unused_mut)]
+    let mut guard = TransportGuard::default();
 
     #[cfg(feature = "tor")]
-    if tor {
+    if posture.is_tor_only() {
         let tor_transport = iroh_tor_transport::TorCustomTransport::builder()
             .build(secret_key.clone())
             .await
@@ -299,15 +439,25 @@ async fn bind_endpoint(
                 tor_transport.clone() as Arc<dyn iroh::endpoint::transports::CustomTransport>
             )
             .address_lookup(tor_transport.discovery());
-        tracing::info!("Tor transport enabled");
+        // Keeping this is not bookkeeping: dropping it makes tor delete the onion
+        // service, silently and permanently. See `TransportGuard`.
+        guard._tor = Some(tor_transport);
+        tracing::info!("Tor transport enabled (Tor only)");
     }
 
     #[cfg(not(feature = "tor"))]
-    if tor {
-        anyhow::bail!("Tor support requires building with --features tor");
+    if posture.is_tor_only() {
+        anyhow::bail!(
+            "Tor mode requires a build with --features tor\n    \
+             turn it off with: ray up --no-tor"
+        );
     }
 
-    builder.bind().await.context("failed to bind iroh endpoint")
+    let endpoint = builder
+        .bind()
+        .await
+        .context("failed to bind iroh endpoint")?;
+    Ok(BoundEndpoint { endpoint, guard })
 }
 
 /// Tailscale's IPv6 ULA range. Its IPv4 half is inside `100.64.0.0/10`, which
@@ -462,6 +612,115 @@ pub(crate) fn is_alpn_mismatch(err: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real composition, against a live Tor daemon. Ignored by default: it
+    /// needs `tor` running with `ControlPort 9051`, takes ~10s for the descriptor
+    /// to publish, and talks to the public Tor network.
+    ///
+    /// Run with: `cargo test --features tor -- --ignored tor_posture_binds`
+    ///
+    /// What it pins is the pair of claims the design rests on: a Tor node gathers
+    /// no address at all (so it can publish none), and the guard that keeps its
+    /// onion service alive is actually populated. The second matters more than it
+    /// looks: dropping it leaves a node that binds, reports healthy, and is
+    /// unreachable forever (see [`TransportGuard`]).
+    #[tokio::test]
+    #[ignore = "needs a Tor daemon with ControlPort 9051"]
+    #[cfg(feature = "tor")]
+    async fn tor_posture_binds_nothing_and_keeps_its_service() {
+        let bound = create_endpoint_with_alpns(
+            SecretKey::generate(),
+            vec![b"test/1".to_vec()],
+            NodePosture::Tor,
+            &ServerOverride::default(),
+            &ServerOverride::default(),
+            &ServerOverride::default(),
+        )
+        .await
+        .expect("a Tor endpoint binds");
+
+        assert!(
+            bound.endpoint.bound_sockets().is_empty(),
+            "a Tor posture must bind no UDP socket: {:?}",
+            bound.endpoint.bound_sockets()
+        );
+        assert!(
+            bound.guard._tor.is_some(),
+            "the onion service's control connection must be held, or tor deletes it"
+        );
+        bound.endpoint.close().await;
+    }
+
+    /// The two settings are orthogonal, and every combination is a real state a
+    /// node can be in. Pinned because the whole design rests on them composing
+    /// rather than one implying the other.
+    #[test]
+    fn posture_is_the_product_of_the_two_settings() {
+        use NodePosture::*;
+        assert_eq!(NodePosture::new(false, false), Open);
+        assert_eq!(NodePosture::new(false, true), Tor);
+        assert_eq!(NodePosture::new(true, false), Private);
+        assert_eq!(NodePosture::new(true, true), PrivateTor);
+
+        // Tor-only is what decides whether a UDP socket is bound at all, and it
+        // is exactly the two Tor arms: `Private` alone still binds and publishes.
+        assert!(!Open.is_tor_only());
+        assert!(Tor.is_tor_only());
+        assert!(!Private.is_tor_only());
+        assert!(PrivateTor.is_tor_only());
+
+        assert!(!Open.is_private());
+        assert!(!Tor.is_private());
+        assert!(Private.is_private());
+        assert!(PrivateTor.is_private());
+    }
+
+    /// A Tor posture must bind no UDP socket, so the port it would have used is
+    /// irrelevant. Guards against someone "fixing" the skipped bind by making it
+    /// conditional on the port instead of the posture.
+    #[tokio::test]
+    async fn a_tor_posture_binds_no_socket_and_publishes_nothing() {
+        // Without the `tor` feature the composition is unreachable by design and
+        // `bind_endpoint` says so rather than silently binding in the clear.
+        #[cfg(not(feature = "tor"))]
+        {
+            let err = bind_endpoint(
+                &SecretKey::generate(),
+                &[b"test/1".to_vec()],
+                NodePosture::Tor,
+                0,
+                &ServerOverride::default(),
+                &ServerOverride::default(),
+                &[],
+            )
+            .await
+            .expect_err("a Tor posture cannot bind without the feature");
+            assert!(
+                err.to_string().contains("--features tor"),
+                "the error must name what is missing: {err}"
+            );
+        }
+
+        // With the feature, binding needs a live Tor daemon, so this asserts the
+        // half that holds without one: an Open posture still binds normally, and
+        // the Tor branch is not silently taken for it.
+        let bound = bind_endpoint(
+            &SecretKey::generate(),
+            &[b"test/1".to_vec()],
+            NodePosture::Open,
+            0,
+            &ServerOverride::default(),
+            &ServerOverride::default(),
+            &[],
+        )
+        .await
+        .expect("an open posture binds");
+        assert!(
+            !bound.endpoint.bound_sockets().is_empty(),
+            "an open posture binds at least one socket"
+        );
+        bound.endpoint.close().await;
+    }
 
     #[test]
     fn overlay_addr_filter_keeps_only_non_overlay() {

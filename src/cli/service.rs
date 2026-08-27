@@ -91,6 +91,8 @@ pub(crate) struct UpOptions {
     pub hostname: Option<String>,
     pub private: bool,
     pub no_private: bool,
+    pub tor: bool,
+    pub no_tor: bool,
     pub relay: Option<String>,
     pub pkarr: Option<String>,
     pub yes: bool,
@@ -101,7 +103,12 @@ impl UpOptions {
     /// bringing the data plane up. The common `ray up` answers `false` and skips
     /// the settings round trips entirely.
     fn touches_posture(&self) -> bool {
-        self.private || self.no_private || self.relay.is_some() || self.pkarr.is_some()
+        self.private
+            || self.no_private
+            || self.tor
+            || self.no_tor
+            || self.relay.is_some()
+            || self.pkarr.is_some()
     }
 }
 
@@ -156,6 +163,16 @@ async fn apply_posture(opts: &UpOptions) -> Result<()> {
         set_global(ipc::GlobalKey::DiscoveryDns, pkarr, true)
             .await
             .context("setting the discovery server")?;
+    }
+    // Tor before private, because what private mode demands depends on it: with
+    // Tor it needs only a discovery server, without it a relay as well. Sending
+    // them the other way round would reject `ray up --private --tor --pkarr <p>`
+    // for a missing relay it is about to stop needing.
+    if opts.tor {
+        set_global(ipc::GlobalKey::Tor, "on", false).await?;
+    }
+    if opts.no_tor {
+        set_global(ipc::GlobalKey::Tor, "off", false).await?;
     }
     if opts.private {
         set_global(ipc::GlobalKey::Private, "on", false).await?;
@@ -213,8 +230,25 @@ fn announce_posture(opts: &UpOptions, restarting: bool) {
         );
     } else if opts.no_private {
         println!("  {} private mode off", style::check());
-    } else {
+    } else if !opts.tor && !opts.no_tor {
         println!("  {} servers updated", style::check());
+    }
+    if opts.tor {
+        println!("  {} tor mode on", style::check());
+        println!(
+            "    {}",
+            style::faint("peers are reached over Tor only; this node publishes no address")
+        );
+        // Worth saying because it is the one way a healthy-looking Tor node is
+        // still unreachable, and the wait is long enough to look like a failure.
+        println!(
+            "    {}",
+            style::faint(
+                "needs a Tor daemon with ControlPort 9051; peers can reach you ~10s after start"
+            )
+        );
+    } else if opts.no_tor {
+        println!("  {} tor mode off", style::check());
     }
     println!(
         "    {}",
@@ -656,6 +690,8 @@ mod tests {
             hostname: None,
             private: false,
             no_private: false,
+            tor: false,
+            no_tor: false,
             relay: None,
             pkarr: None,
             yes: false,
@@ -687,6 +723,14 @@ mod tests {
             },
             UpOptions {
                 no_private: true,
+                ..opts()
+            },
+            UpOptions {
+                tor: true,
+                ..opts()
+            },
+            UpOptions {
+                no_tor: true,
                 ..opts()
             },
             UpOptions {
