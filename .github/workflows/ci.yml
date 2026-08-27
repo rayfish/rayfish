@@ -154,6 +154,21 @@ jobs:
       - name: Clippy quality gate
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # install.ps1 is only ever run by a user piping it into iex, so a syntax
+      # error in it reaches them and nothing else. This is the only Windows
+      # shell in the tree that can parse it.
+      - name: Parse install.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) {
+            $errors | ForEach-Object { Write-Host $_ }
+            throw "install.ps1 has $($errors.Count) parse error(s)."
+          }
+          Write-Host 'install.ps1 parses clean.'
+
   # Windows on ARM is its own target, not a variant of the x86_64 one: its C
   # dependencies (ring, blake3) select different sources there, so a green
   # x86_64 job says nothing about it. Built natively on `windows-11-arm`, which

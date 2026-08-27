@@ -8,12 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Windows on ARM64.** CI now builds `ray.exe` for `aarch64-pc-windows-msvc`
-  on every change, and the nightly release publishes it as
+- **Windows on ARM64.** Releases and nightlies now publish
   `ray-windows-aarch64.exe`, so Snapdragon and other ARM laptops get a native
-  binary instead of running the x86_64 one under emulation. The MSI installer
-  is still x86_64 only, and so is `ray update` on Windows: the ARM64 binary is
-  a manual download for now.
+  binary instead of running the x86_64 one under emulation. CI builds the
+  target on every change.
+
+- **An installer for Windows.** `install.ps1` is the counterpart to
+  `install.sh`, which only ever covered Linux and macOS. On x64 it downloads
+  and runs the MSI; on ARM64, which has no MSI, it places `ray.exe` with the
+  matching Wintun DLL beside it and puts the directory on PATH, leaving
+  `ray install` to register the service.
+
+  The ARM64 binary is unsigned, and `ray update` does not cover it yet, so it
+  is upgraded by re-running the installer.
 
 - **Android: back up and restore your identity.** "You" now has an Identity
   backup card. Backing up asks for a password, encrypts the key with it, and
