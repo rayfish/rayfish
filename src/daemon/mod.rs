@@ -654,6 +654,12 @@ pub struct Daemon {
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
     dns: Arc<DnsService>,
     mdns_enabled: bool,
+    /// Whether this node runs in private mode (`ray up --private`): it contacts
+    /// only the relay and discovery servers it was given, and neither mDNS nor
+    /// the update checker runs. Read at startup, because the posture is decided
+    /// when the endpoint binds; changing the setting takes a restart. Echoed
+    /// back in `ray status`.
+    private_mode: bool,
     /// Whether this node opted into automatic stable updates
     /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
@@ -1129,6 +1135,11 @@ impl Daemon {
             // match and forces the choice.
             NodeKey::Global(
                 k @ (GlobalKey::Mdns
+                // A plain write, but only because the posture is read at bind
+                // time: `apply_global` validates it and the restart below is
+                // what makes it take effect. `ray up --private` drives that
+                // restart for you.
+                | GlobalKey::Private
                 | GlobalKey::Relay
                 | GlobalKey::DiscoveryDns
                 | GlobalKey::DnsUpstreams
@@ -1627,6 +1638,12 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
                 "disabled"
             }
         ),
+        // Names what it turns off, because those are separate settings the user
+        // set themselves and will otherwise wonder about.
+        GlobalKey::Private if cfg.private_mode => {
+            format!("Private mode on: mDNS and auto-update are off while it is. {restart}")
+        }
+        GlobalKey::Private => format!("Private mode off. {restart}"),
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {
