@@ -89,6 +89,7 @@ impl Daemon {
             endpoint_id: self.transport.endpoint.id(),
             mdns_enabled: self.mdns_enabled,
             private_mode: self.private_mode,
+            tor: self.tor,
             auto_update: self.auto_update,
             active: self.active.load(Ordering::SeqCst),
             contact_id: Some(self.contact_public.to_string()),

@@ -18,6 +18,13 @@ use super::*;
 pub(crate) struct Transport {
     /// The one shared iroh endpoint (all ALPNs, all networks) for the process.
     pub(crate) endpoint: Endpoint,
+    /// Whatever the endpoint's transports need kept alive, held for exactly as
+    /// long as the endpoint itself. In a Tor posture this owns the control
+    /// connection that the node's onion service exists on: drop it and the node
+    /// goes silently unreachable while still looking healthy. Never read, which
+    /// is the point, so it is named to say so. See
+    /// [`crate::transport::TransportGuard`].
+    pub(crate) _guard: crate::transport::TransportGuard,
     /// This node's persistent identity + derived mesh addresses.
     pub(crate) identity: IrohIdentityProvider,
     /// Content-addressed blob store backing file transfer and membership blobs.
@@ -31,8 +38,11 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
+    /// Takes the [`BoundEndpoint`](crate::transport::BoundEndpoint) whole rather
+    /// than just its endpoint: the guard beside it is not optional bookkeeping,
+    /// and splitting them at the call site is how it gets dropped by accident.
     pub(crate) fn new(
-        endpoint: Endpoint,
+        bound: crate::transport::BoundEndpoint,
         identity: IrohIdentityProvider,
         blob_store: FsStore,
         stats: Arc<ForwardMetrics>,
@@ -40,7 +50,8 @@ impl Transport {
         lan_peers: Arc<LanPeers>,
     ) -> Self {
         Self {
-            endpoint,
+            endpoint: bound.endpoint,
+            _guard: bound.guard,
             identity,
             blob_store,
             stats,

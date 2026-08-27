@@ -448,6 +448,17 @@ pub struct AppConfig {
     /// `transport::bind_endpoint`.
     #[serde(default)]
     pub private_mode: bool,
+    /// Node-wide Tor mode (`ray up --tor`): every connection this node makes or
+    /// accepts goes over Tor, and nothing else. The endpoint binds no UDP socket
+    /// and uses no relay, so it gathers no addresses and publishes none.
+    ///
+    /// It needs no discovery to be reachable. A Tor v3 onion address *is* an
+    /// ed25519 public key, and so is an `EndpointId`, so a peer that knows who we
+    /// are already knows where we are (see `transport::NodePosture`).
+    ///
+    /// OR'd with the older per-network `TransportMode::Tor`, which stays working.
+    #[serde(default)]
+    pub tor: bool,
     /// Local UID authorized to control the daemon without root (Tailscale's
     /// `--operator` model). `None` means root-only for mutating commands.
     #[serde(default)]
@@ -545,6 +556,7 @@ impl Default for AppConfig {
         Self {
             mdns_enabled: true,
             private_mode: false,
+            tor: false,
             operator_uid: None,
             default_hostname: None,
             contact_secret_key: None,
@@ -683,6 +695,8 @@ struct Settings {
     mdns_enabled: bool,
     #[serde(default)]
     private_mode: bool,
+    #[serde(default)]
+    tor: bool,
     #[serde(default)]
     operator_uid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1369,6 +1383,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
     Ok(AppConfig {
         mdns_enabled: settings.mdns_enabled,
         private_mode: settings.private_mode,
+        tor: settings.tor,
         operator_uid: settings.operator_uid,
         default_hostname: settings.default_hostname,
         contact_secret_key: settings.contact_secret_key,
@@ -1437,6 +1452,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
     let settings = Settings {
         mdns_enabled: config.mdns_enabled,
         private_mode: config.private_mode,
+        tor: config.tor,
         operator_uid: config.operator_uid,
         default_hostname: config.default_hostname.clone(),
         contact_secret_key: config.contact_secret_key.clone(),

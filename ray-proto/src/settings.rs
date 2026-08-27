@@ -78,6 +78,7 @@ setting_keys! {
     GlobalKey {
         Mdns = "mdns", "LAN peer discovery over mDNS (on|off)";
         Private = "private", "contact only your own relay and discovery servers (on|off)";
+        Tor = "tor", "reach peers over Tor only, node-wide (on|off)";
         Relay = "relay", "iroh relay servers (preset or URL, comma-separated)";
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
         DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders (IP addresses, comma-separated)";

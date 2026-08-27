@@ -52,8 +52,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
 
+use crate::dht::PkarrClient;
 use anyhow::{Context, Result};
-use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::{Connection, Endpoint, VarInt};
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
@@ -660,6 +660,10 @@ pub struct Daemon {
     /// when the endpoint binds; changing the setting takes a restart. Echoed
     /// back in `ray status`.
     private_mode: bool,
+    /// Whether this node reaches peers over Tor only. The *effective* value: the
+    /// node-wide `tor` setting OR'd with any network joined with `--tor`, which
+    /// is what `build_daemon` actually gave the endpoint.
+    tor: bool,
     /// Whether this node opted into automatic stable updates
     /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
@@ -1140,6 +1144,7 @@ impl Daemon {
                 // what makes it take effect. `ray up --private` drives that
                 // restart for you.
                 | GlobalKey::Private
+                | GlobalKey::Tor
                 | GlobalKey::Relay
                 | GlobalKey::DiscoveryDns
                 | GlobalKey::DnsUpstreams
@@ -1644,6 +1649,10 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
             format!("Private mode on: mDNS and auto-update are off while it is. {restart}")
         }
         GlobalKey::Private => format!("Private mode off. {restart}"),
+        GlobalKey::Tor if cfg.tor => {
+            format!("Tor mode on: peers are reached over Tor only. {restart}")
+        }
+        GlobalKey::Tor => format!("Tor mode off. {restart}"),
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {
@@ -2912,7 +2921,10 @@ mod accept_handler_tests {
         contact: EndpointId,
     ) -> Arc<NetworkRegistry> {
         let transport = Arc::new(Transport::new(
-            endpoint,
+            crate::transport::BoundEndpoint {
+                endpoint,
+                guard: Default::default(),
+            },
             identity,
             blob_store,
             Arc::new(ForwardMetrics::default()),

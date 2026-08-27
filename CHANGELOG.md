@@ -26,6 +26,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   This is not anonymity on its own. Your node still publishes its addresses, just
   to the servers you chose, and those servers still see its address.
 
+- **`ray up --tor`: reach peers over Tor, and publish nothing.** Tor was already
+  a per-network option, but it only ever ran *alongside* the normal transport, so
+  a Tor node still opened a UDP socket and still published its real addresses. It
+  was "also reachable over Tor", not "reachable only over Tor". The new node-wide
+  flag is the second one: no UDP socket, no relay, and no address published
+  anywhere, because there is nothing to publish.
+
+  Nothing is lost by publishing nothing. A Tor onion address is an ed25519 public
+  key, and so is a rayfish identity, so they are the same 32 bytes in a different
+  encoding: a peer that knows who you are can already work out where you are. An
+  invite code carries the coordinator's identity, so joining with one needs no
+  lookup at all. Joining by bare network key, and `ray connect`, still ask your
+  discovery server, and those requests go through Tor too.
+
+  Combine it with `--private` to also choose whose discovery server that is:
+  `ray up --private --tor --pkarr <url>`. A relay is meaningless with `--tor` and
+  is refused rather than quietly ignored.
+
+  Needs a Tor daemon with `ControlPort 9051`, and a build with `--features tor`.
+  Expect to be reachable about ten seconds after starting, not instantly: that is
+  how long Tor takes to publish the service.
+
 - **Android: back up and restore your identity.** "You" now has an Identity
   backup card. Backing up asks for a password, encrypts the key with it, and
   hands the result to the system file picker, so it can go to Drive, OneDrive,

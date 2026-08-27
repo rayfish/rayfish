@@ -3,6 +3,29 @@
 //! Each network has a single pkarr record containing the group blob hash and
 //! seed peer list. Only the coordinator (holder of the per-network secret key)
 //! can publish or update the record.
+//!
+//! ## What still needs this under Tor
+//!
+//! A Tor node needs no discovery to be *reached*: a v3 onion address is an
+//! ed25519 public key and so is an `EndpointId`, so a peer's address is derived
+//! from its identity arithmetically (see [`crate::transport::NodePosture`]).
+//! This module is the other plane, and it does not go away, because a network
+//! key is not a peer. Which entry path a user takes decides whether they touch
+//! it at all:
+//!
+//! - `ray join <invite-code>` needs nothing here. The invite already carries the
+//!   coordinator's `EndpointId`, so its onion address is computed locally and
+//!   dialed. This is the entry path to prefer on a Tor node.
+//! - `ray join <bare-network-key>` needs this. The network key names a network,
+//!   not a peer, so the record is the only thing that supplies the seed peers'
+//!   `EndpointId`s.
+//! - `ray connect <contact-id>` needs this. A contact id is deliberately a
+//!   separate, rotatable key from the transport identity, and the
+//!   `_rayfish_contact` record is what maps one to the other. The onion address
+//!   derives from the *transport* key, so the lookup cannot be skipped.
+//!
+//! That is why a Tor posture still needs a pkarr server, and why the requests to
+//! it go through Tor's SOCKS proxy rather than in the clear: see [`PkarrClient`].
 
 use anyhow::{Context as _, Result, ensure};
 use iroh::{
@@ -10,6 +33,8 @@ use iroh::{
 };
 use iroh_dns::pkarr::SignedPacket;
 use url::Url;
+
+use crate::transport::NodePosture;
 
 const RECORD_NAME: &str = "_rayfish";
 const RECORD_VERSION: &str = "v1";
@@ -49,6 +74,113 @@ pub fn effective_pkarr_url() -> String {
         .unwrap_or_else(|| PKARR_RELAY_URL.to_string())
 }
 
+/// Process-wide node posture, set once at daemon startup, for the same reason
+/// [`PKARR_OVERRIDE`] is: `create_pkarr_client` is called from a dozen places
+/// across the daemon, and threading a value that never changes through all of
+/// them would be noise at every call site to serve one decision made once.
+static POSTURE: std::sync::OnceLock<NodePosture> = std::sync::OnceLock::new();
+
+/// Record the posture before anything publishes or resolves. Called once in
+/// `build_daemon`; a second call is ignored, as with the discovery override.
+pub fn set_posture(posture: NodePosture) {
+    let _ = POSTURE.set(posture);
+}
+
+fn posture() -> NodePosture {
+    POSTURE.get().copied().unwrap_or(NodePosture::Open)
+}
+
+/// Tor's SOCKS5 port. Matches `iroh_tor_transport`'s `DEFAULT_SOCKS_PORT`, which
+/// is what the transport half of a Tor posture already dials through.
+const TOR_SOCKS_PORT: u16 = 9050;
+
+/// How the record plane talks to the pkarr server.
+///
+/// Two variants because the transport posture decides the answer and the two
+/// have nothing in common underneath. iroh's [`PkarrRelayClient`] is built from
+/// a TLS config and a DNS resolver, not from a connector, so there is no proxy
+/// to hand it; reaching a pkarr server through Tor means owning the two HTTP
+/// calls instead. They are small: the pkarr relay API is a `GET` and a `PUT` of
+/// a signed packet at `/<z32-pubkey>`, and `SignedPacket` already has both
+/// payload codecs.
+///
+/// This exists because the record plane is a *separate* client from the
+/// endpoint's transports. Clearing the endpoint's IP transports stops it dialing
+/// peers in the clear, and does nothing at all about this: without the SOCKS
+/// variant, a Tor node would still hit the pkarr server over plain HTTPS from its
+/// real address, every time it published or resolved, which is most of what
+/// private mode exists to prevent.
+pub enum PkarrClient {
+    /// Plain HTTPS, using the endpoint's TLS config and resolver.
+    Direct(PkarrRelayClient),
+    /// Through Tor's SOCKS5 proxy, with remote DNS so the relay's hostname is
+    /// never resolved on this machine either.
+    Socks {
+        http: reqwest::Client,
+        relay_url: Url,
+    },
+}
+
+impl PkarrClient {
+    pub async fn publish(&self, packet: &SignedPacket) -> Result<()> {
+        match self {
+            Self::Direct(c) => c
+                .publish(packet)
+                .await
+                .map_err(|e| anyhow::anyhow!("pkarr publish failed: {e}")),
+            Self::Socks { http, relay_url } => {
+                let url = record_url(relay_url, &packet.public_key().to_z32())?;
+                let resp = http
+                    .put(url)
+                    .body(packet.to_relay_payload())
+                    .send()
+                    .await
+                    .context("pkarr publish over Tor failed")?;
+                ensure!(
+                    resp.status().is_success(),
+                    "pkarr publish over Tor rejected: HTTP {}",
+                    resp.status()
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn resolve(&self, key: EndpointId) -> Result<SignedPacket> {
+        match self {
+            Self::Direct(c) => c
+                .resolve(key)
+                .await
+                .map_err(|e| anyhow::anyhow!("pkarr resolve failed: {e}")),
+            Self::Socks { http, relay_url } => {
+                let url = record_url(relay_url, &key.to_z32())?;
+                let resp = http
+                    .get(url)
+                    .send()
+                    .await
+                    .context("pkarr resolve over Tor failed")?;
+                ensure!(
+                    resp.status().is_success(),
+                    "pkarr resolve over Tor: HTTP {}",
+                    resp.status()
+                );
+                let payload = resp.bytes().await.context("reading pkarr response")?;
+                SignedPacket::from_relay_payload(&key, &payload)
+                    .map_err(|e| anyhow::anyhow!("invalid pkarr payload: {e}"))
+            }
+        }
+    }
+}
+
+/// `{relay}/{z32}`, the one path shape the pkarr relay API has.
+fn record_url(relay_url: &Url, z32: &str) -> Result<Url> {
+    let mut url = relay_url.clone();
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("pkarr relay URL cannot have a path: {relay_url}"))?
+        .push(z32);
+    Ok(url)
+}
+
 /// pkarr record name for a user's contact key (`ray connect`). Published under
 /// the contact key, it maps the contact id to the user's current transport
 /// EndpointId so a peer can dial them without knowing the transport id.
@@ -58,14 +190,45 @@ const CONTACT_RECORD_NAME: &str = "_rayfish_contact";
 // Pkarr client
 // ---------------------------------------------------------------------------
 
-pub fn create_pkarr_client(ep: &Endpoint) -> Result<PkarrRelayClient> {
+/// Build the record-plane client for the posture this daemon started in.
+///
+/// The signature is unchanged from when it returned iroh's client directly, so
+/// the dozen call sites across `daemon/mesh/` and `daemon/` pass it straight
+/// through and none of them had to learn about Tor.
+pub fn create_pkarr_client(ep: &Endpoint) -> Result<PkarrClient> {
+    let relay_url: Url = effective_pkarr_url().parse().expect("relay URL is valid");
+
+    if posture().is_tor_only() {
+        // `socks5h` rather than `socks5`: the `h` is what makes the proxy resolve
+        // the hostname. Without it reqwest would resolve the pkarr server's name
+        // locally first, which is a clearnet DNS query naming the one server this
+        // node talks to, defeating the point of proxying the request that follows.
+        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{TOR_SOCKS_PORT}"))
+            .context("building the Tor SOCKS proxy for pkarr")?;
+        // reqwest is built with `rustls-no-provider`, so `build()` *panics* (it
+        // does not return an error) unless a process-default CryptoProvider is
+        // already installed. In the daemon that panic is fatal: the panic hook
+        // restores DNS and aborts. Install ring first, exactly as
+        // `update::build_http_client` does; `install_default` errors only when one
+        // is already set, which is harmless.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .proxy(proxy)
+            .build()
+            .context("building the pkarr client for Tor")?;
+        return Ok(PkarrClient::Socks { http, relay_url });
+    }
+
     let tls_config = ep.tls_config().clone();
     let dns_resolver: DnsResolver = ep
         .dns_resolver()
         .context("endpoint has no DNS resolver")?
         .clone();
-    let relay_url: Url = effective_pkarr_url().parse().expect("relay URL is valid");
-    Ok(PkarrRelayClient::new(relay_url, tls_config, dns_resolver))
+    Ok(PkarrClient::Direct(PkarrRelayClient::new(
+        relay_url,
+        tls_config,
+        dns_resolver,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +358,7 @@ pub fn decode_contact_record(packet: &SignedPacket) -> Result<EndpointId> {
 // ---------------------------------------------------------------------------
 
 pub async fn publish_network(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
@@ -216,7 +379,7 @@ pub async fn publish_network(
 /// pre-dial compatibility check. Decode the standard fields with
 /// [`decode_network_record`].
 pub async fn resolve_network_packet(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     network_pubkey: EndpointId,
 ) -> Result<SignedPacket> {
     // `{e:#}` rather than `{e}`: the top-level Display of iroh's lookup error is
@@ -235,7 +398,7 @@ pub async fn resolve_network_packet(
 }
 
 pub async fn resolve_network(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     network_pubkey: EndpointId,
 ) -> Result<(blake3::Hash, Vec<EndpointId>)> {
     let packet = resolve_network_packet(client, network_pubkey).await?;
@@ -244,7 +407,7 @@ pub async fn resolve_network(
 
 /// Publish this user's contact record (`contact_key -> current endpoint`).
 pub async fn publish_contact(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     contact_key: &SecretKey,
     endpoint: EndpointId,
 ) -> Result<()> {
@@ -257,7 +420,7 @@ pub async fn publish_contact(
 
 /// Resolve a contact id to the holder's current transport EndpointId.
 pub async fn resolve_contact(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     contact_pubkey: EndpointId,
 ) -> Result<EndpointId> {
     let packet = client
@@ -273,6 +436,37 @@ pub async fn resolve_contact(
 
 #[cfg(test)]
 mod tests {
+
+    /// The SOCKS half of the record plane, against a live Tor daemon and the
+    /// default pkarr server. Ignored by default: it needs `tor` running on
+    /// 127.0.0.1:9050 and it talks to the public network.
+    ///
+    /// Run with: `cargo test -- --ignored pkarr_over_tor`
+    ///
+    /// Asserts we get an *HTTP* answer for a key nobody published, which is the
+    /// distinction that matters: a 404 means the request reached the pkarr server
+    /// through Tor, where a transport error would mean the proxy, the TLS stack
+    /// or the `socks` feature is not doing its job. Resolving a random key
+    /// publishes nothing and leaves no trace on the server.
+    #[tokio::test]
+    #[ignore = "needs a Tor daemon with SocksPort 9050"]
+    async fn pkarr_over_tor_reaches_the_server() {
+        let relay_url: Url = effective_pkarr_url().parse().unwrap();
+        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{TOR_SOCKS_PORT}")).unwrap();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        let client = PkarrClient::Socks { http, relay_url };
+
+        let err = client
+            .resolve(SecretKey::generate().public())
+            .await
+            .expect_err("a key nobody published cannot resolve");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HTTP"),
+            "expected an HTTP status from the server, got a transport failure: {msg}"
+        );
+    }
     use super::*;
     use iroh::SecretKey;
 

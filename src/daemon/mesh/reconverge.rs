@@ -632,7 +632,7 @@ pub(crate) async fn apply_roster_to_dns(
 }
 
 pub(crate) fn spawn_group_poller(
-    client: PkarrRelayClient,
+    client: PkarrClient,
     net_pubkey: EndpointId,
     state: SharedNetworkState,
     endpoint: Endpoint,

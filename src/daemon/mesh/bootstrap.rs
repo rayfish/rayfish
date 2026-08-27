@@ -252,20 +252,33 @@ async fn build_daemon_inner(
         private_mode_servers_ok(&app_config)?;
     }
     let alpns = initial_alpns(&app_config);
-    let use_tor = app_config
-        .networks
-        .iter()
-        .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
-    let ep = transport::create_endpoint_with_alpns(
+    // The node-wide `tor` setting, OR'd with the older per-network
+    // `TransportMode::Tor` so `ray create/join --tor` keeps working. One endpoint
+    // serves every network, so a single network asking for Tor puts the whole node
+    // in it: that was already true before the node-wide setting existed.
+    let use_tor = app_config.tor
+        || app_config
+            .networks
+            .iter()
+            .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
+    let posture = transport::NodePosture::new(app_config.private_mode, use_tor);
+    let bound = transport::create_endpoint_with_alpns(
         key.clone(),
         alpns,
-        use_tor,
+        posture,
         &app_config.relay,
         &app_config.discovery_dns,
         &app_config.dns_upstreams,
     )
     .await?;
+    // `bound` is moved into `Transport` below, which is what discharges the
+    // guard's single job: stay alive as long as the endpoint (see
+    // `transport::TransportGuard`). Everything up to there works off this clone.
+    let ep = bound.endpoint.clone();
     *endpoint_out = Some(ep.clone());
+    // Tell the record plane how it is allowed to reach the pkarr server before
+    // anything publishes or resolves (see `dht::set_posture`).
+    crate::dht::set_posture(posture);
 
     // Built before the blob store below, because the provider event pump that
     // feeds it (a bit further down, once `blobs_proto` exists) needs the
@@ -521,7 +534,7 @@ async fn build_daemon_inner(
     // loose `Daemon` fields below still hold the originals until the daemon
     // god object is dissolved.
     let transport = Arc::new(Transport::new(
-        ep.clone(),
+        bound,
         identity.clone(),
         blob_store.clone(),
         stats.clone(),
@@ -697,6 +710,7 @@ async fn build_daemon_inner(
         dns,
         mdns_enabled,
         private_mode: app_config.private_mode,
+        tor: use_tor,
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),
