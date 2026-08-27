@@ -64,13 +64,13 @@ pub fn label(s: &str) -> String {
 pub fn faint(s: &str) -> String {
     paint("38;5;240", s)
 }
-/// Primary value text, bright and readable.
+/// Primary value text: theme-adaptive default foreground (not bold).
 pub fn value(s: &str) -> String {
-    paint("38;5;252", s)
+    paint("39", s)
 }
-/// Emphasis for names/headlines.
+/// Emphasis for names/headlines: bold default foreground.
 pub fn bold(s: &str) -> String {
-    paint("1;38;5;255", s)
+    paint("1", s)
 }
 /// Warning / loss. red-400-ish.
 pub fn red(s: &str) -> String {
