@@ -822,9 +822,16 @@ pub struct InactiveNetwork {
     /// attempt has failed.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The network as the daemon's config last saved it, so `ray status` can
+    /// show the group, its roster and its join code while the restore retries
+    /// instead of a bare name with nothing under it. Every peer in it reads
+    /// offline: there is no registration yet, so there is no link to any of
+    /// them. `None` from a daemon predating this field.
+    #[serde(default)]
+    pub saved: Option<NetworkStatus>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub name: String,
     pub role: NetworkRole,
@@ -882,7 +889,7 @@ pub enum NetworkRole {
     Direct,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub endpoint_id: EndpointId,
     pub ipv6: Ipv6Addr,
@@ -933,7 +940,7 @@ pub enum PeerState {
     Offline,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub conn_type: ConnType,
     pub remote_addr: Option<String>,

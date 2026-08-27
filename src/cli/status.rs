@@ -404,37 +404,66 @@ fn print_nearby(peers: &[ipc::LanPeerInfo]) {
     );
 }
 
-/// Render one network block: header (name · role · dns · ip · member count),
-/// the aligned peer table, and the shareable join code (suppressed for direct
-/// `ray connect` networks).
+/// Where a network block's contents come from, which is also how much of it can
+/// be believed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// The daemon has the network registered: the peer rows carry real links.
+    Live,
+    /// Saved on disk but not registered, and no restore attempt has failed yet.
+    Connecting,
+    /// Saved on disk but not registered, and the last restore attempt failed.
+    Offline,
+}
+
 /// The block for one saved network the daemon has not registered, ending in a
 /// newline.
 ///
-/// The marker alone reads like a setting rather than a fault. This state is
-/// always a failed restore: the network is saved but the daemon never registered
-/// it, so peers on it are unreachable and their packets are dropped as an unknown
-/// network. Say that, say the daemon is working on it, and give the reason when
-/// the daemon has one, so this doesn't read as something the user has to go fix.
+/// A restore needs the network's signed record and a coordinator that answers,
+/// which after a reboot is a minute of backoff (`restore_member_network`).
+/// Rendering that minute as a bare name over one line of apology hid a group the
+/// config describes in full: its roster, our address on it and its join code are
+/// all on disk. So draw the same block a live network gets, marked `connecting…`
+/// until an attempt has actually failed and `offline` after, with every peer row
+/// offline because nothing on an unregistered network is reachable. The reason,
+/// when the daemon has one, is what the reader would otherwise go find in the log.
 fn inactive_network_block(net: &ipc::InactiveNetwork) -> String {
-    let mut out = format!(
-        "  {}  {}\n",
-        style::faint(&net.name),
-        style::marker("inactive")
-    );
-    out.push_str(&format!(
+    let live = if net.reason.is_some() {
+        Liveness::Offline
+    } else {
+        Liveness::Connecting
+    };
+    // The caption and the reason sit directly under the header, above the roster,
+    // so the group is explained before it is listed.
+    let mut note = format!(
         "    {}\n",
-        style::faint(
-            "saved but not connected: peers on it are unreachable. The daemon keeps retrying."
-        )
-    ));
+        style::faint(match (&net.saved, live) {
+            // Without a roster to show, the caption is the only place the block
+            // can say that nothing on the network is reachable.
+            (None, _) => {
+                "saved but not connected: peers on it are unreachable. The daemon keeps retrying."
+            }
+            (Some(_), Liveness::Offline) => "saved but not connected: the daemon keeps retrying.",
+            (Some(_), _) => "saved roster: syncing with the coordinator.",
+        })
+    );
     if let Some(ref reason) = net.reason {
-        out.push_str(&format!(
+        note.push_str(&format!(
             "    {} {}\n",
             style::label("reason"),
             style::faint(reason)
         ));
     }
-    out
+    match net.saved {
+        Some(ref saved) => network_block(saved, live, Some(&note)),
+        // A daemon predating the saved projection sends the name alone. Say what
+        // little there is rather than drop the group from the listing.
+        None => format!(
+            "  {}  {}\n{note}",
+            style::faint(&net.name),
+            style::marker("inactive"),
+        ),
+    }
 }
 
 /// A network's header block: the name/role/address line, plus the line that says
@@ -443,7 +472,7 @@ fn inactive_network_block(net: &ipc::InactiveNetwork) -> String {
 ///
 /// Built as a string rather than printed so the flags can be tested, the way the
 /// peer rows already are.
-fn network_header(net: &ipc::NetworkStatus) -> String {
+fn network_header(net: &ipc::NetworkStatus, live: Liveness) -> String {
     use std::fmt::Write as _;
 
     let role = net.role.to_string();
@@ -451,7 +480,22 @@ fn network_header(net: &ipc::NetworkStatus) -> String {
     // active + idle (everything not confirmed offline); on-demand nodes hold no
     // connections when idle, so counting only live connections would read "0/N".
     let reachable = net.peers.iter().filter(|p| !p.state.is_offline()).count();
-    let mut out = format!("  {}  {}", style::bold(&net.name), style::marker(&role));
+    // A group drawn from disk is dimmed and says which of the two not-registered
+    // states it is in, so it never reads as a working network with everyone down.
+    let name = match live {
+        Liveness::Live => style::bold(&net.name),
+        _ => style::faint(&net.name),
+    };
+    let mut out = format!("  {}  {}", name, style::marker(&role));
+    match live {
+        Liveness::Live => {}
+        Liveness::Connecting => {
+            let _ = write!(out, "  {}", style::marker("connecting…"));
+        }
+        Liveness::Offline => {
+            let _ = write!(out, "  {}", style::red("offline"));
+        }
+    }
     // Just the hostname: the network name is already the block header, so the
     // `.{network}.ray` suffix would only repeat it.
     if let Some(ref dns) = net.my_hostname {
@@ -459,11 +503,18 @@ fn network_header(net: &ipc::NetworkStatus) -> String {
     }
     let my_addr = net.my_ipv6.to_string();
     let _ = write!(out, "   {}", style::faint(&my_addr));
+    // `reachable/total` is a live reading. On a group with no registration there
+    // is nothing to reach yet, and "0/3" would send the reader looking for three
+    // members that are down rather than one network that has not come up.
+    let members = match live {
+        Liveness::Live => format!("{reachable}/{}", net.peers.len()),
+        _ => net.peers.len().to_string(),
+    };
     let _ = write!(
         out,
         "   {} {}",
         style::label("members"),
-        style::value(&format!("{reachable}/{}", net.peers.len())),
+        style::value(&members),
     );
     if let Some(ttl) = net.ephemeral_ttl_secs {
         let _ = write!(
@@ -503,7 +554,23 @@ fn network_header(net: &ipc::NetworkStatus) -> String {
 
 fn print_network(net: &ipc::NetworkStatus) {
     println!();
-    println!("{}", network_header(net));
+    print!("{}", network_block(net, Liveness::Live, None));
+}
+
+/// Render one network block, ending in a newline: header (name · role · dns · ip
+/// · member count), the aligned peer table, and the shareable join code
+/// (suppressed for direct `ray connect` networks).
+///
+/// Shared by live networks and by the ones still being restored, so a group does
+/// not change shape the moment its coordinator answers. `note`, when given, is a
+/// block of already-indented lines placed between the header and the roster.
+fn network_block(net: &ipc::NetworkStatus, live: Liveness, note: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!("{}\n", network_header(net, live));
+    if let Some(note) = note {
+        out.push_str(note);
+    }
 
     // Invert the local alias map (alias -> identity) for identity -> alias
     // lookups when rendering peers.
@@ -528,12 +595,12 @@ fn print_network(net: &ipc::NetworkStatus) {
     let down_w = counter_width(|c| c.bytes_rx);
     let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w);
     if rows.is_empty() {
-        println!("    {}", style::faint("(no other members)"));
+        let _ = writeln!(out, "    {}", style::faint("(no other members)"));
     } else {
-        // `indent` strips the block's trailing newline, so use `println!` to
-        // terminate the last peer row, otherwise the network's `join <room-id>`
-        // line below gets glued onto it.
-        println!("{}", indent(&layout::columns(&rows, 3), 4));
+        // `indent` strips the block's trailing newline, so terminate the last
+        // peer row here, otherwise the network's `join <room-id>` line below gets
+        // glued onto it.
+        let _ = writeln!(out, "{}", indent(&layout::columns(&rows, 3), 4));
     }
 
     // join code. Direct (`ray connect`) networks have no shareable room id, so
@@ -541,8 +608,9 @@ fn print_network(net: &ipc::NetworkStatus) {
     if let Some(ref key) = net.network_key
         && !net.role.is_direct()
     {
-        println!("    {} {}", style::label("join"), style::rose(key));
+        let _ = writeln!(out, "    {} {}", style::label("join"), style::rose(key));
     }
+    out
 }
 
 /// Resolve a peer's local alias, if any: match its identity (user identity when
@@ -1175,7 +1243,7 @@ mod grouping_tests {
             network: 2,
             ours: 4,
         });
-        let out = network_header(&n);
+        let out = network_header(&n, Liveness::Live);
         assert!(out.contains("incompatible"), "{out}");
         // Both versions, so the reader can tell which side is behind.
         assert!(out.contains("v2"), "{out}");
@@ -1186,7 +1254,10 @@ mod grouping_tests {
     /// The same header on a healthy network carries none of that.
     #[test]
     fn a_compatible_network_header_carries_no_version_flag() {
-        let out = network_header(&net("laptop", vec![peer("srv", None, false, true, false)]));
+        let out = network_header(
+            &net("laptop", vec![peer("srv", None, false, true, false)]),
+            Liveness::Live,
+        );
         assert!(!out.contains("incompatible"), "{out}");
         assert!(!out.contains("ray update"), "{out}");
     }
@@ -1200,6 +1271,7 @@ mod grouping_tests {
         let out = inactive_network_block(&ipc::InactiveNetwork {
             name: "homelab".to_string(),
             reason: Some("runs mesh protocol v2, this build speaks v4".to_string()),
+            saved: None,
         });
         assert!(out.contains("homelab"), "{out}");
         assert!(out.contains("inactive"), "{out}");
@@ -1214,6 +1286,7 @@ mod grouping_tests {
         let out = inactive_network_block(&ipc::InactiveNetwork {
             name: "homelab".to_string(),
             reason: None,
+            saved: None,
         });
         assert!(out.contains("homelab"), "{out}");
         assert!(!out.contains("reason"), "{out}");
@@ -1225,5 +1298,92 @@ mod grouping_tests {
         let net = net("laptop", vec![peer("phone", Some(me), true, true, false)]);
         let out = render(&net);
         assert!(out.contains("1 device, 1 online"), "{out}");
+    }
+
+    /// The roster a saved-but-unregistered network carries: every peer known
+    /// from disk, none of them reachable yet.
+    fn saved_roster(hosts: &[&str]) -> ipc::NetworkStatus {
+        let peers = hosts
+            .iter()
+            .map(|h| ipc::PeerStatus {
+                endpoint_id: iroh::SecretKey::generate().public(),
+                ipv6: "200::2".parse().unwrap(),
+                hostname: Some((*h).to_string()),
+                user_identity: None,
+                is_own_device: false,
+                incompatible: false,
+                connection: None,
+                state: ipc::PeerState::Offline,
+                exit_node: false,
+                exit_in_use: false,
+            })
+            .collect();
+        let mut n = net("laptop", peers);
+        n.name = "homelab".to_string();
+        n.role = ipc::NetworkRole::Member;
+        n.network_key = Some("ray1abcd".to_string());
+        n
+    }
+
+    /// A group the daemon is still restoring has to look like a group, not like
+    /// a one-line apology: the roster is on disk, so the members, our address
+    /// and the join code are all knowable before the coordinator answers.
+    #[test]
+    fn a_connecting_group_lists_its_saved_roster() {
+        let out = inactive_network_block(&ipc::InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: None,
+            saved: Some(saved_roster(&["desktop", "phone"])),
+        });
+        assert!(out.contains("homelab"), "{out}");
+        assert!(out.contains("connecting"), "{out}");
+        assert!(out.contains("desktop") && out.contains("phone"), "{out}");
+        assert!(out.contains("ray1abcd"), "{out}");
+        // Nothing has failed yet, so the header does not claim it has. The peer
+        // rows still read offline: nothing on an unregistered network is
+        // reachable.
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("connecting"), "{out}");
+        assert!(!header.contains("offline"), "{out}");
+        assert!(!out.contains("reason"), "{out}");
+    }
+
+    /// Once a restore attempt has actually failed, "connecting" is a lie: the
+    /// group reads offline and says why.
+    #[test]
+    fn a_group_whose_restore_failed_reads_offline() {
+        let out = inactive_network_block(&ipc::InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: Some("runs mesh protocol v2, this build speaks v4".to_string()),
+            saved: Some(saved_roster(&["desktop"])),
+        });
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("offline"), "{out}");
+        assert!(!header.contains("connecting"), "{out}");
+        assert!(out.contains("runs mesh protocol v2"), "{out}");
+        assert!(out.contains("desktop"), "{out}");
+    }
+
+    /// The member count on a group with no live link is a plain total: the
+    /// live header's `reachable/total` would read `0/3` and invite the reader
+    /// to go looking for the three that are down.
+    #[test]
+    fn a_connecting_group_counts_members_without_a_reachable_split() {
+        let out = network_header(&saved_roster(&["a", "b", "c"]), Liveness::Connecting);
+        assert!(out.contains("members 3"), "{out}");
+        assert!(!out.contains("0/3"), "{out}");
+    }
+
+    /// A daemon predating the saved projection sends no roster. The group still
+    /// has to be named rather than vanish.
+    #[test]
+    fn a_group_from_a_daemon_without_a_saved_roster_still_gets_named() {
+        let out = inactive_network_block(&ipc::InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: None,
+            saved: None,
+        });
+        assert!(out.contains("homelab"), "{out}");
+        assert!(out.contains("inactive"), "{out}");
     }
 }

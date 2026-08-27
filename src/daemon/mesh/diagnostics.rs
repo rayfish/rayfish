@@ -79,6 +79,7 @@ impl Daemon {
                             .restore_errors
                             .get(&n.name)
                             .map(|e| e.value().clone()),
+                        saved: Some(saved_network_status(n, my_id)),
                     })
                     .collect()
             })
@@ -946,6 +947,72 @@ async fn client_gone<S: Hangup>(stream: &S) -> std::io::Result<()> {
     }
 }
 
+/// Project a saved but unregistered network into the `NetworkStatus` shape, so
+/// `ray status` can draw the group from disk while the restore is still dialling
+/// its coordinator.
+///
+/// Restoring a membership needs the network's signed pkarr record, and that can
+/// take a minute of backoff after a reboot (`restore_member_network`). Until it
+/// lands the network is not in the registry, and status used to render it as a
+/// bare name over one line of apology: no address, no members, no join code,
+/// even though the config on disk holds all three. The projection is the
+/// `members` list as last saved, which is deliberately lossy compared with the
+/// signed blob, so nothing here is presented as live: every peer carries no
+/// connection and reads `Offline`, and pairing is left unresolved (the
+/// device/user map is filled by applying a verified roster, which has not
+/// happened yet).
+pub(crate) fn saved_network_status(
+    net: &config::NetworkConfig,
+    my_id: EndpointId,
+) -> NetworkStatus {
+    // Same order the registered path decides in: a `ray connect` link is
+    // `direct` whatever else it is, then holding the network secret key is what
+    // makes this node the coordinator.
+    let role = if net.direct {
+        NetworkRole::Direct
+    } else if net.network_secret_key.is_some() {
+        NetworkRole::Coordinator
+    } else {
+        NetworkRole::Member
+    };
+    let peers = net
+        .members
+        .iter()
+        .filter(|m| m.identity != my_id)
+        .map(|m| PeerStatus {
+            endpoint_id: m.identity,
+            ipv6: derive_ipv6(&m.identity),
+            hostname: m.hostname.clone(),
+            user_identity: None,
+            is_own_device: false,
+            incompatible: false,
+            connection: None,
+            // Not `Idle`: idle means "no link, but nothing says it failed", which
+            // is the optimistic default for a *registered* network. Nothing on
+            // this one is reachable at all until the restore lands.
+            state: PeerState::Offline,
+            exit_node: false,
+            exit_in_use: false,
+        })
+        .collect();
+    NetworkStatus {
+        name: net.name.clone(),
+        role,
+        my_ipv6: derive_ipv6(&my_id),
+        my_hostname: net.my_hostname.clone(),
+        network_key: net.network_public_key.map(|k| k.to_string()),
+        member_count: net.members.len(),
+        peers,
+        pending_suggestions: 0,
+        pending_requests: 0,
+        aliases: net.aliases.clone(),
+        ephemeral_ttl_secs: net.ephemeral_ttl_secs,
+        my_exit_node: None,
+        exit_offering: false,
+        incompatible: None,
+    }
+}
+
 #[cfg(test)]
 mod log_tests {
     use super::*;
@@ -1202,5 +1269,73 @@ mod log_stream_tests {
                 .is_none()
         );
         task.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod saved_network_tests {
+    use super::*;
+
+    fn member(id: EndpointId, host: &str, coordinator: bool) -> config::MemberEntry {
+        config::MemberEntry {
+            identity: id,
+            is_coordinator: coordinator,
+            hostname: Some(host.to_string()),
+        }
+    }
+
+    /// The roster on disk is the whole point of the projection: a group the
+    /// daemon has not registered yet still knows who is on it, and every one of
+    /// them is unreachable until the restore lands.
+    #[test]
+    fn projects_the_saved_roster_with_every_peer_offline() {
+        let me = iroh::SecretKey::generate().public();
+        let them = iroh::SecretKey::generate().public();
+        let cfg = config::NetworkConfig {
+            name: "homelab".to_string(),
+            my_hostname: Some("laptop".to_string()),
+            members: vec![member(me, "laptop", false), member(them, "desktop", true)],
+            ..Default::default()
+        };
+
+        let status = saved_network_status(&cfg, me);
+
+        assert_eq!(status.name, "homelab");
+        assert_eq!(status.my_ipv6, derive_ipv6(&me));
+        // Self is not a peer of itself.
+        assert_eq!(status.peers.len(), 1);
+        let peer = &status.peers[0];
+        assert_eq!(peer.endpoint_id, them);
+        assert_eq!(peer.hostname.as_deref(), Some("desktop"));
+        assert_eq!(peer.ipv6, derive_ipv6(&them));
+        assert!(peer.connection.is_none());
+        assert!(peer.state.is_offline());
+    }
+
+    /// Holding the network secret key is what makes this node the coordinator,
+    /// and the header says so before any coordinator has been reached.
+    #[test]
+    fn a_key_holder_projects_as_the_coordinator() {
+        let me = iroh::SecretKey::generate().public();
+        let cfg = config::NetworkConfig {
+            name: "homelab".to_string(),
+            network_secret_key: Some(iroh::SecretKey::generate()),
+            ..Default::default()
+        };
+        assert!(saved_network_status(&cfg, me).role.is_coordinator());
+    }
+
+    /// A `ray connect` link is tagged `direct` wherever it renders, including
+    /// here, so its (non-shareable) room id stays suppressed.
+    #[test]
+    fn a_direct_link_projects_as_direct() {
+        let me = iroh::SecretKey::generate().public();
+        let cfg = config::NetworkConfig {
+            name: "peer".to_string(),
+            direct: true,
+            network_secret_key: Some(iroh::SecretKey::generate()),
+            ..Default::default()
+        };
+        assert!(saved_network_status(&cfg, me).role.is_direct());
     }
 }

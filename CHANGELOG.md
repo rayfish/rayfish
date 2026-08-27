@@ -31,6 +31,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ray status` shows a group before its coordinator answers.** Restoring a
+  saved network needs its signed record and a coordinator that replies, which
+  after a reboot is up to a minute of backoff. Until then the group rendered as
+  a bare name and one line of apology, with no address, no members and no join
+  code, even though all three sit in the config on disk. It now draws the same
+  block a connected group gets, built from the saved roster and marked
+  `connecting…`, or `offline` with the reason once an attempt has actually
+  failed. Every peer on it reads offline until the roster is confirmed.
+
 - **`ray firewall ssh show` says a node cannot SSH to itself.** Connecting to
   your own mesh address from the box it belongs to is refused: the kernel
   delivers self-traffic over loopback, so it never reaches the mesh SSH server,
