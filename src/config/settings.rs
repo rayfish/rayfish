@@ -36,7 +36,9 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
     let entries = super::parse_entries(value);
     let reset = entries.is_empty() || entries == ["n0"];
     match key {
-        GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
+        GlobalKey::Mdns => {
+            cfg.mdns_enabled = private_mode_forbids(cfg, value, key)?;
+        }
         // Validated here rather than in the CLI arm so every caller is bound by
         // it, including `ray config set private on`. Private mode's whole claim
         // is that this node contacts no infrastructure it was not given, and a
@@ -49,19 +51,8 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             }
             cfg.private_mode = on;
         }
-        // Refused rather than stored-and-ignored: private mode never spawns the
-        // update checker (it would reach GitHub from the real address), so
-        // accepting the write would leave `ray config get` claiming something
-        // untrue.
         GlobalKey::AutoUpdate => {
-            let on = parse_bool(value, false)?;
-            if on && cfg.private_mode {
-                bail!(
-                    "auto-update reaches GitHub directly, which private mode does not allow\n    \
-                     leave private mode first: ray up --no-private"
-                );
-            }
-            cfg.auto_update = on;
+            cfg.auto_update = private_mode_forbids(cfg, value, key)?;
         }
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
@@ -137,6 +128,36 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         }
     }
     Ok(())
+}
+
+/// Parse an on/off value for a setting private mode does not permit, refusing
+/// `on` while private rather than storing it.
+///
+/// Both settings this guards (`mdns`, `auto-update`) reach past the servers
+/// private mode confines the node to: one announces the node's identity to every
+/// device on the LAN, the other fetches releases from GitHub. The daemon already
+/// declines to act on either while private (see `mesh::bootstrap::build_daemon`),
+/// so accepting the write would leave `ray config get` reporting an `on` that
+/// nothing honours. Turning one *off* is always allowed, since that is the state
+/// private mode wants anyway.
+///
+/// Note this deliberately does not reach back through `ray up --no-private`:
+/// leaving private mode restores whatever these were set to before, because they
+/// were never overwritten, only refused.
+fn private_mode_forbids(cfg: &AppConfig, value: &str, key: GlobalKey) -> Result<bool> {
+    // The two differ in what an empty value (a reset) means: `mdns` defaults on,
+    // `auto-update` off. So `ray config unset mdns` while private is refused too,
+    // which is the point rather than an edge case: there must be no spelling of
+    // "turn mDNS on" that a private node accepts and then ignores.
+    let default = matches!(key, GlobalKey::Mdns);
+    let on = parse_bool(value, default)?;
+    if on && cfg.private_mode {
+        bail!(
+            "{key} reaches past the servers private mode confines this node to\n    \
+             leave private mode first: ray up --no-private"
+        );
+    }
+    Ok(on)
 }
 
 /// Whether `o` names servers of the operator's own, to the exclusion of the
@@ -400,21 +421,35 @@ mod tests {
         assert!(cfg.relay.is_unset());
     }
 
-    /// Refused rather than stored-and-ignored: the daemon never spawns the update
-    /// checker while private, so accepting the write would leave `ray config get`
-    /// reporting something that is not true.
+    /// Refused rather than stored-and-ignored: the daemon acts on neither while
+    /// private, so accepting the write would leave `ray config get` reporting
+    /// something nothing honours.
     #[test]
-    fn auto_update_is_refused_while_private() {
+    fn mdns_and_auto_update_are_refused_while_private() {
         let mut cfg = private_cfg();
-        let err = apply_global(&mut cfg, GlobalKey::AutoUpdate, "on", false).unwrap_err();
-        assert!(err.to_string().contains("private mode"), "{err}");
+
+        for key in [GlobalKey::Mdns, GlobalKey::AutoUpdate] {
+            let err = apply_global(&mut cfg, key, "on", false).unwrap_err();
+            assert!(err.to_string().contains("private mode"), "{key}: {err}");
+        }
         assert!(!cfg.auto_update);
 
-        // Off is always allowed, and on comes back once private mode is off.
-        apply_global(&mut cfg, GlobalKey::AutoUpdate, "off", false).unwrap();
+        // Reset is refused too where the default is `on`. There must be no
+        // spelling of "turn mDNS on" that a private node takes and then ignores.
+        let err = apply_global(&mut cfg, GlobalKey::Mdns, "", false).unwrap_err();
+        assert!(err.to_string().contains("private mode"), "{err}");
+
+        // Off is always allowed: it is the state private mode wants anyway.
+        apply_global(&mut cfg, GlobalKey::Mdns, "off", false).unwrap();
+        assert!(!cfg.mdns_enabled);
+
+        // And both come back once private mode is off, from whatever they were
+        // left at: a refused write never overwrote anything.
         apply_global(&mut cfg, GlobalKey::Private, "off", false).unwrap();
         apply_global(&mut cfg, GlobalKey::AutoUpdate, "on", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::Mdns, "", false).unwrap();
         assert!(cfg.auto_update);
+        assert!(cfg.mdns_enabled, "reset restores the default once allowed");
     }
 
     /// A config already in private mode with both servers set: the starting point
