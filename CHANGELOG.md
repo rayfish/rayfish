@@ -61,6 +61,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ssh localhost`, instead of leaving a bare "connection refused" to explain
   itself.
 
+### Fixed
+
+- **CLI text stays readable on light terminals.** Value and headline text was
+  hard-coded to near-white grays that vanish on a light background. Both now
+  use the terminal's default foreground, which adapts to the theme (headlines
+  also stay bold), so `ray status`, tables and invite codes stay legible on
+  light and dark terminals alike — without bold body text.
+
 ### Security
 
 - **Android no longer sends your keys to Google's backup.** The app allowed
