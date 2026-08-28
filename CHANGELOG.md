@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ray files reject <id>`.** Turn down an incoming file offer instead of
+  leaving it sitting in the queue. The offer is dropped without being fetched;
+  the sender is not told, so it is the same as never picking it up. The
+  Android app has had a Reject button on the offer notification for a while,
+  and the CLI now matches it.
+
 - **Windows on ARM64.** Releases and nightlies now publish
   `ray-windows-aarch64.exe`, so Snapdragon and other ARM laptops get a native
   binary instead of running the x86_64 one under emulation. CI builds the

@@ -1391,6 +1391,7 @@ impl Daemon {
             IpcMessage::AcceptFile { id, output } => {
                 self.files.accept_file(id, output, peer_cred).await
             }
+            IpcMessage::RejectFile { id } => self.files.reject_file(id),
             IpcMessage::StartPairing => self.start_pairing(),
             IpcMessage::PairWithDevice {
                 endpoint_id,

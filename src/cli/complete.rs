@@ -193,7 +193,7 @@ pub(crate) fn invite_ids() -> ArgValueCompleter {
     })
 }
 
-/// Incoming transfers awaiting a decision, for `ray files accept <id>`.
+/// Incoming transfers awaiting a decision, for `ray files accept|reject <id>`.
 pub(crate) fn incoming_files() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| {
         let (files, _) = file_queues();
@@ -1051,7 +1051,7 @@ mod tests {
     /// is not something the model records.
     #[test]
     fn every_id_read_off_a_listing_has_a_completer() {
-        let expected: [(&[&str], &str); 9] = [
+        let expected: [(&[&str], &str); 10] = [
             (&["requests", "accept"], "id"),
             (&["requests", "deny"], "id"),
             (&["accept"], "id"),
@@ -1059,6 +1059,7 @@ mod tests {
             (&["connect", "approve"], "id"),
             (&["invite", "revoke"], "id"),
             (&["files", "accept"], "id"),
+            (&["files", "reject"], "id"),
             (&["files", "cancel"], "id"),
             (&["firewall", "remove"], "index"),
         ];
