@@ -46,7 +46,7 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         GlobalKey::Private => {
             let on = parse_bool(value, false)?;
             if on {
-                private_servers_or_bail(cfg, cfg.tor)?;
+                private_servers_or_bail(cfg, cfg.uses_tor())?;
             }
             cfg.private_mode = on;
         }
@@ -56,7 +56,16 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         // to: the alternative is a node that silently has no way to reach anyone.
         GlobalKey::Tor => {
             let on = parse_bool(value, false)?;
-            if cfg.private_mode && !on {
+            // What the posture becomes, not what was asked for: a network still
+            // carrying the per-network flag keeps the node on Tor whatever this
+            // setting says, and demanding a relay it will not use would refuse a
+            // write for a requirement that is not real.
+            let still_tor = AppConfig {
+                tor: on,
+                ..cfg.clone()
+            }
+            .uses_tor();
+            if cfg.private_mode && !still_tor {
                 private_servers_or_bail(cfg, false)?;
             }
             cfg.tor = on;
@@ -107,7 +116,7 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             let next = server_override(entries, reset, replace, super::RELAY_PRESET_RAYFISH)?;
             // Not guarded under Tor: the relay is unused there, so clearing it
             // takes nothing away.
-            if cfg.private_mode && !cfg.tor {
+            if cfg.private_mode && !cfg.uses_tor() {
                 own_servers_or_bail(&next, "relay")?;
             }
             cfg.relay = next;
@@ -167,6 +176,16 @@ fn private_mode_forbids(cfg: &AppConfig, value: &str, key: GlobalKey) -> Result<
         bail!(
             "{key} reaches past the servers private mode confines this node to\n    \
              leave private mode first: ray up --no-private"
+        );
+    }
+    // Tor refuses them for its own reason, and a harder one: this node's id is
+    // its onion address, so an mDNS packet would tie that onion to the LAN it
+    // was sent from, and the update checker would call GitHub from the address
+    // the circuits exist to hide.
+    if on && cfg.uses_tor() {
+        bail!(
+            "{key} would reach past Tor, from this node's real address\n    \
+             leave tor mode first: ray up --no-tor"
         );
     }
     Ok(on)

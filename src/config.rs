@@ -586,6 +586,23 @@ impl AppConfig {
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_secs(self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS))
     }
+
+    /// Whether this node runs on Tor: the node-wide `tor` setting, or any single
+    /// network still carrying the older per-network `TransportMode::Tor` so
+    /// `ray create/join --tor` keeps working.
+    ///
+    /// One endpoint serves every network, so a single network asking for Tor
+    /// puts the whole node in it. Everything that reasons about the posture asks
+    /// here rather than reading `tor` directly, because the two answers differ
+    /// and disagreeing about which one is the posture is how a node ends up
+    /// accepting a setting it will then ignore.
+    pub fn uses_tor(&self) -> bool {
+        self.tor
+            || self
+                .networks
+                .iter()
+                .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()))
+    }
 }
 
 /// Return this node's contact key, generating and persisting it on first use.

@@ -85,6 +85,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--tor` on a network now puts the whole node on Tor only.** `ray create
+  --tor` and `ray join --tor` used to add the Tor transport alongside the normal
+  one, leaving the node reachable both ways and still publishing its addresses.
+  A node with one such network is now Tor-only, like `ray up --tor`: no UDP
+  socket, no relay, nothing published, and reachable only by peers that also
+  speak Tor. One endpoint serves every network, so this was never a per-network
+  choice in the first place; it is now the same choice everywhere. There is no
+  setting that changes it afterwards: the flag is fixed when the network is
+  created or joined, so getting the old behaviour back means leaving the network
+  and rejoining it without `--tor`.
+
 - **`ray status` shows a group before its coordinator answers.** Restoring a
   saved network needs its signed record and a coordinator that replies, which
   after a reboot is up to a minute of backoff. Until then the group rendered as
