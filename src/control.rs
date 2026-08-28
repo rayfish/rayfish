@@ -3,7 +3,7 @@
 //! Each message is encoded as a 4-byte big-endian length prefix followed by a msgpack body.
 //! Control messages manage membership (join, approve, sync) and mesh topology (hello, reconnect).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
@@ -118,6 +118,12 @@ pub enum ConnectMsg {
 }
 
 /// Control messages exchanged between peers over QUIC bidirectional streams.
+/// `serde(default)` for a `bool` field that means "yes" when an older peer's
+/// shorter array leaves it out.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
     /// Sent by a joining peer as the first message on an initial (non-reconnect)
@@ -131,6 +137,12 @@ pub enum ControlMsg {
         hostname: Option<String>,
         #[serde(default)]
         device_cert: Option<DeviceCert>,
+        /// Roles the joiner *asks* for (`ray join --role sentry`). A request,
+        /// not a claim: the coordinator only grants what the redeemed key
+        /// already permits, and denies the join outright if this asks for
+        /// anything outside it. Empty means "whatever the key carries".
+        #[serde(default)]
+        roles: BTreeSet<String>,
     },
     /// Coordinator response telling the joiner it has been queued for live
     /// approval (closed network, no invite). The joiner retries until accepted.
@@ -140,6 +152,14 @@ pub enum ControlMsg {
     },
     JoinDenied {
         reason: String,
+        /// Whether trying again could ever produce a different answer. A
+        /// coordinator-side hiccup (a direct grant it cannot reproduce yet, a
+        /// roster commit that did not land) is retryable; a refused `--role` is
+        /// not, and the joiner's pending-join loop would otherwise reask on a
+        /// backoff forever with nothing surfacing the deadlock. Defaults to
+        /// `true` so a shorter array from an older peer keeps the old behaviour.
+        #[serde(default = "default_true")]
+        retryable: bool,
     },
     /// Notify connected members that the roster/blob changed. Payload-free: it
     /// is a *trigger only*. Receivers reconverge from the network-key-signed
@@ -169,6 +189,11 @@ pub enum ControlMsg {
         hostname: Option<String>,
         #[serde(default)]
         device_cert: Option<DeviceCert>,
+        /// Roles the coordinator assigned. Unlike the request side on
+        /// [`Self::JoinRequest`] this is the authoritative grant, so members
+        /// resolving a `role:` firewall key agree on who holds what.
+        #[serde(default)]
+        roles: BTreeSet<String>,
     },
     Welcome {
         members: Vec<Member>,
@@ -241,10 +266,20 @@ pub enum ControlMsg {
     },
     /// Coordinator → coordinators: share a minted single-use invite's hash so any
     /// coordinator can redeem it. Carries the hash only, never the secret.
+    ///
+    /// `roles` travels with it because it is part of what the invite grants, and
+    /// the ledger entry a co-coordinator writes from this message is the only
+    /// thing it has to redeem against: without them a role-bearing code redeemed
+    /// through any coordinator but its minter seats the node with no roles at
+    /// all, and its `role:` rules never materialize. (The invite's authoritative
+    /// hostname does not travel yet, so that half still falls back to the
+    /// joiner's own claim on a co-coordinator.)
     InviteShare {
         id: String,
         secret_hash: Vec<u8>,
         expires: u64,
+        #[serde(default)]
+        roles: BTreeSet<String>,
     },
     /// Coordinator → coordinators: a shared single-use invite was redeemed; burn it.
     InviteUsed {
@@ -576,6 +611,7 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: Default::default(),
             }],
         };
         let bytes = encode_msg(None, &msg);
@@ -725,6 +761,7 @@ mod tests {
             invite_secret: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             hostname: Some("alice".to_string()),
             device_cert: None,
+            roles: Default::default(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -737,6 +774,7 @@ mod tests {
             invite_secret: None,
             hostname: None,
             device_cert: None,
+            roles: Default::default(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -779,6 +817,7 @@ mod tests {
     fn test_roundtrip_join_denied() {
         let msg = ControlMsg::JoinDenied {
             reason: "not authorized".to_string(),
+            retryable: false,
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -799,6 +838,7 @@ mod tests {
             identity: test_id(1),
             hostname: None,
             device_cert: None,
+            roles: Default::default(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -818,12 +858,14 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: Default::default(),
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                roles: Default::default(),
             }],
             direct_key: Some([7u8; 32]),
             direct_record: Some(vec![1, 2, 3]),
@@ -963,6 +1005,7 @@ mod tests {
                 id: "ab3f".into(),
                 secret_hash: vec![1, 2, 3],
                 expires: 42,
+                roles: ["sentry".to_string()].into(),
             },
             ControlMsg::InviteUsed {
                 secret_hash: vec![4, 5, 6],

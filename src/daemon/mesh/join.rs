@@ -22,6 +22,28 @@ pub(crate) enum JoinResult {
     Pending,
 }
 
+/// A refusal the joiner cannot retry its way out of: the coordinator answered
+/// `JoinDenied` with `retryable: false`, which today means a `--role` neither
+/// the presented credential nor the operator's approval carries.
+///
+/// Carried as a concrete error so it survives the `context` layers between the
+/// handshake and the pending-join retry loop, which downcasts for it. Without
+/// that the loop cannot tell "the coordinator is busy, ask again" from "the
+/// answer is no", and reasks on a backoff forever while the CLI has long since
+/// printed "waiting for coordinator approval".
+#[derive(Debug)]
+pub(crate) struct JoinRefused {
+    pub(crate) reason: String,
+}
+
+impl std::fmt::Display for JoinRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "join denied: {}", self.reason)
+    }
+}
+
+impl std::error::Error for JoinRefused {}
+
 /// Outcome of one `join_network_inner` attempt. The reply is boxed because
 /// `IpcMessage` is far larger than the `Pending` case, and this enum is returned
 /// through the whole join/retry path.
@@ -115,6 +137,9 @@ pub(crate) struct JoinParams {
     /// (`--auto-accept-files`). Persisted config wins on reconnect/restore; this
     /// is only the first-join seed.
     pub(crate) auto_accept_files: bool,
+    /// Roles this join asks for. Forwarded in the `JoinRequest` and granted only
+    /// where the presented credential already permits them.
+    pub(crate) requested_roles: BTreeSet<String>,
     /// Fresh join (send `JoinRequest` first) vs reconnect/restore (coordinator
     /// speaks first).
     pub(crate) initial: bool,
@@ -158,6 +183,7 @@ pub(crate) async fn join_mesh_shared(
         group_blob,
         auto_accept_firewall,
         auto_accept_files,
+        requested_roles,
         initial,
     } = params;
     let my_identity = identity.local_identity();
@@ -175,6 +201,7 @@ pub(crate) async fn join_mesh_shared(
             invite_secret,
             &my_hostname,
             &device_cert,
+            &requested_roles,
             &group_blob,
         )
         .await?
@@ -544,6 +571,7 @@ async fn perform_join_handshake(
     invite_secret: Option<Vec<u8>>,
     my_hostname: &Option<String>,
     device_cert: &Option<control::DeviceCert>,
+    requested_roles: &BTreeSet<String>,
     fallback_blob: &crate::membership::GroupBlob,
 ) -> Result<HandshakeOutcome> {
     if initial {
@@ -558,6 +586,7 @@ async fn perform_join_handshake(
                 invite_secret,
                 hostname: my_hostname.clone(),
                 device_cert: device_cert.clone(),
+                roles: requested_roles.clone(),
             },
         )
         .await
@@ -596,7 +625,12 @@ async fn perform_join_handshake(
                 tracing::info!(network = %network_name, "join pending operator approval");
                 Ok(HandshakeOutcome::Pending)
             }
-            ControlMsg::JoinDenied { reason } => anyhow::bail!("join denied: {reason}"),
+            ControlMsg::JoinDenied { reason, retryable } => {
+                if retryable {
+                    anyhow::bail!("join denied: {reason}");
+                }
+                Err(JoinRefused { reason }.into())
+            }
             other => anyhow::bail!("expected Welcome or JoinPending, got {other:?}"),
         }
     } else {
@@ -775,6 +809,7 @@ mod persist_config_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 

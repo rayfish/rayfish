@@ -81,6 +81,9 @@ fn materialize_coordinator_roster(
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            // Roles are assigned to joiners by a coordinator; the coordinator
+            // seating itself has none to assign.
+            roles: BTreeSet::new(),
         }),
     }
     RestoredRoster {
@@ -561,11 +564,14 @@ impl NetworkRegistry {
                 .join_network_inner(
                     &net_pubkey,
                     Some(&name),
-                    persisted_hostname.clone(),
-                    None,
-                    None,
-                    auto_accept_firewall,
-                    auto_accept_files,
+                    JoinOptions {
+                        hostname: persisted_hostname.clone(),
+                        auto_accept_firewall,
+                        auto_accept_files,
+                        // A restore is already a member; its roles are in the
+                        // roster, so there is nothing to ask for.
+                        ..Default::default()
+                    },
                     false,
                 )
                 .await
@@ -896,10 +902,22 @@ impl NetworkRegistry {
             let me = Arc::clone(self);
             let key = pending.network_key.clone();
             let name = pending.name.clone();
+            // Resume the request the user actually made. Roles are policy: a
+            // node that came back asking for nothing could be seated without the
+            // class it was provisioned for, and the rules keyed on that role
+            // would never reach it.
+            let opts = JoinOptions {
+                roles: pending.roles.clone(),
+                ..JoinOptions::default()
+            };
             tokio::spawn(async move {
-                let _ = me
-                    .join_network(&key, name.as_deref(), None, None, None, false, false)
-                    .await;
+                // Nobody is holding an IPC stream for this one, so the reply has
+                // nowhere to go but the log.
+                if let IpcMessage::Error { message } =
+                    me.join_network(&key, name.as_deref(), opts).await
+                {
+                    tracing::warn!(net = %key, error = %message, "resumed join request failed");
+                }
             });
         }
 
@@ -1724,6 +1742,7 @@ mod coordinator_restore_tests {
             last_seen: Some(42),
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 
@@ -1787,12 +1806,14 @@ mod coordinator_restore_tests {
         let me = id(1);
         let approved_id = id(2);
         let nullified = id(3);
-        let (key_hash, key) = crate::membership::ReusableKey::from_secret(b"key", 10, 20);
+        let (key_hash, key) =
+            crate::membership::ReusableKey::from_secret(b"key", 10, 20, Default::default());
         let approved = ApprovedEntry {
             identity: approved_id,
             hostname: Some("waiting".to_string()),
             user_identity: None,
             device_cert: None,
+            roles: Default::default(),
         };
         let mut source = blob(vec![member(me, true)]);
         source.approved.push(approved.clone());

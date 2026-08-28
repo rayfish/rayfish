@@ -11,10 +11,11 @@ impl Daemon {
         network: &str,
         expires_secs: u64,
         hostname: Option<String>,
+        roles: Vec<String>,
         reusable: bool,
     ) -> IpcMessage {
         self.registry
-            .invite_create(network, expires_secs, hostname, reusable)
+            .invite_create(network, expires_secs, hostname, roles, reusable)
             .await
     }
 
@@ -22,8 +23,15 @@ impl Daemon {
         self.registry.list_requests(network)
     }
 
-    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
-        self.registry.accept_request(network, id_prefix).await
+    pub async fn accept_request(
+        &self,
+        network: &str,
+        id_prefix: &str,
+        roles: Vec<String>,
+    ) -> IpcMessage {
+        self.registry
+            .accept_request(network, id_prefix, roles)
+            .await
     }
 
     pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
@@ -38,21 +46,33 @@ impl NetworkRegistry {
         network: &str,
         expires_secs: u64,
         hostname: Option<String>,
+        roles: Vec<String>,
         reusable: bool,
     ) -> IpcMessage {
+        // Validated here, on the authority side: the daemon assigns roles, so it
+        // is the daemon that decides what a role may look like.
+        let roles = match crate::roles::normalize(&roles) {
+            Ok(roles) => roles,
+            Err(e) => return ipc_err(format!("{e:#}")),
+        };
         if reusable {
             return self
-                .reusable_key_create(network, expires_secs, hostname)
+                .reusable_key_create(network, expires_secs, hostname, roles)
                 .await;
         }
         let (net_pubkey, lock) = match self.coordinator_handle(network) {
             Ok(v) => v,
             Err(e) => return e,
         };
+        // Kept for the reply and the gossip below: the grant consumes the set.
+        let minted_roles = roles.clone();
         let minted = {
             let _guard = lock.lock().await;
             match crate::invite::InviteStore::load(network) {
-                Ok(mut store) => store.mint(Duration::from_secs(expires_secs), hostname),
+                Ok(mut store) => store.mint(
+                    Duration::from_secs(expires_secs),
+                    crate::invite::Grant { hostname, roles },
+                ),
                 Err(e) => Err(e),
             }
         };
@@ -92,6 +112,7 @@ impl NetworkRegistry {
                             id: id.clone(),
                             secret_hash: secret_hash.into_bytes(),
                             expires,
+                            roles: minted_roles.clone(),
                         },
                     )
                     .await;
@@ -100,6 +121,7 @@ impl NetworkRegistry {
                     code,
                     id,
                     expires_secs,
+                    roles: minted_roles.into_iter().collect(),
                 }
             }
             Err(e) => ipc_err(format!("failed to mint invite: {e:#}")),
@@ -109,17 +131,24 @@ impl NetworkRegistry {
     /// Mint a reusable join key: insert its hash into the signed blob and
     /// republish, so any network-key holder can admit. Authority is holding the
     /// network secret key (like firewall suggestions), not the `is_coordinator`
-    /// flag. A reusable key cannot bind an authoritative hostname.
+    /// flag.
+    ///
+    /// A reusable key cannot bind an authoritative hostname but **can** bind
+    /// roles, and the asymmetry is the point: a hostname is unique per node, so
+    /// a key admitting many machines cannot assign one, while a role is
+    /// deliberately shared by a whole class. That is what lets a single key sit
+    /// in a Terraform user-data block and seat an autoscaling group as sentries.
     pub(crate) async fn reusable_key_create(
         &self,
         network: &str,
         expires_secs: u64,
         hostname: Option<String>,
+        roles: BTreeSet<String>,
     ) -> IpcMessage {
         if hostname.is_some() {
             return ipc_err(
                 "a reusable key cannot bind a hostname (a multi-use key admits many \
-                          machines); drop --hostname or omit --reusable"
+                          machines); drop --hostname, or use --role to tag them all"
                     .to_string(),
             );
         }
@@ -143,8 +172,9 @@ impl NetworkRegistry {
             );
         }
         let secret = crate::invite::generate_secret();
+        let roles_out: Vec<String> = roles.iter().cloned().collect();
         let (hash, key) =
-            crate::membership::ReusableKey::from_secret(&secret, now_secs(), expires_secs);
+            crate::membership::ReusableKey::from_secret(&secret, now_secs(), expires_secs, roles);
         let id = key.id.clone();
         {
             let mut s = state.write().unwrap();
@@ -157,6 +187,7 @@ impl NetworkRegistry {
             code,
             id,
             expires_secs,
+            roles: roles_out,
         }
     }
 
@@ -284,17 +315,36 @@ impl NetworkRegistry {
                 short_id: id.fmt_short().to_string(),
                 hostname: pj.hostname.clone(),
                 waiting_secs: pj.requested_at.elapsed().as_secs(),
+                requested_roles: pj.requested_roles.iter().cloned().collect(),
             })
             .collect();
         IpcMessage::PendingRequests { requests }
     }
 
-    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+    pub async fn accept_request(
+        &self,
+        network: &str,
+        id_prefix: &str,
+        roles: Vec<String>,
+    ) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
-        // Find and remove the pending request matching the short id prefix.
-        let pending = {
+        // A live approval has no credential to read roles off, so the operator
+        // supplies them: `ray accept <peer> --role sentry`.
+        let granted = match crate::roles::normalize(&roles) {
+            Ok(roles) => roles,
+            Err(e) => return ipc_err(format!("{e:#}")),
+        };
+        // Find the pending request matching the short id prefix, and take it only
+        // if this accept grants every role it asked for. The peer's `--role` is a
+        // request and this approval is the grant, so accepting without those roles
+        // leaves the peer refused for good: its next attempt takes the approved
+        // branch, `roles::grant` fails there, and the denial is final. Removing the
+        // entry first would delete the request the operator has to re-accept along
+        // with it, leaving no way back but a manual `ray join` on the peer itself,
+        // so refuse while the request is still queued and the peer still retrying.
+        let taken = {
             let Some(handle) = self.networks.get(network) else {
                 return ipc_err(format!("network '{network}' not active"));
             };
@@ -307,9 +357,32 @@ impl NetworkRegistry {
                         || k.to_string().starts_with(id_prefix)
                 })
                 .copied();
-            found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
+            match found {
+                Some(id) => {
+                    let unmet: Vec<String> = s
+                        .pending
+                        .get(&id)
+                        .map(|pj| pj.requested_roles.difference(&granted).cloned().collect())
+                        .unwrap_or_default();
+                    match unmet.as_slice() {
+                        [] => s.pending.remove(&id).map(|pj| (id, pj)),
+                        _ => {
+                            return ipc_err(format!(
+                                "{short} asked for {unmet}, which this accept does not grant; \
+                                 it would be refused for good. Accept it with `ray requests \
+                                 {network} accept {short} --role {flags}`, or turn it away with \
+                                 `ray requests {network} deny {short}`",
+                                short = id.fmt_short(),
+                                unmet = unmet.join(", "),
+                                flags = unmet.join(" --role "),
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            }
         };
-        let Some((identity, pj)) = pending else {
+        let Some((identity, pj)) = taken else {
             return ipc_err(format!("no pending request matching '{id_prefix}'"));
         };
 
@@ -325,6 +398,7 @@ impl NetworkRegistry {
                 hostname: pj.hostname.clone(),
                 user_identity: user_id,
                 device_cert: pj.device_cert.clone(),
+                roles: granted.clone(),
             });
             s.refresh_snapshot();
             net_pubkey
@@ -338,11 +412,12 @@ impl NetworkRegistry {
                 identity,
                 hostname: pj.hostname.clone(),
                 device_cert: pj.device_cert.clone(),
+                roles: granted.clone(),
             },
         )
         .await;
         IpcMessage::Ok {
-            message: format!("accepted {} — they'll join shortly", identity.fmt_short()),
+            message: format!("accepted {}, they'll join shortly", identity.fmt_short()),
         }
     }
 

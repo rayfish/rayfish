@@ -433,17 +433,58 @@ networks:
       denies:
         eve: "icmp"
     carol: {}                 # empty subject = fully open, no rules
+  hyperliquid:
+    "role:validator":         # a role: a class of nodes, not one machine
+      allows:
+        "role:sentry": "tcp:4000-4004"
 ```
 
 A few rules of thumb:
 
 - Subject and peer keys are **hostnames** (or an alias/group that expands to
-  them). `*` as a subject means every node; `*` as a peer means any peer.
+  them), or a **role** (`role:sentry`). `*` as a subject means every node; `*`
+  as a peer means any peer.
 - If a subject has an `allows:` list, it's an allow-list: only the listed peers
   get through, everything else is denied. `denies:` carves exceptions out.
 - Aliases and groups are coordinator-side shorthand, expanded before publishing.
   They never travel over the mesh. An alias only resolves once that user has
   joined; literal hostnames work before anyone joins.
+- Roles are the opposite: they are published as written and resolved on each
+  node against the signed roster, so a node that joins later is covered without
+  a second `ray apply`. Use a role wherever the count can change.
+- A role name is lowercase `[a-z0-9-]`, and the spec is matched against the
+  roster byte for byte, so `role:Sentry` is rejected when the spec is read
+  rather than published as a rule no member can match.
+
+### Roles, for fleets that grow
+
+A hostname names one machine, so a rule keyed on one cannot say "every sentry".
+A role can. The coordinator assigns it from the join code, and the node never
+gets a say, which is what makes it safe to write firewall rules against:
+
+```bash
+# Mint one key per role. Unlike --hostname, --role is allowed on a reusable key:
+# a hostname is unique per node, a role is shared by a class of them on purpose.
+ray invite hyperliquid create --reusable --role sentry --json
+
+# Every instance runs the same line, whether there is one of them or twenty.
+ray join <code> --auto-accept-firewall
+```
+
+That is the whole scale-out story: the spec never changes, and each new sentry
+picks up its rules on the next roster update. `ray join --role <name>` can ask
+for a subset of what the code grants; asking for anything it does not grant
+refuses the join rather than seating the node with the wrong policy.
+
+For Terraform or Ansible, `--json` on `ray apply` and `ray invite` gives the
+machine-readable output to drive it from:
+
+```yaml
+- name: publish the mesh policy
+  command: ray apply /etc/ray/deploy.yaml --json
+  register: out
+  changed_when: (out.stdout | from_json).changed
+```
 
 Run it, and iterate safely:
 
@@ -453,6 +494,7 @@ ray apply deploy.yaml --dry-run  # show what would change, apply nothing
 ray apply deploy.yaml            # create missing networks, publish suggestions
 ray apply deploy.yaml --invite-missing   # also mint invites for expected-but-absent hosts
 ray apply deploy.yaml --prune            # drop suggestions for hosts no longer in the spec
+ray apply deploy.yaml --json             # machine-readable, for Terraform/Ansible
 ```
 
 Suggestions are still advisory on the receiving end: each node queues them for

@@ -58,6 +58,7 @@
 //! Explicit rules always win (first-match). Established return traffic only
 //! bypasses the *default* action, never an explicit rule.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +70,7 @@ use arc_swap::ArcSwap;
 use iroh::EndpointId;
 use ray_proto::SuggestedFirewall;
 use ray_proto::ipc::FirewallRuleView;
+use ray_proto::policy::{self, ROLE_PREFIX};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -925,13 +927,32 @@ pub fn parse_spec_token(tok: &str) -> Result<(Protocol, Option<PortRange>)> {
     }
 }
 
+/// How [`materialize_suggestions`] turns the names in a suggestion into peers.
+///
+/// Every field is derived from the same signed `GroupBlob` the suggestions came
+/// from, so a rule and the roster it resolves against cannot disagree.
+pub struct SubjectResolver<'a> {
+    /// This node's hostname, from the roster rather than its join-time claim.
+    pub hostname: &'a str,
+    /// Roles this node holds. Matched against a `role:` subject key, so one
+    /// published rule covers every node the coordinator gave that role.
+    pub roles: &'a BTreeSet<String>,
+    /// Hostname to identity, for a peer key naming one machine.
+    pub by_hostname: &'a dyn Fn(&str) -> Option<EndpointId>,
+    /// Role to every member currently holding it, for a `role:` peer key. This
+    /// is what makes scaling out free: a new holder shows up here on the next
+    /// blob update and its rule materializes with no `ray apply` re-run.
+    pub by_role: &'a dyn Fn(&str) -> Vec<EndpointId>,
+}
+
 /// Build the concrete local firewall rules a node enforces for network `net`,
 /// from `suggestions` targeting `my_hostname`. Two subjects apply to a node: its
-/// own hostname and the wildcard `*` subject (which targets every node, e.g.
-/// "everyone opens 6969"). Peer hostnames are resolved to identities via
-/// `resolve` (the blob's member list); unresolved peers are skipped, their rules
-/// materialize once they join. The `*` peer key means *any peer* and bypasses
-/// resolution. Every rule is inbound, network-scoped to `net`, and tagged
+/// own hostname, every `role:` it holds, and the wildcard `*` subject (which
+/// targets every node, e.g. "everyone opens 6969"). Peer names are resolved to
+/// identities via `r` (built from the blob's member list); unresolved peers are
+/// skipped, their rules materialize once they join. The `*` peer key means *any
+/// peer* and bypasses resolution, and a `role:` peer expands to every member
+/// holding that role. Every rule is inbound, network-scoped to `net`, and tagged
 /// `origin: Network(net)`. Suggestions are purely additive: each token yields
 /// exactly one rule (allow or deny) and nothing is synthesized: the node's own
 /// `default_inbound` (Deny by default) already covers anything an allow-list
@@ -940,44 +961,56 @@ pub fn parse_spec_token(tok: &str) -> Result<(Protocol, Option<PortRange>)> {
 /// value yields one rule per token.
 pub fn materialize_suggestions(
     net: &str,
-    my_hostname: &str,
     suggestions: &SuggestedFirewall,
-    resolve: &dyn Fn(&str) -> Option<EndpointId>,
+    r: &SubjectResolver,
 ) -> Vec<FirewallRule> {
     let mut rules = Vec::new();
-    // The wildcard `*` subject applies to every node, alongside its own subject
-    // (deduped so a node literally named "*" isn't counted twice).
-    let mut keys = vec!["*"];
-    if my_hostname != "*" {
-        keys.push(my_hostname);
+    // The wildcard `*` subject applies to every node, alongside its own hostname
+    // (deduped so a node literally named "*" isn't counted twice) and every role
+    // it holds. A node wearing two roles takes the union of both.
+    let mut keys = vec!["*".to_string()];
+    if r.hostname != "*" {
+        keys.push(r.hostname.to_string());
     }
-    let applicable: Vec<_> = keys.iter().filter_map(|k| suggestions.get(*k)).collect();
+    keys.extend(r.roles.iter().map(|role| format!("{ROLE_PREFIX}{role}")));
+    let applicable: Vec<_> = keys.iter().filter_map(|k| suggestions.get(k)).collect();
     if applicable.is_empty() {
         return rules;
     }
     for host in &applicable {
         for (action, list) in [(Action::Allow, &host.allows), (Action::Deny, &host.denies)] {
             for (peer, ports) in list {
-                // `*` ⇒ any peer (no resolution); otherwise resolve the hostname.
-                let filter = if peer == "*" {
-                    PeerFilter::Any
+                // One peer key can name several peers: `*` is any of them, a
+                // role is every member currently holding it, a hostname is one.
+                // A role naming nobody yet emits nothing and materializes on the
+                // blob update that seats its first holder, exactly as an
+                // unresolved hostname does.
+                let filters: Vec<PeerFilter> = if peer == "*" {
+                    vec![PeerFilter::Any]
+                } else if let Some(role) = policy::role_of(peer) {
+                    (r.by_role)(role)
+                        .into_iter()
+                        .map(PeerFilter::Identity)
+                        .collect()
                 } else {
-                    match resolve(peer) {
-                        Some(id) => PeerFilter::Identity(id),
+                    match (r.by_hostname)(peer) {
+                        Some(id) => vec![PeerFilter::Identity(id)],
                         None => continue,
                     }
                 };
                 for tok in ports.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     match parse_spec_token(tok) {
-                        Ok((proto, port)) => rules.push(FirewallRule {
-                            direction: Direction::In,
-                            action,
-                            protocol: proto,
-                            port,
-                            peer: filter.clone(),
-                            network: Some(net.to_string()),
-                            origin: RuleOrigin::Network(net.to_string()),
-                        }),
+                        Ok((proto, port)) => {
+                            rules.extend(filters.iter().map(|filter| FirewallRule {
+                                direction: Direction::In,
+                                action,
+                                protocol: proto,
+                                port: port.clone(),
+                                peer: filter.clone(),
+                                network: Some(net.to_string()),
+                                origin: RuleOrigin::Network(net.to_string()),
+                            }))
+                        }
                         Err(e) => tracing::warn!(
                             token = %tok, network = %net, error = %e,
                             "skipping invalid firewall spec token"
@@ -1040,6 +1073,26 @@ pub fn rule_views(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No roles on this node and no role holders anywhere: the shape every
+    /// hostname-keyed case wants, so those tests keep reading as they did.
+    static NO_ROLES: BTreeSet<String> = BTreeSet::new();
+
+    fn no_holders(_: &str) -> Vec<EndpointId> {
+        Vec::new()
+    }
+
+    fn host_resolver<'a>(
+        hostname: &'a str,
+        by_hostname: &'a dyn Fn(&str) -> Option<EndpointId>,
+    ) -> SubjectResolver<'a> {
+        SubjectResolver {
+            hostname,
+            roles: &NO_ROLES,
+            by_hostname,
+            by_role: &no_holders,
+        }
+    }
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -2431,6 +2484,145 @@ mod tests {
         map
     }
 
+    /// A `role:` subject applies to a node holding that role, and its rules
+    /// resolve exactly as a hostname-keyed subject's would.
+    #[test]
+    fn materialize_matches_a_role_subject_this_node_holds() {
+        let peer = test_id(2);
+        let by_hostname = |h: &str| (h == "peer").then_some(peer);
+        let my_roles: BTreeSet<String> = ["sentry".to_string()].into();
+        let suggestions = suggest("role:sentry", &[("peer", "tcp:4000")]);
+        let rules = materialize_suggestions(
+            "prod",
+            &suggestions,
+            &SubjectResolver {
+                hostname: "sentry-07",
+                roles: &my_roles,
+                by_hostname: &by_hostname,
+                by_role: &no_holders,
+            },
+        );
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].peer, PeerFilter::Identity(peer));
+        assert_eq!(rules[0].port.as_ref().unwrap().start, 4000);
+    }
+
+    /// The other half: a node that does not hold the role installs nothing, so
+    /// one published rule cannot leak to the rest of the network.
+    #[test]
+    fn materialize_ignores_a_role_subject_this_node_lacks() {
+        let peer = test_id(2);
+        let by_hostname = |h: &str| (h == "peer").then_some(peer);
+        let my_roles: BTreeSet<String> = ["nonvalid".to_string()].into();
+        let suggestions = suggest("role:sentry", &[("peer", "tcp:4000")]);
+        let rules = materialize_suggestions(
+            "prod",
+            &suggestions,
+            &SubjectResolver {
+                hostname: "box",
+                roles: &my_roles,
+                by_hostname: &by_hostname,
+                by_role: &no_holders,
+            },
+        );
+        assert!(rules.is_empty());
+    }
+
+    /// A `role:` peer expands to every member holding it: one rule each, so
+    /// twenty sentries are twenty identities and no wildcard.
+    #[test]
+    fn materialize_expands_a_role_peer_to_every_holder() {
+        let a = test_id(2);
+        let b = test_id(3);
+        let by_hostname = |_: &str| None;
+        let by_role = |role: &str| {
+            if role == "sentry" {
+                vec![a, b]
+            } else {
+                Vec::new()
+            }
+        };
+        let suggestions = suggest("me", &[("role:sentry", "tcp:4000")]);
+        let rules = materialize_suggestions(
+            "prod",
+            &suggestions,
+            &SubjectResolver {
+                hostname: "me",
+                roles: &NO_ROLES,
+                by_hostname: &by_hostname,
+                by_role: &by_role,
+            },
+        );
+        assert_eq!(rules.len(), 2);
+        let mut peers: Vec<PeerFilter> = rules.iter().map(|r| r.peer.clone()).collect();
+        peers.sort_by_key(|p| format!("{p:?}"));
+        let mut want = vec![PeerFilter::Identity(a), PeerFilter::Identity(b)];
+        want.sort_by_key(|p| format!("{p:?}"));
+        assert_eq!(peers, want);
+        // Never a blanket "any peer": an empty role must not read as `*`.
+        assert!(!rules.iter().any(|r| r.peer == PeerFilter::Any));
+    }
+
+    /// The property the whole design rests on: a role nobody holds yet emits
+    /// nothing, and the same published suggestion starts emitting once a member
+    /// turns up, with no re-apply in between.
+    #[test]
+    fn a_role_peer_with_no_holders_materializes_later() {
+        let by_hostname = |_: &str| None;
+        let suggestions = suggest("me", &[("role:sentry", "tcp:4000")]);
+        let empty =
+            materialize_suggestions("prod", &suggestions, &host_resolver("me", &by_hostname));
+        assert!(empty.is_empty(), "no holders yet, so no rules");
+
+        // Same suggestions, one member later.
+        let joined = test_id(9);
+        let by_role = |role: &str| {
+            if role == "sentry" {
+                vec![joined]
+            } else {
+                Vec::new()
+            }
+        };
+        let now = materialize_suggestions(
+            "prod",
+            &suggestions,
+            &SubjectResolver {
+                hostname: "me",
+                roles: &NO_ROLES,
+                by_hostname: &by_hostname,
+                by_role: &by_role,
+            },
+        );
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].peer, PeerFilter::Identity(joined));
+    }
+
+    /// A node wearing two roles takes the union of both subjects, alongside its
+    /// hostname and `*`.
+    #[test]
+    fn materialize_unions_every_role_a_node_holds() {
+        let peer = test_id(2);
+        let by_hostname = |h: &str| (h == "peer").then_some(peer);
+        let my_roles: BTreeSet<String> = ["eu".to_string(), "sentry".to_string()].into();
+        let mut suggestions = suggest("role:sentry", &[("peer", "tcp:4000")]);
+        suggestions.extend(suggest("role:eu", &[("peer", "tcp:8080")]));
+        let rules = materialize_suggestions(
+            "prod",
+            &suggestions,
+            &SubjectResolver {
+                hostname: "box",
+                roles: &my_roles,
+                by_hostname: &by_hostname,
+                by_role: &no_holders,
+            },
+        );
+        let ports: BTreeSet<u16> = rules
+            .iter()
+            .map(|r| r.port.as_ref().unwrap().start)
+            .collect();
+        assert_eq!(ports, [4000, 8080].into());
+    }
+
     #[test]
     fn materialize_resolves_peer_hostnames_and_expands_comma_ports() {
         let me = test_id(1);
@@ -2441,7 +2633,7 @@ mod tests {
             _ => None,
         };
         let suggestions = suggest("me", &[("peer", "tcp:9000,tcp:8123")]);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         // Two allow rules (one per port), all inbound, network-scoped, origin prod.
         let allows: Vec<_> = rules.iter().filter(|r| r.action == Action::Allow).collect();
         assert_eq!(allows.len(), 2);
@@ -2472,7 +2664,7 @@ mod tests {
         // An allow-list yields exactly its allow rules, no synthesized catch-all
         // deny. The node's own `default_inbound` already drops the rest.
         let suggestions = suggest("me", &[("peer", "tcp:9000")]);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         assert_eq!(rules.len(), 1, "only the suggested allow rule");
         assert_eq!(rules[0].action, Action::Allow);
         assert_eq!(rules[0].peer, PeerFilter::Identity(peer));
@@ -2499,7 +2691,7 @@ mod tests {
         };
         let mut suggestions = SuggestedFirewall::new();
         suggestions.insert("me".to_string(), entry);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         // One deny rule for eve, no catch-all deny.
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].action, Action::Deny);
@@ -2517,7 +2709,7 @@ mod tests {
         // Subject present but no allows and no default ⇒ no catch-all deny.
         let mut suggestions = SuggestedFirewall::new();
         suggestions.insert("me".to_string(), HostSuggestions::default());
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         assert!(rules.is_empty(), "expected no rules for an open subject");
     }
 
@@ -2526,7 +2718,7 @@ mod tests {
         // No resolver ever returns an identity for "ghost".
         let resolve = |_: &str| None;
         let suggestions = suggest("me", &[("ghost", "tcp:9000")]);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         // The allow rule is dropped (peer not joined) and nothing is synthesized,
         // so no rules materialize at all.
         assert!(rules.is_empty());
@@ -2541,7 +2733,7 @@ mod tests {
         };
         // Suggestions target a different subject.
         let suggestions = suggest("other", &[("me", "tcp:9000")]);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         assert!(rules.is_empty());
     }
 
@@ -2556,7 +2748,7 @@ mod tests {
         };
         // One peer, mixed protocols in a single comma-list.
         let suggestions = suggest("me", &[("peer", "icmp,tcp:*,udp:53,any")]);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         let allows: Vec<_> = rules.iter().filter(|r| r.action == Action::Allow).collect();
         // icmp + tcp:* + udp:53 + any = 4 rules.
         assert_eq!(allows.len(), 4);
@@ -2587,7 +2779,7 @@ mod tests {
         entry.allows.insert("*".to_string(), "tcp:6969".to_string());
         suggestions.insert("*".to_string(), entry);
         // "me" has no own subject, only the wildcard.
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         let allow = rules
             .iter()
             .find(|r| r.action == Action::Allow)
@@ -2605,7 +2797,7 @@ mod tests {
         // A `*` peer key opens the port to anyone, without resolving a hostname.
         let resolve = |_: &str| None; // resolves nothing
         let suggestions = suggest("me", &[("*", "udp:53")]);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         let allow = rules
             .iter()
             .find(|r| r.action == Action::Allow)
@@ -2629,7 +2821,7 @@ mod tests {
         let mut wild = HostSuggestions::default();
         wild.allows.insert("*".to_string(), "tcp:6969".to_string());
         suggestions.insert("*".to_string(), wild);
-        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let rules = materialize_suggestions("prod", &suggestions, &host_resolver("me", &resolve));
         let allows: Vec<_> = rules.iter().filter(|r| r.action == Action::Allow).collect();
         assert_eq!(allows.len(), 2, "own subject + wildcard subject");
         assert!(

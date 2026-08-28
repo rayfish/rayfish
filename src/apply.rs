@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use ray_proto::policy::SuggestedFirewall;
+use ray_proto::policy::{self, SuggestedFirewall};
 use serde::{Deserialize, Serialize};
 
 /// The full deploy spec: a `networks:` map of network name → its suggested
@@ -97,7 +97,10 @@ fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
 }
 
 /// Structural validation independent of live state: a name may not be defined as
-/// both a group and an alias (resolution would be ambiguous).
+/// both a group and an alias (resolution would be ambiguous), neither may take a
+/// `role:` name, which the node side resolves against the roster and the admin
+/// side must therefore pass through untouched, and every `role:` selector must
+/// name a role a member can actually hold.
 fn validate_names(spec: &DeploySpec) -> Result<()> {
     for name in spec.groups.keys() {
         anyhow::ensure!(
@@ -105,7 +108,61 @@ fn validate_names(spec: &DeploySpec) -> Result<()> {
             "`{name}` is defined as both a group and an alias; names must be unique"
         );
     }
+    for name in spec.groups.keys().chain(spec.aliases.keys()) {
+        anyhow::ensure!(
+            policy::role_of(name).is_none(),
+            "`{name}` starts with `role:`, which names a coordinator-assigned \
+             role resolved on each node; a group or alias cannot shadow one"
+        );
+    }
+    // A group member is not expanded when it names a role: `expand_firewall`
+    // passes it through and the node side resolves it, so it reaches the
+    // published rules exactly as a subject or peer key would, and needs the same
+    // check. Nothing downstream would report it: `expected_hosts` skips `role:`
+    // keys, so a miscased one is not even listed as a host that never joined.
+    for (group, members) in &spec.groups {
+        for member in members {
+            validate_role_selector(member)
+                .with_context(|| format!("group `{group}`: member `{member}`"))?;
+        }
+    }
+    for (network, firewall) in &spec.networks {
+        for (subject, rules) in firewall {
+            validate_role_key(network, subject)?;
+            for peer in rules.allows.keys().chain(rules.denies.keys()) {
+                validate_role_key(network, peer)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Check one subject/peer key that names a role. Keys that name a hostname or
+/// `*` pass untouched.
+///
+/// A `role:` selector is compared byte for byte against the roles the
+/// coordinator minted, and those are canonical ([`crate::roles::normalize`]
+/// lowercases and trims). The spec is not canonicalized on the way in: the
+/// `config` crate preserves the case a key was written in, so `role:Sentry`
+/// would publish verbatim and then resolve on no member at all, on every node,
+/// silently. Reject it here, where the author can still see it, rather than let
+/// `ray apply` report "no members yet" for a role nobody can hold.
+///
+/// Rejected rather than lowercased in place: two subjects differing only in case
+/// are distinct YAML keys, and folding them would merge one into the other and
+/// drop its rules without a word.
+fn validate_role_key(network: &str, key: &str) -> Result<()> {
+    validate_role_selector(key)
+        .with_context(|| format!("network `{network}`: firewall key `{key}`"))
+}
+
+/// The check itself, without the caller's context: a name that is not a `role:`
+/// selector passes untouched, one that is has to name a role a member can hold.
+fn validate_role_selector(name: &str) -> Result<()> {
+    match policy::role_of(name) {
+        Some(role) => crate::roles::validate_role(role),
+        None => Ok(()),
+    }
 }
 
 /// Recursively replace `ValueKind::Nil` with an empty `Table` so a null
@@ -149,12 +206,20 @@ pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 # `ray firewall accept`, or auto-installs them if it joined with
 # `--auto-accept-firewall`.
 #
+# A subject or peer can also be a ROLE (`role:sentry`). A role names a class of
+# nodes rather than one machine: the coordinator assigns it from the join code
+# (`ray invite <net> create --reusable --role sentry`), and every node resolves
+# it against the signed roster, so a node joining later is covered with no second
+# `ray apply`. Roles are what to reach for when a group has 1 or 20 instances.
+#
 # Optional `aliases:` and `groups:` are coordinator-side shorthand, expanded
 # client-side before publishing (they never reach the network). An alias names a
 # user by identity (copy it from `ray identityof <net> <host>`) and expands to
 # all of that user's joined device hostnames. A group is a named set of aliases
 # and/or literal hostnames. Both can be used as a rule subject or peer. An alias
 # only resolves once the user has joined; literal hostnames work pre-join.
+# Unlike a role, a group is expanded before publishing, so growing one needs
+# another `ray apply`.
 
 aliases:
   # Fill in a real identity, e.g.:
@@ -186,27 +251,67 @@ networks:
     "*":
       allows:
         admins: "tcp:22"
+  hyperliquid:
+    # Roles, for a fleet whose size changes. Mint one key per role and bake it
+    # into the machine image or user-data:
+    #   ray invite hyperliquid create --reusable --role sentry
+    # Every instance then joins with a bare `ray join <code>` and is covered.
+    "role:validator":
+      allows:
+        "role:sentry": "tcp:4000-4004"
+    "role:sentry":
+      allows:
+        "role:nonvalid": "tcp:4000-4004"
+    # A role and a hostname mix freely in either position.
+    "role:streamer":
+      allows:
+        "*": "tcp:8080"
+        jumpbox: "tcp:22"
 "#;
 
-/// Union of every concrete hostname mentioned in the spec, both subjects and
-/// peer hostnames in `allows`/`denies`. This is the set of hosts the spec
-/// expects to exist; it is diffed against the joined hosts. The `*` wildcard
-/// (subject or peer) is not a real host and is excluded.
-pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
+/// Union of every concrete hostname mentioned in one network's firewall, both
+/// subjects and peer hostnames in `allows`/`denies`. This is the set of hosts
+/// that network expects to exist; it is diffed against the hosts joined to *that
+/// network*. The `*` wildcard and any `role:` key are not real hosts and are
+/// excluded: a role has no single machine to mint a hostname-bound invite for,
+/// and its members are covered by the reusable key that grants it.
+pub fn expected_hosts(firewall: &SuggestedFirewall) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
-    for firewall in spec.networks.values() {
-        for (subject, rules) in firewall {
-            if subject != "*" {
-                set.insert(subject.clone());
-            }
-            for peer in rules.allows.keys().chain(rules.denies.keys()) {
-                if peer != "*" {
-                    set.insert(peer.clone());
-                }
+    for (subject, rules) in firewall {
+        if is_host_key(subject) {
+            set.insert(subject.clone());
+        }
+        for peer in rules.allows.keys().chain(rules.denies.keys()) {
+            if is_host_key(peer) {
+                set.insert(peer.clone());
             }
         }
     }
     set.into_iter().collect()
+}
+
+/// Every role named as a subject or peer in one network's firewall, sorted. The
+/// counterpart to [`expected_hosts`]: `ray apply` reports these by how many
+/// members hold them rather than as hosts that have not joined.
+pub fn expected_roles(firewall: &SuggestedFirewall) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for (subject, rules) in firewall {
+        if let Some(role) = policy::role_of(subject) {
+            set.insert(role.to_string());
+        }
+        for peer in rules.allows.keys().chain(rules.denies.keys()) {
+            if let Some(role) = policy::role_of(peer) {
+                set.insert(role.to_string());
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Whether a subject/peer key names a machine that has to join, as opposed to
+/// the `*` wildcard or a role the roster resolves.
+fn is_host_key(key: &str) -> bool {
+    key != "*" && policy::role_of(key).is_none()
 }
 
 /// Expand all group/alias references in one network's firewall into a pure,
@@ -216,7 +321,8 @@ pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
 /// identity *in this network* (the caller builds it from live `Status`). A name
 /// used as a subject or peer resolves by precedence: **group → alias → literal
 /// hostname** (a name matching no group or alias passes through as itself, so
-/// plain-hostname specs behave exactly as before). `*` is never expanded.
+/// plain-hostname specs behave exactly as before). Neither `*` nor a `role:`
+/// name is ever expanded: both are resolved node-side against the signed blob.
 ///
 /// Returns the expanded firewall plus the sorted, unique set of alias names that
 /// resolved to zero joined hosts (the caller surfaces these as warnings; their
@@ -253,10 +359,13 @@ pub fn expand_firewall(
         hosts
     };
 
-    // Resolve a subject/peer name to concrete hostnames (or keep `*`).
+    // Resolve a subject/peer name to concrete hostnames (or keep `*`/`role:`).
     let mut resolve_name = |name: &str| -> Vec<String> {
-        if name == "*" {
-            return vec!["*".to_string()];
+        // A role is resolved on each node against the signed roster, not here:
+        // expanding it now would freeze today's membership into the published
+        // rules and a node joining later would never be covered.
+        if name == "*" || policy::role_of(name).is_some() {
+            return vec![name.to_string()];
         }
         if let Some(members) = groups.get(name) {
             let mut out: Vec<String> = Vec::new();
@@ -473,16 +582,205 @@ networks:
                 denies: [].into(),
             },
         );
-        let mut spec = DeploySpec {
-            networks: BTreeMap::new(),
-            ..Default::default()
-        };
-        spec.networks.insert("gaming".to_string(), fw);
-        let hosts = expected_hosts(&spec);
+        let hosts = expected_hosts(&fw);
         assert_eq!(
             hosts,
             vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
         );
+    }
+
+    /// A role survives expansion untouched. Expanding it here would freeze
+    /// today's membership into the published rules, and the node that joins
+    /// tomorrow would never be covered.
+    #[test]
+    fn a_role_passes_through_expansion_unexpanded() {
+        let mut fw = SuggestedFirewall::new();
+        let mut entry = HostSuggestions::default();
+        entry
+            .allows
+            .insert("role:sentry".to_string(), "tcp:4000".to_string());
+        fw.insert("role:validator".to_string(), entry);
+
+        let groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let aliases: BTreeMap<String, String> = BTreeMap::new();
+        let (out, empty) = expand_firewall(&fw, &aliases, &groups, &|_| Vec::new());
+        assert!(empty.is_empty());
+        assert_eq!(
+            out.get("role:validator")
+                .and_then(|h| h.allows.get("role:sentry"))
+                .map(String::as_str),
+            Some("tcp:4000")
+        );
+    }
+
+    /// A role is not a host, so it is neither a gap to report nor something to
+    /// mint a hostname-bound invite for.
+    #[test]
+    fn expected_hosts_skips_roles_and_wildcards() {
+        let mut fw = SuggestedFirewall::new();
+        let mut entry = HostSuggestions::default();
+        entry
+            .allows
+            .insert("role:sentry".to_string(), "tcp:4000".to_string());
+        entry.allows.insert("*".to_string(), "icmp".to_string());
+        entry
+            .allows
+            .insert("jumpbox".to_string(), "tcp:22".to_string());
+        fw.insert("role:validator".to_string(), entry);
+        fw.insert("named-host".to_string(), HostSuggestions::default());
+
+        assert_eq!(
+            expected_hosts(&fw),
+            vec!["jumpbox".to_string(), "named-host".to_string()]
+        );
+        assert_eq!(
+            expected_roles(&fw),
+            vec!["sentry".to_string(), "validator".to_string()]
+        );
+    }
+
+    /// A group or alias called `role:x` would shadow a name the node side
+    /// resolves against the roster, so it is rejected at parse time.
+    #[test]
+    fn a_group_or_alias_cannot_shadow_a_role() {
+        let err = parse(
+            r#"
+groups:
+  "role:sentry": [box]
+networks:
+  prod: {}
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("role:"), "{err}");
+
+        let err = parse(
+            r#"
+aliases:
+  "role:sentry": abc
+networks:
+  prod: {}
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("role:"), "{err}");
+    }
+
+    /// A group member naming a role is not expanded here, it passes through into
+    /// the published rules, so a miscased one is the same silent no-match as a
+    /// miscased subject key and is rejected at the same place.
+    #[test]
+    fn a_role_inside_a_group_is_held_to_the_same_case_rule() {
+        let yaml = r#"
+groups:
+  fleet: ["role:Sentry"]
+networks:
+  prod:
+    alice:
+      allows:
+        fleet: "tcp:22"
+"#;
+        let err = parse(yaml).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("role:Sentry"), "{text}");
+        assert!(text.contains("fleet"), "{text}");
+    }
+
+    /// The other side of it: a canonical role in a group expands to itself and
+    /// reaches the published firewall as a selector the node side resolves.
+    #[test]
+    fn a_canonical_role_inside_a_group_expands_to_itself() {
+        let yaml = r#"
+groups:
+  fleet: ["role:sentry", "alice"]
+networks:
+  prod:
+    bob:
+      allows:
+        fleet: "tcp:22"
+"#;
+        let spec = parse(yaml).unwrap();
+        let (expanded, empty) = expand_firewall(
+            &spec.networks["prod"],
+            &BTreeMap::new(),
+            &spec.groups,
+            &|_| vec![],
+        );
+        assert!(empty.is_empty());
+        let peers: Vec<&String> = expanded["bob"].allows.keys().collect();
+        assert_eq!(peers, vec!["alice", "role:sentry"]);
+    }
+
+    /// The bug this guards: `config` preserves key case, so a spec written with
+    /// `role:Sentry` published verbatim and matched no member on any node, while
+    /// `ray apply` blamed the roster ("no members yet").
+    #[test]
+    fn a_role_key_with_capitals_is_rejected() {
+        let yaml = r#"
+networks:
+  prod:
+    "role:Sentry":
+      allows:
+        "*": "tcp:22"
+"#;
+        let err = parse(yaml).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("role:Sentry"), "{text}");
+        assert!(text.contains("prod"), "{text}");
+    }
+
+    /// Peer keys resolve the same way subjects do, so they are held to the same
+    /// rule.
+    #[test]
+    fn a_role_peer_key_with_capitals_is_rejected() {
+        let yaml = r#"
+networks:
+  prod:
+    alice:
+      allows:
+        "role:Sentry": "tcp:22"
+"#;
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn a_denies_role_key_with_capitals_is_rejected() {
+        let yaml = r#"
+networks:
+  prod:
+    alice:
+      denies:
+        "role:Sentry": "tcp:22"
+"#;
+        assert!(parse(yaml).is_err());
+    }
+
+    /// Canonical role keys, `*` and plain hostnames all pass untouched.
+    #[test]
+    fn canonical_role_keys_and_hostnames_pass() {
+        let yaml = r#"
+networks:
+  prod:
+    "role:sentry":
+      allows:
+        "role:non-validating": "tcp:4000"
+        "*": "tcp:22"
+    alice:
+      denies:
+        bob: "tcp:22"
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.networks["prod"].len(), 2);
+    }
+
+    /// A bare `role:` is not a role, so it stays an (odd) hostname and still
+    /// counts as a host the spec expects.
+    #[test]
+    fn a_bare_role_prefix_is_treated_as_a_host() {
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("role:".to_string(), HostSuggestions::default());
+        assert_eq!(expected_hosts(&fw), vec!["role:".to_string()]);
+        assert!(expected_roles(&fw).is_empty());
     }
 
     /// Build a HostSuggestions from (peer, spec) allow pairs.

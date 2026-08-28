@@ -544,6 +544,12 @@ pub(crate) async fn ipc_apply(
     // A dry-run with no aliases/groups needs nothing from the daemon: just echo
     // the normalized spec (the historical behavior).
     if dry_run && !has_dynamic {
+        if json_enabled() {
+            print_json(&serde_json::json!({
+                "dry_run": true, "changed": false, "spec": spec,
+            }));
+            return Ok(());
+        }
         println!("{}", style::bold("Spec (normalized):"));
         print!("{}", apply::to_yaml(&spec)?);
         println!("{}", style::faint("(dry-run; no changes applied)"));
@@ -577,15 +583,23 @@ pub(crate) async fn ipc_apply(
         };
         let (efw, empty_aliases) = apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve);
         for a in empty_aliases {
-            eprintln!(
-                "{}  {net_name}: alias '{a}' has no joined devices yet; its rules are skipped",
-                style::faint("note:")
-            );
+            if !json_enabled() {
+                eprintln!(
+                    "{}  {net_name}: alias '{a}' has no joined devices yet; its rules are skipped",
+                    style::faint("note:")
+                );
+            }
         }
         expanded.networks.insert(net_name.clone(), efw);
     }
 
     if dry_run {
+        if json_enabled() {
+            print_json(&serde_json::json!({
+                "dry_run": true, "changed": false, "spec": expanded,
+            }));
+            return Ok(());
+        }
         println!("{}", style::bold("Spec (expanded):"));
         print!("{}", apply::to_yaml(&expanded)?);
         println!("{}", style::faint("(dry-run; no changes applied)"));
@@ -593,21 +607,38 @@ pub(crate) async fn ipc_apply(
     }
 
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
+    let mut role_counts: Vec<RoleCoverage> = Vec::new();
+    let mut net_reports: Vec<serde_json::Value> = Vec::new();
+    // Ansible's `changed_when` reads this: creating a network or publishing a
+    // suggestion set counts, reporting a gap does not.
+    let mut changed = false;
+    let json = json_enabled();
 
     for (net_name, net_firewall) in &expanded.networks {
         let is_active = active_names.contains(net_name.as_str());
+        let mut created = false;
         // Create-if-absent (always a closed network).
         if !is_active {
-            println!(
-                "{} {}: creating closed network",
-                style::label("apply"),
-                style::bold(net_name),
-            );
+            if !json {
+                println!(
+                    "{} {}: creating closed network",
+                    style::label("apply"),
+                    style::bold(net_name),
+                );
+            }
             if let Err(e) = ipc_apply_create(net_name).await {
-                eprintln!("{}  create failed: {e}", style::red("  !"));
+                if json {
+                    net_reports.push(serde_json::json!({
+                        "network": net_name, "created": false, "error": e.to_string(),
+                    }));
+                } else {
+                    eprintln!("{}  create failed: {e}", style::red("  !"));
+                }
                 continue;
             }
-        } else {
+            created = true;
+            changed = true;
+        } else if !json {
             println!(
                 "{} {}: already active",
                 style::label("apply"),
@@ -618,33 +649,135 @@ pub(crate) async fn ipc_apply(
         // Publish suggestions (idempotent). With --prune, publish exactly the
         // spec's set; without it, merge into the live set (so `apply` never
         // silently drops subjects authored out-of-band - use --prune for that).
+        //
+        // The live set is read either way, not only for the merge: publishing
+        // always replaces the live set, so a successful publish says nothing
+        // about whether anything moved, and `changed` has to come from the
+        // comparison or Ansible's `changed_when` reports a change on every play.
+        // A read that failed reads as empty, which errs towards "changed".
+        let live = ipc_firewall_suggestions_get(net_name)
+            .await
+            .unwrap_or_default();
         let to_publish = if prune {
             net_firewall.clone()
         } else {
-            let mut live = ipc_firewall_suggestions_get(net_name)
-                .await
-                .unwrap_or_default();
             // Merge spec subjects over live (spec wins on conflict).
+            let mut merged = live.clone();
             for (subj, rules) in net_firewall {
-                live.insert(subj.clone(), rules.clone());
+                merged.insert(subj.clone(), rules.clone());
             }
-            live
+            merged
         };
-        match ipc_firewall_suggest_set(net_name, to_publish).await {
-            Ok(msg) => println!("{}   {msg}", style::faint("→")),
-            Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
+        let differs = to_publish != live;
+        let published = ipc_firewall_suggest_set(net_name, to_publish).await;
+        match &published {
+            Ok(msg) => {
+                changed |= differs;
+                if !json {
+                    println!("{}   {msg}", style::faint("→"));
+                }
+            }
+            Err(e) => {
+                if !json {
+                    eprintln!("{}   suggest failed: {e}", style::red("  !"));
+                }
+            }
+        }
+        if json {
+            net_reports.push(serde_json::json!({
+                "network": net_name,
+                "created": created,
+                "published": published.is_ok(),
+                "error": published.as_ref().err().map(|e| e.to_string()),
+            }));
         }
 
-        // B3, membership diff for this network.
+        // B3, membership diff for this network. Scoped to *this* network's
+        // firewall: over the whole spec, a host expected in one network reads as
+        // missing from every other, and `--invite-missing` mints its invite on
+        // the wrong network.
         let joined = joined_hostnames(&status_networks, net_name);
-        for host in apply::expected_hosts(&expanded) {
+        for host in apply::expected_hosts(net_firewall) {
             if !joined.iter().any(|j| j == &host) {
                 missing_hosts.push((net_name.clone(), host));
             }
         }
+        // A role is not a host to invite: report who holds it instead. Zero
+        // holders is worth saying, since its rules materialize on nobody.
+        for role in apply::expected_roles(net_firewall) {
+            let holders = role_holders(&status_networks, net_name, &role);
+            role_counts.push(RoleCoverage {
+                network: net_name.clone(),
+                role,
+                holders,
+            });
+        }
     }
 
-    // B3, report the membership gap.
+    if !role_counts.is_empty() && !json {
+        println!("\n{} Roles the spec targets:", style::label("roles"));
+        for RoleCoverage {
+            network,
+            role,
+            holders,
+        } in &role_counts
+        {
+            let line = format!("role:{role}");
+            if *holders == 0 {
+                println!(
+                    "  {}  {}",
+                    style::red(&line),
+                    style::faint(&format!(
+                        "no members yet - mint one with `ray invite {network} create --reusable --role {role}`"
+                    ))
+                );
+            } else {
+                println!(
+                    "  {}  {}",
+                    style::bold(&line),
+                    style::faint(&format!("{holders} member(s)"))
+                );
+            }
+        }
+        println!(
+            "  {}",
+            style::faint("nodes joining later are covered without re-running apply")
+        );
+    }
+
+    // B3, report the membership gap. In JSON the codes go in the payload, so
+    // the whole human branch is skipped.
+    if json {
+        let mut hosts = Vec::new();
+        for (net, host) in &missing_hosts {
+            let code = if invite_missing {
+                ipc_invite_mint(net, Some(host.clone()), Vec::new())
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            if code.is_some() {
+                changed = true;
+            }
+            hosts.push(serde_json::json!({
+                "network": net, "hostname": host, "code": code,
+            }));
+        }
+        print_json(&serde_json::json!({
+            "dry_run": false,
+            "changed": changed,
+            "networks": net_reports,
+            "roles": role_counts
+                .iter()
+                .map(|r| serde_json::json!({
+                    "network": r.network, "role": r.role, "holders": r.holders,
+                }))
+                .collect::<Vec<_>>(),
+            "missing_hosts": hosts,
+        }));
+        return Ok(());
+    }
     if missing_hosts.is_empty() {
         println!("{}", style::green("All expected hosts have joined."));
     } else {
@@ -653,9 +786,9 @@ pub(crate) async fn ipc_apply(
             style::label("diff")
         );
         for (net, host) in &missing_hosts {
-            let cmd = format!("ray invite {net} --hostname {host}");
+            let cmd = format!("ray invite {net} create --hostname {host}");
             if invite_missing {
-                match ipc_invite_mint(net, Some(host.clone())).await {
+                match ipc_invite_mint(net, Some(host.clone()), Vec::new()).await {
                     Ok(code) => println!(
                         "  {}  {}  {}",
                         style::bold(host),
@@ -680,6 +813,28 @@ pub(crate) async fn ipc_apply(
         }
     }
     Ok(())
+}
+
+/// How many members currently hold `role` on `network`. What a `role:` rule
+/// will actually resolve to on each node, so apply can say whether a rule
+/// covers anyone yet.
+fn role_holders(networks: &[ipc::NetworkStatus], network: &str, role: &str) -> usize {
+    let Some(net) = networks.iter().find(|n| n.name == network) else {
+        return 0;
+    };
+    let mine = usize::from(net.my_roles.iter().any(|r| r == role));
+    mine + net
+        .peers
+        .iter()
+        .filter(|p| p.roles.iter().any(|r| r == role))
+        .count()
+}
+
+/// One `role:` key in the spec and how many members it covers today.
+struct RoleCoverage {
+    network: String,
+    role: String,
+    holders: usize,
 }
 
 /// Joined hostnames on `network` (this node's hostname + every peer's hostname).
@@ -877,7 +1032,11 @@ pub(crate) async fn ipc_firewall_suggest_set(
     }
 }
 
-pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> Result<String> {
+pub(crate) async fn ipc_invite_mint(
+    network: &str,
+    hostname: Option<String>,
+    roles: Vec<String>,
+) -> Result<String> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
@@ -886,6 +1045,7 @@ pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> 
             expires_secs: 7 * 24 * 3600,
             hostname,
             reusable: false,
+            roles,
         },
     )
     .await?;
@@ -1019,6 +1179,7 @@ mod tests {
             state: ipc::PeerState::Idle,
             exit_node: false,
             exit_in_use: false,
+            roles: Default::default(),
         }
     }
 
@@ -1038,6 +1199,7 @@ mod tests {
             my_exit_node: None,
             exit_offering: false,
             incompatible: None,
+            my_roles: Default::default(),
         }
     }
 

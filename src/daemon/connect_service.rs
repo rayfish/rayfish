@@ -291,11 +291,11 @@ impl ConnectService {
             .join_network(
                 &room_id.to_string(),
                 None,
-                hostname,
-                None,
-                Some(coordinator),
-                false,
-                false,
+                JoinOptions {
+                    hostname,
+                    coordinator: Some(coordinator),
+                    ..Default::default()
+                },
             )
             .await;
         if let IpcMessage::Joined { name, .. } = &resp {
@@ -362,6 +362,9 @@ impl ConnectService {
                 short_id: p.from_contact_id.fmt_short().to_string(),
                 hostname: p.hostname.clone(),
                 waiting_secs: now.saturating_duration_since(p.requested_at).as_secs(),
+                // `ray connect` is a 2-peer link, not a network join: it has no
+                // credential to carry roles and no `--role` to ask with.
+                requested_roles: Vec::new(),
             })
             .collect();
         IpcMessage::PendingRequests { requests }

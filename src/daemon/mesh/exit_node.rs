@@ -873,6 +873,7 @@ mod tests {
             last_seen: None,
             exit_node,
             exit_families,
+            roles: Default::default(),
         }
     }
 

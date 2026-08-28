@@ -213,6 +213,7 @@ mod mesh;
 // by bare name, as before the split.
 pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
+pub use mesh::JoinOptions;
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
@@ -514,6 +515,11 @@ pub(crate) struct NetworkState {
 pub(crate) struct PendingJoin {
     pub(crate) hostname: Option<String>,
     pub(crate) device_cert: Option<control::DeviceCert>,
+    /// Roles the joiner asked for. A request, never a grant: `ray requests`
+    /// shows it so the operator can decide, and only `ray requests accept
+    /// --role` actually confers anything. Kept because without it the operator
+    /// cannot see why an otherwise-accepted peer keeps being refused.
+    pub(crate) requested_roles: BTreeSet<String>,
     pub(crate) requested_at: Instant,
 }
 
@@ -1264,15 +1270,19 @@ impl Daemon {
                 coordinator,
                 auto_accept_firewall,
                 auto_accept_files,
+                roles,
             } => {
                 self.join_network(
                     &network_key,
                     name.as_deref(),
-                    hostname,
-                    invite,
-                    coordinator,
-                    auto_accept_firewall,
-                    auto_accept_files,
+                    JoinOptions {
+                        hostname,
+                        invite,
+                        coordinator,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                        roles,
+                    },
                 )
                 .await
             }
@@ -1418,9 +1428,10 @@ impl Daemon {
                 expires_secs,
                 hostname,
                 reusable,
+                roles,
             } => {
                 self.registry
-                    .invite_create(&network, expires_secs, hostname, reusable)
+                    .invite_create(&network, expires_secs, hostname, roles, reusable)
                     .await
             }
             IpcMessage::InviteList { network } => self.registry.invite_list(&network).await,
@@ -1428,8 +1439,8 @@ impl Daemon {
                 self.registry.invite_revoke(&network, &id).await
             }
             IpcMessage::Requests { network } => self.registry.list_requests(&network),
-            IpcMessage::AcceptRequest { network, id } => {
-                self.registry.accept_request(&network, &id).await
+            IpcMessage::AcceptRequest { network, id, roles } => {
+                self.registry.accept_request(&network, &id, roles).await
             }
             IpcMessage::DenyRequest { network, id } => self.registry.deny_request(&network, &id),
             IpcMessage::AdminAdd { network, identity } => {
@@ -2610,6 +2621,7 @@ mod absent_member_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 
@@ -2781,6 +2793,7 @@ mod accept_handler_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 
@@ -2808,6 +2821,7 @@ mod accept_handler_tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                roles: Default::default(),
             });
         }
         assert!(h.knows_sender(peer));
@@ -3008,6 +3022,7 @@ mod accept_handler_tests {
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
+                    roles: Default::default(),
                 });
             }
             registry.networks.insert(
@@ -3118,6 +3133,7 @@ mod accept_handler_tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: Default::default(),
             });
         }
         registry.networks.insert(
@@ -3265,6 +3281,7 @@ mod accept_handler_tests {
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
+                    roles: Default::default(),
                 },
                 Member {
                     identity: member_id,
@@ -3275,6 +3292,7 @@ mod accept_handler_tests {
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
+                    roles: Default::default(),
                 },
             ]
         };
@@ -3500,6 +3518,7 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
@@ -3518,6 +3537,7 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         };
 
         // No coordinators in the roster ⇒ empty order (caller bails).
@@ -3578,6 +3598,7 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
         let me = a;
@@ -3597,6 +3618,7 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.
         let members = vec![mk(me, true), mk(test_id(2), false)];

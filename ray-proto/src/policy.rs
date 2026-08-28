@@ -8,6 +8,11 @@
 //! the rules targeting its own hostname, resolving peer hostnames to identities
 //! from the same blob's member list.
 //!
+//! A subject or peer key is a hostname, the wildcard `*`, or a **role**
+//! (`role:sentry`, see [`ROLE_PREFIX`]). A role names a class of nodes rather
+//! than one machine, so a rule written against it covers every member the
+//! coordinator has assigned that role, including ones that join later.
+//!
 //! [`BTreeMap`] keys give a canonical (sorted) serialization, so the blob hash
 //! is stable regardless of authoring order.
 
@@ -41,3 +46,49 @@ pub struct HostSuggestions {
 
 /// Subject hostname -> its suggested rules. Sorted keys ⇒ canonical bytes.
 pub type SuggestedFirewall = BTreeMap<String, HostSuggestions>;
+
+/// Marks a subject or peer key as naming a **role** instead of a hostname.
+///
+/// Roles are assigned by the coordinator from the redeemed join key, never
+/// claimed by the joining node, so a rule keyed on one cannot be captured by a
+/// peer picking a convenient name for itself.
+pub const ROLE_PREFIX: &str = "role:";
+
+/// The role a subject/peer key names, or `None` if it names a hostname or `*`.
+///
+/// The single parser for the prefix, shared by the authoring side (a `ray apply`
+/// spec passes a role through unexpanded, exactly like `*`) and the node side
+/// (`materialize_suggestions` resolves it against the blob's member list). A
+/// bare `role:` with nothing after it is not a role: it would match every member
+/// carrying the empty role, which no member can carry.
+pub fn role_of(key: &str) -> Option<&str> {
+    match key.strip_prefix(ROLE_PREFIX) {
+        Some("") | None => None,
+        Some(role) => Some(role),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_keys_are_recognised() {
+        assert_eq!(role_of("role:sentry"), Some("sentry"));
+        assert_eq!(role_of("role:non-validating"), Some("non-validating"));
+    }
+
+    #[test]
+    fn hostnames_and_wildcards_are_not_roles() {
+        assert_eq!(role_of("sentry"), None);
+        assert_eq!(role_of("*"), None);
+        assert_eq!(role_of("sentry-01.hyperliquid.ray"), None);
+    }
+
+    /// A bare prefix would otherwise resolve to the empty role and match on a
+    /// value no member can hold; treat it as a plain (odd) hostname instead.
+    #[test]
+    fn a_bare_prefix_is_not_a_role() {
+        assert_eq!(role_of("role:"), None);
+    }
+}
