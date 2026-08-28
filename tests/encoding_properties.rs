@@ -165,7 +165,8 @@ fn control_msg_strategy() -> impl Strategy<Value = ControlMsg> {
     prop_oneof![
         Just(ControlMsg::MemberSync),
         Just(ControlMsg::JoinPending),
-        ".{0,40}".prop_map(|reason| ControlMsg::JoinDenied { reason }),
+        (".{0,40}", any::<bool>())
+            .prop_map(|(reason, retryable)| ControlMsg::JoinDenied { reason, retryable }),
         prop::collection::vec(any::<u8>(), 0..64)
             .prop_map(|packet| ControlMsg::SignedRecord { packet }),
         (

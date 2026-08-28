@@ -240,33 +240,58 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::PendingRequests { requests } => {
             if json_enabled() {
-                print_json(&serde_json::json!(requests
-                    .iter()
-                    .map(|r| serde_json::json!({
-                        "id": r.short_id, "hostname": r.hostname, "waiting_secs": r.waiting_secs,
-                    }))
-                    .collect::<Vec<_>>()));
+                print_json(&serde_json::json!(
+                    requests
+                        .iter()
+                        .map(|r| serde_json::json!({
+                            "id": r.short_id,
+                            "hostname": r.hostname,
+                            "waiting_secs": r.waiting_secs,
+                            "requested_roles": r.requested_roles,
+                        }))
+                        .collect::<Vec<_>>()
+                ));
             } else if requests.is_empty() {
                 println!("\n  {}\n", style::faint("no pending join requests"));
             } else {
+                // The peer's `--role` is a request, not a grant: only
+                // `accept --role` confers one, so the column is what tells the
+                // operator which flag to repeat.
+                let any_roles = requests.iter().any(|r| !r.requested_roles.is_empty());
                 let rows = requests
                     .iter()
                     .map(|r| {
                         let host = r.hostname.clone().unwrap_or_else(|| "—".to_string());
                         let wait = format!("{}s", r.waiting_secs);
-                        vec![
+                        let mut row = vec![
                             layout::Cell::new(r.short_id.clone(), style::rose(&r.short_id)),
                             layout::Cell::new(host.clone(), style::value(&host)),
-                            layout::Cell::right(wait.clone(), style::faint(&wait)),
-                        ]
+                        ];
+                        if any_roles {
+                            let asked = if r.requested_roles.is_empty() {
+                                "—".to_string()
+                            } else {
+                                r.requested_roles.join(", ")
+                            };
+                            row.push(layout::Cell::new(asked.clone(), style::value(&asked)));
+                        }
+                        row.push(layout::Cell::right(wait.clone(), style::faint(&wait)));
+                        row
                     })
                     .collect();
+                let headers: &[&str] = if any_roles {
+                    &["id", "host", "asked for", "waiting"]
+                } else {
+                    &["id", "host", "waiting"]
+                };
                 println!();
-                print!("{}", table(&["id", "host", "waiting"], rows, 2));
-                println!(
-                    "\n  {}",
-                    style::faint(&format!("admit with: ray requests {network} accept <id>"))
-                );
+                print!("{}", table(headers, rows, 2));
+                let hint = if any_roles {
+                    format!("admit with: ray requests {network} accept <id> [--role <asked for>]")
+                } else {
+                    format!("admit with: ray requests {network} accept <id>")
+                };
+                println!("\n  {}", style::faint(&hint));
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),

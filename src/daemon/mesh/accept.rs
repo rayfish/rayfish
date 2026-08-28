@@ -366,6 +366,21 @@ impl CoordinatorAcceptState {
                 .await;
         }
 
+        // Canonicalize what was asked for before any branch compares it. Our own
+        // joiner normalizes first, but `grant` compares by exact set difference,
+        // so an older or hand-rolled client asking for `Sentry` would be refused
+        // a role its key does grant. Placed after the reconnect short-circuit: a
+        // seated member's roles come from the roster, not from this field.
+        let requested_roles = match crate::roles::canonicalize(&requested_roles) {
+            Ok(roles) => roles,
+            Err(e) => {
+                tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "malformed role request");
+                self.deny_final(conn, send, format!("role request refused: {e}"))
+                    .await;
+                return None;
+            }
+        };
+
         // A peer pre-approved via `ray accept` is admitted directly.
         let is_approved = self.state.read().unwrap().approved.is_approved(&remote_id);
         if is_approved {
@@ -385,7 +400,7 @@ impl CoordinatorAcceptState {
                 Ok(roles) => roles,
                 Err(e) => {
                     tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
-                    self.deny(conn, send, format!("role request refused: {e}"))
+                    self.deny_final(conn, send, format!("role request refused: {e}"))
                         .await;
                     return None;
                 }
@@ -427,9 +442,22 @@ impl CoordinatorAcceptState {
         // Unknown peer, no invite: open networks auto-admit; closed networks queue
         // the request for live operator approval (`ray accept`).
         let mode = self.state.read().unwrap().mode;
+        // Neither admission path below reads a credential, so neither has a
+        // grant to narrow. `grant` against an empty permitted set is exactly the
+        // answer: fine for the usual empty request, an error for anything else.
+        // Seating the node quietly without the roles it asked for is the failure
+        // this module refuses to have (see `crate::roles::grant`) - it would
+        // report success and leave the firewall shut with nothing to point at.
+        let no_roles = crate::roles::grant(&BTreeSet::new(), &requested_roles);
         match mode {
-            GroupMode::Open => self
-                .admit_peer(
+            GroupMode::Open => {
+                if let Err(e) = no_roles {
+                    tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
+                    self.deny_final(conn, send, format!("role request refused: {e}"))
+                        .await;
+                    return None;
+                }
+                self.admit_peer(
                     conn,
                     send,
                     AdmitRequest {
@@ -444,11 +472,18 @@ impl CoordinatorAcceptState {
                     },
                 )
                 .await
-                .into_ip(),
+                .into_ip()
+            }
             GroupMode::Restricted => {
                 // A device cert signed by this coordinator's own owner identity is
                 // one of our own paired devices: admit directly (no approval step).
                 if owner_admits(device_cert.as_ref(), self.ctx.identity.local_identity()) {
+                    if let Err(e) = no_roles {
+                        tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
+                        self.deny_final(conn, send, format!("role request refused: {e}"))
+                            .await;
+                        return None;
+                    }
                     return self
                         .admit_peer(
                             conn,
@@ -486,6 +521,7 @@ impl CoordinatorAcceptState {
                         PendingJoin {
                             hostname,
                             device_cert,
+                            requested_roles,
                             requested_at: Instant::now(),
                         },
                     );
@@ -685,15 +721,25 @@ impl CoordinatorAcceptState {
         };
 
         if changed {
-            let mut s = self.state.write().unwrap();
-            if let Some(m) = s.members.get_mut(&remote_id) {
-                m.hostname = Some(final_hostname.clone());
+            {
+                let mut s = self.state.write().unwrap();
+                if let Some(m) = s.members.get_mut(&remote_id) {
+                    m.hostname = Some(final_hostname.clone());
+                }
             }
-        }
-        if changed {
             commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
         }
         drop(commit_guard);
+        if changed {
+            // A rename moves this member in and out of every suggested rule that
+            // names a hostname, and changes which host a rule keyed on a `role:`
+            // it holds resolves to. Same reason as `admit_peer`: the coordinator
+            // is the published record's source, so its own poller short-circuits
+            // and nothing else re-resolves its installed rules.
+            self.ctx
+                .registry
+                .reapply_suggested_firewall(&self.network_name);
+        }
 
         // Re-assert this peer's DNS entry (idempotent).
         dns::remove_hostname_by_ip(
@@ -799,7 +845,7 @@ impl CoordinatorAcceptState {
                     Ok(roles) => roles,
                     Err(e) => {
                         tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
-                        self.deny(conn, send, format!("role request refused: {e}"))
+                        self.deny_final(conn, send, format!("role request refused: {e}"))
                             .await;
                         // The secret was burned above; a refused role request is
                         // a definite denial, so give it back to its holder.
@@ -883,7 +929,7 @@ impl CoordinatorAcceptState {
                         Ok(roles) => roles,
                         Err(e) => {
                             tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
-                            self.deny(conn, send, format!("role request refused: {e}"))
+                            self.deny_final(conn, send, format!("role request refused: {e}"))
                                 .await;
                             return None;
                         }
@@ -914,13 +960,41 @@ impl CoordinatorAcceptState {
         }
     }
 
+    /// Refuse this attempt but invite another. For a condition on our side that
+    /// a later attempt may find gone: a direct grant we cannot reproduce yet, a
+    /// roster commit that did not land.
+    async fn deny(&self, conn: &Connection, send: iroh::endpoint::SendStream, reason: String) {
+        self.send_denial(conn, send, reason, true).await
+    }
+
+    /// Refuse the join for good. Nothing the joiner can do by asking again
+    /// changes the answer: it asked for a role that neither its credential nor
+    /// the operator's approval carries, or for one that is not a role name at
+    /// all. Say so, because a closed-network joiner retries on a backoff until
+    /// told to stop, and its CLI returned at "waiting for approval", so an
+    /// unmarked refusal loops silently forever.
+    async fn deny_final(
+        &self,
+        conn: &Connection,
+        send: iroh::endpoint::SendStream,
+        reason: String,
+    ) {
+        self.send_denial(conn, send, reason, false).await
+    }
+
     /// Reply on the joiner's stream that the join was refused, then wait for the
     /// joiner to close so the JoinDenied flushes before `conn` is dropped.
-    async fn deny(&self, conn: &Connection, mut send: iroh::endpoint::SendStream, reason: String) {
+    async fn send_denial(
+        &self,
+        conn: &Connection,
+        mut send: iroh::endpoint::SendStream,
+        reason: String,
+        retryable: bool,
+    ) {
         let _ = control::send_msg(
             &mut send,
             Some(self.net_pubkey()),
-            &ControlMsg::JoinDenied { reason },
+            &ControlMsg::JoinDenied { reason, retryable },
         )
         .await;
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
@@ -2478,6 +2552,7 @@ mod pending_cap_tests {
         PendingJoin {
             hostname: None,
             device_cert: None,
+            requested_roles: BTreeSet::new(),
             requested_at: t,
         }
     }

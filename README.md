@@ -452,6 +452,9 @@ A few rules of thumb:
 - Roles are the opposite: they are published as written and resolved on each
   node against the signed roster, so a node that joins later is covered without
   a second `ray apply`. Use a role wherever the count can change.
+- A role name is lowercase `[a-z0-9-]`, and the spec is matched against the
+  roster byte for byte, so `role:Sentry` is rejected when the spec is read
+  rather than published as a rule no member can match.
 
 ### Roles, for fleets that grow
 

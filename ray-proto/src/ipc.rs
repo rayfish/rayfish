@@ -787,6 +787,11 @@ pub struct PendingRequestInfo {
     pub short_id: String,
     pub hostname: Option<String>,
     pub waiting_secs: u64,
+    /// Roles the peer asked for (`ray join --role`). Shown so the operator can
+    /// see what to pass to `ray requests accept --role`; the request itself
+    /// confers nothing, the approval does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_roles: Vec<String>,
 }
 
 /// An outbound send waiting in the daemon's outbox for its peer to come online.

@@ -35,10 +35,13 @@ pub const MAX_ROLE_LEN: usize = 32;
 /// Check one role name: 1..=[`MAX_ROLE_LEN`] chars of `[a-z0-9-]`, starting
 /// alphanumeric.
 ///
-/// Lowercase-only is not cosmetic. The `config` crate lowercases every key it
-/// parses, so a spec written as `role:Sentry` arrives as `role:sentry`; if a
-/// role could be minted with capitals it would silently never match its own
-/// rule. [`normalize`] lowercases first so both sides meet in the same case.
+/// Lowercase-only is not cosmetic. A `role:` selector in a `ray apply` spec is
+/// compared byte for byte against these names, and the `config` crate preserves
+/// the case its keys were written in, so nothing folds the two sides together on
+/// its own: a role minted with capitals would silently never match its own rule.
+/// [`normalize`] lowercases what the CLI hands in, and `apply::validate_names`
+/// rejects a spec key that is not already canonical, so both sides meet in the
+/// same case.
 ///
 /// `:` is rejected along with everything else outside the set, which is what
 /// stops a role named `role:sentry` from nesting the
@@ -80,6 +83,18 @@ pub fn normalize(names: &[String]) -> Result<BTreeSet<String>> {
         bail!("{} roles given; the limit is {MAX_ROLES}", out.len());
     }
     Ok(out)
+}
+
+/// Canonicalize a role set that arrived over the wire.
+///
+/// The joiner normalizes what it asks for before sending, but an older or
+/// hand-rolled client need not have, and [`grant`] compares by exact set
+/// difference: an un-normalized `Sentry` reads as outside a key that grants
+/// `sentry` and fails the join for no reason the operator can see. A name that
+/// is still not a role after trimming and lowercasing is an error, so a
+/// malformed request is refused rather than quietly dropped.
+pub fn canonicalize(roles: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    normalize(&roles.iter().cloned().collect::<Vec<_>>())
 }
 
 /// Narrow the roles a redeemed credential permits to the subset the joiner
@@ -146,8 +161,10 @@ mod tests {
         assert!(validate_role(&over).is_err());
     }
 
-    /// The spec side is lowercased by the `config` crate, so the mint side has
-    /// to meet it there or a `--role Sentry` key would never match its rule.
+    /// The mint side takes free-form CLI input, so it canonicalizes; the spec
+    /// side is validated to be canonical already (`apply::validate_role_key`).
+    /// Both land on the same name or a `--role Sentry` key would never match
+    /// its rule.
     #[test]
     fn normalize_lowercases_trims_and_dedupes() {
         let got = normalize(&[
@@ -234,6 +251,21 @@ mod tests {
                 .is_empty()
         );
         assert!(grant(&BTreeSet::new(), &set(&["sentry"])).is_err());
+    }
+
+    /// The join path's half of the case rule: a key minted `--role Sentry` is
+    /// stored as `sentry`, so a request spelled `Sentry` has to land there too
+    /// or `grant` refuses a role the key actually carries.
+    #[test]
+    fn canonicalize_matches_what_the_mint_stored() {
+        let permitted = normalize(&["Sentry".to_string()]).unwrap();
+        let requested = canonicalize(&set(&["Sentry"])).unwrap();
+        assert_eq!(grant(&permitted, &requested).unwrap(), set(&["sentry"]));
+    }
+
+    #[test]
+    fn canonicalize_rejects_a_name_that_is_not_a_role() {
+        assert!(canonicalize(&set(&["not a role"])).is_err());
     }
 
     #[test]

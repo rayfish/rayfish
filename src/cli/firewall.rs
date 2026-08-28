@@ -649,22 +649,30 @@ pub(crate) async fn ipc_apply(
         // Publish suggestions (idempotent). With --prune, publish exactly the
         // spec's set; without it, merge into the live set (so `apply` never
         // silently drops subjects authored out-of-band - use --prune for that).
+        //
+        // The live set is read either way, not only for the merge: publishing
+        // always replaces the live set, so a successful publish says nothing
+        // about whether anything moved, and `changed` has to come from the
+        // comparison or Ansible's `changed_when` reports a change on every play.
+        // A read that failed reads as empty, which errs towards "changed".
+        let live = ipc_firewall_suggestions_get(net_name)
+            .await
+            .unwrap_or_default();
         let to_publish = if prune {
             net_firewall.clone()
         } else {
-            let mut live = ipc_firewall_suggestions_get(net_name)
-                .await
-                .unwrap_or_default();
             // Merge spec subjects over live (spec wins on conflict).
+            let mut merged = live.clone();
             for (subj, rules) in net_firewall {
-                live.insert(subj.clone(), rules.clone());
+                merged.insert(subj.clone(), rules.clone());
             }
-            live
+            merged
         };
+        let differs = to_publish != live;
         let published = ipc_firewall_suggest_set(net_name, to_publish).await;
         match &published {
             Ok(msg) => {
-                changed = true;
+                changed |= differs;
                 if !json {
                     println!("{}   {msg}", style::faint("→"));
                 }
