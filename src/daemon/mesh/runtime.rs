@@ -911,7 +911,13 @@ impl NetworkRegistry {
                 ..JoinOptions::default()
             };
             tokio::spawn(async move {
-                let _ = me.join_network(&key, name.as_deref(), opts).await;
+                // Nobody is holding an IPC stream for this one, so the reply has
+                // nowhere to go but the log.
+                if let IpcMessage::Error { message } =
+                    me.join_network(&key, name.as_deref(), opts).await
+                {
+                    tracing::warn!(net = %key, error = %message, "resumed join request failed");
+                }
             });
         }
 

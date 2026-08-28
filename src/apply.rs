@@ -115,6 +115,17 @@ fn validate_names(spec: &DeploySpec) -> Result<()> {
              role resolved on each node; a group or alias cannot shadow one"
         );
     }
+    // A group member is not expanded when it names a role: `expand_firewall`
+    // passes it through and the node side resolves it, so it reaches the
+    // published rules exactly as a subject or peer key would, and needs the same
+    // check. Nothing downstream would report it: `expected_hosts` skips `role:`
+    // keys, so a miscased one is not even listed as a host that never joined.
+    for (group, members) in &spec.groups {
+        for member in members {
+            validate_role_selector(member)
+                .with_context(|| format!("group `{group}`: member `{member}`"))?;
+        }
+    }
     for (network, firewall) in &spec.networks {
         for (subject, rules) in firewall {
             validate_role_key(network, subject)?;
@@ -141,11 +152,17 @@ fn validate_names(spec: &DeploySpec) -> Result<()> {
 /// are distinct YAML keys, and folding them would merge one into the other and
 /// drop its rules without a word.
 fn validate_role_key(network: &str, key: &str) -> Result<()> {
-    let Some(role) = policy::role_of(key) else {
-        return Ok(());
-    };
-    crate::roles::validate_role(role)
+    validate_role_selector(key)
         .with_context(|| format!("network `{network}`: firewall key `{key}`"))
+}
+
+/// The check itself, without the caller's context: a name that is not a `role:`
+/// selector passes untouched, one that is has to name a role a member can hold.
+fn validate_role_selector(name: &str) -> Result<()> {
+    match policy::role_of(name) {
+        Some(role) => crate::roles::validate_role(role),
+        None => Ok(()),
+    }
 }
 
 /// Recursively replace `ValueKind::Nil` with an empty `Table` so a null
@@ -647,6 +664,51 @@ networks:
         )
         .unwrap_err();
         assert!(err.to_string().contains("role:"), "{err}");
+    }
+
+    /// A group member naming a role is not expanded here, it passes through into
+    /// the published rules, so a miscased one is the same silent no-match as a
+    /// miscased subject key and is rejected at the same place.
+    #[test]
+    fn a_role_inside_a_group_is_held_to_the_same_case_rule() {
+        let yaml = r#"
+groups:
+  fleet: ["role:Sentry"]
+networks:
+  prod:
+    alice:
+      allows:
+        fleet: "tcp:22"
+"#;
+        let err = parse(yaml).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("role:Sentry"), "{text}");
+        assert!(text.contains("fleet"), "{text}");
+    }
+
+    /// The other side of it: a canonical role in a group expands to itself and
+    /// reaches the published firewall as a selector the node side resolves.
+    #[test]
+    fn a_canonical_role_inside_a_group_expands_to_itself() {
+        let yaml = r#"
+groups:
+  fleet: ["role:sentry", "alice"]
+networks:
+  prod:
+    bob:
+      allows:
+        fleet: "tcp:22"
+"#;
+        let spec = parse(yaml).unwrap();
+        let (expanded, empty) = expand_firewall(
+            &spec.networks["prod"],
+            &BTreeMap::new(),
+            &spec.groups,
+            &|_| vec![],
+        );
+        assert!(empty.is_empty());
+        let peers: Vec<&String> = expanded["bob"].allows.keys().collect();
+        assert_eq!(peers, vec!["alice", "role:sentry"]);
     }
 
     /// The bug this guards: `config` preserves key case, so a spec written with

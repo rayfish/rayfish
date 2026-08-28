@@ -331,7 +331,18 @@ impl InviteStore {
     /// The `secret_hash` is the full hex blake3 of the secret (same format as
     /// `mint` stores internally). This lets a co-coordinator redeem an invite it
     /// did not mint, when the originating coordinator shares the hash out-of-band.
-    pub fn record_shared(&mut self, id: String, secret_hash: String, expires: u64) -> Result<()> {
+    ///
+    /// `roles` is what the minter bound to the code, so redeeming here grants the
+    /// same thing it would have there. `hostname` has no counterpart: it is not
+    /// gossiped, so an authoritative name still only binds on the coordinator
+    /// that minted the invite.
+    pub fn record_shared(
+        &mut self,
+        id: String,
+        secret_hash: String,
+        expires: u64,
+        roles: BTreeSet<String>,
+    ) -> Result<()> {
         if self.invites.iter().any(|i| i.id == id) {
             return Ok(());
         }
@@ -342,7 +353,7 @@ impl InviteStore {
             expires,
             status: InviteStatus::Pending,
             hostname: None,
-            roles: BTreeSet::new(),
+            roles,
         });
         self.save()
     }
@@ -680,13 +691,17 @@ mod tests {
         // secret_hash is a hex String in the real code.
         let hash = blake3::hash(&secret).to_hex().to_string();
 
+        let roles: BTreeSet<String> = ["sentry".to_string()].into();
         store
-            .record_shared("abcd1234".into(), hash.clone(), u64::MAX)
+            .record_shared("abcd1234".into(), hash.clone(), u64::MAX, roles.clone())
             .unwrap();
-        // A shared entry is redeemable by this (non-minting) coordinator
-        // (hostname is None since record_shared has no hostname binding):
+        // A shared entry is redeemable by this (non-minting) coordinator, and
+        // grants the roles the minter bound to it. The hostname is None: that
+        // half of the binding is not gossiped.
         let by = test_id(5);
-        assert!(store.redeem(&secret, by).unwrap().hostname.is_none());
+        let grant = store.redeem(&secret, by).unwrap();
+        assert!(grant.hostname.is_none());
+        assert_eq!(grant.roles, roles);
         // Burning an already-redeemed hash is a no-op (returns false):
         assert!(!store.burn_by_hash(&hash).unwrap());
     }
@@ -698,7 +713,7 @@ mod tests {
         let secret = generate_secret();
         let hash = blake3::hash(&secret).to_hex().to_string();
         store
-            .record_shared("id00".into(), hash.clone(), u64::MAX)
+            .record_shared("id00".into(), hash.clone(), u64::MAX, BTreeSet::new())
             .unwrap();
         assert!(store.burn_by_hash(&hash).unwrap()); // first burn changes state
         assert!(store.redeem(&secret, test_id(9)).is_err()); // now unusable

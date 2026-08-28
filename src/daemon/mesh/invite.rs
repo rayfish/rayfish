@@ -64,8 +64,8 @@ impl NetworkRegistry {
             Ok(v) => v,
             Err(e) => return e,
         };
-        // Kept for the reply: the grant consumes the set below.
-        let roles_out: Vec<String> = roles.iter().cloned().collect();
+        // Kept for the reply and the gossip below: the grant consumes the set.
+        let minted_roles = roles.clone();
         let minted = {
             let _guard = lock.lock().await;
             match crate::invite::InviteStore::load(network) {
@@ -112,6 +112,7 @@ impl NetworkRegistry {
                             id: id.clone(),
                             secret_hash: secret_hash.into_bytes(),
                             expires,
+                            roles: minted_roles.clone(),
                         },
                     )
                     .await;
@@ -120,7 +121,7 @@ impl NetworkRegistry {
                     code,
                     id,
                     expires_secs,
-                    roles: roles_out,
+                    roles: minted_roles.into_iter().collect(),
                 }
             }
             Err(e) => ipc_err(format!("failed to mint invite: {e:#}")),
@@ -335,8 +336,15 @@ impl NetworkRegistry {
             Ok(roles) => roles,
             Err(e) => return ipc_err(format!("{e:#}")),
         };
-        // Find and remove the pending request matching the short id prefix.
-        let pending = {
+        // Find the pending request matching the short id prefix, and take it only
+        // if this accept grants every role it asked for. The peer's `--role` is a
+        // request and this approval is the grant, so accepting without those roles
+        // leaves the peer refused for good: its next attempt takes the approved
+        // branch, `roles::grant` fails there, and the denial is final. Removing the
+        // entry first would delete the request the operator has to re-accept along
+        // with it, leaving no way back but a manual `ray join` on the peer itself,
+        // so refuse while the request is still queued and the peer still retrying.
+        let taken = {
             let Some(handle) = self.networks.get(network) else {
                 return ipc_err(format!("network '{network}' not active"));
             };
@@ -349,9 +357,32 @@ impl NetworkRegistry {
                         || k.to_string().starts_with(id_prefix)
                 })
                 .copied();
-            found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
+            match found {
+                Some(id) => {
+                    let unmet: Vec<String> = s
+                        .pending
+                        .get(&id)
+                        .map(|pj| pj.requested_roles.difference(&granted).cloned().collect())
+                        .unwrap_or_default();
+                    match unmet.as_slice() {
+                        [] => s.pending.remove(&id).map(|pj| (id, pj)),
+                        _ => {
+                            return ipc_err(format!(
+                                "{short} asked for {unmet}, which this accept does not grant; \
+                                 it would be refused for good. Accept it with `ray requests \
+                                 {network} accept {short} --role {flags}`, or turn it away with \
+                                 `ray requests {network} deny {short}`",
+                                short = id.fmt_short(),
+                                unmet = unmet.join(", "),
+                                flags = unmet.join(" --role "),
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            }
         };
-        let Some((identity, pj)) = pending else {
+        let Some((identity, pj)) = taken else {
             return ipc_err(format!("no pending request matching '{id_prefix}'"));
         };
 
@@ -385,27 +416,9 @@ impl NetworkRegistry {
             },
         )
         .await;
-        // The peer's own `--role` is a request, not a grant: this approval is
-        // the grant, so accepting without `--role` confers nothing and the
-        // peer's next attempt is refused for good. Say which roles went ungranted
-        // instead of leaving the operator to work it out from a retry that stops.
-        let unmet: Vec<&str> = pj
-            .requested_roles
-            .difference(&granted)
-            .map(String::as_str)
-            .collect();
-        let message = if unmet.is_empty() {
-            format!("accepted {} — they'll join shortly", identity.fmt_short())
-        } else {
-            format!(
-                "accepted {short} without {unmet}, which it asked for; it will be refused \
-                 until you accept it with `ray requests accept {short} --role {flags}`",
-                short = identity.fmt_short(),
-                unmet = unmet.join(", "),
-                flags = unmet.join(" --role "),
-            )
-        };
-        IpcMessage::Ok { message }
+        IpcMessage::Ok {
+            message: format!("accepted {}, they'll join shortly", identity.fmt_short()),
+        }
     }
 
     pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {

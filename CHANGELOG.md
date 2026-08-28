@@ -27,7 +27,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a role it does not grant refuses the join, and does so once rather than
   retrying. `ray requests <net> accept <id> --role <name>` assigns roles on a
   live approval, which has no code to read them from; `ray requests` shows what
-  each waiting peer asked for, so there is something to copy into that flag.
+  each waiting peer asked for, so there is something to copy into that flag. An
+  accept that leaves out a role the peer asked for is refused and the request
+  stays queued: seating it without them would refuse its next attempt for good.
   `ray status` shows the roles a peer holds.
 
   Role names are lowercase `[a-z0-9-]`. A `role:` key in a spec is matched

@@ -38,6 +38,38 @@ pub(crate) fn evict_oldest_pending(
     Some(oldest)
 }
 
+/// The parts of a gossiped [`ControlMsg::InviteShare`] a ledger entry is written
+/// from. One struct rather than four positional arguments, because two handlers
+/// (a coordinator's, and a member's for the co-coordinator case) build the same
+/// call.
+pub(crate) struct SharedInvite {
+    pub(crate) id: String,
+    /// The hex `blake3(secret)` as UTF-8 bytes, the form it travels in.
+    pub(crate) secret_hash: Vec<u8>,
+    pub(crate) expires: u64,
+    /// What the minter bound to the code, so redeeming it here grants the same
+    /// thing it would have there.
+    pub(crate) roles: BTreeSet<String>,
+}
+
+/// Write a coordinator-gossiped invite into `network`'s ledger. The caller holds
+/// the invite lock. A hash that is not UTF-8 is not one we minted, so it is
+/// dropped rather than stored.
+fn record_shared_invite(network: &str, shared: SharedInvite) {
+    let SharedInvite {
+        id,
+        secret_hash,
+        expires,
+        roles,
+    } = shared;
+    let Ok(hash) = String::from_utf8(secret_hash) else {
+        return;
+    };
+    if let Ok(mut store) = crate::invite::InviteStore::load(network) {
+        let _ = store.record_shared(id, hash, expires, roles);
+    }
+}
+
 /// A paired device is auto-admitted into a closed network only when its device
 /// cert is signed by this coordinator's own owner identity. The cert's
 /// signature is verified by the caller before this check.
@@ -290,9 +322,18 @@ impl CoordinatorAcceptState {
                 id,
                 secret_hash,
                 expires,
+                roles,
             } => {
-                self.handle_invite_share(peer_id, id, secret_hash, expires)
-                    .await;
+                self.handle_invite_share(
+                    peer_id,
+                    SharedInvite {
+                        id,
+                        secret_hash,
+                        expires,
+                        roles,
+                    },
+                )
+                .await;
                 None
             }
             ControlMsg::InviteUsed { secret_hash } => {
@@ -774,24 +815,13 @@ impl CoordinatorAcceptState {
     /// Handle an `InviteShare` gossiped by another coordinator: record its hash so
     /// this coordinator can redeem the cross-minted single-use invite too. Honored
     /// only from a coordinator peer in our verified roster.
-    async fn handle_invite_share(
-        &self,
-        peer_id: EndpointId,
-        id: String,
-        secret_hash: Vec<u8>,
-        expires: u64,
-    ) {
+    async fn handle_invite_share(&self, peer_id: EndpointId, shared: SharedInvite) {
         if !sender_is_coordinator(&self.state, peer_id) {
             tracing::warn!(peer = %peer_id.fmt_short(), "ignoring InviteShare from non-coordinator");
             return;
         }
-        let Ok(hash) = String::from_utf8(secret_hash) else {
-            return;
-        };
         let _guard = self.invite_lock.lock().await;
-        if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
-            let _ = store.record_shared(id, hash, expires);
-        }
+        record_shared_invite(&self.network_name, shared);
     }
 
     /// Handle an `InviteUsed` gossiped by another coordinator: burn the single-use
@@ -1480,14 +1510,19 @@ impl MemberAcceptState {
                 id,
                 secret_hash,
                 expires,
+                roles,
             } => {
-                if sender_is_coordinator(&self.state, peer_id)
-                    && let Ok(hash) = String::from_utf8(secret_hash)
-                {
+                if sender_is_coordinator(&self.state, peer_id) {
                     let _guard = self.invite_lock.lock().await;
-                    if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
-                        let _ = store.record_shared(id, hash, expires);
-                    }
+                    record_shared_invite(
+                        &self.network_name,
+                        SharedInvite {
+                            id,
+                            secret_hash,
+                            expires,
+                            roles,
+                        },
+                    );
                 }
                 None
             }
@@ -2295,6 +2330,7 @@ mod stranger_policy_tests {
                 id: "ab".into(),
                 secret_hash: vec![],
                 expires: 0,
+                roles: Default::default(),
             },
             ControlMsg::InviteUsed {
                 secret_hash: vec![],
