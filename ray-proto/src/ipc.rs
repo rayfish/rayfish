@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
@@ -60,6 +60,12 @@ pub enum IpcMessage {
         /// network (`--auto-accept-files`).
         #[serde(default)]
         auto_accept_files: bool,
+        /// Roles to ask for (`ray join --role sentry`). A request, not a claim:
+        /// the coordinator grants only what the presented credential permits,
+        /// and refuses the join outright for anything outside it. Empty means
+        /// "whatever the credential carries", which is the usual case.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
     },
     Leave {
         name: String,
@@ -295,6 +301,11 @@ pub enum IpcMessage {
         /// so any network-key holder can admit. Hostname is not authoritative.
         #[serde(default)]
         reusable: bool,
+        /// Roles every node redeeming this credential is assigned. Unlike
+        /// `hostname` these are allowed on a reusable key: a role is shared by a
+        /// class of nodes by design, so one key can seat a whole group.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
     },
     /// List invites for a network (coordinator-only).
     InviteList {
@@ -313,6 +324,10 @@ pub enum IpcMessage {
     AcceptRequest {
         network: String,
         id: String,
+        /// Roles to assign on approval. A live approval has no credential to
+        /// read them off, so the operator names them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
     },
     /// Drop a pending peer's join request by short id (coordinator-only).
     DenyRequest {
@@ -594,6 +609,10 @@ pub enum IpcMessage {
         code: String,
         id: String,
         expires_secs: u64,
+        /// Roles the credential grants, echoed back so `--json` can report what
+        /// was actually minted rather than what was asked for.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
     },
     /// The list of invites for a network.
     InviteListResponse {
@@ -853,6 +872,9 @@ pub struct NetworkStatus {
     /// seeds `ray apply`'s `aliases:` map.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// Roles this node itself holds on this network, from the signed roster.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub my_roles: BTreeSet<String>,
     /// Per-network ephemeral auto-kick TTL in seconds, if the policy is on
     /// (`ray ephemeral <net> <dur>`). `None` = off. Shown on the network line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -914,6 +936,11 @@ pub struct PeerStatus {
     /// when idle, so a bare `connection.is_none()` must read as `Idle`, not offline.
     #[serde(default)]
     pub state: PeerState,
+    /// Roles the coordinator assigned this peer, from the signed roster. What a
+    /// `role:` firewall rule resolves against, so `ray apply` can report which
+    /// members a role actually covers.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub roles: BTreeSet<String>,
     /// True when this peer advertises itself as an exit node on this network
     /// (`Member.exit_node` in the signed roster). Shown as a badge in status.
     #[serde(default)]
@@ -1709,6 +1736,7 @@ mod tests {
             expires_secs: 604_800,
             hostname: None,
             reusable: true,
+            roles: vec!["sentry".to_string()],
         };
         // The IPC codec uses `to_vec_named`; positional encoding can't survive a
         // `skip_serializing_if` field followed by another field.
@@ -1720,10 +1748,15 @@ mod tests {
                 expires_secs,
                 hostname: _,
                 reusable,
+                roles,
             } => {
                 assert_eq!(network, "gaming");
                 assert_eq!(expires_secs, 604_800);
                 assert!(reusable);
+                // A reusable key carrying roles is the shape a provisioner
+                // mints; it must survive the codec alongside the skipped
+                // `hostname` in front of it.
+                assert_eq!(roles, vec!["sentry".to_string()]);
             }
             _ => panic!("wrong variant"),
         }
@@ -1765,6 +1798,7 @@ mod tests {
             coordinator: Some(coord),
             auto_accept_firewall: false,
             auto_accept_files: false,
+            roles: Vec::new(),
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -1883,6 +1917,7 @@ mod tests {
                     ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 6),
                     hostname: None,
                     user_identity: None,
+                    roles: Default::default(),
                     is_own_device: false,
                     incompatible: false,
                     connection: None,
@@ -1893,6 +1928,7 @@ mod tests {
                 pending_suggestions: 0,
                 pending_requests: 0,
                 aliases: BTreeMap::new(),
+                my_roles: Default::default(),
                 ephemeral_ttl_secs: None,
                 my_exit_node: None,
                 exit_offering: false,

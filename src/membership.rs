@@ -168,6 +168,20 @@ pub struct Member {
     /// family's traffic and have nowhere to send it. Without this that failure is
     /// a silent black hole, since nothing else on the roster says which families a
     /// gateway can egress. See [`ExitFamilies`] for why it is three-valued.
+    #[serde(default)]
+    pub exit_families: ExitFamilies,
+    /// Roles the coordinator assigned this member, the selector a suggested
+    /// firewall rule uses when it targets a class of nodes (`role:sentry`)
+    /// rather than one machine. Empty for a member admitted without any.
+    ///
+    /// Assigned from the redeemed join key, never from anything the joiner says
+    /// about itself (see [`crate::roles`]), so unlike [`Self::hostname`] on an
+    /// unbound invite this cannot be self-claimed. That is what lets a rule key
+    /// on it safely.
+    ///
+    /// A [`BTreeSet`] because it sorts: `canonical_group_bytes` hashes this, so
+    /// two coordinators assigning the same roles in different orders must
+    /// produce the same blob.
     ///
     /// **Last on purpose.** The wire is positional, so a field's declaration order
     /// *is* the wire format: appending is what makes an older build's shorter array
@@ -176,7 +190,7 @@ pub struct Member {
     /// only when the two happen to differ in type and decodes clean and wrong when
     /// they do not.
     #[serde(default)]
-    pub exit_families: ExitFamilies,
+    pub roles: BTreeSet<String>,
 }
 
 impl Member {
@@ -284,6 +298,11 @@ pub struct ApprovedEntry {
     pub user_identity: Option<EndpointId>,
     #[serde(default)]
     pub device_cert: Option<DeviceCert>,
+    /// Roles to assign when this peer connects, so an approval made before the
+    /// peer arrives carries the same authority a redeemed key would. Appended
+    /// last for the reason spelled out on [`Member::roles`].
+    #[serde(default)]
+    pub roles: BTreeSet<String>,
 }
 
 /// Pre-approved peers that the coordinator has broadcast but that haven't
@@ -312,6 +331,13 @@ impl ApprovedList {
 
     pub fn is_approved(&self, identity: &EndpointId) -> bool {
         self.entries.contains_key(identity)
+    }
+
+    /// The approval recorded for `identity`, if any. Admission reads the roles
+    /// off it so a peer approved before it connected is seated with the same
+    /// authority a redeemed key would have given it.
+    pub fn get(&self, identity: &EndpointId) -> Option<&ApprovedEntry> {
+        self.entries.get(identity)
     }
 
     pub fn remove(&mut self, identity: &EndpointId) -> Option<ApprovedEntry> {
@@ -402,6 +428,15 @@ pub struct ReusableKey {
     pub expires: u64,
     /// Set by `ray invite revoke`; a revoked key admits no one.
     pub revoked: bool,
+    /// Roles this key grants. Every node redeeming it is assigned these (or the
+    /// subset it asks for with `ray join --role`), which is what lets one key in
+    /// a Terraform user-data block admit a whole autoscaling group as sentries.
+    ///
+    /// A reusable key may bind roles even though it may not bind a hostname: a
+    /// hostname is unique per node and a role is deliberately not, so a shared
+    /// key can carry one and not the other. Appended last, see [`Member::roles`].
+    #[serde(default)]
+    pub roles: BTreeSet<String>,
 }
 
 /// The single authoritative blob for a network, published by the coordinator.
@@ -438,7 +473,14 @@ impl ReusableKey {
     /// Build a reusable key from a freshly generated secret. Returns the map key
     /// (hex `blake3(secret)`) and the entry. `created`/`ttl_secs` are Unix seconds;
     /// the raw secret is the caller's to encode into the join code and discard.
-    pub fn from_secret(secret: &[u8], created: u64, ttl_secs: u64) -> (String, ReusableKey) {
+    /// `roles` is what every node redeeming this key is assigned; already
+    /// validated and canonicalized by [`crate::roles::normalize`].
+    pub fn from_secret(
+        secret: &[u8],
+        created: u64,
+        ttl_secs: u64,
+        roles: BTreeSet<String>,
+    ) -> (String, ReusableKey) {
         let hash = blake3::hash(secret).to_hex().to_string();
         let id = hash[..8].to_string();
         (
@@ -448,6 +490,7 @@ impl ReusableKey {
                 created,
                 expires: created.saturating_add(ttl_secs),
                 revoked: false,
+                roles,
             },
         )
     }
@@ -650,6 +693,21 @@ mod tests {
         }
     }
 
+    /// A plain roster entry, for tests that only care about one field.
+    fn test_member(n: u8) -> Member {
+        Member {
+            identity: test_id(n),
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+            roles: BTreeSet::new(),
+        }
+    }
+
     #[test]
     fn test_derive_ipv6_different_identities_differ() {
         let a = derive_ipv6(&test_id(1));
@@ -684,6 +742,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         };
         list.add(member.clone());
         assert!(list.is_member(&id));
@@ -703,6 +762,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         list.add(Member {
             identity: id,
@@ -713,6 +773,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         assert!(list.get(&id).unwrap().is_coordinator);
     }
@@ -730,6 +791,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         let removed = list.remove(&id);
         assert!(removed.is_some());
@@ -749,6 +811,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         list.add(Member {
             identity: test_id(2),
@@ -759,6 +822,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         assert_eq!(list.all().len(), 2);
     }
@@ -772,6 +836,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            roles: Default::default(),
         };
         list.approve(entry);
         assert!(list.is_approved(&id));
@@ -787,12 +852,14 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            roles: Default::default(),
         });
         approved.approve(ApprovedEntry {
             identity: id,
             hostname: None,
             user_identity: None,
             device_cert: None,
+            roles: Default::default(),
         });
         assert_eq!(approved.all().len(), 1);
     }
@@ -806,6 +873,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            roles: Default::default(),
         });
         let removed = approved.remove(&id);
         assert!(removed.is_some());
@@ -820,12 +888,14 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                roles: Default::default(),
             },
             ApprovedEntry {
                 identity: test_id(2),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                roles: Default::default(),
             },
         ];
         let list = ApprovedList::from_entries(entries);
@@ -849,6 +919,7 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: Default::default(),
             });
         }
         list
@@ -869,6 +940,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
 
         // Mesh IPv6 literal -> the member's device id.
@@ -966,6 +1038,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            roles: Default::default(),
         });
 
         let bytes = canonical_group_bytes(
@@ -1057,6 +1130,7 @@ mod tests {
             last_seen: Some(12345),
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
@@ -1096,6 +1170,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
@@ -1332,6 +1407,7 @@ mod tests {
                     1 => ExitFamilies::Dual,
                     _ => ExitFamilies::Unknown,
                 },
+                roles: Default::default(),
             });
             released.push(ReleasedMember {
                 identity: id,
@@ -1502,6 +1578,7 @@ mod tests {
             last_seen: None,
             exit_node: true,
             exit_families: ExitFamilies::Dual,
+            roles: Default::default(),
         })
         .unwrap();
 
@@ -1564,6 +1641,7 @@ mod tests {
                 created: 0,
                 expires,
                 revoked,
+                roles: Default::default(),
             },
         )
     }
@@ -1655,10 +1733,61 @@ mod tests {
         assert!(blob.nullifiers.is_empty());
     }
 
+    /// Roles ride the signed blob, so they must survive the array encoding the
+    /// hash is taken over.
+    #[test]
+    fn member_roles_survive_the_blob_round_trip() {
+        let roles: BTreeSet<String> = ["eu".to_string(), "sentry".to_string()].into();
+        let mut member = test_member(1);
+        member.roles = roles.clone();
+        let mut members = MemberList::new();
+        members.add(member);
+        let bytes = canonical_group_bytes(
+            &members,
+            &ApprovedList::new(),
+            &SuggestedFirewall::new(),
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let decoded: GroupBlob = rmp_serde::from_slice(&bytes).expect("decode blob");
+        assert_eq!(decoded.members[0].roles, roles);
+    }
+
+    /// The hash has to be independent of the order roles were assigned in, or
+    /// two coordinators with the same intent would fight over the blob.
+    #[test]
+    fn role_order_does_not_change_the_blob_hash() {
+        let bytes_for = |names: [&str; 2]| {
+            let mut member = test_member(1);
+            member.roles = names.iter().map(|s| s.to_string()).collect();
+            let mut members = MemberList::new();
+            members.add(member);
+            canonical_group_bytes(
+                &members,
+                &ApprovedList::new(),
+                &SuggestedFirewall::new(),
+                None,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            )
+        };
+        assert_eq!(bytes_for(["sentry", "eu"]), bytes_for(["eu", "sentry"]));
+    }
+
+    /// A reusable key carries the roles it grants; that is what lets one code in
+    /// a user-data block seat a whole group.
+    #[test]
+    fn a_reusable_key_carries_its_roles() {
+        let roles: BTreeSet<String> = ["sentry".to_string()].into();
+        let (_hash, key) = ReusableKey::from_secret(&[7u8; 16], 0, 100, roles.clone());
+        assert_eq!(key.roles, roles);
+    }
+
     #[test]
     fn reusable_key_from_secret_sets_id_and_expiry() {
         let secret = [5u8; 16];
-        let (hash, key) = ReusableKey::from_secret(&secret, 100, 50);
+        let (hash, key) = ReusableKey::from_secret(&secret, 100, 50, Default::default());
         assert_eq!(hash, blake3::hash(&secret).to_hex().to_string());
         assert_eq!(key.id, hash[..8]);
         assert_eq!(key.created, 100);
@@ -1669,7 +1798,7 @@ mod tests {
     #[test]
     fn revoke_reusable_by_full_id_and_prefix() {
         let secret = [6u8; 16];
-        let (hash, key) = ReusableKey::from_secret(&secret, 0, 100);
+        let (hash, key) = ReusableKey::from_secret(&secret, 0, 100, Default::default());
         let mut keys = BTreeMap::new();
         keys.insert(hash.clone(), key.clone());
         // Full id.
@@ -1694,6 +1823,7 @@ mod tests {
                 created: 0,
                 expires: 100,
                 revoked: false,
+                roles: Default::default(),
             },
         );
         keys.insert(
@@ -1703,6 +1833,7 @@ mod tests {
                 created: 0,
                 expires: 100,
                 revoked: false,
+                roles: Default::default(),
             },
         );
         assert!(
@@ -1752,6 +1883,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         });
         mark_coordinator(&mut list, &id);
         assert!(list.get(&id).unwrap().is_coordinator);

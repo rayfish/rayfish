@@ -18,6 +18,7 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`firewall/`](firewall) | 3 | The coordinator suggested-firewall pipeline (`suggest` → `pending`/`accept`, `auto-accept`, additive whitelist vs blacklist) and the per-packet rule matrix (UDP, port ranges, same-selector replace, `--network` scoping) over a real TUN. |
 | [`closed-net/`](closed-net) | 3 | Closed-net admission + lifecycle commands: live approval (`requests`/`accept`/`deny`), co-coordinator (`admin add`) gatekeeper resilience with a reusable key, `ray hostname` + magic-DNS, `ray leave`/`nuke`, and a `ray apply` smoke. |
 | [`apply/`](apply) | 3 | Declarative `ray apply` deploy end to end: create-if-absent + membership-gap diff, `--invite-missing`, `ray identityof`, alias/group expansion (`--dry-run`), real suggestion publish + data-plane enforcement, and `--prune`. |
+| [`roles/`](roles) | 3 | Coordinator-assigned roles: one reusable `--role` key seats two nodes, a `role:` subject/peer resolves against the signed roster, a third node joining later is covered with **no** second `ray apply`, and a `--role` outside the key's grant refuses the join. |
 | [`dns/`](dns) | 2 | Magic DNS resolution over a real TUN: `<host>.<net>.ray` resolves via the system resolver, drives reachability, no host `:53` bind, non-`.ray` passthrough, and `ray down` revert. |
 | [`ssh/`](ssh) | 2 | Mesh SSH (`ray firewall ssh`): the allow/deny matrix over the TUN, so an SSH grant is a firewall rule and not a separate door. |
 | [`v4bridge/`](v4bridge) | 2 | A service listening on `0.0.0.0` answers over the IPv6-only mesh: the payload path by IP and by `.ray` name, the firewall still upstream of the bridge, loopback-only services declined, no bind/unbind flap across rescans, the setting + data-plane lifetime, and a new listener picked up from a kernel event rather than a timer (droplets only, see the scenario README). |
@@ -36,7 +37,7 @@ tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 ```
 
 where `<scenario>` is `device-cert`, `connect`, `firewall`, `closed-net`,
-`apply`, `dns`, `ssh`, `reliability`, `restore-offline`, `unpair`, `churn`,
+`apply`, `roles`, `dns`, `ssh`, `reliability`, `restore-offline`, `unpair`, `churn`,
 `exit-node`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).

@@ -11,10 +11,11 @@ impl Daemon {
         network: &str,
         expires_secs: u64,
         hostname: Option<String>,
+        roles: Vec<String>,
         reusable: bool,
     ) -> IpcMessage {
         self.registry
-            .invite_create(network, expires_secs, hostname, reusable)
+            .invite_create(network, expires_secs, hostname, roles, reusable)
             .await
     }
 
@@ -22,8 +23,15 @@ impl Daemon {
         self.registry.list_requests(network)
     }
 
-    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
-        self.registry.accept_request(network, id_prefix).await
+    pub async fn accept_request(
+        &self,
+        network: &str,
+        id_prefix: &str,
+        roles: Vec<String>,
+    ) -> IpcMessage {
+        self.registry
+            .accept_request(network, id_prefix, roles)
+            .await
     }
 
     pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
@@ -38,21 +46,33 @@ impl NetworkRegistry {
         network: &str,
         expires_secs: u64,
         hostname: Option<String>,
+        roles: Vec<String>,
         reusable: bool,
     ) -> IpcMessage {
+        // Validated here, on the authority side: the daemon assigns roles, so it
+        // is the daemon that decides what a role may look like.
+        let roles = match crate::roles::normalize(&roles) {
+            Ok(roles) => roles,
+            Err(e) => return ipc_err(format!("{e:#}")),
+        };
         if reusable {
             return self
-                .reusable_key_create(network, expires_secs, hostname)
+                .reusable_key_create(network, expires_secs, hostname, roles)
                 .await;
         }
         let (net_pubkey, lock) = match self.coordinator_handle(network) {
             Ok(v) => v,
             Err(e) => return e,
         };
+        // Kept for the reply: the grant consumes the set below.
+        let roles_out: Vec<String> = roles.iter().cloned().collect();
         let minted = {
             let _guard = lock.lock().await;
             match crate::invite::InviteStore::load(network) {
-                Ok(mut store) => store.mint(Duration::from_secs(expires_secs), hostname),
+                Ok(mut store) => store.mint(
+                    Duration::from_secs(expires_secs),
+                    crate::invite::Grant { hostname, roles },
+                ),
                 Err(e) => Err(e),
             }
         };
@@ -100,6 +120,7 @@ impl NetworkRegistry {
                     code,
                     id,
                     expires_secs,
+                    roles: roles_out,
                 }
             }
             Err(e) => ipc_err(format!("failed to mint invite: {e:#}")),
@@ -109,17 +130,24 @@ impl NetworkRegistry {
     /// Mint a reusable join key: insert its hash into the signed blob and
     /// republish, so any network-key holder can admit. Authority is holding the
     /// network secret key (like firewall suggestions), not the `is_coordinator`
-    /// flag. A reusable key cannot bind an authoritative hostname.
+    /// flag.
+    ///
+    /// A reusable key cannot bind an authoritative hostname but **can** bind
+    /// roles, and the asymmetry is the point: a hostname is unique per node, so
+    /// a key admitting many machines cannot assign one, while a role is
+    /// deliberately shared by a whole class. That is what lets a single key sit
+    /// in a Terraform user-data block and seat an autoscaling group as sentries.
     pub(crate) async fn reusable_key_create(
         &self,
         network: &str,
         expires_secs: u64,
         hostname: Option<String>,
+        roles: BTreeSet<String>,
     ) -> IpcMessage {
         if hostname.is_some() {
             return ipc_err(
                 "a reusable key cannot bind a hostname (a multi-use key admits many \
-                          machines); drop --hostname or omit --reusable"
+                          machines); drop --hostname, or use --role to tag them all"
                     .to_string(),
             );
         }
@@ -143,8 +171,9 @@ impl NetworkRegistry {
             );
         }
         let secret = crate::invite::generate_secret();
+        let roles_out: Vec<String> = roles.iter().cloned().collect();
         let (hash, key) =
-            crate::membership::ReusableKey::from_secret(&secret, now_secs(), expires_secs);
+            crate::membership::ReusableKey::from_secret(&secret, now_secs(), expires_secs, roles);
         let id = key.id.clone();
         {
             let mut s = state.write().unwrap();
@@ -157,6 +186,7 @@ impl NetworkRegistry {
             code,
             id,
             expires_secs,
+            roles: roles_out,
         }
     }
 
@@ -289,10 +319,21 @@ impl NetworkRegistry {
         IpcMessage::PendingRequests { requests }
     }
 
-    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+    pub async fn accept_request(
+        &self,
+        network: &str,
+        id_prefix: &str,
+        roles: Vec<String>,
+    ) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
+        // A live approval has no credential to read roles off, so the operator
+        // supplies them: `ray accept <peer> --role sentry`.
+        let roles = match crate::roles::normalize(&roles) {
+            Ok(roles) => roles,
+            Err(e) => return ipc_err(format!("{e:#}")),
+        };
         // Find and remove the pending request matching the short id prefix.
         let pending = {
             let Some(handle) = self.networks.get(network) else {
@@ -325,6 +366,7 @@ impl NetworkRegistry {
                 hostname: pj.hostname.clone(),
                 user_identity: user_id,
                 device_cert: pj.device_cert.clone(),
+                roles: roles.clone(),
             });
             s.refresh_snapshot();
             net_pubkey
@@ -338,6 +380,7 @@ impl NetworkRegistry {
                 identity,
                 hostname: pj.hostname.clone(),
                 device_cert: pj.device_cert.clone(),
+                roles,
             },
         )
         .await;

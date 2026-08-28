@@ -81,6 +81,7 @@ fn json_requested(command: &Command) -> bool {
         | Command::Pair { json, .. }
         | Command::Identityof { json, .. }
         | Command::Alias { json, .. }
+        | Command::Apply { json, .. }
         | Command::Config { json, .. } => *json,
         _ => false,
     }
@@ -126,6 +127,11 @@ pub(crate) enum Command {
         /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
         auto_accept_firewall: bool,
+        /// Ask for a role the invite grants (repeatable). Only ever narrows what
+        /// the code already carries; asking for one it does not grant refuses
+        /// the join. Omit it to take everything the code carries.
+        #[arg(long = "role")]
+        roles: Vec<String>,
         /// Opt out of auto-accepting file transfers from your own paired devices
         /// on this network. By default own-device offers are accepted without a
         /// manual `ray files accept` (only offers whose sender is one of your own
@@ -288,6 +294,10 @@ pub(crate) enum Command {
         /// Short id of the pending peer (from `ray requests`)
         #[arg(add = complete::join_requests())]
         id: String,
+        /// Role to assign on approval (repeatable). A live approval has no code
+        /// to read roles off, so name them here.
+        #[arg(long = "role")]
+        roles: Vec<String>,
     },
     /// The old spelling of `ray requests <network> deny <id>`.
     #[command(hide = true)]
@@ -438,6 +448,11 @@ pub(crate) enum Command {
         /// Print an example spec file and exit.
         #[arg(long, conflicts_with_all = ["spec", "prune", "dry_run", "invite_missing"])]
         example: bool,
+        /// Emit machine-readable JSON instead of styled text. What a provisioner
+        /// reads: the networks touched, role coverage, the missing hosts and any
+        /// invite codes minted for them.
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Change your hostname on a network
     Hostname {
@@ -604,6 +619,12 @@ pub(crate) enum InviteAction {
         /// `ray invite <net> revoke <id>`.
         #[arg(long)]
         reusable: bool,
+        /// Role to assign every node redeeming this code (repeatable). Firewall
+        /// rules target `role:<name>`, so one reusable key seats a whole
+        /// autoscaling group with the right policy. Unlike --hostname this is
+        /// allowed on a reusable key.
+        #[arg(long = "role")]
+        roles: Vec<String>,
         /// Also render the invite as a scannable QR code (off by default, it
         /// takes up a lot of terminal space).
         #[arg(long)]
@@ -707,6 +728,10 @@ pub(crate) enum RequestsAction {
         /// Short id of the pending peer (from `ray requests <network>`)
         #[arg(add = complete::join_requests())]
         id: String,
+        /// Role to assign on approval (repeatable). A live approval has no code
+        /// to read roles off, so name them here.
+        #[arg(long = "role")]
+        roles: Vec<String>,
     },
     /// Reject a peer waiting for approval
     Deny {
@@ -1405,14 +1430,18 @@ async fn run() -> Result<()> {
             tor,
             auto_accept_firewall,
             no_auto_accept_files,
+            roles,
         } => {
             ipc_join(
                 &network_key,
                 name.as_deref(),
-                hostname,
-                tor,
-                auto_accept_firewall,
-                !no_auto_accept_files,
+                JoinArgs {
+                    hostname,
+                    tor,
+                    auto_accept_firewall,
+                    auto_accept_files: !no_auto_accept_files,
+                    roles,
+                },
             )
             .await
         }
@@ -1454,10 +1483,12 @@ async fn run() -> Result<()> {
             json: _,
         } => match action {
             None => ipc_requests(&network).await,
-            Some(RequestsAction::Accept { id }) => ipc_accept_request(&network, &id).await,
+            Some(RequestsAction::Accept { id, roles }) => {
+                ipc_accept_request(&network, &id, roles).await
+            }
             Some(RequestsAction::Deny { id }) => ipc_deny_request(&network, &id).await,
         },
-        Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
+        Command::Accept { network, id, roles } => ipc_accept_request(&network, &id, roles).await,
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
         // An action is a request-queue verb, a bare contact id dials that peer,
         // and with neither, show the queue, the same as `ray connections` did.
@@ -1499,6 +1530,7 @@ async fn run() -> Result<()> {
             dry_run,
             invite_missing,
             example,
+            json: _,
         } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
         Command::Identityof {

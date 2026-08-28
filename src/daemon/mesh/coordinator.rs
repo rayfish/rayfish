@@ -596,6 +596,11 @@ pub(crate) async fn finalize_removal(
     victims: &[EndpointId],
 ) {
     update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
+    // The departure side of the same problem `admit_peer` solves: a rule naming
+    // the removed peer (by hostname, or by a `role:` it held) has to stop
+    // resolving to it, and the coordinator does not reconverge from its own
+    // published record.
+    ctx.registry.reapply_suggested_firewall(network);
     let net_pubkey = state.read().unwrap().network_public_key;
     broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
     for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
@@ -708,6 +713,7 @@ mod prune_tests {
             last_seen,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 
@@ -783,6 +789,7 @@ mod sender_authority_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 

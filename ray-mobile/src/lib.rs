@@ -73,7 +73,7 @@ use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
 use rayfish::control;
 use rayfish::daemon::transfers;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{DaemonState, JoinOptions, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
@@ -513,11 +513,13 @@ impl Node {
         let result = self.runtime.block_on(state.join_network(
             &network_key,
             None,
-            None,
-            invite,
-            coordinator,
-            false, // auto_accept_firewall
-            true,  // auto_accept_files (own-device offers, identity-checked)
+            JoinOptions {
+                invite,
+                coordinator,
+                // Own-device offers, identity-checked.
+                auto_accept_files: true,
+                ..Default::default()
+            },
         ));
 
         match result {
@@ -570,10 +572,14 @@ impl Node {
     /// Mint a single-use invite code for `network` (default 7d TTL), to share.
     pub fn invite(&self, network: String) -> Result<String, RayError> {
         let state = self.state()?;
-        // 7 days, single-use, coordinator-picked hostname (None).
-        let result =
-            self.runtime
-                .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false));
+        // 7 days, single-use, coordinator-picked hostname (None), no roles.
+        let result = self.runtime.block_on(state.invite_create(
+            &network,
+            7 * 24 * 60 * 60,
+            None,
+            Vec::new(),
+            false,
+        ));
         match result {
             IpcMessage::InviteCreated { code, .. } => Ok(code),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
@@ -954,7 +960,7 @@ impl Node {
         let state = self.state()?;
         match self
             .runtime
-            .block_on(state.accept_request(&network, &short_id))
+            .block_on(state.accept_request(&network, &short_id, Vec::new()))
         {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),

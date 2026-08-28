@@ -12,6 +12,7 @@
 //! secret, looks it up in the ledger, and burns it. Codes minted before the
 //! checksum existed still decode.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +51,23 @@ pub struct Invite {
     /// networks). `None` = the joiner's `--hostname` claim is used as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Roles the coordinator assigns on redemption. Unlike [`Self::hostname`]
+    /// there is no "the joiner's claim stands" fallback: a role is only ever
+    /// what the credential grants.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub roles: BTreeSet<String>,
+}
+
+/// What redeeming a credential grants the joiner. Everything here is the
+/// coordinator's assignment, never the joiner's claim, which is what lets a
+/// firewall rule key on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grant {
+    /// Hostname to assign authoritatively. `None` leaves the joiner's own
+    /// `--hostname` claim standing (and subject to collision-rename).
+    pub hostname: Option<String>,
+    /// Roles to assign, already validated at mint time.
+    pub roles: BTreeSet<String>,
 }
 
 /// On-disk container (so the toml file has a stable `[[invites]]` shape).
@@ -221,13 +239,9 @@ impl InviteStore {
 
     /// Mint a new invite valid for `ttl`, persist it, and return `(secret, id)`.
     /// The raw secret is returned only here so it can be encoded into the code.
-    /// `hostname` (trusted networks) is assigned authoritatively on redemption,
-    /// so the holder joins with `ray join <code>` and no `--hostname`.
-    pub fn mint(
-        &mut self,
-        ttl: Duration,
-        hostname: Option<String>,
-    ) -> Result<([u8; SECRET_LEN], String)> {
+    /// `grant` is what redemption assigns: a hostname (trusted networks, so the
+    /// holder joins with `ray join <code>` and no `--hostname`) and any roles.
+    pub fn mint(&mut self, ttl: Duration, grant: Grant) -> Result<([u8; SECRET_LEN], String)> {
         let secret = generate_secret();
         let secret_hash = hash_secret(&secret);
         let id = secret_hash[..8].to_string();
@@ -239,16 +253,17 @@ impl InviteStore {
             created,
             expires,
             status: InviteStatus::Pending,
-            hostname,
+            hostname: grant.hostname,
+            roles: grant.roles,
         });
         self.save()?;
         Ok((secret, id))
     }
 
     /// Verify a presented secret and burn it (single-use). Errors if the secret is
-    /// unknown, already used, revoked, or expired. Returns the invite's intended
-    /// hostname (trusted networks) so the coordinator can assign it.
-    pub fn redeem(&mut self, secret: &[u8], by: EndpointId) -> Result<Option<String>> {
+    /// unknown, already used, revoked, or expired. Returns what the invite
+    /// grants (hostname, roles) so the coordinator can assign it.
+    pub fn redeem(&mut self, secret: &[u8], by: EndpointId) -> Result<Grant> {
         let hash = hash_secret(secret);
         let now = now_secs();
         let invite = self
@@ -264,10 +279,13 @@ impl InviteStore {
         if now >= invite.expires {
             bail!("invite expired");
         }
-        let hostname = invite.hostname.clone();
+        let grant = Grant {
+            hostname: invite.hostname.clone(),
+            roles: invite.roles.clone(),
+        };
         invite.status = InviteStatus::Redeemed { by, at: now };
         self.save()?;
-        Ok(hostname)
+        Ok(grant)
     }
 
     /// Un-burn an invite: revert a `Redeemed` record back to `Pending`. Used when
@@ -324,6 +342,7 @@ impl InviteStore {
             expires,
             status: InviteStatus::Pending,
             hostname: None,
+            roles: BTreeSet::new(),
         });
         self.save()
     }
@@ -468,7 +487,9 @@ mod tests {
     #[test]
     fn mint_then_redeem_succeeds() {
         let (mut store, _dir) = temp_store();
-        let (secret, id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        let (secret, id) = store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         assert_eq!(id.len(), 8);
         store.redeem(&secret, test_id(9)).unwrap();
         // Status is now redeemed.
@@ -481,7 +502,9 @@ mod tests {
     #[test]
     fn redeem_is_single_use() {
         let (mut store, _dir) = temp_store();
-        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        let (secret, _id) = store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         store.redeem(&secret, test_id(9)).unwrap();
         let err = store.redeem(&secret, test_id(10)).unwrap_err();
         assert!(err.to_string().contains("already used"));
@@ -491,7 +514,9 @@ mod tests {
     fn redeem_rejects_expired() {
         let (mut store, _dir) = temp_store();
         // ttl=0 → expires == created == now, so now >= expires immediately.
-        let (secret, _id) = store.mint(Duration::from_secs(0), None).unwrap();
+        let (secret, _id) = store
+            .mint(Duration::from_secs(0), Grant::default())
+            .unwrap();
         let err = store.redeem(&secret, test_id(9)).unwrap_err();
         assert!(err.to_string().contains("expired"));
     }
@@ -499,7 +524,9 @@ mod tests {
     #[test]
     fn redeem_rejects_wrong_secret() {
         let (mut store, _dir) = temp_store();
-        store.mint(Duration::from_secs(3600), None).unwrap();
+        store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         let err = store.redeem(&generate_secret(), test_id(9)).unwrap_err();
         assert!(err.to_string().contains("invalid invite"));
     }
@@ -507,7 +534,9 @@ mod tests {
     #[test]
     fn revoke_then_redeem_fails() {
         let (mut store, _dir) = temp_store();
-        let (secret, id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        let (secret, id) = store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         store.revoke(&id).unwrap();
         let err = store.redeem(&secret, test_id(9)).unwrap_err();
         assert!(err.to_string().contains("revoked"));
@@ -516,7 +545,9 @@ mod tests {
     #[test]
     fn cannot_revoke_used_invite() {
         let (mut store, _dir) = temp_store();
-        let (secret, id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        let (secret, id) = store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         store.redeem(&secret, test_id(9)).unwrap();
         assert!(store.revoke(&id).is_err());
     }
@@ -528,7 +559,9 @@ mod tests {
         let secret;
         {
             let mut store = InviteStore::with_path(&path);
-            let (s, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
+            let (s, _id) = store
+                .mint(Duration::from_secs(3600), Grant::default())
+                .unwrap();
             secret = s;
         }
         // Reload from disk and redeem.
@@ -539,7 +572,9 @@ mod tests {
     #[test]
     fn list_reports_expired_lazily() {
         let (mut store, _dir) = temp_store();
-        store.mint(Duration::from_secs(0), None).unwrap();
+        store
+            .mint(Duration::from_secs(0), Grant::default())
+            .unwrap();
         let view = store.list();
         assert_eq!(view[0].status, "expired");
         // Stored status remains Pending (not mutated).
@@ -550,19 +585,47 @@ mod tests {
     fn mint_with_hostname_returns_it_on_redeem() {
         let (mut store, _dir) = temp_store();
         let (secret, _id) = store
-            .mint(Duration::from_secs(3600), Some("ty2-clic01".to_string()))
+            .mint(
+                Duration::from_secs(3600),
+                Grant {
+                    hostname: Some("ty2-clic01".to_string()),
+                    roles: BTreeSet::new(),
+                },
+            )
             .unwrap();
-        let hostname = store.redeem(&secret, test_id(9)).unwrap();
-        assert_eq!(hostname.as_deref(), Some("ty2-clic01"));
+        let grant = store.redeem(&secret, test_id(9)).unwrap();
+        assert_eq!(grant.hostname.as_deref(), Some("ty2-clic01"));
         // The bound hostname is visible in the list.
         let view = store.list();
         assert_eq!(view[0].hostname.as_deref(), Some("ty2-clic01"));
     }
 
+    /// A single-use invite can carry roles too, so `--hostname sentry-01
+    /// --role sentry` seats a named node with its policy class in one code.
+    #[test]
+    fn mint_with_roles_returns_them_on_redeem() {
+        let (mut store, _dir) = temp_store();
+        let roles: BTreeSet<String> = ["sentry".to_string()].into();
+        let (secret, _id) = store
+            .mint(
+                Duration::from_secs(3600),
+                Grant {
+                    hostname: None,
+                    roles: roles.clone(),
+                },
+            )
+            .unwrap();
+        let grant = store.redeem(&secret, test_id(9)).unwrap();
+        assert_eq!(grant.roles, roles);
+        assert!(grant.hostname.is_none());
+    }
+
     #[test]
     fn restore_reinstates_a_burned_invite() {
         let (mut store, _dir) = temp_store();
-        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        let (secret, _id) = store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         store.redeem(&secret, test_id(9)).unwrap();
         // After restore the invite is pending again and redeemable once more.
         store.restore(&secret).unwrap();
@@ -574,7 +637,9 @@ mod tests {
     #[test]
     fn restore_is_noop_for_unknown_or_pending() {
         let (mut store, _dir) = temp_store();
-        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        let (secret, _id) = store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         // Pending stays pending; an unknown secret is ignored.
         store.restore(&secret).unwrap();
         store.restore(&generate_secret()).unwrap();
@@ -588,7 +653,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("net.toml");
         let mut store = InviteStore::with_path(&path);
-        store.mint(Duration::from_secs(3600), None).unwrap();
+        store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
@@ -596,9 +663,12 @@ mod tests {
     #[test]
     fn mint_without_hostname_returns_none_on_redeem() {
         let (mut store, _dir) = temp_store();
-        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
-        let hostname = store.redeem(&secret, test_id(9)).unwrap();
-        assert!(hostname.is_none());
+        let (secret, _id) = store
+            .mint(Duration::from_secs(3600), Grant::default())
+            .unwrap();
+        let grant = store.redeem(&secret, test_id(9)).unwrap();
+        assert!(grant.hostname.is_none());
+        assert!(grant.roles.is_empty());
     }
 
     #[test]
@@ -616,7 +686,7 @@ mod tests {
         // A shared entry is redeemable by this (non-minting) coordinator
         // (hostname is None since record_shared has no hostname binding):
         let by = test_id(5);
-        assert!(store.redeem(&secret, by).unwrap().is_none());
+        assert!(store.redeem(&secret, by).unwrap().hostname.is_none());
         // Burning an already-redeemed hash is a no-op (returns false):
         assert!(!store.burn_by_hash(&hash).unwrap());
     }

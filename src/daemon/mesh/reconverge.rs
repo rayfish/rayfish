@@ -54,9 +54,36 @@ pub(crate) fn apply_suggested_firewall(
         .iter()
         .filter_map(|m| m.hostname.as_deref().map(|h| (h, m.identity)))
         .collect();
-    let resolve = |h: &str| map.get(h).copied();
-    let rules =
-        firewall::materialize_suggestions(network_name, &my_hostname, &suggestions, &resolve);
+    let by_hostname = |h: &str| map.get(h).copied();
+    // Every member holding a role. Sorted by identity because the roster is a
+    // HashMap: without this the rule order a node installs would shuffle between
+    // recomputes, and `ray firewall show` would look like it kept changing.
+    let by_role = |role: &str| -> Vec<EndpointId> {
+        let mut holders: Vec<EndpointId> = members
+            .iter()
+            .filter(|m| m.roles.iter().any(|r| r == role))
+            .map(|m| m.identity)
+            .collect();
+        holders.sort_by_key(|id| id.to_string());
+        holders
+    };
+    // Our own roles come from the roster too, for the same reason the hostname
+    // does: it is the signed record, not what this node asked for at join time.
+    let my_roles = members
+        .iter()
+        .find(|m| m.identity == my_identity)
+        .map(|m| m.roles.clone())
+        .unwrap_or_default();
+    let rules = firewall::materialize_suggestions(
+        network_name,
+        &suggestions,
+        &firewall::SubjectResolver {
+            hostname: &my_hostname,
+            roles: &my_roles,
+            by_hostname: &by_hostname,
+            by_role: &by_role,
+        },
+    );
 
     // Auto-install only if this node opted into `--auto-accept-firewall` for the
     // network; otherwise queue the materialized rules for `ray firewall accept`.
@@ -911,6 +938,7 @@ mod self_nullified_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 

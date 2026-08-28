@@ -895,6 +895,15 @@ fn device_row(
         (false, true) => layout::Cell::new("offers", style::faint("offers")),
         (false, false) => layout::Cell::plain(""),
     });
+    // Roles last: what a `role:` firewall rule resolves this peer as. Only shown
+    // when it holds any, so a mesh that uses none looks exactly as it did.
+    cells.push(if peer.roles.is_empty() {
+        layout::Cell::plain("")
+    } else {
+        let text = peer.roles.iter().cloned().collect::<Vec<_>>().join(",");
+        let styled = style::faint(&text);
+        layout::Cell::new(&text, styled)
+    });
     cells
 }
 
@@ -1097,6 +1106,7 @@ mod grouping_tests {
             },
             exit_node: false,
             exit_in_use: false,
+            roles: Default::default(),
         }
     }
 
@@ -1116,6 +1126,7 @@ mod grouping_tests {
             my_exit_node: None,
             exit_offering: false,
             incompatible: None,
+            my_roles: Default::default(),
         }
     }
 
@@ -1180,6 +1191,7 @@ mod grouping_tests {
             state: ipc::PeerState::Active,
             exit_node: false,
             exit_in_use: false,
+            roles: Default::default(),
         };
         let secondary = peer("sm-f966b", Some(laptop), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);
@@ -1192,6 +1204,18 @@ mod grouping_tests {
         assert!(out.contains("└─"), "{out}");
         let at = |s: &str| out.find(s).unwrap();
         assert!(at("laptop") < at("sm-f966b"), "{out}");
+    }
+
+    /// A peer's roles show in its row, and a peer with none renders exactly as
+    /// it did before roles existed.
+    #[test]
+    fn peer_rows_show_roles_when_a_peer_holds_any() {
+        let plain = net("laptop", vec![peer("server", None, false, true, false)]);
+        assert!(!render(&plain).contains("sentry"));
+
+        let mut tagged = plain;
+        tagged.peers[0].roles = ["sentry".to_string()].into();
+        assert!(render(&tagged).contains("sentry"));
     }
 
     #[test]
@@ -1316,6 +1340,7 @@ mod grouping_tests {
                 state: ipc::PeerState::Offline,
                 exit_node: false,
                 exit_in_use: false,
+                roles: Default::default(),
             })
             .collect();
         let mut n = net("laptop", peers);

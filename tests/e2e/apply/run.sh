@@ -75,9 +75,9 @@ echo "$APPLY1" | grep -qi 'creating closed network' \
 has_net "$A" "$NET" && pass "'$NET' now present on srv-a" || fail "'$NET' missing on srv-a after apply"
 echo "$APPLY1" | grep -qi 'Missing hosts' \
   && pass "apply reported a membership gap" || fail "no membership gap reported"
-echo "$APPLY1" | grep -q "ray invite $NET --hostname srv-b" \
+echo "$APPLY1" | grep -q "ray invite $NET create --hostname srv-b" \
   && pass "gap lists an invite command for srv-b" || fail "srv-b not in the gap"
-echo "$APPLY1" | grep -q "ray invite $NET --hostname srv-c" \
+echo "$APPLY1" | grep -q "ray invite $NET create --hostname srv-c" \
   && pass "gap lists an invite command for srv-c" || fail "srv-c not in the gap"
 # apply never joins — the members must not have the network yet.
 ! has_net "$B" "$NET" && ! has_net "$C" "$NET" \
