@@ -151,36 +151,65 @@ async fn set_global(key: ipc::GlobalKey, value: &str, replace: bool) -> Result<(
 /// on`, and an unprivileged CLI cannot reliably read the daemon's config to
 /// repeat it.
 async fn apply_posture(opts: &UpOptions) -> Result<()> {
+    for write in posture_writes(opts) {
+        set_global(write.key, write.value, write.replace)
+            .await
+            .with_context(|| format!("setting {}", write.key))?;
+    }
+    Ok(())
+}
+
+/// One `ConfigSet` the posture flags turn into.
+struct PostureWrite<'a> {
+    key: ipc::GlobalKey,
+    value: &'a str,
+    replace: bool,
+}
+
+/// The writes `apply_posture` sends, in the order it sends them.
+///
+/// Split out from the sending so the order can be tested, because the order is
+/// the part that is easy to get wrong: each write is validated on its own by the
+/// daemon, against the config the ones before it left behind.
+///
+/// The rule is relaxations before restrictions. Entering, that puts Tor first:
+/// with it private mode needs only a discovery server, without it a relay as
+/// well, so the other order would reject `ray up --private --tor --pkarr <p>`
+/// for a relay it is about to stop needing. Leaving, it puts private mode first,
+/// for the mirror reason: `ray up --no-private --no-tor` on a node with no relay
+/// would otherwise turn Tor off while still private and be refused for a relay it
+/// never had, in the middle of the command asking to stop being private.
+fn posture_writes(opts: &UpOptions) -> Vec<PostureWrite<'_>> {
+    let mut writes = Vec::new();
+    let mut push = |key, value, replace| {
+        writes.push(PostureWrite {
+            key,
+            value,
+            replace,
+        })
+    };
     // `replace: true`: private mode means *only* these servers. Appending them
     // to n0's defaults would leave the node still talking to n0, which is the
     // one thing the mode promises it does not do.
     if let Some(relay) = &opts.relay {
-        set_global(ipc::GlobalKey::Relay, relay, true)
-            .await
-            .context("setting the relay")?;
+        push(ipc::GlobalKey::Relay, relay.as_str(), true);
     }
     if let Some(pkarr) = &opts.pkarr {
-        set_global(ipc::GlobalKey::DiscoveryDns, pkarr, true)
-            .await
-            .context("setting the discovery server")?;
-    }
-    // Tor before private, because what private mode demands depends on it: with
-    // Tor it needs only a discovery server, without it a relay as well. Sending
-    // them the other way round would reject `ray up --private --tor --pkarr <p>`
-    // for a missing relay it is about to stop needing.
-    if opts.tor {
-        set_global(ipc::GlobalKey::Tor, "on", false).await?;
-    }
-    if opts.no_tor {
-        set_global(ipc::GlobalKey::Tor, "off", false).await?;
-    }
-    if opts.private {
-        set_global(ipc::GlobalKey::Private, "on", false).await?;
+        push(ipc::GlobalKey::DiscoveryDns, pkarr.as_str(), true);
     }
     if opts.no_private {
-        set_global(ipc::GlobalKey::Private, "off", false).await?;
+        push(ipc::GlobalKey::Private, "off", false);
     }
-    Ok(())
+    if opts.tor {
+        push(ipc::GlobalKey::Tor, "on", false);
+    }
+    if opts.private {
+        push(ipc::GlobalKey::Private, "on", false);
+    }
+    if opts.no_tor {
+        push(ipc::GlobalKey::Tor, "off", false);
+    }
+    writes
 }
 
 /// Confirm leaving private mode.
@@ -684,6 +713,48 @@ pub(crate) async fn cmd_start() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::UpOptions;
+    use super::posture_writes;
+
+    fn keys(opts: &UpOptions) -> Vec<(String, String)> {
+        posture_writes(opts)
+            .into_iter()
+            .map(|w| (w.key.to_string(), w.value.to_string()))
+            .collect()
+    }
+
+    /// Each write is validated on its own against what the ones before it left,
+    /// so the order decides whether a legal posture change is accepted. Entering
+    /// needs Tor set before private mode, which relaxes the relay requirement;
+    /// leaving needs private mode cleared before Tor, which re-imposes it. The
+    /// two are opposite orders, which is why this is worth pinning.
+    #[test]
+    fn posture_writes_relax_before_they_restrict() {
+        let entering = UpOptions {
+            private: true,
+            tor: true,
+            pkarr: Some("http://d.example".to_string()),
+            ..opts()
+        };
+        assert_eq!(
+            keys(&entering),
+            [
+                ("discovery-dns", "http://d.example"),
+                ("tor", "on"),
+                ("private", "on"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+
+        let leaving = UpOptions {
+            no_private: true,
+            no_tor: true,
+            ..opts()
+        };
+        assert_eq!(
+            keys(&leaving),
+            [("private", "off"), ("tor", "off")].map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+    }
 
     fn opts() -> UpOptions {
         UpOptions {

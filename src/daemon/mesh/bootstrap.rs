@@ -243,24 +243,18 @@ async fn build_daemon_inner(
         Some(id) => id,
         None => config::contact_secret(&mut app_config).public(),
     };
+    let alpns = initial_alpns(&app_config);
+    let use_tor = app_config.uses_tor();
     // Refuse to bind rather than quietly falling back to n0's servers. Both
     // write paths (`ray up --private`, `ray config set private on`) already
     // check this, so reaching here means `settings.toml` was hand-edited, and
     // for a setting whose entire promise is "nothing else is contacted",
     // starting anyway with the promise broken is the wrong failure.
+    //
+    // Below `use_tor` because it needs it: a Tor node has no relay to require.
     if app_config.private_mode {
-        private_mode_servers_ok(&app_config)?;
+        private_mode_servers_ok(&app_config, use_tor)?;
     }
-    let alpns = initial_alpns(&app_config);
-    // The node-wide `tor` setting, OR'd with the older per-network
-    // `TransportMode::Tor` so `ray create/join --tor` keeps working. One endpoint
-    // serves every network, so a single network asking for Tor puts the whole node
-    // in it: that was already true before the node-wide setting existed.
-    let use_tor = app_config.tor
-        || app_config
-            .networks
-            .iter()
-            .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
     let posture = transport::NodePosture::new(app_config.private_mode, use_tor);
     let bound = transport::create_endpoint_with_alpns(
         key.clone(),
@@ -514,11 +508,10 @@ async fn build_daemon_inner(
         dns_resolver.clone(),
         derive_ipv6(&identity.local_identity()),
     ));
-    // mDNS is silenced by private mode rather than merely defaulted off: an mDNS
-    // announcement hands this node's identity to every other device on whatever
-    // LAN it is attached to, which is the one exposure a private node cannot fix
-    // by choosing its own servers.
-    let mdns_enabled = app_config.mdns_enabled && !app_config.private_mode;
+    // Silenced rather than merely defaulted off, and note this is a *runtime*
+    // `lookups.add` further down: it would otherwise put an address lookup back
+    // on the endpoint the Tor branch built with `clear_address_lookup()`.
+    let mdns_enabled = app_config.mdns_enabled && side_services_ok(&app_config, use_tor);
     // Stays empty when mDNS is off, so `ray mdns scan` reports nothing rather
     // than stale sightings from a previous run.
     let lan_peers = Arc::new(LanPeers::new());
@@ -694,11 +687,10 @@ async fn build_daemon_inner(
     #[cfg(target_os = "android")]
     let metrics_server: Option<MetricsServer> = None;
 
-    // Same treatment as mDNS: the update checker reaches GitHub directly, so it
-    // does not run while private. `apply_global` also refuses to turn it on, so
-    // this is the backstop for a config that was already `on` when private mode
-    // went on.
-    let auto_update = app_config.auto_update && !app_config.private_mode;
+    // Same treatment as mDNS, and the same reason: the update checker calls
+    // GitHub directly. `apply_global` also refuses to turn it on, so this is the
+    // backstop for a config that was already `on` when the posture changed.
+    let auto_update = app_config.auto_update && side_services_ok(&app_config, use_tor);
     let daemon = Arc::new(Daemon {
         transport,
         registry,
@@ -1422,25 +1414,55 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Private mode's precondition: both server lists name the operator's own
-/// servers and only those (`replace` mode, non-empty).
+/// Whether the node may run the two services that reach past the transport it
+/// was configured with: mDNS, which announces this node to a LAN, and the update
+/// checker, which calls GitHub.
+///
+/// Private mode forbids both because it promises no infrastructure it was not
+/// given gets contacted, and an mDNS announcement hands this node's identity to
+/// every device on whatever LAN it is attached to, which is the one exposure
+/// choosing your own servers cannot fix.
+///
+/// Tor forbids both for a sharper reason. A node's `EndpointId` is its onion
+/// address (see [`crate::transport::NodePosture`]), so an mDNS packet ties that
+/// onion to the LAN address it was sent from, and the update checker would reach
+/// GitHub from the very IP the rest of the node is spending Tor circuits to keep
+/// out of sight.
+fn side_services_ok(cfg: &config::AppConfig, use_tor: bool) -> bool {
+    !cfg.private_mode && !use_tor
+}
+
+/// Private mode's precondition: every server list it needs names the operator's
+/// own servers and only those (`replace` mode, non-empty).
 ///
 /// Split out from the check in `config::settings::apply_global` because the two
 /// answer different questions. That one rejects a bad *write*; this one rejects
-/// a bad *state*, which is what a hand-edited `settings.toml` produces.
-fn private_mode_servers_ok(cfg: &config::AppConfig) -> Result<()> {
+/// a bad *state*, which is what a hand-edited `settings.toml` produces. They
+/// have to agree on what private mode needs, hence `use_tor`: a Tor node reaches
+/// peers through onion routing and never contacts a relay, so requiring one here
+/// would reject the config `ray up --private --tor --pkarr <url>` writes.
+fn private_mode_servers_ok(cfg: &config::AppConfig, use_tor: bool) -> Result<()> {
     use crate::config::settings::is_own_servers;
-    let missing: Vec<&str> = [("relay", &cfg.relay), ("discovery-dns", &cfg.discovery_dns)]
+    let mut needed = Vec::new();
+    if !use_tor {
+        needed.push((GlobalKey::Relay, &cfg.relay));
+    }
+    needed.push((GlobalKey::DiscoveryDns, &cfg.discovery_dns));
+    let missing: Vec<&str> = needed
         .into_iter()
         .filter(|(_, o)| !is_own_servers(o))
-        .map(|(name, _)| name)
+        .map(|(key, _)| key.name())
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
+    // Not "run `ray up --no-private`": that is an IPC call, and the daemon it
+    // would talk to is the one refusing to start. The file is the only way out.
     anyhow::bail!(
         "private mode is on but {} {} not set to a server of your own\n    \
-         fix the config, or leave private mode: ray up --no-private",
+         the daemon cannot start, so there is nothing for `ray` to talk to:\n    \
+         edit settings.toml, either naming the missing server or setting \
+         private_mode = false",
         missing.join(" and "),
         if missing.len() == 1 { "is" } else { "are" },
     )
@@ -1448,6 +1470,27 @@ fn private_mode_servers_ok(cfg: &config::AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Tor gates these as tightly as private mode does. `--tor` on its own is a
+    /// supported posture, and its own help says nothing is published: an mDNS
+    /// announcement of a node whose id is its onion address would make that a
+    /// lie to every device on the LAN.
+    #[test]
+    fn tor_alone_silences_mdns_and_the_update_checker() {
+        use super::side_services_ok;
+        use crate::config::AppConfig;
+
+        let cfg = AppConfig::default();
+        assert!(side_services_ok(&cfg, false), "an open node runs both");
+        assert!(!side_services_ok(&cfg, true), "tor without private mode");
+
+        let private = AppConfig {
+            private_mode: true,
+            ..AppConfig::default()
+        };
+        assert!(!side_services_ok(&private, false));
+        assert!(!side_services_ok(&private, true));
+    }
+
     /// The startup guard is the backstop for a hand-edited `settings.toml`: both
     /// write paths already refuse this state, so reaching it means the file was
     /// changed behind them, and starting anyway would leave the node claiming a
@@ -1466,20 +1509,50 @@ mod tests {
             private_mode: true,
             ..AppConfig::default()
         };
-        let err = private_mode_servers_ok(&cfg).unwrap_err().to_string();
+        let err = private_mode_servers_ok(&cfg, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("relay and discovery-dns"), "{err}");
         assert!(err.contains("are not set"), "plural reads right: {err}");
 
         cfg.relay = own();
-        let err = private_mode_servers_ok(&cfg).unwrap_err().to_string();
+        let err = private_mode_servers_ok(&cfg, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("discovery-dns is not set"), "singular: {err}");
 
         cfg.discovery_dns = own();
-        assert!(private_mode_servers_ok(&cfg).is_ok());
+        assert!(private_mode_servers_ok(&cfg, false).is_ok());
 
         // `augment` keeps n0's servers alongside these, so it does not satisfy it.
         cfg.relay.replace = false;
-        assert!(private_mode_servers_ok(&cfg).is_err());
+        assert!(private_mode_servers_ok(&cfg, false).is_err());
+    }
+
+    /// The mirror of `config::settings`' `private_with_tor_needs_no_relay`. The
+    /// two checks guard the same setting from different sides, so a config the
+    /// write path accepts has to be one this one starts from: without this the
+    /// guard demanded a relay `ray up --private --tor --pkarr <url>` never sets
+    /// and `--relay` refuses to accept, leaving the daemon in a restart loop it
+    /// could only be talked out of by editing the file.
+    #[test]
+    fn the_startup_guard_wants_no_relay_under_tor() {
+        use super::private_mode_servers_ok;
+        use crate::config::{AppConfig, ServerOverride};
+
+        let cfg = AppConfig {
+            private_mode: true,
+            tor: true,
+            discovery_dns: ServerOverride {
+                servers: vec!["http://d.example".to_string()],
+                replace: true,
+            },
+            ..AppConfig::default()
+        };
+        assert!(cfg.relay.is_unset(), "the case under test is a bare relay");
+        assert!(private_mode_servers_ok(&cfg, true).is_ok());
+        // ...and the requirement comes back the moment Tor does not cover it.
+        assert!(private_mode_servers_ok(&cfg, false).is_err());
     }
 
     use super::*;
