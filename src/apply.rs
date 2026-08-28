@@ -97,9 +97,10 @@ fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
 }
 
 /// Structural validation independent of live state: a name may not be defined as
-/// both a group and an alias (resolution would be ambiguous), and neither may
-/// take a `role:` name, which the node side resolves against the roster and the
-/// admin side must therefore pass through untouched.
+/// both a group and an alias (resolution would be ambiguous), neither may take a
+/// `role:` name, which the node side resolves against the roster and the admin
+/// side must therefore pass through untouched, and every `role:` selector must
+/// name a role a member can actually hold.
 fn validate_names(spec: &DeploySpec) -> Result<()> {
     for name in spec.groups.keys() {
         anyhow::ensure!(
@@ -114,7 +115,37 @@ fn validate_names(spec: &DeploySpec) -> Result<()> {
              role resolved on each node; a group or alias cannot shadow one"
         );
     }
+    for (network, firewall) in &spec.networks {
+        for (subject, rules) in firewall {
+            validate_role_key(network, subject)?;
+            for peer in rules.allows.keys().chain(rules.denies.keys()) {
+                validate_role_key(network, peer)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Check one subject/peer key that names a role. Keys that name a hostname or
+/// `*` pass untouched.
+///
+/// A `role:` selector is compared byte for byte against the roles the
+/// coordinator minted, and those are canonical ([`crate::roles::normalize`]
+/// lowercases and trims). The spec is not canonicalized on the way in: the
+/// `config` crate preserves the case a key was written in, so `role:Sentry`
+/// would publish verbatim and then resolve on no member at all, on every node,
+/// silently. Reject it here, where the author can still see it, rather than let
+/// `ray apply` report "no members yet" for a role nobody can hold.
+///
+/// Rejected rather than lowercased in place: two subjects differing only in case
+/// are distinct YAML keys, and folding them would merge one into the other and
+/// drop its rules without a word.
+fn validate_role_key(network: &str, key: &str) -> Result<()> {
+    let Some(role) = policy::role_of(key) else {
+        return Ok(());
+    };
+    crate::roles::validate_role(role)
+        .with_context(|| format!("network `{network}`: firewall key `{key}`"))
 }
 
 /// Recursively replace `ValueKind::Nil` with an empty `Table` so a null
@@ -616,6 +647,68 @@ networks:
         )
         .unwrap_err();
         assert!(err.to_string().contains("role:"), "{err}");
+    }
+
+    /// The bug this guards: `config` preserves key case, so a spec written with
+    /// `role:Sentry` published verbatim and matched no member on any node, while
+    /// `ray apply` blamed the roster ("no members yet").
+    #[test]
+    fn a_role_key_with_capitals_is_rejected() {
+        let yaml = r#"
+networks:
+  prod:
+    "role:Sentry":
+      allows:
+        "*": "tcp:22"
+"#;
+        let err = parse(yaml).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("role:Sentry"), "{text}");
+        assert!(text.contains("prod"), "{text}");
+    }
+
+    /// Peer keys resolve the same way subjects do, so they are held to the same
+    /// rule.
+    #[test]
+    fn a_role_peer_key_with_capitals_is_rejected() {
+        let yaml = r#"
+networks:
+  prod:
+    alice:
+      allows:
+        "role:Sentry": "tcp:22"
+"#;
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn a_denies_role_key_with_capitals_is_rejected() {
+        let yaml = r#"
+networks:
+  prod:
+    alice:
+      denies:
+        "role:Sentry": "tcp:22"
+"#;
+        assert!(parse(yaml).is_err());
+    }
+
+    /// Canonical role keys, `*` and plain hostnames all pass untouched.
+    #[test]
+    fn canonical_role_keys_and_hostnames_pass() {
+        let yaml = r#"
+networks:
+  prod:
+    "role:sentry":
+      allows:
+        "role:non-validating": "tcp:4000"
+        "*": "tcp:22"
+    alice:
+      denies:
+        bob: "tcp:22"
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.networks["prod"].len(), 2);
     }
 
     /// A bare `role:` is not a role, so it stays an (odd) hostname and still

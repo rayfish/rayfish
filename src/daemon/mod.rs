@@ -515,6 +515,11 @@ pub(crate) struct NetworkState {
 pub(crate) struct PendingJoin {
     pub(crate) hostname: Option<String>,
     pub(crate) device_cert: Option<control::DeviceCert>,
+    /// Roles the joiner asked for. A request, never a grant: `ray requests`
+    /// shows it so the operator can decide, and only `ray requests accept
+    /// --role` actually confers anything. Kept because without it the operator
+    /// cannot see why an otherwise-accepted peer keeps being refused.
+    pub(crate) requested_roles: BTreeSet<String>,
     pub(crate) requested_at: Instant,
 }
 

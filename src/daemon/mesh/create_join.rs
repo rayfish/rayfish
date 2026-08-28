@@ -56,8 +56,10 @@ struct JoinContext<'a> {
     invite_lock: Arc<AsyncMutex<()>>,
     /// Pinned coordinator to dial first (the invite minter), if known.
     coordinator: Option<EndpointId>,
-    /// Roles this join asks for, forwarded in the `JoinRequest`.
-    roles: Vec<String>,
+    /// Roles this join asks for, forwarded in the `JoinRequest`. Canonical
+    /// already ([`crate::roles::normalize`]), so it meets the mint side's
+    /// spelling of the same names.
+    roles: BTreeSet<String>,
     /// Set on a restore whose network record advertises a mesh protocol version
     /// this build does not speak. Only [`VersionGate::Record`] can produce it,
     /// so it is always `None` on a fresh join.
@@ -328,6 +330,7 @@ impl NetworkRegistry {
                 let _ = config::add_pending_join(config::PendingJoinEntry {
                     network_key: network_key.to_string(),
                     name: name.map(|s| s.to_string()),
+                    roles: opts.roles.clone(),
                 });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
@@ -353,6 +356,19 @@ impl NetworkRegistry {
                                 return;
                             }
                             Ok(TryJoin::Pending) => continue,
+                            // A refusal the coordinator marked final: asking
+                            // again cannot change it, so stop and drop the
+                            // persisted request instead of looping forever on a
+                            // backoff that nothing ever surfaces.
+                            Err(e) if e.downcast_ref::<JoinRefused>().is_some() => {
+                                let _ = config::remove_pending_join(&nk);
+                                tracing::error!(
+                                    net = %nk,
+                                    error = %e,
+                                    "coordinator refused the join; giving up"
+                                );
+                                return;
+                            }
                             Err(e) => {
                                 tracing::warn!(net = %nk, error = %e, "join retry failed");
                             }
@@ -387,6 +403,12 @@ impl NetworkRegistry {
             auto_accept_files,
             roles,
         } = opts;
+        // Canonicalize before asking. The mint side stores what
+        // `roles::normalize` produced, and the coordinator compares by exact set
+        // difference, so `--role Sentry` against a key minted `--role Sentry`
+        // would otherwise be refused a role the key does carry. A name that is
+        // not a role at all fails here, on the machine that typed it.
+        let roles = crate::roles::normalize(&roles).context("invalid --role")?;
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
         if let Some(a) = alias
@@ -636,6 +658,16 @@ impl NetworkRegistry {
                     abort_join_tasks(&cancel, tasks);
                     return Ok(None);
                 }
+                // A refusal the coordinator marked final rests on the
+                // credential and the signed roster, both of which every
+                // coordinator shares, so the next one answers the same. Return
+                // it as-is: trying on would replace it in `last_err` with
+                // whatever the last coordinator said, and the caller's retry
+                // loop needs this exact error to know to stop.
+                Err(e) if e.downcast_ref::<JoinRefused>().is_some() => {
+                    abort_join_tasks(&cancel, tasks);
+                    return Err(e);
+                }
                 Err(e) => {
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
                     abort_join_tasks(&cancel, tasks);
@@ -644,10 +676,13 @@ impl NetworkRegistry {
             }
         }
 
-        anyhow::bail!(
-            "no coordinator admitted the join (tried {}): {last_err:#}",
+        // `context`, not a formatted `bail!`: interpolating `{last_err:#}` into a
+        // fresh error reads the same but flattens the chain, and callers
+        // downcast through it.
+        Err(last_err.context(format!(
+            "no coordinator admitted the join (tried {})",
             order.len()
-        )
+        )))
     }
 
     /// Reconnect/restore dial: the coordinator speaks first, so pick the single
@@ -1294,6 +1329,38 @@ impl NetworkRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pending-join retry loop tells "ask again" from "the answer is no" by
+    /// downcasting, and every layer between the handshake and the loop has to
+    /// keep the error reachable. This once did not hold: `dial_fresh_join`
+    /// ended in a `bail!` that interpolated `{last_err:#}` into a fresh error,
+    /// which reads identically and flattens the chain, so the loop saw an
+    /// opaque string and reasked on a backoff forever.
+    #[test]
+    fn a_final_refusal_survives_the_context_layers() {
+        let refused: anyhow::Error = JoinRefused {
+            reason: "this key does not grant validator; it grants sentry".to_string(),
+        }
+        .into();
+        let wrapped = refused
+            .context("no coordinator admitted the join (tried 2)")
+            .context("join network");
+        assert!(wrapped.downcast_ref::<JoinRefused>().is_some());
+        // And the flattened rendering is unchanged, so nothing reads differently.
+        let msg = format!("{wrapped:#}");
+        assert!(msg.contains("no coordinator admitted the join"), "{msg}");
+        assert!(msg.contains("it grants sentry"), "{msg}");
+    }
+
+    /// The other half: a transient denial stays retryable, so a coordinator
+    /// hiccup does not tear down a join that would succeed a moment later.
+    #[test]
+    fn a_retryable_denial_is_not_a_final_refusal() {
+        let err =
+            anyhow::anyhow!("join denied: direct coordinator grant is temporarily unavailable")
+                .context("no coordinator admitted the join (tried 1)");
+        assert!(err.downcast_ref::<JoinRefused>().is_none());
+    }
 
     /// A restore of a network we already belong to must not be undone by the
     /// version gate. The roster blob is not ALPN-gated, so the network still

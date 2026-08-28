@@ -902,10 +902,16 @@ impl NetworkRegistry {
             let me = Arc::clone(self);
             let key = pending.network_key.clone();
             let name = pending.name.clone();
+            // Resume the request the user actually made. Roles are policy: a
+            // node that came back asking for nothing could be seated without the
+            // class it was provisioned for, and the rules keyed on that role
+            // would never reach it.
+            let opts = JoinOptions {
+                roles: pending.roles.clone(),
+                ..JoinOptions::default()
+            };
             tokio::spawn(async move {
-                let _ = me
-                    .join_network(&key, name.as_deref(), JoinOptions::default())
-                    .await;
+                let _ = me.join_network(&key, name.as_deref(), opts).await;
             });
         }
 

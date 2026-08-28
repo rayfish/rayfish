@@ -118,6 +118,12 @@ pub enum ConnectMsg {
 }
 
 /// Control messages exchanged between peers over QUIC bidirectional streams.
+/// `serde(default)` for a `bool` field that means "yes" when an older peer's
+/// shorter array leaves it out.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
     /// Sent by a joining peer as the first message on an initial (non-reconnect)
@@ -146,6 +152,14 @@ pub enum ControlMsg {
     },
     JoinDenied {
         reason: String,
+        /// Whether trying again could ever produce a different answer. A
+        /// coordinator-side hiccup (a direct grant it cannot reproduce yet, a
+        /// roster commit that did not land) is retryable; a refused `--role` is
+        /// not, and the joiner's pending-join loop would otherwise reask on a
+        /// backoff forever with nothing surfacing the deadlock. Defaults to
+        /// `true` so a shorter array from an older peer keeps the old behaviour.
+        #[serde(default = "default_true")]
+        retryable: bool,
     },
     /// Notify connected members that the roster/blob changed. Payload-free: it
     /// is a *trigger only*. Receivers reconverge from the network-key-signed
@@ -793,6 +807,7 @@ mod tests {
     fn test_roundtrip_join_denied() {
         let msg = ControlMsg::JoinDenied {
             reason: "not authorized".to_string(),
+            retryable: false,
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();

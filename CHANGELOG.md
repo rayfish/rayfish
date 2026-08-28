@@ -24,9 +24,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   roster update with no second apply.
 
   `ray join --role <name>` asks for a subset of what the code grants; asking for
-  a role it does not grant refuses the join. `ray requests <net> accept <id>
-  --role <name>` assigns roles on a live approval, which has no code to read
-  them from. `ray status` shows the roles a peer holds.
+  a role it does not grant refuses the join, and does so once rather than
+  retrying. `ray requests <net> accept <id> --role <name>` assigns roles on a
+  live approval, which has no code to read them from; `ray requests` shows what
+  each waiting peer asked for, so there is something to copy into that flag.
+  `ray status` shows the roles a peer holds.
+
+  Role names are lowercase `[a-z0-9-]`. A `role:` key in a spec is matched
+  against the roster as written, so one with capitals is an error when the spec
+  is read rather than a rule that silently matches nobody.
 
 - **`--json` on `ray apply` and `ray invite`.** Enough machine-readable output
   to drive a deploy from Terraform or Ansible: the networks touched, role
