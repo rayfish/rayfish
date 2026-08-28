@@ -176,6 +176,7 @@ fn control_msg_strategy() -> impl Strategy<Value = ControlMsg> {
                 invite_secret,
                 hostname,
                 device_cert: None,
+                roles: Default::default(),
             }),
     ]
 }

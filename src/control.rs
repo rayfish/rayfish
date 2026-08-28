@@ -3,7 +3,7 @@
 //! Each message is encoded as a 4-byte big-endian length prefix followed by a msgpack body.
 //! Control messages manage membership (join, approve, sync) and mesh topology (hello, reconnect).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
@@ -131,6 +131,12 @@ pub enum ControlMsg {
         hostname: Option<String>,
         #[serde(default)]
         device_cert: Option<DeviceCert>,
+        /// Roles the joiner *asks* for (`ray join --role sentry`). A request,
+        /// not a claim: the coordinator only grants what the redeemed key
+        /// already permits, and denies the join outright if this asks for
+        /// anything outside it. Empty means "whatever the key carries".
+        #[serde(default)]
+        roles: BTreeSet<String>,
     },
     /// Coordinator response telling the joiner it has been queued for live
     /// approval (closed network, no invite). The joiner retries until accepted.
@@ -169,6 +175,11 @@ pub enum ControlMsg {
         hostname: Option<String>,
         #[serde(default)]
         device_cert: Option<DeviceCert>,
+        /// Roles the coordinator assigned. Unlike the request side on
+        /// [`Self::JoinRequest`] this is the authoritative grant, so members
+        /// resolving a `role:` firewall key agree on who holds what.
+        #[serde(default)]
+        roles: BTreeSet<String>,
     },
     Welcome {
         members: Vec<Member>,
@@ -576,6 +587,7 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: Default::default(),
             }],
         };
         let bytes = encode_msg(None, &msg);
@@ -725,6 +737,7 @@ mod tests {
             invite_secret: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             hostname: Some("alice".to_string()),
             device_cert: None,
+            roles: Default::default(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -737,6 +750,7 @@ mod tests {
             invite_secret: None,
             hostname: None,
             device_cert: None,
+            roles: Default::default(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -799,6 +813,7 @@ mod tests {
             identity: test_id(1),
             hostname: None,
             device_cert: None,
+            roles: Default::default(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -818,12 +833,14 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: Default::default(),
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                roles: Default::default(),
             }],
             direct_key: Some([7u8; 32]),
             direct_record: Some(vec![1, 2, 3]),

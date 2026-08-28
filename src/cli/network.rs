@@ -65,14 +65,25 @@ pub(crate) async fn ipc_create(
     Ok(())
 }
 
-pub(crate) async fn ipc_join(
-    network_key: &str,
-    name: Option<&str>,
-    hostname: Option<String>,
-    tor: bool,
-    auto_accept_firewall: bool,
-    auto_accept_files: bool,
-) -> Result<()> {
+/// The choices `ray join` carries beyond the code itself. Grouped so the call
+/// site names each one: four of them are bare flags that would swap silently.
+pub(crate) struct JoinArgs {
+    pub(crate) hostname: Option<String>,
+    pub(crate) tor: bool,
+    pub(crate) auto_accept_firewall: bool,
+    pub(crate) auto_accept_files: bool,
+    /// Roles to ask for. Narrows what the code grants, never widens it.
+    pub(crate) roles: Vec<String>,
+}
+
+pub(crate) async fn ipc_join(network_key: &str, name: Option<&str>, args: JoinArgs) -> Result<()> {
+    let JoinArgs {
+        hostname,
+        tor,
+        auto_accept_firewall,
+        auto_accept_files,
+        roles,
+    } = args;
     let transport = if tor {
         Some(config::TransportMode::Tor)
     } else {
@@ -97,6 +108,7 @@ pub(crate) async fn ipc_join(
             coordinator,
             auto_accept_firewall,
             auto_accept_files,
+            roles,
         },
     )
     .await?;

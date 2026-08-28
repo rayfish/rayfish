@@ -115,6 +115,9 @@ pub(crate) struct JoinParams {
     /// (`--auto-accept-files`). Persisted config wins on reconnect/restore; this
     /// is only the first-join seed.
     pub(crate) auto_accept_files: bool,
+    /// Roles this join asks for. Forwarded in the `JoinRequest` and granted only
+    /// where the presented credential already permits them.
+    pub(crate) requested_roles: Vec<String>,
     /// Fresh join (send `JoinRequest` first) vs reconnect/restore (coordinator
     /// speaks first).
     pub(crate) initial: bool,
@@ -158,6 +161,7 @@ pub(crate) async fn join_mesh_shared(
         group_blob,
         auto_accept_firewall,
         auto_accept_files,
+        requested_roles,
         initial,
     } = params;
     let my_identity = identity.local_identity();
@@ -175,6 +179,7 @@ pub(crate) async fn join_mesh_shared(
             invite_secret,
             &my_hostname,
             &device_cert,
+            &requested_roles,
             &group_blob,
         )
         .await?
@@ -544,6 +549,7 @@ async fn perform_join_handshake(
     invite_secret: Option<Vec<u8>>,
     my_hostname: &Option<String>,
     device_cert: &Option<control::DeviceCert>,
+    requested_roles: &[String],
     fallback_blob: &crate::membership::GroupBlob,
 ) -> Result<HandshakeOutcome> {
     if initial {
@@ -558,6 +564,7 @@ async fn perform_join_handshake(
                 invite_secret,
                 hostname: my_hostname.clone(),
                 device_cert: device_cert.clone(),
+                roles: requested_roles.iter().cloned().collect(),
             },
         )
         .await
@@ -775,6 +782,7 @@ mod persist_config_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 

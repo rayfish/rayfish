@@ -699,6 +699,8 @@ impl NetworkRegistry {
             // `Unknown` until the data plane probes the uplink: an offer we have
             // not verified is not a claim to publish.
             exit_families: ExitFamilies::Unknown,
+            // See the coordinator's own entry in `runtime::restore_roster`.
+            roles: BTreeSet::new(),
         });
 
         let mut approved = ApprovedList::new();
@@ -708,6 +710,9 @@ impl NetworkRegistry {
                 hostname: peer_hostname,
                 user_identity: None,
                 device_cert: None,
+                // A `ray connect` link is a symmetric 2-peer network with no
+                // policy to select on, so the requester gets no roles.
+                roles: BTreeSet::new(),
             });
         }
 

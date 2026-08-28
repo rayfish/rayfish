@@ -8,6 +8,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Roles: firewall rules that name a class of nodes.** A subject or peer in a
+  `ray apply` spec can now be `role:sentry` instead of a hostname. A hostname
+  names one machine, so covering a group meant listing every member by hand and
+  re-running `ray apply` each time the group grew. A role is assigned by the
+  coordinator from the join code and resolved on each node against the signed
+  roster, so the spec stops changing when the fleet does.
+
+  `ray invite <net> create --reusable --role sentry` mints one code that seats a
+  group. `--role` is allowed on a reusable key where `--hostname` is not: a
+  hostname is unique per node, a role is shared by a class of them on purpose,
+  which is what lets one code sit in a machine image or Terraform user-data and
+  cover an autoscaling group. Every instance then runs the same bare
+  `ray join <code>`, and a node joining later picks up its rules on the next
+  roster update with no second apply.
+
+  `ray join --role <name>` asks for a subset of what the code grants; asking for
+  a role it does not grant refuses the join. `ray requests <net> accept <id>
+  --role <name>` assigns roles on a live approval, which has no code to read
+  them from. `ray status` shows the roles a peer holds.
+
+- **`--json` on `ray apply` and `ray invite`.** Enough machine-readable output
+  to drive a deploy from Terraform or Ansible: the networks touched, role
+  coverage, the hosts a spec expects that have not joined, and any codes minted
+  for them. `changed` in the apply payload is what an Ansible `changed_when`
+  wants.
+
 - **Windows on ARM64.** Releases and nightlies now publish
   `ray-windows-aarch64.exe`, so Snapdragon and other ARM laptops get a native
   binary instead of running the x86_64 one under emulation. CI builds the
@@ -61,7 +87,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ssh localhost`, instead of leaving a bare "connection refused" to explain
   itself.
 
+### Fixed
+
+- **A coordinator never picked up a peer that joined after a rule was
+  published.** Suggested rules name their peers by hostname, resolved against
+  the roster, and the docs promised a rule for a not-yet-joined peer would
+  appear once it joined. That held for members, which reconverge from the
+  published record, but not for the coordinator: it *is* that record's source,
+  so the poller's hash check short-circuited and it only ever re-resolved when
+  suggestions themselves were republished. It now re-resolves whenever its
+  roster changes, on both admission and removal.
+
+- **The invite command `ray apply` printed could not be pasted.** The
+  membership-gap tip rendered `ray invite <net> --hostname <h>`, which the parser
+  rejects: those flags belong to the `create` subcommand. It now prints
+  `ray invite <net> create --hostname <h>`.
+
+- **`ray apply --invite-missing` minted invites on the wrong network.** The
+  expected-host diff was computed over the whole spec but reported once per
+  network, so a host belonging to one network read as missing from every other
+  and its invite was minted there. Harmless when reading the output by eye, and
+  not when a provisioner consumes it. The diff is now scoped to the network it
+  is reported under.
+
 ### Security
+
+- **A role cannot be self-claimed.** Firewall rules keyed on a hostname rest on
+  a name the joiner picked whenever the invite did not bind one, so an unbound
+  join could take a name the spec had rules for. A role never comes from the
+  joiner: the coordinator reads it off the redeemed code, and `--role` on the
+  join side can only narrow that grant. Rules written against `role:` are free
+  of that hole.
 
 - **Android no longer sends your keys to Google's backup.** The app allowed
   Android Auto Backup with no exclusions, so the identity key, the device

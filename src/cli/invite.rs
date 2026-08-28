@@ -28,6 +28,7 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
         expires: None,
         hostname: None,
         reusable: false,
+        roles: Vec::new(),
         qr: false,
     });
     let hostname_opt = match &action {
@@ -40,6 +41,7 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
             expires,
             hostname,
             reusable,
+            roles,
             qr: _,
         } => {
             // Reusable keys default to a longer 30d TTL; single-use to 7d.
@@ -55,6 +57,7 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
                 expires_secs: parse_duration_secs(&ttl)?,
                 hostname,
                 reusable,
+                roles,
             }
         }
         InviteAction::List => ipc::IpcMessage::InviteList {
@@ -72,14 +75,16 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
             code,
             id,
             expires_secs,
-        } => print_invite_created(
-            &code,
-            &id,
+            roles,
+        } => print_invite_created(MintedInvite {
+            code: &code,
+            id: &id,
             expires_secs,
+            roles: &roles,
             show_qr,
             reusable_requested,
-            &hostname_opt,
-        ),
+            hostname_opt: &hostname_opt,
+        }),
         ipc::IpcMessage::InviteListResponse { invites } => print_invite_list(&invites),
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
@@ -90,14 +95,43 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
 
 /// Render a freshly minted invite: id, join code, optional QR, TTL, and the
 /// reusable/single-use + hostname-binding notes.
-fn print_invite_created(
-    code: &str,
-    id: &str,
+/// What was actually minted, as the coordinator reports it back. A struct
+/// rather than seven positionals, and it is also the shape `--json` renders, so
+/// the human and machine outputs cannot drift apart.
+struct MintedInvite<'a> {
+    code: &'a str,
+    id: &'a str,
     expires_secs: u64,
+    /// Roles the credential grants, as the daemon normalized them (lowercased,
+    /// deduped), not as they were typed.
+    roles: &'a [String],
     show_qr: bool,
     reusable_requested: bool,
-    hostname_opt: &Option<String>,
-) {
+    hostname_opt: &'a Option<String>,
+}
+
+fn print_invite_created(minted: MintedInvite) {
+    let MintedInvite {
+        code,
+        id,
+        expires_secs,
+        roles,
+        show_qr,
+        reusable_requested,
+        hostname_opt,
+    } = minted;
+    // A provisioner reads this: emit the code and what it grants, nothing else.
+    if json_enabled() {
+        print_json(&serde_json::json!({
+            "id": id,
+            "code": code,
+            "expires_secs": expires_secs,
+            "reusable": reusable_requested,
+            "hostname": hostname_opt,
+            "roles": roles,
+        }));
+        return;
+    }
     println!();
     println!(
         "  {} {} {}",
@@ -127,17 +161,26 @@ fn print_invite_created(
     };
     if reusable_requested {
         println!("  reusable (multi-use), expires in {ttl}");
-        println!(
-            "  servers join unattended with: {}",
-            style::faint(&format!(
-                "ray join {code} --hostname <h> --auto-accept-firewall"
-            ))
-        );
+        // With roles the per-host `--hostname` is the wrong advice: the whole
+        // point is that every machine runs the identical line.
+        let join = if roles.is_empty() {
+            format!("ray join {code} --hostname <h> --auto-accept-firewall")
+        } else {
+            format!("ray join {code} --auto-accept-firewall")
+        };
+        println!("  servers join unattended with: {}", style::faint(&join));
     } else {
         println!("  single-use, expires in {ttl}");
     }
     if let Some(h) = hostname_opt {
         println!("  binds hostname: {}", style::bold(h));
+    }
+    if !roles.is_empty() {
+        println!("  assigns roles: {}", style::bold(&roles.join(", ")));
+        println!(
+            "  firewall rules targeting {} now cover every node that redeems this",
+            style::faint(&format!("role:{}", roles[0]))
+        );
     }
 }
 
@@ -232,13 +275,14 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn ipc_accept_request(network: &str, id: &str) -> Result<()> {
+pub(crate) async fn ipc_accept_request(network: &str, id: &str, roles: Vec<String>) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
         ipc::IpcMessage::AcceptRequest {
             network: network.to_string(),
             id: id.to_string(),
+            roles,
         },
     )
     .await?;

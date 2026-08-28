@@ -154,6 +154,7 @@ impl Daemon {
                 Ok(s) => s,
                 Err(_) => {
                     return NetworkStatus {
+                        my_roles: BTreeSet::new(),
                         name: h.name.clone(),
                         role,
                         my_ipv6: derive_ipv6(&my_id),
@@ -215,6 +216,7 @@ impl Daemon {
                     ipv6: derive_ipv6(&m.identity),
                     hostname,
                     user_identity,
+                    roles: m.roles.clone(),
                     is_own_device: user_id == own_user,
                     // Only meaningful for a peer with no live connection: a dial hit
                     // the mesh-version ALPN gate. A connected peer is same-version by
@@ -257,6 +259,11 @@ impl Daemon {
                     .unwrap_or_else(|| m.identity.fmt_short().to_string()),
                 None => stored,
             });
+        let my_roles = members
+            .iter()
+            .find(|m| m.identity == self.transport.identity.local_identity())
+            .map(|m| m.roles.clone())
+            .unwrap_or_default();
         NetworkStatus {
             name: h.name.clone(),
             role,
@@ -265,6 +272,7 @@ impl Daemon {
             network_key: Some(h.network_key.to_string()),
             member_count,
             peers,
+            my_roles,
             pending_suggestions,
             pending_requests,
             aliases,
@@ -991,11 +999,16 @@ pub(crate) fn saved_network_status(
             // is the optimistic default for a *registered* network. Nothing on
             // this one is reachable at all until the restore lands.
             state: PeerState::Offline,
+            // Roles live only in the signed blob; this projection is the lossy
+            // config cache, so it has none to show until the restore lands.
+            roles: BTreeSet::new(),
             exit_node: false,
             exit_in_use: false,
         })
         .collect();
     NetworkStatus {
+        // Roles come from the signed blob, which this projection does not have.
+        my_roles: BTreeSet::new(),
         name: net.name.clone(),
         role,
         my_ipv6: derive_ipv6(&my_id),

@@ -291,11 +291,11 @@ impl ConnectService {
             .join_network(
                 &room_id.to_string(),
                 None,
-                hostname,
-                None,
-                Some(coordinator),
-                false,
-                false,
+                JoinOptions {
+                    hostname,
+                    coordinator: Some(coordinator),
+                    ..Default::default()
+                },
             )
             .await;
         if let IpcMessage::Joined { name, .. } = &resp {
