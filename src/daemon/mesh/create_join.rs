@@ -380,6 +380,15 @@ impl NetworkRegistry {
                         .to_string(),
                 }
             }
+            // Same answer as in the retry loop above, for the caller that never
+            // reaches it: the coordinator refused for good, so drop the persisted
+            // request instead of leaving it to be re-asked once per daemon
+            // restart (`connect`'s resume) with nothing ever surfacing it.
+            Err(e) if e.downcast_ref::<JoinRefused>().is_some() => {
+                let _ = config::remove_pending_join(network_key);
+                tracing::error!(net = %network_key, error = %e, "coordinator refused the join; giving up");
+                ipc_err(format!("{e:#}"))
+            }
             Err(e) => ipc_err(format!("{e:#}")),
         }
     }
@@ -612,6 +621,11 @@ impl NetworkRegistry {
         }
 
         let mut last_err = anyhow::anyhow!("no coordinators tried");
+        // The first final refusal, kept aside so the loop can carry on without
+        // `last_err` overwriting it: the caller's retry loop downcasts for it to
+        // know to stop, and whatever the last coordinator happened to say would
+        // hide it.
+        let mut refused: Option<anyhow::Error> = None;
         for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
             // Reconnect + cleanup are daemon-wide now (the connection supervisor),
@@ -658,15 +672,18 @@ impl NetworkRegistry {
                     abort_join_tasks(&cancel, tasks);
                     return Ok(None);
                 }
-                // A refusal the coordinator marked final rests on the
-                // credential and the signed roster, both of which every
-                // coordinator shares, so the next one answers the same. Return
-                // it as-is: trying on would replace it in `last_err` with
-                // whatever the last coordinator said, and the caller's retry
-                // loop needs this exact error to know to stop.
+                // A refusal the coordinator marked final answers for that
+                // coordinator, not for the network. Most of what it rests on is
+                // shared (the signed roster, a reusable key inside it), but a
+                // single-use invite lives in a per-coordinator ledger fed by
+                // gossip, so one that has not arrived yet, or predates a field
+                // the minter added, makes this coordinator refuse a code the
+                // minter would honor. Keep the refusal and try the rest; it is
+                // returned only if nobody admits us.
                 Err(e) if e.downcast_ref::<JoinRefused>().is_some() => {
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator refused the join, trying next");
                     abort_join_tasks(&cancel, tasks);
-                    return Err(e);
+                    refused.get_or_insert(e);
                 }
                 Err(e) => {
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
@@ -676,10 +693,14 @@ impl NetworkRegistry {
             }
         }
 
-        // `context`, not a formatted `bail!`: interpolating `{last_err:#}` into a
+        // A final refusal outranks whatever the last coordinator said: it is the
+        // one answer the caller's retry loop can act on, and a transient failure
+        // from a later dial would only send it back to a backoff that never ends.
+        //
+        // `context`, not a formatted `bail!`: interpolating `{err:#}` into a
         // fresh error reads the same but flattens the chain, and callers
         // downcast through it.
-        Err(last_err.context(format!(
+        Err(refused.unwrap_or(last_err).context(format!(
             "no coordinator admitted the join (tried {})",
             order.len()
         )))

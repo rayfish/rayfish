@@ -266,10 +266,20 @@ pub enum ControlMsg {
     },
     /// Coordinator → coordinators: share a minted single-use invite's hash so any
     /// coordinator can redeem it. Carries the hash only, never the secret.
+    ///
+    /// `roles` travels with it because it is part of what the invite grants, and
+    /// the ledger entry a co-coordinator writes from this message is the only
+    /// thing it has to redeem against: without them a role-bearing code redeemed
+    /// through any coordinator but its minter seats the node with no roles at
+    /// all, and its `role:` rules never materialize. (The invite's authoritative
+    /// hostname does not travel yet, so that half still falls back to the
+    /// joiner's own claim on a co-coordinator.)
     InviteShare {
         id: String,
         secret_hash: Vec<u8>,
         expires: u64,
+        #[serde(default)]
+        roles: BTreeSet<String>,
     },
     /// Coordinator → coordinators: a shared single-use invite was redeemed; burn it.
     InviteUsed {
@@ -995,6 +1005,7 @@ mod tests {
                 id: "ab3f".into(),
                 secret_hash: vec![1, 2, 3],
                 expires: 42,
+                roles: ["sentry".to_string()].into(),
             },
             ControlMsg::InviteUsed {
                 secret_hash: vec![4, 5, 6],
