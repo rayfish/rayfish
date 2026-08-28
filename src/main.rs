@@ -1065,6 +1065,15 @@ pub(crate) enum FilesAction {
         #[arg(long, short, value_hint = clap::ValueHint::DirPath)]
         output: Option<String>,
     },
+    /// Decline a pending file transfer
+    ///
+    /// Drops the offer from the queue without fetching it. The sender is not
+    /// told: their offer is simply never pulled.
+    Reject {
+        /// Transfer ID (from 'ray files')
+        #[arg(add = complete::incoming_files())]
+        id: u64,
+    },
     /// Cancel a queued send that hasn't reached its peer yet
     Cancel {
         /// Queued-send ID (from 'ray files')

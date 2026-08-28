@@ -166,6 +166,14 @@ pub(crate) fn evict_oldest_file(pending: &mut Vec<PendingFile>, cap: usize) -> O
     Some(dropped.id)
 }
 
+/// Take the queued offer with `id` out of `pending`, if it is still there.
+/// Shared by accept and reject: both consume the entry, and neither may leave
+/// it behind for the other to act on a second time.
+pub(crate) fn take_pending(pending: &mut Vec<PendingFile>, id: u64) -> Option<PendingFile> {
+    let i = pending.iter().position(|f| f.id == id)?;
+    Some(pending.remove(i))
+}
+
 /// How long an open pairing session stays open.
 ///
 /// Nothing else closes it. A wrong secret deliberately does not (that was the bug
@@ -402,9 +410,8 @@ impl FileService {
         let _ = peer_cred;
         let pending_file = {
             let mut pending = self.pending_files.lock().unwrap();
-            let idx = pending.iter().position(|f| f.id == id);
-            match idx {
-                Some(i) => pending.remove(i),
+            match take_pending(&mut pending, id) {
+                Some(f) => f,
                 None => {
                     return ipc_err(format!("no pending file with id {id}"));
                 }
@@ -954,13 +961,10 @@ impl FileService {
     /// blob. In-memory only, mirroring how `accept_file` consumes the entry.
     pub(crate) fn reject_file(&self, id: u64) -> IpcMessage {
         let mut pending = self.pending_files.lock().unwrap();
-        match pending.iter().position(|f| f.id == id) {
-            Some(i) => {
-                pending.remove(i);
-                IpcMessage::Ok {
-                    message: format!("declined file {id}"),
-                }
-            }
+        match take_pending(&mut pending, id) {
+            Some(f) => IpcMessage::Ok {
+                message: format!("declined {} from {}", f.filename, f.from.fmt_short()),
+            },
             None => ipc_err(format!("no pending file with id {id}")),
         }
     }
@@ -1151,6 +1155,39 @@ mod tests {
     use super::*;
     use iroh_blobs::Hash;
     use std::time::Instant;
+
+    fn pending(id: u64) -> PendingFile {
+        PendingFile {
+            id,
+            from: SecretKey::from([id as u8; 32]).public(),
+            filename: format!("file{id}.bin"),
+            size: 1,
+            mime_type: "application/octet-stream".to_string(),
+            blob_hash: blake3::hash(b"payload"),
+        }
+    }
+
+    /// `ray files accept` and `ray files reject` both consume the offer, so a
+    /// second command on the same id must find nothing left to act on.
+    #[test]
+    fn taking_a_pending_offer_removes_only_that_one() {
+        let mut queue = vec![pending(1), pending(2), pending(3)];
+
+        let taken = take_pending(&mut queue, 2).expect("id 2 is queued");
+        assert_eq!(taken.id, 2);
+        assert_eq!(
+            queue.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the other offers stay queued, in order"
+        );
+
+        assert!(
+            take_pending(&mut queue, 2).is_none(),
+            "an id already taken is gone, not taken twice"
+        );
+        assert!(take_pending(&mut queue, 99).is_none());
+        assert_eq!(queue.len(), 2, "a miss leaves the queue untouched");
+    }
 
     /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`
     /// must survive a JSON round trip (the file is reloaded across daemon

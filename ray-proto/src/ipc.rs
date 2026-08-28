@@ -262,6 +262,12 @@ pub enum IpcMessage {
         id: u64,
         output: Option<String>,
     },
+    /// Decline a pending inbound offer (`ray files reject <id>`). Local only:
+    /// the entry leaves the queue and nothing is sent to the sender, so their
+    /// offer is left unpulled exactly as if it had been ignored.
+    RejectFile {
+        id: u64,
+    },
     StartPairing,
     PairWithDevice {
         endpoint_id: EndpointId,

@@ -332,6 +332,18 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 other => fail_unexpected(&other),
             }
         }
+        Some(FilesAction::Reject { id }) => {
+            // No spinner, unlike `Accept`: nothing is fetched, the daemon just
+            // drops the entry and answers.
+            ipc::send(&mut stream, ipc::IpcMessage::RejectFile { id }).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("  {} {}", style::check(), style::value(&message));
+                }
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
+            }
+        }
         Some(FilesAction::Cancel { id }) => {
             ipc::send(&mut stream, ipc::IpcMessage::CancelSend { id }).await?;
             match ipc::recv(&mut stream).await? {
