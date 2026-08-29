@@ -163,7 +163,7 @@ object OfferNotifier {
 
     private fun post(context: Context, f: FileOffer) {
         ensureChannel(context)
-        val text = "${f.from} · ${formatSize(f.size)}"
+        val text = context.getString(R.string.notif_offer_text, f.from, formatSize(f.size))
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setContentTitle(f.filename)
             .setContentText(text)
@@ -185,13 +185,13 @@ object OfferNotifier {
             .setAutoCancel(true)
             .addAction(
                 action(
-                    context, f, ReceiveService.ACTION_ACCEPT, "Save",
+                    context, f, ReceiveService.ACTION_ACCEPT, context.getString(R.string.action_save),
                     android.R.drawable.stat_sys_download,
                 ),
             )
             .addAction(
                 action(
-                    context, f, ReceiveService.ACTION_REJECT, "Reject",
+                    context, f, ReceiveService.ACTION_REJECT, context.getString(R.string.action_reject),
                     android.R.drawable.ic_menu_close_clear_cancel,
                 ),
             )
@@ -240,9 +240,9 @@ object OfferNotifier {
         if (channelEnsured) return
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Incoming files",
+            context.getString(R.string.notif_channel_offers),
             NotificationManager.IMPORTANCE_DEFAULT,
-        ).apply { description = "Files other people have sent you over the mesh" }
+        ).apply { description = context.getString(R.string.notif_channel_offers_desc) }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         channelEnsured = true
     }

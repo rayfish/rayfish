@@ -8,6 +8,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -16,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.R
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 
@@ -66,21 +68,20 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
                         ?: error("no output stream")
                 }.isSuccess
             }
-            onToast(if (wrote) "Backup saved" else "Could not write the backup")
+            onToast(context.getString(if (wrote) R.string.toast_backup_saved else R.string.toast_backup_write_failed))
         }
     }
 
     SectionCard {
-        SectionLabel("Identity backup")
+        SectionLabel(stringResource(R.string.label_identity_backup))
         Text(
-            "Your identity is this device's key. Lose it and your networks do not know you; " +
-                "back it up encrypted with a password only you know.",
+            stringResource(R.string.identity_backup_body),
             fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted,
         )
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PillButton(
-                "Back up",
+                stringResource(R.string.action_backup),
                 enabled = !busy,
                 onClick = {
                     backupPassword = ""
@@ -90,7 +91,7 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
                 modifier = Modifier.weight(1f),
             )
             OutlinePillButton(
-                "Restore",
+                stringResource(R.string.action_restore),
                 enabled = !busy && !running && !restoring,
                 onClick = { restoring = true },
                 modifier = Modifier.weight(1f),
@@ -99,7 +100,7 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
         if (running) {
             Spacer(Modifier.height(8.dp))
             Text(
-                "Turn Rayfish off to restore an identity.",
+                stringResource(R.string.identity_restore_need_off),
                 fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
             )
         }
@@ -116,13 +117,13 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
         AlertDialog(
             onDismissRequest = { askBackupPassword = false },
             containerColor = Rf.Sheet,
-            title = { Text("Back up identity", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            title = { Text(stringResource(R.string.backup_title), fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RayfishTextField(backupPassword, { backupPassword = it }, "password", password = true)
-                    RayfishTextField(backupConfirm, { backupConfirm = it }, "confirm password", password = true)
+                    RayfishTextField(backupPassword, { backupPassword = it }, stringResource(R.string.hint_password), password = true)
+                    RayfishTextField(backupConfirm, { backupConfirm = it }, stringResource(R.string.hint_confirm_password), password = true)
                     Text(
-                        "There is no way to recover this password. Without it the backup is just noise.",
+                        stringResource(R.string.backup_password_warning),
                         fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
                     )
                 }
@@ -144,17 +145,17 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
                                 pendingCode = backup.code
                                 saveBackup.launch(suggestedFileName(backup.publicKey))
                             } catch (t: Throwable) {
-                                onToast("Backup failed: ${t.message}")
+                                onToast(context.getString(R.string.error_backup_failed, t.message.orEmpty()))
                             } finally {
                                 busy = false
                             }
                         }
                     },
-                ) { Text("Continue", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+                ) { Text(stringResource(R.string.action_continue), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = {
                 TextButton(onClick = { askBackupPassword = false }) {
-                    Text("Cancel", color = Rf.Body, fontFamily = Chakra)
+                    Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra)
                 }
             },
         )

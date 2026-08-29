@@ -224,26 +224,15 @@ object TransferNotifier {
         if (postedProgress[t.id] == newState) return
 
         ensureChannel(context)
-        val title = if (t.outgoing) "Sending ${t.filename}" else "Receiving ${t.filename}"
+        val title = if (t.outgoing) context.getString(R.string.notif_sending_file, t.filename) else context.getString(R.string.notif_receiving_file, t.filename)
         val text = when {
-            // Waiting on a human on the other end can take arbitrarily long, or
-            // never resolve at all, and we have no way to tell the user which.
-            // Say so plainly, but only when it is actually true: with a poller
-            // alive in the background (RayfishVpnService, VPN on or standby), the
-            // completion will be observed and notified regardless of whether
-            // Rayfish's UI is open, so the caveat would be simply wrong there.
             waiting && !RayfishVpnService.isRunning ->
-                "Waiting for ${t.peer} to accept · only notified if Rayfish stays running"
-            waiting -> "Waiting for ${t.peer} to accept"
-            // Spell the percentage out next to the bar. The bar alone reads as
-            // "something is happening" but not how far along it is, and a large
-            // file's bar can look frozen for a while. `pct` is -1 only when the
-            // bar is indeterminate anyway (waiting, or an empty file), so those
-            // cases fall through to the plain text.
-            t.outgoing && pct >= 0 -> "To ${t.peer} ($pct%)"
-            t.outgoing -> "To ${t.peer}"
-            pct >= 0 -> "From ${t.peer} ($pct%)"
-            else -> "From ${t.peer}"
+                context.getString(R.string.notif_waiting_accept_if_running, t.peer)
+            waiting -> context.getString(R.string.notif_waiting_accept, t.peer)
+            t.outgoing && pct >= 0 -> context.getString(R.string.notif_to_peer_pct, t.peer, pct)
+            t.outgoing -> context.getString(R.string.notif_to_peer, t.peer)
+            pct >= 0 -> context.getString(R.string.notif_from_peer_pct, t.peer, pct)
+            else -> context.getString(R.string.notif_from_peer, t.peer)
         }
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setContentTitle(title)
@@ -295,16 +284,16 @@ object TransferNotifier {
         val savedToDownloads = ok && !t.outgoing &&
             DownloadsOutcome.consume(TransferKey(t.peer, t.filename, t.size))
         val title = when {
-            ok && t.outgoing -> "Sent ${t.filename}"
-            ok -> "Saved ${t.filename}"
-            t.outgoing -> "Could not send ${t.filename}"
-            else -> "Could not receive ${t.filename}"
+            ok && t.outgoing -> context.getString(R.string.notif_sent_file, t.filename)
+            ok -> context.getString(R.string.notif_saved_file, t.filename)
+            t.outgoing -> context.getString(R.string.notif_could_not_send_file, t.filename)
+            else -> context.getString(R.string.notif_could_not_receive_file, t.filename)
         }
         val text = when {
-            ok && t.outgoing -> "${t.peer} has it"
-            savedToDownloads -> "Saved to Downloads"
-            ok -> "Saved"
-            else -> "Transfer with ${t.peer} failed"
+            ok && t.outgoing -> context.getString(R.string.notif_peer_has_it, t.peer)
+            savedToDownloads -> context.getString(R.string.notif_saved_to_downloads)
+            ok -> context.getString(R.string.notif_saved)
+            else -> context.getString(R.string.notif_transfer_failed, t.peer)
         }
         // Tapping a file actually saved to Downloads opens Downloads; anything
         // else (a send, or a receive that landed in app storage instead) opens
@@ -341,9 +330,9 @@ object TransferNotifier {
         if (channelEnsured) return
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "File transfers",
+            context.getString(R.string.notif_channel_transfers),
             NotificationManager.IMPORTANCE_LOW,
-        ).apply { description = "Progress and results for files sent and received over the mesh" }
+        ).apply { description = context.getString(R.string.notif_channel_transfers_desc) }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         // Set only after the channel actually exists: another thread reading
         // channelEnsured == true before createNotificationChannel returns could

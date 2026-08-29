@@ -12,6 +12,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -22,6 +24,7 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.R
 import xyz.rayfish.android.isActive
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.qr.QrImage
@@ -39,10 +42,10 @@ fun NetworksScreen(
     var showAdd by remember { mutableStateOf(false) }
     var inviteCode by remember { mutableStateOf<String?>(null) }   // non-null -> show invite sheet
 
-    fun <T> run(block: suspend () -> T, ok: (T) -> Unit, errPrefix: String) {
+    fun <T> run(block: suspend () -> T, ok: (T) -> Unit, errRes: Int) {
         scope.launch {
             try { val r = withContext(Dispatchers.IO) { block() }; ok(r); onChanged() }
-            catch (t: Throwable) { onToast("$errPrefix: ${t.message}") }
+            catch (t: Throwable) { onToast(context.getString(errRes, t.message.orEmpty())) }
         }
     }
 
@@ -50,11 +53,11 @@ fun NetworksScreen(
     val running = status?.running == true
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        BrandHeader(title = "Networks") {
-            PillButton("＋ Add", onClick = { showAdd = true })
+        BrandHeader(title = stringResource(R.string.tab_networks)) {
+            PillButton(stringResource(R.string.action_add), onClick = { showAdd = true })
         }
         if (nets.isEmpty()) {
-            SectionCard { Text(if (starting) "Starting…" else "No networks yet. Add one to get started.",
+            SectionCard { Text(if (starting) stringResource(R.string.status_starting_ellipsis) else stringResource(R.string.networks_empty),
                 fontFamily = Chakra, fontSize = 13.sp, color = Rf.Muted) }
         }
         nets.forEach { net ->
@@ -71,7 +74,7 @@ fun NetworksScreen(
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(net.name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                        Text("${net.hostname.ifEmpty { net.ipv6 }} · ${if (running) "${net.peers.count { it.isActive }} online" else "offline"}",
+                        Text("${net.hostname.ifEmpty { net.ipv6 }} · ${if (running) pluralStringResource(R.plurals.network_peers_online, net.peers.count { it.isActive }, net.peers.count { it.isActive }) else stringResource(R.string.status_offline)}",
                             fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
                     }
                     // The device's stable .ray DNS name in this network. Prefer
@@ -81,13 +84,13 @@ fun NetworksScreen(
                     OverflowMenu(
                         header = dns,
                         items = listOf(
-                            MenuItem("Invite to share") {
-                                run({ NodeHolder.get(context).invite(net.name) }, { inviteCode = it }, "Invite failed")
+                            MenuItem(stringResource(R.string.menu_invite)) {
+                                run({ NodeHolder.get(context).invite(net.name) }, { inviteCode = it }, R.string.error_invite_failed)
                             },
-                            MenuItem("Copy address") {
+                            MenuItem(stringResource(R.string.menu_copy_address)) {
                                 val address = dns ?: net.ipv6
-                                copyToClipboard(context, "address", address)
-                                onToast("Copied $address")
+                                copyToClipboard(context, context.getString(R.string.clipboard_address), address)
+                                onToast(context.getString(R.string.toast_copied, address))
                             },
                         ),
                     )
@@ -102,7 +105,7 @@ fun NetworksScreen(
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                        Text("waiting for approval", fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
+                        Text(stringResource(R.string.networks_waiting_approval), fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
                     }
                 }
             }
@@ -112,23 +115,18 @@ fun NetworksScreen(
     if (showAdd) {
         AddNetworkSheet(
             onDismiss = { showAdd = false },
-            onCreate = { name -> showAdd = false; run({ NodeHolder.get(context).create(name) }, { onToast("Created ${it.name}") }, "Create failed") },
+            onCreate = { name -> showAdd = false; run({ NodeHolder.get(context).create(name) }, { onToast(context.getString(R.string.toast_created, it.name)) }, R.string.error_create_failed) },
             onSubmitCode = { code ->
                 showAdd = false
                 run({ NodeHolder.get(context).submitCode(code) }, { action ->
-                    onToast(when (action) {
-                        is uniffi.ray_mobile.LinkAction.Joined ->
-                            if (action.v1.pending) "Join requested for ${action.v1.name} - waiting for approval"
-                            else "Joined ${action.v1.name}"
-                        is uniffi.ray_mobile.LinkAction.Paired -> "Device paired"
-                    })
-                }, "Failed")
+                    onToast(context.messageForLinkAction(action))
+                }, R.string.error_failed)
             },
             onToast = onToast,
         )
     }
     inviteCode?.let { code ->
-        QrCodeSheet(title = "Invite to share", code = code, context = context) { inviteCode = null }
+        QrCodeSheet(title = stringResource(R.string.invite_sheet_title), code = code, context = context) { inviteCode = null }
     }
 }
 
@@ -139,19 +137,20 @@ private fun AddNetworkSheet(
 ) {
     var name by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
+    val context = LocalContext.current
     val scan = rememberQrScanner { result -> if (result != null) onSubmitCode(result.trim()) }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet) {
         Column(Modifier.padding(20.dp).padding(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            SectionLabel("Join or pair")
-            RayfishTextField(code, { code = it }, "Invite or pairing code")
+            SectionLabel(stringResource(R.string.label_join_or_pair))
+            RayfishTextField(code, { code = it }, stringResource(R.string.hint_invite_or_pairing_code))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                PillButton("Continue", onClick = { if (code.isNotBlank()) onSubmitCode(code.trim()) else onToast("Enter a code") }, modifier = Modifier.weight(1f))
-                OutlinePillButton("Scan", onClick = scan, modifier = Modifier.weight(1f))
+                PillButton(stringResource(R.string.action_continue), onClick = { if (code.isNotBlank()) onSubmitCode(code.trim()) else onToast(context.getString(R.string.toast_enter_code)) }, modifier = Modifier.weight(1f))
+                OutlinePillButton(stringResource(R.string.action_scan), onClick = scan, modifier = Modifier.weight(1f))
             }
             Spacer(Modifier.height(6.dp))
-            SectionLabel("Create a network")
-            RayfishTextField(name, { name = it }, "Name (optional)")
-            PillButton("Create network", onClick = { onCreate(name.trim().ifEmpty { null }) }, modifier = Modifier.fillMaxWidth())
+            SectionLabel(stringResource(R.string.label_create_a_network))
+            RayfishTextField(name, { name = it }, stringResource(R.string.hint_network_name_optional))
+            PillButton(stringResource(R.string.action_create_network), onClick = { onCreate(name.trim().ifEmpty { null }) }, modifier = Modifier.fillMaxWidth())
         }
     }
 }
@@ -176,9 +175,9 @@ fun QrCodeSheet(title: String, code: String, context: android.content.Context, o
             QrImage(code, size = 200.dp)
             Text(code, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted, modifier = Modifier.fillMaxWidth())
             PillButton(
-                if (taps == 0) "Copy code" else if (copied) "Copied" else "Copy failed",
+                if (taps == 0) stringResource(R.string.action_copy_code) else if (copied) stringResource(R.string.action_copied) else stringResource(R.string.action_copy_failed),
                 onClick = {
-                    copied = copyToClipboard(context, "Rayfish code", code)
+                    copied = copyToClipboard(context, context.getString(R.string.clipboard_code), code)
                     taps++
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -199,4 +198,14 @@ fun copyToClipboard(context: android.content.Context, label: String, text: Strin
         android.util.Log.w("rayfish", "clipboard write failed", t)
         false
     }
+}
+
+fun android.content.Context.messageForLinkAction(
+    action: uniffi.ray_mobile.LinkAction,
+    pairedRes: Int = R.string.toast_device_paired,
+): String = when (action) {
+    is uniffi.ray_mobile.LinkAction.Joined ->
+        if (action.v1.pending) getString(R.string.toast_join_requested, action.v1.name)
+        else getString(R.string.toast_joined, action.v1.name)
+    is uniffi.ray_mobile.LinkAction.Paired -> getString(pairedRes)
 }
