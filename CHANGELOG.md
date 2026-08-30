@@ -69,6 +69,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android: networks no longer disappear while they reconnect.** The app listed
+  only the networks the daemon had finished registering, so a cold start showed
+  an empty Networks screen until every restore landed, and a network whose
+  restore kept failing was simply absent with nothing to say why. Saved networks
+  now stay on the list throughout: "connecting…" while the restore is in flight,
+  and "not connected" with the daemon's reason once an attempt has failed, which
+  is what `ray status` has always shown. Opening one shows its saved roster
+  rather than nothing.
+
 - **CLI text stays readable on light terminals.** Value and headline text was
   hard-coded to near-white grays that vanish on a light background. Both now
   use the terminal's default foreground, which adapts to the theme (headlines

@@ -3180,7 +3180,13 @@ data class NetworkDetail (
     var `ipv6`: kotlin.String, 
     var `hostname`: kotlin.String, 
     var `isCoordinator`: kotlin.Boolean, 
-    var `peers`: List<PeerInfo>
+    var `peers`: List<PeerInfo>, 
+    var `state`: NetworkConnState, 
+    /**
+     * The daemon's one-line reason for the last failed restore, when `state` is
+     * [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
+     */
+    var `reason`: kotlin.String?
 ) {
     
     companion object
@@ -3197,6 +3203,8 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
+            FfiConverterTypeNetworkConnState.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -3205,7 +3213,9 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterString.allocationSize(value.`hostname`) +
             FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
-            FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`)
+            FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
+            FfiConverterTypeNetworkConnState.allocationSize(value.`state`) +
+            FfiConverterOptionalString.allocationSize(value.`reason`)
     )
 
     override fun write(value: NetworkDetail, buf: ByteBuffer) {
@@ -3214,6 +3224,8 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterBoolean.write(value.`isCoordinator`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
+            FfiConverterTypeNetworkConnState.write(value.`state`, buf)
+            FfiConverterOptionalString.write(value.`reason`, buf)
     }
 }
 
@@ -3601,6 +3613,56 @@ public object FfiConverterTypeLinkAction : FfiConverterRustBuffer<LinkAction>{
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+ * Whether the daemon has this network registered, for the UI's status dot.
+ *
+ * A saved network the daemon has not registered yet still has to be listed.
+ * Dropping it makes every network vanish for the seconds a cold start spends
+ * restoring them, and makes a restore that never lands indistinguishable from a
+ * network the user never joined. `ray status` has always shown these (its
+ * `inactive_networks` block); this is the same thing for the phone.
+ */
+
+enum class NetworkConnState {
+    
+    /**
+     * Registered by the daemon: the rest of this snapshot is live.
+     */
+    CONNECTED,
+    /**
+     * Saved, restore still in flight and not yet failed once.
+     */
+    CONNECTING,
+    /**
+     * Saved but carrying nothing: either a restore that has failed at least
+     * once (see [`NetworkDetail::reason`]) or a deliberately stopped node.
+     */
+    NOT_CONNECTED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNetworkConnState: FfiConverterRustBuffer<NetworkConnState> {
+    override fun read(buf: ByteBuffer) = try {
+        NetworkConnState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: NetworkConnState) = 4UL
+
+    override fun write(value: NetworkConnState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
