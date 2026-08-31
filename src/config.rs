@@ -457,6 +457,13 @@ pub struct AppConfig {
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
     #[serde(default)]
     pub dns_upstreams: ServerOverride,
+    /// Recently successful peer transport paths.  These are only connection
+    /// hints: iroh still authenticates the endpoint identity in TLS and falls
+    /// back to its normal discovery services when a hint is stale.  Keeping
+    /// them lets a restart try a known LAN/direct path or relay immediately,
+    /// before a pkarr lookup completes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_hints: Vec<iroh::EndpointAddr>,
     /// Global toggle for the embedded mesh SSH server (`ray firewall ssh on`).
     /// When on, the daemon listens on each mesh IP's port 22 and admits peers
     /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
@@ -534,6 +541,7 @@ impl Default for AppConfig {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            endpoint_hints: Vec::new(),
             ssh_enabled: false,
             v4_bridge: true,
             on_demand: true,
@@ -676,6 +684,8 @@ struct Settings {
     discovery_dns: ServerOverride,
     #[serde(default)]
     dns_upstreams: ServerOverride,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
     ssh_enabled: bool,
     #[serde(default = "default_true")]
@@ -1355,6 +1365,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
+        endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         v4_bridge: settings.v4_bridge,
         on_demand: settings.on_demand,
@@ -1422,6 +1433,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
+        endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         v4_bridge: config.v4_bridge,
         on_demand: config.on_demand,
@@ -2207,6 +2219,22 @@ name = "test"
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.download_dir.as_deref(), Some("/srv/incoming"));
         assert_eq!(loaded.download_user, Some(1000));
+    }
+
+    #[test]
+    fn settings_endpoint_hints_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let hint =
+            iroh::EndpointAddr::new(test_id(7)).with_ip_addr("203.0.113.7:41383".parse().unwrap());
+        let cfg = AppConfig {
+            endpoint_hints: vec![hint.clone()],
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.endpoint_hints, vec![hint]);
     }
 
     /// The IPv6-only cutover deleted the `ipv6-only` setting, and the release

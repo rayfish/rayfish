@@ -2902,6 +2902,7 @@ mod accept_handler_tests {
             Arc::new(ForwardMetrics::default()),
             contact,
             Arc::new(LanPeers::new()),
+            iroh::address_lookup::memory::MemoryLookup::new(),
         ));
         let hostname_table = dns::new_hostname_table();
         let reverse_table = dns::new_reverse_table();

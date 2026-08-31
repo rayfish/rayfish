@@ -11,6 +11,7 @@
 //! the crate-level `transport` module that owns iroh endpoint setup.
 
 use super::*;
+use iroh::address_lookup::memory::MemoryLookup;
 
 // Fields are read starting in M2 (extracted services consume `Arc<Transport>`);
 // during M1 only the bundle is constructed, so silence the transitional warning.
@@ -28,6 +29,10 @@ pub(crate) struct Transport {
     pub(crate) contact_public: EndpointId,
     /// Nodes seen on the LAN over mDNS. Empty when mDNS is disabled.
     pub(crate) lan_peers: Arc<LanPeers>,
+    /// Bootstrap-only address hints from successful prior connections.  This is
+    /// registered with iroh's lookup chain, so a stale hint simply falls through
+    /// to normal discovery and can never impersonate its endpoint id.
+    pub(crate) warm_lookup: MemoryLookup,
 }
 
 impl Transport {
@@ -38,6 +43,7 @@ impl Transport {
         stats: Arc<ForwardMetrics>,
         contact_public: EndpointId,
         lan_peers: Arc<LanPeers>,
+        warm_lookup: MemoryLookup,
     ) -> Self {
         Self {
             endpoint,
@@ -46,6 +52,7 @@ impl Transport {
             stats,
             contact_public,
             lan_peers,
+            warm_lookup,
         }
     }
 }

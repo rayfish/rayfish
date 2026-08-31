@@ -83,6 +83,10 @@ impl MeshConnection {
     /// exit that isn't daemon shutdown, stop the reader and, if this connection was
     /// ever a registered member, report the drop to the supervisor.
     pub(crate) async fn run(mut self) {
+        // Feed the warm-start cache from the authenticated connection.  A later
+        // restart can try its selected relay or direct path immediately instead
+        // of waiting for discovery to rediscover it.
+        self.ctx.registry.remember_connection_hints(&self.conn);
         // A connection to this peer now exists (either side dialed): let the
         // composition-root hook flush anything queued for it (send outbox).
         self.manager.notify_peer_connected(self.peer_id);
