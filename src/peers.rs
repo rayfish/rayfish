@@ -41,7 +41,8 @@ pub type FastDashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
 /// peer is reachable iff we share at least one network with it. Since the
 /// transport now uses a single mesh ALPN, a peer has exactly **one** QUIC
 /// connection regardless of how many networks it shares with us — [`PeerEntry`]
-/// holds that connection plus the *set* of networks it carries. Datagrams over
+/// holds that connection plus the set of networks encoded in its outbound-handle
+/// map. Datagrams over
 /// the shared connection are tagged with a small per-connection network handle
 /// (see [`PeerEntry::out_handles`]/[`in_handles`](PeerEntry::in_handles)) so the
 /// receiver can recover which network each datagram belongs to.
@@ -69,24 +70,24 @@ pub struct PeerTable {
     version_incompatible: Arc<DashSet<EndpointId>>,
 }
 
-/// A single peer's identity, its one shared connection, and the networks that
-/// connection carries.
+/// A single peer's identity, its one shared connection, and the network-handle
+/// maps that connection carries.
 ///
 /// A peer has one virtual IP (derived from its identity, stable across every
 /// network it joins) and one QUIC connection (single mesh ALPN). Reachability is
-/// "we share at least one network", tracked by `networks`. The connection
+/// "we share at least one network", tracked by `out_handles`. The connection
 /// multiplexes all shared networks; each datagram is prefixed with a `u16`
 /// handle identifying its network.
 pub struct PeerEntry {
     pub endpoint_id: EndpointId,
     /// The single shared connection to this peer.
     conn: Connection,
-    /// Networks we currently share with this peer over `conn`.
-    networks: HashSet<SmolStr>,
     /// Outbound tag table: network → the `u16` handle *we* stamp on datagrams we
     /// send to this peer for that network. We own this namespace and announce it
-    /// to the peer (it becomes the peer's inbound decode table). Handle `0` is
-    /// reserved as invalid, so assigned handles start at `1`.
+    /// to the peer (it becomes the peer's inbound decode table). Its keys are also
+    /// the source of truth for networks currently shared with this peer, avoiding
+    /// a separate `HashSet` with duplicate keys. Handle `0` is reserved as invalid,
+    /// so assigned handles start at `1`.
     out_handles: HashMap<SmolStr, u16>,
     /// Inbound decode table: handle → network, taken from the peer's announced
     /// `NetworkHandles`. Used to resolve which network an inbound datagram from
@@ -146,9 +147,11 @@ fn connection_is_new(prior: Option<usize>, incoming: usize) -> bool {
 /// Lowest free handle (≥ 1; `0` is reserved as "invalid") not already assigned
 /// in `used`.
 fn next_free_handle(used: &HashMap<SmolStr, u16>) -> u16 {
-    let taken: HashSet<u16> = used.values().copied().collect();
     (1u16..=u16::MAX)
-        .find(|h| !taken.contains(h))
+        // Network handles change only on membership updates, not in the packet
+        // path. Avoid allocating a temporary HashSet for that infrequent work;
+        // this preserves the existing "lowest available handle" behavior.
+        .find(|h| !used.values().any(|taken| taken == h))
         .unwrap_or(u16::MAX)
 }
 
@@ -175,14 +178,14 @@ impl PeerEntry {
         // With one shared network there is nothing to choose between: the filter
         // below could only keep it or fall back to it, so the common case pays
         // nothing per packet for a guard that exists for multi-network peers.
-        let network = if self.networks.len() < 2 {
-            self.networks.iter().next()?.clone()
+        let network = if self.out_handles.len() < 2 {
+            self.out_handles.keys().next()?.clone()
         } else {
-            self.networks
-                .iter()
+            self.out_handles
+                .keys()
                 .filter(|n| self.in_handles.values().any(|announced| announced == *n))
                 .min()
-                .or_else(|| self.networks.iter().min())?
+                .or_else(|| self.out_handles.keys().min())?
                 .clone()
         };
         let handle = self.out_handles.get(&network).copied().unwrap_or(0);
@@ -277,7 +280,6 @@ impl PeerTable {
                     conn_changed = connection_is_new(Some(e.conn.stable_id()), stable);
                     e.endpoint_id = endpoint_id;
                     e.conn = conn.clone();
-                    e.networks.insert(net.clone());
                     if !e.out_handles.contains_key(&net) {
                         let h = next_free_handle(&e.out_handles);
                         e.out_handles.insert(net.clone(), h);
@@ -373,7 +375,7 @@ impl PeerTable {
         let ip = membership::derive_ipv6(peer_id);
         let e = self.peers.get(&ip)?;
         let network = e.in_handles.get(&handle)?;
-        if !e.networks.contains(network) {
+        if !e.out_handles.contains_key(network) {
             return None;
         }
         // Reset the idle timer on the same entry we already hold, so a valid
@@ -398,7 +400,7 @@ impl PeerTable {
     /// allow-list permits us. `None` if the peer isn't connected on `network`.
     pub fn route_on_network(&self, ip: &Ipv6Addr, network: &str) -> Option<PeerRoute> {
         let e = self.peers.get(ip)?;
-        if !e.networks.contains(network) {
+        if !e.out_handles.contains_key(network) {
             return None;
         }
         let handle = e.out_handles.get(network).copied().unwrap_or(0);
@@ -431,8 +433,8 @@ impl PeerTable {
         let table: HashMap<u16, SmolStr> = entries.iter().cloned().collect();
         if let Some(mut e) = self.peers.get_mut(ip) {
             let stale: Vec<&str> = e
-                .networks
-                .iter()
+                .out_handles
+                .keys()
                 .filter(|n| !table.values().any(|announced| announced == *n))
                 .map(|n| n.as_str())
                 .collect();
@@ -508,11 +510,10 @@ impl PeerTable {
     pub fn attach_network(&self, ip: &Ipv6Addr, network: &str) -> Option<u16> {
         let net = SmolStr::new(network);
         let mut e = self.peers.get_mut(ip)?;
-        if e.networks.contains(&net) {
+        if e.out_handles.contains_key(&net) {
             return None;
         }
         let handle = next_free_handle(&e.out_handles);
-        e.networks.insert(net.clone());
         e.out_handles.insert(net, handle);
         Some(handle)
     }
@@ -537,7 +538,7 @@ impl PeerTable {
     pub fn identity_and_networks(&self, ip: &Ipv6Addr) -> Option<(EndpointId, Vec<SmolStr>)> {
         self.peers
             .get(ip)
-            .map(|e| (e.endpoint_id, e.networks.iter().cloned().collect()))
+            .map(|e| (e.endpoint_id, e.out_handles.keys().cloned().collect()))
     }
 
     /// True if we currently share `network` with the peer at mesh IPv6 `ip`. The
@@ -546,7 +547,7 @@ impl PeerTable {
     pub fn shares_network_v6(&self, ip: &Ipv6Addr, network: &str) -> bool {
         self.peers
             .get(ip)
-            .map(|e| e.networks.contains(network))
+            .map(|e| e.out_handles.contains_key(network))
             .unwrap_or(false)
     }
 
@@ -573,14 +574,13 @@ impl PeerTable {
         let mut last_conn = None;
         let mut dropped_id = None;
         if let Some(mut e) = self.peers.get_mut(ip) {
-            e.networks.remove(network);
             e.out_handles.remove(network);
-            if e.networks.is_empty() {
+            if e.out_handles.is_empty() {
                 last_conn = Some(e.conn.clone());
                 dropped_id = Some(e.endpoint_id);
             }
         }
-        self.peers.remove_if(ip, |_, e| e.networks.is_empty());
+        self.peers.remove_if(ip, |_, e| e.out_handles.is_empty());
         if let (Some(endpoint_id), Some(audit)) = (dropped_id, &self.audit) {
             audit.log_disconnect(*ip, &endpoint_id.to_string());
         }
@@ -623,7 +623,7 @@ impl PeerTable {
         let matches = self
             .peers
             .get(ip)
-            .map(|e| e.networks.contains(network) && e.conn.stable_id() == stable_id)
+            .map(|e| e.out_handles.contains_key(network) && e.conn.stable_id() == stable_id)
             .unwrap_or(false);
         if !matches {
             return None;
@@ -655,9 +655,8 @@ impl PeerTable {
     pub fn remove_by_network(&self, network: &str) -> Vec<(Ipv6Addr, Connection)> {
         let mut removed = Vec::new();
         self.peers.retain(|ip, e| {
-            e.networks.remove(network);
             e.out_handles.remove(network);
-            if e.networks.is_empty() {
+            if e.out_handles.is_empty() {
                 removed.push((*ip, e.conn.clone()));
                 // A peer losing its last shared network is a full disconnect, so
                 // audit it here too (matching `remove`/`remove_peer_from_network`);
@@ -677,7 +676,7 @@ impl PeerTable {
     pub fn peers_for_network(&self, network: &str) -> Vec<(EndpointId, Ipv6Addr)> {
         self.peers
             .iter()
-            .filter(|e| e.networks.contains(network))
+            .filter(|e| e.out_handles.contains_key(network))
             .map(|e| (e.endpoint_id, *e.key()))
             .collect()
     }
@@ -692,7 +691,7 @@ impl PeerTable {
     ) -> Vec<(EndpointId, Ipv6Addr, Connection)> {
         self.peers
             .iter()
-            .filter(|e| e.networks.contains(network))
+            .filter(|e| e.out_handles.contains_key(network))
             .map(|e| (e.endpoint_id, *e.key(), e.conn.clone()))
             .collect()
     }
@@ -885,13 +884,10 @@ impl Reachability {
 /// the v4/v6 `or_insert_with` closures in [`PeerTable::add`] agree.
 fn first_conn_placeholder(endpoint_id: EndpointId, conn: Connection, net: SmolStr) -> PeerEntry {
     let mut out_handles = HashMap::new();
-    out_handles.insert(net.clone(), 1u16);
-    let mut networks = HashSet::new();
-    networks.insert(net);
+    out_handles.insert(net, 1u16);
     PeerEntry {
         endpoint_id,
         conn,
-        networks,
         out_handles,
         in_handles: HashMap::new(),
         last_active: Arc::new(AtomicU64::new(now_ms())),
