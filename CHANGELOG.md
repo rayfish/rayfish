@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-01
+
 ### Added
 
 - **`ray status` marks the coordinator, and `ray s` is short for `ray status`.**
@@ -1944,7 +1946,8 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/rayfish/rayfish/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rayfish/rayfish/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rayfish/rayfish/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rayfish/rayfish/compare/v0.2.0...v0.2.1
