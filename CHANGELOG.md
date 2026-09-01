@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **Inbound packets are taken from a peer in batches.** A burst from one peer is
+  drained in a single pass instead of one wake and one lock per packet, which is
+  where the forwarding path spent its time under load. Packets that were held
+  while a connection was being dialled are also handed over in one call when the
+  connection comes up. Drop behaviour is unchanged: a full send buffer still
+  drops the newest packet rather than evicting an older one.
+
 ## [0.4.1] - 2026-09-01
 
 ### Added
