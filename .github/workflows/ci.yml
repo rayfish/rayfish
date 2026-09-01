@@ -23,17 +23,24 @@ jobs:
         with:
           components: clippy
 
+      # `save-if` on master only. Every job here writes half a gigabyte or more
+      # of target dir, and a cache written on a pull request branch is readable
+      # from that branch alone: master never sees it. Those writes bought
+      # nothing and pushed the repo past the 10 GB per-repo cache budget, where
+      # GitHub evicts by last use and takes out the master caches these jobs
+      # actually restore from. Restoring is unaffected on pull requests.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-x86_64-unknown-linux-gnu"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      # `--workspace`: ray-proto and ray-mobile are members, and a root-package
-      # build never compiles their tests, so one of them had already gone stale.
-      - name: Check
-        run: cargo check --workspace --all-targets --locked
-
+      # Clippy runs rustc's own checks before its lints, so a separate
+      # `cargo check` pass only compiles the tree a second time under a
+      # different fingerprint. `--workspace`: ray-proto and ray-mobile are
+      # members, and a root-package build never compiles their tests, so one of
+      # them had already gone stale.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -58,6 +65,7 @@ jobs:
         with:
           shared-key: "ci-aarch64-apple-darwin"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -85,6 +93,7 @@ jobs:
         with:
           shared-key: "ci-aarch64-linux-android"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@v2
@@ -141,9 +150,7 @@ jobs:
         with:
           shared-key: "ci-x86_64-pc-windows-msvc"
           cache-on-failure: true
-
-      - name: Cross-target compile
-        run: cargo check --locked --target x86_64-pc-windows-msvc --features desktop --bin ray
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Host regression tests
         run: cargo test --workspace --locked
@@ -151,6 +158,10 @@ jobs:
       - name: Windows contract tests
         run: cargo test --test windows_contracts --locked
 
+      # Covers the `ray` bin too (`desktop` is a default feature), which is why
+      # there is no separate `--target x86_64-pc-windows-msvc` check step: the
+      # runner is already that triple, so naming it only built the whole
+      # dependency tree a second time into `target/x86_64-pc-windows-msvc`.
       - name: Clippy quality gate
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -191,6 +202,7 @@ jobs:
         with:
           shared-key: "ci-aarch64-pc-windows-msvc"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build ray.exe
         run: cargo build --locked --release --target aarch64-pc-windows-msvc --features desktop --bin ray
@@ -229,6 +241,7 @@ jobs:
         with:
           shared-key: "ci-package-x86_64-pc-windows-msvc"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install WiX 3
         shell: pwsh
