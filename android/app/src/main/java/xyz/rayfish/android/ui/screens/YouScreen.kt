@@ -9,6 +9,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -18,6 +19,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.R
 import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.Telemetry
 import xyz.rayfish.android.ui.components.*
@@ -52,56 +54,52 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         if (result != null) scope.launch {
             try {
                 val action = withContext(Dispatchers.IO) { NodeHolder.get(context).submitCode(result.trim()) }
-                onToast(when (action) {
-                    is uniffi.ray_mobile.LinkAction.Joined ->
-                        if (action.v1.pending) "Join requested for ${action.v1.name} - waiting for approval"
-                        else "Joined ${action.v1.name}"
-                    is uniffi.ray_mobile.LinkAction.Paired -> "Device paired"
-                })
+                onToast(context.messageForLinkAction(action))
                 onChanged()
-            } catch (t: Throwable) { onToast("Failed: ${t.message}") }
+            } catch (t: Throwable) { onToast(context.getString(R.string.error_failed, t.message.orEmpty())) }
         }
     }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        BrandHeader(title = "You")
+        BrandHeader(title = stringResource(R.string.tab_you))
         SectionCard {
-            SectionLabel("This device")
+            SectionLabel(stringResource(R.string.label_this_device))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Device name", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                Text(stringResource(R.string.device_name), fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
                 TextButton(onClick = { hostnameInput = deviceName; editing = true }) {
-                    Text(deviceName.ifEmpty { "set" } + " ✎", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
+                    val hostnameShown = deviceName.ifEmpty { stringResource(R.string.action_set) }
+                    Text(stringResource(R.string.hostname_edit, hostnameShown), fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
                 }
             }
             val nodeId = status?.nodeId?.takeIf { it.isNotEmpty() }
             val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
-            KeyValueRow("Node ID", nodeId?.let { if (it.length > 12) "${it.take(6)}…${it.takeLast(4)}" else it } ?: "-",
-                onClick = nodeId?.let { v -> { copyToClipboard(context, "Node ID", v); onToast("Copied node ID") } })
-            KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
+            KeyValueRow(stringResource(R.string.label_node_id), nodeId?.let { if (it.length > 12) "${it.take(6)}…${it.takeLast(4)}" else it } ?: stringResource(R.string.dash),
+                onClick = nodeId?.let { v -> { copyToClipboard(context, context.getString(R.string.label_node_id), v); onToast(context.getString(R.string.toast_copied_node_id)) } })
+            KeyValueRow(stringResource(R.string.label_ipv6), ip6 ?: stringResource(R.string.dash), onClick = ip6?.let { v -> { copyToClipboard(context, context.getString(R.string.label_ipv6), v); onToast(context.getString(R.string.toast_copied, v)) } })
         }
         SectionCard {
-            SectionLabel("Pairing")
+            SectionLabel(stringResource(R.string.label_pairing))
             val running = status?.running == true
             if (!running) {
-                Text("Start the tunnel to pair another device.",
+                Text(stringResource(R.string.pairing_need_tunnel),
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
             } else if (paired) {
-                Text("This device is paired. Add new devices from your primary device.",
+                Text(stringResource(R.string.pairing_already),
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
                 Spacer(Modifier.height(10.dp))
-                OutlinePillButton("Unpair this device", onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth())
+                OutlinePillButton(stringResource(R.string.pairing_unpair), onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth())
             } else {
-                Text("Pair another of your devices: show it a code, or scan the code it shows.",
+                Text(stringResource(R.string.pairing_intro),
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PillButton("Show my code", onClick = {
+                    PillButton(stringResource(R.string.pairing_show_code), onClick = {
                         scope.launch {
                             try { pairingTicket = withContext(Dispatchers.IO) { NodeHolder.get(context).startPairing() } }
-                            catch (t: Throwable) { onToast("Pairing failed: ${t.message}") }
+                            catch (t: Throwable) { onToast(context.getString(R.string.error_pairing_failed, t.message.orEmpty())) }
                         }
                     }, modifier = Modifier.weight(1f))
-                    OutlinePillButton("Scan a code", onClick = scan, modifier = Modifier.weight(1f))
+                    OutlinePillButton(stringResource(R.string.pairing_scan_code), onClick = scan, modifier = Modifier.weight(1f))
                 }
             }
         }
@@ -113,11 +111,11 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         // instead.
         var goOfflineWhenDisabled by remember { mutableStateOf(NodeHolder.isGoOfflineWhenDisabled(context)) }
         ToggleCard(
-            title = "Go fully offline when disabled",
+            title = stringResource(R.string.pref_go_offline),
             subtitle = if (goOfflineWhenDisabled) {
-                "on · turning the VPN off takes this device offline"
+                stringResource(R.string.pref_go_offline_on)
             } else {
-                "off · Rayfish keeps working for files with the VPN off, so you can run another VPN"
+                stringResource(R.string.pref_go_offline_off)
             },
             checked = goOfflineWhenDisabled,
             onCheckedChange = { on ->
@@ -165,8 +163,8 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         )
         var autoAcceptOwn by remember { mutableStateOf(NodeHolder.isAutoAcceptOwnDevices(context)) }
         ToggleCard(
-            title = "Auto-accept from my devices",
-            subtitle = if (autoAcceptOwn) "on · files from your paired devices save to Downloads" else "off · accept them manually",
+            title = stringResource(R.string.pref_auto_accept),
+            subtitle = if (autoAcceptOwn) stringResource(R.string.pref_auto_accept_on) else stringResource(R.string.pref_auto_accept_off),
             checked = autoAcceptOwn,
             onCheckedChange = { on ->
                 autoAcceptOwn = on
@@ -175,8 +173,8 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         )
         var crashReporting by remember { mutableStateOf(NodeHolder.isCrashReportingEnabled(context)) }
         ToggleCard(
-            title = "Crash reporting",
-            subtitle = if (crashReporting) "on · diagnostics" else "off",
+            title = stringResource(R.string.pref_crash_reporting),
+            subtitle = if (crashReporting) stringResource(R.string.pref_crash_reporting_on) else stringResource(R.string.pref_crash_reporting_off),
             checked = crashReporting,
             onCheckedChange = { on ->
                 crashReporting = on
@@ -185,19 +183,19 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             },
         )
         if (crashReporting) {
-            PillButton("Send diagnostics", onClick = {
+            PillButton(stringResource(R.string.action_send_diagnostics), onClick = {
                 scope.launch {
                     val id = withContext(Dispatchers.IO) {
                         runCatching { Telemetry.sendDiagnostics(context) }.getOrNull()
                     }
-                    onToast(if (id != null) "Diagnostics sent" else "Diagnostics unavailable")
+                    onToast(context.getString(if (id != null) R.string.toast_diagnostics_sent else R.string.toast_diagnostics_unavailable))
                 }
             }, modifier = Modifier.fillMaxWidth())
         }
         SectionCard {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("About", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                Text("v$version", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Muted)
+                Text(stringResource(R.string.label_about), fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                Text(stringResource(R.string.about_version, version), fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Muted)
             }
         }
     }
@@ -206,11 +204,11 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         AlertDialog(
             onDismissRequest = { editing = false },
             containerColor = Rf.Sheet,
-            title = { Text("Device name", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            title = { Text(stringResource(R.string.device_name), fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RayfishTextField(hostnameInput, { hostnameInput = it }, "lowercase, 1-63 chars")
-                    Text("Applies to all your networks.", fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint)
+                    RayfishTextField(hostnameInput, { hostnameInput = it }, stringResource(R.string.hint_hostname))
+                    Text(stringResource(R.string.device_name_applies), fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint)
                 }
             },
             confirmButton = {
@@ -225,21 +223,21 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                                 nets.forEach { node.setHostname(it.name, h) }
                             }
                             deviceName = h
-                            onToast("Device name set"); onChanged(); editing = false
-                        } catch (t: Throwable) { onToast("Invalid name: ${t.message}") }
+                            onToast(context.getString(R.string.toast_device_name_set)); onChanged(); editing = false
+                        } catch (t: Throwable) { onToast(context.getString(R.string.error_invalid_name, t.message.orEmpty())) }
                     }
-                }) { Text("Save", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+                }) { Text(stringResource(R.string.action_save), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
-            dismissButton = { TextButton(onClick = { editing = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
+            dismissButton = { TextButton(onClick = { editing = false }) { Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra) } },
         )
     }
     if (confirmUnpair) {
         AlertDialog(
             onDismissRequest = { confirmUnpair = false },
             containerColor = Rf.Sheet,
-            title = { Text("Unpair this device?", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            title = { Text(stringResource(R.string.unpair_title), fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
-                Text("This device leaves all your networks and deletes its pairing certificate. Peers disconnect from it right away. Re-pair from your primary device to rejoin.",
+                Text(stringResource(R.string.unpair_body),
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Body)
             },
             confirmButton = {
@@ -249,13 +247,13 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                         try {
                             withContext(Dispatchers.IO) { NodeHolder.get(context).unpair() }
                             paired = false
-                            onToast("Unpaired this device"); onChanged()
-                        } catch (t: Throwable) { onToast("Unpair failed: ${t.message}") }
+                            onToast(context.getString(R.string.toast_unpaired)); onChanged()
+                        } catch (t: Throwable) { onToast(context.getString(R.string.error_unpair_failed, t.message.orEmpty())) }
                     }
-                }) { Text("Unpair", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+                }) { Text(stringResource(R.string.action_unpair), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
-            dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
+            dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra) } },
         )
     }
-    pairingTicket?.let { t -> QrCodeSheet("Show this to your other device", t, context) { pairingTicket = null } }
+    pairingTicket?.let { t -> QrCodeSheet(stringResource(R.string.qr_pairing_title), t, context) { pairingTicket = null } }
 }
