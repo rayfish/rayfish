@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
@@ -881,6 +881,77 @@ mod macos {
         Ok(STORE.get().unwrap())
     }
 
+    /// Who holds [`SC_DNS_KEY`] right now, as one re-assert pass sees it.
+    ///
+    /// The two bad states are separated because only one of them is ours to
+    /// repair. A VPN that takes DNS for the duration of its tunnel writes its
+    /// own resolver over every service's key, ours included, and re-asserts
+    /// that on a notification of its own; racing it for the key would be two
+    /// daemons overwriting each other for as long as it stays connected, which
+    /// is the fight `MERGE_COOLDOWN` exists to avoid on Linux. A key
+    /// that is simply *gone* has no owner to fight, and is what a VPN leaves
+    /// behind on the way out: it removes the key rather than restoring the
+    /// value it found, so `.ray` stops resolving when the other VPN
+    /// disconnects, not while it is up.
+    pub enum DnsKeyState {
+        /// Our resolver is installed and nothing has touched it.
+        Ours,
+        /// The key is not in the store. Nobody owns it, so re-applying is safe.
+        Gone,
+        /// Somebody else's resolver sits at our key. Leave it to them.
+        Foreign,
+    }
+
+    /// Read [`SC_DNS_KEY`] back and classify it.
+    ///
+    /// `ServerAddresses` is the marker: ours names the one address the mesh
+    /// resolver answers on, so any other value is a dictionary we did not
+    /// write. A key we cannot parse counts as foreign, because re-applying over
+    /// something we do not understand is the fight, not the repair.
+    pub(super) fn dns_key_state() -> DnsKeyState {
+        // No store means `apply` never ran, so there is nothing of ours to miss.
+        let Some(store) = STORE.get() else {
+            return DnsKeyState::Gone;
+        };
+        let store = store.lock().unwrap();
+        let Some(plist) = store.0.get(SC_DNS_KEY) else {
+            return DnsKeyState::Gone;
+        };
+        let Some(dict) = plist.downcast::<CFDictionary>() else {
+            return DnsKeyState::Foreign;
+        };
+        // Typed only for the read: `downcast` can only produce the untyped
+        // dictionary, and `find` needs a key type it can turn into a void
+        // pointer. Same re-wrap the write path does, in the other direction.
+        let dict = unsafe {
+            CFDictionary::<CFType, CFType>::wrap_under_get_rule(dict.as_concrete_TypeRef())
+        };
+        let server_key =
+            unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerAddresses) }.as_CFType();
+        let ours = dict
+            .find(&server_key)
+            .and_then(|v| v.downcast::<CFArray>())
+            // Typed the same way round as the dictionary above, and to `CFType`
+            // rather than `CFString` because this array is whatever the last
+            // writer put there: an element that is not a string is skipped, not
+            // reinterpreted as one.
+            .map(|servers| unsafe {
+                CFArray::<CFType>::wrap_under_get_rule(servers.as_concrete_TypeRef())
+            })
+            .is_some_and(|servers| {
+                let mine = CFString::new(&super::resolver_addr().to_string());
+                servers
+                    .iter()
+                    .filter_map(|v| v.downcast::<CFString>())
+                    .any(|s| s == mine)
+            });
+        if ours {
+            DnsKeyState::Ours
+        } else {
+            DnsKeyState::Foreign
+        }
+    }
+
     /// Drop every key this backend owns. Idempotent, and safe with no store.
     pub fn remove_dns_config() {
         if let Some(store) = STORE.get() {
@@ -1133,6 +1204,40 @@ use macos::MacosDynamicStoreDns;
 #[cfg(target_os = "macos")]
 fn write_dns_config_macos(search_domains: &[SearchDomain], tun_name: &str) -> Result<()> {
     macos::write_dns_config(search_domains, tun_name)
+}
+
+/// How often the macOS re-assert pass reads its own key back.
+///
+/// A plain delay, not a deadline like the Linux `REASSERT_TICK`: nothing else
+/// drives that loop, so the interval is also the worst case for how long `.ray`
+/// stays unresolvable after another VPN drops our key. The pass is one Mach IPC
+/// round trip to configd, so it is cheap enough to ask often.
+#[cfg(target_os = "macos")]
+pub const SC_REASSERT_TICK: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "macos")]
+pub use macos::DnsKeyState;
+
+/// Who holds the macOS DNS configuration right now.
+///
+/// There is no SCDynamicStore equivalent of the inotify watch
+/// `run_resolv_reassert` uses: a notification would need its own store with a
+/// callback context and a thread running a `CFRunLoop`, and the store this
+/// backend holds is deliberately built without one. Asking on a timer gets the
+/// same repair for one `SCDynamicStoreCopyValue` every few seconds.
+#[cfg(target_os = "macos")]
+pub fn dns_key_state() -> DnsKeyState {
+    macos::dns_key_state()
+}
+
+/// Drop the macOS DNS keys, with or without a configurator to do it for us.
+///
+/// The re-assert loop uses this to undo a write that lost a race with `revert`:
+/// by then the configurator has been taken and its `revert` has already run, so
+/// there is nothing left holding the keys we just put back. Idempotent.
+#[cfg(target_os = "macos")]
+pub fn remove_dns_config() {
+    macos::remove_dns_config();
 }
 
 // ---------------------------------------------------------------------------

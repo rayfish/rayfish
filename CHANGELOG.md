@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS: `.ray` names keep resolving after another VPN comes and goes.**
+  Mullvad (and anything else that takes DNS the same way) writes its own
+  resolver over every network service in the system's dynamic store while it is
+  connected, ours included, and deletes those entries on disconnect instead of
+  restoring what it found. That left the daemon running with no DNS
+  configuration at all and no way to notice, so `.ray` names stopped resolving
+  the moment the other VPN was switched off and only `ray down && ray up`
+  brought them back. The configuration is now checked every few seconds and
+  re-installed as soon as it goes missing. A VPN that is holding DNS while
+  connected is left alone rather than fought over, and logged once so `ray logs`
+  says why `.ray` is quiet.
+
 ### Performance
 
 - **Inbound packets are taken from a peer in batches.** A burst from one peer is

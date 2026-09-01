@@ -1523,7 +1523,7 @@ impl Daemon {
         // Re-apply system DNS to match the now-settled full-tunnel state: route
         // *all* DNS through Magic DNS while the tunnel is up (so resolution goes
         // out via the exit), split `.ray`-only otherwise.
-        self.dns.reassert_os_config().await;
+        self.dns.reassert_os_config(tun_name).await;
         result
     }
 
