@@ -176,8 +176,11 @@ pub(crate) enum Command {
         #[arg(add = complete::ephemeral_args())]
         arg: String,
     },
-    /// Show status of all networks (active + saved)
-    #[command(visible_aliases = ["st", "ls"])]
+    /// Show status of all networks
+    ///
+    /// Covers the networks the daemon has registered and the saved ones it has
+    /// not brought up yet.
+    #[command(visible_aliases = ["s", "st", "ls"])]
     Status {
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]

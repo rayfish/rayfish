@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ray status` marks the coordinator, and `ray s` is short for `ray status`.**
+  The peer holding the network key now carries a `·coord·` tag on its row, so
+  the node that approves joins and signs the roster is visible without asking
+  anyone. Your own coordinator role was already in the network header.
+
 - **Android speaks Japanese, Simplified Chinese and Traditional Chinese.** The
   app now follows the phone's language instead of always being English, with
   every screen, notification, tile and share-sheet label translated. Firewall

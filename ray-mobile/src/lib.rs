@@ -1622,6 +1622,7 @@ mod network_state_tests {
             state: PeerState::Offline,
             exit_node: false,
             exit_in_use: false,
+            is_coordinator: false,
         }
     }
 

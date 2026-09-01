@@ -792,9 +792,10 @@ fn user_display_name(
 /// ipv4 · via · rtt · ↑tx · ↓rx. `prefix` is the tree branch when the device is
 /// nested under a user (empty for a top-level member). A local `alias`, when set,
 /// shows as `host [alias]` (only for standalone members; a paired device's alias
-/// rides its parent row). No ownership marker: an own device always nests under
-/// your own parent row, which already names you, so a per-device `(your device)`
-/// would just repeat it. The host is the bare hostname (no `.{network}.ray`): the
+/// rides its parent row), and the network's coordinator carries a `·coord·`
+/// marker. No ownership marker: an own device always nests under your own parent
+/// row, which already names you, so a per-device `(your device)` would just
+/// repeat it. The host is the bare hostname (no `.{network}.ray`): the
 /// header names the network.
 fn device_row(
     peer: &ipc::PeerStatus,
@@ -825,11 +826,23 @@ fn device_row(
     } else {
         style::value
     };
+    // The coordinator carries the network's secret key: it admits members and
+    // signs the roster. Marked with the same `·tag·` the header uses for our own
+    // role, so the word reads the same in both places. Abbreviated because it
+    // rides the name column every later column aligns against.
+    let (coord_plain, coord_styled) = if peer.is_coordinator {
+        (
+            " ·coord·".to_string(),
+            format!(" {}", style::marker("coord")),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     // Merge branch + glyph + host into the first cell so the branch sits before
     // the glyph and the columns after it (ip, via, …) still align across all rows.
     let name = layout::Cell::new(
-        format!("{prefix}{glyph_plain} {host}"),
-        format!("{prefix}{glyph_styled} {}", host_style(&host)),
+        format!("{prefix}{glyph_plain} {host}{coord_plain}"),
+        format!("{prefix}{glyph_styled} {}{coord_styled}", host_style(&host)),
     );
     let ip = layout::Cell::new(addr.clone(), style::faint(&addr));
     let mut cells = match &peer.connection {
@@ -1097,6 +1110,7 @@ mod grouping_tests {
             },
             exit_node: false,
             exit_in_use: false,
+            is_coordinator: false,
         }
     }
 
@@ -1162,6 +1176,24 @@ mod grouping_tests {
         assert!(!out.contains("100.64."), "{out}");
     }
 
+    /// Which node admits members and signs the roster is not derivable from a
+    /// peer row otherwise: every member looks alike, and the header's role names
+    /// only ourselves.
+    #[test]
+    fn marks_the_coordinator_among_the_peers() {
+        let mut coord = peer("hub", None, false, true, false);
+        coord.is_coordinator = true;
+        let net = net("laptop", vec![coord, peer("dev", None, false, true, false)]);
+
+        let out = render(&net);
+        assert_eq!(out.matches("·coord·").count(), 1, "{out}");
+        let coord_line = out
+            .lines()
+            .find(|l| l.contains("hub"))
+            .expect("coordinator row");
+        assert!(coord_line.contains("·coord·"), "{out}");
+    }
+
     #[test]
     fn visible_primary_anchors_its_own_group() {
         // Viewing a *foreign* user whose primary device is itself a visible member
@@ -1180,6 +1212,7 @@ mod grouping_tests {
             state: ipc::PeerState::Active,
             exit_node: false,
             exit_in_use: false,
+            is_coordinator: false,
         };
         let secondary = peer("sm-f966b", Some(laptop), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);
@@ -1316,6 +1349,7 @@ mod grouping_tests {
                 state: ipc::PeerState::Offline,
                 exit_node: false,
                 exit_in_use: false,
+                is_coordinator: false,
             })
             .collect();
         let mut n = net("laptop", peers);

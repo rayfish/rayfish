@@ -1019,6 +1019,7 @@ mod tests {
             state: ipc::PeerState::Idle,
             exit_node: false,
             exit_in_use: false,
+            is_coordinator: false,
         }
     }
 
