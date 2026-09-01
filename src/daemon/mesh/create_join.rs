@@ -834,14 +834,15 @@ impl NetworkRegistry {
     /// rather than a second source of authority.
     pub(crate) async fn warm_resume_member_network(
         self: &Arc<Self>,
-        name: &str,
+        saved: &SavedMemberNetwork,
         net_pubkey: EndpointId,
-        persisted_hostname: Option<String>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
-        cached_hash: Option<blake3::Hash>,
-        cached_is_published: bool,
     ) -> Result<bool> {
+        let name = saved.name.as_str();
+        let persisted_hostname = saved.persisted_hostname.clone();
+        let auto_accept_firewall = saved.auto_accept_firewall;
+        let auto_accept_files = saved.auto_accept_files;
+        let cached_hash = saved.cached_hash;
+        let cached_is_published = saved.cached_is_published;
         // A locally authored-but-unpublished pointer belongs to coordinator
         // recovery. A member warm-resume only trusts a record it previously saw
         // published by the network key.

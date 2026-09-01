@@ -33,6 +33,22 @@ const RESTORE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// [`NetworkRegistry::run_restore_supervisor`].
 const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
 
+/// The saved-network fields a member restore works from, read off the config
+/// once when the restore is spawned. The retry loop and the warm-resume path
+/// both take the whole group, so neither call site has to keep seven values in
+/// the right order.
+pub(crate) struct SavedMemberNetwork {
+    pub(crate) name: String,
+    /// The network public key as it is stored: still a string, because a config
+    /// that fails to parse must still reach the signed-record restore.
+    pub(crate) net_pubkey: String,
+    pub(crate) persisted_hostname: Option<String>,
+    pub(crate) auto_accept_firewall: bool,
+    pub(crate) auto_accept_files: bool,
+    pub(crate) cached_hash: Option<blake3::Hash>,
+    pub(crate) cached_is_published: bool,
+}
+
 /// Whether the member-restore loop runs another attempt or is done.
 enum RestoreNext {
     Retry,
@@ -523,32 +539,20 @@ impl NetworkRegistry {
     /// showed it inactive, and only a manual `ray restart` brought it back. So
     /// retry with backoff until the join lands, the network is gone from the
     /// config (leave/nuke), or the daemon shuts down.
-    async fn restore_member_network(
-        self: Arc<Self>,
-        name: String,
-        net_pubkey: String,
-        persisted_hostname: Option<String>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
-        cached_hash: Option<blake3::Hash>,
-        cached_is_published: bool,
-    ) {
+    async fn restore_member_network(self: Arc<Self>, saved: SavedMemberNetwork) {
+        let name = saved.name.as_str();
+        let net_pubkey = saved.net_pubkey.as_str();
+        let persisted_hostname = &saved.persisted_hostname;
+        let auto_accept_firewall = saved.auto_accept_firewall;
+        let auto_accept_files = saved.auto_accept_files;
         let parsed_key = net_pubkey.parse::<EndpointId>();
         if let Ok(net_public_key) = parsed_key {
             match self
-                .warm_resume_member_network(
-                    &name,
-                    net_public_key,
-                    persisted_hostname.clone(),
-                    auto_accept_firewall,
-                    auto_accept_files,
-                    cached_hash,
-                    cached_is_published,
-                )
+                .warm_resume_member_network(&saved, net_public_key)
                 .await
             {
                 Ok(true) => {
-                    self.restore_errors.remove(&name);
+                    self.restore_errors.remove(name);
                     return;
                 }
                 Ok(false) => {}
@@ -572,24 +576,24 @@ impl NetworkRegistry {
             // only once it matches. Leaving the registration untouched meanwhile
             // is the point: tearing it down each retry would put the network back
             // to invisible between attempts.
-            let stuck = match self.incompatible_registration(&name) {
+            let stuck = match self.incompatible_registration(name) {
                 Some(mismatch) => {
                     !self
-                        .mesh_version_recovered(&name, &net_pubkey, &mismatch)
+                        .mesh_version_recovered(name, net_pubkey, &mismatch)
                         .await
                 }
                 None => false,
             };
             if stuck {
-                match self.after_attempt(&name, &mut delay, attempt).await {
+                match self.after_attempt(name, &mut delay, attempt).await {
                     RestoreNext::Retry => continue,
                     RestoreNext::Stop => return,
                 }
             }
             match self
                 .join_network_inner(
-                    &net_pubkey,
-                    Some(&name),
+                    net_pubkey,
+                    Some(name),
                     persisted_hostname.clone(),
                     None,
                     None,
@@ -646,7 +650,8 @@ impl NetworkRegistry {
                     // Keep the reason where `ray status` can read it: a saved
                     // network that never registers otherwise renders as a bare
                     // "inactive" with the explanation only in the daemon log.
-                    self.restore_errors.insert(name.clone(), format!("{e:#}"));
+                    self.restore_errors
+                        .insert(name.to_string(), format!("{e:#}"));
                     // The first failure is worth flagging; the rest are just the
                     // shape of waiting for connectivity, so keep them at debug.
                     if attempt == 1 {
@@ -657,7 +662,7 @@ impl NetworkRegistry {
                 }
             }
 
-            match self.after_attempt(&name, &mut delay, attempt).await {
+            match self.after_attempt(name, &mut delay, attempt).await {
                 RestoreNext::Retry => {}
                 RestoreNext::Stop => return,
             }
@@ -756,25 +761,18 @@ impl NetworkRegistry {
             return;
         }
         let me = Arc::clone(self);
-        let name = net.name.clone();
         let guard = net.name.clone();
-        let persisted_hostname = net.my_hostname.clone();
-        let auto_accept_firewall = net.auto_accept_firewall;
-        let auto_accept_files = net.auto_accept_files;
-        let cached_hash = net.last_group_hash;
-        let cached_is_published = net.last_group_hash_published;
+        let saved = SavedMemberNetwork {
+            name: net.name.clone(),
+            net_pubkey,
+            persisted_hostname: net.my_hostname.clone(),
+            auto_accept_firewall: net.auto_accept_firewall,
+            auto_accept_files: net.auto_accept_files,
+            cached_hash: net.last_group_hash,
+            cached_is_published: net.last_group_hash_published,
+        };
         tokio::spawn(async move {
-            Arc::clone(&me)
-                .restore_member_network(
-                    name,
-                    net_pubkey,
-                    persisted_hostname,
-                    auto_accept_firewall,
-                    auto_accept_files,
-                    cached_hash,
-                    cached_is_published,
-                )
-                .await;
+            Arc::clone(&me).restore_member_network(saved).await;
             me.restoring.remove(&guard);
         });
     }

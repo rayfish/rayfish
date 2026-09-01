@@ -258,10 +258,11 @@ if on "$B" '[ -d /sys/kernel/tracing/events/sock/inet_sock_set_state ]' >/dev/nu
   fi
   unserve "$B" "$EV_PORT"
 else
-  # The docker backend lands here: a privileged container has
-  # /sys/kernel/tracing as an empty directory with tracefs not mounted, so the
-  # daemon finds no events and stays on its 15s timer. Assert the fallback
-  # rather than skipping, but do not claim to have covered the event path.
+  # The docker backend lands here: the node image masks tracefs (it is not
+  # namespaced, so every container would share one trace instance and one
+  # consuming trace_pipe; see tests/docker/Dockerfile), so the daemon finds no
+  # events and stays on its 15s timer. Assert the fallback rather than skipping,
+  # but do not claim to have covered the event path.
   serve "$B" "$EV_PORT" 0.0.0.0
   if retry_until "$SETTLE" "[[ \"\$(bridged '$B' '$B_IP' $EV_PORT)\" == 1 ]]"; then
     pass "no tracefs here: the timer fallback bridged [$B_IP]:$EV_PORT"
