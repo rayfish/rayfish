@@ -160,6 +160,9 @@ pub(crate) enum Command {
         /// Member to remove: hostname, mesh IP, or short id
         #[arg(add = complete::peers())]
         peer: String,
+        /// Skip the confirmation when the member holds more than one device
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Set or show a per-network ephemeral policy (coordinator only)
     ///
@@ -1426,7 +1429,7 @@ async fn run() -> Result<()> {
             .await
         }
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
-        Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
+        Command::Kick { network, peer, yes } => ipc_kick(&network, &peer, yes).await,
         Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
         Command::Status { json: _ } => ipc_status().await,
         Command::Report => ipc_report().await,
