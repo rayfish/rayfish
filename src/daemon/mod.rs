@@ -223,7 +223,7 @@ pub type DaemonState = Daemon;
 
 // The process-lifetime network + storage foundation every service depends on.
 mod foundation;
-pub(crate) use foundation::Transport;
+pub(crate) use foundation::{Transport, TransportBootstrap};
 
 // The per-peer mesh connection driver (one connection per peer, frame demux).
 mod connection_manager;
@@ -1278,7 +1278,11 @@ impl Daemon {
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
-            IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
+            IpcMessage::Kick {
+                network,
+                peer,
+                confirm,
+            } => self.registry.kick_member(&network, &peer, confirm).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer.as_ref()),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
@@ -2900,9 +2904,12 @@ mod accept_handler_tests {
             identity,
             blob_store,
             Arc::new(ForwardMetrics::default()),
-            contact,
-            Arc::new(LanPeers::new()),
-            iroh::address_lookup::memory::MemoryLookup::new(),
+            TransportBootstrap {
+                contact_public: contact,
+                lan_peers: Arc::new(LanPeers::new()),
+                warm_lookup: iroh::address_lookup::memory::MemoryLookup::new(),
+                pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
+            },
         ));
         let hostname_table = dns::new_hostname_table();
         let reverse_table = dns::new_reverse_table();

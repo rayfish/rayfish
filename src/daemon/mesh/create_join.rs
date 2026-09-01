@@ -536,13 +536,14 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
         gate: VersionGate,
     ) -> Result<ResolvedNetwork> {
-        let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
+        let pkarr_client =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
         let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
             .await
             .with_context(|| {
                 format!(
                     "could not look up this network at {}",
-                    dht::effective_pkarr_url()
+                    self.transport.pkarr_relay_url
                 )
             })?;
 
@@ -1087,7 +1088,9 @@ impl NetworkRegistry {
         };
 
         // Membership poller
-        if let Ok(poller_client) = dht::create_pkarr_client(&self.transport.endpoint) {
+        if let Ok(poller_client) =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
+        {
             tasks.push(spawn_group_poller(
                 poller_client,
                 net_pubkey,
@@ -1194,7 +1197,10 @@ impl NetworkRegistry {
         cached_is_published: bool,
         persisted_peers: &[EndpointId],
     ) -> Result<RestoredGroupBlob> {
-        let resolved = match dht::create_pkarr_client(&self.transport.endpoint) {
+        let resolved = match dht::create_pkarr_client(
+            &self.transport.endpoint,
+            &self.transport.pkarr_relay_url,
+        ) {
             Ok(client) => match dht::resolve_network_packet(&client, net_pubkey).await {
                 Ok(packet) => Some(
                     dht::decode_network_record(&packet)

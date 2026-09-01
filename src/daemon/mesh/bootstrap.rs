@@ -224,9 +224,10 @@ async fn build_daemon_inner(
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
     let on_demand = overrides.on_demand.unwrap_or(app_config.on_demand);
-    // Point the pkarr client at the configured discovery-DNS server (if any)
-    // before any record publish/resolve happens.
-    dht::set_discovery_override(&app_config.discovery_dns);
+    // Resolve the pkarr relay once for this daemon. It travels with the
+    // transport foundation so an embedded stop/start cannot inherit a prior
+    // daemon's discovery-DNS configuration.
+    let pkarr_relay_url = dht::pkarr_relay_url(&app_config.discovery_dns);
     // Lazily generate + persist this node's contact key (`ray connect`). The
     // secret stays in config; only its public id is held in `Daemon`.
     let mut contact_public = None;
@@ -514,9 +515,12 @@ async fn build_daemon_inner(
         identity.clone(),
         blob_store.clone(),
         stats.clone(),
-        contact_public,
-        lan_peers,
-        warm_lookup,
+        TransportBootstrap {
+            contact_public,
+            lan_peers,
+            warm_lookup,
+            pkarr_relay_url,
+        },
     ));
     // The per-peer connection driver is built once here and shared by the
     // ProtocolRouter (which delegates the mesh ALPN to it) and the
@@ -706,7 +710,10 @@ async fn build_daemon_inner(
     // (no worker channel), so nothing to spawn here.
 
     // --- Contact record publisher (ray connect) ---
-    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.transport.endpoint) {
+    if let Ok(pkarr_client) = dht::create_pkarr_client(
+        &daemon.transport.endpoint,
+        &daemon.transport.pkarr_relay_url,
+    ) {
         spawn_contact_publisher(pkarr_client, daemon.transport.endpoint.id(), token.clone());
     }
 

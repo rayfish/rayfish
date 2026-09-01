@@ -1541,7 +1541,10 @@ impl MemberAcceptState {
             return;
         }
         let key = SecretKey::from(secret_key);
-        let pkarr_client = match dht::create_pkarr_client(&self.endpoint) {
+        let pkarr_client = match dht::create_pkarr_client(
+            &self.endpoint,
+            &self.registry.transport.pkarr_relay_url,
+        ) {
             Ok(client) => client,
             Err(e) => {
                 tracing::warn!(network = %self.network_name, error = %e, "cannot accept admin grant without a network publisher");

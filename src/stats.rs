@@ -45,10 +45,18 @@ pub enum DropReason {
     /// demand. The small first-packet queue is full, so retaining this newest
     /// packet would let a temporarily unreachable peer consume unbounded memory.
     LazyDialBufferFull,
+    /// A packet needed an on-demand dial but the daemon was already attempting
+    /// the bounded maximum number of peer handshakes. The sender will retry;
+    /// dropping here prevents a large roster from creating unbounded work.
+    LazyDialConcurrency,
+    /// A local packet targeted Magic DNS while the bounded set of upstream
+    /// resolver tasks was full. Keeping this separate from generic send
+    /// backpressure makes resolver overload visible in diagnostics.
+    DnsConcurrency,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 9] = [
+    const ALL: [DropReason; 11] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -58,6 +66,8 @@ impl DropReason {
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
         DropReason::LazyDialBufferFull,
+        DropReason::LazyDialConcurrency,
+        DropReason::DnsConcurrency,
     ];
 }
 
@@ -367,7 +377,9 @@ mod tests {
                 | DropReason::Spoof
                 | DropReason::ExitDenied
                 | DropReason::PacketTooBig
-                | DropReason::LazyDialBufferFull => 1,
+                | DropReason::LazyDialBufferFull
+                | DropReason::LazyDialConcurrency
+                | DropReason::DnsConcurrency => 1,
             }
         });
         assert_eq!(counted, DropReason::ALL.len());

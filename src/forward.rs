@@ -15,7 +15,7 @@ use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -74,6 +74,14 @@ const LAZY_DIAL_MAX_PACKETS_PER_PEER: usize = 64;
 const LAZY_DIAL_MAX_BYTES_PER_PEER: usize = 128 * 1024;
 const LAZY_DIAL_MAX_PACKETS_TOTAL: usize = 512;
 const LAZY_DIAL_MAX_BYTES_TOTAL: usize = 1024 * 1024;
+/// Limit concurrent connection attempts.  The packet queues are bounded, but
+/// without this cap a large roster could still turn one local packet burst into
+/// one handshake task per unreachable peer.
+const LAZY_DIAL_MAX_IN_FLIGHT: usize = 16;
+/// Magic DNS forwarding may await an upstream resolver.  Keep enough requests
+/// in flight for normal browser parallelism while bounding task and socket use
+/// when a local app floods the resolver address.
+const DNS_QUERIES_MAX_IN_FLIGHT: usize = 64;
 
 /// The port a stock `ssh` client targets (`ssh user@host.ray`). Defined here in
 /// the always-compiled forward core because the userspace SSH NAT below rewrites
@@ -507,6 +515,7 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
     let mut buffered = LazyDialBuffers::default();
     let mut in_flight: HashSet<EndpointId> = HashSet::new();
     let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
+    let dns_queries = Arc::new(Semaphore::new(DNS_QUERIES_MAX_IN_FLIGHT));
     // Client-side exit-node selection (cheap Arc-backed clone), consulted for
     // internet-bound packets. Default (no selection) when there is no registry.
     let exit_client = dialer
@@ -552,10 +561,15 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             continue;
         };
         if is_magic_dns(&info) {
+            let Ok(permit) = dns_queries.clone().try_acquire_owned() else {
+                stats.record_drop(DropReason::DnsConcurrency);
+                continue;
+            };
             let resolver = resolver.clone();
             let tun_tx = tun_tx.clone();
             let pkt = pkt.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 resolver.handle_tun_query(&pkt, &info, &tun_tx).await;
             });
             continue; // do not fall through to peer routing
@@ -576,6 +590,10 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             };
 
             let peer = target.endpoint_id;
+            if !in_flight.contains(&peer) && in_flight.len() >= LAZY_DIAL_MAX_IN_FLIGHT {
+                stats.record_drop(DropReason::LazyDialConcurrency);
+                continue;
+            }
             // Buffer a bounded beginning of the flow so its first packets aren't
             // lost once connected. A single dial per peer runs at a time
             // (in_flight dedup) and is bounded by LAZY_DIAL_TIMEOUT; on completion

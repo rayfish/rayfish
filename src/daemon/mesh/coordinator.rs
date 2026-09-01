@@ -135,7 +135,13 @@ impl NetworkRegistry {
         // Resolve + fetch the current signed blob and leave only on a positive
         // confirmation that it no longer lists us; on any failure (can't
         // resolve/fetch) we stay, never leaving on uncertainty.
-        let removed = match resolve_signed(&self.transport.endpoint, net_pubkey).await {
+        let removed = match resolve_signed(
+            &self.transport.endpoint,
+            &self.transport.pkarr_relay_url,
+            net_pubkey,
+        )
+        .await
+        {
             // The timestamp is not consulted here: this only ever *confirms* a
             // kick before leaving, and an older record listing us is a reason to
             // stay, which is already the safe answer.
