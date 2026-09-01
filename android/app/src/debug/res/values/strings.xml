@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Overlays the release labels so the dev install is distinguishable in the
+         launcher and the share sheet. `share_with_rayfish` is translated, so the
+         override needs one file per locale the main catalogs carry: a
+         locale-qualified string in main/ wins over an unqualified one here, and
+         the dev build would otherwise show the release label on a ja/zh device. -->
+    <string name="app_name" translatable="false">Rayfish Dev</string>
+    <string name="share_with_rayfish">Share with Rayfish Dev</string>
+</resources>

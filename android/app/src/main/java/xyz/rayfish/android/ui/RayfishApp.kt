@@ -7,6 +7,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import android.content.Intent
 import android.net.VpnService
 import androidx.compose.ui.platform.LocalContext
@@ -21,14 +22,15 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.R
 import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.ui.screens.*
 import xyz.rayfish.android.ui.theme.Rf
 
-enum class Tab(val label: String, val icon: ImageVector) {
-    NETWORKS("Networks", Icons.Filled.Hub),
-    HOME("Home", Icons.Filled.Home),
-    YOU("You", Icons.Filled.AccountCircle),
+enum class Tab(val labelRes: Int, val icon: ImageVector) {
+    NETWORKS(R.string.tab_networks, Icons.Filled.Hub),
+    HOME(R.string.tab_home, Icons.Filled.Home),
+    YOU(R.string.tab_you, Icons.Filled.AccountCircle),
 }
 
 @Composable
@@ -110,7 +112,7 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                 )
             }
             readStatus()
-        } catch (t: Throwable) { snackbar.showSnackbar("Failed to start: ${t.message}") }
+        } catch (t: Throwable) { snackbar.showSnackbar(context.getString(R.string.error_failed_to_start, t.message.orEmpty())) }
         finally { starting = false }
     }
     LaunchedEffect(lifecycleOwner) {
@@ -132,11 +134,8 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                 NodeHolder.ensureStarted(context)
                 val action = withContext(Dispatchers.IO) { NodeHolder.get(context).handleLink(uri) }
                 refreshNow()
-                toast(when (action) {
-                    is uniffi.ray_mobile.LinkAction.Joined -> "Joined ${action.v1.name}"
-                    is uniffi.ray_mobile.LinkAction.Paired -> "Paired"
-                })
-            } catch (t: Throwable) { toast("Link failed: ${t.message}") }
+                toast(context.messageForLinkAction(action, R.string.toast_paired))
+            } catch (t: Throwable) { toast(context.getString(R.string.error_link_failed, t.message.orEmpty())) }
         }
     }
     LaunchedEffect(initialLinkUri) {
@@ -155,11 +154,12 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
             if (detail == null) {
                 NavigationBar(containerColor = Rf.Bg) {
                     Tab.entries.forEach { t ->
+                        val label = stringResource(t.labelRes)
                         NavigationBarItem(
                             selected = tab == t,
                             onClick = { tab = t },
-                            icon = { Icon(t.icon, contentDescription = t.label) },
-                            label = { Text(t.label) },
+                            icon = { Icon(t.icon, contentDescription = label) },
+                            label = { Text(label) },
                             colors = NavigationBarItemDefaults.colors(
                                 selectedIconColor = Rf.Rose400, selectedTextColor = Rf.Rose400,
                                 unselectedIconColor = Rf.Faint, unselectedTextColor = Rf.Faint,

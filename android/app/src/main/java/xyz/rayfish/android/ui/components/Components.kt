@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.MoreVert
@@ -39,11 +40,11 @@ fun BrandHeader(title: String? = null, actions: @Composable RowScope.() -> Unit 
         if (title == null) {
             Image(
                 painter = painterResource(xyz.rayfish.android.R.mipmap.ic_brand),
-                contentDescription = "Rayfish",
+                contentDescription = stringResource(xyz.rayfish.android.R.string.cd_rayfish),
                 modifier = Modifier.size(26.dp).clip(RoundedCornerShape(7.dp)),
             )
             Spacer(Modifier.width(9.dp))
-            Text("Rayfish", fontFamily = PressStart, fontSize = 12.sp, color = Rf.Heading)
+            Text(stringResource(xyz.rayfish.android.R.string.app_name), fontFamily = PressStart, fontSize = 12.sp, color = Rf.Heading)
         } else {
             Text(title, fontFamily = Chakra, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Rf.Heading)
         }
@@ -103,7 +104,7 @@ fun KeyValueRow(key: String, value: String, onClick: (() -> Unit)? = null) {
         )
         if (onClick != null) {
             Spacer(Modifier.width(6.dp))
-            Icon(Icons.Filled.ContentCopy, "Copy", tint = Rf.Faint, modifier = Modifier.size(13.dp))
+            Icon(Icons.Filled.ContentCopy, stringResource(xyz.rayfish.android.R.string.cd_copy), tint = Rf.Faint, modifier = Modifier.size(13.dp))
         }
     }
 }
@@ -230,7 +231,7 @@ fun OverflowMenu(items: List<MenuItem>, header: String? = null) {
     var open by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { open = true }) {
-            Icon(Icons.Filled.MoreVert, contentDescription = "More", tint = Rf.Muted)
+            Icon(Icons.Filled.MoreVert, contentDescription = stringResource(xyz.rayfish.android.R.string.cd_more), tint = Rf.Muted)
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = Color(0xFF27272A)) {
             if (header != null) {
