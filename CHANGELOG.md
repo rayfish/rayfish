@@ -57,6 +57,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ray kick` asks before removing someone's other devices.** Membership
+  follows the user identity, so naming a paired phone removes the laptop it is
+  paired to as well. The command said none of that: one name went in and three
+  roster rows could go, reported afterwards as "and 2 paired device(s)". It now
+  lists every row the kick would take, marks which one is the primary, and waits
+  for `y`. A member with a single row is kicked as before, with no prompt.
+  `--yes` (`-y`) skips the question for scripts.
+
 - **`ray status` shows a group before its coordinator answers.** Restoring a
   saved network needs its signed record and a coordinator that replies, which
   after a reboot is up to a minute of backoff. Until then the group rendered as

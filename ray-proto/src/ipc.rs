@@ -71,9 +71,18 @@ pub enum IpcMessage {
     /// Coordinator-only: remove a member from a closed network. Prunes it from the
     /// roster + approved list, republishes the signed blob, and disconnects it
     /// mesh-wide. `peer` is a hostname / mesh IP / short id of a current member.
+    ///
+    /// Membership follows the user identity, so naming one device removes every
+    /// row that user holds. When that set is larger than one row, an unconfirmed
+    /// request is answered with [`IpcMessage::KickConfirm`] listing what would
+    /// go, and the CLI asks before sending the same request with `confirm` set.
+    /// Defaulted to `false` so a request from a CLI that predates the field is
+    /// held at the confirmation step rather than silently kicking a whole user.
     Kick {
         network: String,
         peer: String,
+        #[serde(default)]
+        confirm: bool,
     },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
@@ -424,6 +433,15 @@ pub enum IpcMessage {
     Error {
         message: String,
     },
+    /// Answer to an unconfirmed [`IpcMessage::Kick`] that would remove more than
+    /// one roster row: every row the kick would take, for the CLI to print
+    /// before it asks. Nothing has been removed when this is sent.
+    KickConfirm {
+        network: String,
+        /// The row the caller's argument resolved to, for the prompt's wording.
+        display: String,
+        targets: Vec<KickTarget>,
+    },
     Created {
         name: String,
         network_key: EndpointId,
@@ -734,6 +752,19 @@ pub struct PairedDeviceInfo {
     pub hostname: Option<String>,
     /// Networks this device is currently a member of.
     pub networks: Vec<String>,
+}
+
+/// One roster row a pending kick would remove (reply to an unconfirmed
+/// [`IpcMessage::Kick`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KickTarget {
+    /// The row's hostname on this network, if the roster carries one.
+    pub hostname: Option<String>,
+    /// Short id form of the row's identity, for display.
+    pub short_id: String,
+    /// Whether this row is the user's own identity rather than one of the
+    /// devices paired to it.
+    pub primary: bool,
 }
 
 /// One rayfish node seen on the local network over mDNS. A sighting says only

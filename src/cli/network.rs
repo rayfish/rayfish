@@ -1,5 +1,7 @@
 //! CLI handlers for network lifecycle: create / join / nuke / leave.
 
+use std::io::IsTerminal;
+
 use crate::*;
 use ipc::NetworkKey;
 
@@ -156,23 +158,116 @@ pub(crate) async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn ipc_kick(network: &str, peer: &str) -> Result<()> {
+/// `ray kick`: remove a member, asking first when the argument names someone
+/// who holds more than one device.
+///
+/// Membership follows the user identity, so naming a paired phone removes the
+/// laptop it is paired to as well. That is deliberate (access cannot be taken
+/// away one device at a time when the firewall and `ssh` resolve a device to
+/// its user), but the command line does not say it: one name goes in and three
+/// rows can go. So the daemon answers an unconfirmed kick that would take more
+/// than one row with the set instead of taking it, and this prints that set and
+/// asks. `--yes` sends the confirmed request straight away.
+pub(crate) async fn ipc_kick(network: &str, peer: &str, yes: bool) -> Result<()> {
+    match send_kick(network, peer, yes).await? {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        ipc::IpcMessage::KickConfirm {
+            network: net,
+            display,
+            targets,
+        } => {
+            print_kick_targets(&net, &display, &targets);
+            // Nothing to read an answer from: a script piping into `ray kick`
+            // would hang on the prompt or, worse, take an EOF for a yes.
+            if !std::io::stdin().is_terminal() {
+                fail_with(
+                    "kick needs confirmation",
+                    &format!(
+                        "'{display}' holds {} roster rows and stdin is not a terminal; \
+                         re-run with --yes to remove them all",
+                        targets.len()
+                    ),
+                );
+            }
+            if !prompt_yes(&format!("kick all {} from '{net}'?", targets.len()))? {
+                println!("  {}\n", style::faint("cancelled"));
+                return Ok(());
+            }
+            match send_kick(network, peer, true).await? {
+                ipc::IpcMessage::Ok { message } => println!("{}", message),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
+            }
+        }
+        other => fail_unexpected(&other),
+    }
+    Ok(())
+}
+
+/// One `Kick` request/response round trip. Called twice when the first answer
+/// is a [`ipc::IpcMessage::KickConfirm`]: the daemon re-resolves the argument on
+/// the confirmed request, so the roster it acts on is the one it just read
+/// rather than one cached across the prompt.
+async fn send_kick(network: &str, peer: &str, confirm: bool) -> Result<ipc::IpcMessage> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
         ipc::IpcMessage::Kick {
             network: network.to_string(),
             peer: peer.to_string(),
+            confirm,
         },
     )
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
+    ipc::recv(&mut stream).await
+}
+
+/// The rows a pending kick would take, one per line, primary first so the
+/// person reading sees whose devices these are before the devices.
+fn print_kick_targets(network: &str, display: &str, targets: &[ipc::KickTarget]) {
+    println!();
+    println!(
+        "  {} is one of {} roster rows held by the same user in '{}'.",
+        style::value(display),
+        targets.len(),
+        network
+    );
+    println!("  {}", style::faint("kicking removes every one of them:"));
+    println!();
+    let mut rows: Vec<&ipc::KickTarget> = targets.iter().collect();
+    rows.sort_by_key(|t| !t.primary);
+    let names: Vec<String> = rows
+        .iter()
+        .map(|t| t.hostname.clone().unwrap_or_else(|| t.short_id.clone()))
+        .collect();
+    // Pad to the longest name: styling wraps the string in escapes, so the width
+    // has to be applied to the plain text, not to the styled cell.
+    let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
+    for (t, name) in rows.iter().zip(&names) {
+        let role = if t.primary { "primary" } else { "device" };
+        println!(
+            "    {}{}  {}  {}",
+            style::value(name),
+            " ".repeat(width - name.len()),
+            style::rose(&t.short_id),
+            style::faint(role)
+        );
     }
-    Ok(())
+    println!();
+}
+
+/// Ask a yes/no question on stdin, defaulting to no on anything else.
+fn prompt_yes(question: &str) -> Result<bool> {
+    use std::io::{BufRead, Write};
+    print!("  {question} (y/N) ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
