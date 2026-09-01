@@ -22,6 +22,50 @@ const EXIT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "macos")]
 const NUDGE_REPLY_WAIT: Duration = Duration::from_millis(500);
 
+/// The roster rows one `ray kick` removes: the named identity and every device
+/// held by the same user. Returns `(targets, any_is_coordinator, display)`, or
+/// `None` when nothing in the roster matches.
+///
+/// Membership follows the user identity while a roster row is per device, and
+/// this is where the two are reconciled. Kicking used to take the *first* row
+/// matching either the device or its user, which meant naming a paired
+/// secondary removed its primary (seated earlier) and left the secondary in the
+/// network. Removing the whole user is the only reading that matches what the
+/// rest of the daemon does with a pairing: `ssh` and the firewall resolve a
+/// device to its user and grant on that, so access cannot be taken away one
+/// device at a time. Revoking a single device is `ray unpair`, which nullifies
+/// its cert mesh-wide rather than editing one network's roster.
+fn kick_targets(
+    members: &MemberList,
+    candidate: EndpointId,
+    candidate_user: EndpointId,
+) -> Option<(Vec<EndpointId>, bool, String)> {
+    let rows: Vec<&Member> = members
+        .all()
+        .into_iter()
+        .filter(|m| {
+            m.identity == candidate
+                || m.identity == candidate_user
+                || m.user_identity == Some(candidate_user)
+        })
+        .collect();
+    // Name the row the caller pointed at, falling back to the primary's, so the
+    // message says what they typed rather than a sibling device.
+    let named = rows
+        .iter()
+        .find(|m| m.identity == candidate)
+        .or(rows.first())?;
+    let display = named
+        .hostname
+        .clone()
+        .unwrap_or_else(|| named.identity.fmt_short().to_string());
+    Some((
+        rows.iter().map(|m| m.identity).collect(),
+        rows.iter().any(|m| m.is_coordinator),
+        display,
+    ))
+}
+
 /// First and last backoff step for the member-network restore retry loop.
 const RESTORE_RETRY_MIN: Duration = Duration::from_secs(2);
 const RESTORE_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -475,28 +519,23 @@ impl NetworkRegistry {
             }
         };
         let candidate_user = self.device_user_map.resolve(&candidate);
-        let (member_id, _member_ip, is_coord, display) = {
+        // Membership follows the user identity, so a kick removes the person and
+        // every device they hold rather than whichever roster row matched first.
+        // It used to take the first: naming a paired secondary resolved to its
+        // primary, and since the primary's row is normally seated earlier,
+        // `ray kick <phone>` removed the *laptop* and left the phone in place.
+        // The victim's own row is matched too, so a device with no live pairing
+        // (a stale row from a reinstall) is still kickable by its own id.
+        let (targets, is_coord, display) = {
             let s = state.read().unwrap();
-            match s
-                .members
-                .all()
-                .into_iter()
-                .find(|m| m.identity == candidate || m.identity == candidate_user)
-            {
-                Some(m) => (
-                    m.identity,
-                    derive_ipv6(&m.identity),
-                    m.is_coordinator,
-                    m.hostname
-                        .clone()
-                        .unwrap_or_else(|| m.identity.fmt_short().to_string()),
-                ),
+            match kick_targets(&s.members, candidate, candidate_user) {
+                Some(t) => t,
                 None => {
                     return ipc_err(format!("'{peer}' is not a member of '{network}'"));
                 }
             }
         };
-        if member_id == self.transport.endpoint.id() {
+        if targets.contains(&self.transport.endpoint.id()) {
             return ipc_err("cannot kick yourself — use `ray leave` or `ray nuke`".to_string());
         }
         if is_coord {
@@ -518,12 +557,24 @@ impl NetworkRegistry {
         // at the kick. `finalize_removal` also deliberately leaves the connection
         // open, so the message cannot lose a race with its own teardown.
         let ctx = self.mesh_ctx();
-        remove_member_roster_only(&ctx, network, &state, member_id, derive_ipv6(&member_id)).await;
-        finalize_removal(&ctx, network, &state, &dht_notify, &[member_id]).await;
+        for member_id in &targets {
+            remove_member_roster_only(&ctx, network, &state, *member_id, derive_ipv6(member_id))
+                .await;
+        }
+        // One finalize for the whole set: it publishes the snapshot once and
+        // sends every victim its own `KickedFromNetwork`, so a person and their
+        // devices leave on the same record rather than on N republished ones.
+        finalize_removal(&ctx, network, &state, &dht_notify, &targets).await;
 
-        tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
+        for member_id in &targets {
+            tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
+        }
+        let devices = match targets.len() {
+            1 => String::new(),
+            n => format!(" and {} paired device(s)", n - 1),
+        };
         IpcMessage::Ok {
-            message: format!("kicked '{display}' from '{network}'"),
+            message: format!("kicked '{display}'{devices} from '{network}'"),
         }
     }
 
@@ -1888,5 +1939,77 @@ mod coordinator_restore_tests {
             Some(hash),
             "a failed replacement snapshot write must retain the recovery pointer"
         );
+    }
+}
+
+#[cfg(test)]
+mod kick_target_tests {
+    use super::*;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        SecretKey::from(bytes).public()
+    }
+
+    fn member(identity: EndpointId, user: Option<EndpointId>, hostname: &str) -> Member {
+        Member {
+            identity,
+            is_coordinator: false,
+            hostname: Some(hostname.to_string()),
+            user_identity: user,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }
+    }
+
+    /// Laptop (primary, seated in its own right) plus a phone paired to it.
+    fn roster() -> (MemberList, EndpointId, EndpointId) {
+        let laptop = id(1);
+        let phone = id(2);
+        let mut members = MemberList::new();
+        members.add(member(laptop, None, "laptop"));
+        members.add(member(phone, Some(laptop), "phone"));
+        (members, laptop, phone)
+    }
+
+    #[test]
+    fn kicking_a_paired_device_takes_the_whole_user() {
+        let (members, laptop, phone) = roster();
+        // What `ray kick <phone>` resolves to: the phone's id, and the user
+        // identity its cert names, which is the laptop.
+        let (targets, _, display) = kick_targets(&members, phone, laptop).unwrap();
+        assert_eq!(targets.len(), 2, "both devices of the user must be removed");
+        assert!(targets.contains(&laptop) && targets.contains(&phone));
+        assert_eq!(display, "phone", "the message names what the caller typed");
+    }
+
+    #[test]
+    fn kicking_the_primary_takes_its_devices_too() {
+        let (members, laptop, phone) = roster();
+        let (targets, _, display) = kick_targets(&members, laptop, laptop).unwrap();
+        assert!(targets.contains(&laptop) && targets.contains(&phone));
+        assert_eq!(display, "laptop");
+    }
+
+    #[test]
+    fn an_unpaired_row_is_kicked_alone() {
+        // A stale row left by a reinstall: no live pairing, so `resolve` hands
+        // back the device id itself and only that row goes.
+        let (mut members, _laptop, _phone) = roster();
+        let ghost = id(3);
+        members.add(member(ghost, None, "old-phone"));
+        let (targets, _, display) = kick_targets(&members, ghost, ghost).unwrap();
+        assert_eq!(targets, vec![ghost]);
+        assert_eq!(display, "old-phone");
+    }
+
+    #[test]
+    fn a_stranger_matches_nothing() {
+        let (members, _laptop, _phone) = roster();
+        let stranger = id(9);
+        assert!(kick_targets(&members, stranger, stranger).is_none());
     }
 }
