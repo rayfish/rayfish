@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.set
@@ -29,12 +30,13 @@ fun QrImage(content: String, size: Dp = 180.dp, modifier: Modifier = Modifier) {
             }
         }
     }
-    Image(bitmap = bitmap.asImageBitmap(), contentDescription = "QR code", modifier = modifier.size(size))
+    Image(bitmap = bitmap.asImageBitmap(), contentDescription = stringResource(xyz.rayfish.android.R.string.cd_qr), modifier = modifier.size(size))
 }
 
 /** Camera QR scanner. Returns a lambda to launch it; [onResult] gets the decoded text or null. */
 @Composable
 fun rememberQrScanner(onResult: (String?) -> Unit): () -> Unit {
+    val prompt = stringResource(xyz.rayfish.android.R.string.qr_scan_prompt)
     val launcher = rememberLauncherForActivityResult(ScanContract()) { result ->
         onResult(result.contents)
     }
@@ -43,7 +45,7 @@ fun rememberQrScanner(onResult: (String?) -> Unit): () -> Unit {
             ScanOptions()
                 .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
                 .setBeepEnabled(false)
-                .setPrompt("Scan a Rayfish code")
+                .setPrompt(prompt)
                 // Force portrait. setOrientationLocked only locks to whatever the
                 // sensor reads at launch, which is landscape on foldables; a
                 // capture activity pinned to portrait in the manifest is the fix.

@@ -1,7 +1,6 @@
 package xyz.rayfish.android.ui.screens
 
 import android.app.Activity
-import android.content.Context
 import android.net.VpnService
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -12,6 +11,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -27,6 +28,7 @@ import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.OfferNotifier
+import xyz.rayfish.android.R
 import xyz.rayfish.android.formatSize
 import xyz.rayfish.android.TransferKey
 import xyz.rayfish.android.TransferNotifier
@@ -72,14 +74,14 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         // means the system refused the service start outright, so there is no
         // bring-up to be optimistic about and the toggle must stay where it is.
         if (!TunnelControl.start(context)) {
-            onToast("Could not start the VPN service")
+            onToast(context.getString(R.string.error_vpn_start))
             return
         }
         vpnOn = true
         pendingVpn = true
     }
     val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
-        if (r.resultCode == Activity.RESULT_OK) startService() else onToast("VPN permission denied")
+        if (r.resultCode == Activity.RESULT_OK) startService() else onToast(context.getString(R.string.error_vpn_denied))
     }
     fun toggle(on: Boolean) {
         if (on) {
@@ -100,9 +102,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     // networks that are still connecting, and this banner claims a working link.
     val connected = nets.count { it.state == NetworkConnState.CONNECTED }
     val banner = when {
-        starting -> "Starting"
-        vpnOn -> "Connected · $connected network${if (connected == 1) "" else "s"}"
-        else -> "Disconnected"
+        starting -> stringResource(R.string.status_starting)
+        vpnOn -> pluralStringResource(R.plurals.status_connected_networks, connected, connected)
+        else -> stringResource(R.string.status_disconnected)
     }
 
     // Pending file/connect offers don't change `status`, so poll on our own timer
@@ -163,7 +165,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     fun act(onFailure: () -> Unit = {}, block: suspend () -> Unit) {
         scope.launch {
             try { withContext(Dispatchers.IO) { block() }; reloadNotifs() }
-            catch (t: Throwable) { onFailure(); onToast("Failed: ${t.message}") }
+            catch (t: Throwable) { onFailure(); onToast(context.getString(R.string.error_failed, t.message.orEmpty())) }
         }
     }
     // The core writes into this app-private staging dir; we then move the file to
@@ -217,7 +219,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 // Same reason as the reject path: the offer may still be pending,
                 // so stop suppressing its notification.
                 OfferNotifier.clearActedOn(f.id)
-                onToast("Failed: ${t.message}")
+                onToast(context.getString(R.string.error_failed, t.message.orEmpty()))
             }
         }
     }
@@ -232,26 +234,26 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         BrandHeader()
         StatusEyebrow(connected = vpnOn && !starting, text = banner)
         ToggleCard(
-            title = "Tunnel",
-            subtitle = if (vpnOn) "running · this device ${status?.ipv6.orEmpty()}" else "stopped",
+            title = stringResource(R.string.label_tunnel),
+            subtitle = if (vpnOn) stringResource(R.string.tunnel_running, status?.ipv6.orEmpty()) else stringResource(R.string.status_stopped),
             checked = vpnOn, onCheckedChange = { toggle(it) },
         )
         SectionCard {
-            SectionLabel("This device")
+            SectionLabel(stringResource(R.string.label_this_device))
             val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
-            KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
-            KeyValueRow("Networks", "${nets.size} · $online peers online")
+            KeyValueRow(stringResource(R.string.label_ipv6), ip6 ?: stringResource(R.string.dash), onClick = ip6?.let { v -> { copyToClipboard(context, context.getString(R.string.label_ipv6), v); onToast(context.getString(R.string.toast_copied, v)) } })
+            KeyValueRow(stringResource(R.string.label_networks), pluralStringResource(R.plurals.home_networks_peers, online, nets.size, online))
         }
         if (hasNotifs) {
             SectionCard {
-                SectionLabel("Notifications")
+                SectionLabel(stringResource(R.string.label_notifications))
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     files.forEach { f ->
                         if (f.id in accepting || f.id in doneFiles) return@forEach
                         NotifRow(
                             title = f.filename,
-                            subtitle = "file · ${formatSize(f.size)} · from ${f.from}",
-                            acceptLabel = "Save", onAccept = { acceptFile(f) },
+                            subtitle = stringResource(R.string.home_file_from, formatSize(f.size), f.from),
+                            acceptLabel = stringResource(R.string.action_save), onAccept = { acceptFile(f) },
                             onReject = {
                                 OfferNotifier.markActedOn(context, f.id)
                                 act(onFailure = { OfferNotifier.clearActedOn(f.id) }) {
@@ -263,7 +265,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                     queued.forEach { q ->
                         QueuedSendRow(
                             title = q.filename,
-                            subtitle = "waiting for ${q.peer} · ${formatSize(q.size)}",
+                            subtitle = stringResource(R.string.home_waiting_for_peer, q.peer, formatSize(q.size)),
                             onCancel = { act { NodeHolder.get(context).cancelSend(q.id) } },
                         )
                     }
@@ -272,16 +274,16 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                     connects.forEach { c ->
                         NotifRow(
                             title = c.hostname ?: c.shortId,
-                            subtitle = "connect request · ${c.shortId} · ${c.waitingSecs}s",
-                            acceptLabel = "Accept", onAccept = { act { NodeHolder.get(context).approveConnectRequest(c.shortId) } },
+                            subtitle = stringResource(R.string.home_connect_request, c.shortId, c.waitingSecs.toInt()),
+                            acceptLabel = stringResource(R.string.action_accept), onAccept = { act { NodeHolder.get(context).approveConnectRequest(c.shortId) } },
                             onReject = { act { NodeHolder.get(context).rejectConnectRequest(c.shortId) } },
                         )
                     }
                     joins.forEach { (net, j) ->
                         NotifRow(
                             title = j.hostname ?: j.shortId,
-                            subtitle = "wants to join $net · ${j.shortId}",
-                            acceptLabel = "Accept", onAccept = { act { NodeHolder.get(context).acceptJoinRequest(net, j.shortId) } },
+                            subtitle = stringResource(R.string.home_join_request, net, j.shortId),
+                            acceptLabel = stringResource(R.string.action_accept), onAccept = { act { NodeHolder.get(context).acceptJoinRequest(net, j.shortId) } },
                             onReject = { act { NodeHolder.get(context).denyJoinRequest(net, j.shortId) } },
                         )
                     }
@@ -301,7 +303,7 @@ private fun NotifRow(title: String, subtitle: String, acceptLabel: String, onAcc
                 Text(acceptLabel, color = Rf.Emerald, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
             }
             TextButton(onClick = onReject, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
-                Text("Decline", color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
+                Text(stringResource(R.string.action_decline), color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
             }
         }
     }
@@ -315,7 +317,7 @@ private fun QueuedSendRow(title: String, subtitle: String, onCancel: () -> Unit)
         Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading, maxLines = 1)
         Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted)
         TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
-            Text("Cancel", color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
+            Text(stringResource(R.string.action_cancel), color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
         }
     }
 }
@@ -326,7 +328,7 @@ private fun FileTransferRow(filename: String, done: Boolean) {
         Text(filename, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading, maxLines = 1)
         Spacer(Modifier.height(6.dp))
         if (done) {
-            Text("Done!", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Rf.Emerald)
+            Text(stringResource(R.string.action_done), fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 12.sp, color = Rf.Emerald)
         } else {
             LinearProgressIndicator(
                 modifier = Modifier.fillMaxWidth(),

@@ -1,3 +1,272 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Rayfish</string>
+    <!-- Brand / launcher. Not translated: it is the product name. Debug overlays this. -->
+    <string name="app_name" translatable="false">Rayfish</string>
+    <string name="share_with_rayfish">Share with Rayfish</string>
+    <string name="fallback_file">file</string>
+    <string name="fallback_peer">peer</string>
+
+    <!-- Tabs -->
+    <string name="tab_home">Home</string>
+    <string name="tab_networks">Networks</string>
+    <string name="tab_you">You</string>
+
+    <!-- Content descriptions -->
+    <string name="cd_rayfish">Rayfish</string>
+    <string name="cd_more">More</string>
+    <string name="cd_copy">Copy</string>
+    <string name="cd_back">Back</string>
+    <string name="cd_qr">QR code</string>
+
+    <!-- Common actions -->
+    <string name="action_save">Save</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_accept">Accept</string>
+    <string name="action_decline">Decline</string>
+    <string name="action_continue">Continue</string>
+    <string name="action_add">＋ Add</string>
+    <string name="action_remove">remove</string>
+    <string name="action_scan">Scan</string>
+    <string name="action_set">set</string>
+    <string name="action_disable">Disable</string>
+    <string name="action_leave">Leave</string>
+    <string name="action_unpair">Unpair</string>
+    <string name="action_replace">Replace</string>
+    <string name="action_restore">Restore</string>
+    <string name="action_backup">Back up</string>
+    <string name="action_add_rule">Add</string>
+    <string name="action_copy_code">Copy code</string>
+    <string name="action_copied">Copied</string>
+    <string name="action_copy_failed">Copy failed</string>
+    <string name="action_reject">Reject</string>
+    <string name="action_done">Done!</string>
+
+    <!-- Common labels -->
+    <string name="label_this_device">This device</string>
+    <string name="label_ipv6">IPv6</string>
+    <string name="label_node_id">Node ID</string>
+    <string name="label_networks">Networks</string>
+    <string name="label_hostname">Hostname</string>
+    <string name="label_notifications">Notifications</string>
+    <string name="label_peers">Peers</string>
+    <string name="label_firewall">Firewall</string>
+    <string name="label_about">About</string>
+    <string name="label_pairing">Pairing</string>
+    <string name="label_tunnel">Tunnel</string>
+    <string name="label_your_address">Your address</string>
+    <string name="label_role">Role</string>
+    <string name="label_status">Status</string>
+    <string name="label_inbound_default">Inbound default</string>
+    <string name="label_outbound_default">Outbound default</string>
+    <string name="label_identity_backup">Identity backup</string>
+    <string name="label_join_or_pair">Join or pair</string>
+    <string name="label_create_a_network">Create a network</string>
+    <string name="label_share">Share</string>
+    <string name="dash">-</string>
+    <string name="role_coordinator">coordinator</string>
+    <string name="role_member">member</string>
+    <string name="fw_any_peer">any peer</string>
+    <string name="fw_peer">peer</string>
+    <string name="fw_protocol">protocol</string>
+    <string name="status_offline">offline</string>
+    <string name="status_starting">Starting</string>
+    <string name="status_starting_ellipsis">Starting…</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_stopped">stopped</string>
+    <string name="status_connecting_ellipsis">connecting…</string>
+    <string name="status_not_connected">not connected</string>
+    <string name="status_not_connected_reason">not connected · %1$s</string>
+
+    <!-- Home -->
+    <string name="tunnel_running">running · this device %s</string>
+    <string name="home_file_from">file · %1$s · from %2$s</string>
+    <string name="home_waiting_for_peer">waiting for %1$s · %2$s</string>
+    <string name="home_connect_request">connect request · %1$s · %2$ds</string>
+    <string name="home_join_request">wants to join %1$s · %2$s</string>
+    <plurals name="status_connected_networks">
+        <item quantity="one">Connected · %d network</item>
+        <item quantity="other">Connected · %d networks</item>
+    </plurals>
+    <plurals name="home_networks_peers">
+        <item quantity="one">%1$d · %2$d peer online</item>
+        <item quantity="other">%1$d · %2$d peers online</item>
+    </plurals>
+
+    <!-- Networks -->
+    <string name="networks_empty">No networks yet. Add one to get started.</string>
+    <string name="networks_waiting_approval">waiting for approval</string>
+    <string name="menu_invite">Invite to share</string>
+    <string name="menu_copy_address">Copy address</string>
+    <string name="menu_leave_network">Leave network</string>
+    <string name="invite_sheet_title">Invite to share</string>
+    <string name="hint_invite_or_pairing_code">Invite or pairing code</string>
+    <string name="hint_network_name_optional">Name (optional)</string>
+    <string name="action_create_network">Create network</string>
+    <string name="qr_pairing_title">Show this to your other device</string>
+    <string name="clipboard_code">Rayfish code</string>
+    <string name="clipboard_address">address</string>
+    <string name="clipboard_peer">peer</string>
+    <plurals name="network_peers_online">
+        <item quantity="one">%d online</item>
+        <item quantity="other">%d online</item>
+    </plurals>
+    <string name="network_row_subtitle">%1$s · %2$s</string>
+
+    <!-- Network detail -->
+    <plurals name="peers_section">
+        <item quantity="one">Peers · %d online</item>
+        <item quantity="other">Peers · %d online</item>
+    </plurals>
+    <string name="no_peers_yet">No peers yet</string>
+    <string name="no_inbound_rules">No inbound rules</string>
+    <string name="allow_inbound">Allow inbound</string>
+    <string name="allow_inbound_add">+ Allow inbound</string>
+    <string name="hint_hostname">lowercase, 1–63 chars</string>
+    <string name="hint_port">port (blank for any), e.g. 22</string>
+    <string name="leave_title">Leave %s?</string>
+    <string name="leave_body">You\'ll lose your address and stop reaching its peers. You can rejoin later with an invite.</string>
+    <string name="hostname_on">Hostname on %s</string>
+    <string name="peer_row_meta">%1$s · %2$s</string>
+    <string name="peer_unknown" translatable="false">?</string>
+    <string name="fw_rule_with_port">%1$s %2$s:%3$s</string>
+    <string name="fw_rule_any_port">%1$s %2$s</string>
+    <string name="fw_toggle_edit">%s ✎</string>
+    <string name="hostname_edit">%s ✎</string>
+
+    <!-- Welcome -->
+    <string name="welcome_body">Rayfish gives this device an identity of its own. Peers know it by that and nothing else, so it is worth keeping.</string>
+    <string name="welcome_get_started">Get started</string>
+    <string name="welcome_restore">Restore a backup</string>
+    <string name="welcome_restore_hint">Restoring moves an identity from another device, or back from a backup you saved. You will need the password you chose for it.</string>
+
+    <!-- You / pairing / settings -->
+    <string name="device_name">Device name</string>
+    <string name="pairing_need_tunnel">Start the tunnel to pair another device.</string>
+    <string name="pairing_already">This device is paired. Add new devices from your primary device.</string>
+    <string name="pairing_unpair">Unpair this device</string>
+    <string name="pairing_intro">Pair another of your devices: show it a code, or scan the code it shows.</string>
+    <string name="pairing_show_code">Show my code</string>
+    <string name="pairing_scan_code">Scan a code</string>
+    <string name="pref_go_offline">Go fully offline when disabled</string>
+    <string name="pref_go_offline_on">on · turning the VPN off takes this device offline</string>
+    <string name="pref_go_offline_off">off · Rayfish keeps working for files with the VPN off, so you can run another VPN</string>
+    <string name="pref_auto_accept">Auto-accept from my devices</string>
+    <string name="pref_auto_accept_on">on · files from your paired devices save to Downloads</string>
+    <string name="pref_auto_accept_off">off · accept them manually</string>
+    <string name="pref_crash_reporting">Crash reporting</string>
+    <string name="pref_crash_reporting_on">on · diagnostics</string>
+    <string name="pref_crash_reporting_off">off</string>
+    <string name="action_send_diagnostics">Send diagnostics</string>
+    <string name="about_version">v%s</string>
+    <string name="device_name_applies">Applies to all your networks.</string>
+    <string name="unpair_title">Unpair this device?</string>
+    <string name="unpair_body">This device leaves all your networks and deletes its pairing certificate. Peers disconnect from it right away. Re-pair from your primary device to rejoin.</string>
+    <string name="qr_scan_prompt">Scan a Rayfish code</string>
+
+    <!-- Identity backup / restore -->
+    <string name="identity_backup_body">Your identity is this device\'s key. Lose it and your networks do not know you; back it up encrypted with a password only you know.</string>
+    <string name="identity_restore_need_off">Turn Rayfish off to restore an identity.</string>
+    <string name="backup_title">Back up identity</string>
+    <string name="hint_password">password</string>
+    <string name="hint_confirm_password">confirm password</string>
+    <string name="backup_password_warning">There is no way to recover this password. Without it the backup is just noise.</string>
+    <string name="restore_title">Restore identity</string>
+    <string name="hint_backup_password">backup password</string>
+    <string name="restore_password_hint">The password you chose when you made this backup.</string>
+    <string name="replace_identity_title">Replace this identity?</string>
+    <string name="replace_identity_body">This device already has identity %s. Restoring replaces it: the old one is gone from this device, its pairing certificate is deleted, and peers will see this device at a new address.</string>
+
+    <!-- Share sheet -->
+    <string name="share_send_to_peer">Send %s to a peer</string>
+    <string name="share_connecting">Connecting…</string>
+    <string name="share_no_peers">No peers yet. Open Rayfish and join a network, then try again.</string>
+    <string name="peer_connected">connected</string>
+    <string name="peer_idle">idle</string>
+    <string name="peer_offline_queue">offline, will queue</string>
+    <string name="share_peer_subtitle">%1$s · %2$s.ray (%3$s)</string>
+    <plurals name="share_item_count">
+        <item quantity="one">%d item</item>
+        <item quantity="other">%d items</item>
+    </plurals>
+
+    <!-- Toasts / errors -->
+    <string name="error_failed">Failed: %s</string>
+    <string name="error_failed_to_start">Failed to start: %s</string>
+    <string name="error_vpn_start">Could not start the VPN service</string>
+    <string name="error_vpn_denied">VPN permission denied</string>
+    <string name="error_link_failed">Link failed: %s</string>
+    <string name="error_invite_failed">Invite failed: %s</string>
+    <string name="error_create_failed">Create failed: %s</string>
+    <string name="error_leave_failed">Leave failed: %s</string>
+    <string name="error_remove_failed">Remove failed: %s</string>
+    <string name="error_add_failed">Add failed: %s</string>
+    <string name="error_pairing_failed">Pairing failed: %s</string>
+    <string name="error_unpair_failed">Unpair failed: %s</string>
+    <string name="error_backup_failed">Backup failed: %s</string>
+    <string name="error_restore_failed">Restore failed: %s</string>
+    <string name="error_invalid_name">Invalid name: %s</string>
+    <string name="error_invalid_hostname">Invalid hostname: %s</string>
+    <string name="toast_copied">Copied %s</string>
+    <string name="toast_copied_node_id">Copied node ID</string>
+    <string name="toast_joined">Joined %s</string>
+    <string name="toast_join_requested">Join requested for %s — waiting for approval</string>
+    <string name="toast_paired">Paired</string>
+    <string name="toast_device_paired">Device paired</string>
+    <string name="toast_created">Created %s</string>
+    <string name="toast_enter_code">Enter a code</string>
+    <string name="toast_inbound_default">Inbound default: %s</string>
+    <string name="toast_rule_removed">Rule removed</string>
+    <string name="toast_rule_added">Rule added</string>
+    <string name="toast_left">Left %s</string>
+    <string name="toast_hostname_set">Hostname set</string>
+    <string name="toast_device_name_set">Device name set</string>
+    <string name="toast_unpaired">Unpaired this device</string>
+    <string name="toast_diagnostics_sent">Diagnostics sent</string>
+    <string name="toast_diagnostics_unavailable">Diagnostics unavailable</string>
+    <string name="toast_backup_saved">Backup saved</string>
+    <string name="toast_backup_write_failed">Could not write the backup</string>
+    <string name="toast_restore_read_failed">Could not read that file</string>
+    <string name="toast_restored_identity">Restored identity %s</string>
+    <string name="toast_bad_backup">Wrong password, or that file is not a backup</string>
+    <string name="toast_restore_need_off">Turn Rayfish off before restoring</string>
+
+    <!-- Notifications / tiles / FGS -->
+    <string name="notif_channel_vpn">Rayfish VPN</string>
+    <string name="notif_channel_vpn_desc">Rayfish mesh tunnel status</string>
+    <string name="notif_channel_transfers">File transfers</string>
+    <string name="notif_channel_transfers_desc">Progress and results for files sent and received over the mesh</string>
+    <string name="notif_channel_offers">Incoming files</string>
+    <string name="notif_channel_offers_desc">Files other people have sent you over the mesh</string>
+    <string name="notif_vpn_standby">Online, VPN off · files still work</string>
+    <string name="notif_vpn_active">Mesh tunnel active</string>
+    <string name="tile_tunnel_on">Tunnel on</string>
+    <string name="tile_tunnel_off">Tunnel off</string>
+    <string name="notif_sending_to">Sending to %s</string>
+    <string name="notif_items_over_rayfish">%s over Rayfish</string>
+    <string name="notif_waking">Waking %s…</string>
+    <string name="notif_peer_queued">%s is not answering, queued until it\'s back</string>
+    <plurals name="notif_send_failed">
+        <item quantity="one">Could not send %1$d item to %2$s</item>
+        <item quantity="other">Could not send %1$d items to %2$s</item>
+    </plurals>
+    <string name="notif_working">Working</string>
+    <string name="notif_saving_file">Saving %s</string>
+    <string name="notif_from_peer">From %s</string>
+    <string name="notif_declining_file">Declining %s</string>
+    <string name="notif_sending_file">Sending %s</string>
+    <string name="notif_receiving_file">Receiving %s</string>
+    <string name="notif_waiting_accept">Waiting for %s to accept</string>
+    <string name="notif_waiting_accept_if_running">Waiting for %s to accept · only notified if Rayfish stays running</string>
+    <string name="notif_to_peer_pct">To %1$s (%2$d%%)</string>
+    <string name="notif_to_peer">To %s</string>
+    <string name="notif_from_peer_pct">From %1$s (%2$d%%)</string>
+    <string name="notif_sent_file">Sent %s</string>
+    <string name="notif_saved_file">Saved %s</string>
+    <string name="notif_could_not_send_file">Could not send %s</string>
+    <string name="notif_could_not_receive_file">Could not receive %s</string>
+    <string name="notif_peer_has_it">%s has it</string>
+    <string name="notif_saved_to_downloads">Saved to Downloads</string>
+    <string name="notif_saved">Saved</string>
+    <string name="notif_transfer_failed">Transfer with %s failed</string>
+    <string name="notif_offer_text">%1$s · %2$s</string>
 </resources>

@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Android speaks Japanese, Simplified Chinese and Traditional Chinese.** The
+  app now follows the phone's language instead of always being English, with
+  every screen, notification, tile and share-sheet label translated. Firewall
+  vocabulary (`tcp`, `allow`, `deny`) stays as the daemon prints it, so a rule
+  reads the same on the phone as in `ray firewall`.
+
 - **`ray files reject <id>`.** Turn down an incoming file offer instead of
   leaving it sitting in the queue. The offer is dropped without being fetched;
   the sender is not told, so it is the same as never picking it up. The
