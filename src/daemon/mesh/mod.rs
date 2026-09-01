@@ -40,6 +40,9 @@ pub(crate) use join::*;
 pub(crate) use publish::*;
 pub(crate) use reconverge::*;
 pub(crate) use rename::*;
+// The saved-network parameter group the member-restore loop hands to
+// `warm_resume_member_network` in `create_join`.
+pub(crate) use runtime::SavedMemberNetwork;
 pub(crate) use select::*;
 // `run_daemon` is the public process entry point (called by `ray daemon`).
 pub use bootstrap::run_daemon;

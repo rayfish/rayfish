@@ -172,18 +172,16 @@ pub async fn create_endpoint_with_alpns(
     // Hints came from paths that previously completed an identity-authenticated
     // QUIC handshake; if an address has gone stale, iroh tries discovery as usual.
     let warm_lookup = MemoryLookup::from_endpoint_info(warm_hints);
-    let ep = match bind_endpoint(
-        &secret_key,
-        &alpns,
+    let bind = BindConfig {
+        secret_key: &secret_key,
+        alpns: &alpns,
         tor,
-        RAYFISH_LISTEN_PORT,
         relay,
         discovery,
-        &nameservers,
-        &warm_lookup,
-    )
-    .await
-    {
+        nameservers: &nameservers,
+        warm_lookup: &warm_lookup,
+    };
+    let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
         Err(e) => {
             tracing::warn!(
@@ -191,24 +189,29 @@ pub async fn create_endpoint_with_alpns(
                 error = %e,
                 "fixed UDP port unavailable; falling back to an ephemeral port"
             );
-            bind_endpoint(
-                &secret_key,
-                &alpns,
-                tor,
-                0,
-                relay,
-                discovery,
-                &nameservers,
-                &warm_lookup,
-            )
-            .await
-            .context("failed to bind iroh endpoint")?
+            bind_endpoint(&bind, 0)
+                .await
+                .context("failed to bind iroh endpoint")?
         }
     };
 
     tracing::info!(id = %ep.id().fmt_short(), "iroh endpoint ready");
 
     Ok((ep, warm_lookup))
+}
+
+/// Everything a bind attempt needs except the port. The port is the one value
+/// that differs between the fixed-port attempt and the ephemeral retry, so it
+/// stays a plain argument and the rest travels as one named group.
+#[derive(Clone, Copy)]
+struct BindConfig<'a> {
+    secret_key: &'a SecretKey,
+    alpns: &'a [Vec<u8>],
+    tor: bool,
+    relay: &'a ServerOverride,
+    discovery: &'a ServerOverride,
+    nameservers: &'a [Ipv4Addr],
+    warm_lookup: &'a MemoryLookup,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -222,16 +225,16 @@ pub async fn create_endpoint_with_alpns(
 /// published, and a peer on an IPv6-only network reachable through a relay only.
 /// The v6 bind is best-effort (`set_is_required(false)`), matching the preset,
 /// since a host with IPv6 disabled must still start.
-async fn bind_endpoint(
-    secret_key: &SecretKey,
-    alpns: &[Vec<u8>],
-    tor: bool,
-    port: u16,
-    relay: &ServerOverride,
-    discovery: &ServerOverride,
-    nameservers: &[Ipv4Addr],
-    warm_lookup: &MemoryLookup,
-) -> Result<Endpoint> {
+async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
+    let BindConfig {
+        secret_key,
+        alpns,
+        tor,
+        relay,
+        discovery,
+        nameservers,
+        warm_lookup,
+    } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
