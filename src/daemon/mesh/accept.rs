@@ -43,6 +43,21 @@ fn owner_admits(device_cert: Option<&control::DeviceCert>, own_identity: Endpoin
     device_cert.map(|c| c.user_identity) == Some(own_identity)
 }
 
+/// A paired device of a user identity already seated here is admitted with no
+/// approval step, because membership follows the *user* and the device cert is
+/// what says this device is that user. The signature is verified by the caller.
+///
+/// Without this, the two halves of the model disagreed: `ssh` and the firewall
+/// resolve a device to its user (`device_user_map`) and hand it everything the
+/// user has, while admission keyed on the device id alone, so a phone paired to
+/// a laptop that was already a member arrived as a stranger and queued for an
+/// approval nobody expected to have to give. Pairing a device to a member is the
+/// grant; asking a second time adds nothing an attacker could not already do
+/// with the user key that signed the cert.
+fn member_admits(device_cert: Option<&control::DeviceCert>, members: &MemberList) -> bool {
+    device_cert.is_some_and(|c| members.is_member(&c.user_identity))
+}
+
 /// Whether a signed record authored at `record_ts` may replace what we hold,
 /// given the timestamp of the last record applied (`floor`).
 ///
@@ -375,7 +390,10 @@ impl CoordinatorAcceptState {
             GroupMode::Restricted => {
                 // A device cert signed by this coordinator's own owner identity is
                 // one of our own paired devices: admit directly (no approval step).
-                if owner_admits(device_cert.as_ref(), self.ctx.identity.local_identity()) {
+                // The same for a device of any seated member: see `member_admits`.
+                let admits = owner_admits(device_cert.as_ref(), self.ctx.identity.local_identity())
+                    || member_admits(device_cert.as_ref(), &self.state.read().unwrap().members);
+                if admits {
                     return self
                         .admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
                         .await
@@ -2277,6 +2295,36 @@ mod pending_cap_tests {
         pending.insert(eid(1), pending_at(Instant::now()));
         assert_eq!(evict_oldest_pending(&mut pending, eid(2), 4), None);
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn member_admits_any_seated_users_device() {
+        let user = iroh::SecretKey::from([7u8; 32]);
+        let user_id = user.public();
+        let device = iroh::SecretKey::from([9u8; 32]).public();
+        let cert = control::DeviceCert::create(&user, &device, 0);
+
+        let mut members = MemberList::new();
+        assert!(
+            !member_admits(Some(&cert), &members),
+            "a device of nobody seated here still needs approval"
+        );
+
+        members.add(Member {
+            identity: user_id,
+            is_coordinator: false,
+            hostname: Some("laptop".to_string()),
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        });
+        assert!(
+            member_admits(Some(&cert), &members),
+            "the laptop is a member, so its paired phone is admitted with it"
+        );
+        assert!(!member_admits(None, &members), "no cert, no shortcut");
     }
 
     #[test]
