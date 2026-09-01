@@ -2,6 +2,7 @@
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
 use super::super::*;
+use futures::StreamExt;
 
 /// Upper bound on a single proactive full-mesh dial in `dial_all_members`. An
 /// offline peer's `connect` fails on its own (fast when it has no fresh
@@ -11,6 +12,11 @@ use super::super::*;
 /// best-effort and the peer's own reconnect loop re-establishes the link once it
 /// comes back online.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A cold resume should give every recently known peer an equal chance to win
+/// the first connection race.  This cap avoids turning a large roster into an
+/// unbounded NAT-punch / relay storm.
+const WARM_DIAL_CONCURRENCY: usize = 12;
 
 /// Borrowed bundle of the per-join inputs threaded through the dial + finalize
 /// phases of `join_network_inner`, so each phase takes one argument instead of a
@@ -660,6 +666,39 @@ impl NetworkRegistry {
         )
     }
 
+    /// Build an unconnected member state from a locally retained, previously
+    /// verified group blob.  The immediate group poller reconciles it against
+    /// the current signed record after registration.
+    fn member_state_from_blob(
+        &self,
+        ctx: &JoinContext<'_>,
+        data: &crate::membership::GroupBlob,
+    ) -> SharedNetworkState {
+        let mut state = NetworkState {
+            members: MemberList::from_members(data.members.clone()),
+            approved: ApprovedList::from_entries(data.approved.clone()),
+            snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
+            converged_hash: None,
+            unconfirmed_durable_hash: None,
+            network_secret_key: None,
+            network_public_key: ctx.net_pubkey,
+            network_name: Some(ctx.display_name.to_string()),
+            group_name: data.name.clone(),
+            mode: GroupMode::Restricted,
+            suggested_firewall: data.suggested_firewall.clone(),
+            reusable_keys: data.reusable_keys.clone(),
+            nullifiers: data.nullifiers.clone(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+            // Cold restore: nothing has been applied yet, so there is no
+            // rollback to refuse. The first current signed record sets the floor.
+            last_record_timestamp: None,
+        };
+        state.refresh_snapshot();
+        Arc::new(std::sync::RwLock::new(state))
+    }
+
     /// Reconnect/restore dial: the coordinator speaks first, so pick the single
     /// coordinator from the blob and run the legacy handshake. `Ok(None)` when
     /// queued for live approval (caller retries on backoff).
@@ -683,35 +722,6 @@ impl NetworkRegistry {
         // Reconnect + cleanup are daemon-wide now (the connection supervisor).
         let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
-        // Fallback state built straight from the verified blob so registration
-        // never blocks on (or dies with) the coordinator handshake.
-        let state_from_blob = || {
-            let mut ns = NetworkState {
-                members: MemberList::from_members(data.members.clone()),
-                approved: ApprovedList::from_entries(data.approved.clone()),
-                snapshot: None,
-                snapshot_commit: Arc::new(AsyncMutex::new(())),
-                converged_hash: None,
-                unconfirmed_durable_hash: None,
-                network_secret_key: None,
-                network_public_key: ctx.net_pubkey,
-                network_name: Some(ctx.display_name.to_string()),
-                group_name: data.name.clone(),
-                mode: GroupMode::Restricted,
-                suggested_firewall: data.suggested_firewall.clone(),
-                reusable_keys: data.reusable_keys.clone(),
-                nullifiers: data.nullifiers.clone(),
-                pending_suggestions: Vec::new(),
-                pending: HashMap::new(),
-                // Cold restore: nothing has been applied yet, so there is no
-                // rollback to refuse. The floor is set by whichever record lands
-                // first, the reconverge poll or a coordinator's `SignedRecord`.
-                last_record_timestamp: None,
-            };
-            ns.refresh_snapshot();
-            Arc::new(std::sync::RwLock::new(ns))
-        };
-
         // Seed the route map from the verified blob so the data path can re-dial the
         // coordinator or any member that has since been idle-closed, before the first
         // reconverge poll populates it.
@@ -734,7 +744,7 @@ impl NetworkRegistry {
             );
             self.seed_absent_members(ctx.display_name, &data.members);
             return Ok(Some(EstablishedMesh {
-                state: state_from_blob(),
+                state: self.member_state_from_blob(ctx, data),
                 direct_exact_hash: None,
                 direct_hash_published: None,
                 cancel,
@@ -772,7 +782,7 @@ impl NetworkRegistry {
                     // reconnect loop recover rather than dropping the network.
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator handshake failed on restore; registering from blob, reconnect loop will retry");
                     seed_from_blob = true;
-                    state_from_blob()
+                    self.member_state_from_blob(ctx, data)
                 }
             },
             Err(e) => {
@@ -781,7 +791,7 @@ impl NetworkRegistry {
                 // returns.
                 tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator offline on restore; registering from blob, reconnect loop will retry");
                 seed_from_blob = true;
-                state_from_blob()
+                self.member_state_from_blob(ctx, data)
             }
         };
 
@@ -815,6 +825,125 @@ impl NetworkRegistry {
             }
             self.clone().spawn_reconnect(m.identity, vec![net.clone()]);
         }
+    }
+
+    /// Register a saved member network from its last *published and locally
+    /// verified* group blob, without making startup wait for pkarr.  The member
+    /// poller that [`finalize_join`](Self::finalize_join) starts resolves the
+    /// current signed record immediately, so this is a warm-resume optimisation
+    /// rather than a second source of authority.
+    pub(crate) async fn warm_resume_member_network(
+        self: &Arc<Self>,
+        name: &str,
+        net_pubkey: EndpointId,
+        persisted_hostname: Option<String>,
+        auto_accept_firewall: bool,
+        auto_accept_files: bool,
+        cached_hash: Option<blake3::Hash>,
+        cached_is_published: bool,
+    ) -> Result<bool> {
+        // A locally authored-but-unpublished pointer belongs to coordinator
+        // recovery. A member warm-resume only trusts a record it previously saw
+        // published by the network key.
+        let Some(group_hash) = cached_hash.filter(|_| cached_is_published) else {
+            return Ok(false);
+        };
+        let blob_hash = iroh_blobs::Hash::from_bytes(*group_hash.as_bytes());
+        let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await else {
+            return Ok(false);
+        };
+        let Ok(data) = verify_group_blob(&bytes, &group_hash) else {
+            tracing::warn!(network = %name, %group_hash, "discarding invalid cached group blob during warm resume");
+            return Ok(false);
+        };
+        let my_identity = self.transport.identity.local_identity();
+        if !data
+            .members
+            .iter()
+            .any(|member| member.identity == my_identity)
+        {
+            tracing::warn!(network = %name, %group_hash, "cached group blob does not contain this member; skipping warm resume");
+            return Ok(false);
+        }
+
+        // The persisted name is normally present.  The roster copy is the
+        // fallback for older configs, and a generated name preserves the normal
+        // restore behaviour for a very old partial config.
+        let my_hostname = persisted_hostname
+            .or_else(|| {
+                data.members
+                    .iter()
+                    .find(|member| member.identity == my_identity)
+                    .and_then(|member| member.hostname.clone())
+            })
+            .unwrap_or_else(|| {
+                let taken: Vec<&str> = data
+                    .members
+                    .iter()
+                    .filter(|member| member.identity != my_identity)
+                    .filter_map(|member| member.hostname.as_deref())
+                    .collect();
+                crate::hostname::default_hostname(
+                    config::load().ok().and_then(|cfg| cfg.default_hostname),
+                    &taken,
+                )
+            });
+        let alpn = transport::mesh_alpn();
+        let invite_lock = Arc::new(AsyncMutex::new(()));
+        let ctx = JoinContext {
+            display_name: name,
+            my_hostname: &my_hostname,
+            alpn: &alpn,
+            net_pubkey,
+            group_hash,
+            invite: None,
+            auto_accept_firewall,
+            auto_accept_files,
+            invite_lock,
+            coordinator: None,
+            mismatch: None,
+        };
+
+        self.seed_route_map(name, &data.members);
+        let cancel = self.shutdown_token.child_token();
+        let mesh = EstablishedMesh {
+            state: self.member_state_from_blob(&ctx, &data),
+            direct_exact_hash: None,
+            direct_hash_published: None,
+            cancel: cancel.clone(),
+            tasks: Vec::new(),
+        };
+        match self.finalize_join(ctx, &data, mesh).await? {
+            TryJoin::Joined(_) => {}
+            TryJoin::Pending => return Ok(false),
+        }
+
+        // Dial immediately and concurrently.  `seed_absent_members` remains
+        // the retry backstop for peers that lose this first race.
+        self.seed_absent_members(name, &data.members);
+        let me = Arc::clone(self);
+        let network_name = name.to_string();
+        let members = data.members.clone();
+        let dial_cancel = cancel;
+        let dial_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = dial_cancel.cancelled() => {}
+                _ = me.dial_all_members(
+                    &members,
+                    net_pubkey,
+                    &network_name,
+                    my_identity,
+                    Some(my_hostname),
+                ) => {}
+            }
+        });
+        if let Some(mut handle) = self.networks.get_mut(name) {
+            handle.tasks.push(dial_task);
+        } else {
+            dial_task.abort();
+        }
+        tracing::info!(network = %name, %group_hash, "warm-resumed member network from cached verified roster");
+        Ok(true)
     }
 
     /// Run the mesh handshake over an established connection (shared by both dial
@@ -1213,88 +1342,118 @@ impl NetworkRegistry {
         // Announce the current name (a pending rename or the confirmed one),
         // read fresh from config, rather than a value captured before a rename.
         let my_hostname = outgoing_hostname(network_name).or(my_hostname);
-        let ctx = self.mesh_ctx();
-        for m in members {
-            if m.identity == my_identity {
-                continue;
-            }
-            // Bound each dial so a dead peer with a stale discovery record can't
-            // stall restore for iroh's full internal handshake timeout; the
-            // connection supervisor retries anything still unreachable.
-            let dialed = tokio::time::timeout(
-                DIAL_TIMEOUT,
-                transport::connect_to_peer_with_alpn(
-                    &self.transport.endpoint,
-                    m.identity,
-                    &transport::mesh_alpn(),
-                ),
-            )
+        let network_name = network_name.to_string();
+        let members: Vec<Member> = members
+            .iter()
+            .filter(|m| m.identity != my_identity)
+            .cloned()
+            .collect();
+        let this = Arc::clone(self);
+        futures::stream::iter(members)
+            .for_each_concurrent(Some(WARM_DIAL_CONCURRENCY), move |member| {
+                let this = Arc::clone(&this);
+                let network_name = network_name.clone();
+                let my_hostname = my_hostname.clone();
+                async move {
+                    this.dial_known_member(
+                        member,
+                        net_pubkey,
+                        &network_name,
+                        my_identity,
+                        my_hostname,
+                    )
+                    .await;
+                }
+            })
             .await;
-            match dialed {
-                Ok(Ok(peer_conn)) => {
-                    if let Ok((mut s, _)) = peer_conn.open_bi().await {
-                        let _ = control::send_msg(
-                            &mut s,
-                            Some(net_pubkey),
-                            &ControlMsg::MeshHello {
-                                identity: my_identity,
-                                hostname: my_hostname.clone(),
-                                device_cert: self.current_device_cert(),
-                            },
-                        )
-                        .await;
-                    }
-                    crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
-                    // Register the route, then drive the new connection's control
-                    // demux (which owns the data reader) and announce our handles.
-                    let conn_changed = ctx.register_peer_conn(&peer_conn, m.identity, network_name);
-                    if conn_changed {
-                        let router = self.protocol_router().clone();
-                        let dconn = peer_conn.clone();
-                        tokio::spawn(
-                            async move { router.drive_mesh_connection(dconn, true).await },
-                        );
-                    }
-                    announce_network_handles(&self.peers, &peer_conn, derive_ipv6(&m.identity))
-                        .await;
-                    // Eager-connect reachability: a successful dial marks the peer
-                    // reachable so `ray status` shows it active/idle, not offline.
-                    self.reachability.note_ok(m.identity);
-                    tracing::info!(
-                        network = %network_name,
-                        peer = %m.identity.fmt_short(),
-                        "dialed known member on restore/join (full mesh)"
-                    );
+    }
+
+    /// One bounded member dial within [`Self::dial_all_members`].  Split out so
+    /// the fan-out scheduling above cannot accidentally make a stale peer block
+    /// every peer behind it.
+    async fn dial_known_member(
+        self: &Arc<Self>,
+        member: Member,
+        net_pubkey: EndpointId,
+        network_name: &str,
+        my_identity: EndpointId,
+        my_hostname: Option<String>,
+    ) {
+        let ctx = self.mesh_ctx();
+        let m = member;
+        // Bound each dial so a dead peer with a stale discovery record can't
+        // stall restore for iroh's full internal handshake timeout; the
+        // connection supervisor retries anything still unreachable.
+        let dialed = tokio::time::timeout(
+            DIAL_TIMEOUT,
+            transport::connect_to_peer_with_alpn(
+                &self.transport.endpoint,
+                m.identity,
+                &transport::mesh_alpn(),
+            ),
+        )
+        .await;
+        match dialed {
+            Ok(Ok(peer_conn)) => {
+                if let Ok((mut s, _)) = peer_conn.open_bi().await {
+                    let _ = control::send_msg(
+                        &mut s,
+                        Some(net_pubkey),
+                        &ControlMsg::MeshHello {
+                            identity: my_identity,
+                            hostname: my_hostname.clone(),
+                            device_cert: self.current_device_cert(),
+                        },
+                    )
+                    .await;
                 }
-                Ok(Err(e)) => {
-                    // Distinguish an incompatible-version peer (ALPN gate) from a
-                    // merely-unreachable one, so `ray status` can flag it instead
-                    // of showing plain offline. A success later clears this in
-                    // `PeerTable::add`.
-                    if transport::is_alpn_mismatch(&format!("{e:#}")) {
-                        self.peers.mark_incompatible(m.identity);
-                    } else {
-                        self.peers.clear_incompatible(&m.identity);
-                    }
-                    // Record the failed reach so status shows the peer offline from
-                    // startup, not optimistically idle.
-                    self.reachability.note_fail(m.identity);
-                    tracing::debug!(
-                        network = %network_name,
-                        peer = %m.identity.fmt_short(),
-                        error = %e,
-                        "could not dial member yet; connection supervisor will retry"
-                    );
+                crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
+                // Register the route, then drive the new connection's control
+                // demux (which owns the data reader) and announce our handles.
+                let conn_changed = ctx.register_peer_conn(&peer_conn, m.identity, network_name);
+                if conn_changed {
+                    let router = self.protocol_router().clone();
+                    let dconn = peer_conn.clone();
+                    tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
                 }
-                Err(_elapsed) => {
-                    self.reachability.note_fail(m.identity);
-                    tracing::debug!(
-                        network = %network_name,
-                        peer = %m.identity.fmt_short(),
-                        timeout_secs = DIAL_TIMEOUT.as_secs(),
-                        "dial timed out; connection supervisor will retry"
-                    );
+                announce_network_handles(&self.peers, &peer_conn, derive_ipv6(&m.identity)).await;
+                // Eager-connect reachability: a successful dial marks the peer
+                // reachable so `ray status` shows it active/idle, not offline.
+                self.reachability.note_ok(m.identity);
+                tracing::info!(
+                    network = %network_name,
+                    peer = %m.identity.fmt_short(),
+                    "dialed known member on restore/join (full mesh)"
+                );
+            }
+            Ok(Err(e)) => {
+                // Distinguish an incompatible-version peer (ALPN gate) from a
+                // merely-unreachable one, so `ray status` can flag it instead
+                // of showing plain offline. A success later clears this in
+                // `PeerTable::add`.
+                if transport::is_alpn_mismatch(&format!("{e:#}")) {
+                    self.peers.mark_incompatible(m.identity);
+                } else {
+                    self.peers.clear_incompatible(&m.identity);
                 }
+                // Record the failed reach so status shows the peer offline from
+                // startup, not optimistically idle.
+                self.reachability.note_fail(m.identity);
+                tracing::debug!(
+                    network = %network_name,
+                    peer = %m.identity.fmt_short(),
+                    error = %e,
+                    "could not dial member yet; connection supervisor will retry"
+                );
+            }
+            Err(_elapsed) => {
+                self.reachability.note_fail(m.identity);
+                tracing::debug!(
+                    network = %network_name,
+                    peer = %m.identity.fmt_short(),
+                    timeout_secs = DIAL_TIMEOUT.as_secs(),
+                    "dial timed out; connection supervisor will retry"
+                );
             }
         }
     }

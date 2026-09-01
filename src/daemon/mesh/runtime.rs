@@ -530,7 +530,36 @@ impl NetworkRegistry {
         persisted_hostname: Option<String>,
         auto_accept_firewall: bool,
         auto_accept_files: bool,
+        cached_hash: Option<blake3::Hash>,
+        cached_is_published: bool,
     ) {
+        let parsed_key = net_pubkey.parse::<EndpointId>();
+        if let Ok(net_public_key) = parsed_key {
+            match self
+                .warm_resume_member_network(
+                    &name,
+                    net_public_key,
+                    persisted_hostname.clone(),
+                    auto_accept_firewall,
+                    auto_accept_files,
+                    cached_hash,
+                    cached_is_published,
+                )
+                .await
+            {
+                Ok(true) => {
+                    self.restore_errors.remove(&name);
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // The normal signed-record restore immediately below remains
+                    // the fallback: a bad or absent local cache must never make
+                    // a saved network unrecoverable.
+                    tracing::warn!(network = %name, error = %e, "warm resume failed; falling back to signed-record restore");
+                }
+            }
+        }
         let mut delay = RESTORE_RETRY_MIN;
         let mut attempt: u32 = 0;
         loop {
@@ -732,6 +761,8 @@ impl NetworkRegistry {
         let persisted_hostname = net.my_hostname.clone();
         let auto_accept_firewall = net.auto_accept_firewall;
         let auto_accept_files = net.auto_accept_files;
+        let cached_hash = net.last_group_hash;
+        let cached_is_published = net.last_group_hash_published;
         tokio::spawn(async move {
             Arc::clone(&me)
                 .restore_member_network(
@@ -740,6 +771,8 @@ impl NetworkRegistry {
                     persisted_hostname,
                     auto_accept_firewall,
                     auto_accept_files,
+                    cached_hash,
+                    cached_is_published,
                 )
                 .await;
             me.restoring.remove(&guard);

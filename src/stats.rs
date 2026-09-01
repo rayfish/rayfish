@@ -41,10 +41,14 @@ pub enum DropReason {
     /// rather than blackholing. Seen mostly under an exit-node full tunnel
     /// carrying bulk traffic over a relayed peer.
     PacketTooBig,
+    /// Outbound packet dropped while its destination peer was being dialed on
+    /// demand. The small first-packet queue is full, so retaining this newest
+    /// packet would let a temporarily unreachable peer consume unbounded memory.
+    LazyDialBufferFull,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 8] = [
+    const ALL: [DropReason; 9] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -53,6 +57,7 @@ impl DropReason {
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
+        DropReason::LazyDialBufferFull,
     ];
 }
 
@@ -361,7 +366,8 @@ mod tests {
                 | DropReason::Backpressure
                 | DropReason::Spoof
                 | DropReason::ExitDenied
-                | DropReason::PacketTooBig => 1,
+                | DropReason::PacketTooBig
+                | DropReason::LazyDialBufferFull => 1,
             }
         });
         assert_eq!(counted, DropReason::ALL.len());

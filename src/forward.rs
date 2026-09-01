@@ -65,6 +65,16 @@ pub(crate) fn untag_datagram(datagram: &[u8]) -> Option<(u16, &[u8])> {
 /// quinn and is freed as those datagrams are sent).
 const TX_POOL_CHUNK: usize = 64 * 1024;
 
+/// A disconnected peer gets enough retained traffic to cover a normal handshake
+/// without letting a burst to an offline route turn into an unbounded allocation.
+/// TCP, DNS, and QUIC all retry if their earliest packet is dropped, so preserving
+/// the oldest packets is more useful than queuing every new one during the
+/// five-second lazy-dial timeout.
+const LAZY_DIAL_MAX_PACKETS_PER_PEER: usize = 64;
+const LAZY_DIAL_MAX_BYTES_PER_PEER: usize = 128 * 1024;
+const LAZY_DIAL_MAX_PACKETS_TOTAL: usize = 512;
+const LAZY_DIAL_MAX_BYTES_TOTAL: usize = 1024 * 1024;
+
 /// The port a stock `ssh` client targets (`ssh user@host.ray`). Defined here in
 /// the always-compiled forward core because the userspace SSH NAT below rewrites
 /// it on every platform, including Android, where the desktop-only `crate::ssh`
@@ -76,6 +86,60 @@ pub(crate) const SSH_PORT: u16 = 22;
 /// source-port ranges so the outbound NAT (which matches `src_port == this`)
 /// can't collide with a kernel-assigned ephemeral port. See `crate::ssh`.
 pub(crate) const SSH_LISTEN_PORT: u16 = 30022;
+
+/// Packets retained while on-demand connection establishment is in flight.
+/// Owned solely by [`run_mesh`], so accounting needs no atomics or locks.
+#[derive(Default)]
+struct LazyDialBuffers {
+    by_peer: HashMap<EndpointId, LazyDialQueue>,
+    packets: usize,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct LazyDialQueue {
+    packets: VecDeque<Bytes>,
+    bytes: usize,
+}
+
+impl LazyDialBuffers {
+    /// Retain a packet if both the peer-local and process-wide budgets permit
+    /// it. At a limit we deliberately drop newest: packets already retained are
+    /// closer to the beginning of the flow and are more likely to make the first
+    /// connection useful.
+    fn push(&mut self, peer: EndpointId, packet: Bytes) -> bool {
+        let bytes = packet.len();
+        if self.packets >= LAZY_DIAL_MAX_PACKETS_TOTAL
+            || self.bytes.saturating_add(bytes) > LAZY_DIAL_MAX_BYTES_TOTAL
+        {
+            return false;
+        }
+
+        let queue = self.by_peer.entry(peer).or_default();
+        if queue.packets.len() >= LAZY_DIAL_MAX_PACKETS_PER_PEER
+            || queue.bytes.saturating_add(bytes) > LAZY_DIAL_MAX_BYTES_PER_PEER
+        {
+            return false;
+        }
+
+        queue.bytes += bytes;
+        queue.packets.push_back(packet);
+        self.packets += 1;
+        self.bytes += bytes;
+        true
+    }
+
+    /// Remove a peer's retained packets once its dial completes, returning them
+    /// in arrival order and releasing their budget immediately.
+    fn take(&mut self, peer: &EndpointId) -> VecDeque<Bytes> {
+        let Some(queue) = self.by_peer.remove(peer) else {
+            return VecDeque::new();
+        };
+        self.packets -= queue.packets.len();
+        self.bytes -= queue.bytes;
+        queue.packets
+    }
+}
 
 /// Userspace NAT that maps this node's mesh `:22` to/from the embedded SSH
 /// server's internal listen port ([`SSH_LISTEN_PORT`]). The kernel
@@ -437,7 +501,10 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
 ) -> Result<()> {
     let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
     // On-demand lazy-dial state, owned by this loop (no shared/locked buffer).
-    let mut buffered: HashMap<EndpointId, VecDeque<Bytes>> = HashMap::new();
+    // `LazyDialBuffers` bounds retained bytes and packets both per peer and for
+    // the whole daemon, so an offline route cannot make the forwarding task grow
+    // without limit during a dial timeout.
+    let mut buffered = LazyDialBuffers::default();
     let mut in_flight: HashSet<EndpointId> = HashSet::new();
     let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
     // Client-side exit-node selection (cheap Arc-backed clone), consulted for
@@ -462,7 +529,7 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             result = tun.read_into(&mut pool) => result?,
             Some((peer, connected)) = done_rx.recv() => {
                 in_flight.remove(&peer);
-                let pkts = buffered.remove(&peer).unwrap_or_default();
+                let pkts = buffered.take(&peer);
                 flush_or_drop(&peers, &firewall, &stats, &tun_tx, &exit_client, connected, pkts)
                     .await;
                 continue;
@@ -509,11 +576,16 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             };
 
             let peer = target.endpoint_id;
-            // Buffer so the first packets of the flow aren't lost once connected. A
-            // single dial per peer runs at a time (in_flight dedup) and is bounded by
-            // LAZY_DIAL_TIMEOUT; on completion `done` flushes the buffer (success) or
-            // drops it and records the drops (timeout/failure).
-            buffered.entry(peer).or_default().push_back(pkt);
+            // Buffer a bounded beginning of the flow so its first packets aren't
+            // lost once connected. A single dial per peer runs at a time
+            // (in_flight dedup) and is bounded by LAZY_DIAL_TIMEOUT; on completion
+            // `done` flushes the retained packets (success) or drops them
+            // (timeout/failure). Once either retention budget is full, drop newest
+            // rather than allowing an unreachable peer to accumulate unbounded
+            // memory.
+            if !buffered.push(peer, pkt) {
+                stats.record_drop(DropReason::LazyDialBufferFull);
+            }
 
             if in_flight.insert(peer) {
                 let reg = reg.clone();
@@ -870,7 +942,55 @@ mod tests {
     use super::*;
     use crate::AsyncMutex;
     use crate::firewall::Action;
+    use iroh::SecretKey;
     use smol_str::SmolStr;
+
+    fn test_peer(seed: u8) -> EndpointId {
+        SecretKey::from([seed; 32]).public()
+    }
+
+    #[test]
+    fn lazy_dial_buffer_keeps_oldest_packets_and_releases_budget() {
+        let peer = test_peer(1);
+        let mut buffers = LazyDialBuffers::default();
+        assert!(buffers.push(peer, Bytes::from_static(b"first")));
+        assert!(buffers.push(peer, Bytes::from_static(b"second")));
+
+        let packets = buffers.take(&peer);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0], Bytes::from_static(b"first"));
+        assert_eq!(packets[1], Bytes::from_static(b"second"));
+        assert_eq!(buffers.packets, 0);
+        assert_eq!(buffers.bytes, 0);
+        assert!(buffers.by_peer.is_empty());
+    }
+
+    #[test]
+    fn lazy_dial_buffer_caps_each_peer_and_drops_newest() {
+        let peer = test_peer(2);
+        let mut buffers = LazyDialBuffers::default();
+        for n in 0..LAZY_DIAL_MAX_PACKETS_PER_PEER {
+            assert!(buffers.push(peer, Bytes::from(vec![n as u8])));
+        }
+        assert!(!buffers.push(peer, Bytes::from_static(b"newest")));
+
+        let packets = buffers.take(&peer);
+        assert_eq!(packets.len(), LAZY_DIAL_MAX_PACKETS_PER_PEER);
+        assert_eq!(packets.front().unwrap().as_ref(), &[0]);
+        assert_eq!(
+            packets.back().unwrap().as_ref(),
+            &[(LAZY_DIAL_MAX_PACKETS_PER_PEER - 1) as u8]
+        );
+    }
+
+    #[test]
+    fn lazy_dial_buffer_caps_total_retention_across_peers() {
+        let mut buffers = LazyDialBuffers::default();
+        for n in 0..LAZY_DIAL_MAX_PACKETS_TOTAL {
+            assert!(buffers.push(test_peer((n % 8) as u8 + 3), Bytes::from_static(b"x")));
+        }
+        assert!(!buffers.push(test_peer(42), Bytes::from_static(b"x")));
+    }
 
     #[test]
     fn only_a_deliberate_leave_prunes_the_member() {

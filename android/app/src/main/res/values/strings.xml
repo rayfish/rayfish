@@ -54,6 +54,7 @@
     <string name="label_tunnel">Tunnel</string>
     <string name="label_your_address">Your address</string>
     <string name="label_role">Role</string>
+    <string name="label_status">Status</string>
     <string name="label_inbound_default">Inbound default</string>
     <string name="label_outbound_default">Outbound default</string>
     <string name="label_identity_backup">Identity backup</string>
@@ -73,6 +74,9 @@
     <string name="status_starting_ellipsis">Starting…</string>
     <string name="status_disconnected">Disconnected</string>
     <string name="status_stopped">stopped</string>
+    <string name="status_connecting_ellipsis">connecting…</string>
+    <string name="status_not_connected">not connected</string>
+    <string name="status_not_connected_reason">not connected · %1$s</string>
     <string name="toggle_on">on</string>
     <string name="toggle_off">off</string>
 

@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.ray_mobile.NetworkConnState
 import uniffi.ray_mobile.NetworkDetail
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
@@ -63,10 +64,12 @@ fun NetworksScreen(
         nets.forEach { net ->
             SectionCard {
                 Row(Modifier.fillMaxWidth().clickable { onOpen(net) }, verticalAlignment = Alignment.CenterVertically) {
-                    // Red when the node is offline (tunnel disabled), green when a
-                    // peer is reachable, grey when online but nobody's connected.
+                    // Amber while a saved network is still being restored, red
+                    // when its restore failed or the tunnel is off, green once a
+                    // peer is reachable, grey when up but nobody's connected.
                     val dot = when {
-                        !running -> Rf.Rose500
+                        net.state == NetworkConnState.CONNECTING -> Rf.Amber
+                        net.state == NetworkConnState.NOT_CONNECTED || !running -> Rf.Rose500
                         net.peers.any { it.isActive } -> Rf.Emerald
                         else -> Rf.Faint
                     }
@@ -74,7 +77,20 @@ fun NetworksScreen(
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(net.name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                        Text("${net.hostname.ifEmpty { net.ipv6 }} · ${if (running) pluralStringResource(R.plurals.network_peers_online, net.peers.count { it.isActive }, net.peers.count { it.isActive }) else stringResource(R.string.status_offline)}",
+                        // A network the daemon has not registered has no peer
+                        // count worth printing. Say what it is doing instead, and
+                        // why, when the daemon has recorded a reason.
+                        val peersOnline = net.peers.count { it.isActive }
+                        val line = when (net.state) {
+                            NetworkConnState.CONNECTING -> stringResource(R.string.status_connecting_ellipsis)
+                            NetworkConnState.NOT_CONNECTED ->
+                                net.reason?.let { stringResource(R.string.status_not_connected_reason, it) }
+                                    ?: stringResource(R.string.status_not_connected)
+                            NetworkConnState.CONNECTED ->
+                                if (running) pluralStringResource(R.plurals.network_peers_online, peersOnline, peersOnline)
+                                else stringResource(R.string.status_offline)
+                        }
+                        Text(stringResource(R.string.network_row_subtitle, net.hostname.ifEmpty { net.ipv6 }, line),
                             fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
                     }
                     // The device's stable .ray DNS name in this network. Prefer

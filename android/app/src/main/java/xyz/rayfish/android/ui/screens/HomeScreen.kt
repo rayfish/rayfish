@@ -20,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
+import uniffi.ray_mobile.NetworkConnState
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.QueuedSend
 import uniffi.ray_mobile.Status
@@ -97,9 +98,12 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
 
     val nets = status?.networks ?: emptyList()
     val online = nets.sumOf { n -> n.peers.count { it.isActive } }
+    // Count only what the daemon has registered: the list also carries saved
+    // networks that are still connecting, and this banner claims a working link.
+    val connected = nets.count { it.state == NetworkConnState.CONNECTED }
     val banner = when {
         starting -> stringResource(R.string.status_starting)
-        vpnOn -> pluralStringResource(R.plurals.status_connected_networks, nets.size, nets.size)
+        vpnOn -> pluralStringResource(R.plurals.status_connected_networks, connected, connected)
         else -> stringResource(R.string.status_disconnected)
     }
 
@@ -136,9 +140,15 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 .filter { !(autoAccepting && it.ownDevice) || FileAutoAccept.hasGivenUp(it.id) }
             queued = runCatching { node.listQueuedSends() }.getOrDefault(emptyList())
             connects = runCatching { node.listConnectRequests() }.getOrDefault(emptyList())
-            joins = currentNets.filter { it.isCoordinator }.flatMap { n ->
-                runCatching { node.listJoinRequests(n.name) }.getOrDefault(emptyList()).map { n.name to it }
-            }
+            // Only registered networks can answer: an unregistered one has no
+            // handler to ask, so polling it is a round trip that always fails.
+            joins = currentNets
+                .filter { it.isCoordinator && it.state == NetworkConnState.CONNECTED }
+                .flatMap { n ->
+                    runCatching { node.listJoinRequests(n.name) }
+                        .getOrDefault(emptyList())
+                        .map { n.name to it }
+                }
         }
     }
     LaunchedEffect(Unit) {

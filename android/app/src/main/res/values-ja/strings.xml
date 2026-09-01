@@ -48,6 +48,7 @@
     <string name="label_tunnel">トンネル</string>
     <string name="label_your_address">あなたのアドレス</string>
     <string name="label_role">役割</string>
+    <string name="label_status">ステータス</string>
     <string name="label_inbound_default">受信の既定</string>
     <string name="label_outbound_default">送信の既定</string>
     <string name="label_identity_backup">ID のバックアップ</string>
@@ -67,6 +68,9 @@
     <string name="status_starting_ellipsis">起動中…</string>
     <string name="status_disconnected">切断</string>
     <string name="status_stopped">停止</string>
+    <string name="status_connecting_ellipsis">接続中…</string>
+    <string name="status_not_connected">未接続</string>
+    <string name="status_not_connected_reason">未接続 · %1$s</string>
     <string name="toggle_on">オン</string>
     <string name="toggle_off">オフ</string>
 

@@ -248,13 +248,14 @@ async fn build_daemon_inner(
         .networks
         .iter()
         .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
-    let ep = transport::create_endpoint_with_alpns(
+    let (ep, warm_lookup) = transport::create_endpoint_with_alpns(
         key.clone(),
         alpns,
         use_tor,
         &app_config.relay,
         &app_config.discovery_dns,
         &app_config.dns_upstreams,
+        app_config.endpoint_hints.clone(),
     )
     .await?;
     *endpoint_out = Some(ep.clone());
@@ -515,6 +516,7 @@ async fn build_daemon_inner(
         stats.clone(),
         contact_public,
         lan_peers,
+        warm_lookup,
     ));
     // The per-peer connection driver is built once here and shared by the
     // ProtocolRouter (which delegates the mesh ALPN to it) and the

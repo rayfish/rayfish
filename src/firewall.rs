@@ -298,14 +298,13 @@ impl SharedFirewall {
 
     /// First matching explicit rule's action, or `None` if no rule matches.
     fn match_rule(
-        &self,
+        config: &FirewallConfig,
         direction: Direction,
         protocol: u8,
         dst_port: u16,
         peer: &EndpointId,
         network: Option<&str>,
     ) -> Option<Action> {
-        let config = self.inner.load();
         for rule in &config.rules {
             if rule.direction != direction {
                 continue;
@@ -340,8 +339,7 @@ impl SharedFirewall {
     /// direction. Inbound ICMP is *not* special-cased here: it is allowed by a
     /// seeded, removable `allow in icmp` rule (see [`default_icmp_rule`]) that the
     /// rule scan matches first, so the user can delete it to deny ICMP.
-    fn default_for(&self, direction: Direction) -> Action {
-        let config = self.inner.load();
+    fn default_for(config: &FirewallConfig, direction: Direction) -> Action {
         match direction {
             Direction::Out => config.default_outbound,
             Direction::In => config.default_inbound,
@@ -358,8 +356,9 @@ impl SharedFirewall {
         dst_port: u16,
         peer: &EndpointId,
     ) -> Action {
-        self.match_rule(direction, protocol, dst_port, peer, None)
-            .unwrap_or_else(|| self.default_for(direction))
+        let config = self.inner.load();
+        Self::match_rule(&config, direction, protocol, dst_port, peer, None)
+            .unwrap_or_else(|| Self::default_for(&config, direction))
     }
 
     /// Whether "fail fast" REJECT mode is enabled (opt-in, default off). When on,
@@ -392,10 +391,16 @@ impl SharedFirewall {
         peer: &EndpointId,
         network: Option<&str>,
     ) -> Action {
+        // Hold one immutable firewall generation for this packet. A concurrent
+        // configuration update is allowed to affect the next packet, but never
+        // makes one packet evaluate its rules and default against different
+        // generations. This also keeps the forwarding hot path to one ArcSwap
+        // load instead of up to three.
+        let config = self.inner.load();
         // Global kill switch (`ray firewall off`): allow everything, skip rules,
         // defaults, and conntrack. The ingress anti-spoof check runs upstream in
         // `forward::evaluate_inbound`, so spoofed sources are still dropped.
-        if self.inner.load().disabled {
+        if config.disabled {
             return Action::Allow;
         }
         let proto = info.protocol;
@@ -413,7 +418,9 @@ impl SharedFirewall {
         };
 
         // 1. Explicit rules always win.
-        if let Some(action) = self.match_rule(direction, proto, info.dst_port, peer, network) {
+        if let Some(action) =
+            Self::match_rule(&config, direction, proto, info.dst_port, peer, network)
+        {
             if direction == Direction::Out && action.is_allow() {
                 self.track_outbound(&flow, info);
             }
@@ -422,7 +429,7 @@ impl SharedFirewall {
 
         match direction {
             Direction::Out => {
-                let default = self.default_for(Direction::Out);
+                let default = Self::default_for(&config, Direction::Out);
                 if default.is_allow() {
                     self.track_outbound(&flow, info);
                 }
@@ -446,7 +453,7 @@ impl SharedFirewall {
                     self.conntrack.insert(flow, Instant::now());
                     Action::Allow
                 } else {
-                    self.default_for(Direction::In)
+                    Self::default_for(&config, Direction::In)
                 }
             }
         }

@@ -195,6 +195,24 @@ pub struct PeerInfo {
     pub state: PeerConnState,
 }
 
+/// Whether the daemon has this network registered, for the UI's status dot.
+///
+/// A saved network the daemon has not registered yet still has to be listed.
+/// Dropping it makes every network vanish for the seconds a cold start spends
+/// restoring them, and makes a restore that never lands indistinguishable from a
+/// network the user never joined. `ray status` has always shown these (its
+/// `inactive_networks` block); this is the same thing for the phone.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetworkConnState {
+    /// Registered by the daemon: the rest of this snapshot is live.
+    Connected,
+    /// Saved, restore still in flight and not yet failed once.
+    Connecting,
+    /// Saved but carrying nothing: either a restore that has failed at least
+    /// once (see [`NetworkDetail::reason`]) or a deliberately stopped node.
+    NotConnected,
+}
+
 /// One network this node belongs to, with its peers.
 #[derive(uniffi::Record)]
 pub struct NetworkDetail {
@@ -203,6 +221,10 @@ pub struct NetworkDetail {
     pub hostname: String,
     pub is_coordinator: bool,
     pub peers: Vec<PeerInfo>,
+    pub state: NetworkConnState,
+    /// The daemon's one-line reason for the last failed restore, when `state` is
+    /// [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
+    pub reason: Option<String>,
 }
 
 /// Health/addresses/networks snapshot for the UI.
@@ -354,6 +376,73 @@ impl Node {
     }
 }
 
+/// One roster entry as the UI's [`PeerInfo`]. The mesh address is derived from
+/// the identity rather than taken from `PeerStatus::ipv6` so live and saved
+/// projections agree on it by construction.
+fn peer_info(p: &ipc::PeerStatus) -> PeerInfo {
+    PeerInfo {
+        ipv6: membership::derive_ipv6(&p.endpoint_id).to_string(),
+        node_id: p.endpoint_id.to_string(),
+        hostname: p.hostname.clone().unwrap_or_default(),
+        state: p.state.into(),
+    }
+}
+
+/// Project a saved network the daemon has not registered into a [`NetworkDetail`].
+///
+/// `reason` is the daemon's record of the last restore failure and is `None`
+/// until one has actually happened, which is exactly the distinction the UI
+/// needs: no failure yet means the restore is still in flight (`Connecting`),
+/// and a failure means it is stuck with something to say about why.
+///
+/// `fallback_ipv6` is this device's own mesh address, used for the name-only row
+/// a daemon predating the `saved` projection produces.
+fn inactive_network_detail(net: &ipc::InactiveNetwork, fallback_ipv6: &str) -> NetworkDetail {
+    let state = match net.reason {
+        None => NetworkConnState::Connecting,
+        Some(_) => NetworkConnState::NotConnected,
+    };
+    let Some(saved) = net.saved.as_ref() else {
+        return NetworkDetail {
+            name: net.name.clone(),
+            ipv6: fallback_ipv6.to_string(),
+            hostname: String::new(),
+            is_coordinator: false,
+            peers: Vec::new(),
+            state,
+            reason: net.reason.clone(),
+        };
+    };
+    NetworkDetail {
+        name: saved.name.clone(),
+        ipv6: saved.my_ipv6.to_string(),
+        hostname: saved.my_hostname.clone().unwrap_or_default(),
+        is_coordinator: saved.role.is_coordinator(),
+        peers: saved.peers.iter().map(peer_info).collect(),
+        state,
+        reason: net.reason.clone(),
+    }
+}
+
+/// Fold the daemon's unregistered networks in with the live ones and sort the
+/// result. One list rather than two so a network keeps its place in the UI when
+/// its restore lands, instead of jumping out of a "connecting" section.
+fn merge_networks(
+    mut live: Vec<NetworkDetail>,
+    inactive: &[ipc::InactiveNetwork],
+    fallback_ipv6: &str,
+) -> Vec<NetworkDetail> {
+    live.extend(
+        inactive
+            .iter()
+            .map(|n| inactive_network_detail(n, fallback_ipv6)),
+    );
+    // Stable alphabetical order so the list does not shuffle between status
+    // refreshes with the core's iteration order.
+    live.sort_by_key(|n| n.name.to_lowercase());
+    live
+}
+
 /// Build an offline status snapshot from the on-disk config, used when the node
 /// is stopped so the UI can still show the user's saved networks. Everything is
 /// reported offline: `running` is false and every peer's state is `Offline`. The
@@ -410,6 +499,10 @@ fn saved_networks_status() -> Status {
                 hostname: net.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: net.network_secret_key.is_some(),
                 peers,
+                // Stopped on purpose, so there is nothing in progress and no
+                // failure to explain.
+                state: NetworkConnState::NotConnected,
+                reason: None,
             }
         })
         .collect();
@@ -1264,14 +1357,6 @@ impl Node {
     /// Peers + addresses + running flag + per-network detail for the UI.
     /// Empty snapshot before [`Node::start`].
     pub fn status(&self) -> Status {
-        let empty = || Status {
-            running: false,
-            node_id: String::new(),
-            ipv6: String::new(),
-            peers: Vec::new(),
-            networks: Vec::new(),
-            pending_networks: Vec::new(),
-        };
         let Some(state) = self.state.lock().unwrap().as_ref().cloned() else {
             // Stopped (the user disabled the tunnel): the control plane is gone,
             // so there is no live snapshot. Read the saved networks off disk and
@@ -1285,25 +1370,20 @@ impl Node {
             active,
             networks,
             pending_networks,
+            inactive_networks,
             ..
         } = state.status()
         else {
-            return empty();
+            // Not the reply we asked for. Fall back to the saved networks rather
+            // than a blank snapshot: an empty list is indistinguishable from
+            // having joined none, which is the worst thing to show here.
+            return saved_networks_status();
         };
 
-        let mut detail = Vec::with_capacity(networks.len());
+        let mut detail = Vec::with_capacity(networks.len() + inactive_networks.len());
         let mut flat_peers = Vec::new();
         for n in &networks {
-            let peers: Vec<PeerInfo> = n
-                .peers
-                .iter()
-                .map(|p| PeerInfo {
-                    ipv6: rayfish::membership::derive_ipv6(&p.endpoint_id).to_string(),
-                    node_id: p.endpoint_id.to_string(),
-                    hostname: p.hostname.clone().unwrap_or_default(),
-                    state: p.state.into(),
-                })
-                .collect();
+            let peers: Vec<PeerInfo> = n.peers.iter().map(peer_info).collect();
             flat_peers.extend(peers.iter().map(|p| PeerInfo {
                 ipv6: p.ipv6.clone(),
                 node_id: p.node_id.clone(),
@@ -1316,14 +1396,16 @@ impl Node {
                 hostname: n.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: n.role.is_coordinator(),
                 peers,
+                state: NetworkConnState::Connected,
+                reason: None,
             });
         }
-        // Present networks in a stable alphabetical order so the UI list does
-        // not shuffle between status refreshes with the core's iteration order.
-        detail.sort_by_key(|n| n.name.to_lowercase());
         // The node's own mesh address derives from its identity, so it needs no
         // joined network to be known. It is what the tunnel binds.
         let ipv6 = rayfish::membership::derive_ipv6(&endpoint_id).to_string();
+        // `flat_peers` stays live-only on purpose: it is the set of peers we
+        // hold connection state for, and an unregistered network has none.
+        let detail = merge_networks(detail, &inactive_networks, &ipv6);
 
         Status {
             running: active,
@@ -1514,5 +1596,158 @@ mod tun_fd_ownership_tests {
             "up() must close the fd it was handed when it fails, or the tunnel lingers"
         );
         unsafe { libc::close(observer) };
+    }
+}
+
+#[cfg(test)]
+mod network_state_tests {
+    use std::collections::BTreeMap;
+    use std::net::Ipv6Addr;
+
+    use rayfish::ipc::{InactiveNetwork, NetworkRole, NetworkStatus, PeerState, PeerStatus};
+
+    use super::*;
+
+    fn peer(hostname: &str) -> PeerStatus {
+        PeerStatus {
+            endpoint_id: iroh::SecretKey::generate().public(),
+            ipv6: Ipv6Addr::LOCALHOST,
+            hostname: Some(hostname.to_string()),
+            user_identity: None,
+            is_own_device: false,
+            incompatible: false,
+            connection: None,
+            // The daemon projects a saved network's roster with every peer
+            // offline: it is not registered, so there is no link to any of them.
+            state: PeerState::Offline,
+            exit_node: false,
+            exit_in_use: false,
+        }
+    }
+
+    fn saved(name: &str, peers: Vec<PeerStatus>) -> NetworkStatus {
+        NetworkStatus {
+            name: name.to_string(),
+            role: NetworkRole::Member,
+            my_ipv6: Ipv6Addr::LOCALHOST,
+            my_hostname: Some("phone".to_string()),
+            network_key: None,
+            member_count: peers.len(),
+            peers,
+            pending_suggestions: 0,
+            pending_requests: 0,
+            aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
+            my_exit_node: None,
+            exit_offering: false,
+            incompatible: None,
+        }
+    }
+
+    fn live(name: &str) -> NetworkDetail {
+        NetworkDetail {
+            name: name.to_string(),
+            ipv6: "200::1".to_string(),
+            hostname: "phone".to_string(),
+            is_coordinator: false,
+            peers: Vec::new(),
+            state: NetworkConnState::Connected,
+            reason: None,
+        }
+    }
+
+    /// A cold start has every saved network unregistered for the seconds its
+    /// restore takes. Nothing has failed yet, so the row reads as in progress —
+    /// not as an error, and above all not as absent.
+    #[test]
+    fn a_restore_that_has_not_failed_yet_reads_as_connecting() {
+        let net = InactiveNetwork {
+            name: "field".to_string(),
+            reason: None,
+            saved: Some(saved("field", vec![])),
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.state, NetworkConnState::Connecting);
+        assert_eq!(detail.reason, None);
+    }
+
+    /// Once an attempt has actually failed, the daemon has a one-line reason and
+    /// the row has to carry it: it is the only place the user can see why, short
+    /// of reading the log off the device.
+    #[test]
+    fn a_failed_restore_reads_as_not_connected_and_keeps_the_reason() {
+        let net = InactiveNetwork {
+            name: "dgrr-peer".to_string(),
+            reason: Some("could not fetch group blob from any peer".to_string()),
+            saved: Some(saved("dgrr-peer", vec![])),
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.state, NetworkConnState::NotConnected);
+        assert_eq!(
+            detail.reason.as_deref(),
+            Some("could not fetch group blob from any peer")
+        );
+    }
+
+    /// The saved projection is what makes the row worth opening: its roster,
+    /// hostname and address come from the daemon's config, so a network that is
+    /// still connecting shows its members rather than an empty card.
+    #[test]
+    fn an_unregistered_network_carries_its_saved_roster_offline() {
+        let net = InactiveNetwork {
+            name: "field".to_string(),
+            reason: None,
+            saved: Some(saved("field", vec![peer("laptop"), peer("desktop")])),
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.hostname, "phone");
+        assert_eq!(detail.ipv6, Ipv6Addr::LOCALHOST.to_string());
+        assert_eq!(detail.peers.len(), 2);
+        assert!(
+            detail
+                .peers
+                .iter()
+                .all(|p| p.state == PeerConnState::Offline),
+            "an unregistered network has no link to any of its peers"
+        );
+    }
+
+    /// A daemon predating the `saved` projection sends the name alone. The row
+    /// still has to appear, addressed with this device's own mesh address.
+    #[test]
+    fn a_network_without_a_saved_projection_degrades_to_a_name_only_row() {
+        let net = InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: Some("runs mesh protocol v2".to_string()),
+            saved: None,
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.name, "homelab");
+        assert_eq!(detail.ipv6, "200::9");
+        assert!(detail.peers.is_empty());
+        assert_eq!(detail.state, NetworkConnState::NotConnected);
+    }
+
+    /// Live and unregistered networks share one alphabetically sorted list, so a
+    /// network does not jump position when its restore lands.
+    #[test]
+    fn merged_networks_are_one_alphabetical_list() {
+        let inactive = [
+            InactiveNetwork {
+                name: "alpha".to_string(),
+                reason: None,
+                saved: Some(saved("alpha", vec![])),
+            },
+            InactiveNetwork {
+                name: "zulu".to_string(),
+                reason: None,
+                saved: Some(saved("zulu", vec![])),
+            },
+        ];
+        let merged = merge_networks(vec![live("Mike"), live("bravo")], &inactive, "200::9");
+        let names: Vec<&str> = merged.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "bravo", "Mike", "zulu"]);
+        assert_eq!(merged[1].state, NetworkConnState::Connected);
+        assert_eq!(merged[3].state, NetworkConnState::Connecting);
     }
 }

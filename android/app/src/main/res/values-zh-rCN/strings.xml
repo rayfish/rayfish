@@ -48,6 +48,7 @@
     <string name="label_tunnel">隧道</string>
     <string name="label_your_address">你的地址</string>
     <string name="label_role">角色</string>
+    <string name="label_status">状态</string>
     <string name="label_inbound_default">默认入站</string>
     <string name="label_outbound_default">默认出站</string>
     <string name="label_identity_backup">身份备份</string>
@@ -67,6 +68,9 @@
     <string name="status_starting_ellipsis">正在启动…</string>
     <string name="status_disconnected">已断开</string>
     <string name="status_stopped">已停止</string>
+    <string name="status_connecting_ellipsis">正在连接…</string>
+    <string name="status_not_connected">未连接</string>
+    <string name="status_not_connected_reason">未连接 · %1$s</string>
     <string name="toggle_on">开</string>
     <string name="toggle_off">关</string>
 

@@ -23,6 +23,10 @@ use tokio::sync::Notify;
 /// the peer is marked unreachable until a later packet retries the dial.
 const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Keep the persisted hint set small and bounded.  A hint is only a speed-up;
+/// the endpoint id in the QUIC certificate remains the authentication boundary.
+const MAX_WARM_ENDPOINT_HINTS: usize = 64;
+
 /// One network to (re)handshake when dialing a peer: its name and the per-network
 /// public key that signs the `MeshHello`. A peer's single connection carries every
 /// shared network, so a dial takes a slice of these.
@@ -337,6 +341,70 @@ impl NetworkRegistry {
             disconnect_tx: self.disconnect_tx.clone(),
             registry: self.clone(),
         }
+    }
+
+    /// Remember a path that a peer has just completed an authenticated QUIC
+    /// handshake over.  The in-memory lookup makes it available immediately;
+    /// the compact on-disk cache survives the next daemon restart.  Neither is
+    /// authoritative: stale hints fall through to iroh discovery, and TLS pins
+    /// the endpoint id before a connection can be accepted.
+    fn remember_endpoint_hint(&self, peer: EndpointId, addr: iroh::TransportAddr) {
+        if peer == self.transport.identity.local_identity()
+            || !matches!(
+                addr,
+                iroh::TransportAddr::Ip(_) | iroh::TransportAddr::Relay(_)
+            )
+        {
+            return;
+        }
+        let hint = iroh::EndpointAddr::from_parts(peer, [addr]);
+        self.transport.warm_lookup.add_endpoint_info(hint.clone());
+        if let Err(e) = config::update_settings(|cfg| {
+            if let Some(index) = cfg.endpoint_hints.iter().position(|h| h.id == peer) {
+                // Move a refreshed entry to the tail so the bounded vector is a
+                // simple LRU.  Retain every prior path for that identity: a
+                // direct candidate and its relay are useful fallbacks for each
+                // other after a network change.
+                let mut existing = cfg.endpoint_hints.remove(index);
+                existing.addrs.extend(hint.addrs);
+                cfg.endpoint_hints.push(existing);
+            } else {
+                cfg.endpoint_hints.push(hint);
+            }
+            // Every entry is appended or refreshed at the tail, so trimming from
+            // the front evicts the least-recently useful peer hint.
+            let overflow = cfg
+                .endpoint_hints
+                .len()
+                .saturating_sub(MAX_WARM_ENDPOINT_HINTS);
+            if overflow != 0 {
+                cfg.endpoint_hints.drain(..overflow);
+            }
+            Ok(())
+        }) {
+            tracing::debug!(peer = %peer.fmt_short(), error = %e, "failed to persist warm endpoint hint");
+        }
+    }
+
+    /// Capture the paths available now and keep listening for a relay-to-direct
+    /// upgrade.  This runs once per established mesh connection and exits with
+    /// that connection's path-event stream.
+    pub(crate) fn remember_connection_hints(self: &Arc<Self>, conn: &Connection) {
+        let peer = conn.remote_id();
+        for path in conn.paths().iter() {
+            self.remember_endpoint_hint(peer, path.remote_addr().clone());
+        }
+        let this = Arc::clone(self);
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut events = conn.path_events();
+            while let Some(event) = events.next().await {
+                if let iroh::endpoint::PathEvent::Opened { remote_addr, .. } = event {
+                    this.remember_endpoint_hint(peer, remote_addr);
+                }
+            }
+        });
     }
 
     /// This device's pairing cert. The on-disk cert is authoritative: a cleanly

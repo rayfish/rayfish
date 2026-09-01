@@ -7,6 +7,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result};
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
@@ -154,7 +155,8 @@ pub async fn create_endpoint_with_alpns(
     relay: &ServerOverride,
     discovery: &ServerOverride,
     dns_upstreams: &ServerOverride,
-) -> Result<Endpoint> {
+    warm_hints: Vec<EndpointAddr>,
+) -> Result<(Endpoint, MemoryLookup)> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
     // it for the ephemeral fallback. Falling back to port 0 keeps the guarantee
@@ -166,6 +168,10 @@ pub async fn create_endpoint_with_alpns(
         control_plane_nameservers(dns_upstreams, crate::dns::config::system_nameservers());
     tracing::debug!(?nameservers, "control-plane DNS");
 
+    // This lookup is intentionally additive to pkarr/mDNS, never a replacement.
+    // Hints came from paths that previously completed an identity-authenticated
+    // QUIC handshake; if an address has gone stale, iroh tries discovery as usual.
+    let warm_lookup = MemoryLookup::from_endpoint_info(warm_hints);
     let ep = match bind_endpoint(
         &secret_key,
         &alpns,
@@ -174,6 +180,7 @@ pub async fn create_endpoint_with_alpns(
         relay,
         discovery,
         &nameservers,
+        &warm_lookup,
     )
     .await
     {
@@ -184,15 +191,24 @@ pub async fn create_endpoint_with_alpns(
                 error = %e,
                 "fixed UDP port unavailable; falling back to an ephemeral port"
             );
-            bind_endpoint(&secret_key, &alpns, tor, 0, relay, discovery, &nameservers)
-                .await
-                .context("failed to bind iroh endpoint")?
+            bind_endpoint(
+                &secret_key,
+                &alpns,
+                tor,
+                0,
+                relay,
+                discovery,
+                &nameservers,
+                &warm_lookup,
+            )
+            .await
+            .context("failed to bind iroh endpoint")?
         }
     };
 
     tracing::info!(id = %ep.id().fmt_short(), "iroh endpoint ready");
 
-    Ok(ep)
+    Ok((ep, warm_lookup))
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -214,6 +230,7 @@ async fn bind_endpoint(
     relay: &ServerOverride,
     discovery: &ServerOverride,
     nameservers: &[Ipv4Addr],
+    warm_lookup: &MemoryLookup,
 ) -> Result<Endpoint> {
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -287,6 +304,10 @@ async fn bind_endpoint(
         builder = builder.relay_mode(mode);
     }
     builder = apply_discovery(builder, discovery)?;
+    // `discovery-dns = replace` clears the preset lookup chain above, so add
+    // this after `apply_discovery`: warm hints must remain available regardless
+    // of whether the operator replaces the public discovery service.
+    builder = builder.address_lookup(warm_lookup.clone());
 
     #[cfg(feature = "tor")]
     if tor {

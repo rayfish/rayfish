@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.ray_mobile.NetworkConnState
 import uniffi.ray_mobile.NetworkDetail
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.R
@@ -84,6 +85,16 @@ fun NetworkDetailScreen(
             val ip6 = detail.ipv6.takeIf { it.isNotEmpty() }
             KeyValueRow(stringResource(R.string.label_ipv6), ip6 ?: stringResource(R.string.dash), onClick = ip6?.let { v -> { copyToClipboard(context, context.getString(R.string.label_ipv6), v); onToast(context.getString(R.string.toast_copied, v)) } })
             KeyValueRow(stringResource(R.string.label_role), if (detail.isCoordinator) stringResource(R.string.role_coordinator) else stringResource(R.string.role_member))
+            // An unregistered network still opens, because its saved roster is
+            // worth seeing. Say plainly that it carries no traffic, or the peer
+            // list below reads as live.
+            when (detail.state) {
+                NetworkConnState.CONNECTING ->
+                    KeyValueRow(stringResource(R.string.label_status), stringResource(R.string.status_connecting_ellipsis))
+                NetworkConnState.NOT_CONNECTED ->
+                    KeyValueRow(stringResource(R.string.label_status), detail.reason ?: stringResource(R.string.status_not_connected))
+                NetworkConnState.CONNECTED -> {}
+            }
         }
         SectionCard {
             val online = detail.peers.count { it.isActive }
