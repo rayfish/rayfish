@@ -48,7 +48,7 @@ class SendService : Service() {
             return START_NOT_STICKY
         }
         val peerId = intent.getStringExtra(EXTRA_PEER_ID)
-        val peerName = intent.getStringExtra(EXTRA_PEER_NAME) ?: getString(R.string.clipboard_peer)
+        val peerName = intent.getStringExtra(EXTRA_PEER_NAME) ?: getString(R.string.fallback_peer)
         val uris = collectUris(intent)
         if (peerId.isNullOrBlank() || uris.isEmpty()) {
             stopSelf(startId)

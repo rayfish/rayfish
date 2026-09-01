@@ -52,7 +52,7 @@ object OfferNotifier {
     // action the user just took.
     private val acted = java.util.Collections.synchronizedSet(HashSet<ULong>())
 
-    @Volatile private var channelEnsured = false
+    @Volatile private var channelName: String? = null
     private var cancelledStaleOnStart = false
 
     /**
@@ -233,17 +233,19 @@ object OfferNotifier {
         return Notification.Action.Builder(icon, label, pending).build()
     }
 
-    /** See [TransferNotifier.ensureChannel]: one definition per channel, created
-     * once per process, and the flag is set only after the platform actually has
-     * the channel or a notify() racing it would be dropped in silence. */
+    /** See [TransferNotifier.ensureChannel]: one definition per channel, rewritten
+     * only when the localized name changes, and the name is recorded only after
+     * the platform actually has the channel or a notify() racing it would be
+     * dropped in silence. */
     internal fun ensureChannel(context: Context) {
-        if (channelEnsured) return
+        val name = context.getString(R.string.notif_channel_offers)
+        if (channelName == name) return
         val channel = NotificationChannel(
             CHANNEL_ID,
-            context.getString(R.string.notif_channel_offers),
+            name,
             NotificationManager.IMPORTANCE_DEFAULT,
         ).apply { description = context.getString(R.string.notif_channel_offers_desc) }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        channelEnsured = true
+        channelName = name
     }
 }

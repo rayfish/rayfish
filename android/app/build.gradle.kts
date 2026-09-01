@@ -124,9 +124,11 @@ android {
             // A build type can only suffix the applicationId (a full override
             // needs product flavors), so the dev package is xyz.rayfish.android.dev.
             applicationIdSuffix = ".dev"
-            // Launcher / share-sheet names come from src/debug/res/values/strings.xml
-            // (`app_name`, `share_with_rayfish`) so they stay distinct from the
-            // release install without a second copy of the localized catalogs.
+            // Launcher / share-sheet names come from src/debug/res (`app_name`,
+            // `share_with_rayfish`) so they stay distinct from the release
+            // install. `share_with_rayfish` is translated, so the overlay carries
+            // one file per locale: a locale-qualified string in main/ outranks an
+            // unqualified one in the debug overlay.
         }
         release {
             isMinifyEnabled = false

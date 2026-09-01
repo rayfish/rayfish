@@ -4,6 +4,7 @@
     <string name="app_name" translatable="false">Rayfish</string>
     <string name="share_with_rayfish">Share with Rayfish</string>
     <string name="fallback_file">file</string>
+    <string name="fallback_peer">peer</string>
 
     <!-- Tabs -->
     <string name="tab_home">Home</string>
@@ -64,8 +65,6 @@
     <string name="dash">-</string>
     <string name="role_coordinator">coordinator</string>
     <string name="role_member">member</string>
-    <string name="fw_allow">allow</string>
-    <string name="fw_deny">deny</string>
     <string name="fw_any_peer">any peer</string>
     <string name="fw_peer">peer</string>
     <string name="fw_protocol">protocol</string>
@@ -77,8 +76,6 @@
     <string name="status_connecting_ellipsis">connecting…</string>
     <string name="status_not_connected">not connected</string>
     <string name="status_not_connected_reason">not connected · %1$s</string>
-    <string name="toggle_on">on</string>
-    <string name="toggle_off">off</string>
 
     <!-- Home -->
     <string name="tunnel_running">running · this device %s</string>
@@ -130,6 +127,7 @@
     <string name="leave_body">You\'ll lose your address and stop reaching its peers. You can rejoin later with an invite.</string>
     <string name="hostname_on">Hostname on %s</string>
     <string name="peer_row_meta">%1$s · %2$s</string>
+    <string name="peer_unknown" translatable="false">?</string>
     <string name="fw_rule_with_port">%1$s %2$s:%3$s</string>
     <string name="fw_rule_any_port">%1$s %2$s</string>
     <string name="fw_toggle_edit">%s ✎</string>

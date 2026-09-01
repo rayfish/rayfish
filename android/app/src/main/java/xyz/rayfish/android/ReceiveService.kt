@@ -57,7 +57,7 @@ class ReceiveService : Service() {
         }
         val offerId = id.toULong()
         val filename = intent.getStringExtra(EXTRA_FILENAME) ?: getString(R.string.fallback_file)
-        val peer = intent.getStringExtra(EXTRA_PEER) ?: getString(R.string.clipboard_peer)
+        val peer = intent.getStringExtra(EXTRA_PEER) ?: getString(R.string.fallback_peer)
         val size = intent.getLongExtra(EXTRA_SIZE, 0L).toULong()
         val mime = intent.getStringExtra(EXTRA_MIME) ?: ""
 

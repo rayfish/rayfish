@@ -30,12 +30,6 @@ import xyz.rayfish.android.isActive
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 
-private fun fwActionLabel(context: android.content.Context, value: String): String = when (value) {
-    "allow" -> context.getString(R.string.fw_allow)
-    "deny" -> context.getString(R.string.fw_deny)
-    else -> value
-}
-
 @Composable
 fun NetworkDetailScreen(
     detail: NetworkDetail, onBack: () -> Unit, onToast: (String) -> Unit,
@@ -108,7 +102,8 @@ fun NetworkDetailScreen(
                     Spacer(Modifier.width(8.dp))
                     Text(p.ipv6, fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
                     Spacer(Modifier.weight(1f))
-                    Text("${p.hostname.ifEmpty { "?" }} · ${p.nodeId.take(4)}", fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
+                    Text(stringResource(R.string.peer_row_meta, p.hostname.ifEmpty { stringResource(R.string.peer_unknown) }, p.nodeId.take(4)),
+                        fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
                 }
             }
         }
@@ -124,14 +119,14 @@ fun NetworkDetailScreen(
                             scope.launch {
                                 try {
                                     withContext(Dispatchers.IO) { NodeHolder.get(context).firewallSetDefaultInbound(next) }
-                                    reloadFirewall(); onToast(context.getString(R.string.toast_inbound_default, fwActionLabel(context, next)))
+                                    reloadFirewall(); onToast(context.getString(R.string.toast_inbound_default, next))
                                 } catch (t: Throwable) { onToast(context.getString(R.string.error_failed, t.message.orEmpty())) }
                             }
                         },
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                    ) { Text(stringResource(R.string.fw_toggle_edit, fwActionLabel(context, fw.defaultInbound)), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Rose400) }
+                    ) { Text(stringResource(R.string.fw_toggle_edit, fw.defaultInbound), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Rose400) }
                 }
-                KeyValueRow(stringResource(R.string.label_outbound_default), fwActionLabel(context, fw.defaultOutbound))
+                KeyValueRow(stringResource(R.string.label_outbound_default), fw.defaultOutbound)
                 if (fw.rules.none { it.direction == "in" }) {
                     Text(stringResource(R.string.no_inbound_rules), fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint,
                         modifier = Modifier.padding(top = 6.dp))
@@ -139,10 +134,14 @@ fun NetworkDetailScreen(
                 fw.rules.forEachIndexed { globalIndex, r ->
                     if (r.direction != "in") return@forEachIndexed
                     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        val actionLabel = fwActionLabel(context, r.action)
+                        // `allow`/`deny` and the protocol stay in the daemon's
+                        // own vocabulary, in every language: they are the words
+                        // `ray firewall` prints and the ones written back over
+                        // IPC, so translating half of a rule row would leave it
+                        // matching neither.
                         Text(
-                            if (r.port != "*") stringResource(R.string.fw_rule_with_port, actionLabel, r.protocol, r.port)
-                            else stringResource(R.string.fw_rule_any_port, actionLabel, r.protocol),
+                            if (r.port != "*") stringResource(R.string.fw_rule_with_port, r.action, r.protocol, r.port)
+                            else stringResource(R.string.fw_rule_any_port, r.action, r.protocol),
                             fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
                         Spacer(Modifier.weight(1f))
                         // The daemon renders a rule's peer as a short id; name it

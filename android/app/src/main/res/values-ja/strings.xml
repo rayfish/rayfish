@@ -2,6 +2,7 @@
 <resources>
     <string name="share_with_rayfish">Rayfish で共有</string>
     <string name="fallback_file">ファイル</string>
+    <string name="fallback_peer">ピア</string>
 
     <string name="tab_home">ホーム</string>
     <string name="tab_networks">ネットワーク</string>
@@ -58,8 +59,6 @@
     <string name="dash">-</string>
     <string name="role_coordinator">コーディネーター</string>
     <string name="role_member">メンバー</string>
-    <string name="fw_allow">許可</string>
-    <string name="fw_deny">拒否</string>
     <string name="fw_any_peer">すべてのピア</string>
     <string name="fw_peer">ピア</string>
     <string name="fw_protocol">プロトコル</string>
@@ -71,8 +70,6 @@
     <string name="status_connecting_ellipsis">接続中…</string>
     <string name="status_not_connected">未接続</string>
     <string name="status_not_connected_reason">未接続 · %1$s</string>
-    <string name="toggle_on">オン</string>
-    <string name="toggle_off">オフ</string>
 
     <string name="tunnel_running">稼働中 · この端末 %s</string>
     <string name="home_file_from">ファイル · %1$s · 送信元 %2$s</string>

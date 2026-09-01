@@ -2,6 +2,7 @@
 <resources>
     <string name="share_with_rayfish">通过 Rayfish 分享</string>
     <string name="fallback_file">文件</string>
+    <string name="fallback_peer">节点</string>
 
     <string name="tab_home">首页</string>
     <string name="tab_networks">网络</string>
@@ -58,8 +59,6 @@
     <string name="dash">-</string>
     <string name="role_coordinator">协调者</string>
     <string name="role_member">成员</string>
-    <string name="fw_allow">允许</string>
-    <string name="fw_deny">拒绝</string>
     <string name="fw_any_peer">任意节点</string>
     <string name="fw_peer">节点</string>
     <string name="fw_protocol">协议</string>
@@ -71,8 +70,6 @@
     <string name="status_connecting_ellipsis">正在连接…</string>
     <string name="status_not_connected">未连接</string>
     <string name="status_not_connected_reason">未连接 · %1$s</string>
-    <string name="toggle_on">开</string>
-    <string name="toggle_off">关</string>
 
     <string name="tunnel_running">运行中 · 此设备 %s</string>
     <string name="home_file_from">文件 · %1$s · 来自 %2$s</string>
