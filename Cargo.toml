@@ -212,18 +212,24 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [patch.crates-io]
-# iroh fork carrying two rayfish features on the `rayfish-integration` branch:
+# iroh fork carrying three rayfish features on the `rayfish-integration` branch:
 #   - `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397)
 #   - `Builder::configure_socket`, a hook run on every socket iroh opens (UDP and
 #     the relay's TCP), used for the exit-node loop prevention: SO_MARK on Linux,
-#     IP_BOUND_IF interface pinning on macOS. Supersedes the socket_mark draft
-#     (PR #4406); not proposed upstream yet.
+#     IP_BOUND_IF interface pinning on macOS (upstream PR n0-computer/iroh#4406)
+#   - the batch datagram passthroughs on `Connection` (upstream PR
+#     n0-computer/iroh#4383, which needs the noq patch below)
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
 iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
-# netwatch fork exposing the `ConfigureSocket` hook that the iroh branch above
-# threads through (upstream has only the SO_MARK-only BindOptions from
-# n0-computer/net-tools#179, unreleased).
+# netwatch fork exposing the configure-socket hook that the iroh branch above
+# threads through (upstream PR n0-computer/net-tools#182, unmerged).
 netwatch = { git = "https://github.com/rayfish/net-tools", branch = "feat/configure-socket" }
+# noq fork carrying the batch datagram APIs the forwarder uses, `send_many_datagrams`
+# and `read_many_datagrams` (upstream PR n0-computer/noq#735, under review). iroh
+# re-exports them on `Connection`; drop this once a noq release carries them.
+noq = { git = "https://github.com/rayfish/noq", branch = "perf/datagram-batching" }
+noq-proto = { git = "https://github.com/rayfish/noq", branch = "perf/datagram-batching" }
+noq-udp = { git = "https://github.com/rayfish/noq", branch = "perf/datagram-batching" }

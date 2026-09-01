@@ -33,6 +33,11 @@ use crate::stats::{DropReason, ForwardMetrics};
 /// datagrams from a malicious or buggy peer.
 const MAX_PEER_DATAGRAM: usize = 1500 + TAG_LEN;
 
+/// Datagrams drained from a peer connection in one `read_many_datagrams` call.
+/// Sized for a burst at line rate without holding a large idle buffer: each slot
+/// is an empty `Bytes` between reads, so the cost when idle is the vector itself.
+const RECV_BATCH: usize = 32;
+
 /// Bytes of the per-datagram network handle tag: a big-endian `u16` prefixed to
 /// every mesh datagram. Since one connection now carries every network the two
 /// peers share, the receiver can no longer infer a datagram's network from the
@@ -539,8 +544,8 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             Some((peer, connected)) = done_rx.recv() => {
                 in_flight.remove(&peer);
                 let pkts = buffered.take(&peer);
-                flush_or_drop(&peers, &firewall, &stats, &tun_tx, &exit_client, connected, pkts)
-                    .await;
+                let ctx = SendCtx { firewall: &firewall, stats: &stats, tun_tx: &tun_tx };
+                flush_or_drop(&peers, &ctx, &exit_client, connected, pkts).await;
                 continue;
             }
         };
@@ -616,7 +621,12 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
 
             continue;
         };
-        send_over_route(&firewall, &stats, &tun_tx, &route, &info, pkt).await;
+        let ctx = SendCtx {
+            firewall: &firewall,
+            stats: &stats,
+            tun_tx: &tun_tx,
+        };
+        send_over_route(&ctx, &route, &info, pkt).await;
     }
 }
 
@@ -656,53 +666,88 @@ fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Opti
 /// [`run_mesh`] when a dial completes.
 async fn flush_or_drop(
     peers: &PeerTable,
-    firewall: &SharedFirewall,
-    stats: &ForwardMetrics,
-    tun_tx: &mpsc::Sender<Bytes>,
+    ctx: &SendCtx<'_>,
     exit: &ExitClient,
     connected: bool,
     pkts: VecDeque<Bytes>,
 ) {
     if !connected {
         for _ in &pkts {
-            stats.record_drop(DropReason::NoPeer);
+            ctx.stats.record_drop(DropReason::NoPeer);
         }
         return;
     }
 
+    // The whole flush is one peer's backlog, so consecutive packets almost always
+    // share a route and go out in a single call. `staged` keeps the drop-newest
+    // budget honest across a run: the send buffer does not shrink until the batch
+    // is handed over, so each packet is measured against what the run already holds.
+    let mut batch: Vec<Bytes> = Vec::new();
+    let mut batched: Option<PeerRoute> = None;
+    let mut staged = 0;
     for pkt in pkts {
         let Some(info) = firewall::parse_packet_info(&pkt) else {
-            stats.record_drop(DropReason::Malformed);
+            ctx.stats.record_drop(DropReason::Malformed);
             continue;
         };
 
         let Some(route) = resolve_send_route(peers, exit, info.dst_ip) else {
             // The connection vanished between dialing and flushing (a racing
             // teardown); the flow's retransmit will re-drive it.
-            stats.record_drop(DropReason::NoPeer);
+            ctx.stats.record_drop(DropReason::NoPeer);
             continue;
         };
 
-        send_over_route(firewall, stats, tun_tx, &route, &info, pkt).await;
+        // A route change ends the run: the batch belongs to one connection.
+        if batched.as_ref().is_some_and(|b| {
+            b.handle != route.handle || b.conn.stable_id() != route.conn.stable_id()
+        }) && let Some(prev) = batched.take()
+        {
+            send_batch(ctx, &prev, &batch);
+            batch.clear();
+            staged = 0;
+        }
+
+        if let Some(tagged) = prepare_datagram(ctx, &route, &info, pkt, staged).await {
+            staged += tagged.len();
+            batch.push(tagged);
+            batched = Some(route);
+        }
+    }
+    if let Some(route) = batched {
+        send_batch(ctx, &route, &batch);
     }
 }
 
-/// Firewall-check an outbound packet already routed to `route`, then send it as a
-/// tagged QUIC datagram. Applies the same reject-inject, drop-newest backpressure,
-/// and SSH source-port NAT as the main loop. Shared by [`run_mesh`] and the
-/// on-demand flush of packets buffered while a peer connection was established.
-pub(crate) async fn send_over_route(
-    firewall: &SharedFirewall,
-    stats: &ForwardMetrics,
-    tun_tx: &mpsc::Sender<Bytes>,
+/// The three pieces of forwarding state every outbound send needs: the firewall
+/// that admits the packet, the counters it is recorded in, and the TUN writer a
+/// reject or PMTU reply is injected back into.
+pub(crate) struct SendCtx<'a> {
+    pub firewall: &'a SharedFirewall,
+    pub stats: &'a ForwardMetrics,
+    pub tun_tx: &'a mpsc::Sender<Bytes>,
+}
+
+/// Firewall-check an outbound packet routed to `route` and turn it into the tagged
+/// datagram to put on the wire, or `None` if it must not be sent (the reason is
+/// counted, and any reject or PMTU reply already injected). Applies the reject
+/// inject, drop-newest backpressure, and SSH source-port NAT.
+///
+/// `staged` is the number of bytes already prepared for this connection but not yet
+/// handed to it, so a caller building a batch keeps the same drop-newest budget as
+/// one sending packet by packet.
+async fn prepare_datagram(
+    ctx: &SendCtx<'_>,
     route: &PeerRoute,
     info: &firewall::PacketInfo,
     pkt: Bytes,
-) {
+    staged: usize,
+) -> Option<Bytes> {
     let n = pkt.len();
     // Reachability is "we share a network", enforced by connection existence. The
     // per-host firewall is the fine-grained gate.
-    if firewall
+    if ctx
+        .firewall
         .evaluate_packet(
             Direction::Out,
             info,
@@ -712,20 +757,20 @@ pub(crate) async fn send_over_route(
         .is_deny()
     {
         tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
-        stats.record_drop(DropReason::Firewall);
+        ctx.stats.record_drop(DropReason::Firewall);
         // Fail fast (opt-in): inject a RST / ICMP-unreachable back into our own TUN
         // so the local app's socket fails immediately instead of hanging.
-        if firewall.reject_enabled()
+        if ctx.firewall.reject_enabled()
             && let Some(reply) = crate::reject::build_reject(&pkt, info)
         {
-            stats.record_reject();
-            let _ = tun_tx.send(reply).await;
+            ctx.stats.record_reject();
+            let _ = ctx.tun_tx.send(reply).await;
         }
-        return;
+        return None;
     }
     // PMTUD: if the packet (plus its tag) is larger than a single datagram can
     // carry on this peer's current path, tell the source to lower its path MTU
-    // (ICMP "packet too big") instead of dropping into a blackhole. Injecting the
+    // ("packet too big") instead of dropping into a blackhole. Injecting the
     // reply into our own TUN makes the local kernel shrink the flow and resend a
     // packet that fits. Common under an exit-node full tunnel: bulk internet
     // traffic over a relayed peer whose datagram budget is below the 1280 TUN MTU.
@@ -737,26 +782,27 @@ pub(crate) async fn send_over_route(
         let inner_mtu = max.saturating_sub(TAG_LEN) as u16;
         tracing::debug!(dst = %info.dst_ip, len = n, max, inner_mtu, "packet too big for datagram; signalling PMTU");
         if let Some(reply) = crate::reject::build_packet_too_big(&pkt, info, inner_mtu) {
-            let _ = tun_tx.send(reply).await;
+            let _ = ctx.tun_tx.send(reply).await;
         }
-        stats.record_drop(DropReason::PacketTooBig);
-        return;
+        ctx.stats.record_drop(DropReason::PacketTooBig);
+        return None;
     }
     // Drop-newest at the application boundary: if the peer's QUIC datagram send
     // buffer is too full to accept this packet (plus its tag) without evicting an
-    // already-queued (older) one, drop the *new* packet here instead of calling
-    // `send_datagram`, which would drop the *oldest* queued packet (see N6 in the
-    // datagram audit). This keeps the send path non-blocking while preferring
-    // drop-newest over drop-oldest.
-    if route.conn.datagram_send_buffer_space() < n + TAG_LEN {
+    // already-queued (older) one, drop the *new* packet here instead of handing it
+    // to noq, which would drop the *oldest* queued packet (see N6 in the datagram
+    // audit). This keeps the send path non-blocking while preferring drop-newest
+    // over drop-oldest.
+    if route.conn.datagram_send_buffer_space() < staged + n + TAG_LEN {
         tracing::trace!(
             dst = %info.dst_ip,
             space = route.conn.datagram_send_buffer_space(),
+            staged,
             len = n,
             "datagram send buffer full; dropping newest",
         );
-        stats.record_drop(DropReason::Backpressure);
-        return;
+        ctx.stats.record_drop(DropReason::Backpressure);
+        return None;
     }
     // SSH NAT: rewrite our reply's source port (listen -> 22) so the peer sees it as
     // coming from `:22`. The cheap pre-check (TCP + source port == listen port)
@@ -775,19 +821,61 @@ pub(crate) async fn send_over_route(
     // network yet (the peer hasn't been announced) — drop rather than send an
     // undecodable datagram.
     if route.handle == 0 {
-        stats.record_drop(DropReason::NoPeer);
-        return;
+        ctx.stats.record_drop(DropReason::NoPeer);
+        return None;
     }
-    let tagged = tag_datagram(route.handle, &pkt);
+    Some(tag_datagram(route.handle, &pkt))
+}
+
+/// Firewall-check an outbound packet already routed to `route`, then send it as a
+/// tagged QUIC datagram. Shared by [`run_mesh`] and the on-demand flush of packets
+/// buffered while a peer connection was established.
+pub(crate) async fn send_over_route(
+    ctx: &SendCtx<'_>,
+    route: &PeerRoute,
+    info: &firewall::PacketInfo,
+    pkt: Bytes,
+) {
+    let Some(tagged) = prepare_datagram(ctx, route, info, pkt, 0).await else {
+        return;
+    };
+    let n = tagged.len() - TAG_LEN;
     match route.conn.send_datagram(tagged) {
         Ok(()) => {
-            stats.record_tx(n);
+            ctx.stats.record_tx(n);
             // Outbound traffic keeps the connection off the idle reaper's list.
             route.note_activity();
         }
         Err(e) => {
             tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
-            stats.record_drop(DropReason::SendFailure);
+            ctx.stats.record_drop(DropReason::SendFailure);
+        }
+    }
+}
+
+/// Hands a run of datagrams bound for the same connection to noq in one call.
+/// Counts each one that was queued, and the remainder as send failures.
+fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes]) {
+    if batch.is_empty() {
+        return;
+    }
+    match route.conn.send_many_datagrams(batch) {
+        Ok(queued) => {
+            for tagged in &batch[..queued] {
+                ctx.stats.record_tx(tagged.len() - TAG_LEN);
+            }
+            for _ in queued..batch.len() {
+                ctx.stats.record_drop(DropReason::Backpressure);
+            }
+            if queued > 0 {
+                route.note_activity();
+            }
+        }
+        Err(e) => {
+            tracing::debug!(peer = %route.endpoint_id.fmt_short(), error = %e, "batch datagram send failed");
+            for _ in batch {
+                ctx.stats.record_drop(DropReason::SendFailure);
+            }
         }
     }
 }
@@ -830,14 +918,19 @@ pub fn spawn_peer_reader(
         // sender. The steady state (sender unchanged) is then refcount-free on the
         // hottest path we have, while a re-attach still redirects this reader.
         let mut tun_tx = arc_swap::cache::Cache::new(tun_tx);
+        // Reused across reads: `read_many_datagrams` drains what is buffered into
+        // this slice under a single lock hold, so a burst costs one wake and one
+        // lock instead of one of each per packet. Taking each entry out leaves an
+        // empty `Bytes` behind, so the batch holds no packet memory between reads.
+        let mut batch = vec![Bytes::new(); RECV_BATCH];
         loop {
-            // Wait for the next datagram, exiting on cancellation or connection
-            // loss. Keeping the `select!` to "yield a datagram or return" leaves
-            // the actual forwarding below at loop-body depth.
-            let datagram = tokio::select! {
+            // Wait for the next batch, exiting on cancellation or connection loss.
+            // Keeping the `select!` to "yield datagrams or return" leaves the
+            // actual forwarding below at loop-body depth.
+            let count = tokio::select! {
                 _ = token.cancelled() => return,
-                result = conn.read_datagram() => match result {
-                    Ok(d) => d,
+                result = conn.read_many_datagrams(&mut batch) => match result {
+                    Ok(n) => n,
                     Err(e) => {
                         // Connection closed. The owning `MeshConnection` observes
                         // the same close and reports the disconnect to the
@@ -847,82 +940,86 @@ pub fn spawn_peer_reader(
                     }
                 },
             };
-            if datagram.len() > MAX_PEER_DATAGRAM {
-                stats.record_drop(DropReason::Malformed);
-                continue;
-            }
-            // Strip the network handle tag and resolve which network it names.
-            let Some((handle, _)) = untag_datagram(&datagram) else {
-                stats.record_drop(DropReason::Malformed);
-                continue;
-            };
-            // Resolve the peer's mesh IPv6 + arrival network from the handle in one
-            // pass, which also enforces the in-band reachability wall: it returns
-            // `None` unless the handle maps to a network *we* currently share with
-            // this peer per our own roster. So the peer's handle table alone can't
-            // smuggle a datagram into a network we don't agree it belongs to.
-            let Some((peer_ipv6, network)) = peers.resolve_inbound_by_id(&peer_id, handle) else {
-                stats.record_drop(DropReason::Spoof);
-                continue;
-            };
-            // Owned, zero-copy view of the IP packet (drops the 2-byte tag).
-            let datagram = datagram.slice(TAG_LEN..);
-
-            let peer_user = device_user_map.resolve(&peer_id);
-            match evaluate_inbound(&datagram, &firewall, &exit, &peer_user, peer_ipv6, &network) {
-                InboundDecision::Accept => {
-                    stats.record_rx(datagram.len());
-                    // SSH NAT: a packet to our mesh `:22` is rewritten to the
-                    // SSH server's internal listen port before injection. The
-                    // anti-spoof + firewall checks above already ran on the
-                    // original `:22` packet. Cheap pre-check avoids a copy on
-                    // ordinary traffic.
-                    let datagram = match ssh_nat() {
-                        Some(_) => match firewall::parse_packet_info(&datagram) {
-                            Some(info) if info.protocol == 6 && info.dst_port == SSH_PORT => {
-                                let mut v = datagram.to_vec();
-                                rewrite_ssh_port(&mut v, &info, true);
-                                Bytes::from(v)
-                            }
-                            _ => datagram,
-                        },
-                        None => datagram,
-                    };
-                    // Resolve the live writer for each packet: the sender is
-                    // swapped on every TUN re-attach (VPN toggle). A send error
-                    // means the writer is currently down (standby between a
-                    // detach and the next attach); drop the packet and keep the
-                    // reader alive so it forwards again once a new TUN attaches.
-                    let _ = tun_tx.load().send(datagram).await;
+            for datagram in batch.iter_mut().take(count).map(std::mem::take) {
+                if datagram.len() > MAX_PEER_DATAGRAM {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
                 }
-                InboundDecision::DropFirewall(info) => {
-                    stats.record_drop(DropReason::Firewall);
-                    // Fail fast (opt-in): send a RST / ICMP-unreachable back over
-                    // this connection so the initiator on the other host fails
-                    // immediately. Its conntrack admits the reply (a RST matches
-                    // its outbound flow; the seeded `allow in icmp` rule admits an
-                    // ICMP error), so the initiator's app sees "connection refused".
-                    if firewall.reject_enabled()
-                        && let Some(reply) = crate::reject::build_reject(&datagram, &info)
-                    {
-                        stats.record_reject();
-                        let _ = conn.send_datagram(reply);
-                    }
-                }
-                InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
-                InboundDecision::DropSpoof => {
+                // Strip the network handle tag and resolve which network it names.
+                let Some((handle, _)) = untag_datagram(&datagram) else {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
+                };
+                // Resolve the peer's mesh IPv6 + arrival network from the handle in one
+                // pass, which also enforces the in-band reachability wall: it returns
+                // `None` unless the handle maps to a network *we* currently share with
+                // this peer per our own roster. So the peer's handle table alone can't
+                // smuggle a datagram into a network we don't agree it belongs to.
+                let Some((peer_ipv6, network)) = peers.resolve_inbound_by_id(&peer_id, handle)
+                else {
                     stats.record_drop(DropReason::Spoof);
-                    tracing::debug!(
-                        peer = %peer_id.fmt_short(),
-                        "dropped inbound packet with spoofed source IP"
-                    );
-                }
-                InboundDecision::DropExit => {
-                    stats.record_drop(DropReason::ExitDenied);
-                    tracing::debug!(
-                        peer = %peer_id.fmt_short(),
-                        "dropped internet-bound packet: not an exit node for this sender"
-                    );
+                    continue;
+                };
+                // Owned, zero-copy view of the IP packet (drops the 2-byte tag).
+                let datagram = datagram.slice(TAG_LEN..);
+
+                let peer_user = device_user_map.resolve(&peer_id);
+                match evaluate_inbound(&datagram, &firewall, &exit, &peer_user, peer_ipv6, &network)
+                {
+                    InboundDecision::Accept => {
+                        stats.record_rx(datagram.len());
+                        // SSH NAT: a packet to our mesh `:22` is rewritten to the
+                        // SSH server's internal listen port before injection. The
+                        // anti-spoof + firewall checks above already ran on the
+                        // original `:22` packet. Cheap pre-check avoids a copy on
+                        // ordinary traffic.
+                        let datagram = match ssh_nat() {
+                            Some(_) => match firewall::parse_packet_info(&datagram) {
+                                Some(info) if info.protocol == 6 && info.dst_port == SSH_PORT => {
+                                    let mut v = datagram.to_vec();
+                                    rewrite_ssh_port(&mut v, &info, true);
+                                    Bytes::from(v)
+                                }
+                                _ => datagram,
+                            },
+                            None => datagram,
+                        };
+                        // Resolve the live writer for each packet: the sender is
+                        // swapped on every TUN re-attach (VPN toggle). A send error
+                        // means the writer is currently down (standby between a
+                        // detach and the next attach); drop the packet and keep the
+                        // reader alive so it forwards again once a new TUN attaches.
+                        let _ = tun_tx.load().send(datagram).await;
+                    }
+                    InboundDecision::DropFirewall(info) => {
+                        stats.record_drop(DropReason::Firewall);
+                        // Fail fast (opt-in): send a RST / ICMP-unreachable back over
+                        // this connection so the initiator on the other host fails
+                        // immediately. Its conntrack admits the reply (a RST matches
+                        // its outbound flow; the seeded `allow in icmp` rule admits an
+                        // ICMP error), so the initiator's app sees "connection refused".
+                        if firewall.reject_enabled()
+                            && let Some(reply) = crate::reject::build_reject(&datagram, &info)
+                        {
+                            stats.record_reject();
+                            let _ = conn.send_datagram(reply);
+                        }
+                    }
+                    InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
+                    InboundDecision::DropSpoof => {
+                        stats.record_drop(DropReason::Spoof);
+                        tracing::debug!(
+                            peer = %peer_id.fmt_short(),
+                            "dropped inbound packet with spoofed source IP"
+                        );
+                    }
+                    InboundDecision::DropExit => {
+                        stats.record_drop(DropReason::ExitDenied);
+                        tracing::debug!(
+                            peer = %peer_id.fmt_short(),
+                            "dropped internet-bound packet: not an exit node for this sender"
+                        );
+                    }
                 }
             }
         }
