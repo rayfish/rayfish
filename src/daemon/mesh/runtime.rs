@@ -1120,6 +1120,11 @@ impl Daemon {
     /// Activate the VPN: bring the TUN interface up, configure system DNS.
     /// Idempotent: a no-op if already active. Runs entirely inside the
     /// (root) daemon, so the IPC client needs no privileges.
+    ///
+    /// Returns `Error` only when the link itself could not be brought up, which
+    /// nothing after it can work around; that path puts the node back on standby
+    /// rather than leaving it half configured. Every other problem comes back as
+    /// an `Ok` carrying warnings.
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// bring the data plane up (mark active, configure Magic DNS). On Android the
     /// packet interface + routes are the `VpnService`'s job, so those desktop
@@ -1168,8 +1173,17 @@ impl Daemon {
             let tun_name = self.tun_name.load().as_str().to_owned();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::set_link_up(&tun_name).await {
-                tracing::warn!(error = %e, "failed to bring TUN interface up");
-                warnings.push(format!("failed to bring TUN interface up: {e}"));
+                // Not one warning among many. With the link down the kernel
+                // flushes the address assigned below and refuses the connected
+                // route, so every step after this one would report success onto
+                // an interface that cannot carry a packet, and the node would
+                // sit there advertising a data plane it does not have. Undo the
+                // half-built state and stay on standby, which is both true and
+                // what `ray status` will then say.
+                let err = format!("{e:#}");
+                tracing::error!(error = %err, "failed to bring TUN interface up");
+                self.deactivate().await;
+                return ipc_err(format!("failed to bring the TUN interface up: {err}"));
             }
 
             // Linux drops the TUN's global IPv6 address whenever the link goes
@@ -1177,8 +1191,9 @@ impl Daemon {
             // this node answers on IPv4 only for the rest of the daemon's life.
             #[cfg(target_os = "linux")]
             if let Err(e) = tun::ensure_ipv6_addr(&tun_name, my_v6).await {
-                tracing::warn!(error = %e, "failed to assign TUN IPv6 address");
-                warnings.push(format!("failed to assign TUN IPv6 address: {e}"));
+                let err = format!("{e:#}");
+                tracing::warn!(error = %err, "failed to assign TUN IPv6 address");
+                warnings.push(format!("failed to assign TUN IPv6 address: {err}"));
             }
 
             // Route the 200::/7 peer range into the TUN. Must happen after
@@ -1188,8 +1203,9 @@ impl Daemon {
             // `200::/7` also delivers `dns::MAGIC_DNS_V6`, so the resolver needs
             // no host route of its own.
             if let Err(e) = tun::route_peer_range(&tun_name).await {
-                tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
-                warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
+                let err = format!("{e:#}");
+                tracing::warn!(error = %err, "failed to route 200::/7 into TUN");
+                warnings.push(format!("failed to route IPv6 peer range into TUN: {err}"));
             }
 
             // Loop our own addresses back through lo0 so self-traffic (e.g.
@@ -1198,8 +1214,9 @@ impl Daemon {
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
             if let Err(e) = tun::route_self_loopback(my_v6).await {
-                tracing::warn!(error = %e, "failed to install loopback self-route");
-                warnings.push(format!("failed to install loopback self-route: {e}"));
+                let err = format!("{e:#}");
+                tracing::warn!(error = %err, "failed to install loopback self-route");
+                warnings.push(format!("failed to install loopback self-route: {err}"));
             }
         }
 
@@ -1249,6 +1266,13 @@ impl Daemon {
                 message: "VPN up".to_string(),
             }
         } else {
+            // Logged as well as returned: at service start nobody is holding the
+            // IPC socket to read the reply, and a node that came up half
+            // configured would otherwise leave no trace of it in `ray logs`.
+            tracing::warn!(
+                problems = %warnings.join("; "),
+                "data plane activated with problems"
+            );
             let mut message = "VPN up. Some things need attention:".to_string();
             for w in &warnings {
                 message.push_str("\n  - ");
@@ -1707,12 +1731,15 @@ impl Daemon {
 
         #[cfg(target_os = "windows")]
         if let Err(e) = tun::unroute_peer_range(&tun_name).await {
-            tracing::warn!(error = %e, "failed to remove Windows TUN routes");
+            tracing::warn!(error = %format!("{e:#}"), "failed to remove Windows TUN routes");
         }
 
+        // A link that will not go down keeps the address and the `200::/7` route,
+        // so the host still routes the overlay into a TUN whose writer is now
+        // dropping everything: peer traffic black-holes instead of failing fast.
         #[cfg(not(target_os = "android"))]
         if let Err(e) = tun::set_link_down(&tun_name).await {
-            tracing::warn!(error = %e, "failed to bring TUN interface down");
+            tracing::warn!(error = %format!("{e:#}"), "failed to bring TUN interface down");
         }
 
         // Exit-node server: drop the allow policy so no transit happens while on

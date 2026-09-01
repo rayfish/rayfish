@@ -19,8 +19,9 @@ use std::net::Ipv6Addr;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 // Windows drives the interface through PowerShell (`windows_process`), not a
-// synchronous `Command`, so nothing here needs the blocking spawn.
-#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
+// synchronous `Command`, so nothing here needs the blocking spawn. Linux does
+// every one of these through netlink and spawns nothing at all.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
@@ -516,12 +517,26 @@ async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let state = if up { "up" } else { "down" };
-        let status = Command::new("ip")
-            .args(["link", "set", tun_name, state])
-            .status()
-            .context("run ip link set")?;
-        anyhow::ensure!(status.success(), "ip link set {state} failed with {status}");
+        // Netlink rather than `ip link set`, for the same reason the address and
+        // route helpers above use it: a shell-out puts iproute2 on the daemon's
+        // runtime PATH, and a service unit without it fails this one step while
+        // every netlink call around it succeeds. That leaves the link never
+        // brought up (or, on standby, never brought down) with the address and
+        // the `200::/7` route still in place, which reads as a working VPN that
+        // silently swallows every packet.
+        use rtnetlink::LinkUnspec;
+
+        with_tun_link(tun_name, async |handle, index| {
+            let msg = LinkUnspec::new_with_index(index);
+            let msg = if up { msg.up() } else { msg.down() };
+            handle
+                .link()
+                .set(msg.build())
+                .execute()
+                .await
+                .context("set TUN link state via netlink")
+        })
+        .await?;
     }
     #[cfg(target_os = "windows")]
     {

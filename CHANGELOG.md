@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Linux: the VPN interface is brought up and down through the kernel, with no
+  `ip` binary needed.** Bringing the link up and down was the one step that
+  shelled out to `iproute2` while the address and the route next to it went
+  straight to the kernel. On a host whose service `PATH` has no `ip` (NixOS
+  packaging, minimal containers) that single step failed and everything around it
+  succeeded, so the daemon activated onto an interface that was never brought up:
+  `ray ping` answered normally, because it does not use the tunnel, while every
+  real packet vanished. Standby had the mirror image of the problem, leaving the
+  interface up and the `200::/7` route installed with nothing behind it, so
+  traffic to that node black-holed instead of failing fast.
+- **`ray up` fails out loud when the interface cannot be brought up.** It used to
+  report the VPN as up, with the failure noted among any warnings, and go on to
+  log "data plane activated". Now the node stays on standby and says why, so
+  `ray status` is not left claiming a data plane that cannot carry a packet.
+  Problems that do not stop activation are written to the log as well as returned,
+  since a daemon activating at service start has nobody reading its reply, and
+  failures that happen while configuring the interface now record what the system
+  actually said instead of only the step that failed.
+
 - **macOS: `.ray` names keep resolving after another VPN comes and goes.**
   Mullvad (and anything else that takes DNS the same way) writes its own
   resolver over every network service in the system's dynamic store while it is
