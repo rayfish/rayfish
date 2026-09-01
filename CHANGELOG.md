@@ -69,6 +69,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Traffic to an unreachable peer no longer grows the daemon's memory.** When a
+  packet goes to a peer that is not connected yet, the daemon dials it and holds
+  the packets meanwhile so the start of the flow survives. That queue had no
+  limit, so anything pointed at a peer that stays offline for the dial timeout
+  (a backup, a file copy, a scan) was retained in full. It is now capped per
+  peer and for the daemon as a whole, keeping the oldest packets, which are the
+  ones a handshake needs; the rest are dropped and counted under a new
+  `LazyDialBufferFull` reason in the metrics export and in `ray report`.
+
 - **Android: networks no longer disappear while they reconnect.** The app listed
   only the networks the daemon had finished registering, so a cold start showed
   an empty Networks screen until every restore landed, and a network whose
