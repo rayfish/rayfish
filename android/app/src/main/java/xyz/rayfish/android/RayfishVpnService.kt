@@ -943,9 +943,9 @@ class RayfishVpnService : VpnService() {
         val nm = getSystemService(NotificationManager::class.java)
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Rayfish VPN",
+            getString(R.string.notif_channel_vpn),
             NotificationManager.IMPORTANCE_LOW,
-        ).apply { description = "Rayfish mesh tunnel status" }
+        ).apply { description = getString(R.string.notif_channel_vpn_desc) }
         nm.createNotificationChannel(channel)
 
         val openIntent = PendingIntent.getActivity(
@@ -956,8 +956,8 @@ class RayfishVpnService : VpnService() {
         )
 
         val builder = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Rayfish")
-            .setContentText(if (standby) "Online, VPN off · files still work" else "Mesh tunnel active")
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(if (standby) getString(R.string.notif_vpn_standby) else getString(R.string.notif_vpn_active))
             .setSmallIcon(R.drawable.ic_stat_vpn)
             .setOngoing(true)
             .setContentIntent(openIntent)
@@ -979,7 +979,7 @@ class RayfishVpnService : VpnService() {
             builder.addAction(
                 Notification.Action.Builder(
                     null as android.graphics.drawable.Icon?,
-                    "Disable",
+                    getString(R.string.action_disable),
                     disableIntent,
                 ).build(),
             )

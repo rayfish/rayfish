@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -16,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.RayException
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.R
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 import java.io.ByteArrayOutputStream
@@ -66,7 +68,7 @@ fun IdentityRestoreDialogs(
                 }.getOrNull()
             }
             if (text.isNullOrBlank()) {
-                onToast("Could not read that file")
+                onToast(context.getString(R.string.toast_restore_read_failed))
                 finish()
             } else {
                 code = text.trim()
@@ -86,12 +88,12 @@ fun IdentityRestoreDialogs(
         AlertDialog(
             onDismissRequest = { askPassword = false; finish() },
             containerColor = Rf.Sheet,
-            title = { Text("Restore identity", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            title = { Text(stringResource(R.string.restore_title), fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RayfishTextField(password, { password = it }, "backup password", password = true)
+                    RayfishTextField(password, { password = it }, stringResource(R.string.hint_backup_password), password = true)
                     Text(
-                        "The password you chose when you made this backup.",
+                        stringResource(R.string.restore_password_hint),
                         fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
                     )
                 }
@@ -109,11 +111,11 @@ fun IdentityRestoreDialogs(
                             onSettled = ::finish,
                         )
                     },
-                ) { Text("Restore", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+                ) { Text(stringResource(R.string.action_restore), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = {
                 TextButton(onClick = { askPassword = false; finish() }) {
-                    Text("Cancel", color = Rf.Body, fontFamily = Chakra)
+                    Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra)
                 }
             },
         )
@@ -123,12 +125,10 @@ fun IdentityRestoreDialogs(
         AlertDialog(
             onDismissRequest = { identityToReplace = null; finish() },
             containerColor = Rf.Sheet,
-            title = { Text("Replace this identity?", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            title = { Text(stringResource(R.string.replace_identity_title), fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Text(
-                    "This device already has identity ${shortId(existing)}. Restoring replaces it: " +
-                        "the old one is gone from this device, its pairing certificate is deleted, and peers " +
-                        "will see this device at a new address.",
+                    stringResource(R.string.replace_identity_body, shortId(existing)),
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Body,
                 )
             },
@@ -142,11 +142,11 @@ fun IdentityRestoreDialogs(
                         onRestored = onRestored,
                         onSettled = ::finish,
                     )
-                }) { Text("Replace", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+                }) { Text(stringResource(R.string.action_replace), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = {
                 TextButton(onClick = { identityToReplace = null; finish() }) {
-                    Text("Cancel", color = Rf.Body, fontFamily = Chakra)
+                    Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra)
                 }
             },
         )
@@ -188,16 +188,16 @@ private fun restore(
                 NodeHolder.get(context).restoreIdentity(code, password, replaceExisting)
             }
             restored = true
-            onToast("Restored identity ${shortId(id)}")
+            onToast(context.getString(R.string.toast_restored_identity, shortId(id)))
         } catch (e: RayException.IdentityExists) {
             awaitingConfirmation = true
             onExists(e.v1)
         } catch (e: RayException.BadBackup) {
-            onToast("Wrong password, or that file is not a backup")
+            onToast(context.getString(R.string.toast_bad_backup))
         } catch (e: RayException.NodeRunning) {
-            onToast("Turn Rayfish off before restoring")
+            onToast(context.getString(R.string.toast_restore_need_off))
         } catch (t: Throwable) {
-            onToast("Restore failed: ${t.message}")
+            onToast(context.getString(R.string.error_restore_failed, t.message.orEmpty()))
         }
         if (awaitingConfirmation) return@launch
         onSettled()

@@ -18,6 +18,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -145,18 +147,18 @@ class ShareActivity : ComponentActivity() {
         Surface(color = Rf.Bg, modifier = Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                BrandHeader(title = "Share")
-                val label = if (itemCount == 1) "1 item" else "$itemCount items"
-                Text("Send $label to a peer", fontFamily = Chakra, fontSize = 13.sp, color = Rf.Muted)
+                BrandHeader(title = stringResource(R.string.label_share))
+                val label = pluralStringResource(R.plurals.share_item_count, itemCount, itemCount)
+                Text(stringResource(R.string.share_send_to_peer, label), fontFamily = Chakra, fontSize = 13.sp, color = Rf.Muted)
 
                 SectionCard {
-                    SectionLabel("Peers")
+                    SectionLabel(stringResource(R.string.label_peers))
                     when {
                         targets.isNotEmpty() -> targets.forEach { t ->
                             val (dot, note) = when (t.state) {
-                                PeerConnState.ACTIVE -> Rf.Emerald to "connected"
-                                PeerConnState.IDLE -> Rf.Amber to "idle"
-                                PeerConnState.OFFLINE -> Rf.Faint to "offline, will queue"
+                                PeerConnState.ACTIVE -> Rf.Emerald to stringResource(R.string.peer_connected)
+                                PeerConnState.IDLE -> Rf.Amber to stringResource(R.string.peer_idle)
+                                PeerConnState.OFFLINE -> Rf.Faint to stringResource(R.string.peer_offline_queue)
                             }
                             Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
                                 .clickable { onPick(t) }.padding(vertical = 9.dp),
@@ -167,18 +169,18 @@ class ShareActivity : ComponentActivity() {
                                     Text(t.hostname.ifEmpty { "?" }, fontFamily = Chakra,
                                         fontWeight = FontWeight.SemiBold, fontSize = 14.sp,
                                         color = if (t.state == PeerConnState.OFFLINE) Rf.Muted else Rf.Heading)
-                                    Text("${t.ipv6} · ${t.network}.ray ($note)", fontFamily = PlexMono,
+                                    Text(stringResource(R.string.share_peer_subtitle, t.ipv6, t.network, note), fontFamily = PlexMono,
                                         fontSize = 10.sp, color = Rf.Faint)
                                 }
                             }
                         }
-                        loading -> Text("Connecting…", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
-                        else -> Text("No peers yet. Open Rayfish and join a network, then try again.",
+                        loading -> Text(stringResource(R.string.share_connecting), fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
+                        else -> Text(stringResource(R.string.share_no_peers),
                             fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
                     }
                 }
 
-                OutlinePillButton("Cancel", onClick = onCancel, modifier = Modifier.fillMaxWidth())
+                OutlinePillButton(stringResource(R.string.action_cancel), onClick = onCancel, modifier = Modifier.fillMaxWidth())
             }
         }
     }

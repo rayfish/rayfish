@@ -84,12 +84,6 @@ android {
         versionCode = rayVersionCode
         versionName = rayVersion
 
-        // App-name placeholders substituted into the manifest labels. The debug
-        // build type overrides these (see below) so the dev build installs as a
-        // separate app with a distinct name in the launcher and share sheet.
-        manifestPlaceholders["appName"] = "Rayfish"
-        manifestPlaceholders["shareLabel"] = "Share with Rayfish"
-
         // ray-mobile only builds these two ABIs for now (device + emulator).
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -130,8 +124,11 @@ android {
             // A build type can only suffix the applicationId (a full override
             // needs product flavors), so the dev package is xyz.rayfish.android.dev.
             applicationIdSuffix = ".dev"
-            manifestPlaceholders["appName"] = "Rayfish Dev"
-            manifestPlaceholders["shareLabel"] = "Share with Rayfish Dev"
+            // Launcher / share-sheet names come from src/debug/res (`app_name`,
+            // `share_with_rayfish`) so they stay distinct from the release
+            // install. `share_with_rayfish` is translated, so the overlay carries
+            // one file per locale: a locale-qualified string in main/ outranks an
+            // unqualified one in the debug overlay.
         }
         release {
             isMinifyEnabled = false

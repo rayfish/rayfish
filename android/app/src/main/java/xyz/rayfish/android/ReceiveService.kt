@@ -45,7 +45,7 @@ class ReceiveService : Service() {
             // drop a running accept out of the foreground and stop the service
             // out from under it.
             synchronized(lifecycle) {
-                startForegroundNotification("Rayfish", "Working")
+                startForegroundNotification(getString(R.string.app_name), getString(R.string.notif_working))
                 if (inFlight.get() == 0) {
                     stopForegroundCompat()
                     stopSelf(startId)
@@ -56,8 +56,8 @@ class ReceiveService : Service() {
             return START_NOT_STICKY
         }
         val offerId = id.toULong()
-        val filename = intent.getStringExtra(EXTRA_FILENAME) ?: "file"
-        val peer = intent.getStringExtra(EXTRA_PEER) ?: "peer"
+        val filename = intent.getStringExtra(EXTRA_FILENAME) ?: getString(R.string.fallback_file)
+        val peer = intent.getStringExtra(EXTRA_PEER) ?: getString(R.string.fallback_peer)
         val size = intent.getLongExtra(EXTRA_SIZE, 0L).toULong()
         val mime = intent.getStringExtra(EXTRA_MIME) ?: ""
 
@@ -77,8 +77,8 @@ class ReceiveService : Service() {
             inFlight.incrementAndGet()
             lastStartId = startId
             startForegroundNotification(
-                if (accepting) "Saving $filename" else "Rayfish",
-                if (accepting) "From $peer" else "Declining $filename",
+                if (accepting) getString(R.string.notif_saving_file, filename) else getString(R.string.app_name),
+                if (accepting) getString(R.string.notif_from_peer, peer) else getString(R.string.notif_declining_file, filename),
             )
         }
 

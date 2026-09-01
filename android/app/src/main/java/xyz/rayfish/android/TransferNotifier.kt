@@ -38,7 +38,9 @@ object TransferNotifier {
     private data class Posted(val transferring: Boolean, val pct: Int)
     private val postedProgress = java.util.Collections.synchronizedMap(HashMap<ULong, Posted>())
 
-    @Volatile private var channelEnsured = false
+    // The name the channel was last created with, not a plain "done" flag: see
+    // [ensureChannel].
+    @Volatile private var channelName: String? = null
     private var cancelledStaleOnStart = false
 
     /**
@@ -224,7 +226,7 @@ object TransferNotifier {
         if (postedProgress[t.id] == newState) return
 
         ensureChannel(context)
-        val title = if (t.outgoing) "Sending ${t.filename}" else "Receiving ${t.filename}"
+        val title = if (t.outgoing) context.getString(R.string.notif_sending_file, t.filename) else context.getString(R.string.notif_receiving_file, t.filename)
         val text = when {
             // Waiting on a human on the other end can take arbitrarily long, or
             // never resolve at all, and we have no way to tell the user which.
@@ -233,17 +235,17 @@ object TransferNotifier {
             // completion will be observed and notified regardless of whether
             // Rayfish's UI is open, so the caveat would be simply wrong there.
             waiting && !RayfishVpnService.isRunning ->
-                "Waiting for ${t.peer} to accept · only notified if Rayfish stays running"
-            waiting -> "Waiting for ${t.peer} to accept"
+                context.getString(R.string.notif_waiting_accept_if_running, t.peer)
+            waiting -> context.getString(R.string.notif_waiting_accept, t.peer)
             // Spell the percentage out next to the bar. The bar alone reads as
             // "something is happening" but not how far along it is, and a large
             // file's bar can look frozen for a while. `pct` is -1 only when the
             // bar is indeterminate anyway (waiting, or an empty file), so those
             // cases fall through to the plain text.
-            t.outgoing && pct >= 0 -> "To ${t.peer} ($pct%)"
-            t.outgoing -> "To ${t.peer}"
-            pct >= 0 -> "From ${t.peer} ($pct%)"
-            else -> "From ${t.peer}"
+            t.outgoing && pct >= 0 -> context.getString(R.string.notif_to_peer_pct, t.peer, pct)
+            t.outgoing -> context.getString(R.string.notif_to_peer, t.peer)
+            pct >= 0 -> context.getString(R.string.notif_from_peer_pct, t.peer, pct)
+            else -> context.getString(R.string.notif_from_peer, t.peer)
         }
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setContentTitle(title)
@@ -295,16 +297,16 @@ object TransferNotifier {
         val savedToDownloads = ok && !t.outgoing &&
             DownloadsOutcome.consume(TransferKey(t.peer, t.filename, t.size))
         val title = when {
-            ok && t.outgoing -> "Sent ${t.filename}"
-            ok -> "Saved ${t.filename}"
-            t.outgoing -> "Could not send ${t.filename}"
-            else -> "Could not receive ${t.filename}"
+            ok && t.outgoing -> context.getString(R.string.notif_sent_file, t.filename)
+            ok -> context.getString(R.string.notif_saved_file, t.filename)
+            t.outgoing -> context.getString(R.string.notif_could_not_send_file, t.filename)
+            else -> context.getString(R.string.notif_could_not_receive_file, t.filename)
         }
         val text = when {
-            ok && t.outgoing -> "${t.peer} has it"
-            savedToDownloads -> "Saved to Downloads"
-            ok -> "Saved"
-            else -> "Transfer with ${t.peer} failed"
+            ok && t.outgoing -> context.getString(R.string.notif_peer_has_it, t.peer)
+            savedToDownloads -> context.getString(R.string.notif_saved_to_downloads)
+            ok -> context.getString(R.string.notif_saved)
+            else -> context.getString(R.string.notif_transfer_failed, t.peer)
         }
         // Tapping a file actually saved to Downloads opens Downloads; anything
         // else (a send, or a receive that landed in app storage instead) opens
@@ -332,23 +334,31 @@ object TransferNotifier {
         Log.i("RayfishTransfers", "transfer ${t.id} ${t.state} (${t.filename})")
     }
 
-    /** Called on every post, but only does binder work once per process: creating an
-     * already-existing channel also silently overwrites its name/description, so a
-     * second definition anywhere would make the label in system Settings flip-flop
-     * depending on which ran last. This is the one definition; [SendService]
-     * reuses it instead of declaring its own. */
+    /** Called on every post, but only does binder work when the label it would
+     * write is not the one already there: creating an already-existing channel
+     * also silently overwrites its name/description, so a second definition
+     * anywhere would make the label in system Settings flip-flop depending on
+     * which ran last. This is the one definition; [SendService] reuses it instead
+     * of declaring its own.
+     *
+     * Guarded on the resolved name rather than a boolean because the name is
+     * localized: Android recreates activities when the device language changes
+     * but need not kill the process, so a once-per-process flag would leave the
+     * channel listed in the old language in system Settings until the next cold
+     * start. Resolving the string is a resource lookup, not a binder call. */
     internal fun ensureChannel(context: Context) {
-        if (channelEnsured) return
+        val name = context.getString(R.string.notif_channel_transfers)
+        if (channelName == name) return
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "File transfers",
+            name,
             NotificationManager.IMPORTANCE_LOW,
-        ).apply { description = "Progress and results for files sent and received over the mesh" }
+        ).apply { description = context.getString(R.string.notif_channel_transfers_desc) }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        // Set only after the channel actually exists: another thread reading
-        // channelEnsured == true before createNotificationChannel returns could
+        // Set only after the channel actually exists: another thread reading a
+        // matching channelName before createNotificationChannel returns could
         // notify() on a channel the platform doesn't know about yet and have the
         // notification silently dropped.
-        channelEnsured = true
+        channelName = name
     }
 }

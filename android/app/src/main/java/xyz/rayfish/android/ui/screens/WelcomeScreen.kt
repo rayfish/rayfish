@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
@@ -40,33 +41,31 @@ fun WelcomeScreen(onDone: () -> Unit) {
             Modifier.fillMaxSize().padding(padding).padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            BrandHeader(title = "Rayfish")
+            BrandHeader(title = stringResource(xyz.rayfish.android.R.string.app_name))
             Spacer(Modifier.weight(1f))
             SectionCard {
-                SectionLabel("This device")
+                SectionLabel(stringResource(xyz.rayfish.android.R.string.label_this_device))
                 Text(
-                    "Rayfish gives this device an identity of its own. Peers know it by that " +
-                        "and nothing else, so it is worth keeping.",
+                    stringResource(xyz.rayfish.android.R.string.welcome_body),
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted,
                 )
                 Spacer(Modifier.height(14.dp))
                 PillButton(
-                    "Get started",
+                    stringResource(xyz.rayfish.android.R.string.welcome_get_started),
                     onClick = onDone,
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !restoring,
                 )
                 Spacer(Modifier.height(8.dp))
                 OutlinePillButton(
-                    "Restore a backup",
+                    stringResource(xyz.rayfish.android.R.string.welcome_restore),
                     onClick = { restoring = true },
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !restoring,
                 )
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    "Restoring moves an identity from another device, or back from a backup " +
-                        "you saved. You will need the password you chose for it.",
+                    stringResource(xyz.rayfish.android.R.string.welcome_restore_hint),
                     fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
                 )
             }
