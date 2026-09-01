@@ -960,6 +960,12 @@ pub struct PeerStatus {
     /// traffic from the others that merely offer.
     #[serde(default)]
     pub exit_in_use: bool,
+    /// True when this peer holds the network's secret key (`Member.is_coordinator`
+    /// in the signed roster): the node that admits members and signs the blob.
+    /// Shown as a marker in status, since "who approves a join" is otherwise only
+    /// visible on the coordinator's own header.
+    #[serde(default)]
+    pub is_coordinator: bool,
 }
 
 /// Three-state peer liveness for `ray status`.
@@ -1926,6 +1932,7 @@ mod tests {
                     state: PeerState::Idle,
                     exit_node: false,
                     exit_in_use: false,
+                    is_coordinator: false,
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,
