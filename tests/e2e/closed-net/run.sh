@@ -97,12 +97,16 @@ sleep 8
 
 # ---------------------------------------------------------------------------
 step "5. gatekeeper resilience — co-coordinator admits while srv-a is offline"
-KEY="$(mint_reusable "$B" "$NET")"   # srv-b (now a co-coordinator) mints a reusable key
-[[ -n "$KEY" ]] && pass "co-coordinator minted a reusable key (${KEY:0:12}…)" || fail "co-coordinator could not mint a key"
+# Not `KEY`: that name is common.sh's SSH private key, and overwriting it points
+# every later `on` at a join code as an identity file. ssh warns and falls back
+# to its default identity, so the run limps on here and breaks outright on a
+# fleet that only accepts a non-default SSH_KEY.
+REUSABLE="$(mint_reusable "$B" "$NET")"   # srv-b (now a co-coordinator) mints a reusable key
+[[ -n "$REUSABLE" ]] && pass "co-coordinator minted a reusable key (${REUSABLE:0:12}…)" || fail "co-coordinator could not mint a key"
 on "$A" 'ray down' >/dev/null 2>&1 || true   # original coordinator goes offline
 sleep 3
 # srv-c joins unattended; only srv-b is online to admit it.
-on "$C" "ray join $KEY --hostname srv-c --auto-accept-firewall" 2>&1 | strip | sed 's/^/   c| /'
+on "$C" "ray join $REUSABLE --hostname srv-c --auto-accept-firewall" 2>&1 | strip | sed 's/^/   c| /'
 wait_roster "$B" srv-c
 on "$A" 'ray up' >/dev/null 2>&1 || true     # bring the coordinator back
 

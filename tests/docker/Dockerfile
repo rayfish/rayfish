@@ -24,7 +24,18 @@ RUN apt-get update \
 # Host keys at build time so they stay stable across container recreation: the
 # runner's known_hosts survives a fleet being rebuilt.
 # No ttys in a container, and a failed getty leaves systemd degraded.
-RUN systemctl mask getty.target console-getty.service
+#
+# tracefs is masked because it is not namespaced: every container shares the
+# host kernel's one `/sys/kernel/tracing`, so all the nodes' daemons open the
+# same `instances/rayfish` and read the same *consuming* `trace_pipe`. One
+# node's listen event is then delivered to whichever daemon reads first, and the
+# node that opened the socket falls back to its timer. Left mounted, that makes
+# `src/listen_events.rs` deliver on a real host and at random here, and
+# `v4bridge/run.sh` step 12 fail on a fleet-size accident. Masked, every node
+# has no tracefs, takes the timer path deterministically, and the scenario
+# reports the event path as uncovered (which it is on this backend either way).
+RUN systemctl mask getty.target console-getty.service \
+    sys-kernel-tracing.mount sys-kernel-debug.mount
 
 RUN ssh-keygen -A \
     && mkdir -p /root/.ssh /run/sshd \
