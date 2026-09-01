@@ -32,7 +32,9 @@ pub(crate) struct DnsService {
     /// `reassert_os_config` can re-apply it. `Arc` (not `Box`) so a re-apply can
     /// clone it out and run without holding the lock across the await.
     configurator: Arc<Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>>,
-    /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
+    /// Cancellation token for the re-assert task that repairs the OS DNS
+    /// configuration after another program tramples it: `run_resolv_reassert`
+    /// on Linux (direct mode only), `run_sc_reassert` on macOS.
     reassert_token: Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Cancellation token for the retry loop spawned when the initial OS-DNS
     /// configuration fails (see [`DnsService::configure`]).
@@ -81,7 +83,7 @@ impl DnsService {
 
     /// Point system DNS at the in-daemon Magic DNS resolver: detect the OS DNS
     /// backend, merge any user-configured upstreams over the captured ones, and
-    /// (Linux direct-resolv.conf mode) spawn the inotify re-assert watcher.
+    /// spawn the re-assert watcher the platform's backend needs.
     /// Failures are non-fatal: pushed to `warnings` so `ray up` can surface them.
     pub(crate) async fn configure(self: &Arc<Self>, tun_name: &str, warnings: &mut Vec<String>) {
         // Configure system DNS to route .ray queries to our in-daemon resolver.
@@ -103,7 +105,8 @@ impl DnsService {
 
     /// Take ownership of a detected OS-DNS backend: seed the resolver's
     /// upstreams, keep the configurator for `revert`, install the current search
-    /// domains, and (Linux direct mode) start the inotify re-assert watcher.
+    /// domains, and start the re-assert watcher that repairs the configuration
+    /// if something else overwrites or deletes it.
     async fn adopt_configurator(
         self: &Arc<Self>,
         c: Box<dyn dns_config::DnsConfigurator>,
@@ -164,6 +167,85 @@ impl DnsService {
                     me.recapture(why, tun_name, &watcher).await;
                 }
             });
+        }
+
+        // macOS: another VPN's DNS handling walks every service in the dynamic
+        // store, ours included. Mullvad writes its own resolver over
+        // `State:/Network/Service/rayfish/DNS` while it is connected and
+        // *removes* the key on disconnect instead of restoring what it found,
+        // so `.ray` stopped resolving the moment the other VPN went away and
+        // nothing brought it back before the next `ray up`. Poll the key and
+        // re-apply when it is gone.
+        #[cfg(target_os = "macos")]
+        {
+            let rt = CancellationToken::new();
+            // Cancel whatever the last adopt left running: `configure` can be
+            // called again without a `revert` in between (the retry loop
+            // succeeding is the usual way), and two watchers on one key would
+            // both answer the same removal.
+            if let Some(old) = self.reassert_token.lock().unwrap().replace(rt.clone()) {
+                old.cancel();
+            }
+            tokio::spawn(Arc::clone(self).run_sc_reassert(tun_name.to_string(), rt));
+        }
+    }
+
+    /// Re-install the macOS DNS configuration after another program deletes it.
+    ///
+    /// Mullvad's `talpid_dns` enumerates every service in the dynamic store when
+    /// it connects, ours included, writes its own resolver over each one, and on
+    /// disconnect *removes* them rather than putting back what it found. Our key
+    /// is a session key, so nothing reclaims it for us: `.ray` went quiet when
+    /// the other VPN was switched off, not while it was up, and stayed that way
+    /// until the next `ray up`.
+    ///
+    /// Only a key that is *gone* is repaired. One that somebody else is holding
+    /// is left to them: a VPN that owns DNS for the length of its tunnel
+    /// re-asserts on a notification of its own, so writing over it would be two
+    /// daemons overwriting each other for as long as it stays connected, which
+    /// is the fight `MERGE_COOLDOWN` avoids on Linux.
+    #[cfg(target_os = "macos")]
+    async fn run_sc_reassert(self: Arc<Self>, tun_name: String, token: CancellationToken) {
+        use dns_config::DnsKeyState;
+
+        // One line per takeover, not one per pass: another VPN holds DNS for as
+        // long as it is connected, and the key is read every few seconds.
+        let mut warned = false;
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(dns_config::SC_REASSERT_TICK) => {}
+            }
+            match dns_config::dns_key_state() {
+                DnsKeyState::Ours => warned = false,
+                DnsKeyState::Foreign => {
+                    if !warned {
+                        warned = true;
+                        tracing::warn!(
+                            "another program has taken the macOS DNS configuration for our \
+                             service; leaving it to them, so .ray names will not resolve \
+                             until they release it"
+                        );
+                    }
+                }
+                DnsKeyState::Gone => {
+                    tracing::warn!(
+                        "the macOS DNS configuration was removed under us; \
+                         re-asserting rayfish DNS"
+                    );
+                    warned = false;
+                    self.reassert_os_config(&tun_name).await;
+                    // `revert` cancels us on the way down, but it can have run
+                    // while the re-apply above was in flight: it took the
+                    // configurator with it, so its own `revert` removed the keys
+                    // before we wrote them back. Drop them rather than leave a
+                    // downed data plane's resolver in the store.
+                    if token.is_cancelled() {
+                        dns_config::remove_dns_config();
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -308,21 +390,40 @@ impl DnsService {
     }
 
     /// Re-apply the current OS-DNS configuration in place (no re-detect, no
-    /// re-capture of upstreams). Called when the exit-node full-tunnel state flips
-    /// so the macOS configurator rewrites its match domains: catch-all (route all
-    /// DNS through Magic DNS, forwarded upstream via the tunnel) while an exit is
-    /// up, `.ray`-only split DNS otherwise. No-op if DNS was never configured.
+    /// re-capture of upstreams), then put the search domains back.
+    ///
+    /// Called when the exit-node full-tunnel state flips, so the macOS
+    /// configurator rewrites its match domains: catch-all (route all DNS through
+    /// Magic DNS, forwarded upstream via the tunnel) while an exit is up,
+    /// `.ray`-only split DNS otherwise. Also how [`run_sc_reassert`] repairs a
+    /// deleted configuration. No-op if DNS was never configured.
+    ///
+    /// The second half is not optional. `apply` writes the whole key from
+    /// scratch and the only search domain it knows is `.ray` itself; the
+    /// per-network ones that make a bare `box` resolve arrive separately, via
+    /// `set_search_domains`, and a re-apply that did not reinstall them would
+    /// drop every one until the next join or leave.
     ///
     /// macOS-only: it is the only platform whose exit-node client rewrites match
     /// domains, so elsewhere this is dead code and `-D warnings` says so.
+    ///
+    /// [`run_sc_reassert`]: DnsService::run_sc_reassert
     #[cfg(target_os = "macos")]
-    pub(crate) async fn reassert_os_config(&self) {
+    pub(crate) async fn reassert_os_config(&self, tun_name: &str) {
         // Clone the Arc out, not the guard, so the lock isn't held across await.
         let configurator = self.configurator.lock().unwrap().clone();
-        if let Some(configurator) = configurator
-            && let Err(e) = configurator.apply().await
+        let Some(configurator) = configurator else {
+            return;
+        };
+        if let Err(e) = configurator.apply().await {
+            tracing::warn!(error = %e, "failed to re-apply system DNS");
+            return;
+        }
+        let domains = self.search_domains.lock().unwrap().clone();
+        if !domains.is_empty()
+            && let Err(e) = configurator.set_search_domains(&domains, tun_name).await
         {
-            tracing::warn!(error = %e, "failed to re-apply system DNS after exit-node change");
+            tracing::warn!(error = %e, "failed to reinstall search domains after re-applying system DNS");
         }
     }
 
