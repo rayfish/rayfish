@@ -459,7 +459,8 @@ impl NetworkRegistry {
             state.network_secret_key.clone()
         };
         if let Some(key) = net_secret_key
-            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
+            && let Ok(client) =
+                dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
         {
             let empty_hash = group_blob_hash(
                 &MemberList::new(),
@@ -484,7 +485,12 @@ impl NetworkRegistry {
     /// drops the target mesh-wide (`prune_departed_peers`); the coordinator also
     /// closes its own link to the target immediately. Refused on open networks
     /// (the target would auto-re-join) and against coordinators / self.
-    pub(crate) async fn kick_member(self: &Arc<Self>, network: &str, peer: &str) -> IpcMessage {
+    pub(crate) async fn kick_member(
+        self: &Arc<Self>,
+        network: &str,
+        peer: &str,
+        confirm: bool,
+    ) -> IpcMessage {
         let (state, dht_notify, has_key, mode) = match self.networks.get(network) {
             Some(h) => {
                 let (has_key, mode) = {
@@ -543,6 +549,35 @@ impl NetworkRegistry {
                 "'{display}' is a coordinator (holds the network key); kicking can't remove \
                      its access. Revoke the key instead."
             ));
+        }
+
+        // Naming one device takes the whole user (see `kick_targets`), which is
+        // not something the command line says out loud: the argument names one
+        // row and three can go. Hand the set back and let the CLI ask, unless the
+        // caller already answered (`--yes`, or a second request after the
+        // prompt). A single-row kick is what it looks like, so it goes straight
+        // through and scripts calling it keep working.
+        if targets.len() > 1 && !confirm {
+            let rows = {
+                let s = state.read().unwrap();
+                let members = s.members.all();
+                targets
+                    .iter()
+                    .map(|id| {
+                        let row = members.iter().find(|m| m.identity == *id);
+                        ipc::KickTarget {
+                            hostname: row.and_then(|m| m.hostname.clone()),
+                            short_id: id.fmt_short().to_string(),
+                            primary: *id == candidate_user,
+                        }
+                    })
+                    .collect()
+            };
+            return IpcMessage::KickConfirm {
+                network: network.to_string(),
+                display,
+                targets: rows,
+            };
         }
 
         // The two calls the ephemeral pruner makes, which is what
@@ -760,7 +795,8 @@ impl NetworkRegistry {
     /// all, which says nothing about the version.
     async fn record_mesh_version(&self, net_pubkey: &str) -> Result<Option<u32>> {
         let net_pubkey: EndpointId = net_pubkey.parse().context("invalid network key")?;
-        let client = dht::create_pkarr_client(&self.transport.endpoint)?;
+        let client =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
         let record = dht::resolve_network_packet(&client, net_pubkey).await?;
         Ok(dht::mesh_version_from_record(&record))
     }
@@ -989,7 +1025,8 @@ impl NetworkRegistry {
         // away, rather than waiting up to one publisher interval (the active-gated
         // `spawn_contact_publisher` only re-checks every TTL/2).
         if let Some(secret) = app_config.contact_secret_key.clone()
-            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
+            && let Ok(client) =
+                dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
         {
             let endpoint_id = self.transport.endpoint.id();
             tokio::spawn(async move {

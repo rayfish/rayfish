@@ -117,8 +117,9 @@ impl ConnectService {
         if contact_pubkey == self.transport.contact_public {
             return Err("cannot connect to your own contact id".to_string());
         }
-        let pkarr = dht::create_pkarr_client(&self.transport.endpoint)
-            .map_err(|e| format!("failed to create pkarr client: {e}"))?;
+        let pkarr =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
+                .map_err(|e| format!("failed to create pkarr client: {e}"))?;
         dht::resolve_contact(&pkarr, contact_pubkey)
             .await
             .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
@@ -407,7 +408,8 @@ impl ConnectService {
             return ipc_err("contact key rotation did not run".to_string());
         };
         if self.active.load(Ordering::SeqCst)
-            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
+            && let Ok(client) =
+                dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
         {
             let _ = dht::publish_contact(&client, &secret, self.transport.endpoint.id()).await;
         }

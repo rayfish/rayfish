@@ -12,6 +12,7 @@
 
 use super::*;
 use iroh::address_lookup::memory::MemoryLookup;
+use url::Url;
 
 // Fields are read starting in M2 (extracted services consume `Arc<Transport>`);
 // during M1 only the bundle is constructed, so silence the transitional warning.
@@ -33,6 +34,19 @@ pub(crate) struct Transport {
     /// registered with iroh's lookup chain, so a stale hint simply falls through
     /// to normal discovery and can never impersonate its endpoint id.
     pub(crate) warm_lookup: MemoryLookup,
+    /// The discovery relay selected for this daemon at startup. Keeping this
+    /// with the endpoint prevents a later embedded daemon from inheriting a
+    /// prior instance's process-global setting.
+    pub(crate) pkarr_relay_url: Url,
+}
+
+/// Startup-only values bundled to keep [`Transport::new`] focused on its core
+/// endpoint, identity, store, and metrics dependencies.
+pub(crate) struct TransportBootstrap {
+    pub(crate) contact_public: EndpointId,
+    pub(crate) lan_peers: Arc<LanPeers>,
+    pub(crate) warm_lookup: MemoryLookup,
+    pub(crate) pkarr_relay_url: Url,
 }
 
 impl Transport {
@@ -41,18 +55,17 @@ impl Transport {
         identity: IrohIdentityProvider,
         blob_store: FsStore,
         stats: Arc<ForwardMetrics>,
-        contact_public: EndpointId,
-        lan_peers: Arc<LanPeers>,
-        warm_lookup: MemoryLookup,
+        bootstrap: TransportBootstrap,
     ) -> Self {
         Self {
             endpoint,
             identity,
             blob_store,
             stats,
-            contact_public,
-            lan_peers,
-            warm_lookup,
+            contact_public: bootstrap.contact_public,
+            lan_peers: bootstrap.lan_peers,
+            warm_lookup: bootstrap.warm_lookup,
+            pkarr_relay_url: bootstrap.pkarr_relay_url,
         }
     }
 }

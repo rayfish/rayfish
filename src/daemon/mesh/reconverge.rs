@@ -4,6 +4,7 @@
 //! peer-cleanup-adjacent helpers that drive reconvergence live here.
 
 use std::net::Ipv6Addr;
+use url::Url;
 
 use super::super::*;
 
@@ -116,9 +117,10 @@ pub(crate) fn apply_suggested_firewall(
 /// same reason, as the mesh path.
 pub(crate) async fn resolve_signed(
     endpoint: &Endpoint,
+    relay_url: &Url,
     net_pubkey: EndpointId,
 ) -> Option<(blake3::Hash, Vec<EndpointId>, u64)> {
-    let client = dht::create_pkarr_client(endpoint).ok()?;
+    let client = dht::create_pkarr_client(endpoint, relay_url).ok()?;
     let packet = dht::resolve_network_packet(&client, net_pubkey)
         .await
         .ok()?;
@@ -261,7 +263,9 @@ pub(crate) async fn reconverge_and_apply(
         let s = state.read().unwrap();
         (s.last_record_timestamp, current_group_hash(&s))
     };
-    let Some((signed, seeds, record_ts)) = resolve_signed(endpoint, net_pubkey).await else {
+    let Some((signed, seeds, record_ts)) =
+        resolve_signed(endpoint, &registry.transport.pkarr_relay_url, net_pubkey).await
+    else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
     };

@@ -836,7 +836,9 @@ impl NetworkRegistry {
         net_secret_key: &SecretKey,
         blob_hash: blake3::Hash,
     ) -> Option<Vec<u8>> {
-        let Ok(pkarr_client) = dht::create_pkarr_client(&self.transport.endpoint) else {
+        let Ok(pkarr_client) =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
+        else {
             return None;
         };
         match dht::publish_network(
@@ -873,7 +875,9 @@ impl NetworkRegistry {
     ) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
 
-        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.transport.endpoint) {
+        if let Ok(pkarr_client) =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
+        {
             tasks.push(spawn_network_publisher(
                 pkarr_client,
                 net_secret_key.clone(),
