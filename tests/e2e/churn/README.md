@@ -41,6 +41,14 @@ what it knows when it returns came from the signed blob and not from a broadcast
 4. **Data-plane flap.** Three `ray down` / `ray up` cycles on `srv-d`. Standby is
    not leave, so the assertion is a pair: traffic stops, and the roster entry does
    not drop.
+4b. **The same flap with no `ip` binary.** `srv-d`'s iproute2 is moved aside and
+   the cycle is repeated: the link must still go down, come back up, get its
+   `200::/7` route and carry traffic, and the journal must hold no link-state
+   failure. Link state is netlink's job, not a spawned process's, and while it
+   was not, a service PATH without iproute2 failed that one step and succeeded at
+   every other, activating onto a link that had never come up. `ray ping` answers
+   over the control plane throughout, so the node looked reachable while the
+   tunnel swallowed everything. The binary is restored on every exit path.
 5. **A kick the absentee never sees.** `srv-c` is stopped, then `srv-d` is kicked.
    The coordinator and the online member drop it; the kicked node leaves the
    network itself, which it does on the signed record rather than on the message

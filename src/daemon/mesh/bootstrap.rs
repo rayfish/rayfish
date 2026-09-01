@@ -77,7 +77,13 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.registry.connect_all_networks().await;
     tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
     daemon.spawn_exit_reapply_listener();
-    daemon.activate(None).await;
+    // A failed activation returns its reason to whoever asked, and at service
+    // start that is nobody: log it here, or a daemon that never got its data
+    // plane up says nothing about why in `ray logs`. (Warnings from a partial
+    // activation are logged by `activate` itself, for the same reason.)
+    if let IpcMessage::Error { message } = daemon.activate(None).await {
+        tracing::error!("data plane did not start: {message}");
+    }
 
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
