@@ -413,7 +413,7 @@ pub(crate) enum Command {
     /// Offer or use an internet gateway
     ///
     /// Offer this node as a gateway, or route this node's traffic through one.
-    #[command(name = "exit-node")]
+    #[command(name = "exit-node", visible_alias = "e")]
     ExitNode {
         #[command(subcommand)]
         action: ExitNodeAction,
