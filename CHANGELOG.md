@@ -8,6 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android: disabling and re-enabling Rayfish no longer strands a DNS retry
+  loop each time.** The loop that keeps trying to hand system DNS over to the
+  mesh is stopped by going on standby, but not by going fully offline, and it
+  survives in the app's process because the node is rebuilt around it. Android
+  never accepts that handover, so the loop can never finish on its own: every
+  "go fully offline" cycle left another one behind, waking the device once a
+  minute for the rest of the app's life and filling the diagnostics log with its
+  own retries. One device had three, between them crowding out most of what the
+  log was there to capture.
+
+- **Android diagnostics now include the app's own log, not just the core's.**
+  Everything that decides whether the tunnel comes up at all happens on the
+  Android side, so a report sent because Rayfish would not come back on used to
+  arrive showing a healthy core and no sign of the attempt that failed.
+
 - **A peer no longer advertises addresses of an IP family its VPN has taken
   away.** With Mullvad connected and IPv6 disabled in its tunnel, the host keeps
   its IPv6 addresses while the route behind them is gone, so every IPv6 send

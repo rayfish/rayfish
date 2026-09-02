@@ -356,7 +356,13 @@ impl DnsService {
     /// just changed and the whole point is to act on it now.
     fn spawn_configure_retry(self: &Arc<Self>, tun_name: String, first_delay: Duration) {
         let token = CancellationToken::new();
-        *self.configure_retry.lock().unwrap() = Some(token.clone());
+        // Cancel whatever this replaces. `configure` and `revert` already cancel
+        // before they call in here, but `recapture` does not, and a token that is
+        // dropped from the cell without being cancelled leaves its loop running
+        // with nothing left that can ever stop it.
+        if let Some(previous) = self.configure_retry.lock().unwrap().replace(token.clone()) {
+            previous.cancel();
+        }
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let mut delay = first_delay;
@@ -469,11 +475,81 @@ impl DnsService {
         dns_config::nm_quiet_remove().await;
         dns_config::clear_search_domains(tun_name).await;
     }
+
+    /// Stop the background tasks (`configure` retry, re-assert watcher) without
+    /// touching OS state. For a node going offline for good, where `revert`'s
+    /// undo work is either already done or about to be irrelevant, but the tasks
+    /// must not outlive the daemon that owns them.
+    ///
+    /// An embedder that rebuilds a daemon in the same process needs this: the
+    /// retry loop holds an `Arc<DnsService>` and runs on a runtime that survives
+    /// the node, so without a cancel here every stop/start cycle strands another
+    /// copy of this service, retrying forever against a platform that already
+    /// refused it. Observed on Android (where OS-DNS configuration always fails,
+    /// so the loop never exits on its own): three live loops after three
+    /// disable/enable cycles, between them filling most of the diagnostics log
+    /// ring with retry chatter.
+    pub(crate) fn shutdown_background(&self) {
+        if let Some(rt) = self.reassert_token.lock().unwrap().take() {
+            rt.cancel();
+        }
+        if let Some(retry) = self.configure_retry.lock().unwrap().take() {
+            retry.cancel();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service() -> Arc<DnsService> {
+        let table = dns::HostnameTable::default();
+        let reverse = dns::ReverseLookupTable::default();
+        let resolver = std::sync::Arc::new(crate::dns::resolver::Resolver::new(
+            table.clone(),
+            reverse.clone(),
+        ));
+        Arc::new(DnsService::new(
+            table,
+            reverse,
+            resolver,
+            Ipv6Addr::UNSPECIFIED,
+        ))
+    }
+
+    /// A second retry loop must cancel the first. `recapture` spawns without
+    /// cancelling, and a token merely dropped from the cell leaves its loop with
+    /// nothing that can ever stop it: on a platform that always refuses OS-DNS
+    /// configuration (Android) that loop then retries for the life of the
+    /// process.
+    #[tokio::test]
+    async fn spawning_a_retry_cancels_the_one_it_replaces() {
+        let dns = service();
+        dns.spawn_configure_retry("tun0".into(), Duration::from_secs(3600));
+        let first = dns.configure_retry.lock().unwrap().clone().unwrap();
+
+        dns.spawn_configure_retry("tun0".into(), Duration::from_secs(3600));
+        assert!(first.is_cancelled(), "the replaced loop was left running");
+
+        let second = dns.configure_retry.lock().unwrap().clone().unwrap();
+        assert!(!second.is_cancelled(), "the new loop must still be live");
+    }
+
+    /// A node going offline has to stop the retry loop even though `revert` was
+    /// never called. The loop holds an `Arc<DnsService>` on a runtime that
+    /// outlives the daemon, so on an embedder that rebuilds in-process an
+    /// uncancelled one strands the whole service.
+    #[tokio::test]
+    async fn shutdown_cancels_the_retry_loop() {
+        let dns = service();
+        dns.spawn_configure_retry("tun0".into(), Duration::from_secs(3600));
+        let token = dns.configure_retry.lock().unwrap().clone().unwrap();
+
+        dns.shutdown_background();
+        assert!(token.is_cancelled());
+        assert!(dns.configure_retry.lock().unwrap().is_none());
+    }
 
     /// Declining is only safe with somebody to decline *to*. Both halves of
     /// that come from the backend: another mesh sharing the file, and at least

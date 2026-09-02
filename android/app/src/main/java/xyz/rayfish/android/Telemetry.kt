@@ -8,7 +8,9 @@ import io.sentry.Attachment
 import io.sentry.Sentry
 import io.sentry.SentryLevel
 import io.sentry.android.core.SentryAndroid
+import io.sentry.android.core.SentryLogcatAdapter as Log
 import io.sentry.protocol.SentryId
+import java.util.concurrent.TimeUnit
 
 /**
  * Sentry crash reporting, gated by the user's opt-out toggle in the You screen.
@@ -107,6 +109,38 @@ object Telemetry {
     @Volatile
     private var lastFailureReportMs = 0L
 
+    /**
+     * This process's own logcat, newest [LOGCAT_LINES] lines of it.
+     *
+     * `--pid` of ourselves needs no permission: READ_LOGS only governs reading
+     * *other* apps' output, and every device since API 16 restricts an
+     * unprivileged reader to its own buffer anyway. A device that refuses
+     * outright (some OEM builds do) returns empty rather than throwing, so a
+     * report still goes out with the Rust log alone.
+     *
+     * Bounded and drained on a timeout: this runs on the same IO dispatcher as
+     * the rest of the send, and `logcat -d` on a busy buffer can outlive the
+     * user's patience.
+     */
+    private fun androidLog(): String = try {
+        val process = ProcessBuilder(
+            "logcat", "-d", "-t", LOGCAT_LINES.toString(), "--pid", android.os.Process.myPid().toString(),
+        ).redirectErrorStream(true).start()
+        val out = process.inputStream.bufferedReader().use { it.readText() }
+        if (!process.waitFor(LOGCAT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) process.destroy()
+        out
+    } catch (t: Throwable) {
+        Log.w(TAG, "could not capture logcat for diagnostics", t)
+        ""
+    }
+
+    private const val TAG = "RayfishTelemetry"
+
+    /** Enough to cover a bring-up attempt and the minutes around it. */
+    private const val LOGCAT_LINES = 2000
+
+    private const val LOGCAT_TIMEOUT_SECONDS = 5L
+
     /** Full log snapshot as a Sentry attachment. Returns the event id, or null
      * when Sentry is off / the send failed. Best-effort. */
     fun sendDiagnostics(context: Context): String? {
@@ -140,6 +174,18 @@ object Telemetry {
             // may or may not exist is worse to read than one that never does.
             if (logs.isNotEmpty()) {
                 scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
+            }
+            // The core's ring buffer only ever holds the Rust side. Every decision
+            // about whether there is a tunnel at all is made in Kotlin
+            // (RayfishVpnService's bring-up and teardown, NodeHolder's start/stop
+            // and network callbacks), so a report sent because "it would not come
+            // back on" arrives with no trace of the attempt that failed: the Rust
+            // log shows a healthy node and nothing else. Ship our own logcat too.
+            val appLogs = androidLog()
+            if (appLogs.isNotEmpty()) {
+                scope.addAttachment(
+                    Attachment(appLogs.toByteArray(), "rayfish-android.txt", "text/plain")
+                )
             }
             if (health != null) {
                 scope.setContexts("rayfish", mapOf(
