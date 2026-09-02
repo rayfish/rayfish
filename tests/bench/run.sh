@@ -21,6 +21,11 @@ ROOT="$(cd "$DIR/../.." && pwd)"
 SERVERS="$DIR/.servers"
 DURATION="${DURATION:-10}"      # iperf3 seconds per run
 ITERATIONS="${ITERATIONS:-3}"   # repeats per measurement; reported value is the mean
+# High-rate probe used to expose short transport queues.  The ordinary RTT
+# number below intentionally remains a low-rate mean so it stays comparable to
+# earlier results; this profile is the latency-under-load complement.
+PING_COUNT="${PING_COUNT:-300}"
+PING_INTERVAL="${PING_INTERVAL:-0.01}"
 # shellcheck source=../lib/common.sh
 source "$ROOT/tests/lib/common.sh"
 
@@ -92,6 +97,35 @@ ping_rtt(){
   echo "$out" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' | head -1
 }
 
+# ping_profile <from-ip> <target-ip> ->
+# mean<TAB>p50<TAB>p95<TAB>p99<TAB>max<TAB>loss-percent
+#
+# A 200 ms ping hides the burst-and-drain failure mode of a datagram tunnel.
+# Keep every RTT from a short 100 pps run, rather than reporting just its mean,
+# so a p99 regression is visible in CI results.  This runs as root on the test
+# droplets, where Linux permits sub-200 ms ping intervals.
+ping_profile(){
+  local out values loss
+  out="$(on "$1" "ping -n -c $PING_COUNT -i $PING_INTERVAL -W 2 $2" 2>/dev/null)"
+  values="$(printf '%s\n' "$out" | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p' | sort -n)"
+  loss="$(printf '%s\n' "$out" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' | head -1)"
+  [[ -n "$loss" ]] || loss="?"
+  if [[ -z "$values" ]]; then
+    printf '?\t?\t?\t?\t?\t%s\n' "$loss"
+    return
+  fi
+  printf '%s\n' "$values" | awk -v loss="$loss" '
+    { samples[++n] = $1; sum += $1 }
+    END {
+      # Inputs are sorted.  Use nearest-rank percentiles: the worst 1%% of
+      # samples is at or above p99, which is the useful alerting threshold.
+      p50 = int(n * .50 + .999); if (p50 < 1) p50 = 1
+      p95 = int(n * .95 + .999); if (p95 < 1) p95 = 1
+      p99 = int(n * .99 + .999); if (p99 < 1) p99 = 1
+      printf "%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\n", sum / n, samples[p50], samples[p95], samples[p99], samples[n], loss
+    }'
+}
+
 # tcp_bw <client-ip> <server-listen-ip> <server-host-ip> [reverse] -> Mbit/s
 # server-listen-ip: address iperf3 -s binds to (so we pick public vs vpn iface)
 # server-host-ip:   ssh target to start the server on
@@ -142,6 +176,20 @@ bench_pair "B -> A" "$B" "$A_PUB" "$A" "direct"
 bench_pair "B -> A" "$B" "$A_VPN" "$A" "rayfish"
 
 # ---------------------------------------------------------------------------
+step "6. high-rate latency profile (${PING_COUNT} probes, ${PING_INTERVAL}s interval)"
+LATENCY_RAW="$RESDIR/$STAMP.latency.raw"; : > "$LATENCY_RAW"
+profile(){ # profile <dir-label> <client-ip> <target-ip> <path>
+  local dir="$1" client="$2" target="$3" path="$4" result
+  result="$(ping_profile "$client" "$target")"
+  printf '   %-22s %-8s mean/p50/p95/p99/max/loss = %s\n' "$dir" "$path" "$result"
+  printf '%s\t%s\t%s\n' "$dir" "$path" "$result" >> "$LATENCY_RAW"
+}
+profile "A -> B" "$A" "$B_PUB" "direct"
+profile "A -> B" "$A" "$B_VPN" "rayfish"
+profile "B -> A" "$B" "$A_PUB" "direct"
+profile "B -> A" "$B" "$A_VPN" "rayfish"
+
+# ---------------------------------------------------------------------------
 step "results"
 ratio(){ # ratio <rayfish> <direct> -> percentage of direct
   local r="$1" d="$2"
@@ -169,10 +217,19 @@ REPORT="$RESDIR/$STAMP.md"
     printf '| %s | TCP tx (Mbit/s) | %s | %s | %s |\n' "$dir" "$(get "$dir" direct 4)" "$(get "$dir" rayfish 4)" "$(ratio "$(get "$dir" rayfish 4)" "$(get "$dir" direct 4)")"
     printf '| %s | TCP rx (Mbit/s) | %s | %s | %s |\n' "$dir" "$(get "$dir" direct 5)" "$(get "$dir" rayfish 5)" "$(ratio "$(get "$dir" rayfish 5)" "$(get "$dir" direct 5)")"
   done
+  echo
+  echo "## High-rate latency (${PING_COUNT} probes at ${PING_INTERVAL}s)"
+  echo
+  echo '| Direction | Path | Mean (ms) | p50 | p95 | p99 | Max | Loss |'
+  echo '|---|---|---:|---:|---:|---:|---:|---:|'
+  while IFS=$'\t' read -r dir path mean p50 p95 p99 max loss; do
+    printf '| %s | %s | %s | %s | %s | %s | %s | %s%% |\n' "$dir" "$path" "$mean" "$p50" "$p95" "$p99" "$max" "$loss"
+  done < "$LATENCY_RAW"
 } | tee "$REPORT"
 
 echo
 echo "Saved: $REPORT"
 echo "Raw:   $RAW"
+echo "Latency raw: $LATENCY_RAW"
 echo
 echo "Tear down with: tests/bench/teardown.sh"

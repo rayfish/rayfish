@@ -29,6 +29,12 @@ here, which you can also invoke directly once `.servers` exists). Overrides:
 `KEEP_STATE=1` (skip the state wipe and re-use an existing network) for the run.
 Results are printed and saved to `results/<stamp>.md` (+ `.raw` TSV).
 
+Each run also performs a 100-packet-per-second latency profile and reports
+mean, p50, p95, p99, maximum, and loss for the direct and Rayfish paths. This
+is intentionally separate from the low-rate mean RTT: queueing bugs can leave
+the mean looking reasonable while causing large tail spikes. Set `PING_COUNT`
+and `PING_INTERVAL` to adjust it (defaults: `300`, `0.01` seconds).
+
 ## Caveats
 
 `s-1vcpu-1gb` has a single shared vCPU, so single-stream TCP is **CPU-bound**:
