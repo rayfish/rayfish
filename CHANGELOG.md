@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A peer no longer advertises addresses of an IP family its VPN has taken
+  away.** With Mullvad connected and IPv6 disabled in its tunnel, the host keeps
+  its IPv6 addresses while the route behind them is gone, so every IPv6 send
+  fails with "no route to host". Those addresses were still published as ways to
+  reach the node, and peers kept dialling them: each attempt opened a path that
+  could not be answered, closed it, and the two ends churned for as long as the
+  VPN stayed up, falling back to a relay in between. Candidates are now checked
+  against the routing table before they are published. Only globally routable
+  ones are checked, so a LAN address on a network with no IPv6 from its ISP still
+  gets advertised and on-link peers still connect directly.
+
 - **Linux: the VPN interface is brought up and down through the kernel, with no
   `ip` binary needed.** Bringing the link up and down was the one step that
   shelled out to `iproute2` while the address and the route next to it went
