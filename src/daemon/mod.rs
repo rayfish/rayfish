@@ -1128,6 +1128,11 @@ impl Daemon {
             NodeKey::Global(GlobalKey::Ssh) => return self.ssh_config_set(value),
             // Likewise: the bridge's listeners follow the setting live.
             NodeKey::Global(GlobalKey::V4Bridge) => return self.v4_bridge_config_set(value),
+            // Likewise: the pf anchor follows the setting live, and on this key
+            // a write that waits for a restart leaves the mesh dead meanwhile.
+            NodeKey::Global(GlobalKey::PfPassthrough) => {
+                return self.pf_passthrough_config_set(value);
+            }
             // Spelled out rather than caught by `_`, so a new global key cannot
             // land here by default. Falling through silently is precisely the
             // `ssh` bug: a key whose write needs a live side effect, getting
@@ -1651,15 +1656,16 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         // Spelled out rather than caught by `_`, so a new global key cannot
         // inherit this generic wording (and its "Restart the daemon" claim) by
         // default. `Ssh` and `V4Bridge` never reach here (`config_apply` routes
-        // them to their own setters); they are listed only to keep the match
-        // exhaustive.
+        // them to their own setters, as does `PfPassthrough`); they are listed
+        // only to keep the match exhaustive.
         k @ (GlobalKey::Relay
         | GlobalKey::DiscoveryDns
         | GlobalKey::DnsUpstreams
         | GlobalKey::AutoUpdate
         | GlobalKey::OnDemand
         | GlobalKey::Ssh
-        | GlobalKey::V4Bridge) => {
+        | GlobalKey::V4Bridge
+        | GlobalKey::PfPassthrough) => {
             if reset {
                 format!("Reset {k} to default. {restart}")
             } else {

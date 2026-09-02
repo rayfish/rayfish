@@ -1208,6 +1208,26 @@ impl Daemon {
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {err}"));
             }
 
+            // Another VPN's kill switch ends in a catch-all block, and its
+            // allow-list names the private ranges, which `200::/7` is not one
+            // of: without a pass rule of ours ahead of it the mesh dies the
+            // moment that VPN connects, with the packets dropped before they
+            // ever reach the TUN. See `crate::hostfw`.
+            #[cfg(target_os = "macos")]
+            if config::load().map(|c| c.pf_passthrough).unwrap_or(true) {
+                if let Err(e) = crate::hostfw::install_tun_passthrough(&tun_name) {
+                    let err = format!("{e:#}");
+                    tracing::warn!(error = %err, "failed to load the pf passthrough anchor");
+                    warnings.push(format!("failed to load the pf passthrough anchor: {err}"));
+                }
+            } else if let Some(w) = crate::hostfw::pf_block_warning() {
+                // Turned off by hand on a host where something is in fact
+                // default-denying. Say which ruleset, or the operator is left
+                // reading a mesh that is up and carries nothing.
+                tracing::warn!("{w}");
+                warnings.push(w);
+            }
+
             // Loop our own addresses back through lo0 so self-traffic (e.g.
             // pinging our own hostname) is answered locally instead of leaving via
             // the TUN, where the forwarding loop would drop it as "no peer for
@@ -1737,6 +1757,12 @@ impl Daemon {
         // A link that will not go down keeps the address and the `200::/7` route,
         // so the host still routes the overlay into a TUN whose writer is now
         // dropping everything: peer traffic black-holes instead of failing fast.
+        // Ours to clean up, and pf rules outlive the process: an anchor still
+        // passing an interface that no longer exists is harmless but is state we
+        // left behind.
+        #[cfg(target_os = "macos")]
+        crate::hostfw::remove_tun_passthrough();
+
         #[cfg(not(target_os = "android"))]
         if let Err(e) = tun::set_link_down(&tun_name).await {
             tracing::warn!(error = %format!("{e:#}"), "failed to bring TUN interface down");

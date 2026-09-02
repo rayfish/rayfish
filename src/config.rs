@@ -476,6 +476,13 @@ pub struct AppConfig {
     /// `crate::v4bridge`.
     #[serde(default = "default_true")]
     pub v4_bridge: bool,
+    /// macOS only: load a pf anchor that passes traffic on the mesh interface
+    /// (`ray config set pf-passthrough off`). On by default. Another VPN's kill
+    /// switch ends in a catch-all block and its allow-list names private ranges
+    /// the overlay is not in, so without this the mesh dies the moment that VPN
+    /// connects. See `crate::hostfw`.
+    #[serde(default = "default_true")]
+    pub pf_passthrough: bool,
     /// On-demand connection mode (battery-minimizing, Tailscale-style). When on,
     /// the node does not eagerly dial peers at startup: it restores memberships and
     /// the roster locally, dials a peer lazily on the first outgoing packet that
@@ -544,6 +551,7 @@ impl Default for AppConfig {
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
             v4_bridge: true,
+            pf_passthrough: true,
             on_demand: true,
             idle_timeout_secs: None,
             auto_update: false,
@@ -690,6 +698,8 @@ struct Settings {
     ssh_enabled: bool,
     #[serde(default = "default_true")]
     v4_bridge: bool,
+    #[serde(default = "default_true")]
+    pf_passthrough: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1368,6 +1378,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         v4_bridge: settings.v4_bridge,
+        pf_passthrough: settings.pf_passthrough,
         on_demand: settings.on_demand,
         idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
@@ -1436,6 +1447,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         v4_bridge: config.v4_bridge,
+        pf_passthrough: config.pf_passthrough,
         on_demand: config.on_demand,
         idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,

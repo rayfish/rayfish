@@ -2075,7 +2075,7 @@ fn enable(_tun_name: &str) -> Result<()> {
     ensure_anchor_referenced()?;
 
     let v6 = default_interface("-inet6");
-    pf_load_anchor(&nat_rules(v6.as_deref()))?;
+    pf_load_anchor(ANCHOR, &nat_rules(v6.as_deref()))?;
     tracing::info!(v6 = ?v6, "exit node forwarding + NAT enabled");
     Ok(())
 }
@@ -2185,13 +2185,15 @@ fn pf_running() -> bool {
         .unwrap_or(true)
 }
 
-/// Replace our anchor's ruleset with `rules`.
+/// Replace `anchor`'s ruleset with `rules`. Shared with [`crate::hostfw`], which
+/// loads a second anchor of ours for a different job; the pf primitives live
+/// here because this module is where the rest of them already are.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn pf_load_anchor(rules: &str) -> Result<()> {
+pub(crate) fn pf_load_anchor(anchor: &str, rules: &str) -> Result<()> {
     use std::io::Write as _;
     use std::process::Stdio;
     let mut child = Command::new("pfctl")
-        .args(["-a", ANCHOR, "-f", "-"])
+        .args(["-a", anchor, "-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -2264,7 +2266,7 @@ fn default_interface(family: &str) -> Option<String> {
 /// Run `pfctl` and return its combined output (it reports most of what we ask for on
 /// stderr). Errors if it exits non-zero.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn pfctl(args: &[&str]) -> Result<String> {
+pub(crate) fn pfctl(args: &[&str]) -> Result<String> {
     let out = Command::new("pfctl")
         .args(args)
         .output()
