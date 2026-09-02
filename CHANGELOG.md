@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **macOS: the mesh survives another VPN's kill switch.** Connecting Mullvad
+  took the mesh down on the spot, and it stayed down for as long as that VPN was
+  connected: pings to a peer got no reply, while the daemon, its routes and its
+  transport were all healthy. The traffic such a firewall permits is enumerated
+  (its own tunnel and resolvers, and with local network sharing on, the private
+  IPv4 ranges plus `fc00::/7`), and it blocks everything else, so the overlay's
+  `200::/7` matched nothing and was dropped before it ever reached Rayfish.
+  Another mesh VPN on the same host is unaffected only because its addresses
+  happen to fall inside `fc00::/7`. Rayfish now loads a rule of its own that
+  passes traffic on the mesh interface, evaluated ahead of that VPN's rules.
+  Nothing leaves the host in the clear: the rule matches the mesh interface
+  alone, and what the daemon sends on is still routed by the table the other VPN
+  owns. `ray config set pf-passthrough off` turns it off, and `ray up` then
+  reports which ruleset is swallowing the traffic instead of leaving you to find
+  out.
+
 - **Android: disabling and re-enabling Rayfish no longer strands a DNS retry
   loop each time.** The loop that keeps trying to hand system DNS over to the
   mesh is stopped by going on standby, but not by going fully offline, and it

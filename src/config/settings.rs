@@ -46,6 +46,9 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         // Like `ssh`, only half the work: the live bridge has to start or stop
         // with it (see `Daemon::v4_bridge_config_set`).
         GlobalKey::V4Bridge => cfg.v4_bridge = parse_bool(value, true)?,
+        // Like `ssh` and `v4-bridge`, only half the work: the live pf anchor
+        // has to follow it (see `Daemon::pf_passthrough_config_set`).
+        GlobalKey::PfPassthrough => cfg.pf_passthrough = parse_bool(value, true)?,
         // Validated here, not in the CLI arm, so every caller is bound by it: a
         // relative download dir would resolve against the daemon's cwd, not the
         // user's.
@@ -132,6 +135,7 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
         GlobalKey::V4Bridge => on_off(cfg.v4_bridge),
+        GlobalKey::PfPassthrough => on_off(cfg.pf_passthrough),
         // Empty renders as unset, matching the `net.ephemeral-ttl` convention.
         GlobalKey::DownloadDir => cfg.download_dir.clone().unwrap_or_default(),
         GlobalKey::DownloadUser => cfg.download_user.map(|u| u.to_string()).unwrap_or_default(),
@@ -349,6 +353,19 @@ mod tests {
         // whether a bridged port answers, and it denies inbound by default.
         apply_global(&mut cfg, GlobalKey::V4Bridge, "", false).unwrap();
         assert!(cfg.v4_bridge);
+    }
+
+    #[test]
+    fn the_pf_passthrough_toggles_and_unsets_back_on() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.pf_passthrough, "on by default");
+        apply_global(&mut cfg, GlobalKey::PfPassthrough, "off", false).unwrap();
+        assert!(!cfg.pf_passthrough);
+        assert_eq!(render_global(&cfg, GlobalKey::PfPassthrough), "off");
+        // Unset is on: a host that never meets a default-deny ruleset loads an
+        // anchor nothing evaluates, which costs it nothing.
+        apply_global(&mut cfg, GlobalKey::PfPassthrough, "", false).unwrap();
+        assert!(cfg.pf_passthrough);
     }
 
     #[test]

@@ -84,6 +84,7 @@ setting_keys! {
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";
         Ssh = "ssh", "embedded mesh SSH server (on|off)";
         V4Bridge = "v4-bridge", "reach this host's IPv4-only listeners over the mesh (on|off)";
+        PfPassthrough = "pf-passthrough", "macOS: keep the mesh alive under another VPN's firewall (on|off)";
         DownloadDir = "download-dir", "directory accepted files land in (absolute path, empty to clear)";
         DownloadUser = "download-user", "uid that owns accepted files (numeric, empty to clear)";
     }

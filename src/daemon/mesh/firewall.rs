@@ -517,6 +517,57 @@ impl Daemon {
         IpcMessage::Ok { message }
     }
 
+    /// Write the `pf-passthrough` setting and make the live pf anchor follow it.
+    ///
+    /// Its own setter for the same reason `v4-bridge` has one, with more at
+    /// stake: a write that waited for the next restart would leave the mesh dead
+    /// for the rest of the session on a host whose other VPN is already
+    /// default-denying.
+    pub(crate) fn pf_passthrough_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        let mut parse_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = settings::apply_global(cfg, GlobalKey::PfPassthrough, value, false) {
+                parse_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = parse_err {
+            return ipc_err(e);
+        }
+        let enabled = match saved {
+            Ok(cfg) => cfg.pf_passthrough,
+            Err(e) => return ipc_err(format!("failed to persist pf-passthrough setting: {e}")),
+        };
+        // Reflect immediately if the data plane is up (else activate() loads it).
+        #[cfg(all(target_os = "macos", feature = "desktop"))]
+        if self.active.load(Ordering::SeqCst) {
+            if enabled {
+                let tun = self.tun_name.load().as_str().to_owned();
+                if let Err(e) = crate::hostfw::install_tun_passthrough(&tun) {
+                    return ipc_err(format!("failed to load the pf passthrough anchor: {e:#}"));
+                }
+            } else {
+                crate::hostfw::remove_tun_passthrough();
+            }
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "pf passthrough {}. {}",
+                if enabled { "on" } else { "off" },
+                if enabled {
+                    "Mesh traffic is passed ahead of any other VPN's pf ruleset, so the \
+                     mesh keeps working while that VPN is connected. Nothing leaves this \
+                     host in the clear: the rule matches the mesh interface only, and what \
+                     the daemon sends on is still routed by the table that VPN owns."
+                } else {
+                    "Another VPN whose ruleset ends in a catch-all block will drop mesh \
+                     traffic on this host while it is connected."
+                }
+            ),
+        }
+    }
+
     /// Write the `v4-bridge` setting and make the running bridge follow it.
     ///
     /// A plain config write would leave the listeners up until the next restart,

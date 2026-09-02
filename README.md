@@ -503,7 +503,8 @@ custom server with no fallback can isolate the node). Settings are saved to
 
 ## Running alongside another VPN
 
-Nothing to configure. Rayfish's overlay is IPv6-only, in `200::/7`, and it never
+Nothing to configure, with one exception on macOS covered at the end of this
+section. Rayfish's overlay is IPv6-only, in `200::/7`, and it never
 claims `100.64.0.0/10` at all. Tailscale (and anything else built on CGNAT
 space) can have that range to itself, and the two coexist without either of
 them stepping aside.
@@ -545,6 +546,19 @@ it would be black-holed the moment the tunnel came up. The rule matters as much
 as the copy, and covers a case the copy alone does not: an SSH session that came
 *in* over that VPN has replies sourced from its address, and those take a
 higher-priority rule that looks up `main`, where the prefix isn't.
+
+On macOS, a VPN with a kill switch is the one case that needs something from
+us. Those rulesets permit a fixed list (their own tunnel and resolvers, and,
+with local network sharing on, the private IPv4 ranges and `fc00::/7`) and block
+everything else. The overlay's `200::/7` is not private space and is on none of
+those lists, so without help the mesh dies the moment such a VPN connects, with
+packets dropped before they reach us. Rayfish loads a pf rule passing traffic on
+its own interface, evaluated ahead of that VPN's rules, which restores the mesh
+without weakening the other VPN: the rule matches the mesh interface alone, and
+what the daemon sends on is still routed by the table that VPN owns. Turn it off
+with `ray config set pf-passthrough off`; `ray up` then names the ruleset that
+is dropping mesh traffic, rather than leaving a working-looking mesh that
+carries nothing.
 
 NetworkManager's DNS backend is not used at all: it can only carry an IPv4
 nameserver, and rayfish's resolver is IPv6. The next backend down takes over.
