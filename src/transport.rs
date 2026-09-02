@@ -4,6 +4,7 @@
 //! and mesh-protocol version gating (see `MESH_PROTOCOL_VERSION`).
 //! A single shared iroh [`Endpoint`] handles all networks, filtering by ALPN on accept.
 
+use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result};
@@ -14,10 +15,12 @@ use iroh::{
     dns::{DnsProtocol, DnsResolver},
     endpoint::Connection,
     endpoint::presets,
-    endpoint::{BindOpts, Builder, DirectAddrFilter, QuicTransportConfig},
+    endpoint::{BindOpts, Builder, DirectAddrFilter, QuicTransportConfig, SocketConfigurator},
 };
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::config::ServerOverride;
+use crate::exit_node::{LoopPrevention, is_transitable};
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
@@ -300,7 +303,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
     // (the underlay UDP sockets and the relay connection) off the default route that
     // `ray up` points into the TUN, instead of looping the transport back through the
     // tunnel it is carrying. See `exit_node::LoopPrevention`.
-    builder = builder.configure_socket(crate::exit_node::LoopPrevention);
+    builder = builder.configure_socket(LoopPrevention);
 
     // Override the N0 preset's relay / discovery defaults when configured.
     if let Some(mode) = build_relay_mode(relay)? {
@@ -363,15 +366,91 @@ fn is_foreign_overlay_ip(ip: std::net::IpAddr) -> bool {
 /// Tailscale would otherwise publish its tailnet address in a public pkarr
 /// record: it names a network no rayfish peer can route to, and it leaks the
 /// fact (and address) of that tailnet to anyone who reads the record.
+///
+/// A *global* candidate whose family this host cannot currently route goes too. A
+/// co-resident VPN that takes one family down (Mullvad with IPv6 disabled removes
+/// the v6 default, and every v6 send then fails with `EHOSTUNREACH`) leaves the
+/// addresses of that family bound and discoverable, so without this we keep
+/// publishing them and peers keep dialling them: each dial opens a path we cannot
+/// answer on, it closes, and the pair churns for as long as the VPN is up.
 #[derive(Debug)]
 struct OverlayAddrFilter;
 
 impl DirectAddrFilter for OverlayAddrFilter {
-    fn keeps(&self, ip: std::net::IpAddr) -> bool {
-        !crate::membership::is_overlay_ip(ip)
-            && !matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
-            && !is_foreign_overlay_ip(ip)
+    fn keeps(&self, ip: IpAddr) -> bool {
+        keeps_addr(ip, family_can_egress)
     }
+}
+
+/// The filter's decision, with the routability probe passed in so it can be tested
+/// without depending on the host's routing table, and so it runs only when the
+/// answer can matter.
+fn keeps_addr(ip: IpAddr, can_egress: impl FnOnce(IpAddr) -> bool) -> bool {
+    if crate::membership::is_overlay_ip(ip)
+        || matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+        || is_foreign_overlay_ip(ip)
+    {
+        return false;
+    }
+    // Only a globally routable candidate is probed. A LAN-scope one (ULA,
+    // link-local, private v4) is a path to an on-link peer, and whether this host
+    // has a *global* route for the family says nothing about whether that path
+    // works. Probing anyway would drop a working LAN address on the common home
+    // network that has ULA addressing and no IPv6 from its ISP, trading the churn
+    // this fixes for a direct path lost. `is_transitable` is the same
+    // "public, globally routable unicast" question the exit node asks of a transit
+    // destination, asked here of our own candidate.
+    !is_transitable(ip) || can_egress(ip)
+}
+
+/// Destinations the probe below looks up. Both are documentation ranges (RFC 3849,
+/// RFC 5737): `connect` on a UDP socket only consults the routing table and sends
+/// nothing, and a range reserved for documentation could not reach a real host even
+/// if that ever stopped being true.
+const PROBE_DST_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+const PROBE_DST_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+
+/// Whether this host can currently route `ip`'s family off-link.
+///
+/// The question has to be asked per family rather than per address: `keeps` is
+/// handed local interface addresses *and* the reflexive addresses QAD discovered
+/// for us, and the latter are not bound here, so a bind-and-connect test would
+/// reject exactly the public candidates that matter.
+///
+/// The probe carries [`LoopPrevention`] because iroh's own sockets do. Without it
+/// the lookup consults a different routing table than the transport actually uses
+/// (on Linux the fwmark rule sends marked traffic to `main`), and the answer would
+/// describe a path no real socket takes.
+///
+/// Fails open: only an explicit "no route" verdict drops an address. Every other
+/// error keeps it, because a probe that cannot run is not evidence that the family
+/// is dead, and the cost of being wrong here is a node that publishes no addresses
+/// at all. `EADDRNOTAVAIL` is deliberately on the keep side: it means the kernel
+/// found no *source* address for the family, which is a host with no such address
+/// at all rather than one whose route was taken away, and that host has no global
+/// candidate of that family to filter in the first place.
+fn family_can_egress(ip: IpAddr) -> bool {
+    let (domain, dst) = match ip {
+        IpAddr::V4(_) => (Domain::IPV4, SocketAddr::from((PROBE_DST_V4, 9))),
+        IpAddr::V6(_) => (Domain::IPV6, SocketAddr::from((PROBE_DST_V6, 9))),
+    };
+    let Ok(sock) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) else {
+        return true;
+    };
+    let _ = LoopPrevention.configure(SockRef::from(&sock), domain);
+    match sock.connect(&dst.into()) {
+        Ok(()) => true,
+        Err(e) => !is_unroutable(&e),
+    }
+}
+
+/// Whether a `connect` error means the kernel has no route for the family, as
+/// opposed to anything else that can go wrong while probing.
+fn is_unroutable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable
+    )
 }
 
 /// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one stream
@@ -487,10 +566,68 @@ pub(crate) fn is_alpn_mismatch(err: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A family this host cannot route is dropped whole, however ordinary the
+    /// address looks. This is the co-resident-VPN case: Mullvad with IPv6 off
+    /// leaves the v6 addresses bound and discoverable while every v6 send returns
+    /// `EHOSTUNREACH`, and publishing them makes peers dial a path we cannot
+    /// answer on.
+    #[test]
+    fn an_unroutable_family_drops_its_global_addresses() {
+        let v6: IpAddr = "2a02:6ea0:c318:2::e023".parse().unwrap();
+        let v4: IpAddr = "51.15.139.151".parse().unwrap();
+        assert!(keeps_addr(v6, |_| true));
+        assert!(!keeps_addr(v6, |_| false));
+        assert!(keeps_addr(v4, |_| true));
+        assert!(!keeps_addr(v4, |_| false));
+
+        // And a routable family does not rescue an overlay address: the two
+        // reasons to drop one are independent.
+        let overlay: IpAddr = "200::1".parse().unwrap();
+        assert!(!keeps_addr(overlay, |_| true));
+    }
+
+    /// The probe answers a question about reaching the internet, so it must not
+    /// be allowed to drop a LAN path. A home network with ULA addressing and no
+    /// IPv6 from its ISP is exactly this case, and dropping the ULA there would
+    /// cost a working direct path to an on-link peer.
+    #[test]
+    fn a_lan_scope_address_survives_an_unroutable_family() {
+        for lan in ["fd00:1234:5678::1", "192.168.1.104", "169.254.3.4"] {
+            let ip: IpAddr = lan.parse().unwrap();
+            assert!(
+                keeps_addr(ip, |_| false),
+                "{lan} is on-link, the global route says nothing about it"
+            );
+        }
+        // And the probe is not even consulted for those, so no syscall is made
+        // for a LAN candidate.
+        let ula: IpAddr = "fd00:1234:5678::1".parse().unwrap();
+        assert!(keeps_addr(ula, |_| panic!("probed a LAN-scope candidate")));
+    }
+
+    /// The probe fails open, so only an explicit "no route" verdict may drop an
+    /// address. A probe that cannot run says nothing about the family, and
+    /// treating it as a failure would publish no addresses at all.
+    #[test]
+    fn only_a_routing_failure_counts_as_unroutable() {
+        assert!(is_unroutable(&io::Error::from(
+            ErrorKind::NetworkUnreachable
+        )));
+        assert!(is_unroutable(&io::Error::from(ErrorKind::HostUnreachable)));
+        // Anything else is the probe failing, not the family being down.
+        assert!(!is_unroutable(&io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_unroutable(&io::Error::from(ErrorKind::AddrInUse)));
+        assert!(!is_unroutable(&io::Error::from(ErrorKind::Other)));
+    }
+
     #[test]
     fn overlay_addr_filter_keeps_only_non_overlay() {
         use std::net::IpAddr;
-        let keeps = |s: &str| OverlayAddrFilter.keeps(s.parse::<IpAddr>().unwrap());
+        // The routability half is covered above; this pins the overlay half, so
+        // the probe's answer is held at "routable" throughout.
+        let keeps = |s: &str| keeps_addr(s.parse::<IpAddr>().unwrap(), |_| true);
         // Real underlay / LAN addresses are kept.
         assert!(keeps("51.15.139.151"));
         assert!(keeps("192.168.1.104"));
