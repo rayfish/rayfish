@@ -560,6 +560,7 @@ impl NetworkRegistry {
         }
         let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
+        let mut last_err = None;
         for peer_id in &peer_ids {
             match self.try_fetch_group_blob(*peer_id, blob_hash).await {
                 Ok(blob) => {
@@ -570,11 +571,25 @@ impl NetworkRegistry {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to fetch blob");
+                    // `{e:#}` not `{e}`: the outermost context here is a flat
+                    // "failed to connect to peer", and the reason a joiner could
+                    // not reach a seed is the whole content of the report.
+                    let reason = format!("{e:#}");
+                    tracing::warn!(peer = %peer_id.fmt_short(), error = %reason, "failed to fetch blob");
+                    last_err = Some((*peer_id, reason));
                 }
             }
         }
-        anyhow::bail!("could not fetch group blob from any peer")
+        // Carry the last seed's reason into the message. Without it `ray join`
+        // says only that every peer failed, which is the one thing the person
+        // running it already knows.
+        match last_err {
+            Some((peer, reason)) => anyhow::bail!(
+                "could not fetch group blob from any peer (last was {}: {reason})",
+                peer.fmt_short()
+            ),
+            None => anyhow::bail!("could not fetch group blob from any peer"),
+        }
     }
 
     /// Fresh-join dial: try each coordinator in `coordinator_dial_order` (minter

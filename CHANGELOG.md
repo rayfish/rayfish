@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A failed `ray join` says why.** It reported only that no peer would serve
+  the roster, and the daemon log reduced the reason to "failed to connect to
+  peer", so a report of a failed join carried nothing to act on. Both now carry
+  the underlying error.
+
 - **Windows: a coordinator no longer republishes its network record every five
   seconds.** Saving a network's config re-checks that the file is on disk, and
   Windows rejects that check on a file opened for reading, so it failed every

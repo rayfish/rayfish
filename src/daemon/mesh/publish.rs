@@ -444,7 +444,7 @@ pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash) -> bo
             false
         }
         Err(e) => {
-            tracing::warn!(network, error = %e, "failed to mark group hash as published");
+            tracing::warn!(network, error = %format!("{e:#}"), "failed to mark group hash as published");
             false
         }
     }
