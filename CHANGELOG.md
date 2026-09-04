@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Windows: a coordinator no longer republishes its network record every five
+  seconds.** Saving a network's config re-checks that the file is on disk, and
+  Windows rejects that check on a file opened for reading, so it failed every
+  time. The coordinator read the failure as "the roster is not durable yet" and
+  retried, at thirty times the intended rate, for as long as the daemon ran,
+  once per network. The retries also filled the diagnostics log with a warning
+  every five seconds, crowding out whatever a report was collected to show.
+
 - **macOS: the mesh survives another VPN's kill switch.** Connecting Mullvad
   took the mesh down on the spot, and it stayed down for as long as that VPN was
   connected: pings to a peer got no reply, while the daemon, its routes and its
