@@ -224,12 +224,13 @@ iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration"
 iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
-# netwatch fork exposing the configure-socket hook that the iroh branch above
-# threads through (upstream PR n0-computer/net-tools#182, unmerged).
-netwatch = { git = "https://github.com/rayfish/net-tools", branch = "feat/configure-socket" }
-# noq fork carrying the batch datagram APIs the forwarder uses, `send_many_datagrams`
-# and `read_many_datagrams` (upstream PR n0-computer/noq#735, under review). iroh
-# re-exports them on `Connection`; drop this once a noq release carries them.
-noq = { git = "https://github.com/rayfish/noq", branch = "perf/datagram-batching" }
-noq-proto = { git = "https://github.com/rayfish/noq", branch = "perf/datagram-batching" }
-noq-udp = { git = "https://github.com/rayfish/noq", branch = "perf/datagram-batching" }
+# netwatch's configure-socket hook, which the iroh branch above threads through.
+# Merged upstream (n0-computer/net-tools#182); drop this once a netwatch release
+# past 0.19.3 carries it.
+netwatch = { git = "https://github.com/n0-computer/net-tools", branch = "main" }
+# The batch datagram APIs the forwarder uses, `send_many_datagrams` and
+# `read_many_datagrams`. Merged upstream (n0-computer/noq#735); iroh re-exports
+# them on `Connection`. Drop these once a noq release past 1.2.0 carries them.
+noq = { git = "https://github.com/n0-computer/noq", branch = "main" }
+noq-proto = { git = "https://github.com/n0-computer/noq", branch = "main" }
+noq-udp = { git = "https://github.com/n0-computer/noq", branch = "main" }

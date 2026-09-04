@@ -3683,11 +3683,12 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.3"
-source = "git+https://github.com/rayfish/net-tools?branch=feat%2Fconfigure-socket#7f5513cd602c29e0b564e6c07d81614244d95730"
+source = "git+https://github.com/n0-computer/net-tools?branch=main#d73b994abce8f683d7d6dcc163eee5eaefb952f5"
 dependencies = [
  "atomic-waker",
  "bytes",
  "cfg_aliases",
+ "chrono",
  "derive_more 2.1.1",
  "ipnet",
  "js-sys",
@@ -3756,7 +3757,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.2.0"
-source = "git+https://github.com/rayfish/noq?branch=perf%2Fdatagram-batching#26509400d39e4ab5b1bb280f303bf77461fd1333"
+source = "git+https://github.com/n0-computer/noq?branch=main#64f85b1cc49fd7b84df9d291b5e7fe4022d711d1"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3777,7 +3778,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.2.0"
-source = "git+https://github.com/rayfish/noq?branch=perf%2Fdatagram-batching#26509400d39e4ab5b1bb280f303bf77461fd1333"
+source = "git+https://github.com/n0-computer/noq?branch=main#64f85b1cc49fd7b84df9d291b5e7fe4022d711d1"
 dependencies = [
  "aes-gcm 0.10.3",
  "bytes",
@@ -3803,7 +3804,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.2.0"
-source = "git+https://github.com/rayfish/noq?branch=perf%2Fdatagram-batching#26509400d39e4ab5b1bb280f303bf77461fd1333"
+source = "git+https://github.com/n0-computer/noq?branch=main#64f85b1cc49fd7b84df9d291b5e7fe4022d711d1"
 dependencies = [
  "cfg_aliases",
  "libc",
