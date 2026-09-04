@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
@@ -1047,9 +1048,17 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// file, then the directory entry naming it. A [`write_file`] that failed
 /// ambiguously may have installed the bytes anyway, so a no-op retry still has
 /// to prove the result is on disk before anything is allowed to point at it.
+///
+/// Opened for writing, not reading. `fsync` on a read-only descriptor is fine
+/// on POSIX, but Windows implements it as `FlushFileBuffers`, which refuses a
+/// handle without write access and returns `ACCESS_DENIED`. That made every
+/// no-op re-sync fail there, which a coordinator reads as "the roster is not
+/// durable yet" and retries every five seconds, forever.
 fn sync_file_and_parent(path: &Path) -> Result<()> {
     let dir = path.parent().context("config path has no parent")?;
-    std::fs::File::open(path)
+    OpenOptions::new()
+        .write(true)
+        .open(path)
         .with_context(|| format!("opening {} to sync", path.display()))?
         .sync_all()
         .with_context(|| format!("syncing {}", path.display()))?;
@@ -2674,6 +2683,25 @@ name = "test"
                 .to_string()
                 .contains("network config update callbacks must not call network config APIs")
         );
+    }
+
+    /// A no-op update still re-syncs the file, and that must succeed. It runs on
+    /// every retry of an already-durable write, so a re-sync that always fails
+    /// leaves the caller retrying a write that has nothing left to do: the
+    /// coordinator republished its pkarr record every five seconds instead of
+    /// every two and a half minutes, for as long as the daemon ran. Windows is
+    /// the case this guards, where `FlushFileBuffers` rejects a read-only handle.
+    #[test]
+    fn a_no_op_network_update_re_syncs_rather_than_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+
+        let updated = update_network_in(dir, "homelab", |_| Ok(()))
+            .expect("a no-op update re-syncs the file rather than reporting a disk error")
+            .expect("the network exists");
+
+        assert_eq!(updated.name, "homelab");
     }
 
     #[test]
