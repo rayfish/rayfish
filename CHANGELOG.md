@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Windows: the installer no longer fails verification on every download.**
+  It fetched the published checksum and compared the first field, but
+  PowerShell 7 hands back the response as a byte array rather than text, so the
+  first field was the decimal value of the digest's first character. Every
+  install aborted with a mismatch reporting a two-digit expected checksum. The
+  installer now decodes the response before parsing it.
+
 - **A failed `ray join` says why.** It reported only that no peer would serve
   the roster, and the daemon log reduced the reason to "failed to connect to
   peer", so a report of a failed join carried nothing to act on. Both now carry
