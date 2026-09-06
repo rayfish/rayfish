@@ -56,13 +56,13 @@
 
 use std::collections::HashMap;
 use std::io::Error;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -77,7 +77,7 @@ use smol_str::SmolStr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -97,6 +97,15 @@ pub(crate) use crate::forward::{SSH_LISTEN_PORT, SSH_PORT};
 /// before the channel is dropped. Short enough that a black-holed address fails
 /// while the person who typed the command is still watching.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connection has, from being accepted to completing authentication,
+/// before it is dropped. sshd's `LoginGraceTime`, which russh has no equivalent
+/// of: its `inactivity_timeout` bounds an *idle* session and is reset by every
+/// packet that arrives, so without this a peer that never authenticates holds
+/// its socket and its task for as long as it keeps the TCP connection alive,
+/// and one whose mesh path black-holes mid-handshake holds them for an hour.
+/// Generous next to a handshake that is a few round trips over a mesh link.
+const LOGIN_GRACE: Duration = Duration::from_secs(60);
 
 /// Per-network SSH authorization snapshot: network name -> the network's SSH
 /// allow rules (peer + permitted login users). Held in an [`ArcSwap`] so
@@ -342,7 +351,11 @@ async fn handle_conn(
     };
     let user_identity = device_user_map.resolve(&peer_id);
     let policy = resolve_user_policy(&authz, &user_identity, &networks);
-    debug!(%src, peer = %user_identity.fmt_short(), authorized = policy.authorized(), "mesh SSH connection");
+    // Logged before the handshake, and with the source port, so a session that
+    // stalls before it authenticates (and so logs nothing else) is still
+    // visible here and can be matched to a socket in `ss` output.
+    debug!(%src, port = peer.port(), peer = %user_identity.fmt_short(),
+        authorized = policy.authorized(), "mesh SSH connection");
     let banner = auth_banner(&policy, &user_identity, &networks);
     // The address the client believes it reached, not the internal listen port
     // the SSH NAT sent it to: this is what the session reports in
@@ -360,11 +373,64 @@ async fn handle_conn(
             server,
         },
     );
-    match russh::server::run_stream(config, stream, handler).await {
-        Ok(session) => {
-            let _ = session.await;
+    serve(config, stream, handler, LOGIN_GRACE).await;
+}
+
+/// Run the SSH protocol on an accepted connection, dropping it if the peer has
+/// not authenticated within `grace`.
+///
+/// The two halves of the handshake have to be bounded separately. russh reads
+/// the client's version string inside `run_stream`, before there is a session
+/// to speak of, so that half is bounded by dropping the future, which takes the
+/// socket with it. Everything after it runs in a task russh spawns and owns,
+/// and nothing here can cancel that task: what ends it is `shutdown(2)` on a
+/// duplicate of the socket, which fails its next read, so it drops the handler
+/// and with it the connection's channels, forwards and agent sockets.
+async fn serve(config: Arc<Config>, stream: TcpStream, handler: SshHandler, grace: Duration) {
+    let client = handler.origin.client;
+    let (src, port) = (client.ip(), client.port());
+    let peer = handler.user;
+    let authenticated = handler.auth_flag();
+    // A hangup handle. Never read from or written to: the session task owns the
+    // socket for I/O, this only ever shuts it down.
+    let hangup = match stream.as_fd().try_clone_to_owned().map(StdTcpStream::from) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(%src, port, error = %e,
+                "mesh SSH: cannot duplicate the connection socket; dropping");
+            return;
         }
-        Err(e) => debug!(error = %e, "mesh SSH session ended with error"),
+    };
+    let deadline = Instant::now() + grace;
+    let mut running =
+        match timeout_at(deadline, russh::server::run_stream(config, stream, handler)).await {
+            Ok(Ok(running)) => running,
+            Ok(Err(e)) => {
+                debug!(error = %e, "mesh SSH session ended with error");
+                return;
+            }
+            Err(_) => {
+                warn!(%src, port, peer = %peer.fmt_short(), secs = grace.as_secs(),
+                "mesh SSH: no version string within the login grace; dropping");
+                return;
+            }
+        };
+    match timeout_at(deadline, &mut running).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => debug!(error = %e, "mesh SSH session ended with error"),
+        // Authenticated in time. From here the session runs for as long as it
+        // likes, bounded by russh's inactivity timeout like any other.
+        Err(_) if authenticated.load(Ordering::Relaxed) => {
+            if let Err(e) = running.await {
+                debug!(error = %e, "mesh SSH session ended with error");
+            }
+        }
+        Err(_) => {
+            warn!(%src, port, peer = %peer.fmt_short(), secs = grace.as_secs(),
+                "mesh SSH: no authentication within the login grace; dropping");
+            let _ = hangup.shutdown(Shutdown::Both);
+            let _ = running.await;
+        }
     }
 }
 
@@ -514,6 +580,9 @@ struct SshHandler {
     /// Where this connection came from, for the session environment and the
     /// login record.
     origin: Origin,
+    /// Set once a peer is admitted, so the login grace can tell a connection
+    /// that authenticated from one that is only holding the socket open.
+    authenticated: Arc<AtomicBool>,
 }
 
 impl Drop for SshHandler {
@@ -543,7 +612,14 @@ impl SshHandler {
             socket_forwards: HashMap::new(),
             token: CancellationToken::new(),
             origin,
+            authenticated: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flag [`Handler::auth_none`] sets once this peer is admitted. Taken
+    /// before the handler is handed to russh, which owns it from then on.
+    fn auth_flag(&self) -> Arc<AtomicBool> {
+        self.authenticated.clone()
     }
 
     /// The login this connection authenticated as, if any. Every forwarding
@@ -673,6 +749,7 @@ impl Handler for SshHandler {
         match resolve_login(user) {
             Ok(info) if self.policy.permits(user, info.uid) => {
                 self.login = Some(Arc::new(info));
+                self.authenticated.store(true, Ordering::Relaxed);
                 Ok(Auth::Accept)
             }
             Ok(info) => {
@@ -2156,7 +2233,7 @@ mod tests {
     /// client connection to it. The peer is authorized for any user, the same
     /// state a live mesh connection reaches before it opens a channel.
     async fn connect_to_test_server() -> client::Handle<AcceptAnyHost> {
-        connect_watching_openings(None, test_account()).await
+        connect_watching_openings(None, test_account(), LOGIN_GRACE).await
     }
 
     /// The same, plus the channels the server opens back to the client: what a
@@ -2167,7 +2244,7 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
-            connect_watching_openings(Some(tx), test_account()).await,
+            connect_watching_openings(Some(tx), test_account(), LOGIN_GRACE).await,
             rx,
         )
     }
@@ -2175,6 +2252,7 @@ mod tests {
     async fn connect_watching_openings(
         opened: Option<mpsc::UnboundedSender<Channel<ClientMsg>>>,
         login_as: String,
+        grace: Duration,
     ) -> client::Handle<AcceptAnyHost> {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
         let config = Arc::new(Config {
@@ -2198,9 +2276,7 @@ mod tests {
                 server: SocketAddr::new(addr.ip(), SSH_PORT),
             };
             let handler = SshHandler::new(policy, id(1), None, origin);
-            if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
-                let _ = session.await;
-            }
+            serve(config, stream, handler, grace).await;
         });
 
         let mut handle = client::connect(
@@ -2219,6 +2295,88 @@ mod tests {
             "the `none` method is the mesh SSH auth gate"
         );
         handle
+    }
+
+    /// Serve one connection with a short login grace and hand back the client
+    /// socket, so a test can stall the handshake the way a black-holed mesh
+    /// path does and watch the server let go.
+    async fn connect_with_grace(grace: Duration) -> TcpStream {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
+        let config = Arc::new(Config {
+            keys: vec![key],
+            methods: MethodSet::from(&[MethodKind::None][..]),
+            auth_rejection_time: Duration::ZERO,
+            ..Default::default()
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, client) = listener.accept().await.expect("accept");
+            let mut policy = UserPolicy::default();
+            policy.add(&["*".to_string()]);
+            let origin = Origin {
+                client,
+                server: SocketAddr::new(addr.ip(), SSH_PORT),
+            };
+            serve(
+                config,
+                stream,
+                SshHandler::new(policy, id(1), None, origin),
+                grace,
+            )
+            .await;
+        });
+        TcpStream::connect(addr).await.expect("client connect")
+    }
+
+    /// Read until the server hangs up, or fail. `read_to_end` returning at all
+    /// is the assertion: it means the socket is gone.
+    async fn wait_for_hangup(sock: &mut TcpStream) {
+        let mut sink = Vec::new();
+        timeout(Duration::from_secs(10), sock.read_to_end(&mut sink))
+            .await
+            .expect("the server held a stalled handshake open past the login grace")
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_session_outlives_the_login_grace() {
+        // The grace has to stop counting once a peer is admitted, or every
+        // session would be cut off partway through whatever it was doing.
+        let handle =
+            connect_watching_openings(None, test_account(), Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("open a session channel after the grace has passed");
+        channel.exec(true, "echo alive").await.expect("exec");
+        let (out, code) = drain(&mut channel).await;
+        assert!(out.contains("alive"), "output after the grace: {out}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_sends_its_version_string_is_dropped() {
+        // Both halves of the handshake need their own bound, and this is the
+        // half russh runs before there is a session: without the grace it sits
+        // here for the inactivity timeout, an hour, holding the socket.
+        let mut sock = connect_with_grace(Duration::from_millis(200)).await;
+        wait_for_hangup(&mut sock).await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_authenticates_is_dropped() {
+        // The other half: the version exchange completes, so russh owns a
+        // session task, and then nothing else arrives. This is the shape of the
+        // real hang, where the mesh path stops carrying the flow mid-handshake.
+        let mut sock = connect_with_grace(Duration::from_millis(200)).await;
+        sock.write_all(b"SSH-2.0-stalls_here\r\n")
+            .await
+            .expect("write version string");
+        wait_for_hangup(&mut sock).await;
     }
 
     /// Drain one channel to its close, returning what the command wrote to
@@ -2593,7 +2751,7 @@ mod tests {
             0 => std::env::var("SUDO_USER").unwrap_or_else(|_| test_account()),
             _ => test_account(),
         };
-        let handle = connect_watching_openings(None, login_as).await;
+        let handle = connect_watching_openings(None, login_as, LOGIN_GRACE).await;
         let mut channel = handle
             .channel_open_session()
             .await

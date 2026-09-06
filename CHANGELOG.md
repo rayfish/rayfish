@@ -101,6 +101,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connected is left alone rather than fought over, and logged once so `ray logs`
   says why `.ray` is quiet.
 
+### Security
+
+- **A mesh SSH connection that never authenticates is now dropped after a
+  minute.** There was no bound between accepting a connection and logging in:
+  the only timer covered an idle *established* session, was an hour long, and
+  was reset by every packet that arrived, so a peer could hold a socket and the
+  task behind it open indefinitely without ever proving it was allowed in. That
+  also hid a real failure. When the mesh path stops carrying a flow partway
+  through the handshake, the client eventually gives up and the person retries,
+  while the server sits on the half-open connection with nothing in the log to
+  say so. Such a connection is now dropped at the deadline and logged with the
+  peer and the address it came from, and the accept-time line carries the source
+  port so a stalled session can be matched to a socket.
+
 ### Performance
 
 - **Inbound packets are taken from a peer in batches.** A burst from one peer is
