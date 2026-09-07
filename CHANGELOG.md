@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A resolver on loopback no longer forms an unbounded DNS loop.** Pointing
+  another VPN's custom-DNS setting at Rayfish is what makes `.ray` names resolve
+  while its tunnel is up, but that VPN runs its own resolver on a loopback
+  address and makes it the host's only nameserver, so Rayfish forwards there and
+  the two send the machine's whole DNS back and forth. Loopback upstreams are
+  now rate-limited by the same guard that already covered another mesh's
+  resolver, rather than dropped: on a host where the capture found nothing else,
+  dropping it would leave off-mesh names with nowhere to go at all.
+
 - **macOS: the DNS forwarder follows the host's resolvers instead of the set it
   found at startup.** Every name outside `.ray` is forwarded to the system
   resolvers captured when Rayfish took over DNS, and that capture never moved
