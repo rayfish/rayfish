@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **macOS: the DNS forwarder follows the host's resolvers instead of the set it
+  found at startup.** Every name outside `.ray` is forwarded to the system
+  resolvers captured when Rayfish took over DNS, and that capture never moved
+  again: joining another network left the old router in the list, and another
+  VPN connecting or disconnecting replaced the machine's resolvers without
+  replacing ours. Starting the daemon while such a VPN was connected was the
+  worst version, since the captured set was that VPN's own resolvers and they
+  stopped answering the moment it went away, taking every off-mesh name with
+  them until the next restart. The set is now re-checked every fifteen seconds
+  by asking each candidate whether it actually answers, which is also what
+  sorts a dead entry out of the front of the list, where it used to cost every
+  lookup a full timeout. A pass that finds nothing alive changes nothing.
+
 - **Windows: the installer no longer fails verification on every download.**
   It fetched the published checksum and compared the first field, but
   PowerShell 7 hands back the response as a byte array rather than text, so the

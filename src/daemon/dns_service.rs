@@ -20,6 +20,14 @@ use std::net::Ipv6Addr;
 const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
 const DNS_CONFIG_RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// How often the forwarder re-checks which system resolvers actually answer.
+///
+/// Slower than the OS-DNS re-assert tick: a resolver going away is not urgent
+/// the way losing our own key is, since the first name to miss reveals it, and
+/// each pass costs one `. NS` probe per candidate.
+#[cfg(target_os = "macos")]
+const UPSTREAM_REFRESH_TICK: Duration = Duration::from_secs(15);
+
 pub(crate) struct DnsService {
     /// `.ray` forward lookup table (hostname → IP). Cloned into `MeshCtx` and the
     /// resolver; the roster is the single source of truth that writes it.
@@ -186,7 +194,79 @@ impl DnsService {
             if let Some(old) = self.reassert_token.lock().unwrap().replace(rt.clone()) {
                 old.cancel();
             }
-            tokio::spawn(Arc::clone(self).run_sc_reassert(tun_name.to_string(), rt));
+            tokio::spawn(Arc::clone(self).run_sc_reassert(tun_name.to_string(), rt.clone()));
+            // Shares the re-assert token: both watch the same host DNS and both
+            // are meaningless once the data plane is down, so `revert` cancelling
+            // one has to cancel the other.
+            tokio::spawn(Arc::clone(self).run_upstream_refresh(rt));
+        }
+    }
+
+    /// Keep the forwarder pointed at system resolvers that actually answer.
+    ///
+    /// The upstream set is captured once, when the OS-DNS backend is detected,
+    /// and without this it stays that way for the life of the backend. Every way
+    /// the host's DNS can move afterwards breaks it: changing network leaves the
+    /// old router in the list, and another VPN connecting or disconnecting
+    /// swaps the resolvers wholesale. The damaging order is connecting that VPN
+    /// and *then* restarting, because the capture takes its resolvers and keeps
+    /// forwarding to them after it goes, so every non-`.ray` name dies with the
+    /// tunnel that is no longer there.
+    ///
+    /// Liveness is decided by probing, not by reading the configuration, because
+    /// the two disagree in exactly the case that matters. Under another VPN's
+    /// kill switch the captured resolver is still named by the system and still
+    /// route-reachable, and simply never answers. Probing also gets the ordering
+    /// right for free: a dead entry at the front of the list otherwise costs
+    /// every lookup a full timeout before the working one behind it is tried.
+    ///
+    /// A pass that finds nothing alive changes nothing. Replacing a set that is
+    /// merely unreachable this second with an empty one turns a slow forwarder
+    /// into a broken one, and the next pass costs 15 seconds.
+    #[cfg(target_os = "macos")]
+    async fn run_upstream_refresh(self: Arc<Self>, token: CancellationToken) {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(UPSTREAM_REFRESH_TICK) => {}
+            }
+
+            let live = dns_config::live_system_upstreams();
+            if live.is_empty() {
+                continue;
+            }
+            // Same merge the initial adopt does, so an operator's `dns-upstreams`
+            // keeps its precedence instead of being overwritten by the capture.
+            let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+            let desired = config::resolve_upstreams(&dns_override, live);
+
+            let mut answering = Vec::new();
+            for ip in desired {
+                if crate::dns::resolver::probe_upstream(SocketAddr::from((ip, 53u16))).await {
+                    answering.push(ip);
+                }
+            }
+            if answering.is_empty() {
+                continue;
+            }
+
+            let current: Vec<Ipv4Addr> = self
+                .resolver
+                .upstreams()
+                .into_iter()
+                .filter_map(|a| match a.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(_) => None,
+                })
+                .collect();
+            if answering != current {
+                tracing::info!(
+                    ?current,
+                    upstreams = ?answering,
+                    "system resolvers changed; re-pointing the DNS forwarder"
+                );
+                self.resolver.set_upstreams(answering);
+            }
         }
     }
 

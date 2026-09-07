@@ -1240,6 +1240,25 @@ mod macos {
 #[cfg(target_os = "macos")]
 use macos::MacosDynamicStoreDns;
 
+/// The system's default resolvers *right now*, as opposed to the set captured
+/// when the backend was detected.
+///
+/// [`DnsConfigurator::captured_upstreams`] is a snapshot taken once, before we
+/// install our own configuration, and it stays frozen for the life of the
+/// backend. That is wrong the moment the host's DNS moves under it: joining
+/// another network, or another VPN connecting or disconnecting, replaces the
+/// resolvers the snapshot names, and the forwarder keeps sending every non-`.ray`
+/// name to addresses that have stopped answering. Connecting a VPN and then
+/// restarting is the worst version, because the snapshot then holds *that VPN's*
+/// resolvers and they become black holes the moment it disconnects.
+///
+/// See [`crate::daemon::dns_service::DnsService::run_upstream_refresh`], which
+/// polls this and re-points the forwarder at whatever currently answers.
+#[cfg(target_os = "macos")]
+pub fn live_system_upstreams() -> Vec<std::net::Ipv4Addr> {
+    macos::capture_system_upstreams()
+}
+
 #[cfg(target_os = "macos")]
 fn write_dns_config_macos(search_domains: &[SearchDomain], tun_name: &str) -> Result<()> {
     macos::write_dns_config(search_domains, tun_name)
