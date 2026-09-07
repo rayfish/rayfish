@@ -15,6 +15,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   install aborted with a mismatch reporting a two-digit expected checksum. The
   installer now decodes the response before parsing it.
 
+- **macOS: connecting Mullvad no longer takes the whole machine's DNS down.**
+  Rayfish published its resolver as a network service but never named the
+  interface that service runs on, in the `Setup:` half of the system
+  configuration store. Mullvad reads exactly that key before it will read a
+  service's DNS, and treats its absence as "this service has no DNS", which
+  nothing it writes can ever satisfy: it rewrote every service's resolver, its
+  own and the physical link's included, a few times a second for as long as it
+  stayed connected, so name resolution never settled and nothing resolved at
+  all. The same read is what it puts back on disconnect, so it also removed
+  Rayfish's resolver on the way out instead of restoring it, which is why `.ray`
+  went quiet when that VPN was switched off. Rayfish now publishes the key. Note
+  what this does not change: while Mullvad is connected it owns DNS for every
+  service by design, so `.ray` names still do not resolve until it disconnects.
+
 - **A failed `ray join` says why.** It reported only that no peer would serve
   the roster, and the daemon log reduced the reason to "failed to connect to
   peer", so a report of a failed join carried nothing to act on. Both now carry
