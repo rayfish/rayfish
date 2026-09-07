@@ -34,11 +34,23 @@ fn is_own_resolver(ip: IpAddr) -> bool {
 /// forwards back to us (as Tailscale does, since it only filters out its own
 /// service IPs) the two resolvers point at each other.
 ///
+/// Loopback counts for the same reason. Mullvad runs its resolver on a
+/// `127.0.0.0/8` address and makes it the host's only nameserver, so the capture
+/// finds it and we forward there; point Mullvad's own custom-DNS setting back at
+/// us, which is what makes `.ray` resolve while its tunnel is up, and the two
+/// forward to each other with the host's whole DNS in the cycle.
+///
 /// Rate-limited rather than dropped, unlike [`is_own_resolver`]: it is a real
 /// resolver that really answers, and on a host where the capture found nothing
-/// else, dropping it leaves the forwarder with nothing to ask at all.
+/// else, dropping it leaves the forwarder with nothing to ask at all. That is
+/// not hypothetical for the loopback case: with that VPN on its default DNS
+/// settings its resolver is the only upstream the capture can see, and it
+/// forwards into the tunnel perfectly well.
 fn is_loopable_upstream(ip: IpAddr) -> bool {
-    matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+    match ip {
+        IpAddr::V4(v4) => crate::membership::is_cgnat_range(v4) || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
 }
 
 pub struct Resolver {
@@ -1028,5 +1040,22 @@ mod tests {
         assert_eq!(r.upstreams(), vec![SocketAddr::from((foreign, 53))]);
         assert!(is_loopable_upstream(IpAddr::V4(foreign)));
         assert!(!is_own_resolver(IpAddr::V4(foreign)));
+    }
+
+    /// A resolver on loopback is kept on the same terms. It is what another VPN
+    /// leaves as the host's only nameserver, so the capture has nothing else to
+    /// offer, and it forwards into that VPN's tunnel perfectly well. The cycle
+    /// it can form, when that VPN is pointed back at us, is the guard's job.
+    #[test]
+    fn a_loopback_resolver_is_rate_limited_rather_than_dropped() {
+        assert!(is_loopable_upstream(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_loopable_upstream(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 53
+        ))));
+        assert!(is_loopable_upstream(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!is_own_resolver(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+        // An ordinary upstream is neither, so the guard stays off its path.
+        assert!(!is_loopable_upstream(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 }
