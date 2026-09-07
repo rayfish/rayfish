@@ -836,7 +836,7 @@ mod macos {
     use system_configuration::sys::schema_definitions::{
         kSCPropInterfaceName, kSCPropNetDNSSearchDomains, kSCPropNetDNSServerAddresses,
         kSCPropNetDNSSupplementalMatchDomains, kSCPropNetIPv6Addresses, kSCPropNetIPv6PrefixLength,
-        kSCPropNetIPv6Router,
+        kSCPropNetIPv6Router, kSCPropNetInterfaceDeviceName,
     };
 
     use async_trait::async_trait;
@@ -849,6 +849,10 @@ mod macos {
     const SC_IPV6_KEY: &str = "State:/Network/Service/rayfish/IPv6";
     /// The service itself, carrying only its rank. See [`write_service_config`].
     const SC_SERVICE_KEY: &str = "State:/Network/Service/rayfish";
+    /// The interface our service runs on, in the `Setup:` half of the store.
+    ///
+    /// The only key here that is not for configd. See [`write_service_config`].
+    const SC_SETUP_INTERFACE_KEY: &str = "Setup:/Network/Service/rayfish/Interface";
     /// The service id, which is the last path component of the keys above.
     /// `ConfirmedServiceID` has to repeat it to be believed; see
     /// [`write_dns_config`].
@@ -959,6 +963,7 @@ mod macos {
             store.0.remove(SC_DNS_KEY);
             store.0.remove(SC_IPV6_KEY);
             store.0.remove(SC_SERVICE_KEY);
+            store.0.remove(SC_SETUP_INTERFACE_KEY);
         }
         tracing::info!("removed SCDynamicStore DNS configuration");
     }
@@ -1040,7 +1045,7 @@ mod macos {
         Ok(())
     }
 
-    /// Publish the IPv6 half of our service, plus the service's rank.
+    /// Publish the IPv6 half of our service, plus its rank and its interface.
     ///
     /// This is what puts the AAAA flag on the resolver written above. configd
     /// asks one question of a service before it will request a family for it:
@@ -1083,6 +1088,40 @@ mod macos {
         anyhow::ensure!(
             store.0.set(SC_SERVICE_KEY, rank),
             "SCDynamicStoreSetValue failed for {SC_SERVICE_KEY}"
+        );
+
+        // Name our interface in the `Setup:` half of the store as well. configd
+        // does not need this: it is what another VPN reads before it will read
+        // our DNS key at all.
+        //
+        // Mullvad's talpid-dns derives this path from the DNS key it found, by
+        // rewriting `State:` to `Setup:` and `/DNS` to `/Interface`, and treats
+        // its absence as a hard failure that loads the whole service as
+        // "no DNS". Nothing it can write ever equals that, so every pass decides
+        // our service still needs writing, and each write re-triggers the store
+        // notification it is reacting to. The result is a rewrite of every
+        // service's DNS a few times a second, host resolution included, for as
+        // long as that VPN is connected: not our DNS breaking, but the machine's.
+        // Publishing the key ends it after one pass.
+        //
+        // The same read is what it restores on disconnect. Without the key it
+        // records "no DNS" as our previous state and removes our resolver on the
+        // way out, which is the disconnect breakage `run_sc_reassert` repairs
+        // from the other side; with it, our resolver is put back and that watcher
+        // becomes a safety net rather than the thing holding `.ray` up.
+        //
+        // A `Setup:` key usually means persistent configuration, but ours is a
+        // session key in the dynamic store, not a preferences entry, and it joins
+        // no service set or service order, so it is not a network service the UI
+        // can see.
+        let device_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetInterfaceDeviceName) };
+        let iface =
+            CFDictionary::from_CFType_pairs(&[(device_key, CFString::new(tun_name).as_CFType())]);
+        let iface = unsafe { CFDictionary::wrap_under_get_rule(iface.as_concrete_TypeRef()) };
+        store.0.remove(SC_SETUP_INTERFACE_KEY);
+        anyhow::ensure!(
+            store.0.set(SC_SETUP_INTERFACE_KEY, iface),
+            "SCDynamicStoreSetValue failed for {SC_SETUP_INTERFACE_KEY}"
         );
 
         let addr_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetIPv6Addresses) };
