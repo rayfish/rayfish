@@ -123,6 +123,8 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     // later on activate. No IPv4 is assigned at all: the overlay is IPv6-only,
     // and `100.64.0.0/10` belongs to whatever else may be sharing the host.
     let builder = DeviceBuilder::new().ipv6(v6, 128).mtu(TUN_MTU).enable(true);
+    #[cfg(target_os = "linux")]
+    let builder = builder.name(LINUX_TUN_NAME);
     #[cfg(target_os = "windows")]
     let builder = builder
         .name(WINDOWS_TUN_NAME)
@@ -145,6 +147,18 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
         tun_name,
     ))
 }
+
+/// Interface name pattern on Linux. The kernel's default `tun0` says nothing
+/// about who owns the device, and on a host with more than one tunnel it is
+/// whoever started first. `%d` is `TUNSETIFF`'s own placeholder: the kernel
+/// substitutes the lowest free index, so this comes out `rayfish0` and a second
+/// device gets `rayfish1` rather than `EBUSY`. `device.name()` reads the
+/// resolved name back off the fd, so the rest of the daemon sees the real one.
+///
+/// Linux only. macOS numbers its own `utunN` and will not take another name,
+/// and FreeBSD's `tun` cloner insists on a `tun` prefix.
+#[cfg(target_os = "linux")]
+const LINUX_TUN_NAME: &str = "rayfish%d";
 
 /// Wintun adapter name. Fixed rather than generated, so a restart reattaches to
 /// the adapter this daemon created instead of leaving a second one behind.

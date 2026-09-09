@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Linux: the mesh interface is now named `rayfish0` instead of `tun0`.** The
+  kernel's default name says nothing about which program owns the device, and
+  on a host running more than one tunnel it went to whoever started first. The
+  index still comes from the kernel, so a second device becomes `rayfish1`.
+  Firewall rules, monitoring or scripts that match on `tun0` by name need
+  updating; nothing inside Rayfish assumed the name. macOS keeps `utunN` and
+  FreeBSD keeps `tunN`, neither of which accepts an arbitrary name; Windows
+  already named its adapter `rayfish`.
+
 ### Fixed
 
 - **A resolver on loopback no longer forms an unbounded DNS loop.** Pointing
