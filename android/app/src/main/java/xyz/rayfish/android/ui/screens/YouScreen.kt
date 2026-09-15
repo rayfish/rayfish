@@ -183,6 +183,22 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             },
         )
         if (crashReporting) {
+            var periodicDiagnostics by remember {
+                mutableStateOf(NodeHolder.isPeriodicDiagnosticsEnabled(context))
+            }
+            ToggleCard(
+                title = stringResource(R.string.pref_periodic_diagnostics),
+                subtitle = if (periodicDiagnostics) {
+                    stringResource(R.string.pref_periodic_diagnostics_on)
+                } else {
+                    stringResource(R.string.pref_periodic_diagnostics_off)
+                },
+                checked = periodicDiagnostics,
+                onCheckedChange = { on ->
+                    periodicDiagnostics = on
+                    NodeHolder.setPeriodicDiagnosticsEnabled(context, on)
+                },
+            )
             PillButton(stringResource(R.string.action_send_diagnostics), onClick = {
                 scope.launch {
                     val id = withContext(Dispatchers.IO) {

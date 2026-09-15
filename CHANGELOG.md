@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Android: an opt-in periodic diagnostics report.** Off by default, under
+  Periodic diagnostics in You, and only available while crash reporting is on.
+  With it on, the app sends one diagnostics report every eight hours, but only
+  when the window has something in it: new warnings or errors from the core, or
+  an unusual number of network-callback rebinds. Quiet windows send nothing and
+  carry their counts into the next one. Reports go out only while Rayfish is
+  running, with a tunnel or in standby, and stop entirely when it is off. This
+  exists for the faults that only show up overnight, where by morning the
+  evidence has already been evicted from the log ring.
+
 ### Changed
 
 - **Linux: the mesh interface is now named `rayfish0` instead of `tun0`.** The

@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -42,10 +43,19 @@ class RayfishVpnService : VpnService() {
     // Polls for incoming own-device file offers and auto-accepts them, so files
     // shared to this device land in Downloads even with the app UI closed.
     private var autoAcceptPoller: ScheduledExecutorService? = null
+    // Opt-in unattended diagnostics. Tied to this service rather than to the
+    // process because the service is alive exactly while the node is, tunnel or
+    // standby, and a report from a stopped node describes nothing.
+    private var diagnosticsJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        // Started unconditionally: the loop reads the pref on each tick, so a
+        // user who turns the feature on mid-session does not have to restart the
+        // service for it to take effect, and one who turns it off is not left
+        // with a loop that has to be torn down to stop reporting.
+        diagnosticsJob = PeriodicDiagnostics.start(applicationContext)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -889,6 +899,8 @@ class RayfishVpnService : VpnService() {
         // poller is still alive, and once onDestroy has been called nothing here
         // is going to observe a transfer completing any more.
         isRunning = false
+        diagnosticsJob?.cancel()
+        diagnosticsJob = null
         // Same reasoning for the tile's state: the service is going away, so the
         // tunnel is going with it. Set here rather than left to the queued
         // teardown below, which can sit behind a whole bring-up before it runs.

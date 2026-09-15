@@ -156,6 +156,9 @@
     <string name="pref_crash_reporting">Crash reporting</string>
     <string name="pref_crash_reporting_on">on · diagnostics</string>
     <string name="pref_crash_reporting_off">off</string>
+    <string name="pref_periodic_diagnostics">Periodic diagnostics</string>
+    <string name="pref_periodic_diagnostics_on">on · a report every 8h when something looks wrong</string>
+    <string name="pref_periodic_diagnostics_off">off</string>
     <string name="action_send_diagnostics">Send diagnostics</string>
     <string name="about_version">v%s</string>
     <string name="device_name_applies">Applies to all your networks.</string>
