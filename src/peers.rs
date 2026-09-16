@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
@@ -68,6 +68,8 @@ pub struct PeerTable {
     /// cleared automatically in [`Self::add`] on any successful (re)connection.
     /// `ray status` reads it to flag such peers instead of showing plain offline.
     version_incompatible: Arc<DashSet<EndpointId>>,
+    /// Actual local TUN limit, shared with readers across TUN reattachments.
+    local_mtu: Arc<AtomicU16>,
 }
 
 /// A single peer's identity, its one shared connection, and the network-handle
@@ -103,6 +105,7 @@ pub struct PeerEntry {
     /// the idle close code; a peer on a build that predates it (default `false`) is
     /// held open like an eager node so it never flaps.
     supports_idle_close: Arc<AtomicBool>,
+    receive_mtu: Arc<AtomicU16>,
 }
 
 /// Result of a routing lookup: the connection to send over, the peer identity,
@@ -117,12 +120,18 @@ pub struct PeerRoute {
     pub network: SmolStr,
     /// The outbound datagram tag for `network` on this connection.
     pub handle: u16,
+    receive_mtu: Arc<AtomicU16>,
     /// Shared last-activity clock for this peer's connection; the sender bumps it
     /// after a successful send so the idle reaper sees the connection as active.
     last_active: Arc<AtomicU64>,
 }
 
 impl PeerRoute {
+    /// The peer's advertised IP packet limit; conservative until it announces.
+    pub fn receive_mtu(&self) -> u16 {
+        self.receive_mtu.load(Ordering::Relaxed)
+    }
+
     /// Record that traffic just went out on this connection (resets its idle timer).
     pub fn note_activity(&self) {
         self.last_active.store(now_ms(), Ordering::Relaxed);
@@ -194,6 +203,7 @@ impl PeerEntry {
             endpoint_id: self.endpoint_id,
             network,
             handle,
+            receive_mtu: self.receive_mtu.clone(),
             last_active: self.last_active.clone(),
         })
     }
@@ -212,6 +222,7 @@ impl PeerTable {
             peers: Arc::new(FastDashMap::default()),
             audit: None,
             version_incompatible: Arc::new(DashSet::default()),
+            local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
         }
     }
 
@@ -223,6 +234,29 @@ impl PeerTable {
             peers: Arc::new(FastDashMap::default()),
             audit: Some(audit),
             version_incompatible: Arc::new(DashSet::default()),
+            local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+        }
+    }
+
+    /// Receive limit advertised to peers and enforced before TUN delivery.
+    pub fn local_mtu(&self) -> u16 {
+        self.local_mtu.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_local_mtu(&self, mtu: u16) {
+        self.local_mtu.store(mtu, Ordering::Relaxed);
+    }
+
+    /// Ignore stale announcements from replaced connections and constrain remote
+    /// values to the IP packet sizes supported by this mesh protocol.
+    pub(crate) fn note_receive_mtu(&self, peer_id: &EndpointId, conn: &Connection, mtu: u16) {
+        if let Some(e) = self.peers.get(&membership::derive_ipv6(peer_id))
+            && e.conn.stable_id() == conn.stable_id()
+        {
+            e.receive_mtu.store(
+                mtu.clamp(crate::tun::MIN_TUN_MTU, crate::tun::TUN_MTU),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -278,6 +312,9 @@ impl PeerTable {
                     let e = o.get_mut();
                     first_ever = false;
                     conn_changed = connection_is_new(Some(e.conn.stable_id()), stable);
+                    if conn_changed {
+                        e.receive_mtu = Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU));
+                    }
                     e.endpoint_id = endpoint_id;
                     e.conn = conn.clone();
                     if !e.out_handles.contains_key(&net) {
@@ -409,6 +446,7 @@ impl PeerTable {
             endpoint_id: e.endpoint_id,
             network: SmolStr::new(network),
             handle,
+            receive_mtu: e.receive_mtu.clone(),
             last_active: e.last_active.clone(),
         })
     }
@@ -892,6 +930,7 @@ fn first_conn_placeholder(endpoint_id: EndpointId, conn: Connection, net: SmolSt
         in_handles: HashMap::new(),
         last_active: Arc::new(AtomicU64::new(now_ms())),
         supports_idle_close: Arc::new(AtomicBool::new(false)),
+        receive_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
     }
 }
 
@@ -1188,6 +1227,46 @@ mod tests {
         // A peer we hold no connection to cannot be attached.
         let absent = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0x9999);
         assert_eq!(table.attach_network(&absent, "n2"), None);
+    }
+
+    #[tokio::test]
+    async fn receive_mtu_tracks_announcements_and_resets_on_reconnect() {
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        table.add(ip, conn.clone(), peer, "net");
+        let route = table.lookup_v6(&ip).unwrap();
+        assert_eq!(route.receive_mtu(), 1280);
+        table.note_receive_mtu(&peer, &conn, 1500);
+        assert_eq!(route.receive_mtu(), 1500);
+        table.note_receive_mtu(&peer, &conn, 0);
+        assert_eq!(route.receive_mtu(), 1280);
+        table.note_receive_mtu(&peer, &conn, u16::MAX);
+        assert_eq!(route.receive_mtu(), 1500);
+        table.add(ip, conn.clone(), peer, "another");
+        assert_eq!(
+            table
+                .route_on_network(&ip, "another")
+                .unwrap()
+                .receive_mtu(),
+            1500
+        );
+
+        // The table normally receives the same identity on a new connection.
+        // A second test connection supplies a different stable id here.
+        let (_srv2, _cli2, replacement, _client2) = connected_pair().await;
+        table.add(ip, replacement.clone(), peer, "net");
+        let route = table.lookup_v6(&ip).unwrap();
+        assert_eq!(route.receive_mtu(), 1280);
+        table.note_receive_mtu(&peer, &conn, 1500);
+        assert_eq!(
+            route.receive_mtu(),
+            1280,
+            "stale connection cannot raise the limit"
+        );
+        table.note_receive_mtu(&peer, &replacement, 1400);
+        assert_eq!(route.receive_mtu(), 1400);
     }
 
     #[tokio::test]

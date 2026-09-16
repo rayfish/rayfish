@@ -779,10 +779,9 @@ async fn prepare_datagrams(
     // The IP-facing limit stays valid for IPv6. A smaller QUIC path is
     // handled below IP by mesh fragmentation, never by a sub-1280 ICMP PTB
     // (IPv6 hosts must ignore those, leaving full-sized packets blackholed).
-    if n > fragment::MAX_PACKET {
-        if let Some(reply) =
-            crate::reject::build_packet_too_big(&pkt, info, fragment::MAX_PACKET as u16)
-        {
+    let receive_mtu = route.receive_mtu();
+    if n > usize::from(receive_mtu) {
+        if let Some(reply) = crate::reject::build_packet_too_big(&pkt, info, receive_mtu) {
             let _ = ctx.tun_tx.send(reply).await;
         }
         ctx.stats.record_drop(DropReason::PacketTooBig);
@@ -990,6 +989,21 @@ pub fn spawn_peer_reader(
                 match evaluate_inbound(&datagram, &firewall, &exit, &peer_user, peer_ipv6, &network)
                 {
                     InboundDecision::Accept => {
+                        // The TUN can be replaced with a smaller one while this
+                        // connection stays open. Guard in-flight packets too,
+                        // before peers have received the new MTU announcement.
+                        let mtu = peers.local_mtu();
+                        if datagram.len() > usize::from(mtu) {
+                            stats.record_drop(DropReason::PacketTooBig);
+                            if let Some(info) = firewall::parse_packet_info(&datagram)
+                                && let Some(reply) =
+                                    crate::reject::build_packet_too_big(&datagram, &info, mtu)
+                                && let Some(handle) = peers.out_handle(&peer_ipv6, &network)
+                            {
+                                send_peer_reply(&conn, handle, &reply);
+                            }
+                            continue;
+                        }
                         stats.record_rx(datagram.len());
                         // SSH NAT: a packet to our mesh `:22` is rewritten to the
                         // SSH server's internal listen port before injection. The
@@ -1025,7 +1039,9 @@ pub fn spawn_peer_reader(
                             && let Some(reply) = crate::reject::build_reject(&datagram, &info)
                         {
                             stats.record_reject();
-                            let _ = conn.send_datagram(reply);
+                            if let Some(handle) = peers.out_handle(&peer_ipv6, &network) {
+                                send_peer_reply(&conn, handle, &reply);
+                            }
                         }
                     }
                     InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
@@ -1050,6 +1066,16 @@ pub fn spawn_peer_reader(
     tokio::spawn(reader.instrument(span))
 }
 
+/// Feedback uses our handle namespace and the same framing as ordinary packets.
+/// Even a 1280-byte ICMP error may need fragmentation on a small QUIC path.
+fn send_peer_reply(conn: &Connection, handle: u16, reply: &[u8]) {
+    if let Some(max) = conn.max_datagram_size()
+        && let Some(encoded) = fragment::encode(handle, reply, max)
+    {
+        let _ = conn.send_many_datagrams(encoded.datagrams());
+    }
+}
+
 /// Spawns a task that consumes packets from `tun_rx` and writes them to the TUN
 /// device. Single instance per session, serializes writes without a Mutex.
 /// `active` is the data-plane gate: while it is false (standby, after `ray
@@ -1066,6 +1092,16 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
             if !active.load(Ordering::Relaxed) {
                 // Data plane is down (standby). Drain and drop so the channel
                 // never backs up while we keep the control plane connected.
+                continue;
+            }
+            // A peer reader may have queued this just before a TUN reattach
+            // lowered the MTU. Never pass an oversized packet to the device.
+            if packet.len() > usize::from(tun.mtu()) {
+                tracing::debug!(
+                    len = packet.len(),
+                    mtu = tun.mtu(),
+                    "packet exceeds TUN MTU"
+                );
                 continue;
             }
             if let Err(e) = tun.write_packet(&packet).await {
@@ -1135,7 +1171,9 @@ mod tests {
         let b_ip = crate::membership::derive_ipv6(&b.id());
         let sender_peers = PeerTable::new();
         sender_peers.add(b_ip, send.clone(), b.id(), "test");
+        sender_peers.note_receive_mtu(&b.id(), &send, crate::tun::TUN_MTU);
         let receiver_peers = PeerTable::new();
+        receiver_peers.set_local_mtu(crate::tun::TUN_MTU);
         receiver_peers.add(a_ip, recv.clone(), a.id(), "test");
         receiver_peers.add_inbound_handle_by_id(&a.id(), 1, SmolStr::new("test"));
 
@@ -1213,6 +1251,61 @@ mod tests {
         assert_eq!(received.packets_rx, 4);
         assert_eq!(sent.bytes_tx, (packet.len() * 2 + small.len() * 2) as u64);
         assert_eq!(received.bytes_rx, sent.bytes_tx);
+
+        if packet_len > usize::from(crate::tun::MIN_TUN_MTU) {
+            // A smaller receive limit takes effect even on an already-cached
+            // route. Feedback reaches the local host without sending the packet.
+            sender_peers.note_receive_mtu(&b.id(), &send, crate::tun::MIN_TUN_MTU);
+            send_over_route(&ctx, &route, &info, packet.clone()).await;
+            let reply = feedback_rx
+                .try_recv()
+                .expect("local PTB for a smaller peer");
+            assert_eq!(reply[40], 2); // ICMPv6 Packet Too Big
+            assert_eq!(&reply[44..48], &1280u32.to_be_bytes());
+            assert!(tun_rx.try_recv().is_err());
+
+            // Simulate a TUN reattach while old 1500-byte packets are still in
+            // flight. The receiver must return a tagged, fragmented PTB rather
+            // than inject an oversized packet into the smaller TUN.
+            receiver_peers.set_local_mtu(crate::tun::MIN_TUN_MTU);
+            let encoded = fragment::encode(1, &packet, send.max_datagram_size().unwrap()).unwrap();
+            send.send_many_datagrams(encoded.datagrams()).unwrap();
+            let reply = timeout(Duration::from_secs(5), async {
+                let mut reassembly = fragment::Reassembler::default();
+                loop {
+                    let wire = send.read_datagram().await.unwrap();
+                    assert_eq!(untag_datagram(&wire).unwrap().0, 1);
+                    if let Some(reply) = reassembly
+                        .accept(wire, tokio::time::Instant::now())
+                        .unwrap()
+                    {
+                        break reply;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(reply[40], 2);
+            assert_eq!(&reply[44..48], &1280u32.to_be_bytes());
+            assert!(tun_rx.try_recv().is_err());
+
+            // The sender can still deliver a packet at the fallback MTU.
+            let mut smaller = packet[..1280].to_vec();
+            smaller[4..6].copy_from_slice(&1240u16.to_be_bytes());
+            smaller[56..58].fill(0);
+            let checksum = tcp_csum_v6(&smaller);
+            smaller[56..58].copy_from_slice(&checksum.to_be_bytes());
+            let smaller = Bytes::from(smaller);
+            let info = firewall::parse_packet_info(&smaller).unwrap();
+            send_over_route(&ctx, &route, &info, smaller.clone()).await;
+            assert_eq!(
+                timeout(Duration::from_secs(5), tun_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                smaller
+            );
+        }
 
         // Reassembled packets still face source validation and the firewall.
         let mut spoofed = packet.to_vec();
