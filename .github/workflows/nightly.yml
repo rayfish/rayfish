@@ -279,6 +279,9 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also requests the retired `tools` package.
+          packages: platform-tools
 
       # The NDK is ~1GB; cache it so we download it once per version instead of
       # on every run. sdkmanager below is a no-op on a cache hit.
