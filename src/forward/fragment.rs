@@ -1,4 +1,14 @@
 //! Mesh v6 packet framing. Whole packets keep `[handle:u16][IP packet]`.
+//!
+//! Rayfish carries IP packets in QUIC DATAGRAM frames, which cannot be fragmented
+//! by QUIC (RFC 9221 §5). QUIC streams do split and reassemble arbitrary bytes,
+//! but their reliable, ordered delivery would make a lost chunk delay later IP
+//! packets on the same stream and add retransmission beneath tunneled TCP.
+//! Datagrams preserve packet loss and unordered delivery, so we split oversized
+//! IP packets here and reassemble them at the peer without retransmitting missing
+//! fragments. MTU discovery can reduce fragmentation, but smaller paths and path
+//! changes still require this fallback.
+//!
 //! Fragments use `[handle:u16][0:u8][id:u64][total:u16][offset:u16][bytes]`,
 //! with integers in network byte order. The zero marker cannot be an IP version.
 //! Fragmentation is below IP: only complete packets reach policy or the TUN.
