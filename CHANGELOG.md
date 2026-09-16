@@ -20,6 +20,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Mesh protocol 6: update connected peers together.** Packet fragmentation
+  changes the mesh wire format. Older peers are reported as incompatible until
+  upgraded; they cannot connect to a protocol 6 peer.
+
 - **Linux: the mesh interface is now named `rayfish0` instead of `tun0`.** The
   kernel's default name says nothing about which program owns the device, and
   on a host running more than one tunnel it went to whoever started first. The
@@ -30,6 +34,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already named its adapter `rayfish`.
 
 ### Fixed
+
+- **SSH and transfers no longer stall when a QUIC path cannot carry a full
+  IPv6 packet.** Rayfish now splits oversized packets into tunnel fragments and
+  reassembles them before firewall checks and delivery. Previously it dropped
+  those packets and sent an MTU reduction below IPv6's 1280-byte minimum, which
+  hosts must ignore. Reassembly has per-connection and daemon-wide memory limits
+  and expires incomplete packets after five seconds.
 
 - **A resolver on loopback no longer forms an unbounded DNS loop.** Pointing
   another VPN's custom-DNS setting at Rayfish is what makes `.ray` names resolve
