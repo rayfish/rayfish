@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use super::{TAG_LEN, tag_datagram};
 use crate::stats::DropReason;
 
-pub(super) const MAX_PACKET: usize = 1500;
+pub(super) const MAX_PACKET: usize = crate::tun::TUN_MTU as usize;
 const HEADER: usize = TAG_LEN + 1 + 8 + 2 + 2;
 const MAX_FRAGMENTS: usize = 16;
 const MAX_PENDING: usize = 64;
@@ -78,6 +78,12 @@ pub(super) fn encode(handle: u16, packet: &[u8], max: usize) -> Option<Encoded> 
     Some(Encoded::Fragments(parts))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct AssemblyKey {
+    handle: u16,
+    id: u64,
+}
+
 struct Assembly {
     packet: Vec<u8>,
     covered: [u64; MAX_PACKET.div_ceil(64)],
@@ -90,7 +96,7 @@ struct Assembly {
 /// validates the network handle. Both per-connection and process-wide limits
 /// apply; dropping a reader releases all its reservations.
 pub(super) struct Reassembler {
-    pending: HashMap<(u16, u64), Assembly>,
+    pending: HashMap<AssemblyKey, Assembly>,
     budget: Arc<Semaphore>,
 }
 
@@ -143,7 +149,7 @@ impl Reassembler {
         let total = u16::from_be_bytes([datagram[11], datagram[12]]) as usize;
         let offset = u16::from_be_bytes([datagram[13], datagram[14]]) as usize;
         let payload = &datagram[HEADER..];
-        let key = (handle, id);
+        let key = AssemblyKey { handle, id };
         if total == 0 || total > MAX_PACKET || offset + payload.len() > total {
             self.pending.remove(&key);
             return Err(malformed);

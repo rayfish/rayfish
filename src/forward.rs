@@ -1087,11 +1087,20 @@ mod tests {
         SecretKey::from([seed; 32]).public()
     }
 
-    /// Exercise the production sender, lazy-dial batch flush and receiver over
-    /// real QUIC, with discovery disabled so the datagram budget stays below
-    /// the 1280-byte IP packet size even on loopback.
     #[tokio::test]
     async fn fragmented_tcp_crosses_small_quic_path_and_keeps_policy_checks() {
+        check_fragmented_tcp(1280).await;
+    }
+
+    #[tokio::test]
+    async fn full_tun_mtu_crosses_small_quic_path_and_keeps_policy_checks() {
+        check_fragmented_tcp(crate::tun::TUN_MTU as usize).await;
+    }
+
+    /// Exercise the production sender, lazy-dial batch flush and receiver over
+    /// real QUIC, with discovery disabled so full IP packets need fragmentation
+    /// even on loopback.
+    async fn check_fragmented_tcp(packet_len: usize) {
         use iroh::endpoint::{QuicTransportConfig, presets};
         use iroh::{Endpoint, RelayMode};
         use std::time::{Duration, Instant};
@@ -1157,8 +1166,8 @@ mod tests {
         };
         let route = sender_peers.lookup_v6(&b_ip).unwrap();
         let mut packet = make_tcp_packet_between(a_ip, b_ip, 22);
-        packet.resize(1280, 0x5a);
-        packet[4..6].copy_from_slice(&1240u16.to_be_bytes());
+        packet.resize(packet_len, 0x5a);
+        packet[4..6].copy_from_slice(&((packet_len - 40) as u16).to_be_bytes());
         packet[52] = 0x50; // TCP data offset
         packet[53] = 0x18; // PSH + ACK
         let checksum = tcp_csum_v6(&packet);

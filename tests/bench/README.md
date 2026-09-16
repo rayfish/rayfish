@@ -41,6 +41,5 @@ and `PING_INTERVAL` to adjust it (defaults: `300`, `0.01` seconds).
 rayfish's userspace TUN + iroh QUIC datagram encryption is the bottleneck, and
 absolute numbers are noisy run-to-run. Use a larger `SIZE` (e.g. `s-2vcpu-4gb`,
 or a CPU-optimized `c-2`) for steadier throughput; the *direct-vs-rayfish ratio*
-is the signal,
-not the absolute Mbit/s. rayfish also runs an MTU of 1280 (the IPv6 minimum, per
-WireGuard/Tailscale), which caps per-packet payload below the link's native MTU.
+is the signal, not the absolute Mbit/s. Rayfish uses a TUN MTU of 1500 bytes;
+packets larger than the QUIC datagram budget require mesh fragmentation.

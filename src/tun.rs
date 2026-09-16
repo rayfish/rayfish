@@ -71,22 +71,14 @@ pub trait TunWrite: Send + 'static {
     ) -> impl core::future::Future<Output = anyhow::Result<()>> + Send;
 }
 
-/// MTU for the TUN device. IPv6 mandates a minimum link MTU of 1280 bytes
-/// (RFC 8200 §5); Linux refuses to enable IPv6 on a device with a smaller MTU,
-/// which silently breaks IPv6 address/route installation (the builder's IPv6
-/// assignment / `route_peer_range` fail with `EINVAL`). 1280 is also the value
-/// WireGuard and
-/// Tailscale use for their TUN interfaces for the same reason, and it still
-/// fits within QUIC datagram limits.
-#[cfg(not(target_os = "android"))]
-const TUN_MTU: u16 = 1280;
+/// Maximum IP packet size for the tunnel. Mesh fragmentation carries packets
+/// over smaller QUIC paths. Keep Android's VpnService MTU in sync with this.
+pub const TUN_MTU: u16 = 1500;
 
 /// Bytes exposed for a single `recv`. A TUN read yields at most one MTU-bounded
 /// packet (offload is off), plus a few bytes of slack for any platform
-/// packet-info header. `recv` needs an initialised `&mut [u8]`, so we zero-fill
-/// this many bytes at the tail of the caller's pool before each read; a hand-set
-/// jumbo MTU beyond this would be truncated, but such a packet exceeds the path
-/// MTU and could not traverse a QUIC datagram anyway.
+/// packet-info header. The reader allocates this much scratch space at creation;
+/// manually raising the interface MTU beyond the tunnel limit is unsupported.
 #[cfg(not(target_os = "android"))]
 const READ_RESERVE: usize = TUN_MTU as usize + 4;
 

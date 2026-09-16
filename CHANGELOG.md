@@ -20,6 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Tunnel MTU increased from 1280 to 1500 bytes on desktop and Android.**
+  Mesh fragmentation carries full-size packets over smaller QUIC paths.
+
 - **Mesh protocol 6: update connected peers together.** Packet fragmentation
   changes the mesh wire format. Older peers are reported as incompatible until
   upgraded; they cannot connect to a protocol 6 peer.
