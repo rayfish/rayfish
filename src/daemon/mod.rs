@@ -378,6 +378,7 @@ pub(crate) async fn announce_network_handles(
         &ControlMsg::NetworkHandles {
             entries,
             features: transport::FEATURE_IDLE_CLOSE,
+            receive_mtu: peers.local_mtu(),
         },
     )
     .await;
@@ -858,6 +859,7 @@ impl Daemon {
         reader: R,
         writer: W,
     ) {
+        self.registry.peers.set_local_mtu(writer.mtu());
         // Fresh channel per attach. The previous writer (if any) was torn down by
         // `detach_tun`, which dropped the old receiver; swapping in the new sender
         // reconnects every incoming send-site to this writer.
@@ -906,6 +908,22 @@ impl Daemon {
             old.cancel.cancel();
             old.writer.abort();
             old.mesh.abort();
+        }
+        // Connections survive mobile VPN toggles; refresh the receive limit for
+        // already-connected peers as well as announcing it on future connects.
+        let peers = self.registry.peers.clone();
+        for (ip, conn) in peers.all_connections() {
+            let peers = peers.clone();
+            let token = self.shutdown_token.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => {},
+                    _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        announce_network_handles(&peers, &conn, ip),
+                    ) => {},
+                }
+            });
         }
     }
 
@@ -3878,9 +3896,14 @@ mod headless_tests {
     #[derive(Clone, Default)]
     struct FakeTunWriter {
         written: Arc<Mutex<Vec<Vec<u8>>>>,
+        mtu: Option<u16>,
     }
 
     impl crate::tun::TunWrite for FakeTunWriter {
+        fn mtu(&self) -> u16 {
+            self.mtu.unwrap_or(crate::tun::TUN_MTU)
+        }
+
         async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
             self.written.lock().unwrap().push(packet.to_vec());
             Ok(())
@@ -3985,7 +4008,10 @@ mod headless_tests {
         // 2. Toggle: detach, then re-attach reader2 + writer2. This is the path
         //    that used to silently break before the fresh-channel-per-attach fix.
         daemon.detach_tun();
-        let writer2 = FakeTunWriter::default();
+        let writer2 = FakeTunWriter {
+            mtu: Some(1280),
+            ..Default::default()
+        };
         let sink2 = writer2.written.clone();
         let alive2 = Arc::new(());
         daemon
@@ -3998,11 +4024,16 @@ mod headless_tests {
             .await;
         daemon.active.store(true, Ordering::SeqCst);
 
+        // A packet queued across the MTU change must not reach the smaller TUN.
+        // The small packet acts as a barrier after the oversized packet.
+        send_pkt(&daemon, &[0; 1500]).await;
         send_pkt(&daemon, b"packet-2").await;
+        assert_eq!(daemon.registry.peers.local_mtu(), 1280);
         assert!(
             wait_for_len(&sink2, 1).await,
             "writer2 should receive the packet after a detach->attach toggle"
         );
+        assert_eq!(*sink2.lock().unwrap(), vec![b"packet-2".to_vec()]);
 
         // 3. Double-attach guard: attach writer3 WITHOUT detaching first. The
         //    previous data plane (writer2's mesh loop + writer) must be aborted,
@@ -4023,6 +4054,7 @@ mod headless_tests {
         daemon.active.store(true, Ordering::SeqCst);
 
         send_pkt(&daemon, b"packet-3").await;
+        assert_eq!(daemon.registry.peers.local_mtu(), 1500);
         assert!(
             wait_for_len(&sink3, 1).await,
             "writer3 should receive the packet after a double-attach"

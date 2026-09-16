@@ -407,7 +407,7 @@ class RayfishVpnService : VpnService() {
                 .setSession("Rayfish")
                 .addDnsServer(magicDns)
                 .addSearchDomain("ray")
-                .setMtu(1280)
+                .setMtu(1500) // Keep in sync with rayfish::tun::TUN_MTU.
                 // Our mesh address and the range it lives in (mirrors the desktop
                 // 200::/7 route). The blank check above guarantees we have one.
                 .addAddress(meshV6, 128)
