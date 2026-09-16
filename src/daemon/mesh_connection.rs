@@ -219,8 +219,15 @@ impl MeshConnection {
             }
             // Connection-level messages (not scoped to a network).
             match &frame.msg {
-                ControlMsg::NetworkHandles { entries, features } => {
+                ControlMsg::NetworkHandles {
+                    entries,
+                    features,
+                    receive_mtu,
+                } => {
                     self.manager.apply_network_handles(self.peer_id, entries);
+                    self.ctx
+                        .peers
+                        .note_receive_mtu(&self.peer_id, &self.conn, *receive_mtu);
                     // The handle announcement is the one control message both ends
                     // send right after connect, so it is where we learn the peer's
                     // idle-close capability (the MeshHello handshake is one-way). Gate

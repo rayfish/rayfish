@@ -31,10 +31,10 @@ use rayfish::firewall::{
     RuleOrigin, SharedFirewall,
 };
 
-/// Datagram sizes spanning the MTU: a 64-byte control/ACK-ish packet and a
-/// full 1280-byte (TUN MTU) data packet. The copy cost scales with size; the
+/// Packet sizes spanning the MTU: a small control/ACK packet, IPv6's minimum
+/// MTU, and a full TUN packet. The copy cost scales with size; the
 /// zero-copy path should be flat.
-const SIZES: &[usize] = &[64, 1280];
+const SIZES: &[usize] = &[64, 1280, rayfish::tun::TUN_MTU as usize];
 
 /// Pool chunk size mirrors `forward::TX_POOL_CHUNK` (64 KiB) so the amortized
 /// allocation behaviour matches production.

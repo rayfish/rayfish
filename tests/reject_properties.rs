@@ -23,7 +23,7 @@ use proptest::prelude::*;
 use rayfish::firewall::{PacketInfo, parse_packet_info};
 use rayfish::reject::{build_packet_too_big, build_reject};
 
-/// TUN MTU. Every synthesized reply has to fit one datagram.
+/// IPv6 minimum MTU. Synthesized error replies stay within this limit.
 const MTU: usize = 1280;
 
 const TCP_RST: u8 = 0x04;

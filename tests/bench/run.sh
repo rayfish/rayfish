@@ -9,7 +9,7 @@
 # rayfish 200::/7 TUN address (RAYFISH):
 #   - ping RTT (latency)
 #   - iperf3 TCP throughput
-# so the delta isolates the cost rayfish (iroh QUIC datagrams, MTU 1200,
+# so the delta isolates the cost rayfish (iroh QUIC datagrams, TUN MTU 1500,
 # encryption, userspace TUN) adds on top of the raw link.
 #
 # Reads tests/bench/.servers (written by provision.sh). Does NOT modify infra.
