@@ -35,12 +35,12 @@ pub enum DropReason {
     /// mode off, or the sender is not in the network's `exit_allow` list). Keeps
     /// a non-exit node from silently transiting a peer's internet traffic.
     ExitDenied,
-    /// Outbound packet larger than the peer path's single-datagram budget. The
-    /// forwarder emits an ICMP "packet too big" (PMTUD) back to the source before
-    /// dropping, so the sender lowers its path MTU and resends a packet that fits
-    /// rather than blackholing. Seen mostly under an exit-node full tunnel
-    /// carrying bulk traffic over a relayed peer.
+    /// Outbound packet exceeds the mesh's IP packet limit or cannot be framed.
     PacketTooBig,
+    /// An incomplete fragmented packet exceeded its fixed reassembly deadline.
+    ReassemblyTimeout,
+    /// A peer or the daemon exhausted its bounded fragment reassembly budget.
+    ReassemblyLimit,
     /// Outbound packet dropped while its destination peer was being dialed on
     /// demand. The small first-packet queue is full, so retaining this newest
     /// packet would let a temporarily unreachable peer consume unbounded memory.
@@ -56,7 +56,7 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    const ALL: [DropReason; 11] = [
+    const ALL: [DropReason; 13] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -65,6 +65,8 @@ impl DropReason {
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
+        DropReason::ReassemblyTimeout,
+        DropReason::ReassemblyLimit,
         DropReason::LazyDialBufferFull,
         DropReason::LazyDialConcurrency,
         DropReason::DnsConcurrency,
@@ -376,6 +378,8 @@ mod tests {
                 | DropReason::Backpressure
                 | DropReason::Spoof
                 | DropReason::ExitDenied
+                | DropReason::ReassemblyTimeout
+                | DropReason::ReassemblyLimit
                 | DropReason::PacketTooBig
                 | DropReason::LazyDialBufferFull
                 | DropReason::LazyDialConcurrency

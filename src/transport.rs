@@ -82,7 +82,11 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Compact gave that up. Bump for anything that changes a struct's shape, and
 /// for anything an old peer would *misinterpret* (removed or repurposed fields
 /// and variants, changed semantics of existing ones).
-pub const MESH_PROTOCOL_VERSION: u32 = 5;
+///
+/// Version 6 adds fragmentation below IP so a 1280-byte IPv6 packet survives
+/// paths whose QUIC datagram budget is smaller. Older readers cannot decode
+/// fragment framing, so reject them at ALPN negotiation rather than blackholing.
+pub const MESH_PROTOCOL_VERSION: u32 = 6;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
 /// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:
