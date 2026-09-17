@@ -855,50 +855,21 @@ impl CoordinatorAcceptState {
                 .flatten()
                 .is_some_and(|n| grants_direct_key(&n, remote_id, &self.state));
 
-        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
-        let commit_guard = snapshot_commit.lock().await;
-        let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
-        let tentative_member = Member {
-            identity: remote_id,
-            is_coordinator: grant_direct,
-            hostname: final_hostname.clone(),
-            user_identity: user_id_opt,
-            device_cert: device_cert.clone(),
-            last_seen: Some(crate::membership::now_secs()),
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-        };
-        let (displaced_member, removed_approved, removed_pending) = {
-            let mut s = self.state.write().unwrap();
-            let displaced_member = s.members.get(&remote_id).cloned();
-            let removed_approved = if was_approved {
-                s.approved.remove(&remote_id)
-            } else {
-                None
-            };
-            let removed_pending = s.pending.remove(&remote_id);
-            s.members.add(tentative_member.clone());
-            (displaced_member, removed_approved, removed_pending)
-        };
-        let committed =
-            commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
-        if !committed {
-            {
-                let mut s = self.state.write().unwrap();
-                if restore_displaced_member(&mut s.members, &tentative_member, displaced_member) {
-                    if let Some(approved) = removed_approved {
-                        s.approved.approve(approved);
-                    }
-                    if let Some(pending) = removed_pending {
-                        s.pending.insert(remote_id, pending);
-                    }
-                    s.refresh_snapshot();
-                }
-            }
-            let rollback_durable =
-                commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
-            if rollback_durable {
-                drop(commit_guard);
+        let (direct_record, direct_record_published) = match self
+            .commit_admission(
+                remote_id,
+                &final_hostname,
+                &device_cert,
+                was_approved,
+                grant_direct,
+            )
+            .await
+        {
+            AdmissionCommit::Committed {
+                direct_record,
+                direct_record_published,
+            } => (direct_record, direct_record_published),
+            AdmissionCommit::Denied => {
                 self.deny(
                     conn,
                     send,
@@ -907,79 +878,13 @@ impl CoordinatorAcceptState {
                 .await;
                 return AdmissionResult::Denied;
             }
-
-            // The failed H2 write may have renamed H2 before its directory sync
-            // failed, while the failed rollback may have left that file in place.
-            // Keep live state on H2 and retry its durable commit; denying while
-            // disk might recover H2 would later grant a supposedly denied peer.
-            {
-                let mut s = self.state.write().unwrap();
-                s.approved.remove(&remote_id);
-                s.pending.remove(&remote_id);
-                s.members.add(tentative_member.clone());
-                s.refresh_snapshot();
-                s.unconfirmed_durable_hash =
-                    s.converged_hash.map(|hash| PendingSnapshotDurability {
-                        hash,
-                        published: false,
-                    });
-            }
-            if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await {
-                if let Some(notify) = &self.dht_notify {
-                    notify.notify_one();
-                }
-                drop(commit_guard);
-                let mut send = send;
+            AdmissionCommit::PendingDurability => {
                 let _ =
                     control::send_msg(&mut send, Some(self.net_pubkey()), &ControlMsg::JoinPending)
                         .await;
-                tracing::warn!(
-                    network = %self.network_name,
-                    peer = %remote_id.fmt_short(),
-                    "admission commit remained ambiguous; retained it live and asked the peer to retry"
-                );
                 return AdmissionResult::PendingDurability;
             }
-        }
-        let target = {
-            let s = self.state.read().unwrap();
-            s.network_secret_key.clone().zip(s.converged_hash)
         };
-        let published_record = match target {
-            Some((key, hash)) => {
-                self.ctx
-                    .registry
-                    .publish_group_hash(&self.network_name, &key, hash)
-                    .await
-            }
-            None => None,
-        };
-        if published_record.is_none() {
-            // The complete generation and unpublished pointer are already
-            // durable. Keep the admission live and let the tracked publisher
-            // retry. This also conservatively covers a successful DHT write whose
-            // publication-marker config write failed: rolling back there would
-            // deny a peer the signed record has already admitted.
-            tracing::warn!(
-                network = %self.network_name,
-                peer = %remote_id.fmt_short(),
-                "admission publication was not confirmed; retaining its durable pending generation"
-            );
-        }
-        let direct_record_published = grant_direct && published_record.is_some();
-        let direct_record = if grant_direct {
-            published_record.clone().or_else(|| {
-                let s = self.state.read().unwrap();
-                let key = s.network_secret_key.as_ref()?;
-                let hash = s.converged_hash?;
-                dht::encode_network_record(key, &hash, &[self.ctx.registry.transport.endpoint.id()])
-                    .ok()
-                    .map(|packet| packet.as_bytes().to_vec())
-            })
-        } else {
-            None
-        };
-        drop(commit_guard);
 
         if let Some(ref h) = final_hostname {
             dns::update_hostname(
@@ -1059,6 +964,137 @@ impl CoordinatorAcceptState {
         AdmissionResult::Admitted(peer_ip)
     }
 
+    /// Commit a tentative roster change before any Welcome or route update.
+    /// A failed directory sync may have installed the new generation already;
+    /// retain it live if the rollback is also ambiguous, so retries cannot turn
+    /// an admitted peer into a denied one.
+    async fn commit_admission(
+        &self,
+        remote_id: EndpointId,
+        final_hostname: &Option<String>,
+        device_cert: &Option<control::DeviceCert>,
+        was_approved: bool,
+        grant_direct: bool,
+    ) -> AdmissionCommit {
+        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
+        let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
+        let tentative_member = Member {
+            identity: remote_id,
+            is_coordinator: grant_direct,
+            hostname: final_hostname.clone(),
+            user_identity: user_id_opt,
+            device_cert: device_cert.clone(),
+            last_seen: Some(crate::membership::now_secs()),
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        };
+        let (displaced_member, removed_approved, removed_pending) = {
+            let mut s = self.state.write().unwrap();
+            let displaced_member = s.members.get(&remote_id).cloned();
+            let removed_approved = if was_approved {
+                s.approved.remove(&remote_id)
+            } else {
+                None
+            };
+            let removed_pending = s.pending.remove(&remote_id);
+            s.members.add(tentative_member.clone());
+            (displaced_member, removed_approved, removed_pending)
+        };
+        let committed =
+            commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+        if !committed {
+            {
+                let mut s = self.state.write().unwrap();
+                if restore_displaced_member(&mut s.members, &tentative_member, displaced_member) {
+                    if let Some(approved) = removed_approved {
+                        s.approved.approve(approved);
+                    }
+                    if let Some(pending) = removed_pending {
+                        s.pending.insert(remote_id, pending);
+                    }
+                    s.refresh_snapshot();
+                }
+            }
+            let rollback_durable =
+                commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+            if rollback_durable {
+                return AdmissionCommit::Denied;
+            }
+
+            // The failed H2 write may have renamed H2 before its directory sync
+            // failed, while the failed rollback may have left that file in place.
+            // Keep live state on H2 and retry its durable commit; denying while
+            // disk might recover H2 would later grant a supposedly denied peer.
+            {
+                let mut s = self.state.write().unwrap();
+                s.approved.remove(&remote_id);
+                s.pending.remove(&remote_id);
+                s.members.add(tentative_member.clone());
+                s.refresh_snapshot();
+                s.unconfirmed_durable_hash =
+                    s.converged_hash.map(|hash| PendingSnapshotDurability {
+                        hash,
+                        published: false,
+                    });
+            }
+            if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await {
+                if let Some(notify) = &self.dht_notify {
+                    notify.notify_one();
+                }
+                tracing::warn!(
+                    network = %self.network_name,
+                    peer = %remote_id.fmt_short(),
+                    "admission commit remained ambiguous; retained it live and asked the peer to retry"
+                );
+                return AdmissionCommit::PendingDurability;
+            }
+        }
+        let target = {
+            let s = self.state.read().unwrap();
+            s.network_secret_key.clone().zip(s.converged_hash)
+        };
+        let published_record = match target {
+            Some((key, hash)) => {
+                self.ctx
+                    .registry
+                    .publish_group_hash(&self.network_name, &key, hash)
+                    .await
+            }
+            None => None,
+        };
+        if published_record.is_none() {
+            // The complete generation and unpublished pointer are already
+            // durable. Keep the admission live and let the tracked publisher
+            // retry. This also conservatively covers a successful DHT write whose
+            // publication-marker config write failed: rolling back there would
+            // deny a peer the signed record has already admitted.
+            tracing::warn!(
+                network = %self.network_name,
+                peer = %remote_id.fmt_short(),
+                "admission publication was not confirmed; retaining its durable pending generation"
+            );
+        }
+        let direct_record_published = grant_direct && published_record.is_some();
+        let direct_record = if grant_direct {
+            published_record.clone().or_else(|| {
+                let s = self.state.read().unwrap();
+                let key = s.network_secret_key.as_ref()?;
+                let hash = s.converged_hash?;
+                dht::encode_network_record(key, &hash, &[self.ctx.registry.transport.endpoint.id()])
+                    .ok()
+                    .map(|packet| packet.as_bytes().to_vec())
+            })
+        } else {
+            None
+        };
+        drop(commit_guard);
+        AdmissionCommit::Committed {
+            direct_record,
+            direct_record_published,
+        }
+    }
+
     /// Decide a joiner's hostname against the current roster, or return a denial
     /// reason. The address needs no deciding: it is derived from the identity, so
     /// two coordinators admitting the same peer arrive at the same one and there is
@@ -1101,6 +1137,16 @@ impl CoordinatorAcceptState {
             hostname: final_hostname,
         })
     }
+}
+
+/// Result of writing a tentative admission while holding the snapshot lock.
+enum AdmissionCommit {
+    Committed {
+        direct_record: Option<Vec<u8>>,
+        direct_record_published: bool,
+    },
+    PendingDurability,
+    Denied,
 }
 
 /// The coordinator's durable outcome for an attempted admission.
