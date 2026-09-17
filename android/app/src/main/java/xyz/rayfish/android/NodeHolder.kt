@@ -2,9 +2,8 @@ package xyz.rayfish.android
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.LinkProperties
-import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.util.Log
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
@@ -17,7 +16,7 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Node
 
 /**
- * A default-network callback [NodeHolder] forwards to the core, counted per kind.
+ * A network callback received by [NodeHolder], counted before filtering.
  *
  * Which kind fires matters for battery, and the two halves are not comparable.
  * [AVAILABLE] and [LOST] mean the default network really changed, and are rare.
@@ -25,10 +24,9 @@ import uniffi.ray_mobile.Node
  * care about: a signal-strength update, a revised link-bandwidth estimate, a
  * reordered DNS server list. On a cellular link those arrive continuously.
  *
- * Every forwarded event costs a full endpoint rebind and path re-probe, so a
- * window where the last two dominate is a window of spent radio with nothing to
- * show for it. Counting them apart is what makes that visible in a report
- * instead of a guess.
+ * Forwarded events request an endpoint refresh and wake the signed-record
+ * pollers. Comparing raw callback counts with dispatched notifications shows
+ * whether filtering and debouncing are keeping that work bounded.
  */
 enum class NetworkEvent(val label: String) {
     AVAILABLE("available"),
@@ -47,8 +45,9 @@ data class NetworkChurn(
     val perEvent: Map<NetworkEvent, Long>,
     /**
      * Callbacks that survived the debounce and became a real `networkChanged()`.
-     * Read against [callbacks]: a ratio near 1 means the debounce is coalescing
-     * nothing and each callback is buying its own rebind.
+     * Read against [callbacks] to measure filtering and debouncing. The field
+     * name is retained for telemetry compatibility; iroh may skip a rebind when
+     * its own interface comparison finds no change.
      */
     val rebinds: Long,
     /** How long the window covers, in milliseconds. */
@@ -323,7 +322,7 @@ object NodeHolder {
     private val netScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkCallbacks: List<NetworkChangeCallback> = emptyList()
 
     /**
      * Per-kind callback counts and the rebinds they produced, since the last
@@ -367,7 +366,8 @@ object NodeHolder {
      * timeouts, no relay, no mDNS announce, device invisible to the mesh).
      * Lives with the node's lifecycle, so it also covers standby, where the
      * control plane is the only thing running and nothing else would notice.
-     * networkChanged() is idempotent and cheap, so the callback stays dumb.
+     * Capability callbacks are filtered before debouncing: bandwidth estimates
+     * and signal strength do not warrant a refresh or a signed-record lookup.
      *
      * onAvailable/onLost alone are not enough, which is what made a phone that
      * had moved stay disconnected: the default Network object survives a Wi-Fi
@@ -377,34 +377,51 @@ object NodeHolder {
      * addresses under the endpoint have changed all the same.
      */
     private fun registerNetworkCallback(context: Context) {
-        if (networkCallback != null) return
+        if (networkCallbacks.isNotEmpty()) return
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
         if (cm == null) return
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) =
-                notifyCore(NetworkEvent.AVAILABLE, network)
-            override fun onLost(network: Network) = notifyCore(NetworkEvent.LOST, network)
-            override fun onLinkPropertiesChanged(network: Network, props: LinkProperties) =
-                notifyCore(NetworkEvent.LINK_PROPERTIES, network)
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-                notifyCore(NetworkEvent.CAPABILITIES, network)
-            private fun notifyCore(event: NetworkEvent, network: Network) {
-                eventCounts[event]?.incrementAndGet()
-                Log.i(TAG, "default network ${event.label} ($network); notifying core")
+        fun callback(source: String) = NetworkChangeCallback { event, network, changed ->
+            eventCounts[event]?.incrementAndGet()
+            if (changed) {
+                Log.i(TAG, "$source network ${event.label} ($network); notifying core")
                 scheduleNotify()
             }
         }
-        runCatching { cm.registerDefaultNetworkCallback(cb) }
-            .onSuccess { networkCallback = cb }
-            .onFailure { Log.w(TAG, "network callback registration failed", it) }
+        val default = callback("default")
+        val physical = callback("physical")
+        // A VPN's addresses/routes can stay fixed while its Wi-Fi or cellular
+        // underlay changes. Observe physical links too so filtering the VPN's
+        // capabilities cannot hide a DHCP renew, DNS change or handover. This
+        // is a passive listener, not a request to keep an extra radio online.
+        val physicalNetworks = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        val registered = mutableListOf<NetworkChangeCallback>()
+        runCatching {
+            cm.registerDefaultNetworkCallback(default)
+            registered += default
+            cm.registerNetworkCallback(physicalNetworks, physical)
+            registered += physical
+        }.onSuccess { networkCallbacks = registered.toList() }
+            .onFailure {
+                default.deactivate()
+                physical.deactivate()
+                registered.forEach { cb -> runCatching { cm.unregisterNetworkCallback(cb) } }
+                synchronized(notifyLock) {
+                    notifyJob?.cancel()
+                    notifyJob = null
+                }
+                Log.w(TAG, "network callback registration failed", it)
+            }
     }
 
     /**
      * Coalesce a burst of callbacks into one rebind. A single network switch
      * fires several of them within a few hundred milliseconds (available, then
      * capabilities, then link properties, often more than once as validation
-     * completes), and each networkChanged() is a full endpoint rebind and path
-     * re-probe. The last one in the burst is the one that sees the settled
+     * completes), and each networkChanged() requests an endpoint refresh and
+     * wakes signed-record polling. The last one sees the settled
      * addresses, so waiting for the burst to stop is both cheaper and more
      * accurate than acting on the first.
      *
@@ -439,14 +456,15 @@ object NodeHolder {
     }
 
     private fun unregisterNetworkCallback(context: Context) {
+        val callbacks = networkCallbacks
+        networkCallbacks = emptyList()
+        callbacks.forEach { it.deactivate() }
         synchronized(notifyLock) {
             notifyJob?.cancel()
             notifyJob = null
         }
-        val cb = networkCallback ?: return
-        networkCallback = null
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
-        runCatching { cm?.unregisterNetworkCallback(cb) }
+        callbacks.forEach { cb -> runCatching { cm?.unregisterNetworkCallback(cb) } }
     }
 
     /**

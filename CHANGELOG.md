@@ -41,6 +41,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android ignores bandwidth and signal-strength updates that do not change
+  connectivity.** These could trigger network refreshes and background lookups
+  every few seconds. Real Wi-Fi/cellular handovers and address, route, DNS and
+  reachability changes still refresh the connection, including behind the VPN.
+
 - **Restoring a paired device also restores its networks.** New identity backups
   include the pairing certificate and saved networks. Restoring one brings the
   networks back automatically and retries connections as they become available.
