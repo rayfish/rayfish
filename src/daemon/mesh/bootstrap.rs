@@ -738,6 +738,8 @@ async fn build_daemon_inner(
 fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken, lan_peers: Arc<LanPeers>) {
     let mdns = match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
         .service_name("rayfish")
+        // Long-lived background discovery, not an interactive device picker.
+        .discovery_cadence(Duration::from_secs(5))
         .advertise(true)
         .build(ep.id())
     {

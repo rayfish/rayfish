@@ -15,7 +15,7 @@ categories = ["network-programming", "command-line-utilities"]
 # The repo root is both the `rayfish` package (binary `ray`) and the workspace
 # root. `ray-proto` is a member crate holding the shared IPC wire protocol.
 [workspace]
-members = ["ray-proto", "ray-mobile"]
+members = ["ray-proto", "ray-mobile", "vendor/iroh-mdns-address-lookup"]
 
 [workspace.metadata.release]
 publish = false
@@ -212,6 +212,8 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [patch.crates-io]
+# Background cadence and content-based discovery deduplication (see vendor patch notes).
+iroh-mdns-address-lookup = { path = "vendor/iroh-mdns-address-lookup" }
 # iroh fork carrying three rayfish features on the `rayfish-integration` branch:
 #   - `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397)
 #   - `Builder::configure_socket`, a hook run on every socket iroh opens (UDP and
