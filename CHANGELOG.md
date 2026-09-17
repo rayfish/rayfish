@@ -20,6 +20,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **LAN discovery uses a five-second base interval and ignores unchanged
+  announcements.** This reduces background multicast traffic and repeated logs.
+  Discovery can take a few seconds; update LAN peers together for consistent
+  expiry behavior with the slower announcements.
+
 - **Routine TUN packet logs require trace logging.** Normal debug diagnostics
   retain connection and failure details without formatting a log for every packet.
 
