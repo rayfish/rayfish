@@ -1181,7 +1181,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_approve_connect_request() != 47115.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_backup_identity() != 49200.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_backup_identity() != 31710.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_cancel_send() != 49789.toShort()) {
@@ -1262,7 +1262,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_reject_file_offer() != 10539.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_restore_identity() != 41698.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_restore_identity() != 5366.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_send_file() != 40644.toShort()) {
@@ -1717,9 +1717,9 @@ public interface NodeInterface {
     fun `approveConnectRequest`(`shortId`: kotlin.String)
     
     /**
-     * Encrypt this device's identity under `password` and return the backup
-     * code, for the platform to hand to a file picker (Drive, Files, whatever
-     * the user has) or a password manager. Format and threat model are in
+     * Encrypt this device's identity, pairing certificate, and saved networks
+     * under `password` and return the backup code for a file or password manager.
+     * Format and threat model are in
      * [`keybackup`]; the same code restores on desktop with
      * `ray pair restore <code>`.
      *
@@ -1907,11 +1907,9 @@ public interface NodeInterface {
      * identity is already on the device and `replace_existing` is false. Call
      * again with the flag once the user has confirmed.
      *
-     * Restoring makes this device the primary holder of the identity, so any
-     * device cert from a previous pairing is deleted: it attests the old key
-     * and would otherwise sit there claiming this device is somebody's
-     * secondary. Restoring the identity already on the device is a no-op
-     * success.
+     * A current backup restores the device cert and saved networks too. An old
+     * key-only backup clears a cert tied to a different key. Restoring the same
+     * identity can still recover missing metadata from a current backup.
      *
      * Returns the restored identity's public key. The caller must restart the
      * node afterwards for it to take effect.
@@ -2164,9 +2162,9 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * Encrypt this device's identity under `password` and return the backup
-     * code, for the platform to hand to a file picker (Drive, Files, whatever
-     * the user has) or a password manager. Format and threat model are in
+     * Encrypt this device's identity, pairing certificate, and saved networks
+     * under `password` and return the backup code for a file or password manager.
+     * Format and threat model are in
      * [`keybackup`]; the same code restores on desktop with
      * `ray pair restore <code>`.
      *
@@ -2634,11 +2632,9 @@ open class Node: Disposable, AutoCloseable, NodeInterface
      * identity is already on the device and `replace_existing` is false. Call
      * again with the flag once the user has confirmed.
      *
-     * Restoring makes this device the primary holder of the identity, so any
-     * device cert from a previous pairing is deleted: it attests the old key
-     * and would otherwise sit there claiming this device is somebody's
-     * secondary. Restoring the identity already on the device is a no-op
-     * success.
+     * A current backup restores the device cert and saved networks too. An old
+     * key-only backup clears a cert tied to a different key. Restoring the same
+     * identity can still recover missing metadata from a current backup.
      *
      * Returns the restored identity's public key. The caller must restart the
      * node afterwards for it to take effect.
