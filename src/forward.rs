@@ -557,7 +557,7 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
         // Zero-copy hand-off: slice the packet out of the pool as an owned
         // `Bytes` sharing the chunk's allocation, no copy, no per-packet malloc.
         let pkt = pool.split_to(n).freeze();
-        tracing::debug!(len = n, first_byte = pkt[0], "TUN read");
+        tracing::trace!(len = n, first_byte = pkt[0], "TUN read");
         let Some(info) = firewall::parse_packet_info(&pkt) else {
             // Not IP, truncated, or IPv6 carrying an extension header we refuse
             // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
