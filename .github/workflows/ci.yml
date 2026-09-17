@@ -128,9 +128,9 @@ jobs:
 
       # `-x cargoNdkBuild` skips the native cross-build: the .so is not linked
       # into anything here, and the step above already compiled that code.
-      - name: Compile the app
+      - name: Compile and test the app
         working-directory: android
-        run: ./gradlew :app:compileDebugKotlin -x cargoNdkBuild
+        run: ./gradlew :app:compileDebugKotlin :app:testDebugUnitTest -x cargoNdkBuild
 
   # Same gap the macOS and Android jobs close, for the third platform whose code
   # no Linux build compiles: the TUN/route/DNS backends are per-OS `cfg`

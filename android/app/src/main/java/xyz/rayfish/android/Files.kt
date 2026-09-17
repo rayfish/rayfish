@@ -63,6 +63,7 @@ internal object DownloadsOutcome {
 
     fun markPending(key: TransferKey) {
         pending[key] = android.os.SystemClock.elapsedRealtime()
+        FileStatusMonitor.request()
     }
 
     /** The accept itself failed before a Downloads outcome could ever be recorded
@@ -70,6 +71,7 @@ internal object DownloadsOutcome {
      * the very next poll instead of waiting out [PENDING_TIMEOUT_MS]. */
     fun clearPending(key: TransferKey) {
         pending.remove(key)
+        FileStatusMonitor.request()
     }
 
     fun isPending(key: TransferKey): Boolean {
@@ -81,12 +83,20 @@ internal object DownloadsOutcome {
         return true
     }
 
+    /** One deadline while a save is pending, never a recurring idle timer. */
+    fun nextCheckDelayMs(): Long? = synchronized(pending) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        pending.entries.removeAll { now - it.value > PENDING_TIMEOUT_MS }
+        pending.values.minOrNull()?.let { (it + PENDING_TIMEOUT_MS + 1 - now).coerceAtLeast(1) }
+    }
+
     fun record(key: TransferKey, reachedDownloads: Boolean) {
         // Write the outcome before clearing pending: otherwise a poll landing
         // between the two writes would see neither pending nor recorded, and
         // fall back to the neutral "Saved" guess.
         outcomes[key] = reachedDownloads
         pending.remove(key)
+        FileStatusMonitor.request()
     }
 
     /** Consumes (removes) the recorded outcome so a later receive reusing the same
@@ -273,12 +283,14 @@ object FileAutoAccept {
                     if (tries < MAX_ATTEMPTS) {
                         // Let a later poll retry this id.
                         handled.remove(f.id)
+                        FileStatusMonitor.request(4_000)
                         Log.w("RayfishFiles", "auto-accept failed for ${f.filename}, will retry ($tries/$MAX_ATTEMPTS)", t)
                     } else {
                         // Give up: id stays in `handled` so no poller respawns it
                         // again, and is recorded in `gaveUp` so the offer can still
                         // be saved manually instead of vanishing for good.
                         gaveUp.add(f.id)
+                        FileStatusMonitor.request()
                         Log.w("RayfishFiles", "auto-accept giving up on ${f.filename} after $tries attempts", t)
                     }
                 }

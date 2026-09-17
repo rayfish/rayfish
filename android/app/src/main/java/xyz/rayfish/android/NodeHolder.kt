@@ -202,6 +202,7 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_AUTO_ACCEPT_OWN, value).apply()
+        FileStatusMonitor.request()
     }
 
     fun isGoOfflineWhenDisabled(context: Context): Boolean =
@@ -479,6 +480,7 @@ object NodeHolder {
      * to deadlock against.
      */
     fun stopNode(context: Context) {
+        FileStatusMonitor.stop()
         synchronized(this) {
             unregisterNetworkCallback(context)
             runCatching { node?.stop() }
