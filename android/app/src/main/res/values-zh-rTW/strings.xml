@@ -147,7 +147,7 @@
     <string name="unpair_body">此裝置會離開你的所有網路，並刪除配對憑證。其他節點會立刻中斷連線。請從主要裝置重新配對才能再加入。</string>
     <string name="qr_scan_prompt">掃描 Rayfish 代碼</string>
 
-    <string name="identity_backup_body">身分就是這台裝置的金鑰。遺失後網路就認不得你；請用只有你知道的密碼加密備份。</string>
+    <string name="identity_backup_body">用只有你知道的密碼備份此裝置的金鑰、配對憑證和已儲存的網路。</string>
     <string name="identity_restore_need_off">請先關閉 Rayfish 才能還原身分。</string>
     <string name="backup_title">備份身分</string>
     <string name="hint_password">密碼</string>
@@ -157,7 +157,7 @@
     <string name="hint_backup_password">備份密碼</string>
     <string name="restore_password_hint">建立此備份時設定的密碼。</string>
     <string name="replace_identity_title">取代這個身分？</string>
-    <string name="replace_identity_body">此裝置已有身分 %s。還原會取代它：舊身分會從本機消失、配對憑證會刪除，其他節點會在新位址看到這台裝置。</string>
+    <string name="replace_identity_body">此裝置已有身分 %s。還原會以備份中的金鑰和已儲存的網路取代目前資料。其他節點可能會看到新位址。</string>
 
     <string name="share_send_to_peer">將 %s 傳給節點</string>
     <string name="share_connecting">連線中…</string>

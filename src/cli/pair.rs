@@ -211,18 +211,18 @@ pub(crate) fn cmd_pair_restore(
     };
 
     let password = rpassword::prompt_password("Enter backup password: ")?;
-    let key = keybackup::decrypt(&backup, &password)?;
+    let restored = keybackup::decrypt_backup(&backup, &password)?;
+    let key = &restored.secret_key;
 
     // Check if a key already exists
     let existing = identity::load_or_create()?;
-    if existing.public() == key.public() {
-        println!("This device already has this identity.");
-        return Ok(());
+    let same_identity = existing.public() == key.public();
+    if !same_identity {
+        // Writes into the shared config tree (Linux: /etc/rayfish, root-owned, so
+        // this command may need sudo there).
+        identity::store_secret_key(key)?;
     }
-
-    // Writes into the shared config tree (Linux: /etc/rayfish, root-owned, so
-    // this command may need sudo there).
-    identity::store_secret_key(&key)?;
+    keybackup::restore_metadata(&restored, same_identity)?;
 
     println!("Restored user identity: {}", key.public());
     println!("Restart the daemon for changes to take effect.");

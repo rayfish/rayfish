@@ -147,7 +147,7 @@
     <string name="unpair_body">この端末はすべてのネットワークを離れ、ペアリング証明書を削除します。ピアはすぐに切断されます。再参加するにはメイン端末から再度ペアリングしてください。</string>
     <string name="qr_scan_prompt">Rayfish コードをスキャン</string>
 
-    <string name="identity_backup_body">ID はこの端末の鍵です。失うとネットワークはあなたを認識できません。自分だけが知るパスワードで暗号化してバックアップしてください。</string>
+    <string name="identity_backup_body">この端末の鍵、ペアリング証明書、保存済みネットワークを、自分だけが知るパスワードでバックアップします。</string>
     <string name="identity_restore_need_off">ID を復元するには Rayfish をオフにしてください。</string>
     <string name="backup_title">ID をバックアップ</string>
     <string name="hint_password">パスワード</string>
@@ -157,7 +157,7 @@
     <string name="hint_backup_password">バックアップのパスワード</string>
     <string name="restore_password_hint">このバックアップを作成したときに決めたパスワードです。</string>
     <string name="replace_identity_title">この ID を置き換えますか？</string>
-    <string name="replace_identity_body">この端末にはすでに ID %s があります。復元すると置き換わります。古い ID とペアリング証明書はこの端末から消え、ピアには新しいアドレスで見えます。</string>
+    <string name="replace_identity_body">この端末にはすでに ID %s があります。復元すると、鍵と保存済みネットワークがバックアップの内容に置き換わります。ピアには新しいアドレスで見える場合があります。</string>
 
     <string name="share_send_to_peer">%s をピアに送信</string>
     <string name="share_connecting">接続中…</string>

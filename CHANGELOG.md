@@ -41,6 +41,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Restoring a paired device also restores its networks.** New identity backups
+  include the pairing certificate and saved networks. Restoring one brings the
+  networks back automatically and retries connections as they become available.
+  Existing key-only backups remain readable but still need a new pairing.
+
 - **Idle mesh SSH sessions stay connected while the client is responsive.**
   The server sends SSH keepalives after 15 seconds without incoming traffic,
   keeping firewall flow tracking alive, and closes the connection after roughly

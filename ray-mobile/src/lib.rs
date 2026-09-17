@@ -1142,9 +1142,9 @@ impl Node {
             .unwrap_or(false)
     }
 
-    /// Encrypt this device's identity under `password` and return the backup
-    /// code, for the platform to hand to a file picker (Drive, Files, whatever
-    /// the user has) or a password manager. Format and threat model are in
+    /// Encrypt this device's identity, pairing certificate, and saved networks
+    /// under `password` and return the backup code for a file or password manager.
+    /// Format and threat model are in
     /// [`keybackup`]; the same code restores on desktop with
     /// `ray pair restore <code>`.
     ///
@@ -1168,11 +1168,9 @@ impl Node {
     /// identity is already on the device and `replace_existing` is false. Call
     /// again with the flag once the user has confirmed.
     ///
-    /// Restoring makes this device the primary holder of the identity, so any
-    /// device cert from a previous pairing is deleted: it attests the old key
-    /// and would otherwise sit there claiming this device is somebody's
-    /// secondary. Restoring the identity already on the device is a no-op
-    /// success.
+    /// A current backup restores the device cert and saved networks too. An old
+    /// key-only backup clears a cert tied to a different key. Restoring the same
+    /// identity can still recover missing metadata from a current backup.
     ///
     /// Returns the restored identity's public key. The caller must restart the
     /// node afterwards for it to take effect.
@@ -1186,25 +1184,28 @@ impl Node {
             return Err(RayError::NodeRunning);
         }
 
-        let key =
-            keybackup::decrypt(&code, &password).map_err(|e| RayError::BadBackup(e.to_string()))?;
-        let restored = key.public().to_string();
+        let backup = keybackup::decrypt_backup(&code, &password)
+            .map_err(|e| RayError::BadBackup(e.to_string()))?;
+        let restored = backup.secret_key.public().to_string();
 
         // Deliberately not `load_or_create`: on a device with no identity yet
         // that would mint one, and the restore would then have to ask the user
         // for permission to overwrite a key it had just invented.
-        if let Some(existing) = identity::load_existing().map_err(RayError::network)? {
-            if existing.public() == key.public() {
-                tracing::info!(id = %restored, "restore: identity already on this device");
-                return Ok(restored);
-            }
-            if !replace_existing {
-                return Err(RayError::IdentityExists(existing.public().to_string()));
-            }
+        let existing = identity::load_existing().map_err(RayError::network)?;
+        let same_identity = existing
+            .as_ref()
+            .is_some_and(|key| key.public() == backup.secret_key.public());
+        if let Some(existing) = existing
+            && !replace_existing
+            && !same_identity
+        {
+            return Err(RayError::IdentityExists(existing.public().to_string()));
         }
 
-        identity::store_secret_key(&key).map_err(RayError::network)?;
-        identity::delete_device_cert().map_err(RayError::network)?;
+        if !same_identity {
+            identity::store_secret_key(&backup.secret_key).map_err(RayError::network)?;
+        }
+        keybackup::restore_metadata(&backup, same_identity).map_err(RayError::network)?;
 
         tracing::info!(id = %restored, "restored identity from backup");
         Ok(restored)

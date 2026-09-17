@@ -292,9 +292,10 @@ ray unpair <device>          # revoke one later
 ```
 
 Once paired, both devices are members of everything you've joined, and transfers
-between them can land automatically (`ray files auto-accept <net> on`). Back the
-shared identity key up with `ray pair backup` (optionally into 1Password) and
-bring it onto a fresh machine with `ray pair restore`.
+between them can land automatically (`ray files auto-accept <net> on`). Back up
+each device with `ray pair backup` (optionally into 1Password) and restore it with
+`ray pair restore`. New backups include its key, pairing certificate, and saved
+networks, so a restored paired device can reconnect without pairing again.
 
 ## Who can join
 

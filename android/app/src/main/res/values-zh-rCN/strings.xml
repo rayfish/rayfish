@@ -147,7 +147,7 @@
     <string name="unpair_body">此设备会离开你的所有网络，并删除配对证书。其他节点会立刻断开连接。请从主设备重新配对才能再加入。</string>
     <string name="qr_scan_prompt">扫描 Rayfish 代码</string>
 
-    <string name="identity_backup_body">身份就是这台设备的密钥。丢失后网络就认不出你；请用只有你知道的密码加密备份。</string>
+    <string name="identity_backup_body">用只有你知道的密码备份此设备的密钥、配对证书和已保存的网络。</string>
     <string name="identity_restore_need_off">请先关闭 Rayfish 才能恢复身份。</string>
     <string name="backup_title">备份身份</string>
     <string name="hint_password">密码</string>
@@ -157,7 +157,7 @@
     <string name="hint_backup_password">备份密码</string>
     <string name="restore_password_hint">创建此备份时设置的密码。</string>
     <string name="replace_identity_title">替换这个身份？</string>
-    <string name="replace_identity_body">此设备已有身份 %s。恢复会替换它：旧身份会从本机消失、配对证书会删除，其他节点会在新地址看到这台设备。</string>
+    <string name="replace_identity_body">此设备已有身份 %s。恢复会用备份中的密钥和已保存的网络替换当前数据。其他节点可能会看到新的地址。</string>
 
     <string name="share_send_to_peer">将 %s 发送给节点</string>
     <string name="share_connecting">正在连接…</string>
