@@ -41,6 +41,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android stops retrying desktop DNS configuration every minute.** VPN DNS
+  continues to be managed by Android, without the unsuccessful background retry.
+
 - **Android ignores bandwidth and signal-strength updates that do not change
   connectivity.** These could trigger network refreshes and background lookups
   every few seconds. Real Wi-Fi/cellular handovers and address, route, DNS and
