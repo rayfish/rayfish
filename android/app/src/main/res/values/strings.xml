@@ -167,7 +167,7 @@
     <string name="qr_scan_prompt">Scan a Rayfish code</string>
 
     <!-- Identity backup / restore -->
-    <string name="identity_backup_body">Your identity is this device\'s key. Lose it and your networks do not know you; back it up encrypted with a password only you know.</string>
+    <string name="identity_backup_body">Back up this device\'s key, pairing, and saved networks with a password only you know.</string>
     <string name="identity_restore_need_off">Turn Rayfish off to restore an identity.</string>
     <string name="backup_title">Back up identity</string>
     <string name="hint_password">password</string>
@@ -177,7 +177,7 @@
     <string name="hint_backup_password">backup password</string>
     <string name="restore_password_hint">The password you chose when you made this backup.</string>
     <string name="replace_identity_title">Replace this identity?</string>
-    <string name="replace_identity_body">This device already has identity %s. Restoring replaces it: the old one is gone from this device, its pairing certificate is deleted, and peers will see this device at a new address.</string>
+    <string name="replace_identity_body">This device already has identity %s. Restoring replaces its key and saved networks with those in the backup. Peers may see a new address.</string>
 
     <!-- Share sheet -->
     <string name="share_send_to_peer">Send %s to a peer</string>

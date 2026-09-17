@@ -210,12 +210,8 @@ private fun restore(
 internal fun shortId(publicKey: String): String =
     if (publicKey.length > 6) publicKey.take(6) else publicKey
 
-/**
- * A backup code is about 126 characters. Reading unbounded would let a
- * mis-tapped video in the picker pull hundreds of megabytes into memory, so
- * stop well past any real code and let the decode reject what comes back.
- */
-private const val MAX_BACKUP_FILE_BYTES = 4096
+/** Bound file picker reads while allowing saved network settings in a backup. */
+private const val MAX_BACKUP_FILE_BYTES = 512 * 1024
 
 private fun readBounded(stream: InputStream): String {
     val out = ByteArrayOutputStream()
