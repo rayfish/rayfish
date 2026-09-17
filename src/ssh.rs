@@ -99,13 +99,27 @@ pub(crate) use crate::forward::{SSH_LISTEN_PORT, SSH_PORT};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a connection has, from being accepted to completing authentication,
-/// before it is dropped. sshd's `LoginGraceTime`, which russh has no equivalent
-/// of: its `inactivity_timeout` bounds an *idle* session and is reset by every
-/// packet that arrives, so without this a peer that never authenticates holds
-/// its socket and its task for as long as it keeps the TCP connection alive,
-/// and one whose mesh path black-holes mid-handshake holds them for an hour.
+/// before it is dropped. Keepalives only establish that the peer is responsive;
+/// without this deadline a peer could answer them forever without authenticating.
 /// Generous next to a handshake that is a few round trips over a mesh link.
 const LOGIN_GRACE: Duration = Duration::from_secs(60);
+
+fn server_config(key: PrivateKey) -> Config {
+    Config {
+        keys: vec![key],
+        // Identity is proven by the mesh link; `auth_none` is the gate.
+        methods: MethodSet::from(&[MethodKind::None][..]),
+        // Quiet sessions stay open while the client answers SSH keepalives.
+        // This also refreshes the mesh firewall's idle TCP flow tracking.
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(15)),
+        // Russh sends three probes, then closes on the fourth tick: roughly
+        // 60 seconds since the last received SSH packet, even with output flowing.
+        keepalive_max: 3,
+        auth_rejection_time: Duration::from_secs(1),
+        ..Default::default()
+    }
+}
 
 /// Per-network SSH authorization snapshot: network name -> the network's SSH
 /// allow rules (peer + permitted login users). Held in an [`ArcSwap`] so
@@ -260,15 +274,7 @@ impl SshServer {
                     return;
                 }
             };
-            let config = Arc::new(Config {
-                keys: vec![key],
-                // Identity is proven by the mesh link, so the `none` method is
-                // the only one offered; our `auth_none` is the authorization gate.
-                methods: MethodSet::from(&[MethodKind::None][..]),
-                inactivity_timeout: Some(Duration::from_secs(3600)),
-                auth_rejection_time: Duration::from_secs(1),
-                ..Default::default()
-            });
+            let config = Arc::new(server_config(key));
             for addr in addrs {
                 let listener = match crate::listener::bind_listener(addr, SSH_LISTEN_PORT) {
                     Ok(l) => l,
@@ -418,8 +424,8 @@ async fn serve(config: Arc<Config>, stream: TcpStream, handler: SshHandler, grac
     match timeout_at(deadline, &mut running).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => debug!(error = %e, "mesh SSH session ended with error"),
-        // Authenticated in time. From here the session runs for as long as it
-        // likes, bounded by russh's inactivity timeout like any other.
+        // Authenticated in time. From here the session runs as long as the
+        // client remains responsive to SSH traffic or keepalives.
         Err(_) if authenticated.load(Ordering::Relaxed) => {
             if let Err(e) = running.await {
                 debug!(error = %e, "mesh SSH session ended with error");
@@ -2256,10 +2262,8 @@ mod tests {
     ) -> client::Handle<AcceptAnyHost> {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
         let config = Arc::new(Config {
-            keys: vec![key],
-            methods: MethodSet::from(&[MethodKind::None][..]),
             auth_rejection_time: Duration::ZERO,
-            ..Default::default()
+            ..server_config(key)
         });
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2303,10 +2307,8 @@ mod tests {
     async fn connect_with_grace(grace: Duration) -> TcpStream {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
         let config = Arc::new(Config {
-            keys: vec![key],
-            methods: MethodSet::from(&[MethodKind::None][..]),
             auth_rejection_time: Duration::ZERO,
-            ..Default::default()
+            ..server_config(key)
         });
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2359,10 +2361,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keepalives_preserve_idle_sessions_and_close_unresponsive_clients() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
+        let interval = Duration::from_millis(250);
+        let config = Arc::new(Config {
+            keepalive_interval: Some(interval),
+            auth_rejection_time: Duration::ZERO,
+            ..server_config(key)
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, client) = listener.accept().await.unwrap();
+            let mut policy = UserPolicy::default();
+            policy.add(&["*".to_string()]);
+            let origin = Origin {
+                client,
+                server: SocketAddr::new(addr.ip(), SSH_PORT),
+            };
+            serve(
+                config,
+                stream,
+                SshHandler::new(policy, id(1), None, origin),
+                LOGIN_GRACE,
+            )
+            .await;
+        });
+
+        // A transparent proxy can swallow replies without closing TCP. The
+        // client still receives probes and answers them, just as it would on
+        // a mesh path whose return traffic has stopped reaching the server.
+        let upstream = TcpStream::connect(addr).await.unwrap();
+        let (client_stream, proxy_stream) = tokio::io::duplex(65536);
+        let blackhole = Arc::new(AtomicBool::new(false));
+        let drop_replies = blackhole.clone();
+        let proxy = tokio::spawn(async move {
+            let (mut client_read, mut client_write) = tokio::io::split(proxy_stream);
+            let (mut server_read, mut server_write) = upstream.into_split();
+            let forward_replies = async {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = client_read.read(&mut buf).await?;
+                    if n == 0 {
+                        return Ok::<_, std::io::Error>(());
+                    }
+                    if !drop_replies.load(Ordering::Relaxed) {
+                        server_write.write_all(&buf[..n]).await?;
+                    }
+                }
+            };
+            let _ = tokio::try_join!(
+                forward_replies,
+                tokio::io::copy(&mut server_read, &mut client_write)
+            );
+        });
+        let mut handle = client::connect_stream(
+            Arc::new(client::Config::default()),
+            client_stream,
+            AcceptAnyHost { opened: None },
+        )
+        .await
+        .unwrap();
+        assert!(
+            handle
+                .authenticate_none(test_account())
+                .await
+                .unwrap()
+                .success()
+        );
+
+        // More than two failure windows with no application traffic. Only
+        // automatic SSH replies keep this session alive.
+        tokio::time::sleep(interval * 9).await;
+        assert!(!server.is_finished(), "responsive idle client was dropped");
+        let mut channel = handle.channel_open_session().await.unwrap();
+        channel.exec(true, "echo alive").await.unwrap();
+        let (out, code) = drain(&mut channel).await;
+        assert!(out.contains("alive"));
+        assert_eq!(code, Some(0));
+
+        blackhole.store(true, Ordering::Relaxed);
+        timeout(interval * 6, server)
+            .await
+            .expect("unresponsive client survived the keepalive failure window")
+            .unwrap();
+        proxy.abort();
+    }
+
+    #[tokio::test]
     async fn a_peer_that_never_sends_its_version_string_is_dropped() {
         // Both halves of the handshake need their own bound, and this is the
         // half russh runs before there is a session: without the grace it sits
-        // here for the inactivity timeout, an hour, holding the socket.
+        // here indefinitely, holding the socket.
         let mut sock = connect_with_grace(Duration::from_millis(200)).await;
         wait_for_hangup(&mut sock).await;
     }
