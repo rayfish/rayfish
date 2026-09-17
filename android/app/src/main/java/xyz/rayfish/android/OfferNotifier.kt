@@ -139,6 +139,7 @@ object OfferNotifier {
      * suppressing it and let the next poll decide again. */
     fun clearActedOn(id: ULong) {
         synchronized(this) { acted.remove(id) }
+        FileStatusMonitor.request()
     }
 
     /**

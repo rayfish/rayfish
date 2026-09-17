@@ -20,6 +20,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Android updates background file notifications when file state changes.**
+  Idle standby no longer checks for offers and transfers every four seconds.
+  Auto-accept, progress, save completion, and pending-save timeouts still work.
+
 - **LAN discovery uses a five-second base interval and ignores unchanged
   announcements.** This reduces background multicast traffic and repeated logs.
   Discovery can take a few seconds; update LAN peers together for consistent

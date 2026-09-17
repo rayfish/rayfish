@@ -307,6 +307,7 @@ impl FileService {
                                     blob_hash,
                                 });
                             }
+                            self.transfers.changed();
                             // Evaluate own-device auto-accept directly: it accepts
                             // only offers from our own paired devices on an opted-in
                             // network, and no-ops otherwise, so the offer stays
@@ -418,6 +419,7 @@ impl FileService {
             }
         };
 
+        self.transfers.changed();
         let blob_hash = iroh_blobs::Hash::from_bytes(*pending_file.blob_hash.as_bytes());
 
         let conn = match transport::connect_to_peer_with_alpn(
@@ -962,9 +964,12 @@ impl FileService {
     pub(crate) fn reject_file(&self, id: u64) -> IpcMessage {
         let mut pending = self.pending_files.lock().unwrap();
         match take_pending(&mut pending, id) {
-            Some(f) => IpcMessage::Ok {
-                message: format!("declined {} from {}", f.filename, f.from.fmt_short()),
-            },
+            Some(f) => {
+                self.transfers.changed();
+                IpcMessage::Ok {
+                    message: format!("declined {} from {}", f.filename, f.from.fmt_short()),
+                }
+            }
             None => ipc_err(format!("no pending file with id {id}")),
         }
     }

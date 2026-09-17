@@ -778,6 +778,12 @@ impl Daemon {
         }
     }
 
+    /// Coalesced invalidations for incoming offers and transfer status. Subscribe
+    /// before reading a snapshot; the receiver does not keep this daemon alive.
+    pub fn subscribe_file_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.transfers.subscribe()
+    }
+
     /// In-flight file transfers, both directions, for progress reporting. Cheap:
     /// clones a small vec. Safe to poll.
     pub fn list_transfers(&self) -> Vec<transfers::TransferInfo> {

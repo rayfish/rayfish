@@ -90,6 +90,7 @@ enum FailureKind {
 pub struct TransferRegistry {
     entries: Mutex<HashMap<u64, Entry>>,
     next_id: AtomicU64,
+    changes: tokio::sync::watch::Sender<()>,
 }
 
 impl TransferRegistry {
@@ -97,7 +98,19 @@ impl TransferRegistry {
         Self {
             entries: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            changes: tokio::sync::watch::Sender::default(),
         }
+    }
+
+    /// Subscribe before taking the initial snapshot. A watch channel coalesces
+    /// bursts and retains a change that races with snapshot reconciliation.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    /// Also used for incoming-offer queue changes, which share the mobile UI.
+    pub(crate) fn changed(&self) {
+        self.changes.send_replace(());
     }
 
     /// An outgoing offer is about to be sent to `peer`. The bytes move later, when
@@ -129,6 +142,7 @@ impl TransferRegistry {
                 failure: None,
             },
         );
+        self.changed();
         id
     }
 
@@ -153,6 +167,7 @@ impl TransferRegistry {
                 failure: None,
             },
         );
+        self.changed();
         id
     }
 
@@ -160,12 +175,14 @@ impl TransferRegistry {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
             e.info.transferred = transferred.min(e.info.size);
             e.info.state = TransferState::Transferring;
+            self.changed();
         }
     }
 
     pub fn finish(&self, id: u64, ok: bool) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
             finish_entry(e, ok, None);
+            self.changed();
         }
     }
 
@@ -176,6 +193,7 @@ impl TransferRegistry {
     pub fn fail_offer(&self, id: u64) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
             finish_entry(e, false, Some(FailureKind::Offer));
+            self.changed();
         }
     }
 
@@ -191,6 +209,7 @@ impl TransferRegistry {
                 && e.info.state == TransferState::Offered
         }) {
             finish_entry(e, false, Some(FailureKind::Offer));
+            self.changed();
         }
     }
 
@@ -212,12 +231,14 @@ impl TransferRegistry {
         if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.state = TransferState::Transferring;
+            self.changed();
         } else if let Some(id) = oldest_revivable_outgoing(&entries, hash, peer, now) {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.finished_at = None;
             e.failure = None;
             e.info.transferred = 0;
             e.info.state = TransferState::Transferring;
+            self.changed();
         }
     }
 
@@ -227,6 +248,7 @@ impl TransferRegistry {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.transferred = end_offset.min(e.info.size);
             e.info.state = TransferState::Transferring;
+            self.changed();
         }
     }
 
@@ -235,6 +257,7 @@ impl TransferRegistry {
         if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
             finish_entry(e, ok, Some(FailureKind::Abort));
+            self.changed();
         }
     }
 
@@ -355,6 +378,52 @@ fn oldest_revivable_outgoing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscriptions_observe_receive_progress_and_completion_without_polling() {
+        let registry = TransferRegistry::new();
+        let mut first = registry.subscribe();
+        let mut second = registry.subscribe();
+        assert!(!first.has_changed().unwrap());
+        let id = registry.register_receive("peer".into(), "file".into(), 100);
+        assert!(first.has_changed().unwrap());
+        first.borrow_and_update();
+        assert!(second.has_changed().unwrap());
+        second.borrow_and_update();
+        for n in 1..=100 {
+            registry.note_progress(id, n);
+        }
+        assert!(first.has_changed().unwrap());
+        first.borrow_and_update();
+        assert_eq!(registry.list()[0].transferred, 100);
+        registry.finish(id, true);
+        assert!(first.has_changed().unwrap());
+        first.borrow_and_update();
+        assert_eq!(registry.list()[0].state, TransferState::Done);
+        assert!(!first.has_changed().unwrap());
+    }
+
+    #[test]
+    fn subscriptions_ignore_unrelated_provider_traffic_and_follow_send_retries() {
+        let registry = TransferRegistry::new();
+        let mut changes = registry.subscribe();
+        registry.provider_started(hash(1), peer(1));
+        registry.provider_progress(hash(1), peer(1), 10);
+        registry.provider_finished(hash(1), peer(1), true);
+        assert!(!changes.has_changed().unwrap());
+        registry.register_send(peer(1), "file".into(), 100, hash(1));
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        registry.provider_started(hash(1), peer(1));
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        registry.provider_finished(hash(1), peer(1), false);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        registry.provider_started(hash(1), peer(1));
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(registry.list()[0].state, TransferState::Transferring);
+    }
     use iroh::SecretKey;
 
     fn hash(byte: u8) -> Hash {
