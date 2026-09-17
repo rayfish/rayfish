@@ -41,6 +41,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Idle mesh SSH sessions stay connected while the client is responsive.**
+  The server sends SSH keepalives after 15 seconds without incoming traffic,
+  keeping firewall flow tracking alive, and closes the connection after roughly
+  a minute without a response. Responsive sessions no longer have an idle cutoff.
+
 - **SSH and transfers no longer stall when a QUIC path cannot carry a full
   IPv6 packet.** Rayfish now splits oversized packets into tunnel fragments and
   reassembles them before firewall checks and delivery. Previously it dropped
