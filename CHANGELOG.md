@@ -20,6 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Routine TUN packet logs require trace logging.** Normal debug diagnostics
+  retain connection and failure details without formatting a log for every packet.
+
 - **Tunnel MTU increased from 1280 to 1500 bytes on desktop and Android.**
   Desktop devices that reject 1500 fall back to 1280. Peers exchange their
   receive limits so larger packets get valid ICMP feedback instead of being
