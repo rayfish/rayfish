@@ -53,6 +53,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android retries file notifications after transient failures.** Background
+  retries preserve the Downloads result and stop once reconciliation succeeds.
+
 - **Android stops retrying desktop DNS configuration every minute.** VPN DNS
   continues to be managed by Android, without the unsuccessful background retry.
 

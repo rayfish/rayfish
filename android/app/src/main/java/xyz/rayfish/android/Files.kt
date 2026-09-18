@@ -99,6 +99,9 @@ internal object DownloadsOutcome {
         FileStatusMonitor.request()
     }
 
+    /** Keep the outcome available until the notification has actually posted. */
+    fun peek(key: TransferKey): Boolean = outcomes[key] ?: false
+
     /** Consumes (removes) the recorded outcome so a later receive reusing the same
      * key does not read a stale value. Defaults to false (the neutral "Saved"
      * copy, no Downloads tap target) when nothing was recorded. */
@@ -243,7 +246,7 @@ object FileAutoAccept {
     fun run(context: Context) {
         if (!NodeHolder.isAutoAcceptOwnDevices(context)) return
         val node = NodeHolder.get(context)
-        val offers = runCatching { node.listFileOffers() }.getOrNull() ?: return
+        val offers = node.listFileOffers()
         // App-private staging dir; moveToDownloads then relocates to public Downloads.
         val saveDir = context.getExternalFilesDir(null)?.absolutePath ?: context.filesDir.absolutePath
         for (f in offers) {
