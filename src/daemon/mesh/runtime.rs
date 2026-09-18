@@ -320,9 +320,9 @@ impl NetworkRegistry {
         self.register_coordinator_handler(
             &ctx,
             name,
-            state.clone(),
-            invite_lock.clone(),
-            Some(dht_notify.clone()),
+            Arc::clone(&state),
+            Arc::clone(&invite_lock),
+            Some(Arc::clone(&dht_notify)),
             net_public_key,
         );
 
@@ -378,8 +378,8 @@ impl NetworkRegistry {
             cancel: cancel.clone(),
             tasks,
             invite_lock,
-            // A coordinator holds the network key and publishes the record, so
-            // the version it advertises is this build's by construction.
+            // A coordinator holds the network key and publishes a version this
+            // build supports, including the rollout compatibility version.
             incompatible: None,
         };
         self.networks.insert(name.to_string(), handle);
@@ -497,7 +497,7 @@ impl NetworkRegistry {
                     let s = h.state.read().unwrap();
                     (s.network_secret_key.is_some(), s.mode)
                 };
-                (h.state.clone(), h.dht_notify.clone(), has_key, mode)
+                (Arc::clone(&h.state), h.dht_notify.clone(), has_key, mode)
             }
             None => {
                 return ipc_err(format!("network '{network}' not found"));
@@ -1074,7 +1074,7 @@ impl Daemon {
         let server = crate::ssh::SshServer::new(
             self.registry.peers.clone(),
             self.registry.device_user_map.clone(),
-            self.ssh_authz.clone(),
+            Arc::clone(&self.ssh_authz),
         );
         // The overlay carries no IPv4, so there is one address to bind and it is
         // the derived mesh IPv6.

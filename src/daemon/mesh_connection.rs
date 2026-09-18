@@ -255,7 +255,7 @@ impl MeshConnection {
                     // every network is heavy, so spawn it off the demux loop rather
                     // than awaiting inline.
                     if is_unpaired_by(self.peer_id) {
-                        let registry = self.ctx.registry.clone();
+                        let registry = Arc::clone(&self.ctx.registry);
                         tokio::spawn(async move {
                             let _ = registry.unpair_self().await;
                         });
@@ -276,7 +276,7 @@ impl MeshConnection {
                     // a stranger is a no-op. Off the demux loop: republish + prune
                     // is heavy.
                     if self.ctx.registry.current_device_cert().is_none() {
-                        let registry = self.ctx.registry.clone();
+                        let registry = Arc::clone(&self.ctx.registry);
                         let requester = self.peer_id;
                         tokio::spawn(async move {
                             if let Err(reason) = registry.nullify_device(requester).await {

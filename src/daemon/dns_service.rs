@@ -593,8 +593,8 @@ mod tests {
         let table = dns::HostnameTable::default();
         let reverse = dns::ReverseLookupTable::default();
         let resolver = std::sync::Arc::new(crate::dns::resolver::Resolver::new(
-            table.clone(),
-            reverse.clone(),
+            Arc::clone(&table),
+            Arc::clone(&reverse),
         ));
         Arc::new(DnsService::new(
             table,

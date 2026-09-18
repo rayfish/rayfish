@@ -329,17 +329,17 @@ impl NetworkRegistry {
         MeshCtx {
             identity: self.transport.identity.clone(),
             peers: self.peers.clone(),
-            tun_tx: self.tun_tx.clone(),
-            stats: self.transport.stats.clone(),
+            tun_tx: Arc::clone(&self.tun_tx),
+            stats: Arc::clone(&self.transport.stats),
             blob_store: self.transport.blob_store.clone(),
             firewall: self.firewall.clone(),
-            hostname_table: self.dns.hostname_table.clone(),
-            reverse_table: self.dns.reverse_table.clone(),
+            hostname_table: Arc::clone(&self.dns.hostname_table),
+            reverse_table: Arc::clone(&self.dns.reverse_table),
             device_user_map: self.device_user_map.clone(),
-            pruned_peers: self.pruned_peers.clone(),
+            pruned_peers: Arc::clone(&self.pruned_peers),
             route_map: self.route_map.clone(),
             disconnect_tx: self.disconnect_tx.clone(),
-            registry: self.clone(),
+            registry: Arc::clone(self),
         }
     }
 
@@ -542,7 +542,7 @@ impl NetworkRegistry {
                 "only the coordinator of '{network}' can manage invites/requests"
             )));
         }
-        Ok((handle.network_key, handle.invite_lock.clone()))
+        Ok((handle.network_key, Arc::clone(&handle.invite_lock)))
     }
 
     /// The name of any network whose roster already holds `peer`, if any. Used
@@ -714,11 +714,11 @@ impl NetworkRegistry {
             name: name.clone(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
-            state: state.clone(),
-            dht_notify: Some(dht_notify.clone()),
+            state: Arc::clone(&state),
+            dht_notify: Some(Arc::clone(&dht_notify)),
             cancel: cancel.clone(),
             tasks,
-            invite_lock: invite_lock.clone(),
+            invite_lock: Arc::clone(&invite_lock),
             // A coordinator holds the network key and publishes the record, so
             // the version it advertises is this build's by construction.
             incompatible: None,
@@ -881,13 +881,13 @@ impl NetworkRegistry {
             tasks.push(spawn_network_publisher(
                 pkarr_client,
                 net_secret_key.clone(),
-                state.clone(),
+                Arc::clone(state),
                 self.transport.blob_store.clone(),
                 self.transport.endpoint.id(),
                 self.peers.clone(),
                 name.to_string(),
                 initially_published,
-                dht_notify.clone(),
+                Arc::clone(dht_notify),
                 cancel.clone(),
             ));
         }
@@ -895,8 +895,8 @@ impl NetworkRegistry {
         tasks.push(spawn_stale_member_pruner(
             ctx.clone(),
             name.to_string(),
-            state.clone(),
-            Some(dht_notify.clone()),
+            Arc::clone(state),
+            Some(Arc::clone(dht_notify)),
             cancel.clone(),
         ));
 
@@ -911,7 +911,7 @@ impl NetworkRegistry {
             let Some(handle) = self.networks.get(network) else {
                 return;
             };
-            (handle.state.clone(), handle.dht_notify.clone())
+            (Arc::clone(&handle.state), handle.dht_notify.clone())
         };
         update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await;
     }
@@ -926,14 +926,14 @@ impl NetworkRegistry {
         &self,
         network: &str,
     ) -> Option<CurrentSignedNetworkState> {
-        let state = self.networks.get(network)?.state.clone();
+        let state = Arc::clone(&self.networks.get(network)?.state);
         let hash = state.read().unwrap().converged_hash?;
         if !persist_group_hash_if_needed(&state, &self.transport.blob_store, network, hash, false)
             .await
         {
             return None;
         }
-        let commit = state.read().unwrap().snapshot_commit.clone();
+        let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let _commit = commit.lock().await;
         let net = config::load_network(network).ok().flatten()?;
         let hash = net.last_group_hash?;
@@ -1120,21 +1120,21 @@ impl NetworkRegistry {
             let publisher = spawn_network_publisher(
                 pkarr_client,
                 key,
-                handle.state.clone(),
+                Arc::clone(&handle.state),
                 self.transport.blob_store.clone(),
                 self.transport.endpoint.id(),
                 self.peers.clone(),
                 network.to_string(),
                 None,
-                notify.clone(),
+                Arc::clone(&notify),
                 handle.cancel.clone(),
             );
             handle.tasks.push(publisher);
-            handle.dht_notify = Some(notify.clone());
+            handle.dht_notify = Some(Arc::clone(&notify));
             handle.role = NetworkRole::Coordinator;
             (
-                handle.state.clone(),
-                handle.invite_lock.clone(),
+                Arc::clone(&handle.state),
+                Arc::clone(&handle.invite_lock),
                 notify,
                 handle.network_key,
             )
@@ -1189,7 +1189,7 @@ impl NetworkRegistry {
             {
                 nets.push((
                     entry.key().clone(),
-                    entry.value().state.clone(),
+                    Arc::clone(&entry.value().state),
                     entry.value().dht_notify.clone(),
                 ));
             }

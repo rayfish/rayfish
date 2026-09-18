@@ -177,7 +177,7 @@ impl ForwardMetrics {
     }
 
     pub fn spawn_logger(self: &Arc<Self>, token: CancellationToken) {
-        let stats = self.clone();
+        let stats = Arc::clone(self);
         tokio::spawn(async move {
             let start = Instant::now();
             let mut prev_rx = 0u64;
@@ -251,7 +251,7 @@ pub struct PeerMetrics {
 
 impl PeerMetrics {
     pub fn spawn_collector(self: &Arc<Self>, peers: PeerTable, token: CancellationToken) {
-        let metrics = self.clone();
+        let metrics = Arc::clone(self);
         tokio::spawn(async move {
             loop {
                 tokio::select! {

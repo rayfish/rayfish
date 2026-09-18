@@ -272,9 +272,9 @@ pub(crate) async fn join_mesh_shared(
     // debounced task. The notify is shared with the member accept handler below.
     let reconverge_notify = Arc::new(tokio::sync::Notify::new());
     spawn_reconverge_worker(
-        reconverge_notify.clone(),
+        Arc::clone(&reconverge_notify),
         token.clone(),
-        live_state.clone(),
+        Arc::clone(&live_state),
         network_name.to_string(),
         worker_ctx.clone(),
         ep.clone(),
@@ -293,13 +293,13 @@ pub(crate) async fn join_mesh_shared(
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: worker_ctx.clone(),
             network_name: network_name.to_string(),
-            state: live_state.clone(),
+            state: Arc::clone(&live_state),
             net_pubkey,
             my_identity,
             endpoint: ep.clone(),
-            registry: registry.clone(),
-            invite_lock: invite_lock.clone(),
-            reconverge_notify: reconverge_notify.clone(),
+            registry: Arc::clone(&registry),
+            invite_lock: Arc::clone(&invite_lock),
+            reconverge_notify: Arc::clone(&reconverge_notify),
         })),
     );
 
@@ -347,7 +347,7 @@ async fn register_dialed_peer(
 ) {
     let conn_changed = ctx.register_peer_conn(&conn, peer_id, network_name);
     if conn_changed {
-        let router = router.clone();
+        let router = Arc::clone(router);
         let dconn = conn.clone();
         tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
     }

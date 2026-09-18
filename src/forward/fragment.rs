@@ -115,9 +115,7 @@ impl Default for Reassembler {
         static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
         Self {
             pending: HashMap::new(),
-            budget: BUDGET
-                .get_or_init(|| Arc::new(Semaphore::new(GLOBAL_BUDGET)))
-                .clone(),
+            budget: Arc::clone(BUDGET.get_or_init(|| Arc::new(Semaphore::new(GLOBAL_BUDGET)))),
         }
     }
 }
@@ -174,9 +172,7 @@ impl Reassembler {
             if self.pending.len() >= MAX_PENDING {
                 return Err(DropReason::ReassemblyLimit);
             }
-            let permit = self
-                .budget
-                .clone()
+            let permit = Arc::clone(&self.budget)
                 .try_acquire_many_owned(ASSEMBLY_COST as u32)
                 .map_err(|_| DropReason::ReassemblyLimit)?;
             self.pending.insert(
@@ -384,7 +380,7 @@ mod tests {
     fn reassembly_limits_are_shared_and_released_on_disconnect() {
         let now = Instant::now();
         let mut a = receiver(MAX_PENDING + 1);
-        let budget = a.budget.clone();
+        let budget = Arc::clone(&a.budget);
         for _ in 0..MAX_PENDING {
             let encoded = encode(1, &packet(1280), 1162).unwrap();
             a.accept(encoded.datagrams()[0].clone(), now).unwrap();
@@ -396,7 +392,7 @@ mod tests {
         );
         let mut b = Reassembler {
             pending: HashMap::new(),
-            budget: budget.clone(),
+            budget: Arc::clone(&budget),
         };
         b.accept(extra.datagrams()[0].clone(), now).unwrap();
         let extra2 = encode(1, &packet(1280), 1162).unwrap();

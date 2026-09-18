@@ -203,8 +203,8 @@ impl PeerEntry {
             endpoint_id: self.endpoint_id,
             network,
             handle,
-            receive_mtu: self.receive_mtu.clone(),
-            last_active: self.last_active.clone(),
+            receive_mtu: Arc::clone(&self.receive_mtu),
+            last_active: Arc::clone(&self.last_active),
         })
     }
 }
@@ -383,7 +383,7 @@ impl PeerTable {
     pub fn last_active_of(&self, peer_id: &EndpointId) -> Option<Arc<AtomicU64>> {
         self.peers
             .get(&membership::derive_ipv6(peer_id))
-            .map(|e| e.last_active.clone())
+            .map(|e| Arc::clone(&e.last_active))
     }
 
     /// Time remaining until `peer_id`'s connection has been idle for `idle`
@@ -446,8 +446,8 @@ impl PeerTable {
             endpoint_id: e.endpoint_id,
             network: SmolStr::new(network),
             handle,
-            receive_mtu: e.receive_mtu.clone(),
-            last_active: e.last_active.clone(),
+            receive_mtu: Arc::clone(&e.receive_mtu),
+            last_active: Arc::clone(&e.last_active),
         })
     }
 
