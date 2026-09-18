@@ -568,11 +568,11 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             continue;
         };
         if is_magic_dns(&info) {
-            let Ok(permit) = dns_queries.clone().try_acquire_owned() else {
+            let Ok(permit) = Arc::clone(&dns_queries).try_acquire_owned() else {
                 stats.record_drop(DropReason::DnsConcurrency);
                 continue;
             };
-            let resolver = resolver.clone();
+            let resolver = Arc::clone(&resolver);
             let tun_tx = tun_tx.clone();
             let pkt = pkt.clone();
             tokio::spawn(async move {
@@ -613,7 +613,7 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             }
 
             if in_flight.insert(peer) {
-                let reg = reg.clone();
+                let reg = Arc::clone(reg);
                 let done = done_tx.clone();
                 tokio::spawn(async move {
                     let connected = reg.dial_target(&target).await;
@@ -791,6 +791,15 @@ async fn prepare_datagrams(
         ctx.stats.record_drop(DropReason::SendFailure);
         return None;
     };
+    let legacy = route.conn.alpn() == crate::transport::MESH_V5_ALPN;
+    if legacy && n + TAG_LEN > max {
+        let inner_mtu = max.saturating_sub(TAG_LEN) as u16;
+        if let Some(reply) = crate::reject::build_packet_too_big(&pkt, info, inner_mtu) {
+            let _ = ctx.tun_tx.send(reply).await;
+        }
+        ctx.stats.record_drop(DropReason::PacketTooBig);
+        return None;
+    }
     let Some(wire_size) = fragment::wire_size(n, max) else {
         ctx.stats.record_drop(DropReason::PacketTooBig);
         return None;
@@ -832,7 +841,11 @@ async fn prepare_datagrams(
         ctx.stats.record_drop(DropReason::NoPeer);
         return None;
     }
-    fragment::encode(route.handle, &pkt, max)
+    if legacy {
+        Some(fragment::Encoded::Whole(tag_datagram(route.handle, &pkt)))
+    } else {
+        fragment::encode(route.handle, &pkt, max)
+    }
 }
 
 /// Firewall-check an outbound packet already routed to `route`, then send it as a
@@ -893,6 +906,7 @@ pub fn spawn_peer_reader(
     peers: PeerTable,
     ctx: ForwardCtx,
 ) -> JoinHandle<()> {
+    let legacy = conn.alpn() == crate::transport::MESH_V5_ALPN;
     let ForwardCtx {
         firewall,
         tun_tx,
@@ -956,6 +970,10 @@ pub fn spawn_peer_reader(
             };
             for datagram in batch.iter_mut().take(count).map(std::mem::take) {
                 if datagram.len() > MAX_PEER_DATAGRAM {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
+                }
+                if legacy && datagram.get(TAG_LEN) == Some(&0) {
                     stats.record_drop(DropReason::Malformed);
                     continue;
                 }
@@ -1133,6 +1151,76 @@ mod tests {
         check_fragmented_tcp(crate::tun::TUN_MTU as usize).await;
     }
 
+    #[tokio::test]
+    async fn v5_connection_sends_only_whole_packets() {
+        use iroh::endpoint::{QuicTransportConfig, presets};
+        use iroh::{Endpoint, RelayMode};
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        async fn endpoint() -> Endpoint {
+            Endpoint::builder(presets::N0)
+                .alpns(vec![crate::transport::MESH_V5_ALPN.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .transport_config(
+                    QuicTransportConfig::builder()
+                        .initial_mtu(1200)
+                        .mtu_discovery_config(None)
+                        .build(),
+                )
+                .bind()
+                .await
+                .unwrap()
+        }
+        let a = endpoint().await;
+        let b = endpoint().await;
+        let (send, recv) = timeout(Duration::from_secs(5), async {
+            tokio::join!(a.connect(b.addr(), crate::transport::MESH_V5_ALPN), async {
+                b.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let send = send.unwrap();
+        assert!(send.max_datagram_size().unwrap() < 1282);
+        let a_ip = crate::membership::derive_ipv6(&a.id());
+        let b_ip = crate::membership::derive_ipv6(&b.id());
+        let peers = PeerTable::new();
+        peers.add(b_ip, send.clone(), b.id(), "test");
+        peers.note_receive_mtu(&b.id(), &send, crate::tun::TUN_MTU);
+        let route = peers.lookup_v6(&b_ip).unwrap();
+        let (feedback_tx, mut feedback_rx) = mpsc::channel(4);
+        let fw = inbound_fw(Action::Allow, vec![]);
+        let stats = ForwardMetrics::default();
+        let ctx = SendCtx {
+            firewall: &fw,
+            stats: &stats,
+            tun_tx: &feedback_tx,
+        };
+        let small = Bytes::from(make_tcp_packet_between(a_ip, b_ip, 22));
+        let info = firewall::parse_packet_info(&small).unwrap();
+        send_over_route(&ctx, &route, &info, small.clone()).await;
+        let wire = timeout(Duration::from_secs(5), recv.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire, tag_datagram(1, &small));
+
+        let mut large = small.to_vec();
+        large.resize(1280, 0);
+        large[4..6].copy_from_slice(&1240u16.to_be_bytes());
+        let info = firewall::parse_packet_info(&large).unwrap();
+        send_over_route(&ctx, &route, &info, Bytes::from(large)).await;
+        let reply = feedback_rx.try_recv().expect("v5 sends a local PTB");
+        assert_eq!(reply[40], 2);
+        assert_eq!(
+            &reply[44..48],
+            &((send.max_datagram_size().unwrap() - TAG_LEN) as u32).to_be_bytes()
+        );
+        a.close().await;
+        b.close().await;
+    }
+
     /// Exercise the production sender, lazy-dial batch flush and receiver over
     /// real QUIC, with discovery disabled so full IP packets need fragmentation
     /// even on loopback.
@@ -1191,7 +1279,7 @@ mod tests {
                 firewall: firewall.clone(),
                 tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(tun_tx)),
                 token: token.clone(),
-                stats: stats.clone(),
+                stats: Arc::clone(&stats),
                 device_user_map: DeviceUserMap::new(),
                 exit: no_exit(),
             },
@@ -1413,7 +1501,7 @@ mod tests {
     async fn tun_writer_writes_when_active() {
         use std::sync::atomic::AtomicBool;
         let writer = FakeTunWriter::default();
-        let sink = writer.written.clone();
+        let sink = Arc::clone(&writer.written);
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         let active = std::sync::Arc::new(AtomicBool::new(true));
         let handle = spawn_tun_writer(writer, rx, active);
@@ -1428,7 +1516,7 @@ mod tests {
     async fn tun_writer_drops_when_inactive() {
         use std::sync::atomic::AtomicBool;
         let writer = FakeTunWriter::default();
-        let sink = writer.written.clone();
+        let sink = Arc::clone(&writer.written);
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         let active = std::sync::Arc::new(AtomicBool::new(false));
         let handle = spawn_tun_writer(writer, rx, active);

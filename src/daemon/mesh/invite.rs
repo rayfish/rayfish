@@ -127,7 +127,7 @@ impl NetworkRegistry {
             Some(h) => {
                 let has_key = h.state.read().unwrap().network_secret_key.is_some();
                 (
-                    h.state.clone(),
+                    Arc::clone(&h.state),
                     h.dht_notify.clone(),
                     h.network_key,
                     has_key,
@@ -169,7 +169,7 @@ impl NetworkRegistry {
             };
             let s = handle.state.read().unwrap();
             (
-                handle.invite_lock.clone(),
+                Arc::clone(&handle.invite_lock),
                 s.network_secret_key.is_some(),
                 s.reusable_keys.clone(),
             )
@@ -228,9 +228,9 @@ impl NetworkRegistry {
             };
             let has_key = handle.state.read().unwrap().network_secret_key.is_some();
             (
-                handle.state.clone(),
+                Arc::clone(&handle.state),
                 handle.dht_notify.clone(),
-                handle.invite_lock.clone(),
+                Arc::clone(&handle.invite_lock),
                 has_key,
             )
         };

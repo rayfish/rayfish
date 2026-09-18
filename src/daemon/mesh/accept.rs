@@ -483,7 +483,7 @@ impl CoordinatorAcceptState {
             .await;
             return None;
         }
-        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         let stable_welcome = {
             let state = self.state.read().unwrap();
@@ -557,7 +557,7 @@ impl CoordinatorAcceptState {
             }
         }
 
-        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         if !self.state.read().unwrap().members.is_member(&remote_id) {
             return None;
@@ -976,7 +976,7 @@ impl CoordinatorAcceptState {
         was_approved: bool,
         grant_direct: bool,
     ) -> AdmissionCommit {
-        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
         let tentative_member = Member {
@@ -1306,7 +1306,7 @@ impl MemberAcceptState {
             // leaving tears down this very handler's network.
             ControlMsg::KickedFromNetwork => {
                 if sender_is_coordinator(&self.state, peer_id) {
-                    let registry = self.registry.clone();
+                    let registry = Arc::clone(&self.registry);
                     let network = self.network_name.clone();
                     tokio::spawn(async move {
                         registry.confirm_kick_and_leave(&network).await;
@@ -1481,7 +1481,7 @@ impl MemberAcceptState {
         final_hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
     ) -> Option<Ipv6Addr> {
-        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         let pending = { self.state.read().unwrap().unconfirmed_durable_hash };
         if let Some(pending) = pending
@@ -1597,7 +1597,7 @@ impl MemberAcceptState {
                 return;
             }
         };
-        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         let previous_authority = {
             let mut s = self.state.write().unwrap();
@@ -1728,7 +1728,7 @@ impl AcceptHandler {
                 enabled,
                 exit_families,
             } => {
-                let registry = self.registry().clone();
+                let registry = Arc::clone(self.registry());
                 let Some(network) = self.network_name() else {
                     return true;
                 };
@@ -1808,7 +1808,7 @@ impl std::fmt::Debug for ConnectProtocol {
 
 impl iroh::protocol::ProtocolHandler for MeshProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        self.0.clone().drive_mesh_connection(conn, false).await;
+        Arc::clone(&self.0).drive_mesh_connection(conn, false).await;
         Ok(())
     }
 }
@@ -1834,7 +1834,7 @@ impl iroh::protocol::ProtocolHandler for ConnectProtocol {
 }
 
 pub(crate) struct ProtocolRouter {
-    blobs: BlobsProtocol,
+    blobs: Arc<BlobsProtocol>,
     /// File-transfer + pairing state and their ALPN accept arms. The accept loop
     /// delegates the `FILES_ALPN`/`PAIR_ALPN` arms to this; `Daemon` holds
     /// the same handle for the IPC-side file/pairing commands.
@@ -1857,7 +1857,7 @@ impl ProtocolRouter {
         conn: Arc<ConnectionManager>,
     ) -> Self {
         Self {
-            blobs,
+            blobs: Arc::new(blobs),
             files,
             connect,
             conn_mngr: conn,
@@ -1892,16 +1892,21 @@ impl ProtocolRouter {
     /// hand-rolled accept loop. The returned `Router` aborts when dropped, so the
     /// caller must keep it alive (stashed on `Daemon`) and `shutdown()` it on exit.
     pub(crate) fn build_router(&self, endpoint: Endpoint) -> iroh::protocol::Router {
-        iroh::protocol::Router::builder(endpoint)
-            .accept(iroh_blobs::protocol::ALPN, self.blobs.clone())
-            .accept(transport::FILES_ALPN, FilesProtocol(self.files.clone()))
-            .accept(daemon::PAIR_ALPN, PairProtocol(self.files.clone()))
+        let mut builder = iroh::protocol::Router::builder(endpoint)
+            .accept(iroh_blobs::protocol::ALPN, Arc::clone(&self.blobs))
+            .accept(
+                transport::FILES_ALPN,
+                FilesProtocol(Arc::clone(&self.files)),
+            )
+            .accept(daemon::PAIR_ALPN, PairProtocol(Arc::clone(&self.files)))
             .accept(
                 transport::CONNECT_ALPN,
-                ConnectProtocol(self.connect.clone()),
-            )
-            .accept(transport::mesh_alpn(), MeshProtocol(self.conn_mngr.clone()))
-            .spawn()
+                ConnectProtocol(Arc::clone(&self.connect)),
+            );
+        for alpn in transport::mesh_alpns() {
+            builder = builder.accept(alpn, MeshProtocol(Arc::clone(&self.conn_mngr)));
+        }
+        builder.spawn()
     }
 
     /// Drive one mesh connection for its whole lifetime. Passthrough to the
@@ -1913,8 +1918,7 @@ impl ProtocolRouter {
         conn: Connection,
         pre_registered: bool,
     ) {
-        self.conn_mngr
-            .clone()
+        Arc::clone(&self.conn_mngr)
             .drive_mesh_connection(conn, pre_registered)
             .await;
     }

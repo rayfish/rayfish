@@ -1,10 +1,10 @@
 //! iroh endpoint setup and peer connection management.
 //!
-//! Each network gets its own ALPN (`rayfish/net/<version>/<prefix>`) for isolation
-//! and mesh-protocol version gating (see `MESH_PROTOCOL_VERSION`).
-//! A single shared iroh [`Endpoint`] handles all networks, filtering by ALPN on accept.
+//! One iroh [`Endpoint`] handles all networks. Mesh ALPNs select the wire
+//! version; network selection happens inside each connection.
 
 use std::io::{self, ErrorKind};
+use std::iter;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result};
@@ -47,11 +47,9 @@ pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
 /// ephemeral port (see `create_endpoint_with_alpns`).
 pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 
-/// Mesh wire-protocol version, embedded in the single mesh ALPN. Bump this on any
-/// breaking change to the mesh control/forwarding protocol. Because iroh negotiates
-/// the ALPN during the QUIC handshake, two peers on different mesh versions share no
-/// common ALPN and simply cannot connect: the version gate is enforced by the
-/// transport, with no in-band handshake.
+/// Latest mesh wire-protocol version. The endpoint also accepts v5 so old peers
+/// can connect during the fragmentation rollout. Bump this on breaking changes;
+/// keep each supported older ALPN bound to its own wire behavior.
 ///
 /// Bumped to 2 for the single-connection-per-identity change: one mesh ALPN carries
 /// every shared network (network selection is now in-band, a `ControlFrame.net`
@@ -84,12 +82,23 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// and variants, changed semantics of existing ones).
 ///
 /// Version 6 adds fragmentation below IP so a 1280-byte IPv6 packet survives
-/// paths whose QUIC datagram budget is smaller. Older readers cannot decode
-/// fragment framing, so reject them at ALPN negotiation rather than blackholing.
+/// paths whose QUIC datagram budget is smaller. A v5 connection sends whole
+/// packets only; its reader cannot decode fragment framing.
 pub const MESH_PROTOCOL_VERSION: u32 = 6;
+/// Older mesh versions this build speaks, newest first. Add a version here only
+/// after its connection-scoped wire behavior is implemented and tested.
+pub const MESH_BACKWARDS_COMPAT: &[u32] = &[5];
+/// Keep the signed network record readable by v5 clients during the rollout.
+/// Once v5 support is removed, this can advance with the mesh ALPN.
+pub const MESH_RECORD_VERSION: u32 = if MESH_BACKWARDS_COMPAT.is_empty() {
+    MESH_PROTOCOL_VERSION
+} else {
+    MESH_BACKWARDS_COMPAT[MESH_BACKWARDS_COMPAT.len() - 1]
+};
+pub const MESH_V5_ALPN: &[u8] = b"rayfish/mesh/5";
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
-/// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:
+/// negotiated inside each mesh connection, so adding one needs no version bump:
 /// a peer acts on a bit only if the other side set it, and an absent `features`
 /// field decodes to `0` (a peer on a build that predates the bit). This is how
 /// idle-close coexists with v0.2.0 peers, which speak mesh v2 but do not
@@ -97,13 +106,19 @@ pub const MESH_PROTOCOL_VERSION: u32 = 6;
 /// idle-close a connection whose peer did not advertise `FEATURE_IDLE_CLOSE`.
 pub const FEATURE_IDLE_CLOSE: u64 = 1 << 0;
 
-/// The single mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,
-/// every mesh connection now negotiates this one ALPN regardless of network — a
-/// peer holds exactly one QUIC connection to us, carrying all networks we share.
+/// The preferred mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,
+/// a peer holds one QUIC connection carrying all networks we share.
 /// The accept loop dispatches every mesh connection to one connection handler,
 /// which routes each control message to the right network by its `ControlFrame.net`.
 pub fn mesh_alpn() -> Vec<u8> {
     format!("rayfish/mesh/{MESH_PROTOCOL_VERSION}").into_bytes()
+}
+
+pub fn mesh_alpns() -> Vec<Vec<u8>> {
+    iter::once(MESH_PROTOCOL_VERSION)
+        .chain(MESH_BACKWARDS_COMPAT.iter().copied())
+        .map(|version| format!("rayfish/mesh/{version}").into_bytes())
+        .collect()
 }
 
 /// Public resolvers appended to the endpoint's nameserver list so the daemon can
@@ -536,25 +551,29 @@ pub async fn connect_to_peer_with_alpn(
     alpn: &[u8],
 ) -> Result<Connection> {
     let addr: EndpointAddr = id.into();
-    let conn = match ep.connect(addr, alpn).await {
-        Ok(conn) => conn,
-        // An ALPN mismatch fails the QUIC/TLS handshake opaquely. Map that one
-        // case to an actionable hint (it's a heuristic: a peer that isn't
-        // running rayfish at all looks similar, hence "may be").
-        Err(e) if is_alpn_mismatch(&e.to_string()) => {
-            return Err(e).context(
-                "no shared protocol with peer — it may be running an incompatible \
-                 rayfish version (run `ray update`)",
-            );
+    let mut candidates = vec![alpn.to_vec()];
+    if alpn == mesh_alpn() {
+        candidates.extend(mesh_alpns().into_iter().skip(1));
+    }
+    let mut mismatch = None;
+    for candidate in candidates {
+        match ep.connect(addr.clone(), &candidate).await {
+            Ok(conn) => {
+                tracing::info!(
+                    peer = %conn.remote_id().fmt_short(),
+                    alpn = %String::from_utf8_lossy(&candidate),
+                    "connected to peer"
+                );
+                return Ok(conn);
+            }
+            Err(e) if is_alpn_mismatch(&e.to_string()) => mismatch = Some(e),
+            Err(e) => return Err(e).context("failed to connect to peer"),
         }
-        Err(e) => return Err(e).context("failed to connect to peer"),
-    };
-    tracing::info!(
-        peer = %conn.remote_id().fmt_short(),
-        alpn = %String::from_utf8_lossy(alpn),
-        "connected to peer"
-    );
-    Ok(conn)
+    }
+    let error = mismatch.expect("at least one ALPN candidate was tried");
+    Err(error).context(
+        "no shared protocol with peer; it may be running an incompatible rayfish version (run `ray update`)",
+    )
 }
 
 /// Heuristic: does a connect error look like an ALPN mismatch (no protocol the
@@ -746,6 +765,48 @@ mod tests {
         // The mesh ALPN is a single node-wide protocol id, no per-network suffix.
         let expected = format!("rayfish/mesh/{MESH_PROTOCOL_VERSION}");
         assert_eq!(mesh_alpn(), expected.as_bytes());
+        assert_eq!(mesh_alpns()[1], MESH_V5_ALPN);
+    }
+
+    #[tokio::test]
+    async fn mesh_dial_falls_back_to_v5() {
+        use iroh::endpoint::presets;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let lookup = MemoryLookup::new();
+        let newer = Endpoint::builder(presets::N0)
+            .alpns(mesh_alpns())
+            .address_lookup(lookup.clone())
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let older = Endpoint::builder(presets::N0)
+            .alpns(vec![MESH_V5_ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        lookup.add_endpoint_info(older.addr());
+        let preferred = mesh_alpn();
+        let dial = connect_to_peer_with_alpn(&newer, older.id(), &preferred);
+        let accept = async {
+            loop {
+                let incoming = older.accept().await.unwrap();
+                if let Ok(conn) = incoming.await {
+                    return conn;
+                }
+            }
+        };
+        let (dialed, accepted) =
+            timeout(Duration::from_secs(5), async { tokio::join!(dial, accept) })
+                .await
+                .unwrap();
+        assert_eq!(dialed.unwrap().alpn(), MESH_V5_ALPN);
+        assert_eq!(accepted.alpn(), MESH_V5_ALPN);
+        newer.close().await;
+        older.close().await;
     }
 
     #[test]

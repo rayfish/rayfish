@@ -279,8 +279,8 @@ impl FileService {
     /// `FILES_ALPN`: read a single `FileOffer` and queue it for `ray files`.
     /// Rejects offers whose claimed sender doesn't match the dialing identity.
     pub(crate) async fn accept_file_offer(self: &Arc<Self>, conn: Connection) {
-        let pending = self.pending_files.clone();
-        let counter = self.file_id_counter.clone();
+        let pending = Arc::clone(&self.pending_files);
+        let counter = Arc::clone(&self.file_id_counter);
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
             Ok((_send, mut recv)) => {
@@ -445,7 +445,7 @@ impl FileService {
         // the entry stuck in `Transferring`: its `Drop` marks the transfer
         // failed unless `success()` disarms it first, which only happens once
         // the file is actually on disk.
-        let finish_guard = transfers::FinishGuard::new(self.transfers.clone(), transfer_id);
+        let finish_guard = transfers::FinishGuard::new(Arc::clone(&self.transfers), transfer_id);
 
         // Claim the blob before fetching it. `fetch` leaves what it downloads
         // untagged, so a GC triggered by some other transfer finishing mid-fetch
@@ -1023,7 +1023,7 @@ impl FileService {
     /// secret against the active pairing session and, on match, signs and returns
     /// a `DeviceCert` binding the new device key to our identity.
     pub(crate) async fn accept_pair_request(&self, conn: Connection) {
-        let pairing_secret = self.pairing_secret.clone();
+        let pairing_secret = Arc::clone(&self.pairing_secret);
         let secret_key = self.secret_key.clone();
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
@@ -1109,7 +1109,7 @@ impl FileService {
                                 // fresh cert; otherwise the device would reconnect-
                                 // loop. Spawned so the reseal/publish doesn't delay
                                 // the cert response the joiner is waiting on.
-                                let registry = self.registry.clone();
+                                let registry = Arc::clone(&self.registry);
                                 tokio::spawn(async move {
                                     registry.reauth_device(device_pubkey).await;
                                 });

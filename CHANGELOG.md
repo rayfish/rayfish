@@ -38,9 +38,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   injected into a smaller TUN. Mesh fragmentation carries packets over smaller
   QUIC paths.
 
-- **Mesh protocol 6: update connected peers together.** Packet fragmentation
-  changes the mesh wire format. Older peers are reported as incompatible until
-  upgraded; they cannot connect to a protocol 6 peer.
+- **Mesh protocol 6 supports protocol 5 peers during rollout.** New peers use
+  fragmentation with each other and send only whole datagrams to protocol 5
+  peers. Coordinators advertise protocol 5 in signed network records so older
+  peers can still join. Paths that need fragmentation still require both peers
+  to run protocol 6.
 
 - **Linux: the mesh interface is now named `rayfish0` instead of `tun0`.** The
   kernel's default name says nothing about which program owns the device, and

@@ -286,8 +286,8 @@ impl SshServer {
                 info!(%addr, port = SSH_LISTEN_PORT, "mesh SSH listening (reachable as :22)");
                 let peers = self.peers.clone();
                 let dum = self.device_user_map.clone();
-                let authz = self.authz.clone();
-                let config = config.clone();
+                let authz = Arc::clone(&self.authz);
+                let config = Arc::clone(&config);
                 let token = token.clone();
                 tokio::spawn(async move {
                     loop {
@@ -299,10 +299,10 @@ impl SshServer {
                                     Err(e) => { debug!(error = %e, "mesh SSH accept failed"); continue; }
                                 };
                                 disable_nagle(&stream);
-                                let config = config.clone();
+                                let config = Arc::clone(&config);
                                 let peers = peers.clone();
                                 let dum = dum.clone();
-                                let authz = authz.clone();
+                                let authz = Arc::clone(&authz);
                                 tokio::spawn(async move {
                                     handle_conn(stream, peer, config, peers, dum, authz).await;
                                 });
@@ -625,7 +625,7 @@ impl SshHandler {
     /// The flag [`Handler::auth_none`] sets once this peer is admitted. Taken
     /// before the handler is handed to russh, which owns it from then on.
     fn auth_flag(&self) -> Arc<AtomicBool> {
-        self.authenticated.clone()
+        Arc::clone(&self.authenticated)
     }
 
     /// The login this connection authenticated as, if any. Every forwarding
@@ -2394,7 +2394,7 @@ mod tests {
         let upstream = TcpStream::connect(addr).await.unwrap();
         let (client_stream, proxy_stream) = tokio::io::duplex(65536);
         let blackhole = Arc::new(AtomicBool::new(false));
-        let drop_replies = blackhole.clone();
+        let drop_replies = Arc::clone(&blackhole);
         let proxy = tokio::spawn(async move {
             let (mut client_read, mut client_write) = tokio::io::split(proxy_stream);
             let (mut server_read, mut server_write) = upstream.into_split();
