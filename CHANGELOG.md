@@ -20,15 +20,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Android updates background file notifications when file state changes.**
+  Idle standby no longer checks for offers and transfers every four seconds.
+  Auto-accept, progress, save completion, and pending-save timeouts still work.
+
+- **LAN discovery uses a 30-second base interval and ignores unchanged
+  announcements.** This reduces background multicast traffic and repeated logs.
+  New LAN peers can take 30 seconds or more to appear, and LAN address lookups
+  wait longer for the next query. Update LAN peers together for consistent
+  expiry behavior with the slower announcements.
+
+- **Routine TUN packet logs require trace logging.** Normal debug diagnostics
+  retain connection and failure details without formatting a log for every packet.
+
 - **Tunnel MTU increased from 1280 to 1500 bytes on desktop and Android.**
   Desktop devices that reject 1500 fall back to 1280. Peers exchange their
   receive limits so larger packets get valid ICMP feedback instead of being
   injected into a smaller TUN. Mesh fragmentation carries packets over smaller
   QUIC paths.
 
-- **Mesh protocol 6: update connected peers together.** Packet fragmentation
-  changes the mesh wire format. Older peers are reported as incompatible until
-  upgraded; they cannot connect to a protocol 6 peer.
+- **Mesh protocol 6 supports protocol 5 peers during rollout.** New peers use
+  fragmentation with each other and send only whole datagrams to protocol 5
+  peers. Coordinators advertise protocol 5 in signed network records so older
+  peers can still join. Paths that need fragmentation still require both peers
+  to run protocol 6.
 
 - **Linux: the mesh interface is now named `rayfish0` instead of `tun0`.** The
   kernel's default name says nothing about which program owns the device, and
@@ -40,6 +55,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already named its adapter `rayfish`.
 
 ### Fixed
+
+- **Android retries file notifications after transient failures.** Background
+  retries preserve the Downloads result and stop once reconciliation succeeds.
+
+- **Android stops retrying desktop DNS configuration every minute.** VPN DNS
+  continues to be managed by Android, without the unsuccessful background retry.
 
 - **Android ignores bandwidth and signal-strength updates that do not change
   connectivity.** These could trigger network refreshes and background lookups

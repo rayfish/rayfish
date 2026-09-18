@@ -292,7 +292,7 @@ pub(crate) async fn reconverge_and_apply(
             && self_is_nullified(cert, &roster, &nullifiers)
         {
             tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = registry.clone();
+            let registry = Arc::clone(registry);
             tokio::spawn(async move {
                 let _ = registry.unpair_self().await;
             });
@@ -345,7 +345,7 @@ pub(crate) async fn reconverge_and_apply(
     let self_nullified = device_cert
         .as_ref()
         .is_some_and(|cert| self_is_nullified(cert, &data.members, &data.nullifiers));
-    let commit = state.read().unwrap().snapshot_commit.clone();
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let commit_guard = commit.lock().await;
     // A local author may have refreshed live state before its blob and recovery
     // pointer became durable while this fetch was in flight. Re-check provenance
@@ -371,7 +371,7 @@ pub(crate) async fn reconverge_and_apply(
         if self_nullified {
             drop(s);
             tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = registry.clone();
+            let registry = Arc::clone(registry);
             tokio::spawn(async move {
                 let _ = registry.unpair_self().await;
             });
@@ -661,7 +661,7 @@ pub(crate) fn spawn_group_poller(
         #[cfg(not(target_os = "android"))]
         let period = GROUP_POLL_INTERVAL;
         let mut tick = tokio::time::interval(period);
-        let nudge = registry.poll_nudge.clone();
+        let nudge = Arc::clone(&registry.poll_nudge);
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
@@ -814,7 +814,7 @@ pub(crate) async fn fetch_and_apply_blob(
     let self_removed =
         !new_member_ids.contains(&my_id) && !data.approved.iter().any(|a| a.identity == my_id);
 
-    let commit = state.read().unwrap().snapshot_commit.clone();
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let commit_guard = commit.lock().await;
     // The live generation can become durable after the optimistic check above
     // but before this lock is acquired. Once its pending pointer exists, an older
@@ -840,7 +840,7 @@ pub(crate) async fn fetch_and_apply_blob(
         if self_nullified {
             drop(s);
             tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = registry.clone();
+            let registry = Arc::clone(registry);
             tokio::spawn(async move {
                 let _ = registry.unpair_self().await;
             });

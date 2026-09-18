@@ -27,7 +27,7 @@ impl NetworkRegistry {
                     None => return,
                 },
             };
-            self.clone().handle_disconnect(ev).await;
+            Arc::clone(&self).handle_disconnect(ev).await;
         }
     }
 
@@ -94,7 +94,7 @@ impl NetworkRegistry {
             // above) is allowed to leave a peer disconnected. The idle timer will
             // close the healed link again if it stays quiet.
             if !reconnect_nets.is_empty() {
-                self.clone().spawn_reconnect(ev.endpoint_id, reconnect_nets);
+                Arc::clone(&self).spawn_reconnect(ev.endpoint_id, reconnect_nets);
             }
             return;
         }
@@ -177,10 +177,10 @@ impl NetworkRegistry {
             if !h.role.is_coordinator() {
                 return;
             }
-            (h.state.clone(), h.network_key, h.dht_notify.clone())
+            (Arc::clone(&h.state), h.network_key, h.dht_notify.clone())
         };
         let member_id = self.device_user_map.resolve(&ev.endpoint_id);
-        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         state.write().unwrap().members.remove(&member_id);
         commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
@@ -220,10 +220,10 @@ impl NetworkRegistry {
             if !h.role.is_coordinator() {
                 return;
             }
-            (h.state.clone(), h.network_key, h.dht_notify.clone())
+            (Arc::clone(&h.state), h.network_key, h.dht_notify.clone())
         };
         let member_id = self.device_user_map.resolve(&peer_id);
-        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         // Nothing to prune means nothing to announce. The tail of this function
         // is a signature, a DHT publish, and a `MemberSync` to every roster
@@ -285,7 +285,7 @@ impl NetworkRegistry {
             drop(s);
             nets.push((
                 entry.key().clone(),
-                entry.value().state.clone(),
+                Arc::clone(&entry.value().state),
                 entry.value().dht_notify.clone(),
                 has_key,
             ));
@@ -418,7 +418,7 @@ impl NetworkRegistry {
         }
         tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
         // Drive the new connection's control demux + announce handles.
-        let router = self.protocol_router().clone();
+        let router = Arc::clone(self.protocol_router());
         let dconn = conn.clone();
         tokio::spawn(router.drive_mesh_connection(dconn, true));
         announce_network_handles(&self.peers, &conn, peer_ip).await;
@@ -451,7 +451,7 @@ impl NetworkRegistry {
             return;
         }
 
-        let this = self.clone();
+        let this = Arc::clone(&self);
         let token = self.shutdown_token.clone();
         use tracing::Instrument as _;
         let span = tracing::info_span!("reconnect", peer = %peer_id.fmt_short());

@@ -315,9 +315,9 @@ impl MeshCtx {
     pub(crate) fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
         forward::ForwardCtx {
             firewall: self.firewall.clone(),
-            tun_tx: self.tun_tx.clone(),
+            tun_tx: Arc::clone(&self.tun_tx),
             token,
-            stats: self.stats.clone(),
+            stats: Arc::clone(&self.stats),
             device_user_map: self.device_user_map.clone(),
             exit: crate::exit_node::ExitContext {
                 server: self.registry.exit_server.clone(),
@@ -778,6 +778,12 @@ impl Daemon {
         }
     }
 
+    /// Coalesced invalidations for incoming offers and transfer status. Subscribe
+    /// before reading a snapshot; the receiver does not keep this daemon alive.
+    pub fn subscribe_file_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.transfers.subscribe()
+    }
+
     /// In-flight file transfers, both directions, for progress reporting. Cheap:
     /// clones a small vec. Safe to poll.
     pub fn list_transfers(&self) -> Vec<transfers::TransferInfo> {
@@ -873,18 +879,18 @@ impl Daemon {
         // A dedicated child token so the data plane can be stopped independently
         // of a full daemon shutdown; it still cancels when `shutdown_token` does.
         let cancel = self.shutdown_token.child_token();
-        let writer_handle = forward::spawn_tun_writer(writer, new_rx, self.active.clone());
+        let writer_handle = forward::spawn_tun_writer(writer, new_rx, Arc::clone(&self.active));
         let mesh_handle = {
             let peers = self.registry.peers.clone();
             let firewall = self.registry.firewall.clone();
             let cancel = cancel.clone();
-            let stats = self.stats.clone();
-            let resolver = self.dns.resolver.clone();
+            let stats = Arc::clone(&self.stats);
+            let resolver = Arc::clone(&self.dns.resolver);
             // The registry is the forwarding loop's on-demand dial mechanism: when a
             // packet has no live route, the loop asks it to dial the roster member.
             // Present on every node so any peer stays reachable-on-demand after a link
             // idle-closes.
-            let dialer = Some(self.registry.clone());
+            let dialer = Some(Arc::clone(&self.registry));
             tokio::spawn(async move {
                 if let Err(e) = forward::run_mesh(
                     reader, peers, firewall, cancel, stats, resolver, new_tx, dialer,
@@ -983,7 +989,7 @@ impl Daemon {
         let (is_coord, state, dht_notify) = match self.registry.networks.get(network) {
             Some(h) => (
                 h.role.is_coordinator(),
-                h.state.clone(),
+                Arc::clone(&h.state),
                 h.dht_notify.clone(),
             ),
             None => {
@@ -1530,7 +1536,7 @@ fn spawn_absent_member_sync(
     if absent.is_empty() {
         return;
     }
-    let registry = registry.clone();
+    let registry = Arc::clone(registry);
     let network_name = network_name.to_string();
     tokio::spawn(async move {
         tracing::debug!(
@@ -1894,8 +1900,8 @@ mod accept_handler_tests {
         let hostname_table = dns::new_hostname_table();
         let reverse_table = dns::new_reverse_table();
         let dns_resolver = Arc::new(crate::dns::resolver::Resolver::new(
-            hostname_table.clone(),
-            reverse_table.clone(),
+            Arc::clone(&hostname_table),
+            Arc::clone(&reverse_table),
         ));
         let dns = Arc::new(DnsService::new(
             hostname_table,
@@ -1942,7 +1948,7 @@ mod accept_handler_tests {
             ctx: sample_mesh_ctx(
                 IrohIdentityProvider::new(my_id),
                 blob_store.clone(),
-                registry.clone(),
+                Arc::clone(&registry),
             ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
@@ -1980,8 +1986,10 @@ mod accept_handler_tests {
             sample_member_handler().await,
         ] {
             let (registry, state) = match &handler {
-                AcceptHandler::Coordinator(s) => (s.ctx.registry.clone(), s.state.clone()),
-                AcceptHandler::Member(s) => (s.ctx.registry.clone(), s.state.clone()),
+                AcceptHandler::Coordinator(s) => {
+                    (Arc::clone(&s.ctx.registry), Arc::clone(&s.state))
+                }
+                AcceptHandler::Member(s) => (Arc::clone(&s.ctx.registry), Arc::clone(&s.state)),
             };
             // Hold the network key (recording needs it) and list the sender.
             let sender = SecretKey::from_bytes(&[9u8; 32]).public();
@@ -2005,7 +2013,7 @@ mod accept_handler_tests {
                     name: "test-net".to_string(),
                     network_key: state.read().unwrap().network_public_key,
                     role: NetworkRole::Coordinator,
-                    state: state.clone(),
+                    state: Arc::clone(&state),
                     dht_notify: None,
                     cancel: CancellationToken::new(),
                     tasks: Vec::new(),
@@ -2115,7 +2123,7 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                state: state.clone(),
+                state: Arc::clone(&state),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
@@ -2131,7 +2139,7 @@ mod accept_handler_tests {
             ctx: sample_mesh_ctx(
                 IrohIdentityProvider::new(coord_id),
                 blob_store.clone(),
-                registry.clone(),
+                Arc::clone(&registry),
             ),
             token: CancellationToken::new(),
             on_peer_connected: Arc::new(|_| {}),
@@ -2142,10 +2150,10 @@ mod accept_handler_tests {
                 ctx: sample_mesh_ctx(
                     IrohIdentityProvider::new(coord_id),
                     blob_store.clone(),
-                    registry.clone(),
+                    Arc::clone(&registry),
                 ),
                 network_name: "test-net".to_string(),
-                state: state.clone(),
+                state: Arc::clone(&state),
                 dht_notify: None,
                 invite_lock: Arc::new(AsyncMutex::new(())),
             })),
@@ -2155,7 +2163,7 @@ mod accept_handler_tests {
         let coord_addr = coord_ep.addr();
         let accept = {
             let coord_ep = coord_ep.clone();
-            let cm = connmgr.clone();
+            let cm = Arc::clone(&connmgr);
             tokio::spawn(async move {
                 let conn = coord_ep
                     .accept()
@@ -2289,7 +2297,7 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                state: coord_state.clone(),
+                state: Arc::clone(&coord_state),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
@@ -2302,7 +2310,7 @@ mod accept_handler_tests {
             ctx: sample_mesh_ctx(
                 IrohIdentityProvider::new(coord_id),
                 coord_blobs.clone(),
-                coord_reg.clone(),
+                Arc::clone(&coord_reg),
             ),
             token: CancellationToken::new(),
             on_peer_connected: Arc::new(|_| {}),
@@ -2313,17 +2321,17 @@ mod accept_handler_tests {
                 ctx: sample_mesh_ctx(
                     IrohIdentityProvider::new(coord_id),
                     coord_blobs.clone(),
-                    coord_reg.clone(),
+                    Arc::clone(&coord_reg),
                 ),
                 network_name: "test-net".to_string(),
-                state: coord_state.clone(),
+                state: Arc::clone(&coord_state),
                 dht_notify: None,
                 invite_lock: Arc::new(AsyncMutex::new(())),
             })),
         );
         let accept = {
             let coord_ep = coord_ep.clone();
-            let cm = connmgr.clone();
+            let cm = Arc::clone(&connmgr);
             tokio::spawn(async move {
                 let conn = coord_ep
                     .accept()
@@ -2356,7 +2364,7 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Member,
-                state: member_state.clone(),
+                state: Arc::clone(&member_state),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
@@ -2938,7 +2946,7 @@ mod headless_tests {
 
         // 1. First attach: reader1 + writer1, forwarding active.
         let writer1 = FakeTunWriter::default();
-        let sink1 = writer1.written.clone();
+        let sink1 = Arc::clone(&writer1.written);
         daemon
             .attach_tun(
                 FakeTunReader {
@@ -2962,12 +2970,12 @@ mod headless_tests {
             mtu: Some(1280),
             ..Default::default()
         };
-        let sink2 = writer2.written.clone();
+        let sink2 = Arc::clone(&writer2.written);
         let alive2 = Arc::new(());
         daemon
             .attach_tun(
                 FakeTunReader {
-                    _alive: alive2.clone(),
+                    _alive: Arc::clone(&alive2),
                 },
                 writer2,
             )
@@ -2992,7 +3000,7 @@ mod headless_tests {
         //    - reader2's `run_mesh` task was dropped (`alive2` count back to 1),
         //      which without the self-healing guard would leak and stay at 2.
         let writer3 = FakeTunWriter::default();
-        let sink3 = writer3.written.clone();
+        let sink3 = Arc::clone(&writer3.written);
         daemon
             .attach_tun(
                 FakeTunReader {
