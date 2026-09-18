@@ -21,7 +21,8 @@ build: apk
 # Regenerate the UniFFI Kotlin bindings and assemble the Android debug APK.
 apk:
     cargo -q build -p ray-mobile
-    cargo -q run -p ray-mobile --bin uniffi-bindgen -- generate --library target/debug/libray_mobile.{{lib_ext}} --language kotlin --out-dir android/app/src/main/java
+    cargo -q run -p ray-mobile --bin uniffi-bindgen -- generate --library target/debug/libray_mobile.{{lib_ext}} --language kotlin --out-dir android/app/src/main/java --no-format
+    sh scripts/format-generated-kotlin.sh
     cd android && ./gradlew :app:assembleDebug
     @echo "APK: android/app/build/outputs/apk/debug/app-debug.apk"
 

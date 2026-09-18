@@ -215,7 +215,7 @@ windows-sys = { version = "0.61.2", features = [
 # Background cadence and content-based discovery deduplication.
 # https://github.com/n0-computer/iroh-address-lookups/pull/15
 # Drop this patch when an upstream release includes it.
-iroh-mdns-address-lookup = { git = "https://github.com/rayfish/iroh-address-lookups", rev = "52983a1f9e505695ea19e2e1a68e4d53d8e7676e" }
+iroh-mdns-address-lookup = { git = "https://github.com/rayfish/iroh-address-lookups", rev = "3c439994559d15fd6683695757ca72f70eccc060" }
 # iroh fork carrying three rayfish features on the `rayfish-integration` branch:
 #   - `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397)
 #   - `Builder::configure_socket`, a hook run on every socket iroh opens (UDP and
