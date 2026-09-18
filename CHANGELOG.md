@@ -24,9 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Idle standby no longer checks for offers and transfers every four seconds.
   Auto-accept, progress, save completion, and pending-save timeouts still work.
 
-- **LAN discovery uses a five-second base interval and ignores unchanged
+- **LAN discovery uses a 30-second base interval and ignores unchanged
   announcements.** This reduces background multicast traffic and repeated logs.
-  Discovery can take a few seconds; update LAN peers together for consistent
+  New LAN peers can take 30 seconds or more to appear, and LAN address lookups
+  wait longer for the next query. Update LAN peers together for consistent
   expiry behavior with the slower announcements.
 
 - **Routine TUN packet logs require trace logging.** Normal debug diagnostics
