@@ -46,6 +46,20 @@ internal class DemandTask(
     }
 }
 
+/** Run every reconciliation even if another fails; only failures need a retry timer. */
+internal fun reconcileFileStatus(
+    accept: () -> Unit,
+    transfers: () -> Unit,
+    offers: () -> Unit,
+): Long? {
+    val accepted = runCatching(accept)
+    val transferred = runCatching(transfers)
+    val offered = runCatching(offers)
+    return if (accepted.isSuccess && transferred.isSuccess && offered.isSuccess) {
+        DownloadsOutcome.nextCheckDelayMs()
+    } else 4_000L
+}
+
 /** Reconciles notifications on core changes, with no timer when files are idle. */
 internal class FileStatusMonitor private constructor(private val context: Context) : AutoCloseable {
     private val reconciliation = Any()
@@ -57,11 +71,11 @@ internal class FileStatusMonitor private constructor(private val context: Contex
             if (isClosed) return@DemandTask null
             // A transient platform failure gets another chance without requiring
             // a new transfer event. Successful idle reconciliations arm no timer.
-            val accept = runCatching { FileAutoAccept.run(context) }
-            val transfers = runCatching { TransferNotifier.poll(context) }
-            val offers = runCatching { OfferNotifier.poll(context) }
-            val ok = accept.isSuccess && transfers.isSuccess && offers.isSuccess
-            if (ok) DownloadsOutcome.nextCheckDelayMs() else 4_000L
+            reconcileFileStatus(
+                accept = { FileAutoAccept.run(context) },
+                transfers = { TransferNotifier.poll(context) },
+                offers = { OfferNotifier.poll(context) },
+            )
         }
     }
 
