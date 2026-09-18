@@ -54,17 +54,21 @@ object TransferNotifier {
      * ever clears.
      */
     fun poll(context: Context) {
+        poll(context) { NodeHolder.get(context).listTransfers() }
+    }
+
+    internal fun poll(context: Context, listTransfers: () -> List<uniffi.ray_mobile.Transfer>) {
         synchronized(this) {
             // The core's transfer registry starts empty on every process start, so
             // any ongoing notification still showing at this point is necessarily
             // left over from a previous process and can never be resolved by this
             // one. Clear it once, before posting anything ourselves.
             if (!cancelledStaleOnStart) {
-                cancelledStaleOnStart = true
                 cancelStaleOngoingNotifications(context)
+                cancelledStaleOnStart = true
             }
 
-            val transfers = runCatching { NodeHolder.get(context).listTransfers() }.getOrNull() ?: return
+            val transfers = listTransfers()
             val liveIds = transfers.mapTo(HashSet()) { it.id }
             for (t in transfers) {
                 when (t.state) {
@@ -93,7 +97,10 @@ object TransferNotifier {
                             DownloadsOutcome.isPending(TransferKey(t.peer, t.filename, t.size))
                         // Terminal entries stay listable for 60s, so guard against
                         // re-posting the same result on every poll.
-                        if (!awaitingSave && terminal.add(t.id)) postResult(context, t)
+                        if (!awaitingSave && t.id !in terminal) {
+                            postResult(context, t)
+                            terminal.add(t.id)
+                        }
                     }
                 }
             }
@@ -114,14 +121,12 @@ object TransferNotifier {
      * ids are below it). */
     private fun cancelStaleOngoingNotifications(context: Context) {
         val nm = context.getSystemService(NotificationManager::class.java)
-        runCatching {
-            for (sbn in nm.activeNotifications) {
-                val n = sbn.notification
-                if (sbn.id < NOTIF_BASE) continue
-                if ((n.flags and Notification.FLAG_FOREGROUND_SERVICE) != 0) continue
-                if (n.channelId == CHANNEL_ID && (n.flags and Notification.FLAG_ONGOING_EVENT) != 0) {
-                    nm.cancel(sbn.id)
-                }
+        for (sbn in nm.activeNotifications) {
+            val n = sbn.notification
+            if (sbn.id < NOTIF_BASE) continue
+            if ((n.flags and Notification.FLAG_FOREGROUND_SERVICE) != 0) continue
+            if (n.channelId == CHANNEL_ID && (n.flags and Notification.FLAG_ONGOING_EVENT) != 0) {
+                nm.cancel(sbn.id)
             }
         }
     }
@@ -280,22 +285,16 @@ object TransferNotifier {
     }
 
     private fun postResult(context: Context, t: uniffi.ray_mobile.Transfer) {
-        // This id no longer names an ongoing notification: it is about to become a
-        // result notification instead. Drop it from postedProgress so pruneVanished
-        // can never mistake the result for a vanished progress notification and
-        // cancel it out from under the user 60s later when the terminal entry ages
-        // out of the registry.
-        postedProgress.remove(t.id)
         ensureChannel(context)
         val ok = t.state == TransferState.DONE
         // moveToDownloads is best-effort (unavailable below API 29, or the
         // MediaStore insert can fail), and its result is only known at accept
-        // time in FileAutoAccept / HomeScreen, not here. Consume what they
+        // time in FileAutoAccept / HomeScreen, not here. Read what they
         // recorded rather than assume Downloads: claiming a file landed there
         // when it is actually sitting in app-private storage sends the user to
         // an empty Downloads view with no way to find their file.
         val savedToDownloads = ok && !t.outgoing &&
-            DownloadsOutcome.consume(TransferKey(t.peer, t.filename, t.size))
+            DownloadsOutcome.peek(TransferKey(t.peer, t.filename, t.size))
         val title = when {
             ok && t.outgoing -> context.getString(R.string.notif_sent_file, t.filename)
             ok -> context.getString(R.string.notif_saved_file, t.filename)
@@ -331,6 +330,10 @@ object TransferNotifier {
             .build()
         context.getSystemService(NotificationManager::class.java)
             .notify(notifId(t.id), notification)
+        // Preserve both the save outcome and progress bookkeeping on failure,
+        // so a retry reports the same result and stale progress can be cleared.
+        if (!t.outgoing) DownloadsOutcome.consume(TransferKey(t.peer, t.filename, t.size))
+        postedProgress.remove(t.id)
         Log.i("RayfishTransfers", "transfer ${t.id} ${t.state} (${t.filename})")
     }
 

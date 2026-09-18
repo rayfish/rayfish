@@ -66,8 +66,8 @@ pub fn create_pkarr_client(ep: &Endpoint, relay_url: &Url) -> Result<PkarrRelayC
 /// Encodes a network record into a signed pkarr packet.
 ///
 /// The record contains the group blob hash, a list of seed peers, and the
-/// publishing coordinator's mesh protocol version (`m,<v>` =
-/// [`transport::MESH_PROTOCOL_VERSION`]). The version lets a joiner detect an
+/// publishing coordinator's oldest supported mesh protocol (`m,<v>` =
+/// [`transport::MESH_RECORD_VERSION`]). The version lets a joiner detect an
 /// incompatible mesh protocol *before* dialing (where the versioned ALPN would
 /// otherwise reject it opaquely), so it can surface a precise "run ray update"
 /// error. The record is network-key-signed, so the version can't be spoofed.
@@ -79,7 +79,7 @@ pub fn encode_network_record(
     let mut values = vec![
         RECORD_VERSION.to_string(),
         format!("h,{blob_hash}"),
-        format!("m,{}", crate::transport::MESH_PROTOCOL_VERSION),
+        format!("m,{}", crate::transport::MESH_RECORD_VERSION),
     ];
     for peer in seed_peers {
         values.push(format!("p,{peer}"));
@@ -88,7 +88,7 @@ pub fn encode_network_record(
         .map_err(|e| anyhow::anyhow!("failed to build network record: {e}"))
 }
 
-/// Extracts the coordinator's advertised mesh protocol version (`m,<v>`) from a
+/// Extracts the coordinator's advertised compatibility version (`m,<v>`) from a
 /// network record, if present. Returns `None` for older records published before
 /// the version was added: callers treat that as "unknown, fall through to the
 /// ALPN gate" rather than blocking.
@@ -320,7 +320,7 @@ mod tests {
         // standard hash/peers decode is unaffected by the added field.
         assert_eq!(
             mesh_version_from_record(&packet),
-            Some(crate::transport::MESH_PROTOCOL_VERSION)
+            Some(crate::transport::MESH_RECORD_VERSION)
         );
         assert_eq!(decode_network_record(&packet).unwrap().0, hash);
     }

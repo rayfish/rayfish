@@ -102,7 +102,7 @@ impl ConnectionManager {
         };
         MeshConnection::new(
             conn,
-            self.clone(),
+            Arc::clone(&self),
             mesh.ctx.clone(),
             mesh.token.clone(),
             pre_registered,

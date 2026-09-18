@@ -815,10 +815,10 @@ impl NetworkRegistry {
     ) {
         let user_id = self.device_user_map.resolve(&sender);
         let (state, dht_notify) = match self.networks.get(network) {
-            Some(h) => (h.state.clone(), h.dht_notify.clone()),
+            Some(h) => (Arc::clone(&h.state), h.dht_notify.clone()),
             None => return,
         };
-        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let _commit_guard = snapshot_commit.lock().await;
         let changed = {
             let mut s = state.write().unwrap();

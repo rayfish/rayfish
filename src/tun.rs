@@ -164,7 +164,7 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     let dev = Arc::new(device);
     Ok((
         TunReader {
-            dev: dev.clone(),
+            dev: Arc::clone(&dev),
             scratch: vec![0u8; READ_RESERVE].into_boxed_slice(),
         },
         TunWriter { dev, mtu },

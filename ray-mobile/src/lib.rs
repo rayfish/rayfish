@@ -14,6 +14,8 @@
 #[cfg(target_os = "android")]
 mod android_tun;
 mod diag;
+mod file_events;
+pub use file_events::{FileChangeListener, FileWatch};
 
 /// JNI bridge that hands the Android `JavaVM` + app `Context` to the two Rust
 /// dependencies that need them: `ndk-context` (so iroh-dns can read the system
@@ -865,6 +867,16 @@ impl Node {
                 "unexpected send response: {other:?}"
             ))),
         }
+    }
+
+    /// Subscribe to file/transfer changes, including one initial reconciliation.
+    /// Close the returned handle when the platform observer stops.
+    pub fn watch_files(
+        &self,
+        listener: Box<dyn FileChangeListener>,
+    ) -> Result<Arc<FileWatch>, RayError> {
+        let changes = self.state()?.subscribe_file_changes();
+        Ok(FileWatch::start(&self.runtime, changes, listener))
     }
 
     /// Incoming file offers waiting to be accepted or declined.

@@ -374,7 +374,9 @@ jobs:
           cargo run -p ray-mobile --bin uniffi-bindgen -- generate \
             --library target/debug/libray_mobile.so \
             --language kotlin \
-            --out-dir android/app/src/main/java
+            --out-dir android/app/src/main/java \
+            --no-format
+          sh scripts/format-generated-kotlin.sh
 
       - name: Build APK
         working-directory: android

@@ -422,8 +422,8 @@ impl ConnectService {
     /// to the dialing identity, replies `Approved` if already accepted
     /// (idempotent), else queues it as `Pending` for `ray connect approve`.
     pub(crate) async fn accept_connect_request(&self, conn: Connection) {
-        let pending = self.pending_connects.clone();
-        let approved = self.approved_connects.clone();
+        let pending = Arc::clone(&self.pending_connects);
+        let approved = Arc::clone(&self.approved_connects);
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {

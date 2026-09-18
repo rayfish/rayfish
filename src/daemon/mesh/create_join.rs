@@ -172,13 +172,16 @@ fn apply_finalized_join_config(
     Ok(())
 }
 
-/// Whether the mesh version a network's record advertises is one this build can
-/// speak.
+/// Whether the mesh version a network's record advertises is one this build can speak.
 ///
 /// An absent version means a record published before the field existed: not a
 /// refusal, just unknown, so the ALPN gate decides for those.
 pub(super) fn mesh_version_is_speakable(record_version: Option<u32>, ours: u32) -> bool {
-    record_version.is_none_or(|v| v == ours)
+    record_version.is_none_or(|v| {
+        v == ours
+            || (ours == transport::MESH_PROTOCOL_VERSION
+                && transport::MESH_BACKWARDS_COMPAT.contains(&v))
+    })
 }
 
 /// Compare the mesh version a network's signed record advertises against ours,
@@ -439,7 +442,7 @@ impl NetworkRegistry {
             && self_is_nullified(&cert, &data.members, &data.nullifiers)
         {
             tracing::warn!(network = %network_key, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = self.clone();
+            let registry = Arc::clone(self);
             tokio::spawn(async move {
                 let _ = registry.unpair_self().await;
             });
@@ -500,7 +503,7 @@ impl NetworkRegistry {
             invite,
             auto_accept_firewall,
             auto_accept_files,
-            invite_lock: invite_lock.clone(),
+            invite_lock: Arc::clone(&invite_lock),
             coordinator,
             mismatch,
         };
@@ -839,7 +842,7 @@ impl NetworkRegistry {
             if m.identity == me {
                 continue;
             }
-            self.clone().spawn_reconnect(m.identity, vec![net.clone()]);
+            Arc::clone(self).spawn_reconnect(m.identity, vec![net.clone()]);
         }
     }
 
@@ -993,9 +996,9 @@ impl NetworkRegistry {
                 initial,
             },
             cancel.clone(),
-            self.clone(),
-            ctx.invite_lock.clone(),
-            self.protocol_router().clone(),
+            Arc::clone(self),
+            Arc::clone(&ctx.invite_lock),
+            Arc::clone(self.protocol_router()),
         )
         .await
     }
@@ -1028,7 +1031,7 @@ impl NetworkRegistry {
 
         // Serialize the authority transition with every snapshot mutation. This
         // binds the durable key and provenance to one exact live generation.
-        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         let (held_key, converged_hash) = {
             let state = state.read().unwrap();
@@ -1109,7 +1112,7 @@ impl NetworkRegistry {
             tasks.push(spawn_group_poller(
                 poller_client,
                 net_pubkey,
-                state.clone(),
+                Arc::clone(&state),
                 self.transport.endpoint.clone(),
                 self.mesh_ctx(),
                 display_name.to_string(),
@@ -1121,11 +1124,11 @@ impl NetworkRegistry {
             name: display_name.to_string(),
             network_key: net_pubkey,
             role: role.clone(),
-            state: state.clone(),
+            state: Arc::clone(&state),
             dht_notify: dht_notify.clone(),
             cancel: cancel.clone(),
             tasks,
-            invite_lock: invite_lock.clone(),
+            invite_lock: Arc::clone(&invite_lock),
             incompatible: mismatch,
         };
         self.networks.insert(display_name.to_string(), handle);
@@ -1136,8 +1139,8 @@ impl NetworkRegistry {
             NetworkRole::Coordinator => self.register_coordinator_handler(
                 &self.mesh_ctx(),
                 display_name,
-                state.clone(),
-                invite_lock.clone(),
+                Arc::clone(&state),
+                Arc::clone(&invite_lock),
                 dht_notify,
                 net_pubkey,
             ),
@@ -1148,12 +1151,12 @@ impl NetworkRegistry {
                         AcceptHandler::Member(Arc::new(MemberAcceptState {
                             ctx: self.mesh_ctx(),
                             network_name: display_name.to_string(),
-                            state: state.clone(),
+                            state: Arc::clone(&state),
                             net_pubkey,
                             my_identity: self.transport.identity.local_identity(),
                             endpoint: self.transport.endpoint.clone(),
-                            registry: self.clone(),
-                            invite_lock: invite_lock.clone(),
+                            registry: Arc::clone(self),
+                            invite_lock: Arc::clone(&invite_lock),
                             reconverge_notify: Arc::new(tokio::sync::Notify::new()),
                         })),
                     );
@@ -1434,7 +1437,7 @@ impl NetworkRegistry {
                 // demux (which owns the data reader) and announce our handles.
                 let conn_changed = ctx.register_peer_conn(&peer_conn, m.identity, network_name);
                 if conn_changed {
-                    let router = self.protocol_router().clone();
+                    let router = Arc::clone(self.protocol_router());
                     let dconn = peer_conn.clone();
                     tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
                 }
@@ -1556,6 +1559,17 @@ mod tests {
     fn a_republished_matching_version_is_speakable_again() {
         assert!(!mesh_version_is_speakable(Some(2), 4));
         assert!(mesh_version_is_speakable(Some(4), 4));
+    }
+
+    #[test]
+    fn a_v5_record_is_speakable_by_v6() {
+        assert!(mesh_version_is_speakable(Some(5), 6));
+        assert!(
+            gate_mesh_version(Some(5), 6, VersionGate::Refuse)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!mesh_version_is_speakable(Some(4), 6));
     }
 
     fn id(seed: u8) -> EndpointId {

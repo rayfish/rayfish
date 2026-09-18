@@ -115,22 +115,23 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 /// router, and metrics server. Returns the shared [`Daemon`] (still on
 /// standby, so the caller is expected to run [`Daemon::activate`]) and the
 /// metrics-server guard, which must outlive the process.
-/// The ALPNs the endpoint advertises at boot: one per saved network plus the
+/// The ALPNs the endpoint advertises at boot: supported mesh versions plus the
 /// network-independent blobs / file-transfer / pairing / connect ALPNs. A
 /// freshly-started daemon with no active network must still accept `ray pair` /
 /// `ray send` / `ray connect`, otherwise the initial handshake fails with "peer
 /// doesn't support any known protocol" until the first create/join triggers
-/// `refresh_alpns()`. Mirrors `ProtocolRouter::alpns()`.
+/// `refresh_alpns()`.
 fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
-    // A single mesh ALPN now carries every network (network selection is in-band),
-    // so the advertised set is static and independent of the saved networks.
-    vec![
-        transport::mesh_alpn(),
+    // Each mesh version carries every network, so this set is independent of
+    // the saved networks.
+    let mut alpns = transport::mesh_alpns();
+    alpns.extend([
         iroh_blobs::protocol::ALPN.to_vec(),
         transport::FILES_ALPN.to_vec(),
         PAIR_ALPN.to_vec(),
         transport::CONNECT_ALPN.to_vec(),
-    ]
+    ]);
+    alpns
 }
 
 /// Settings an embedder decides for itself instead of reading from
@@ -329,7 +330,7 @@ async fn build_daemon_inner(
     // ride the same blobs ALPN, so events for hashes we never registered as an
     // outgoing file send are dropped by the registry regardless of who pulled them.
     {
-        let transfers = transfers.clone();
+        let transfers = Arc::clone(&transfers);
         let token = token.clone();
         let send_done_tx = send_done_tx.clone();
         tokio::spawn(async move {
@@ -363,7 +364,7 @@ async fn build_daemon_inner(
                         // that owns `connections`; the request-tracking task below
                         // only needs the already-resolved value.
                         let peer = connections.get(&connection_id).copied();
-                        let transfers = transfers.clone();
+                        let transfers = Arc::clone(&transfers);
                         let mut updates = msg.rx;
                         let send_done_tx = send_done_tx.clone();
                         tokio::spawn(async move {
@@ -490,15 +491,15 @@ async fn build_daemon_inner(
     let hostname_table = dns::new_hostname_table();
     let reverse_table = dns::new_reverse_table();
     let dns_resolver = std::sync::Arc::new(crate::dns::resolver::Resolver::new(
-        hostname_table.clone(),
-        reverse_table.clone(),
+        Arc::clone(&hostname_table),
+        Arc::clone(&reverse_table),
     ));
     // Built here (not in the struct literal) so NetworkRegistry can share it for
     // the leave/teardown DNS cleanup.
     let dns = Arc::new(DnsService::new(
         hostname_table,
         reverse_table,
-        dns_resolver.clone(),
+        Arc::clone(&dns_resolver),
         derive_ipv6(&identity.local_identity()),
     ));
     let mdns_enabled = app_config.mdns_enabled;
@@ -506,7 +507,7 @@ async fn build_daemon_inner(
     // than stale sightings from a previous run.
     let lan_peers = Arc::new(LanPeers::new());
     if mdns_enabled {
-        spawn_mdns_discovery(&ep, token.clone(), lan_peers.clone());
+        spawn_mdns_discovery(&ep, token.clone(), Arc::clone(&lan_peers));
     } else {
         tracing::info!("mDNS discovery disabled");
     }
@@ -520,7 +521,7 @@ async fn build_daemon_inner(
         ep.clone(),
         identity.clone(),
         blob_store.clone(),
-        stats.clone(),
+        Arc::clone(&stats),
         TransportBootstrap {
             contact_public,
             lan_peers,
@@ -542,18 +543,18 @@ async fn build_daemon_inner(
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
     let pruned_peers = Arc::new(DashSet::new());
     let registry = Arc::new(NetworkRegistry::new(
-        networks.clone(),
-        transport.clone(),
+        Arc::clone(&networks),
+        Arc::clone(&transport),
         peers.clone(),
-        conn.clone(),
-        dns.clone(),
-        tun_name.clone(),
+        Arc::clone(&conn),
+        Arc::clone(&dns),
+        Arc::clone(&tun_name),
         device_cert.clone(),
         token.clone(),
         shared_firewall.clone(),
         device_user_map.clone(),
-        tun_tx.clone(),
-        pruned_peers.clone(),
+        Arc::clone(&tun_tx),
+        Arc::clone(&pruned_peers),
         disconnect_tx.clone(),
         on_demand,
         app_config.idle_timeout(),
@@ -564,15 +565,15 @@ async fn build_daemon_inner(
     // depends on Transport (endpoint + blobs) and NetworkRegistry.
     let files = Arc::new(FileService::new(
         key.clone(),
-        transport.clone(),
-        registry.clone(),
+        Arc::clone(&transport),
+        Arc::clone(&registry),
         device_cert.clone(),
         device_user_map.clone(),
-        transfers.clone(),
+        Arc::clone(&transfers),
     ));
     // Drain completed pulls into the blob reclaim (see the channel above).
     tokio::spawn({
-        let files = files.clone();
+        let files = Arc::clone(&files);
         let token = token.clone();
         async move {
             loop {
@@ -588,19 +589,19 @@ async fn build_daemon_inner(
     });
 
     let connect = Arc::new(ConnectService::new(
-        transport.clone(),
-        active.clone(),
-        registry.clone(),
+        Arc::clone(&transport),
+        Arc::clone(&active),
+        Arc::clone(&registry),
     ));
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
-        files.clone(),
-        connect.clone(),
-        conn.clone(),
+        Arc::clone(&files),
+        Arc::clone(&connect),
+        Arc::clone(&conn),
     ));
     // The registry (re)connect paths drive a dialed connection's demux through the
     // router; install it now that it exists (the registry was built before it).
-    registry.set_protocol_router(protocol_router.clone());
+    registry.set_protocol_router(Arc::clone(&protocol_router));
     // Single daemon-wide connection supervisor: consumes every data reader's
     // disconnect and, per dropped identity, prunes departed peers we coordinate and
     // reconnects the rest across all their shared networks. Spawned here (not in
@@ -608,7 +609,7 @@ async fn build_daemon_inner(
     // without it a transient QUIC drop between two mobile peers would never
     // reconnect and the bounded disconnect channel would eventually back up.
     {
-        let registry = registry.clone();
+        let registry = Arc::clone(&registry);
         let token = token.clone();
         tokio::spawn(async move {
             registry
@@ -633,9 +634,9 @@ async fn build_daemon_inner(
         token: token.clone(),
         on_peer_connected: {
             // Deliver queued `ray send` offers the moment their peer connects.
-            let files = files.clone();
+            let files = Arc::clone(&files);
             Arc::new(move |peer| {
-                let files = files.clone();
+                let files = Arc::clone(&files);
                 tokio::spawn(async move { files.flush_outbox_for(peer).await });
             })
         },
@@ -645,7 +646,7 @@ async fn build_daemon_inner(
     // reconnects). `outbox_peers` only yields currently connected peers, so
     // this never dials into the void.
     tokio::spawn({
-        let files = files.clone();
+        let files = Arc::clone(&files);
         let token = token.clone();
         async move {
             loop {
@@ -654,7 +655,7 @@ async fn build_daemon_inner(
                     _ = tokio::time::sleep(file_service::OUTBOX_SWEEP_INTERVAL) => {}
                 }
                 for peer in files.outbox_peers() {
-                    let files = files.clone();
+                    let files = Arc::clone(&files);
                     tokio::spawn(async move { files.flush_outbox_for(peer).await });
                 }
             }
@@ -669,7 +670,7 @@ async fn build_daemon_inner(
     // owned field. `None` if it failed to bind.
     #[cfg(not(target_os = "android"))]
     let metrics_server = spawn_metrics_server(
-        stats.clone(),
+        Arc::clone(&stats),
         peers.clone(),
         &transport.endpoint,
         token.clone(),
@@ -685,11 +686,11 @@ async fn build_daemon_inner(
     let daemon = Arc::new(Daemon {
         transport,
         registry,
-        stats: stats.clone(),
+        stats: Arc::clone(&stats),
         start: Instant::now(),
         tun_tx,
         shutdown_token: token.clone(),
-        protocol_router: protocol_router.clone(),
+        protocol_router: Arc::clone(&protocol_router),
         dns,
         mdns_enabled,
         auto_update,
@@ -703,7 +704,7 @@ async fn build_daemon_inner(
         connect,
         device_cert,
         contact_public,
-        active: active.clone(),
+        active: Arc::clone(&active),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
         #[cfg(feature = "desktop")]
@@ -738,6 +739,8 @@ async fn build_daemon_inner(
 fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken, lan_peers: Arc<LanPeers>) {
     let mdns = match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
         .service_name("rayfish")
+        // Long-lived background discovery, not an interactive device picker.
+        .discovery_cadence(Duration::from_secs(30))
         .advertise(true)
         .build(ep.id())
     {
@@ -799,7 +802,8 @@ async fn spawn_metrics_server(
     let mut registry = iroh_metrics::Registry::default();
     registry.register(stats);
     let peer_metrics = Arc::new(crate::stats::PeerMetrics::default());
-    registry.register(peer_metrics.clone());
+    let registered_peer_metrics = Arc::clone(&peer_metrics);
+    registry.register(registered_peer_metrics);
     peer_metrics.spawn_collector(peers, token);
     registry.register_all(endpoint.metrics());
 
@@ -848,7 +852,7 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
             }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
-                    let daemon = daemon.clone();
+                    let daemon = Arc::clone(daemon);
                     tokio::spawn(async move {
                         if let Err(e) = handle_ipc_client(stream, &daemon).await {
                             tracing::debug!(error = %e, "IPC client error");
