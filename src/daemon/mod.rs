@@ -345,7 +345,12 @@ impl MeshCtx {
         // later idle teardown can re-dial it on demand (reconverge covers the
         // roster-wide sync + removals; this is the incremental add).
         self.route_map.sync_add(network, ipv6, peer_id);
-        self.peers.add(ipv6, conn.clone(), peer_id, network)
+        // Every pair eagerly dials, so two healthy QUIC connections can briefly
+        // coexist. The lower endpoint id keeps its client side and the higher id
+        // keeps its server side, making both peers choose the same connection.
+        let prefer_client = self.identity.local_identity().as_bytes() < peer_id.as_bytes();
+        self.peers
+            .add_with_preference(ipv6, conn.clone(), peer_id, network, Some(prefer_client))
     }
 }
 

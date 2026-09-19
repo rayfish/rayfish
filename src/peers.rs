@@ -29,9 +29,6 @@ use std::collections::HashSet;
 /// hot path); the idle reaper compares against [`now_ms`].
 static ACTIVITY_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Close code used when a newer connection takes over a peer's route.
-const REPLACED_CONNECTION_CODE: u32 = 0x2e91aced;
-
 /// Milliseconds since [`ACTIVITY_EPOCH`]. Wraps far past any process lifetime.
 fn now_ms() -> u64 {
     ACTIVITY_EPOCH.elapsed().as_millis() as u64
@@ -199,14 +196,31 @@ impl PeerEntry {
 
     /// Install `conn` if it differs from the current connection. Connection-level
     /// state is created and replaced as one value so none survives a reconnect.
-    fn install_connection(&mut self, conn: &Connection) -> bool {
+    ///
+    /// When both peers dial at once, each physical connection has opposite sides
+    /// at its two ends. Prefer one side based on the two endpoint ids so both
+    /// peers select the same connection. A non-preferred connection still works
+    /// as a fallback until the preferred one arrives.
+    fn install_connection(&mut self, conn: &Connection, prefer_client: Option<bool>) -> bool {
         if self.active.matches(conn) {
             self.active.last_active.store(now_ms(), Ordering::Relaxed);
             return false;
         }
+        if let Some(prefer_client) = prefer_client
+            && self.active.conn.side().is_client() == prefer_client
+            && conn.side().is_client() != prefer_client
+        {
+            conn.close(
+                VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
+                b"noncanonical",
+            );
+            return false;
+        }
         let old = std::mem::replace(&mut self.active, ActiveConnection::new(conn.clone()));
-        old.conn
-            .close(VarInt::from_u32(REPLACED_CONNECTION_CODE), b"replaced");
+        old.conn.close(
+            VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
+            b"replaced",
+        );
         true
     }
 
@@ -355,6 +369,19 @@ impl PeerTable {
         endpoint_id: EndpointId,
         network: &str,
     ) -> bool {
+        self.add_with_preference(ipv6, conn, endpoint_id, network, None)
+    }
+
+    /// As [`add`](Self::add), with the side that this node should prefer when
+    /// simultaneous dials create two connections to the same peer.
+    pub fn add_with_preference(
+        &self,
+        ipv6: Ipv6Addr,
+        conn: Connection,
+        endpoint_id: EndpointId,
+        network: &str,
+        prefer_client: Option<bool>,
+    ) -> bool {
         let net = SmolStr::new(network);
         // Whether the peer had no prior entry at all (drives the audit connect
         // event) and whether the stored connection just became current (tells the
@@ -377,7 +404,7 @@ impl PeerTable {
                 Entry::Occupied(mut o) => {
                     let e = o.get_mut();
                     first_ever = false;
-                    conn_changed = e.install_connection(&conn);
+                    conn_changed = e.install_connection(&conn, prefer_client);
                     e.endpoint_id = endpoint_id;
                     if !e.out_handles.contains_key(&net) {
                         let h = next_free_handle(&e.out_handles);
@@ -1048,6 +1075,31 @@ mod tests {
         // Both networks route over the one connection.
         let route = table.lookup_v6(&ipv6).expect("peer routable");
         assert_eq!(route.conn.stable_id(), conn.stable_id());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_dials_keep_the_same_direction_at_both_ends() {
+        let (server, client, server_conn, _client_conn) = connected_pair().await;
+        let peer = server_conn.remote_id();
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+
+        // This table represents `server`, which is the server side of the first
+        // connection. The reverse dial makes it the client side of a second one.
+        assert!(table.add_with_preference(ipv6, server_conn.clone(), peer, "n1", Some(false),));
+        let (_client_server_conn, server_client_conn) = dial(&client, &server).await;
+        assert!(server_conn.side().is_server());
+        assert!(server_client_conn.side().is_client());
+
+        assert!(
+            !table.add_with_preference(ipv6, server_client_conn.clone(), peer, "n1", Some(false),),
+            "a duplicate in the non-canonical direction is not installed"
+        );
+        assert_eq!(
+            table.lookup_v6(&ipv6).unwrap().conn.stable_id(),
+            server_conn.stable_id()
+        );
+        assert!(server_client_conn.close_reason().is_some());
     }
 
     #[tokio::test]

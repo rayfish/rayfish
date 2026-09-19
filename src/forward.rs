@@ -400,6 +400,11 @@ pub const KICK_CODE: u32 = 0x14ced;
 /// an eager peer doesn't immediately re-dial the link we deliberately let go idle.
 pub const IDLE_CODE: u32 = 0x1d1e;
 
+/// Application close code sent when a peer has selected another live QUIC
+/// connection for this identity. The replacement is already in flight, so the
+/// receiver must not immediately create yet another competing connection.
+pub const REPLACED_CONNECTION_CODE: u32 = 0x2e91aced;
+
 /// How a peer's connection ended, from the perspective of the side that observed
 /// the close. Membership is decided solely by the network-key-signed roster, so a
 /// close code is a hint about intent, never authority over who is a member.
@@ -423,6 +428,9 @@ pub enum CloseReason {
     /// go (on-demand teardown). Never reconnect; the link comes back lazily on the
     /// next packet either side sends.
     Idle,
+    /// The peer selected another live connection for this identity. Do not
+    /// reconnect: the selected connection's handshake will register its route.
+    Replaced,
 }
 
 impl CloseReason {
