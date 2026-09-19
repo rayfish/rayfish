@@ -56,6 +56,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Network changes no longer leave control ping working while ordinary mesh
+  traffic disappears.** A delayed handshake from a replaced peer connection
+  could put its stale route back into the forwarding table. The live connection
+  now closes the replaced connection and remains current, including its
+  network-handle and idle-capability state.
+
 - **Android retries file notifications after transient failures.** Background
   retries preserve the Downloads result and stop once reconciliation succeeds.
 

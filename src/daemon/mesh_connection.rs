@@ -126,11 +126,16 @@ impl MeshConnection {
                 .unwrap_or(false);
             let sleep_for = (self.ctx.registry.on_demand
                 && !is_exit_peer
-                && self.ctx.peers.supports_idle_close(&self.peer_id))
-            .then(|| {
-                self.ctx
+                && self
+                    .ctx
                     .peers
-                    .idle_remaining(&self.peer_id, self.ctx.registry.idle_timeout)
+                    .supports_idle_close(&self.peer_id, &self.conn))
+            .then(|| {
+                self.ctx.peers.idle_remaining(
+                    &self.peer_id,
+                    &self.conn,
+                    self.ctx.registry.idle_timeout,
+                )
             })
             .flatten();
 
@@ -153,7 +158,11 @@ impl MeshConnection {
                     let still_idle = self
                         .ctx
                         .peers
-                        .idle_remaining(&self.peer_id, self.ctx.registry.idle_timeout)
+                        .idle_remaining(
+                            &self.peer_id,
+                            &self.conn,
+                            self.ctx.registry.idle_timeout,
+                        )
                         .is_some_and(|d| d.is_zero());
                     if !still_idle {
                         continue;
@@ -224,7 +233,8 @@ impl MeshConnection {
                     features,
                     receive_mtu,
                 } => {
-                    self.manager.apply_network_handles(self.peer_id, entries);
+                    self.manager
+                        .apply_network_handles(&self.conn, self.peer_id, entries);
                     self.ctx
                         .peers
                         .note_receive_mtu(&self.peer_id, &self.conn, *receive_mtu);
@@ -235,6 +245,7 @@ impl MeshConnection {
                     // advertise support is held open, never idle-closed.
                     self.ctx.peers.note_idle_support_by_id(
                         &self.peer_id,
+                        &self.conn,
                         features & crate::transport::FEATURE_IDLE_CLOSE != 0,
                     );
                     continue;

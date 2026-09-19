@@ -987,7 +987,8 @@ pub fn spawn_peer_reader(
                 // `None` unless the handle maps to a network *we* currently share with
                 // this peer per our own roster. So the peer's handle table alone can't
                 // smuggle a datagram into a network we don't agree it belongs to.
-                let Some((peer_ipv6, network)) = peers.resolve_inbound_by_id(&peer_id, handle)
+                let Some((peer_ipv6, network)) =
+                    peers.resolve_inbound_by_id(&peer_id, &conn, handle)
                 else {
                     stats.record_drop(DropReason::Spoof);
                     continue;
@@ -1263,7 +1264,7 @@ mod tests {
         let receiver_peers = PeerTable::new();
         receiver_peers.set_local_mtu(crate::tun::TUN_MTU);
         receiver_peers.add(a_ip, recv.clone(), a.id(), "test");
-        receiver_peers.add_inbound_handle_by_id(&a.id(), 1, SmolStr::new("test"));
+        receiver_peers.add_inbound_handle_by_id(&a.id(), &recv, 1, SmolStr::new("test"));
 
         let (tun_tx, mut tun_rx) = mpsc::channel(16);
         let (feedback_tx, mut feedback_rx) = mpsc::channel(16);
