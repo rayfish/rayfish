@@ -63,7 +63,10 @@ impl NetworkRegistry {
             return;
         }
 
-        if matches!(ev.reason, forward::CloseReason::Idle) {
+        if matches!(
+            ev.reason,
+            forward::CloseReason::Idle | forward::CloseReason::Replaced
+        ) {
             // The peer let an idle connection go (on-demand teardown). Never
             // reconnect on any node; the link comes back lazily on the next packet.
             return;

@@ -414,6 +414,11 @@ fn close_reason(e: &ConnectionError) -> forward::CloseReason {
         {
             forward::CloseReason::Idle
         }
+        ConnectionError::ApplicationClosed(ac)
+            if ac.error_code == VarInt::from_u32(forward::REPLACED_CONNECTION_CODE) =>
+        {
+            forward::CloseReason::Replaced
+        }
         _ => forward::CloseReason::Transient,
     }
 }
@@ -459,6 +464,10 @@ mod tests {
         assert!(matches!(
             close_reason(&app_close(forward::IDLE_CODE)),
             forward::CloseReason::Idle
+        ));
+        assert!(matches!(
+            close_reason(&app_close(forward::REPLACED_CONNECTION_CODE)),
+            forward::CloseReason::Replaced
         ));
         // An unrelated application code is a transient drop (reconnected).
         assert!(matches!(
