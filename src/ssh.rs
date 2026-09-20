@@ -66,13 +66,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream as St
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use iroh::EndpointId;
 use pty_process::Size;
 #[cfg(test)]
@@ -82,7 +80,9 @@ use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
 #[cfg(test)]
 use smol_str::SmolStr;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -97,8 +97,10 @@ use host_keys::{load_host_key, sftp_subsystem_command};
 use host_keys::{parse_hostkey_paths, parse_sftp_subsystem};
 use login::{LoginInfo, resolve_login};
 use permissions::{account_can, hand_over};
-use session::{Exit, SessionSpec, signal_number};
-use session_env::{drop_privs, env_accepted, login_env, login_program, tty_name};
+use session::{Exit, SessionSpec, run_pipe_session, run_pty_session, signal_number};
+use session_env::env_accepted;
+#[cfg(test)]
+use session_env::tty_name;
 
 // The port a stock `ssh` client targets (`ssh user@host.ray`) and the internal
 // port the embedded server actually binds. Both live in `crate::forward` (the
@@ -1298,234 +1300,6 @@ fn reverse_bind_addr(address: &str) -> IpAddr {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         }
     }
-}
-
-/// Allocate a PTY, spawn the login shell (or `exec` command) as the requested
-/// unix user, and pump bytes between the SSH channel and the PTY until the child
-/// exits. Returns the child's exit code.
-async fn run_pty_session(
-    channel: Channel<Msg>,
-    spec: SessionSpec,
-    pty_req: PtyReq,
-    mut resize_rx: mpsc::UnboundedReceiver<Size>,
-) -> Result<Exit> {
-    let SessionSpec {
-        info,
-        command,
-        env,
-        child_proc,
-        origin,
-    } = spec;
-    let (pty, pts) = pty_process::open().context("opening pty")?;
-    let _ = pty.resize(Size::new(pty_req.row, pty_req.col));
-    let tty = tty_name(&pts);
-    // Hold a terminal fd of our own for as long as the child runs. Reading the
-    // master end returns EIO the instant the *last* slave fd closes, and a
-    // child that closes and reopens its terminal while starting up (`login`
-    // does, between the PAM session and the shell) hits exactly that window:
-    // the read half would end there and the session would go silent with the
-    // shell still running behind it. Dropped below, once the child is gone, so
-    // the read half can finish.
-    let keep_open = pts.as_fd().try_clone_to_owned().ok();
-
-    // An interactive terminal with no command is a login, so hand it to
-    // `login(1)` when this host has one: it owns the things a session gets
-    // wrong when it is spawned directly. PAM (so a locked or expired account is
-    // refused, and logind gives the session an XDG_RUNTIME_DIR and its
-    // resource limits), the utmp/wtmp/lastlog records behind `who` and `last`,
-    // `/etc/nologin`, and the motd. It is also what does the setuid, so this
-    // branch keeps root and drops nothing itself.
-    //
-    // Not for root: `login` refuses a root session on a tty that is not in
-    // `/etc/securetty` (a pts never is), and it refuses it by hanging with no
-    // output rather than failing, which would leave `ssh root@host.ray` staring
-    // at nothing. Root keeps the direct path.
-    let handoff = (command.is_none() && info.uid != 0)
-        .then(login_program)
-        .flatten();
-    let mut cmd = match &handoff {
-        Some(login) => pty_process::Command::new(login)
-            // Keep the environment we curated (login sets HOME/USER/SHELL/PATH
-            // itself either way); record where the session came from; and log
-            // the user in without asking for a password we cannot check.
-            .arg("-p")
-            .arg("-h")
-            .arg(origin.client.ip().to_string())
-            .arg("-f")
-            .arg(&info.name),
-        None => match &command {
-            Some(c) => pty_process::Command::new(&info.shell).arg("-c").arg(c),
-            None => pty_process::Command::new(&info.shell).arg("-l"),
-        },
-    };
-    cmd = cmd
-        .env_clear()
-        .envs(login_env(&info.home, &info.shell, &info.name))
-        .env("TERM", &pty_req.term)
-        .envs(tty.map(|t| ("SSH_TTY".to_string(), t)))
-        .envs(env);
-    if handoff.is_none() {
-        // `login` chdirs itself, and copes with a home directory that is gone;
-        // spawning into a missing directory would just fail.
-        cmd = cmd.current_dir(&info.home);
-        let drop = drop_privs(info.uid, info.gid, &info.name)?;
-        // SAFETY: drops privileges (initgroups+setgid+setuid) before exec; we do NOT
-        // use `.uid()/.gid()` because std applies those *after* pre_exec, too late to
-        // also drop supplementary groups.
-        cmd = unsafe { cmd.pre_exec(drop) };
-    }
-    let mut child = cmd.spawn(pts).context("spawning login shell")?;
-    // Publish the pid so `signal` requests reach it, and clear it again below
-    // once it is reaped: a stale pid gets reused by an unrelated process.
-    child_proc
-        .pid
-        .store(child.id().unwrap_or(0), Ordering::Relaxed);
-
-    let stream = channel.into_stream();
-    let (mut chan_read, mut chan_write) = tokio::io::split(stream);
-    let (mut pty_read, mut pty_write) = pty.into_split();
-
-    // Client -> PTY, interleaved with window resizes (both touch the write half).
-    let c2p = tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            tokio::select! {
-                r = chan_read.read(&mut buf) => match r {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if pty_write.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                },
-                Some(size) = resize_rx.recv() => {
-                    let _ = pty_write.resize(size);
-                }
-            }
-        }
-    });
-
-    // PTY -> client. Ends when the child exits and the master side EOFs.
-    let p2c = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut pty_read, &mut chan_write).await;
-        let _ = chan_write.shutdown().await;
-    });
-
-    let status = child.wait().await.context("waiting on child")?;
-    child_proc.pid.store(0, Ordering::Relaxed);
-    // The child is gone, so let the terminal go: with no slave fd left the
-    // master reaches EIO and the reader below finishes instead of blocking.
-    drop(keep_open);
-    let _ = p2c.await;
-    c2p.abort();
-    Ok(Exit::from_status(status))
-}
-
-/// Run a command (or shell) with **pipes** instead of a PTY, for a non-`-t`
-/// `ssh host cmd`. stdout goes to the channel's data stream and stderr to the
-/// extended-data (code 1) stream, kept separate and untranslated, as a
-/// conventional sshd delivers them, so piped/binary output isn't corrupted.
-async fn run_pipe_session(
-    channel: Channel<Msg>,
-    handle: Handle,
-    channel_id: ChannelId,
-    spec: SessionSpec,
-) -> Result<Exit> {
-    let SessionSpec {
-        info,
-        command,
-        env,
-        child_proc,
-        ..
-    } = spec;
-    let drop = drop_privs(info.uid, info.gid, &info.name)?;
-
-    let mut cmd = tokio::process::Command::new(&info.shell);
-    match &command {
-        Some(c) => {
-            cmd.arg("-c").arg(c);
-        }
-        None => {
-            cmd.arg("-l");
-        }
-    }
-    cmd.current_dir(&info.home)
-        .env_clear()
-        .envs(login_env(&info.home, &info.shell, &info.name))
-        .envs(env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: drops privileges (initgroups+setgid+setuid) before exec.
-    unsafe {
-        cmd.pre_exec(drop);
-    }
-    let mut child = cmd.spawn().context("spawning command")?;
-    child_proc
-        .pid
-        .store(child.id().unwrap_or(0), Ordering::Relaxed);
-    let mut stdin = child.stdin.take().context("child stdin")?;
-    let mut stdout = child.stdout.take().context("child stdout")?;
-    let mut stderr = child.stderr.take().context("child stderr")?;
-
-    // Output goes out via `handle.data`/`extended_data` (the stream can't emit
-    // the separate stderr extended-data channel), so we only need the read half
-    // for client stdin. Dropping the write half here is safe: `tokio::io::split`
-    // keeps the underlying channel alive until *both* halves drop, and the
-    // close-on-drop lives on the read half, which `stdin_task` holds open.
-    let stream = channel.into_stream();
-    let (mut chan_read, _chan_write) = tokio::io::split(stream);
-
-    // client stdin -> child
-    let stdin_task = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut chan_read, &mut stdin).await;
-        // drop closes the child's stdin so commands reading to EOF finish.
-    });
-    // child stdout -> channel data
-    let h_out = handle.clone();
-    let out_task = tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if h_out
-                        .data(channel_id, Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    // child stderr -> channel extended data (code 1 = stderr)
-    let h_err = handle.clone();
-    let err_task = tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            match stderr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if h_err
-                        .extended_data(channel_id, 1, Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let status = child.wait().await.context("waiting on child")?;
-    child_proc.pid.store(0, Ordering::Relaxed);
-    let _ = out_task.await;
-    let _ = err_task.await;
-    stdin_task.abort();
-    Ok(Exit::from_status(status))
 }
 
 #[cfg(test)]
