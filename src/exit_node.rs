@@ -45,7 +45,11 @@ use iroh::endpoint::SocketConfigurator;
 use smol_str::SmolStr;
 use socket2::{Domain, SockRef};
 
-use crate::membership::is_overlay_ip;
+mod dns;
+mod policy;
+#[cfg(test)]
+use dns::PUBLIC_FALLBACK_DNS_V6;
+pub use policy::is_transitable;
 
 /// Linux fwmark set on iroh's own sockets (via the forked
 /// `Endpoint::builder().configure_socket`) and on the replies of any connection that
@@ -705,35 +709,6 @@ fn is_tunnel_iface(name: &str) -> bool {
     name.starts_with("utun") || name.starts_with("tun")
 }
 
-pub fn is_transitable(dst: IpAddr) -> bool {
-    if is_overlay_ip(dst) || matches!(dst, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
-    {
-        return false;
-    }
-    match dst {
-        IpAddr::V4(ip) => {
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_broadcast()
-                || ip.is_unspecified()
-                || ip.is_documentation()
-                // 0.0.0.0/8 and 240.0.0.0/4 are not routable either.
-                || ip.octets()[0] == 0
-                || ip.octets()[0] >= 240)
-        }
-        IpAddr::V6(ip) => {
-            !(ip.is_loopback()
-                || ip.is_multicast()
-                || ip.is_unspecified()
-                // fe80::/10 link-local and fc00::/7 unique-local.
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
-                || (ip.segments()[0] & 0xfe00) == 0xfc00)
-        }
-    }
-}
-
 /// Client-side exit-node selection: the peer this node routes all its non-mesh
 /// traffic through, on a specific network. Consulted by the forwarding loop
 /// (outbound routing to the exit peer) and the inbound path (accepting the exit
@@ -811,14 +786,6 @@ impl ExitClient {
     }
 }
 
-/// The IPv6 resolvers a full tunnel forwards DNS to when the operator has named
-/// none of their own: the v6 addresses of the same pair the control plane falls
-/// back to (`transport::PUBLIC_FALLBACK_DNS`).
-const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
-    Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
-    Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
-];
-
 /// The upstreams a client full tunnel should forward DNS to, or `None` when it
 /// needs no override.
 ///
@@ -849,42 +816,7 @@ pub fn tunnel_upstreams(
     carries: ExitFamilies,
     configured: &crate::config::ServerOverride,
 ) -> Option<Vec<SocketAddr>> {
-    if carries.carries_v4() || !carries.carries_v6() {
-        return None;
-    }
-    let v6: Vec<Ipv6Addr> = configured
-        .servers
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if configured.replace {
-        if !v6.is_empty() {
-            return Some(with_port(v6));
-        }
-        // Their list, as given, including the IPv4 entries this mode leaves
-        // untunnelled. Empty only if `replace` was set with nothing usable in it,
-        // where the public fallback is all that is left.
-        let theirs: Vec<SocketAddr> = configured
-            .servers
-            .iter()
-            .filter_map(|s| s.parse::<IpAddr>().ok())
-            .map(|ip| SocketAddr::from((ip, 53u16)))
-            .collect();
-        if !theirs.is_empty() {
-            return Some(theirs);
-        }
-    }
-    let mut servers = v6;
-    servers.extend(PUBLIC_FALLBACK_DNS_V6);
-    Some(with_port(servers))
-}
-
-/// Port 53 on each, the only port a resolver override ever uses here.
-fn with_port(servers: Vec<Ipv6Addr>) -> Vec<SocketAddr> {
-    servers
-        .into_iter()
-        .map(|ip| SocketAddr::from((ip, 53u16)))
-        .collect()
+    dns::tunnel_upstreams(carries, configured)
 }
 
 /// This node's exit-node state as the inbound data path needs it: the gateway allow

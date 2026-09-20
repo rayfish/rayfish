@@ -897,9 +897,17 @@ impl Daemon {
             // idle-closes.
             let dialer = Some(Arc::clone(&self.registry));
             tokio::spawn(async move {
-                if let Err(e) = forward::run_mesh(
-                    reader, peers, firewall, cancel, stats, resolver, new_tx, dialer,
-                )
+                if let Err(e) = (forward::MeshForwarder {
+                    tun: reader,
+                    peers,
+                    firewall,
+                    token: cancel,
+                    stats,
+                    resolver,
+                    tun_tx: new_tx,
+                    dialer,
+                })
+                .run()
                 .await
                 {
                     tracing::warn!(error = %e, "mesh forwarding loop exited with error");

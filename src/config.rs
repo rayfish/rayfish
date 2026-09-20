@@ -1,7 +1,6 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
@@ -9,8 +8,6 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-#[cfg(not(windows))]
-use std::sync::atomic::{AtomicU64, Ordering};
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
 use std::sync::Mutex;
@@ -70,6 +67,11 @@ mod option_secret_key_hex {
         }
     }
 }
+
+mod write;
+
+pub use write::{restrict_perms, write_file};
+use write::{sync_file_and_parent, write_atomic};
 
 /// Info about a member in a saved network config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1038,137 +1040,6 @@ fn validate_net_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Serial number for temp file names, so two writers in this process never
-/// share one. See [`write_file`], which uses an unguessable nonce on Windows
-/// instead and so needs no counter.
-#[cfg(not(windows))]
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Re-establish the durability barrier for a file already in place: fsync the
-/// file, then the directory entry naming it. A [`write_file`] that failed
-/// ambiguously may have installed the bytes anyway, so a no-op retry still has
-/// to prove the result is on disk before anything is allowed to point at it.
-///
-/// Opened for writing, not reading. `fsync` on a read-only descriptor is fine
-/// on POSIX, but Windows implements it as `FlushFileBuffers`, which refuses a
-/// handle without write access and returns `ACCESS_DENIED`. That made every
-/// no-op re-sync fail there, which a coordinator reads as "the roster is not
-/// durable yet" and retries every five seconds, forever.
-fn sync_file_and_parent(path: &Path) -> Result<()> {
-    let dir = path.parent().context("config path has no parent")?;
-    OpenOptions::new()
-        .write(true)
-        .open(path)
-        .with_context(|| format!("opening {} to sync", path.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing {}", path.display()))?;
-    sync_dir(dir)
-}
-
-/// Atomically and durably write `bytes` to `path`: write a sibling temp file,
-/// set its perms/owner, then rename over the target. The rename is atomic on
-/// POSIX, so a concurrent reader sees either the old file or the new one, never
-/// a torn one. `secret` selects 0600 root:root vs 0640 root:rayfish.
-///
-/// Returning `Ok` means the bytes are on disk and reachable under `path` after
-/// a power loss, not just in the page cache: the contents are fsynced before
-/// the rename and the directory entry after it, and a failure of either is an
-/// error rather than a shrug. Callers that persist a pointer to something else
-/// (the coordinator recovery hash) depend on that barrier being exact.
-///
-/// Public so every rayfish config writer (identity key, invite ledger, etc.)
-/// shares the same atomic + restrictive-perms guarantees under the config tree.
-pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
-    let dir = path.parent().context("config path has no parent")?;
-    ensure_dir(dir)?;
-    let fname = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config");
-    // The pid keeps two processes apart and the counter keeps two threads of
-    // this one apart. A temp path shared by two writers of the same file lets
-    // one rename a file the other has only half filled.
-    //
-    // Windows uses a random nonce instead: the stage file is created with
-    // `CREATE_NEW` and an explicit DACL, so an unpredictable name means nothing
-    // can be sitting on the path we are about to claim.
-    #[cfg(windows)]
-    let tmp = windows_config_stage_path(dir, fname);
-    #[cfg(not(windows))]
-    let tmp = {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        dir.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()))
-    };
-    let staged = stage_temp(&tmp, bytes, secret).and_then(|()| {
-        // Refuse to rename over something that is not a plain file we own: on
-        // Windows the target could have been swapped for a reparse point
-        // between the last write and this one.
-        #[cfg(all(windows, not(test)))]
-        validate_existing_windows_config_child(path)?;
-        std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
-    });
-    if staged.is_err() {
-        // Clean up on any failure so we don't litter: the temp path is ours
-        // alone, so nothing else can be waiting on it.
-        let _ = std::fs::remove_file(&tmp);
-        return staged;
-    }
-    sync_dir(dir)
-}
-
-/// Fill `tmp` with `bytes` and give it the target's perms/owner, leaving it
-/// ready to rename into place.
-fn stage_temp(tmp: &Path, bytes: &[u8], secret: bool) -> Result<()> {
-    {
-        use std::io::Write;
-        #[cfg(windows)]
-        let mut f = create_windows_config_stage(tmp)?;
-        #[cfg(not(windows))]
-        let mut f =
-            std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(bytes)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        // Discarding this used to report a write as saved while the bytes were
-        // still only in the page cache, so a crash could roll the file back to
-        // its previous contents with nothing having failed.
-        f.sync_all()
-            .with_context(|| format!("syncing {}", tmp.display()))?;
-    }
-    // Windows has no mode bits to set here. `create_windows_config_stage` gave
-    // the file an explicit SYSTEM + Administrators DACL with inheritance off at
-    // creation, which is stricter than either Unix mode, so `secret` has
-    // nothing left to select between.
-    #[cfg(windows)]
-    let _ = secret;
-    #[cfg(unix)]
-    {
-        let mode = if secret { 0o600 } else { 0o640 };
-        let _ = std::fs::set_permissions(tmp, Permissions::from_mode(mode));
-    }
-    #[cfg(target_os = "linux")]
-    set_owner(tmp, secret);
-    Ok(())
-}
-
-/// fsync a directory, so a rename into it survives a power loss. Without this
-/// the new file's contents are durable but the name is not, and the target can
-/// come back as the old file or as nothing at all.
-fn sync_dir(dir: &Path) -> Result<()> {
-    // Windows has no equivalent: a directory cannot be opened as a file for the
-    // flush, and there is no API that commits a rename the way fsync does. The
-    // stage file's own `sync_all` is the whole barrier available there.
-    #[cfg(windows)]
-    {
-        let _ = dir;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    std::fs::File::open(dir)
-        .with_context(|| format!("opening {} to sync", dir.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing {}", dir.display()))
-}
-
 #[cfg(windows)]
 fn windows_config_stage_path(dir: &Path, filename: &str) -> PathBuf {
     let nonce = hex::encode(rand::random::<[u8; 32]>());
@@ -1199,29 +1070,6 @@ fn validate_existing_windows_config_child(path: &Path) -> Result<()> {
         Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
     }
     Ok(())
-}
-
-fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
-    write_file(path, contents.as_bytes(), secret)
-}
-
-/// Apply restrictive perms/owner to an existing file under the config tree.
-/// For append-mode files (e.g. the audit log) that aren't rewritten via
-/// [`write_file`]. Best-effort.
-pub fn restrict_perms(path: &Path, secret: bool) {
-    #[cfg(all(windows, test))]
-    let _ = (path, secret);
-    #[cfg(all(windows, not(test)))]
-    if secret && let Err(error) = crate::windows_security::protect_file(path) {
-        tracing::error!(path = %path.display(), %error, "failed to protect Windows config file");
-    }
-    #[cfg(unix)]
-    {
-        let mode = if secret { 0o600 } else { 0o640 };
-        let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
-    }
-    #[cfg(target_os = "linux")]
-    set_owner(path, secret);
 }
 
 /// Linux-only: relocate a pre-`/etc` config tree into `/etc/rayfish` on first
