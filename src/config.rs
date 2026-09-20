@@ -1,10 +1,10 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;

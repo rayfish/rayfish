@@ -147,9 +147,10 @@ proptest! {
         prop_assert_eq!(info.dst_ip, want.dst_ip);
         prop_assert_eq!(info.protocol, want.protocol);
 
-        let ports_present = cut >= l4 + 4;
-        prop_assert_eq!(info.src_port, if ports_present { want.src_port } else { 0 });
-        prop_assert_eq!(info.dst_port, if ports_present { want.dst_port } else { 0 });
+        let src_port_present = cut >= l4 + 2;
+        prop_assert_eq!(info.src_port, if src_port_present { want.src_port } else { 0 });
+        let dst_port_present = cut >= l4 + 4;
+        prop_assert_eq!(info.dst_port, if dst_port_present { want.dst_port } else { 0 });
 
         let flags_present = cut >= l4 + 14;
         prop_assert_eq!(info.tcp_flags, if flags_present { want.tcp_flags } else { 0 });
