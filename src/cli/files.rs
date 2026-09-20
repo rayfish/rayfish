@@ -225,7 +225,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             ipc::send(&mut stream, ipc::IpcMessage::ListFiles).await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
-                ipc::IpcMessage::FileList { files, outbox } => {
+                ipc::IpcMessage::FileList {
+                    files,
+                    outbox,
+                    transfers,
+                } => {
                     if json_enabled() {
                         let inbound: Vec<_> = files
                             .iter()
@@ -246,7 +250,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                             })
                             .collect();
                         print_json(&serde_json::json!({"pending": inbound, "queued": queued}));
-                    } else if files.is_empty() && outbox.is_empty() {
+                    } else if files.is_empty() && outbox.is_empty() && transfers.is_empty() {
                         println!("\n  {}\n", style::faint("no pending file transfers"));
                     } else {
                         if !files.is_empty() {
@@ -305,6 +309,50 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                             );
                             print!("{}", table(&["id", "to", "size", "file", ""], rows, 2));
                         }
+                        if !transfers.is_empty() {
+                            let rows = transfers
+                                .iter()
+                                .map(|t| {
+                                    let state = format!("{:?}", t.state).to_lowercase();
+                                    let action = if t.outgoing
+                                        && matches!(
+                                            t.state,
+                                            ipc::TransferFileState::Offered
+                                                | ipc::TransferFileState::Transferring
+                                        ) {
+                                        format!("ray files cancel-transfer {}", t.id)
+                                    } else {
+                                        String::new()
+                                    };
+                                    vec![
+                                        layout::Cell::new(
+                                            t.id.to_string(),
+                                            style::rose(&t.id.to_string()),
+                                        ),
+                                        layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
+                                        layout::Cell::right(
+                                            format!(
+                                                "{} / {}",
+                                                format_size(t.transferred),
+                                                format_size(t.size)
+                                            ),
+                                            style::faint(&format_size(t.size)),
+                                        ),
+                                        layout::Cell::new(
+                                            format!("{} ({state})", t.filename),
+                                            style::value(&t.filename),
+                                        ),
+                                        layout::Cell::new(action.clone(), style::faint(&action)),
+                                    ]
+                                })
+                                .collect();
+                            println!();
+                            println!("  {}", style::faint("transfers"));
+                            print!(
+                                "{}",
+                                table(&["id", "peer", "progress", "file", ""], rows, 2)
+                            );
+                        }
                         println!();
                     }
                 }
@@ -349,6 +397,16 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
+                }
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
+            }
+        }
+        Some(FilesAction::CancelTransfer { id }) => {
+            ipc::send(&mut stream, ipc::IpcMessage::CancelTransfer { id }).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("  {} {}", style::check(), style::value(&message))
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),

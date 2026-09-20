@@ -17,20 +17,20 @@ package uniffi.ray_mobile
 // compile the Rust component. The easiest way to ensure this is to bundle the Kotlin
 // helpers directly inline like we're doing here.
 
-import com.sun.jna.Callback
-import com.sun.jna.IntegerType
 import com.sun.jna.Library
+import com.sun.jna.IntegerType
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
+import com.sun.jna.Callback
 import com.sun.jna.ptr.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
 // A rust-owned buffer is represented by its capacity, its current length, and a
@@ -44,41 +44,29 @@ open class RustBuffer : Structure() {
     // Note: `capacity` and `len` are actually `ULong` values, but JVM only supports signed values.
     // When dealing with these fields, make sure to call `toULong()`.
     @JvmField var capacity: Long = 0
-
     @JvmField var len: Long = 0
-
     @JvmField var data: Pointer? = null
 
-    class ByValue :
-        RustBuffer(),
-        Structure.ByValue
+    class ByValue: RustBuffer(), Structure.ByValue
+    class ByReference: RustBuffer(), Structure.ByReference
 
-    class ByReference :
-        RustBuffer(),
-        Structure.ByReference
-
-    internal fun setValue(other: RustBuffer) {
+   internal fun setValue(other: RustBuffer) {
         capacity = other.capacity
         len = other.len
         data = other.data
     }
 
     companion object {
-        internal fun alloc(size: ULong = 0UL) =
-            uniffiRustCall { status ->
-                // Note: need to convert the size to a `Long` value to make this work with JVM.
-                UniffiLib.INSTANCE.ffi_ray_mobile_rustbuffer_alloc(size.toLong(), status)
-            }.also {
-                if (it.data == null) {
-                    throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=$size)")
-                }
-            }
+        internal fun alloc(size: ULong = 0UL) = uniffiRustCall() { status ->
+            // Note: need to convert the size to a `Long` value to make this work with JVM.
+            UniffiLib.INSTANCE.ffi_ray_mobile_rustbuffer_alloc(size.toLong(), status)
+        }.also {
+            if(it.data == null) {
+               throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=${size})")
+           }
+        }
 
-        internal fun create(
-            capacity: ULong,
-            len: ULong,
-            data: Pointer?,
-        ): RustBuffer.ByValue {
+        internal fun create(capacity: ULong, len: ULong, data: Pointer?): RustBuffer.ByValue {
             var buf = RustBuffer.ByValue()
             buf.capacity = capacity.toLong()
             buf.len = len.toLong()
@@ -86,10 +74,9 @@ open class RustBuffer : Structure() {
             return buf
         }
 
-        internal fun free(buf: RustBuffer.ByValue) =
-            uniffiRustCall { status ->
-                UniffiLib.INSTANCE.ffi_ray_mobile_rustbuffer_free(buf, status)
-            }
+        internal fun free(buf: RustBuffer.ByValue) = uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.ffi_ray_mobile_rustbuffer_free(buf, status)
+        }
     }
 
     @Suppress("TooGenericExceptionThrown")
@@ -142,14 +129,10 @@ class RustBufferByReference : ByReference(16) {
 @Structure.FieldOrder("len", "data")
 internal open class ForeignBytes : Structure() {
     @JvmField var len: Int = 0
-
     @JvmField var data: Pointer? = null
 
-    class ByValue :
-        ForeignBytes(),
-        Structure.ByValue
+    class ByValue : ForeignBytes(), Structure.ByValue
 }
-
 /**
  * The FfiConverter interface handles converter types to and from the FFI
  *
@@ -179,10 +162,7 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun allocationSize(value: KotlinType): ULong
 
     // Write a Kotlin type to a `ByteBuffer`
-    fun write(
-        value: KotlinType,
-        buf: ByteBuffer,
-    )
+    fun write(value: KotlinType, buf: ByteBuffer)
 
     // Lower a value into a `RustBuffer`
     //
@@ -193,10 +173,9 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun lowerIntoRustBuffer(value: KotlinType): RustBuffer.ByValue {
         val rbuf = RustBuffer.alloc(allocationSize(value))
         try {
-            val bbuf =
-                rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
-                    it.order(ByteOrder.BIG_ENDIAN)
-                }
+            val bbuf = rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
+                it.order(ByteOrder.BIG_ENDIAN)
+            }
             write(value, bbuf)
             rbuf.writeField("len", bbuf.position().toLong())
             return rbuf
@@ -213,11 +192,11 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun liftFromRustBuffer(rbuf: RustBuffer.ByValue): KotlinType {
         val byteBuf = rbuf.asByteBuffer()!!
         try {
-            val item = read(byteBuf)
-            if (byteBuf.hasRemaining()) {
-                throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
-            }
-            return item
+           val item = read(byteBuf)
+           if (byteBuf.hasRemaining()) {
+               throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
+           }
+           return item
         } finally {
             RustBuffer.free(rbuf)
         }
@@ -229,9 +208,8 @@ public interface FfiConverter<KotlinType, FfiType> {
  *
  * @suppress
  */
-public interface FfiConverterRustBuffer<KotlinType> : FfiConverter<KotlinType, RustBuffer.ByValue> {
+public interface FfiConverterRustBuffer<KotlinType>: FfiConverter<KotlinType, RustBuffer.ByValue> {
     override fun lift(value: RustBuffer.ByValue) = liftFromRustBuffer(value)
-
     override fun lower(value: KotlinType) = lowerIntoRustBuffer(value)
 }
 // A handful of classes and functions to support the generated data structures.
@@ -244,24 +222,24 @@ internal const val UNIFFI_CALL_UNEXPECTED_ERROR = 2.toByte()
 @Structure.FieldOrder("code", "error_buf")
 internal open class UniffiRustCallStatus : Structure() {
     @JvmField var code: Byte = 0
-
     @JvmField var error_buf: RustBuffer.ByValue = RustBuffer.ByValue()
 
-    class ByValue :
-        UniffiRustCallStatus(),
-        Structure.ByValue
+    class ByValue: UniffiRustCallStatus(), Structure.ByValue
 
-    fun isSuccess(): Boolean = code == UNIFFI_CALL_SUCCESS
+    fun isSuccess(): Boolean {
+        return code == UNIFFI_CALL_SUCCESS
+    }
 
-    fun isError(): Boolean = code == UNIFFI_CALL_ERROR
+    fun isError(): Boolean {
+        return code == UNIFFI_CALL_ERROR
+    }
 
-    fun isPanic(): Boolean = code == UNIFFI_CALL_UNEXPECTED_ERROR
+    fun isPanic(): Boolean {
+        return code == UNIFFI_CALL_UNEXPECTED_ERROR
+    }
 
     companion object {
-        fun create(
-            code: Byte,
-            errorBuf: RustBuffer.ByValue,
-        ): UniffiRustCallStatus.ByValue {
+        fun create(code: Byte, errorBuf: RustBuffer.ByValue): UniffiRustCallStatus.ByValue {
             val callStatus = UniffiRustCallStatus.ByValue()
             callStatus.code = code
             callStatus.error_buf = errorBuf
@@ -270,9 +248,7 @@ internal open class UniffiRustCallStatus : Structure() {
     }
 }
 
-class InternalException(
-    message: String,
-) : kotlin.Exception(message)
+class InternalException(message: String) : kotlin.Exception(message)
 
 /**
  * Each top-level error class has a companion object that can lift the error from the call status's rust buffer
@@ -280,7 +256,7 @@ class InternalException(
  * @suppress
  */
 interface UniffiRustCallStatusErrorHandler<E> {
-    fun lift(error_buf: RustBuffer.ByValue): E
+    fun lift(error_buf: RustBuffer.ByValue): E;
 }
 
 // Helpers for calling Rust
@@ -288,10 +264,7 @@ interface UniffiRustCallStatusErrorHandler<E> {
 // synchronize itself
 
 // Call a rust function that returns a Result<>.  Pass in the Error class companion that corresponds to the Err
-private inline fun <U, E : kotlin.Exception> uniffiRustCallWithError(
-    errorHandler: UniffiRustCallStatusErrorHandler<E>,
-    callback: (UniffiRustCallStatus) -> U,
-): U {
+private inline fun <U, E: kotlin.Exception> uniffiRustCallWithError(errorHandler: UniffiRustCallStatusErrorHandler<E>, callback: (UniffiRustCallStatus) -> U): U {
     var status = UniffiRustCallStatus()
     val return_value = callback(status)
     uniffiCheckCallStatus(errorHandler, status)
@@ -299,10 +272,7 @@ private inline fun <U, E : kotlin.Exception> uniffiRustCallWithError(
 }
 
 // Check UniffiRustCallStatus and throw an error if the call wasn't successful
-private fun <E : kotlin.Exception> uniffiCheckCallStatus(
-    errorHandler: UniffiRustCallStatusErrorHandler<E>,
-    status: UniffiRustCallStatus,
-) {
+private fun<E: kotlin.Exception> uniffiCheckCallStatus(errorHandler: UniffiRustCallStatusErrorHandler<E>, status: UniffiRustCallStatus) {
     if (status.isSuccess()) {
         return
     } else if (status.isError()) {
@@ -326,7 +296,7 @@ private fun <E : kotlin.Exception> uniffiCheckCallStatus(
  *
  * @suppress
  */
-object UniffiNullRustCallStatusErrorHandler : UniffiRustCallStatusErrorHandler<InternalException> {
+object UniffiNullRustCallStatusErrorHandler: UniffiRustCallStatusErrorHandler<InternalException> {
     override fun lift(error_buf: RustBuffer.ByValue): InternalException {
         RustBuffer.free(error_buf)
         return InternalException("Unexpected CALL_ERROR")
@@ -334,31 +304,32 @@ object UniffiNullRustCallStatusErrorHandler : UniffiRustCallStatusErrorHandler<I
 }
 
 // Call a rust function that returns a plain value
-private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U =
-    uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
+private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U {
+    return uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
+}
 
-internal inline fun <T> uniffiTraitInterfaceCall(
+internal inline fun<T> uniffiTraitInterfaceCall(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
 ) {
     try {
         writeReturn(makeCall())
-    } catch (e: kotlin.Exception) {
+    } catch(e: kotlin.Exception) {
         callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
         callStatus.error_buf = FfiConverterString.lower(e.toString())
     }
 }
 
-internal inline fun <T, reified E : Throwable> uniffiTraitInterfaceCallWithError(
+internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
-    lowerError: (E) -> RustBuffer.ByValue,
+    lowerError: (E) -> RustBuffer.ByValue
 ) {
     try {
         writeReturn(makeCall())
-    } catch (e: kotlin.Exception) {
+    } catch(e: kotlin.Exception) {
         if (e is E) {
             callStatus.code = UNIFFI_CALL_ERROR
             callStatus.error_buf = lowerError(e)
@@ -368,15 +339,12 @@ internal inline fun <T, reified E : Throwable> uniffiTraitInterfaceCallWithError
         }
     }
 }
-
 // Map handles to objects
 //
 // This is used pass an opaque 64-bit handle representing a foreign object to the Rust code.
-internal class UniffiHandleMap<T : Any> {
+internal class UniffiHandleMap<T: Any> {
     private val map = ConcurrentHashMap<Long, T>()
-    private val counter =
-        java.util.concurrent.atomic
-            .AtomicLong(0)
+    private val counter = java.util.concurrent.atomic.AtomicLong(0)
 
     val size: Int
         get() = map.size
@@ -389,10 +357,14 @@ internal class UniffiHandleMap<T : Any> {
     }
 
     // Get an object from the handle map
-    fun get(handle: Long): T = map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
+    fun get(handle: Long): T {
+        return map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
+    }
 
     // Remove an entry from the handlemap and get the Kotlin object back
-    fun remove(handle: Long): T = map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
+    fun remove(handle: Long): T {
+        return map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
+    }
 }
 
 // Contains loading, initialization code,
@@ -406,25 +378,22 @@ private fun findLibraryName(componentName: String): String {
     return "ray_mobile"
 }
 
-private inline fun <reified Lib : Library> loadIndirect(componentName: String): Lib =
-    Native.load<Lib>(findLibraryName(componentName), Lib::class.java)
+private inline fun <reified Lib : Library> loadIndirect(
+    componentName: String
+): Lib {
+    return Native.load<Lib>(findLibraryName(componentName), Lib::class.java)
+}
 
 // Define FFI callback types
 internal interface UniffiRustFutureContinuationCallback : com.sun.jna.Callback {
-    fun callback(
-        `data`: Long,
-        `pollResult`: Byte,
-    )
+    fun callback(`data`: Long,`pollResult`: Byte,)
 }
-
 internal interface UniffiForeignFutureFree : com.sun.jna.Callback {
-    fun callback(`handle`: Long)
+    fun callback(`handle`: Long,)
 }
-
 internal interface UniffiCallbackInterfaceFree : com.sun.jna.Callback {
-    fun callback(`handle`: Long)
+    fun callback(`handle`: Long,)
 }
-
 @Structure.FieldOrder("handle", "free")
 internal open class UniffiForeignFuture(
     @JvmField internal var `handle`: Long = 0.toLong(),
@@ -433,15 +402,14 @@ internal open class UniffiForeignFuture(
     class UniffiByValue(
         `handle`: Long = 0.toLong(),
         `free`: UniffiForeignFutureFree? = null,
-    ) : UniffiForeignFuture(`handle`, `free`),
-        Structure.ByValue
+    ): UniffiForeignFuture(`handle`,`free`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFuture) {
+   internal fun uniffiSetValue(other: UniffiForeignFuture) {
         `handle` = other.`handle`
         `free` = other.`free`
     }
-}
 
+}
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -450,22 +418,17 @@ internal open class UniffiForeignFutureStructU8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU8(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU8(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU8) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU8 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU8.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU8.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -474,22 +437,17 @@ internal open class UniffiForeignFutureStructI8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI8(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI8(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI8) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI8 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI8.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI8.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -498,22 +456,17 @@ internal open class UniffiForeignFutureStructU16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU16(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU16(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU16) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU16 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU16.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU16.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -522,22 +475,17 @@ internal open class UniffiForeignFutureStructI16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI16(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI16(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI16) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI16 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI16.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI16.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -546,22 +494,17 @@ internal open class UniffiForeignFutureStructU32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU32(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU32(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU32) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU32 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU32.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU32.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -570,22 +513,17 @@ internal open class UniffiForeignFutureStructI32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI32(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI32(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI32) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI32 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI32.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI32.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -594,22 +532,17 @@ internal open class UniffiForeignFutureStructU64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructU64(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructU64(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructU64) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructU64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteU64 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructU64.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU64.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -618,22 +551,17 @@ internal open class UniffiForeignFutureStructI64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructI64(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructI64(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructI64) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructI64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteI64 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructI64.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI64.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructF32(
     @JvmField internal var `returnValue`: Float = 0.0f,
@@ -642,22 +570,17 @@ internal open class UniffiForeignFutureStructF32(
     class UniffiByValue(
         `returnValue`: Float = 0.0f,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructF32(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructF32(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructF32) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructF32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteF32 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructF32.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructF32.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructF64(
     @JvmField internal var `returnValue`: Double = 0.0,
@@ -666,22 +589,17 @@ internal open class UniffiForeignFutureStructF64(
     class UniffiByValue(
         `returnValue`: Double = 0.0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructF64(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructF64(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructF64) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructF64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteF64 : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructF64.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructF64.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructPointer(
     @JvmField internal var `returnValue`: Pointer = Pointer.NULL,
@@ -690,22 +608,17 @@ internal open class UniffiForeignFutureStructPointer(
     class UniffiByValue(
         `returnValue`: Pointer = Pointer.NULL,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructPointer(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructPointer(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructPointer) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructPointer) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompletePointer : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructPointer.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructPointer.UniffiByValue,)
 }
-
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructRustBuffer(
     @JvmField internal var `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
@@ -714,51 +627,36 @@ internal open class UniffiForeignFutureStructRustBuffer(
     class UniffiByValue(
         `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructRustBuffer(`returnValue`, `callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructRustBuffer(`returnValue`,`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructRustBuffer) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructRustBuffer) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteRustBuffer : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructRustBuffer.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructRustBuffer.UniffiByValue,)
 }
-
 @Structure.FieldOrder("callStatus")
 internal open class UniffiForeignFutureStructVoid(
     @JvmField internal var `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
 ) : Structure() {
     class UniffiByValue(
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ) : UniffiForeignFutureStructVoid(`callStatus`),
-        Structure.ByValue
+    ): UniffiForeignFutureStructVoid(`callStatus`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiForeignFutureStructVoid) {
+   internal fun uniffiSetValue(other: UniffiForeignFutureStructVoid) {
         `callStatus` = other.`callStatus`
     }
-}
 
+}
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
-    fun callback(
-        `callbackData`: Long,
-        `result`: UniffiForeignFutureStructVoid.UniffiByValue,
-    )
+    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructVoid.UniffiByValue,)
 }
-
 internal interface UniffiCallbackInterfaceFileChangeListenerMethod0 : com.sun.jna.Callback {
-    fun callback(
-        `uniffiHandle`: Long,
-        `uniffiOutReturn`: Pointer,
-        uniffiCallStatus: UniffiRustCallStatus,
-    )
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-
 @Structure.FieldOrder("onChange", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceFileChangeListener(
     @JvmField internal var `onChange`: UniffiCallbackInterfaceFileChangeListenerMethod0? = null,
@@ -767,14 +665,171 @@ internal open class UniffiVTableCallbackInterfaceFileChangeListener(
     class UniffiByValue(
         `onChange`: UniffiCallbackInterfaceFileChangeListenerMethod0? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ) : UniffiVTableCallbackInterfaceFileChangeListener(`onChange`, `uniffiFree`),
-        Structure.ByValue
+    ): UniffiVTableCallbackInterfaceFileChangeListener(`onChange`,`uniffiFree`,), Structure.ByValue
 
-    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceFileChangeListener) {
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceFileChangeListener) {
         `onChange` = other.`onChange`
         `uniffiFree` = other.`uniffiFree`
     }
+
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
@@ -791,101 +846,105 @@ internal open class UniffiVTableCallbackInterfaceFileChangeListener(
 // when the library is loaded.
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
-    fun uniffi_ray_mobile_checksum_method_filewatch_cancel(): Short
+    fun uniffi_ray_mobile_checksum_method_filewatch_cancel(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_accept_file_offer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_accept_join_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_backup_identity(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_cancel_send(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_cancel_transfer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_create(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_default_hostname(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_deny_join_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_down(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_add(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_remove(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_show(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_handle_link(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_has_identity(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_health_snapshot(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_invite(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_is_paired(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_join(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_leave(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_connect_requests(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_file_offers(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_join_requests(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_queued_sends(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_transfers(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_log_snapshot(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_network_changed(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_pair(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_restore_identity(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_send_file(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_set_default_hostname(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_set_hostname(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_start(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_start_pairing(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_status(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_stop(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_submit_code(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_unpair(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_up(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_wake_peer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_watch_files(
+): Short
+fun uniffi_ray_mobile_checksum_constructor_node_new(
+): Short
+fun uniffi_ray_mobile_checksum_method_filechangelistener_on_change(
+): Short
+fun ffi_ray_mobile_uniffi_contract_version(
+): Int
 
-    fun uniffi_ray_mobile_checksum_method_node_accept_file_offer(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_accept_join_request(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_backup_identity(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_cancel_send(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_create(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_default_hostname(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_deny_join_request(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_down(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_firewall_add(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_firewall_remove(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_firewall_show(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_handle_link(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_has_identity(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_health_snapshot(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_invite(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_is_paired(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_join(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_leave(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_list_connect_requests(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_list_file_offers(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_list_join_requests(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_list_queued_sends(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_list_transfers(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_log_snapshot(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_network_changed(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_pair(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_restore_identity(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_send_file(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_set_default_hostname(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_set_hostname(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_start(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_start_pairing(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_status(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_stop(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_submit_code(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_unpair(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_up(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_wake_peer(): Short
-
-    fun uniffi_ray_mobile_checksum_method_node_watch_files(): Short
-
-    fun uniffi_ray_mobile_checksum_constructor_node_new(): Short
-
-    fun uniffi_ray_mobile_checksum_method_filechangelistener_on_change(): Short
-
-    fun ffi_ray_mobile_uniffi_contract_version(): Int
 }
 
 // A JNA Library to expose the extern-C FFI definitions.
@@ -933,512 +992,223 @@ internal interface UniffiLib : Library {
     }
 
     // FFI functions
-    fun uniffi_ray_mobile_fn_clone_filewatch(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
+    fun uniffi_ray_mobile_fn_clone_filewatch(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_ray_mobile_fn_free_filewatch(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_filewatch_cancel(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_clone_node(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_ray_mobile_fn_free_node(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_constructor_node_new(`configDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_ray_mobile_fn_method_node_accept_file_offer(`ptr`: Pointer,`id`: Long,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_accept_join_request(`ptr`: Pointer,`network`: RustBuffer.ByValue,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_approve_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_backup_identity(`ptr`: Pointer,`password`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_cancel_send(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_cancel_transfer(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_default_hostname(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_deny_join_request(`ptr`: Pointer,`network`: RustBuffer.ByValue,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_add(`ptr`: Pointer,`direction`: RustBuffer.ByValue,`action`: RustBuffer.ByValue,`protocol`: RustBuffer.ByValue,`port`: RustBuffer.ByValue,`peer`: RustBuffer.ByValue,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_remove(`ptr`: Pointer,`index`: Int,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(`ptr`: Pointer,`action`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_show(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_handle_link(`ptr`: Pointer,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_has_identity(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_ray_mobile_fn_method_node_health_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_invite(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_is_paired(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_ray_mobile_fn_method_node_join(`ptr`: Pointer,`code`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_leave(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_list_connect_requests(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_file_offers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_join_requests(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_queued_sends(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_transfers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_log_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_network_changed(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_reject_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_reject_file_offer(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_restore_identity(`ptr`: Pointer,`code`: RustBuffer.ByValue,`password`: RustBuffer.ByValue,`replaceExisting`: Byte,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_send_file(`ptr`: Pointer,`path`: RustBuffer.ByValue,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_set_default_hostname(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_set_hostname(`ptr`: Pointer,`network`: RustBuffer.ByValue,`hostname`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_start_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_stop(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_submit_code(`ptr`: Pointer,`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_unpair(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_ray_mobile_fn_method_node_wake_peer(`ptr`: Pointer,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_ray_mobile_fn_method_node_watch_files(`ptr`: Pointer,`listener`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_ray_mobile_fn_init_callback_vtable_filechangelistener(`vtable`: UniffiVTableCallbackInterfaceFileChangeListener,
+): Unit
+fun ffi_ray_mobile_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun ffi_ray_mobile_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun ffi_ray_mobile_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun ffi_ray_mobile_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun ffi_ray_mobile_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_u8(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_u8(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun ffi_ray_mobile_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_i8(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_i8(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun ffi_ray_mobile_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_u16(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_u16(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Short
+fun ffi_ray_mobile_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_i16(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_i16(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Short
+fun ffi_ray_mobile_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_u32(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_u32(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Int
+fun ffi_ray_mobile_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_i32(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_i32(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Int
+fun ffi_ray_mobile_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_u64(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_u64(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Long
+fun ffi_ray_mobile_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_i64(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_i64(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Long
+fun ffi_ray_mobile_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_f32(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_f32(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Float
+fun ffi_ray_mobile_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_f64(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_f64(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Double
+fun ffi_ray_mobile_rust_future_poll_pointer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_pointer(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_pointer(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_pointer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun ffi_ray_mobile_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_rust_buffer(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_rust_buffer(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun ffi_ray_mobile_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_cancel_void(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_free_void(`handle`: Long,
+): Unit
+fun ffi_ray_mobile_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+): Unit
 
-    fun uniffi_ray_mobile_fn_free_filewatch(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_filewatch_cancel(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_clone_node(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_ray_mobile_fn_free_node(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_constructor_node_new(
-        `configDir`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_ray_mobile_fn_method_node_accept_file_offer(
-        `ptr`: Pointer,
-        `id`: Long,
-        `outputDir`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_accept_join_request(
-        `ptr`: Pointer,
-        `network`: RustBuffer.ByValue,
-        `shortId`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_approve_connect_request(
-        `ptr`: Pointer,
-        `shortId`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_backup_identity(
-        `ptr`: Pointer,
-        `password`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_cancel_send(
-        `ptr`: Pointer,
-        `id`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_create(
-        `ptr`: Pointer,
-        `name`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_default_hostname(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_deny_join_request(
-        `ptr`: Pointer,
-        `network`: RustBuffer.ByValue,
-        `shortId`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_down(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_firewall_add(
-        `ptr`: Pointer,
-        `direction`: RustBuffer.ByValue,
-        `action`: RustBuffer.ByValue,
-        `protocol`: RustBuffer.ByValue,
-        `port`: RustBuffer.ByValue,
-        `peer`: RustBuffer.ByValue,
-        `network`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_firewall_remove(
-        `ptr`: Pointer,
-        `index`: Int,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(
-        `ptr`: Pointer,
-        `action`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_firewall_show(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_handle_link(
-        `ptr`: Pointer,
-        `uri`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_has_identity(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
-
-    fun uniffi_ray_mobile_fn_method_node_health_snapshot(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_invite(
-        `ptr`: Pointer,
-        `network`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_is_paired(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
-
-    fun uniffi_ray_mobile_fn_method_node_join(
-        `ptr`: Pointer,
-        `code`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_leave(
-        `ptr`: Pointer,
-        `network`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_list_connect_requests(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_list_file_offers(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_list_join_requests(
-        `ptr`: Pointer,
-        `network`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_list_queued_sends(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_list_transfers(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_log_snapshot(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_network_changed(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_pair(
-        `ptr`: Pointer,
-        `ticket`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_reject_connect_request(
-        `ptr`: Pointer,
-        `shortId`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_reject_file_offer(
-        `ptr`: Pointer,
-        `id`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_restore_identity(
-        `ptr`: Pointer,
-        `code`: RustBuffer.ByValue,
-        `password`: RustBuffer.ByValue,
-        `replaceExisting`: Byte,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_send_file(
-        `ptr`: Pointer,
-        `path`: RustBuffer.ByValue,
-        `peer`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_set_default_hostname(
-        `ptr`: Pointer,
-        `name`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(
-        `ptr`: Pointer,
-        `servers`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_set_hostname(
-        `ptr`: Pointer,
-        `network`: RustBuffer.ByValue,
-        `hostname`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_start(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_start_pairing(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_status(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_stop(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_submit_code(
-        `ptr`: Pointer,
-        `input`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun uniffi_ray_mobile_fn_method_node_unpair(
-        `ptr`: Pointer,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_up(
-        `ptr`: Pointer,
-        `tunFd`: Int,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun uniffi_ray_mobile_fn_method_node_wake_peer(
-        `ptr`: Pointer,
-        `peer`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
-
-    fun uniffi_ray_mobile_fn_method_node_watch_files(
-        `ptr`: Pointer,
-        `listener`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun uniffi_ray_mobile_fn_init_callback_vtable_filechangelistener(`vtable`: UniffiVTableCallbackInterfaceFileChangeListener): Unit
-
-    fun ffi_ray_mobile_rustbuffer_alloc(
-        `size`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun ffi_ray_mobile_rustbuffer_from_bytes(
-        `bytes`: ForeignBytes.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun ffi_ray_mobile_rustbuffer_free(
-        `buf`: RustBuffer.ByValue,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
-
-    fun ffi_ray_mobile_rustbuffer_reserve(
-        `buf`: RustBuffer.ByValue,
-        `additional`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun ffi_ray_mobile_rust_future_poll_u8(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_u8(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_u8(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_u8(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
-
-    fun ffi_ray_mobile_rust_future_poll_i8(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_i8(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_i8(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_i8(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
-
-    fun ffi_ray_mobile_rust_future_poll_u16(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_u16(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_u16(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_u16(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Short
-
-    fun ffi_ray_mobile_rust_future_poll_i16(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_i16(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_i16(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_i16(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Short
-
-    fun ffi_ray_mobile_rust_future_poll_u32(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_u32(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_u32(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_u32(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Int
-
-    fun ffi_ray_mobile_rust_future_poll_i32(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_i32(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_i32(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_i32(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Int
-
-    fun ffi_ray_mobile_rust_future_poll_u64(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_u64(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_u64(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_u64(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Long
-
-    fun ffi_ray_mobile_rust_future_poll_i64(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_i64(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_i64(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_i64(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Long
-
-    fun ffi_ray_mobile_rust_future_poll_f32(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_f32(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_f32(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_f32(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Float
-
-    fun ffi_ray_mobile_rust_future_poll_f64(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_f64(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_f64(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_f64(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Double
-
-    fun ffi_ray_mobile_rust_future_poll_pointer(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_pointer(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_pointer(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_pointer(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Pointer
-
-    fun ffi_ray_mobile_rust_future_poll_rust_buffer(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_rust_buffer(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_rust_buffer(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_rust_buffer(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): RustBuffer.ByValue
-
-    fun ffi_ray_mobile_rust_future_poll_void(
-        `handle`: Long,
-        `callback`: UniffiRustFutureContinuationCallback,
-        `callbackData`: Long,
-    ): Unit
-
-    fun ffi_ray_mobile_rust_future_cancel_void(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_free_void(`handle`: Long): Unit
-
-    fun ffi_ray_mobile_rust_future_complete_void(
-        `handle`: Long,
-        uniffi_out_err: UniffiRustCallStatus,
-    ): Unit
 }
 
 private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
@@ -1450,7 +1220,6 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI contract version mismatch: try cleaning and rebuilding your project")
     }
 }
-
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_filewatch_cancel() != 10590.toShort()) {
@@ -1469,6 +1238,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_cancel_send() != 49789.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_cancel_transfer() != 46122.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_create() != 50208.toShort()) {
@@ -1607,6 +1379,7 @@ public fun uniffiEnsureInitialized() {
 
 // Public interface members begin here.
 
+
 // Interface implemented by anything that can contain an object reference.
 //
 // Such types expose a `destroy()` method that must be called to cleanly
@@ -1617,15 +1390,11 @@ public fun uniffiEnsureInitialized() {
 // helper method to execute a block and destroy the object at the end.
 interface Disposable {
     fun destroy()
-
     companion object {
         fun destroy(vararg args: Any?) {
             for (arg in args) {
                 when (arg) {
-                    is Disposable -> {
-                        arg.destroy()
-                    }
-
+                    is Disposable -> arg.destroy()
                     is ArrayList<*> -> {
                         for (idx in arg.indices) {
                             val element = arg[idx]
@@ -1634,7 +1403,6 @@ interface Disposable {
                             }
                         }
                     }
-
                     is Map<*, *> -> {
                         for (element in arg.values) {
                             if (element is Disposable) {
@@ -1642,7 +1410,6 @@ interface Disposable {
                             }
                         }
                     }
-
                     is Iterable<*> -> {
                         for (element in arg) {
                             if (element is Disposable) {
@@ -1676,11 +1443,9 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
  *
  * @suppress
  * */
-object NoPointer // Magic number for the Rust proxy to call using the same mechanism as every other method,
-
+object NoPointer// Magic number for the Rust proxy to call using the same mechanism as every other method,
 // to free the callback once it's dropped by Rust.
 internal const val IDX_CALLBACK_FREE = 0
-
 // Callback return codes
 internal const val UNIFFI_CALLBACK_SUCCESS = 0
 internal const val UNIFFI_CALLBACK_ERROR = 1
@@ -1689,14 +1454,16 @@ internal const val UNIFFI_CALLBACK_UNEXPECTED_ERROR = 2
 /**
  * @suppress
  */
-public abstract class FfiConverterCallbackInterface<CallbackInterface : Any> : FfiConverter<CallbackInterface, Long> {
+public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: FfiConverter<CallbackInterface, Long> {
     internal val handleMap = UniffiHandleMap<CallbackInterface>()
 
     internal fun drop(handle: Long) {
         handleMap.remove(handle)
     }
 
-    override fun lift(value: Long): CallbackInterface = handleMap.get(value)
+    override fun lift(value: Long): CallbackInterface {
+        return handleMap.get(value)
+    }
 
     override fun read(buf: ByteBuffer) = lift(buf.getLong())
 
@@ -1704,14 +1471,10 @@ public abstract class FfiConverterCallbackInterface<CallbackInterface : Any> : F
 
     override fun allocationSize(value: CallbackInterface) = 8UL
 
-    override fun write(
-        value: CallbackInterface,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: CallbackInterface, buf: ByteBuffer) {
         buf.putLong(lower(value))
     }
 }
-
 /**
  * The cleaner interface for Object finalization code to run.
  * This is the entry point to any implementation that we're using.
@@ -1727,24 +1490,17 @@ interface UniffiCleaner {
         fun clean()
     }
 
-    fun register(
-        value: Any,
-        cleanUpTask: Runnable,
-    ): UniffiCleaner.Cleanable
+    fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable
 
     companion object
 }
 
 // The fallback Jna cleaner, which is available for both Android, and the JVM.
 private class UniffiJnaCleaner : UniffiCleaner {
-    private val cleaner =
-        com.sun.jna.internal.Cleaner
-            .getCleaner()
+    private val cleaner = com.sun.jna.internal.Cleaner.getCleaner()
 
-    override fun register(
-        value: Any,
-        cleanUpTask: Runnable,
-    ): UniffiCleaner.Cleanable = UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
+        UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
 }
 
 private class UniffiJnaCleanable(
@@ -1752,6 +1508,7 @@ private class UniffiJnaCleanable(
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
 }
+
 
 // We decide at uniffi binding generation time whether we were
 // using Android or not.
@@ -1771,18 +1528,14 @@ private fun UniffiCleaner.Companion.create(): UniffiCleaner =
     }
 
 private class JavaLangRefCleaner : UniffiCleaner {
-    val cleaner =
-        java.lang.ref.Cleaner
-            .create()
+    val cleaner = java.lang.ref.Cleaner.create()
 
-    override fun register(
-        value: Any,
-        cleanUpTask: Runnable,
-    ): UniffiCleaner.Cleanable = JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
+        JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
 }
 
 private class JavaLangRefCleanable(
-    val cleanable: java.lang.ref.Cleaner.Cleanable,
+    val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
 }
@@ -1790,19 +1543,22 @@ private class JavaLangRefCleanable(
 /**
  * @suppress
  */
-public object FfiConverterUInt : FfiConverter<UInt, Int> {
-    override fun lift(value: Int): UInt = value.toUInt()
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
 
-    override fun read(buf: ByteBuffer): UInt = lift(buf.getInt())
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
 
-    override fun lower(value: UInt): Int = value.toInt()
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
 
     override fun allocationSize(value: UInt) = 4UL
 
-    override fun write(
-        value: UInt,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
     }
 }
@@ -1810,19 +1566,22 @@ public object FfiConverterUInt : FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
-public object FfiConverterInt : FfiConverter<Int, Int> {
-    override fun lift(value: Int): Int = value
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
 
-    override fun read(buf: ByteBuffer): Int = buf.getInt()
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
 
-    override fun lower(value: Int): Int = value
+    override fun lower(value: Int): Int {
+        return value
+    }
 
     override fun allocationSize(value: Int) = 4UL
 
-    override fun write(
-        value: Int,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Int, buf: ByteBuffer) {
         buf.putInt(value)
     }
 }
@@ -1830,19 +1589,22 @@ public object FfiConverterInt : FfiConverter<Int, Int> {
 /**
  * @suppress
  */
-public object FfiConverterULong : FfiConverter<ULong, Long> {
-    override fun lift(value: Long): ULong = value.toULong()
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
 
-    override fun read(buf: ByteBuffer): ULong = lift(buf.getLong())
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
 
-    override fun lower(value: ULong): Long = value.toLong()
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
 
     override fun allocationSize(value: ULong) = 8UL
 
-    override fun write(
-        value: ULong,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: ULong, buf: ByteBuffer) {
         buf.putLong(value.toLong())
     }
 }
@@ -1850,19 +1612,22 @@ public object FfiConverterULong : FfiConverter<ULong, Long> {
 /**
  * @suppress
  */
-public object FfiConverterBoolean : FfiConverter<Boolean, Byte> {
-    override fun lift(value: Byte): Boolean = value.toInt() != 0
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
 
-    override fun read(buf: ByteBuffer): Boolean = lift(buf.get())
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
 
-    override fun lower(value: Boolean): Byte = if (value) 1.toByte() else 0.toByte()
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
 
     override fun allocationSize(value: Boolean) = 1UL
 
-    override fun write(
-        value: Boolean,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Boolean, buf: ByteBuffer) {
         buf.put(lower(value))
     }
 }
@@ -1870,7 +1635,7 @@ public object FfiConverterBoolean : FfiConverter<Boolean, Byte> {
 /**
  * @suppress
  */
-public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
+public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
     // store our length and avoid writing it out to the buffer.
@@ -1917,15 +1682,13 @@ public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
         return sizeForLength + sizeForString
     }
 
-    override fun write(
-        value: String,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: String, buf: ByteBuffer) {
         val byteBuf = toUtf8(value)
         buf.putInt(byteBuf.limit())
         buf.put(byteBuf)
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -2024,11 +1787,13 @@ public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * Dropping or closing the subscription stops delivery. It owns no daemon
  * reference, so a forgotten subscription cannot keep the node alive.
  */
 public interface FileWatchInterface {
+
     /**
      * Idempotent. A callback already executing can finish; the platform must
      * also discard queued work after closing its observer.
@@ -2042,10 +1807,9 @@ public interface FileWatchInterface {
  * Dropping or closing the subscription stops delivery. It owns no daemon
  * reference, so a forgotten subscription cannot keep the node alive.
  */
-open class FileWatch :
-    Disposable,
-    AutoCloseable,
-    FileWatchInterface {
+open class FileWatch: Disposable, AutoCloseable, FileWatchInterface
+{
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -2095,7 +1859,7 @@ open class FileWatch :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -2109,9 +1873,7 @@ open class FileWatch :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -2121,32 +1883,47 @@ open class FileWatch :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_ray_mobile_fn_clone_filewatch(pointer!!, status)
         }
+    }
+
 
     /**
      * Idempotent. A callback already executing can finish; the platform must
      * also discard queued work after closing its observer.
-     */
-    override fun `cancel`() =
-        callWithPointer {
-            uniffiRustCall { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_filewatch_cancel(it, _status)
-            }
-        }
+     */override fun `cancel`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_filewatch_cancel(
+        it, _status)
+}
+    }
+
+
+
+
+
+
 
     companion object
+
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeFileWatch : FfiConverter<FileWatch, Pointer> {
-    override fun lower(value: FileWatch): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeFileWatch: FfiConverter<FileWatch, Pointer> {
 
-    override fun lift(value: Pointer): FileWatch = FileWatch(value)
+    override fun lower(value: FileWatch): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): FileWatch {
+        return FileWatch(value)
+    }
 
     override fun read(buf: ByteBuffer): FileWatch {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -2156,15 +1933,13 @@ public object FfiConverterTypeFileWatch : FfiConverter<FileWatch, Pointer> {
 
     override fun allocationSize(value: FileWatch) = 8UL
 
-    override fun write(
-        value: FileWatch,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: FileWatch, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -2263,26 +2038,22 @@ public object FfiConverterTypeFileWatch : FfiConverter<FileWatch, Pointer> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
+
 /**
  * The FFI object. Owns a multi-thread tokio runtime and, once started, an
  * `Arc<DaemonState>` shared with the core's background tasks.
  */
 public interface NodeInterface {
+
     /**
      * Accept a file offer, saving it under `output_dir` (an app-writable path).
      */
-    fun `acceptFileOffer`(
-        `id`: kotlin.ULong,
-        `outputDir`: kotlin.String,
-    )
+    fun `acceptFileOffer`(`id`: kotlin.ULong, `outputDir`: kotlin.String)
 
     /**
      * Approve a pending join request on a network we coordinate.
      */
-    fun `acceptJoinRequest`(
-        `network`: kotlin.String,
-        `shortId`: kotlin.String,
-    )
+    fun `acceptJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
 
     /**
      * Approve an incoming connect request (mints a direct 2-peer network).
@@ -2309,6 +2080,11 @@ public interface NodeInterface {
     fun `cancelSend`(`id`: kotlin.ULong)
 
     /**
+     * Cancel an outgoing transfer that has already been offered or started.
+     */
+    fun `cancelTransfer`(`id`: kotlin.ULong)
+
+    /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
@@ -2323,10 +2099,7 @@ public interface NodeInterface {
     /**
      * Deny a pending join request on a network we coordinate.
      */
-    fun `denyJoinRequest`(
-        `network`: kotlin.String,
-        `shortId`: kotlin.String,
-    )
+    fun `denyJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
 
     /**
      * Tear the data plane down (stop the forward loop, close the fds) while
@@ -2337,14 +2110,7 @@ public interface NodeInterface {
     /**
      * Add a firewall rule. `port`/`peer`/`network` are optional.
      */
-    fun `firewallAdd`(
-        `direction`: kotlin.String,
-        `action`: kotlin.String,
-        `protocol`: kotlin.String,
-        `port`: kotlin.String?,
-        `peer`: kotlin.String?,
-        `network`: kotlin.String?,
-    )
+    fun `firewallAdd`(`direction`: kotlin.String, `action`: kotlin.String, `protocol`: kotlin.String, `port`: kotlin.String?, `peer`: kotlin.String?, `network`: kotlin.String?)
 
     /**
      * Remove the rule at the given index (as shown by firewall_show).
@@ -2497,16 +2263,9 @@ public interface NodeInterface {
      * Returns the restored identity's public key. The caller must restart the
      * node afterwards for it to take effect.
      */
-    fun `restoreIdentity`(
-        `code`: kotlin.String,
-        `password`: kotlin.String,
-        `replaceExisting`: kotlin.Boolean,
-    ): kotlin.String
+    fun `restoreIdentity`(`code`: kotlin.String, `password`: kotlin.String, `replaceExisting`: kotlin.Boolean): kotlin.String
 
-    fun `sendFile`(
-        `path`: kotlin.String,
-        `peer`: kotlin.String,
-    )
+    fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
 
     /**
      * Set the device's default hostname. Validated with the core's hostname
@@ -2532,10 +2291,7 @@ public interface NodeInterface {
     /**
      * Set this device's hostname on `network`. Validated by the core.
      */
-    fun `setHostname`(
-        `network`: kotlin.String,
-        `hostname`: kotlin.String,
-    )
+    fun `setHostname`(`network`: kotlin.String, `hostname`: kotlin.String)
 
     /**
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
@@ -2619,10 +2375,9 @@ public interface NodeInterface {
  * The FFI object. Owns a multi-thread tokio runtime and, once started, an
  * `Arc<DaemonState>` shared with the core's background tasks.
  */
-open class Node :
-    Disposable,
-    AutoCloseable,
-    NodeInterface {
+open class Node: Disposable, AutoCloseable, NodeInterface
+{
+
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -2638,7 +2393,6 @@ open class Node :
         this.pointer = null
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
     }
-
     /**
      * `config_dir` is the app-private directory (Kotlin `Context.getFilesDir()`)
      * where identity + config live. It is published to the core through
@@ -2647,10 +2401,11 @@ open class Node :
      */
     constructor(`configDir`: kotlin.String) :
         this(
-            uniffiRustCall { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_constructor_node_new(FfiConverterString.lower(`configDir`), _status)
-            },
-        )
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_constructor_node_new(
+        FfiConverterString.lower(`configDir`),_status)
+}
+    )
 
     protected val pointer: Pointer?
     protected val cleanable: UniffiCleaner.Cleanable
@@ -2685,7 +2440,7 @@ open class Node :
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -2699,9 +2454,7 @@ open class Node :
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(
-        private val pointer: Pointer?,
-    ) : Runnable {
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -2711,61 +2464,57 @@ open class Node :
         }
     }
 
-    fun uniffiClonePointer(): Pointer =
-        uniffiRustCall { status ->
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
             UniffiLib.INSTANCE.uniffi_ray_mobile_fn_clone_node(pointer!!, status)
         }
+    }
+
 
     /**
      * Accept a file offer, saving it under `output_dir` (an app-writable path).
      */
-    @Throws(RayException::class)
-    override fun `acceptFileOffer`(
-        `id`: kotlin.ULong,
-        `outputDir`: kotlin.String,
-    ) = callWithPointer {
-        uniffiRustCallWithError(RayException) { _status ->
-            UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_accept_file_offer(
-                it,
-                FfiConverterULong.lower(`id`),
-                FfiConverterString.lower(`outputDir`),
-                _status,
-            )
-        }
+    @Throws(RayException::class)override fun `acceptFileOffer`(`id`: kotlin.ULong, `outputDir`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_accept_file_offer(
+        it, FfiConverterULong.lower(`id`),FfiConverterString.lower(`outputDir`),_status)
+}
     }
+
+
+
 
     /**
      * Approve a pending join request on a network we coordinate.
      */
-    @Throws(RayException::class)
-    override fun `acceptJoinRequest`(
-        `network`: kotlin.String,
-        `shortId`: kotlin.String,
-    ) = callWithPointer {
-        uniffiRustCallWithError(RayException) { _status ->
-            UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_accept_join_request(
-                it,
-                FfiConverterString.lower(`network`),
-                FfiConverterString.lower(`shortId`),
-                _status,
-            )
-        }
+    @Throws(RayException::class)override fun `acceptJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_accept_join_request(
+        it, FfiConverterString.lower(`network`),FfiConverterString.lower(`shortId`),_status)
+}
     }
+
+
+
 
     /**
      * Approve an incoming connect request (mints a direct 2-peer network).
      */
-    @Throws(RayException::class)
-    override fun `approveConnectRequest`(`shortId`: kotlin.String) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_approve_connect_request(
-                    it,
-                    FfiConverterString.lower(`shortId`),
-                    _status,
-                )
-            }
-        }
+    @Throws(RayException::class)override fun `approveConnectRequest`(`shortId`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_approve_connect_request(
+        it, FfiConverterString.lower(`shortId`),_status)
+}
+    }
+
+
+
 
     /**
      * Encrypt this device's identity, pairing certificate, and saved networks
@@ -2777,165 +2526,193 @@ open class Node :
      * Does not need [`Node::start`]: the key is read off disk, and mints one if
      * the device has none yet, exactly as a start would.
      */
-    @Throws(RayException::class)
-    override fun `backupIdentity`(`password`: kotlin.String): IdentityBackup =
-        FfiConverterTypeIdentityBackup.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_backup_identity(it, FfiConverterString.lower(`password`), _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `backupIdentity`(`password`: kotlin.String): IdentityBackup {
+            return FfiConverterTypeIdentityBackup.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_backup_identity(
+        it, FfiConverterString.lower(`password`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Call off a queued send, by the id from [`Node::list_queued_sends`].
      * Fails if the offer has already been delivered, since there is nothing
      * left on this side to withdraw.
      */
-    @Throws(RayException::class)
-    override fun `cancelSend`(`id`: kotlin.ULong) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_cancel_send(it, FfiConverterULong.lower(`id`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `cancelSend`(`id`: kotlin.ULong)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_cancel_send(
+        it, FfiConverterULong.lower(`id`),_status)
+}
+    }
+
+
+
+
+    /**
+     * Cancel an outgoing transfer that has already been offered or started.
+     */
+    @Throws(RayException::class)override fun `cancelTransfer`(`id`: kotlin.ULong)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_cancel_transfer(
+        it, FfiConverterULong.lower(`id`),_status)
+}
+    }
+
+
+
 
     /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
-    @Throws(RayException::class)
-    override fun `create`(`name`: kotlin.String?): NetworkInfo =
-        FfiConverterTypeNetworkInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_create(it, FfiConverterOptionalString.lower(`name`), _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `create`(`name`: kotlin.String?): NetworkInfo {
+            return FfiConverterTypeNetworkInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_create(
+        it, FfiConverterOptionalString.lower(`name`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * The device's default hostname (seeds every join, incl. pairing
      * auto-joins). Empty when unset. Config-only; safe before `start`.
-     */
-    override fun `defaultHostname`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_default_hostname(it, _status)
-                }
-            },
-        )
+     */override fun `defaultHostname`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_default_hostname(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Deny a pending join request on a network we coordinate.
      */
-    @Throws(RayException::class)
-    override fun `denyJoinRequest`(
-        `network`: kotlin.String,
-        `shortId`: kotlin.String,
-    ) = callWithPointer {
-        uniffiRustCallWithError(RayException) { _status ->
-            UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_deny_join_request(
-                it,
-                FfiConverterString.lower(`network`),
-                FfiConverterString.lower(`shortId`),
-                _status,
-            )
-        }
+    @Throws(RayException::class)override fun `denyJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_deny_join_request(
+        it, FfiConverterString.lower(`network`),FfiConverterString.lower(`shortId`),_status)
+}
     }
+
+
+
 
     /**
      * Tear the data plane down (stop the forward loop, close the fds) while
      * keeping the control plane connected. Requires [`Node::start`] first.
      */
-    @Throws(RayException::class)
-    override fun `down`() =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_down(it, _status)
-            }
-        }
+    @Throws(RayException::class)override fun `down`()
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_down(
+        it, _status)
+}
+    }
+
+
+
 
     /**
      * Add a firewall rule. `port`/`peer`/`network` are optional.
      */
-    @Throws(RayException::class)
-    override fun `firewallAdd`(
-        `direction`: kotlin.String,
-        `action`: kotlin.String,
-        `protocol`: kotlin.String,
-        `port`: kotlin.String?,
-        `peer`: kotlin.String?,
-        `network`: kotlin.String?,
-    ) = callWithPointer {
-        uniffiRustCallWithError(RayException) { _status ->
-            UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_add(
-                it,
-                FfiConverterString.lower(`direction`),
-                FfiConverterString.lower(`action`),
-                FfiConverterString.lower(`protocol`),
-                FfiConverterOptionalString.lower(`port`),
-                FfiConverterOptionalString.lower(`peer`),
-                FfiConverterOptionalString.lower(`network`),
-                _status,
-            )
-        }
+    @Throws(RayException::class)override fun `firewallAdd`(`direction`: kotlin.String, `action`: kotlin.String, `protocol`: kotlin.String, `port`: kotlin.String?, `peer`: kotlin.String?, `network`: kotlin.String?)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_add(
+        it, FfiConverterString.lower(`direction`),FfiConverterString.lower(`action`),FfiConverterString.lower(`protocol`),FfiConverterOptionalString.lower(`port`),FfiConverterOptionalString.lower(`peer`),FfiConverterOptionalString.lower(`network`),_status)
+}
     }
+
+
+
 
     /**
      * Remove the rule at the given index (as shown by firewall_show).
      */
-    @Throws(RayException::class)
-    override fun `firewallRemove`(`index`: kotlin.UInt) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_remove(it, FfiConverterUInt.lower(`index`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `firewallRemove`(`index`: kotlin.UInt)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_remove(
+        it, FfiConverterUInt.lower(`index`),_status)
+}
+    }
+
+
+
 
     /**
      * Set the inbound default action ("allow" or "deny"). The outbound default
      * stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
      */
-    @Throws(RayException::class)
-    override fun `firewallSetDefaultInbound`(`action`: kotlin.String) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(
-                    it,
-                    FfiConverterString.lower(`action`),
-                    _status,
-                )
-            }
-        }
+    @Throws(RayException::class)override fun `firewallSetDefaultInbound`(`action`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(
+        it, FfiConverterString.lower(`action`),_status)
+}
+    }
+
+
+
 
     /**
      * Current firewall posture and rules.
      */
-    @Throws(RayException::class)
-    override fun `firewallShow`(): FirewallStateInfo =
-        FfiConverterTypeFirewallStateInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_show(it, _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `firewallShow`(): FirewallStateInfo {
+            return FfiConverterTypeFirewallStateInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_show(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Follow a `rayfish://join/<code>` or `rayfish://pair/<ticket>` deep link,
      * dispatching to [`Node::join`] / [`Node::pair`]. Requires [`Node::start`].
      */
-    @Throws(RayException::class)
-    override fun `handleLink`(`uri`: kotlin.String): LinkAction =
-        FfiConverterTypeLinkAction.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_handle_link(it, FfiConverterString.lower(`uri`), _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `handleLink`(`uri`: kotlin.String): LinkAction {
+            return FfiConverterTypeLinkAction.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_handle_link(
+        it, FfiConverterString.lower(`uri`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Whether this device has an identity on disk yet.
@@ -2946,121 +2723,149 @@ open class Node :
      * screen again, with no first-run flag of its own to keep in step.
      *
      * Reads a file. Does not need (and does not do) a [`Node::start`].
-     */
-    override fun `hasIdentity`(): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_has_identity(it, _status)
-                }
-            },
-        )
+     */override fun `hasIdentity`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_has_identity(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Lightweight health vitals for auto-telemetry. Reuses `status()` for mesh
      * state and reads the diagnostics counters. Cumulative WARN/ERROR counts
      * (since process start); reading does not reset them.
-     */
-    override fun `healthSnapshot`(): HealthSnapshot =
-        FfiConverterTypeHealthSnapshot.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_health_snapshot(it, _status)
-                }
-            },
-        )
+     */override fun `healthSnapshot`(): HealthSnapshot {
+            return FfiConverterTypeHealthSnapshot.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_health_snapshot(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Mint a single-use invite code for `network` (default 7d TTL), to share.
      */
-    @Throws(RayException::class)
-    override fun `invite`(`network`: kotlin.String): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_invite(it, FfiConverterString.lower(`network`), _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `invite`(`network`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_invite(
+        it, FfiConverterString.lower(`network`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Whether this device already holds a device cert (it was paired to a
      * primary). A paired device cannot start or accept further pairing, so the
      * UI hides the pairing controls when this is true. Returns false before
      * [`Node::start`] or when no cert is present.
-     */
-    override fun `isPaired`(): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_is_paired(it, _status)
-                }
-            },
-        )
+     */override fun `isPaired`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_is_paired(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Join an existing network by invite code (or a bare room id / network
      * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
      */
-    @Throws(RayException::class)
-    override fun `join`(`code`: kotlin.String): NetworkInfo =
-        FfiConverterTypeNetworkInfo.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_join(it, FfiConverterString.lower(`code`), _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `join`(`code`: kotlin.String): NetworkInfo {
+            return FfiConverterTypeNetworkInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_join(
+        it, FfiConverterString.lower(`code`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Leave `network`: tears down its runtime and removes it from config.
      */
-    @Throws(RayException::class)
-    override fun `leave`(`network`: kotlin.String) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_leave(it, FfiConverterString.lower(`network`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `leave`(`network`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_leave(
+        it, FfiConverterString.lower(`network`),_status)
+}
+    }
+
+
+
 
     /**
      * Incoming `ray connect` friend requests waiting for a decision.
      */
-    @Throws(RayException::class)
-    override fun `listConnectRequests`(): List<PendingRequest> =
-        FfiConverterSequenceTypePendingRequest.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_connect_requests(it, _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `listConnectRequests`(): List<PendingRequest> {
+            return FfiConverterSequenceTypePendingRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_connect_requests(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Incoming file offers waiting to be accepted or declined.
      */
-    @Throws(RayException::class)
-    override fun `listFileOffers`(): List<FileOffer> =
-        FfiConverterSequenceTypeFileOffer.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_file_offers(it, _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `listFileOffers`(): List<FileOffer> {
+            return FfiConverterSequenceTypeFileOffer.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_file_offers(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Join requests awaiting approval on a network we coordinate.
      */
-    @Throws(RayException::class)
-    override fun `listJoinRequests`(`network`: kotlin.String): List<PendingRequest> =
-        FfiConverterSequenceTypePendingRequest.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_join_requests(it, FfiConverterString.lower(`network`), _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `listJoinRequests`(`network`: kotlin.String): List<PendingRequest> {
+            return FfiConverterSequenceTypePendingRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_join_requests(
+        it, FfiConverterString.lower(`network`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Outbound sends still sitting in the daemon's outbox, waiting for their
@@ -3068,42 +2873,51 @@ open class Node :
      * offer is delivered the entry leaves the outbox and the file is the
      * recipient's to accept or decline.
      */
-    @Throws(RayException::class)
-    override fun `listQueuedSends`(): List<QueuedSend> =
-        FfiConverterSequenceTypeQueuedSend.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_queued_sends(it, _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `listQueuedSends`(): List<QueuedSend> {
+            return FfiConverterSequenceTypeQueuedSend.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_queued_sends(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * In-flight and recently finished transfers, both directions. Terminal entries
      * linger for 60s so a poller can see them before they expire. Cheap: safe to
      * poll on a timer while a notification is on screen.
      */
-    @Throws(RayException::class)
-    override fun `listTransfers`(): List<Transfer> =
-        FfiConverterSequenceTypeTransfer.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_transfers(it, _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `listTransfers`(): List<Transfer> {
+            return FfiConverterSequenceTypeTransfer.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_transfers(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * The full buffered core log, for the "Send diagnostics" button.
-     */
-    override fun `logSnapshot`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_log_snapshot(it, _status)
-                }
-            },
-        )
+     */override fun `logSnapshot`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_log_snapshot(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Send a file to a peer. `path` is a readable file path (the core reads its
@@ -3121,47 +2935,63 @@ open class Node :
      * callbacks here. The core rebinds its QUIC socket and re-probes paths.
      * Cheap, idempotent, safe to call on every callback; a no-op before
      * [`Node::start`].
-     */
-    override fun `networkChanged`() =
-        callWithPointer {
-            uniffiRustCall { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_network_changed(it, _status)
-            }
-        }
+     */override fun `networkChanged`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_network_changed(
+        it, _status)
+}
+    }
+
+
+
 
     /**
      * Pair this device with a primary device using a scanned/pasted pairing
      * ticket (`bs58(endpoint_id[32] || secret[32])`).
      */
-    @Throws(RayException::class)
-    override fun `pair`(`ticket`: kotlin.String) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_pair(it, FfiConverterString.lower(`ticket`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `pair`(`ticket`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_pair(
+        it, FfiConverterString.lower(`ticket`),_status)
+}
+    }
+
+
+
 
     /**
      * Decline an incoming connect request.
      */
-    @Throws(RayException::class)
-    override fun `rejectConnectRequest`(`shortId`: kotlin.String) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_connect_request(it, FfiConverterString.lower(`shortId`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `rejectConnectRequest`(`shortId`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_connect_request(
+        it, FfiConverterString.lower(`shortId`),_status)
+}
+    }
+
+
+
 
     /**
      * Decline a file offer without downloading it.
      */
-    @Throws(RayException::class)
-    override fun `rejectFileOffer`(`id`: kotlin.ULong) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_file_offer(it, FfiConverterULong.lower(`id`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `rejectFileOffer`(`id`: kotlin.ULong)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_file_offer(
+        it, FfiConverterULong.lower(`id`),_status)
+}
+    }
+
+
+
 
     /**
      * Replace this device's identity with the one in `code`.
@@ -3179,53 +3009,47 @@ open class Node :
      * Returns the restored identity's public key. The caller must restart the
      * node afterwards for it to take effect.
      */
-    @Throws(RayException::class)
-    override fun `restoreIdentity`(
-        `code`: kotlin.String,
-        `password`: kotlin.String,
-        `replaceExisting`: kotlin.Boolean,
-    ): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_restore_identity(
-                        it,
-                        FfiConverterString.lower(`code`),
-                        FfiConverterString.lower(`password`),
-                        FfiConverterBoolean.lower(`replaceExisting`),
-                        _status,
-                    )
-                }
-            },
-        )
-
-    @Throws(RayException::class)
-    override fun `sendFile`(
-        `path`: kotlin.String,
-        `peer`: kotlin.String,
-    ) = callWithPointer {
-        uniffiRustCallWithError(RayException) { _status ->
-            UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_send_file(
-                it,
-                FfiConverterString.lower(`path`),
-                FfiConverterString.lower(`peer`),
-                _status,
-            )
-        }
+    @Throws(RayException::class)override fun `restoreIdentity`(`code`: kotlin.String, `password`: kotlin.String, `replaceExisting`: kotlin.Boolean): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_restore_identity(
+        it, FfiConverterString.lower(`code`),FfiConverterString.lower(`password`),FfiConverterBoolean.lower(`replaceExisting`),_status)
+}
     }
+    )
+    }
+
+
+
+    @Throws(RayException::class)override fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_send_file(
+        it, FfiConverterString.lower(`path`),FfiConverterString.lower(`peer`),_status)
+}
+    }
+
+
+
 
     /**
      * Set the device's default hostname. Validated with the core's hostname
      * rules; rejected names leave the stored value untouched. Config-only;
      * safe before `start`.
      */
-    @Throws(RayException::class)
-    override fun `setDefaultHostname`(`name`: kotlin.String) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_default_hostname(it, FfiConverterString.lower(`name`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `setDefaultHostname`(`name`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_default_hostname(
+        it, FfiConverterString.lower(`name`),_status)
+}
+    }
+
+
+
 
     /**
      * Point the Magic DNS resolver at the phone's DNS so non-`.ray` queries are
@@ -3239,35 +3063,32 @@ open class Node :
      * honor the system Private DNS (DoT/DoH); entries that parse as neither are
      * ignored.
      */
-    @Throws(RayException::class)
-    override fun `setDnsUpstreams`(`servers`: List<kotlin.String>) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_dns_upstreams(
-                    it,
-                    FfiConverterSequenceString.lower(`servers`),
-                    _status,
-                )
-            }
-        }
+    @Throws(RayException::class)override fun `setDnsUpstreams`(`servers`: List<kotlin.String>)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_dns_upstreams(
+        it, FfiConverterSequenceString.lower(`servers`),_status)
+}
+    }
+
+
+
 
     /**
      * Set this device's hostname on `network`. Validated by the core.
      */
-    @Throws(RayException::class)
-    override fun `setHostname`(
-        `network`: kotlin.String,
-        `hostname`: kotlin.String,
-    ) = callWithPointer {
-        uniffiRustCallWithError(RayException) { _status ->
-            UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_hostname(
-                it,
-                FfiConverterString.lower(`network`),
-                FfiConverterString.lower(`hostname`),
-                _status,
-            )
-        }
+    @Throws(RayException::class)override fun `setHostname`(`network`: kotlin.String, `hostname`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_hostname(
+        it, FfiConverterString.lower(`network`),FfiConverterString.lower(`hostname`),_status)
+}
     }
+
+
+
 
     /**
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
@@ -3275,40 +3096,50 @@ open class Node :
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
 
      */
-    @Throws(RayException::class)
-    override fun `start`() =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start(it, _status)
-            }
-        }
+    @Throws(RayException::class)override fun `start`()
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start(
+        it, _status)
+}
+    }
+
+
+
 
     /**
      * Begin pairing: returns a ticket to show (as QR) to a device that will
      * scan and call `pair`.
      */
-    @Throws(RayException::class)
-    override fun `startPairing`(): kotlin.String =
-        FfiConverterString.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start_pairing(it, _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `startPairing`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start_pairing(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Peers + addresses + running flag + per-network detail for the UI.
      * Empty snapshot before [`Node::start`].
-     */
-    override fun `status`(): Status =
-        FfiConverterTypeStatus.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_status(it, _status)
-                }
-            },
-        )
+     */override fun `status`(): Status {
+            return FfiConverterTypeStatus.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_status(
+        it, _status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Fully tear down the control plane so the device goes offline: peers can
@@ -3319,13 +3150,17 @@ open class Node :
      *
      * This is the mobile "disable" semantics: unlike [`Node::down`] (standby,
      * control plane stays connected), `stop` takes the node offline outright.
-     */
-    override fun `stop`() =
-        callWithPointer {
-            uniffiRustCall { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_stop(it, _status)
-            }
-        }
+     */override fun `stop`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_stop(
+        it, _status)
+}
+    }
+
+
+
 
     /**
      * Accept any code the user pastes or scans and route it: a `rayfish://`
@@ -3336,15 +3171,18 @@ open class Node :
      * network key" error. Everything that is not a pairing ticket goes to
      * `join`, which still handles both a full invite and a bare room id.
      */
-    @Throws(RayException::class)
-    override fun `submitCode`(`input`: kotlin.String): LinkAction =
-        FfiConverterTypeLinkAction.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_submit_code(it, FfiConverterString.lower(`input`), _status)
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `submitCode`(`input`: kotlin.String): LinkAction {
+            return FfiConverterTypeLinkAction.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_submit_code(
+        it, FfiConverterString.lower(`input`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Unpair this device from its primary: leave every network it joined under
@@ -3352,26 +3190,34 @@ open class Node :
      * device cert. Only meaningful when [`Node::is_paired`] is true; a node with
      * no cert returns an error. Requires [`Node::start`].
      */
-    @Throws(RayException::class)
-    override fun `unpair`() =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_unpair(it, _status)
-            }
-        }
+    @Throws(RayException::class)override fun `unpair`()
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_unpair(
+        it, _status)
+}
+    }
+
+
+
 
     /**
      * Bring the data plane up over the `VpnService` fd: attach the fd's
      * reader/writer to the running daemon and mark the data plane active.
      * Requires [`Node::start`] first.
      */
-    @Throws(RayException::class)
-    override fun `up`(`tunFd`: kotlin.Int) =
-        callWithPointer {
-            uniffiRustCallWithError(RayException) { _status ->
-                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_up(it, FfiConverterInt.lower(`tunFd`), _status)
-            }
-        }
+    @Throws(RayException::class)override fun `up`(`tunFd`: kotlin.Int)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_up(
+        it, FfiConverterInt.lower(`tunFd`),_status)
+}
+    }
+
+
+
 
     /**
      * Dial an idle peer to check it is really reachable before sending to it,
@@ -3381,44 +3227,55 @@ open class Node :
      *
      * Blocks for up to the core's lazy-dial timeout. Cheap and immediate when a
      * live connection already exists. A stopped node returns false.
-     */
-    override fun `wakePeer`(`peer`: kotlin.String): kotlin.Boolean =
-        FfiConverterBoolean.lift(
-            callWithPointer {
-                uniffiRustCall { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_wake_peer(it, FfiConverterString.lower(`peer`), _status)
-                }
-            },
-        )
+     */override fun `wakePeer`(`peer`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_wake_peer(
+        it, FfiConverterString.lower(`peer`),_status)
+}
+    }
+    )
+    }
+
+
 
     /**
      * Subscribe to file/transfer changes, including one initial reconciliation.
      * Close the returned handle when the platform observer stops.
      */
-    @Throws(RayException::class)
-    override fun `watchFiles`(`listener`: FileChangeListener): FileWatch =
-        FfiConverterTypeFileWatch.lift(
-            callWithPointer {
-                uniffiRustCallWithError(RayException) { _status ->
-                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_watch_files(
-                        it,
-                        FfiConverterTypeFileChangeListener.lower(`listener`),
-                        _status,
-                    )
-                }
-            },
-        )
+    @Throws(RayException::class)override fun `watchFiles`(`listener`: FileChangeListener): FileWatch {
+            return FfiConverterTypeFileWatch.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_watch_files(
+        it, FfiConverterTypeFileChangeListener.lower(`listener`),_status)
+}
+    }
+    )
+    }
+
+
+
+
+
 
     companion object
+
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeNode : FfiConverter<Node, Pointer> {
-    override fun lower(value: Node): Pointer = value.uniffiClonePointer()
+public object FfiConverterTypeNode: FfiConverter<Node, Pointer> {
 
-    override fun lift(value: Pointer): Node = Node(value)
+    override fun lower(value: Node): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): Node {
+        return Node(value)
+    }
 
     override fun read(buf: ByteBuffer): Node {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -3428,20 +3285,19 @@ public object FfiConverterTypeNode : FfiConverter<Node, Pointer> {
 
     override fun allocationSize(value: Node) = 8UL
 
-    override fun write(
-        value: Node,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: Node, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
 
+
+
 /**
  * A pending incoming file offer, for the notifications UI.
  */
-data class FileOffer(
+data class FileOffer (
     var `id`: kotlin.ULong,
     var `from`: kotlin.String,
     var `filename`: kotlin.String,
@@ -3451,17 +3307,18 @@ data class FileOffer(
      * True when the sender is one of this user's own paired devices. The UI
      * auto-accepts these (own-device shares) without a manual tap.
      */
-    var `ownDevice`: kotlin.Boolean,
+    var `ownDevice`: kotlin.Boolean
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeFileOffer : FfiConverterRustBuffer<FileOffer> {
-    override fun read(buf: ByteBuffer): FileOffer =
-        FileOffer(
+public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
+    override fun read(buf: ByteBuffer): FileOffer {
+        return FileOffer(
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
@@ -3469,50 +3326,50 @@ public object FfiConverterTypeFileOffer : FfiConverterRustBuffer<FileOffer> {
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
         )
+    }
 
-    override fun allocationSize(value: FileOffer) =
-        (
+    override fun allocationSize(value: FileOffer) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterString.allocationSize(value.`from`) +
-                FfiConverterString.allocationSize(value.`filename`) +
-                FfiConverterULong.allocationSize(value.`size`) +
-                FfiConverterString.allocationSize(value.`mimeType`) +
-                FfiConverterBoolean.allocationSize(value.`ownDevice`)
-        )
+            FfiConverterString.allocationSize(value.`from`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterString.allocationSize(value.`mimeType`) +
+            FfiConverterBoolean.allocationSize(value.`ownDevice`)
+    )
 
-    override fun write(
-        value: FileOffer,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterString.write(value.`from`, buf)
-        FfiConverterString.write(value.`filename`, buf)
-        FfiConverterULong.write(value.`size`, buf)
-        FfiConverterString.write(value.`mimeType`, buf)
-        FfiConverterBoolean.write(value.`ownDevice`, buf)
+    override fun write(value: FileOffer, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterString.write(value.`from`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterString.write(value.`mimeType`, buf)
+            FfiConverterBoolean.write(value.`ownDevice`, buf)
     }
 }
+
+
 
 /**
  * One firewall rule as shown in the UI.
  */
-data class FirewallRuleInfo(
+data class FirewallRuleInfo (
     var `direction`: kotlin.String,
     var `action`: kotlin.String,
     var `protocol`: kotlin.String,
     var `port`: kotlin.String,
     var `peer`: kotlin.String,
-    var `network`: kotlin.String,
+    var `network`: kotlin.String
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeFirewallRuleInfo : FfiConverterRustBuffer<FirewallRuleInfo> {
-    override fun read(buf: ByteBuffer): FirewallRuleInfo =
-        FirewallRuleInfo(
+public object FfiConverterTypeFirewallRuleInfo: FfiConverterRustBuffer<FirewallRuleInfo> {
+    override fun read(buf: ByteBuffer): FirewallRuleInfo {
+        return FirewallRuleInfo(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
@@ -3520,78 +3377,77 @@ public object FfiConverterTypeFirewallRuleInfo : FfiConverterRustBuffer<Firewall
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: FirewallRuleInfo) =
-        (
+    override fun allocationSize(value: FirewallRuleInfo) = (
             FfiConverterString.allocationSize(value.`direction`) +
-                FfiConverterString.allocationSize(value.`action`) +
-                FfiConverterString.allocationSize(value.`protocol`) +
-                FfiConverterString.allocationSize(value.`port`) +
-                FfiConverterString.allocationSize(value.`peer`) +
-                FfiConverterString.allocationSize(value.`network`)
-        )
+            FfiConverterString.allocationSize(value.`action`) +
+            FfiConverterString.allocationSize(value.`protocol`) +
+            FfiConverterString.allocationSize(value.`port`) +
+            FfiConverterString.allocationSize(value.`peer`) +
+            FfiConverterString.allocationSize(value.`network`)
+    )
 
-    override fun write(
-        value: FirewallRuleInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`direction`, buf)
-        FfiConverterString.write(value.`action`, buf)
-        FfiConverterString.write(value.`protocol`, buf)
-        FfiConverterString.write(value.`port`, buf)
-        FfiConverterString.write(value.`peer`, buf)
-        FfiConverterString.write(value.`network`, buf)
+    override fun write(value: FirewallRuleInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`direction`, buf)
+            FfiConverterString.write(value.`action`, buf)
+            FfiConverterString.write(value.`protocol`, buf)
+            FfiConverterString.write(value.`port`, buf)
+            FfiConverterString.write(value.`peer`, buf)
+            FfiConverterString.write(value.`network`, buf)
     }
 }
+
+
 
 /**
  * Current firewall posture and rules, for the UI.
  */
-data class FirewallStateInfo(
+data class FirewallStateInfo (
     var `defaultInbound`: kotlin.String,
     var `defaultOutbound`: kotlin.String,
     var `disabled`: kotlin.Boolean,
-    var `rules`: List<FirewallRuleInfo>,
+    var `rules`: List<FirewallRuleInfo>
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeFirewallStateInfo : FfiConverterRustBuffer<FirewallStateInfo> {
-    override fun read(buf: ByteBuffer): FirewallStateInfo =
-        FirewallStateInfo(
+public object FfiConverterTypeFirewallStateInfo: FfiConverterRustBuffer<FirewallStateInfo> {
+    override fun read(buf: ByteBuffer): FirewallStateInfo {
+        return FirewallStateInfo(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypeFirewallRuleInfo.read(buf),
         )
+    }
 
-    override fun allocationSize(value: FirewallStateInfo) =
-        (
+    override fun allocationSize(value: FirewallStateInfo) = (
             FfiConverterString.allocationSize(value.`defaultInbound`) +
-                FfiConverterString.allocationSize(value.`defaultOutbound`) +
-                FfiConverterBoolean.allocationSize(value.`disabled`) +
-                FfiConverterSequenceTypeFirewallRuleInfo.allocationSize(value.`rules`)
-        )
+            FfiConverterString.allocationSize(value.`defaultOutbound`) +
+            FfiConverterBoolean.allocationSize(value.`disabled`) +
+            FfiConverterSequenceTypeFirewallRuleInfo.allocationSize(value.`rules`)
+    )
 
-    override fun write(
-        value: FirewallStateInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`defaultInbound`, buf)
-        FfiConverterString.write(value.`defaultOutbound`, buf)
-        FfiConverterBoolean.write(value.`disabled`, buf)
-        FfiConverterSequenceTypeFirewallRuleInfo.write(value.`rules`, buf)
+    override fun write(value: FirewallStateInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`defaultInbound`, buf)
+            FfiConverterString.write(value.`defaultOutbound`, buf)
+            FfiConverterBoolean.write(value.`disabled`, buf)
+            FfiConverterSequenceTypeFirewallRuleInfo.write(value.`rules`, buf)
     }
 }
+
+
 
 /**
  * Lightweight health vitals for auto-telemetry. Cheap to build (reads a status
  * snapshot + the diagnostics counters); safe to call before `start`.
  */
-data class HealthSnapshot(
+data class HealthSnapshot (
     var `running`: kotlin.Boolean,
     var `networkCount`: kotlin.UInt,
     var `peersOnline`: kotlin.UInt,
@@ -3601,17 +3457,18 @@ data class HealthSnapshot(
     var `meshIpv6`: kotlin.String,
     var `warnCount`: kotlin.ULong,
     var `errorCount`: kotlin.ULong,
-    var `recentErrors`: List<kotlin.String>,
+    var `recentErrors`: List<kotlin.String>
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeHealthSnapshot : FfiConverterRustBuffer<HealthSnapshot> {
-    override fun read(buf: ByteBuffer): HealthSnapshot =
-        HealthSnapshot(
+public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnapshot> {
+    override fun read(buf: ByteBuffer): HealthSnapshot {
+        return HealthSnapshot(
             FfiConverterBoolean.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
@@ -3623,42 +3480,41 @@ public object FfiConverterTypeHealthSnapshot : FfiConverterRustBuffer<HealthSnap
             FfiConverterULong.read(buf),
             FfiConverterSequenceString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: HealthSnapshot) =
-        (
+    override fun allocationSize(value: HealthSnapshot) = (
             FfiConverterBoolean.allocationSize(value.`running`) +
-                FfiConverterUInt.allocationSize(value.`networkCount`) +
-                FfiConverterUInt.allocationSize(value.`peersOnline`) +
-                FfiConverterSequenceTypeNetworkHealth.allocationSize(value.`networks`) +
-                FfiConverterBoolean.allocationSize(value.`meshUp`) +
-                FfiConverterString.allocationSize(value.`nodeId`) +
-                FfiConverterString.allocationSize(value.`meshIpv6`) +
-                FfiConverterULong.allocationSize(value.`warnCount`) +
-                FfiConverterULong.allocationSize(value.`errorCount`) +
-                FfiConverterSequenceString.allocationSize(value.`recentErrors`)
-        )
+            FfiConverterUInt.allocationSize(value.`networkCount`) +
+            FfiConverterUInt.allocationSize(value.`peersOnline`) +
+            FfiConverterSequenceTypeNetworkHealth.allocationSize(value.`networks`) +
+            FfiConverterBoolean.allocationSize(value.`meshUp`) +
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterString.allocationSize(value.`meshIpv6`) +
+            FfiConverterULong.allocationSize(value.`warnCount`) +
+            FfiConverterULong.allocationSize(value.`errorCount`) +
+            FfiConverterSequenceString.allocationSize(value.`recentErrors`)
+    )
 
-    override fun write(
-        value: HealthSnapshot,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterBoolean.write(value.`running`, buf)
-        FfiConverterUInt.write(value.`networkCount`, buf)
-        FfiConverterUInt.write(value.`peersOnline`, buf)
-        FfiConverterSequenceTypeNetworkHealth.write(value.`networks`, buf)
-        FfiConverterBoolean.write(value.`meshUp`, buf)
-        FfiConverterString.write(value.`nodeId`, buf)
-        FfiConverterString.write(value.`meshIpv6`, buf)
-        FfiConverterULong.write(value.`warnCount`, buf)
-        FfiConverterULong.write(value.`errorCount`, buf)
-        FfiConverterSequenceString.write(value.`recentErrors`, buf)
+    override fun write(value: HealthSnapshot, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`running`, buf)
+            FfiConverterUInt.write(value.`networkCount`, buf)
+            FfiConverterUInt.write(value.`peersOnline`, buf)
+            FfiConverterSequenceTypeNetworkHealth.write(value.`networks`, buf)
+            FfiConverterBoolean.write(value.`meshUp`, buf)
+            FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterString.write(value.`meshIpv6`, buf)
+            FfiConverterULong.write(value.`warnCount`, buf)
+            FfiConverterULong.write(value.`errorCount`, buf)
+            FfiConverterSequenceString.write(value.`recentErrors`, buf)
     }
 }
+
+
 
 /**
  * An encrypted identity backup and the public key it restores to.
  */
-data class IdentityBackup(
+data class IdentityBackup (
     /**
      * The base58 `enc1` blob. This is the secret: anyone holding it and the
      * password holds the identity, so it belongs in a password manager or
@@ -3669,40 +3525,40 @@ data class IdentityBackup(
      * The identity the code restores to, for showing the user which one they
      * just wrote out.
      */
-    var `publicKey`: kotlin.String,
+    var `publicKey`: kotlin.String
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeIdentityBackup : FfiConverterRustBuffer<IdentityBackup> {
-    override fun read(buf: ByteBuffer): IdentityBackup =
-        IdentityBackup(
+public object FfiConverterTypeIdentityBackup: FfiConverterRustBuffer<IdentityBackup> {
+    override fun read(buf: ByteBuffer): IdentityBackup {
+        return IdentityBackup(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: IdentityBackup) =
-        (
+    override fun allocationSize(value: IdentityBackup) = (
             FfiConverterString.allocationSize(value.`code`) +
-                FfiConverterString.allocationSize(value.`publicKey`)
-        )
+            FfiConverterString.allocationSize(value.`publicKey`)
+    )
 
-    override fun write(
-        value: IdentityBackup,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`code`, buf)
-        FfiConverterString.write(value.`publicKey`, buf)
+    override fun write(value: IdentityBackup, buf: ByteBuffer) {
+            FfiConverterString.write(value.`code`, buf)
+            FfiConverterString.write(value.`publicKey`, buf)
     }
 }
+
+
 
 /**
  * One network this node belongs to, with its peers.
  */
-data class NetworkDetail(
+data class NetworkDetail (
     var `name`: kotlin.String,
     var `ipv6`: kotlin.String,
     var `hostname`: kotlin.String,
@@ -3713,17 +3569,18 @@ data class NetworkDetail(
      * The daemon's one-line reason for the last failed restore, when `state` is
      * [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
      */
-    var `reason`: kotlin.String?,
+    var `reason`: kotlin.String?
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeNetworkDetail : FfiConverterRustBuffer<NetworkDetail> {
-    override fun read(buf: ByteBuffer): NetworkDetail =
-        NetworkDetail(
+public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetail> {
+    override fun read(buf: ByteBuffer): NetworkDetail {
+        return NetworkDetail(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
@@ -3732,117 +3589,116 @@ public object FfiConverterTypeNetworkDetail : FfiConverterRustBuffer<NetworkDeta
             FfiConverterTypeNetworkConnState.read(buf),
             FfiConverterOptionalString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: NetworkDetail) =
-        (
+    override fun allocationSize(value: NetworkDetail) = (
             FfiConverterString.allocationSize(value.`name`) +
-                FfiConverterString.allocationSize(value.`ipv6`) +
-                FfiConverterString.allocationSize(value.`hostname`) +
-                FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
-                FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
-                FfiConverterTypeNetworkConnState.allocationSize(value.`state`) +
-                FfiConverterOptionalString.allocationSize(value.`reason`)
-        )
+            FfiConverterString.allocationSize(value.`ipv6`) +
+            FfiConverterString.allocationSize(value.`hostname`) +
+            FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
+            FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
+            FfiConverterTypeNetworkConnState.allocationSize(value.`state`) +
+            FfiConverterOptionalString.allocationSize(value.`reason`)
+    )
 
-    override fun write(
-        value: NetworkDetail,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`name`, buf)
-        FfiConverterString.write(value.`ipv6`, buf)
-        FfiConverterString.write(value.`hostname`, buf)
-        FfiConverterBoolean.write(value.`isCoordinator`, buf)
-        FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
-        FfiConverterTypeNetworkConnState.write(value.`state`, buf)
-        FfiConverterOptionalString.write(value.`reason`, buf)
+    override fun write(value: NetworkDetail, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`ipv6`, buf)
+            FfiConverterString.write(value.`hostname`, buf)
+            FfiConverterBoolean.write(value.`isCoordinator`, buf)
+            FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
+            FfiConverterTypeNetworkConnState.write(value.`state`, buf)
+            FfiConverterOptionalString.write(value.`reason`, buf)
     }
 }
+
+
 
 /**
  * One network's liveness, for the health snapshot.
  */
-data class NetworkHealth(
+data class NetworkHealth (
     var `name`: kotlin.String,
-    var `connected`: kotlin.Boolean,
+    var `connected`: kotlin.Boolean
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeNetworkHealth : FfiConverterRustBuffer<NetworkHealth> {
-    override fun read(buf: ByteBuffer): NetworkHealth =
-        NetworkHealth(
+public object FfiConverterTypeNetworkHealth: FfiConverterRustBuffer<NetworkHealth> {
+    override fun read(buf: ByteBuffer): NetworkHealth {
+        return NetworkHealth(
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
         )
+    }
 
-    override fun allocationSize(value: NetworkHealth) =
-        (
+    override fun allocationSize(value: NetworkHealth) = (
             FfiConverterString.allocationSize(value.`name`) +
-                FfiConverterBoolean.allocationSize(value.`connected`)
-        )
+            FfiConverterBoolean.allocationSize(value.`connected`)
+    )
 
-    override fun write(
-        value: NetworkHealth,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`name`, buf)
-        FfiConverterBoolean.write(value.`connected`, buf)
+    override fun write(value: NetworkHealth, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterBoolean.write(value.`connected`, buf)
     }
 }
+
+
 
 /**
  * Snapshot returned by `create` / `join`.
  */
-data class NetworkInfo(
+data class NetworkInfo (
     var `name`: kotlin.String,
     var `nodeId`: kotlin.String,
     var `ipv6`: kotlin.String,
     /**
      * True when the join was queued for coordinator approval (no IP yet).
      */
-    var `pending`: kotlin.Boolean,
+    var `pending`: kotlin.Boolean
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeNetworkInfo : FfiConverterRustBuffer<NetworkInfo> {
-    override fun read(buf: ByteBuffer): NetworkInfo =
-        NetworkInfo(
+public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
+    override fun read(buf: ByteBuffer): NetworkInfo {
+        return NetworkInfo(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
         )
+    }
 
-    override fun allocationSize(value: NetworkInfo) =
-        (
+    override fun allocationSize(value: NetworkInfo) = (
             FfiConverterString.allocationSize(value.`name`) +
-                FfiConverterString.allocationSize(value.`nodeId`) +
-                FfiConverterString.allocationSize(value.`ipv6`) +
-                FfiConverterBoolean.allocationSize(value.`pending`)
-        )
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterString.allocationSize(value.`ipv6`) +
+            FfiConverterBoolean.allocationSize(value.`pending`)
+    )
 
-    override fun write(
-        value: NetworkInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`name`, buf)
-        FfiConverterString.write(value.`nodeId`, buf)
-        FfiConverterString.write(value.`ipv6`, buf)
-        FfiConverterBoolean.write(value.`pending`, buf)
+    override fun write(value: NetworkInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterString.write(value.`ipv6`, buf)
+            FfiConverterBoolean.write(value.`pending`, buf)
     }
 }
+
+
 
 /**
  * One peer in a network snapshot.
  */
-data class PeerInfo(
+data class PeerInfo (
     /**
      * The peer's mesh IPv6, derived from its identity. The only address it has:
      * the overlay carries no IPv4.
@@ -3850,150 +3706,151 @@ data class PeerInfo(
     var `ipv6`: kotlin.String,
     var `nodeId`: kotlin.String,
     var `hostname`: kotlin.String,
-    var `state`: PeerConnState,
+    var `state`: PeerConnState
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypePeerInfo : FfiConverterRustBuffer<PeerInfo> {
-    override fun read(buf: ByteBuffer): PeerInfo =
-        PeerInfo(
+public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
+    override fun read(buf: ByteBuffer): PeerInfo {
+        return PeerInfo(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterTypePeerConnState.read(buf),
         )
+    }
 
-    override fun allocationSize(value: PeerInfo) =
-        (
+    override fun allocationSize(value: PeerInfo) = (
             FfiConverterString.allocationSize(value.`ipv6`) +
-                FfiConverterString.allocationSize(value.`nodeId`) +
-                FfiConverterString.allocationSize(value.`hostname`) +
-                FfiConverterTypePeerConnState.allocationSize(value.`state`)
-        )
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterString.allocationSize(value.`hostname`) +
+            FfiConverterTypePeerConnState.allocationSize(value.`state`)
+    )
 
-    override fun write(
-        value: PeerInfo,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`ipv6`, buf)
-        FfiConverterString.write(value.`nodeId`, buf)
-        FfiConverterString.write(value.`hostname`, buf)
-        FfiConverterTypePeerConnState.write(value.`state`, buf)
+    override fun write(value: PeerInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`ipv6`, buf)
+            FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterString.write(value.`hostname`, buf)
+            FfiConverterTypePeerConnState.write(value.`state`, buf)
     }
 }
+
+
 
 /**
  * A pending request awaiting the user's decision: an incoming `ray connect`
  * friend request, or a network-join request on a network we coordinate.
  */
-data class PendingRequest(
+data class PendingRequest (
     var `shortId`: kotlin.String,
     var `hostname`: kotlin.String?,
-    var `waitingSecs`: kotlin.ULong,
+    var `waitingSecs`: kotlin.ULong
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypePendingRequest : FfiConverterRustBuffer<PendingRequest> {
-    override fun read(buf: ByteBuffer): PendingRequest =
-        PendingRequest(
+public object FfiConverterTypePendingRequest: FfiConverterRustBuffer<PendingRequest> {
+    override fun read(buf: ByteBuffer): PendingRequest {
+        return PendingRequest(
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: PendingRequest) =
-        (
+    override fun allocationSize(value: PendingRequest) = (
             FfiConverterString.allocationSize(value.`shortId`) +
-                FfiConverterOptionalString.allocationSize(value.`hostname`) +
-                FfiConverterULong.allocationSize(value.`waitingSecs`)
-        )
+            FfiConverterOptionalString.allocationSize(value.`hostname`) +
+            FfiConverterULong.allocationSize(value.`waitingSecs`)
+    )
 
-    override fun write(
-        value: PendingRequest,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterString.write(value.`shortId`, buf)
-        FfiConverterOptionalString.write(value.`hostname`, buf)
-        FfiConverterULong.write(value.`waitingSecs`, buf)
+    override fun write(value: PendingRequest, buf: ByteBuffer) {
+            FfiConverterString.write(value.`shortId`, buf)
+            FfiConverterOptionalString.write(value.`hostname`, buf)
+            FfiConverterULong.write(value.`waitingSecs`, buf)
     }
 }
+
+
 
 /**
  * An outbound send still queued for a peer that hasn't taken the offer yet.
  * `id` is what [`Node::cancel_send`] takes; it is the outbox's own id, not a
  * transfer-registry id.
  */
-data class QueuedSend(
+data class QueuedSend (
     var `id`: kotlin.ULong,
     /**
      * The recipient's short endpoint id.
      */
     var `peer`: kotlin.String,
     var `filename`: kotlin.String,
-    var `size`: kotlin.ULong,
+    var `size`: kotlin.ULong
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeQueuedSend : FfiConverterRustBuffer<QueuedSend> {
-    override fun read(buf: ByteBuffer): QueuedSend =
-        QueuedSend(
+public object FfiConverterTypeQueuedSend: FfiConverterRustBuffer<QueuedSend> {
+    override fun read(buf: ByteBuffer): QueuedSend {
+        return QueuedSend(
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterULong.read(buf),
         )
+    }
 
-    override fun allocationSize(value: QueuedSend) =
-        (
+    override fun allocationSize(value: QueuedSend) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterString.allocationSize(value.`peer`) +
-                FfiConverterString.allocationSize(value.`filename`) +
-                FfiConverterULong.allocationSize(value.`size`)
-        )
+            FfiConverterString.allocationSize(value.`peer`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterULong.allocationSize(value.`size`)
+    )
 
-    override fun write(
-        value: QueuedSend,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterString.write(value.`peer`, buf)
-        FfiConverterString.write(value.`filename`, buf)
-        FfiConverterULong.write(value.`size`, buf)
+    override fun write(value: QueuedSend, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterString.write(value.`peer`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterULong.write(value.`size`, buf)
     }
 }
+
+
 
 /**
  * Health/addresses/networks snapshot for the UI.
  */
-data class Status(
+data class Status (
     var `running`: kotlin.Boolean,
     var `nodeId`: kotlin.String,
     var `ipv6`: kotlin.String,
     var `peers`: List<PeerInfo>,
     var `networks`: List<NetworkDetail>,
-    var `pendingNetworks`: List<kotlin.String>,
+    var `pendingNetworks`: List<kotlin.String>
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeStatus : FfiConverterRustBuffer<Status> {
-    override fun read(buf: ByteBuffer): Status =
-        Status(
+public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
+    override fun read(buf: ByteBuffer): Status {
+        return Status(
             FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
@@ -4001,51 +3858,51 @@ public object FfiConverterTypeStatus : FfiConverterRustBuffer<Status> {
             FfiConverterSequenceTypeNetworkDetail.read(buf),
             FfiConverterSequenceString.read(buf),
         )
+    }
 
-    override fun allocationSize(value: Status) =
-        (
+    override fun allocationSize(value: Status) = (
             FfiConverterBoolean.allocationSize(value.`running`) +
-                FfiConverterString.allocationSize(value.`nodeId`) +
-                FfiConverterString.allocationSize(value.`ipv6`) +
-                FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
-                FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
-                FfiConverterSequenceString.allocationSize(value.`pendingNetworks`)
-        )
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterString.allocationSize(value.`ipv6`) +
+            FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
+            FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
+            FfiConverterSequenceString.allocationSize(value.`pendingNetworks`)
+    )
 
-    override fun write(
-        value: Status,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterBoolean.write(value.`running`, buf)
-        FfiConverterString.write(value.`nodeId`, buf)
-        FfiConverterString.write(value.`ipv6`, buf)
-        FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
-        FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
-        FfiConverterSequenceString.write(value.`pendingNetworks`, buf)
+    override fun write(value: Status, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`running`, buf)
+            FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterString.write(value.`ipv6`, buf)
+            FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
+            FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
+            FfiConverterSequenceString.write(value.`pendingNetworks`, buf)
     }
 }
+
+
 
 /**
  * One in-flight (or recently finished) file transfer, either direction.
  */
-data class Transfer(
+data class Transfer (
     var `id`: kotlin.ULong,
     var `outgoing`: kotlin.Boolean,
     var `peer`: kotlin.String,
     var `filename`: kotlin.String,
     var `size`: kotlin.ULong,
     var `transferred`: kotlin.ULong,
-    var `state`: TransferState,
+    var `state`: TransferState
 ) {
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeTransfer : FfiConverterRustBuffer<Transfer> {
-    override fun read(buf: ByteBuffer): Transfer =
-        Transfer(
+public object FfiConverterTypeTransfer: FfiConverterRustBuffer<Transfer> {
+    override fun read(buf: ByteBuffer): Transfer {
+        return Transfer(
             FfiConverterULong.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
@@ -4054,43 +3911,45 @@ public object FfiConverterTypeTransfer : FfiConverterRustBuffer<Transfer> {
             FfiConverterULong.read(buf),
             FfiConverterTypeTransferState.read(buf),
         )
+    }
 
-    override fun allocationSize(value: Transfer) =
-        (
+    override fun allocationSize(value: Transfer) = (
             FfiConverterULong.allocationSize(value.`id`) +
-                FfiConverterBoolean.allocationSize(value.`outgoing`) +
-                FfiConverterString.allocationSize(value.`peer`) +
-                FfiConverterString.allocationSize(value.`filename`) +
-                FfiConverterULong.allocationSize(value.`size`) +
-                FfiConverterULong.allocationSize(value.`transferred`) +
-                FfiConverterTypeTransferState.allocationSize(value.`state`)
-        )
+            FfiConverterBoolean.allocationSize(value.`outgoing`) +
+            FfiConverterString.allocationSize(value.`peer`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterULong.allocationSize(value.`transferred`) +
+            FfiConverterTypeTransferState.allocationSize(value.`state`)
+    )
 
-    override fun write(
-        value: Transfer,
-        buf: ByteBuffer,
-    ) {
-        FfiConverterULong.write(value.`id`, buf)
-        FfiConverterBoolean.write(value.`outgoing`, buf)
-        FfiConverterString.write(value.`peer`, buf)
-        FfiConverterString.write(value.`filename`, buf)
-        FfiConverterULong.write(value.`size`, buf)
-        FfiConverterULong.write(value.`transferred`, buf)
-        FfiConverterTypeTransferState.write(value.`state`, buf)
+    override fun write(value: Transfer, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterBoolean.write(value.`outgoing`, buf)
+            FfiConverterString.write(value.`peer`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterULong.write(value.`transferred`, buf)
+            FfiConverterTypeTransferState.write(value.`state`, buf)
     }
 }
+
+
 
 /**
  * The outcome of following a `rayfish://` deep link, reflected in the UI.
  */
 sealed class LinkAction {
+
     data class Joined(
-        val v1: NetworkInfo,
-    ) : LinkAction() {
+        val v1: NetworkInfo) : LinkAction() {
         companion object
     }
 
     object Paired : LinkAction()
+
+
+
 
     companion object
 }
@@ -4098,53 +3957,40 @@ sealed class LinkAction {
 /**
  * @suppress
  */
-public object FfiConverterTypeLinkAction : FfiConverterRustBuffer<LinkAction> {
-    override fun read(buf: ByteBuffer): LinkAction =
-        when (buf.getInt()) {
-            1 -> {
-                LinkAction.Joined(
-                    FfiConverterTypeNetworkInfo.read(buf),
+public object FfiConverterTypeLinkAction : FfiConverterRustBuffer<LinkAction>{
+    override fun read(buf: ByteBuffer): LinkAction {
+        return when(buf.getInt()) {
+            1 -> LinkAction.Joined(
+                FfiConverterTypeNetworkInfo.read(buf),
                 )
-            }
-
-            2 -> {
-                LinkAction.Paired
-            }
-
-            else -> {
-                throw RuntimeException("invalid enum value, something is very wrong!!")
-            }
+            2 -> LinkAction.Paired
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
+    }
 
-    override fun allocationSize(value: LinkAction) =
-        when (value) {
-            is LinkAction.Joined -> {
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                (
-                    4UL +
-                        FfiConverterTypeNetworkInfo.allocationSize(value.v1)
-                )
-            }
-
-            is LinkAction.Paired -> {
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                (
-                    4UL
-                )
-            }
+    override fun allocationSize(value: LinkAction) = when(value) {
+        is LinkAction.Joined -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeNetworkInfo.allocationSize(value.v1)
+            )
         }
+        is LinkAction.Paired -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
 
-    override fun write(
-        value: LinkAction,
-        buf: ByteBuffer,
-    ) {
-        when (value) {
+    override fun write(value: LinkAction, buf: ByteBuffer) {
+        when(value) {
             is LinkAction.Joined -> {
                 buf.putInt(1)
                 FfiConverterTypeNetworkInfo.write(value.v1, buf)
                 Unit
             }
-
             is LinkAction.Paired -> {
                 buf.putInt(2)
                 Unit
@@ -4152,6 +3998,10 @@ public object FfiConverterTypeLinkAction : FfiConverterRustBuffer<LinkAction> {
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
+
+
+
+
 
 /**
  * Whether the daemon has this network registered, for the UI's status dot.
@@ -4164,47 +4014,44 @@ public object FfiConverterTypeLinkAction : FfiConverterRustBuffer<LinkAction> {
  */
 
 enum class NetworkConnState {
+
     /**
      * Registered by the daemon: the rest of this snapshot is live.
      */
     CONNECTED,
-
     /**
      * Saved, restore still in flight and not yet failed once.
      */
     CONNECTING,
-
     /**
      * Saved but carrying nothing: either a restore that has failed at least
      * once (see [`NetworkDetail::reason`]) or a deliberately stopped node.
      */
-    NOT_CONNECTED,
-
-    ;
-
+    NOT_CONNECTED;
     companion object
 }
+
 
 /**
  * @suppress
  */
-public object FfiConverterTypeNetworkConnState : FfiConverterRustBuffer<NetworkConnState> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            NetworkConnState.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+public object FfiConverterTypeNetworkConnState: FfiConverterRustBuffer<NetworkConnState> {
+    override fun read(buf: ByteBuffer) = try {
+        NetworkConnState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: NetworkConnState) = 4UL
 
-    override fun write(
-        value: NetworkConnState,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: NetworkConnState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
+
+
+
+
 
 /**
  * Three-state peer liveness, mirroring [`ipc::PeerState`]. `Idle` is not
@@ -4214,43 +4061,47 @@ public object FfiConverterTypeNetworkConnState : FfiConverterRustBuffer<NetworkC
  */
 
 enum class PeerConnState {
+
     ACTIVE,
     IDLE,
-    OFFLINE,
-    ;
-
+    OFFLINE;
     companion object
 }
+
 
 /**
  * @suppress
  */
-public object FfiConverterTypePeerConnState : FfiConverterRustBuffer<PeerConnState> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            PeerConnState.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+public object FfiConverterTypePeerConnState: FfiConverterRustBuffer<PeerConnState> {
+    override fun read(buf: ByteBuffer) = try {
+        PeerConnState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: PeerConnState) = 4UL
 
-    override fun write(
-        value: PeerConnState,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: PeerConnState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
 
+
+
+
+
+
+
 /**
  * Structured error surfaced across the FFI boundary.
  */
-sealed class RayException : kotlin.Exception() {
+sealed class RayException: kotlin.Exception() {
+
     /**
      * A method that needs the daemon was called before [`Node::start`].
      */
-    class NotStarted : RayException() {
+    class NotStarted(
+        ) : RayException() {
         override val message
             get() = ""
     }
@@ -4259,8 +4110,9 @@ sealed class RayException : kotlin.Exception() {
      * The supplied invite/pairing code could not be decoded.
      */
     class BadCode(
-        val v1: kotlin.String,
-    ) : RayException() {
+
+        val v1: kotlin.String
+        ) : RayException() {
         override val message
             get() = "v1=${ v1 }"
     }
@@ -4269,8 +4121,9 @@ sealed class RayException : kotlin.Exception() {
      * Joining a network failed (dial, handshake, or admission).
      */
     class JoinFailed(
-        val v1: kotlin.String,
-    ) : RayException() {
+
+        val v1: kotlin.String
+        ) : RayException() {
         override val message
             get() = "v1=${ v1 }"
     }
@@ -4279,8 +4132,9 @@ sealed class RayException : kotlin.Exception() {
      * Pairing with a primary device failed.
      */
     class PairFailed(
-        val v1: kotlin.String,
-    ) : RayException() {
+
+        val v1: kotlin.String
+        ) : RayException() {
         override val message
             get() = "v1=${ v1 }"
     }
@@ -4290,8 +4144,9 @@ sealed class RayException : kotlin.Exception() {
      * unexpected protocol response.
      */
     class Network(
-        val v1: kotlin.String,
-    ) : RayException() {
+
+        val v1: kotlin.String
+        ) : RayException() {
         override val message
             get() = "v1=${ v1 }"
     }
@@ -4301,8 +4156,9 @@ sealed class RayException : kotlin.Exception() {
      * one case: the AEAD cannot tell them apart.
      */
     class BadBackup(
-        val v1: kotlin.String,
-    ) : RayException() {
+
+        val v1: kotlin.String
+        ) : RayException() {
         override val message
             get() = "v1=${ v1 }"
     }
@@ -4315,8 +4171,9 @@ sealed class RayException : kotlin.Exception() {
      * `replace_existing`.
      */
     class IdentityExists(
-        val v1: kotlin.String,
-    ) : RayException() {
+
+        val v1: kotlin.String
+        ) : RayException() {
         override val message
             get() = "v1=${ v1 }"
     }
@@ -4325,173 +4182,141 @@ sealed class RayException : kotlin.Exception() {
      * A restore was attempted while the node was running. The endpoint is bound
      * to the old key, so the identity cannot change under it; stop first.
      */
-    class NodeRunning : RayException() {
+    class NodeRunning(
+        ) : RayException() {
         override val message
             get() = ""
     }
 
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<RayException> {
         override fun lift(error_buf: RustBuffer.ByValue): RayException = FfiConverterTypeRayError.lift(error_buf)
     }
+
+
 }
 
 /**
  * @suppress
  */
 public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
-    override fun read(buf: ByteBuffer): RayException =
-        when (buf.getInt()) {
-            1 -> {
-                RayException.NotStarted()
-            }
+    override fun read(buf: ByteBuffer): RayException {
 
-            2 -> {
-                RayException.BadCode(
-                    FfiConverterString.read(buf),
+
+        return when(buf.getInt()) {
+            1 -> RayException.NotStarted()
+            2 -> RayException.BadCode(
+                FfiConverterString.read(buf),
                 )
-            }
-
-            3 -> {
-                RayException.JoinFailed(
-                    FfiConverterString.read(buf),
+            3 -> RayException.JoinFailed(
+                FfiConverterString.read(buf),
                 )
-            }
-
-            4 -> {
-                RayException.PairFailed(
-                    FfiConverterString.read(buf),
+            4 -> RayException.PairFailed(
+                FfiConverterString.read(buf),
                 )
-            }
-
-            5 -> {
-                RayException.Network(
-                    FfiConverterString.read(buf),
+            5 -> RayException.Network(
+                FfiConverterString.read(buf),
                 )
-            }
-
-            6 -> {
-                RayException.BadBackup(
-                    FfiConverterString.read(buf),
+            6 -> RayException.BadBackup(
+                FfiConverterString.read(buf),
                 )
-            }
-
-            7 -> {
-                RayException.IdentityExists(
-                    FfiConverterString.read(buf),
+            7 -> RayException.IdentityExists(
+                FfiConverterString.read(buf),
                 )
-            }
-
-            8 -> {
-                RayException.NodeRunning()
-            }
-
-            else -> {
-                throw RuntimeException("invalid error enum value, something is very wrong!!")
-            }
+            8 -> RayException.NodeRunning()
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
+    }
 
-    override fun allocationSize(value: RayException): ULong =
-        when (value) {
+    override fun allocationSize(value: RayException): ULong {
+        return when(value) {
             is RayException.NotStarted -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
             )
-
             is RayException.BadCode -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL +
-                    FfiConverterString.allocationSize(value.v1)
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
             )
-
             is RayException.JoinFailed -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL +
-                    FfiConverterString.allocationSize(value.v1)
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
             )
-
             is RayException.PairFailed -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL +
-                    FfiConverterString.allocationSize(value.v1)
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
             )
-
             is RayException.Network -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL +
-                    FfiConverterString.allocationSize(value.v1)
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
             )
-
             is RayException.BadBackup -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL +
-                    FfiConverterString.allocationSize(value.v1)
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
             )
-
             is RayException.IdentityExists -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL +
-                    FfiConverterString.allocationSize(value.v1)
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
             )
-
             is RayException.NodeRunning -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
             )
         }
+    }
 
-    override fun write(
-        value: RayException,
-        buf: ByteBuffer,
-    ) {
-        when (value) {
+    override fun write(value: RayException, buf: ByteBuffer) {
+        when(value) {
             is RayException.NotStarted -> {
                 buf.putInt(1)
                 Unit
             }
-
             is RayException.BadCode -> {
                 buf.putInt(2)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-
             is RayException.JoinFailed -> {
                 buf.putInt(3)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-
             is RayException.PairFailed -> {
                 buf.putInt(4)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-
             is RayException.Network -> {
                 buf.putInt(5)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-
             is RayException.BadBackup -> {
                 buf.putInt(6)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-
             is RayException.IdentityExists -> {
                 buf.putInt(7)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-
             is RayException.NodeRunning -> {
                 buf.putInt(8)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
+
 }
+
+
 
 /**
  * Where a transfer is. A send is `Offered` until the peer accepts and starts
@@ -4500,37 +4325,40 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
  */
 
 enum class TransferState {
+
     OFFERED,
     TRANSFERRING,
     DONE,
-    FAILED,
-    ;
-
+    FAILED;
     companion object
 }
+
 
 /**
  * @suppress
  */
-public object FfiConverterTypeTransferState : FfiConverterRustBuffer<TransferState> {
-    override fun read(buf: ByteBuffer) =
-        try {
-            TransferState.values()[buf.getInt() - 1]
-        } catch (e: IndexOutOfBoundsException) {
-            throw RuntimeException("invalid enum value, something is very wrong!!", e)
-        }
+public object FfiConverterTypeTransferState: FfiConverterRustBuffer<TransferState> {
+    override fun read(buf: ByteBuffer) = try {
+        TransferState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
 
     override fun allocationSize(value: TransferState) = 4UL
 
-    override fun write(
-        value: TransferState,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: TransferState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
 
+
+
+
+
+
+
 public interface FileChangeListener {
+
     /**
      * Enqueue a reconciliation on a platform worker; never block this callback.
      */
@@ -4539,32 +4367,32 @@ public interface FileChangeListener {
     companion object
 }
 
+
+
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceFileChangeListener {
-    internal object `onChange` : UniffiCallbackInterfaceFileChangeListenerMethod0 {
-        override fun callback(
-            `uniffiHandle`: Long,
-            `uniffiOutReturn`: Pointer,
-            uniffiCallStatus: UniffiRustCallStatus,
-        ) {
+    internal object `onChange`: UniffiCallbackInterfaceFileChangeListenerMethod0 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeFileChangeListener.handleMap.get(uniffiHandle)
-            val makeCall = { uniffiObj.`onChange`() }
+            val makeCall = { ->
+                uniffiObj.`onChange`(
+                )
+            }
             val writeReturn = { _: Unit -> Unit }
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
 
-    internal object uniffiFree : UniffiCallbackInterfaceFree {
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
             FfiConverterTypeFileChangeListener.handleMap.remove(handle)
         }
     }
 
-    internal var vtable =
-        UniffiVTableCallbackInterfaceFileChangeListener.UniffiByValue(
-            `onChange`,
-            uniffiFree,
-        )
+    internal var vtable = UniffiVTableCallbackInterfaceFileChangeListener.UniffiByValue(
+        `onChange`,
+        uniffiFree,
+    )
 
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
@@ -4578,12 +4406,15 @@ internal object uniffiCallbackInterfaceFileChangeListener {
  *
  * @suppress
  */
-public object FfiConverterTypeFileChangeListener : FfiConverterCallbackInterface<FileChangeListener>()
+public object FfiConverterTypeFileChangeListener: FfiConverterCallbackInterface<FileChangeListener>()
+
+
+
 
 /**
  * @suppress
  */
-public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?> {
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
     override fun read(buf: ByteBuffer): kotlin.String? {
         if (buf.get().toInt() == 0) {
             return null
@@ -4599,10 +4430,7 @@ public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?
         }
     }
 
-    override fun write(
-        value: kotlin.String?,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -4612,10 +4440,13 @@ public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.String>> {
+public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
     override fun read(buf: ByteBuffer): List<kotlin.String> {
         val len = buf.getInt()
         return List<kotlin.String>(len) {
@@ -4629,10 +4460,7 @@ public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.St
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<kotlin.String>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
@@ -4640,10 +4468,13 @@ public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.St
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeFileOffer : FfiConverterRustBuffer<List<FileOffer>> {
+public object FfiConverterSequenceTypeFileOffer: FfiConverterRustBuffer<List<FileOffer>> {
     override fun read(buf: ByteBuffer): List<FileOffer> {
         val len = buf.getInt()
         return List<FileOffer>(len) {
@@ -4657,10 +4488,7 @@ public object FfiConverterSequenceTypeFileOffer : FfiConverterRustBuffer<List<Fi
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<FileOffer>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<FileOffer>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFileOffer.write(it, buf)
@@ -4668,10 +4496,13 @@ public object FfiConverterSequenceTypeFileOffer : FfiConverterRustBuffer<List<Fi
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeFirewallRuleInfo : FfiConverterRustBuffer<List<FirewallRuleInfo>> {
+public object FfiConverterSequenceTypeFirewallRuleInfo: FfiConverterRustBuffer<List<FirewallRuleInfo>> {
     override fun read(buf: ByteBuffer): List<FirewallRuleInfo> {
         val len = buf.getInt()
         return List<FirewallRuleInfo>(len) {
@@ -4685,10 +4516,7 @@ public object FfiConverterSequenceTypeFirewallRuleInfo : FfiConverterRustBuffer<
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<FirewallRuleInfo>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<FirewallRuleInfo>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFirewallRuleInfo.write(it, buf)
@@ -4696,10 +4524,13 @@ public object FfiConverterSequenceTypeFirewallRuleInfo : FfiConverterRustBuffer<
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeNetworkDetail : FfiConverterRustBuffer<List<NetworkDetail>> {
+public object FfiConverterSequenceTypeNetworkDetail: FfiConverterRustBuffer<List<NetworkDetail>> {
     override fun read(buf: ByteBuffer): List<NetworkDetail> {
         val len = buf.getInt()
         return List<NetworkDetail>(len) {
@@ -4713,10 +4544,7 @@ public object FfiConverterSequenceTypeNetworkDetail : FfiConverterRustBuffer<Lis
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<NetworkDetail>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<NetworkDetail>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNetworkDetail.write(it, buf)
@@ -4724,10 +4552,13 @@ public object FfiConverterSequenceTypeNetworkDetail : FfiConverterRustBuffer<Lis
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeNetworkHealth : FfiConverterRustBuffer<List<NetworkHealth>> {
+public object FfiConverterSequenceTypeNetworkHealth: FfiConverterRustBuffer<List<NetworkHealth>> {
     override fun read(buf: ByteBuffer): List<NetworkHealth> {
         val len = buf.getInt()
         return List<NetworkHealth>(len) {
@@ -4741,10 +4572,7 @@ public object FfiConverterSequenceTypeNetworkHealth : FfiConverterRustBuffer<Lis
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<NetworkHealth>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<NetworkHealth>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNetworkHealth.write(it, buf)
@@ -4752,10 +4580,13 @@ public object FfiConverterSequenceTypeNetworkHealth : FfiConverterRustBuffer<Lis
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypePeerInfo : FfiConverterRustBuffer<List<PeerInfo>> {
+public object FfiConverterSequenceTypePeerInfo: FfiConverterRustBuffer<List<PeerInfo>> {
     override fun read(buf: ByteBuffer): List<PeerInfo> {
         val len = buf.getInt()
         return List<PeerInfo>(len) {
@@ -4769,10 +4600,7 @@ public object FfiConverterSequenceTypePeerInfo : FfiConverterRustBuffer<List<Pee
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<PeerInfo>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<PeerInfo>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePeerInfo.write(it, buf)
@@ -4780,10 +4608,13 @@ public object FfiConverterSequenceTypePeerInfo : FfiConverterRustBuffer<List<Pee
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypePendingRequest : FfiConverterRustBuffer<List<PendingRequest>> {
+public object FfiConverterSequenceTypePendingRequest: FfiConverterRustBuffer<List<PendingRequest>> {
     override fun read(buf: ByteBuffer): List<PendingRequest> {
         val len = buf.getInt()
         return List<PendingRequest>(len) {
@@ -4797,10 +4628,7 @@ public object FfiConverterSequenceTypePendingRequest : FfiConverterRustBuffer<Li
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<PendingRequest>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<PendingRequest>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePendingRequest.write(it, buf)
@@ -4808,10 +4636,13 @@ public object FfiConverterSequenceTypePendingRequest : FfiConverterRustBuffer<Li
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeQueuedSend : FfiConverterRustBuffer<List<QueuedSend>> {
+public object FfiConverterSequenceTypeQueuedSend: FfiConverterRustBuffer<List<QueuedSend>> {
     override fun read(buf: ByteBuffer): List<QueuedSend> {
         val len = buf.getInt()
         return List<QueuedSend>(len) {
@@ -4825,10 +4656,7 @@ public object FfiConverterSequenceTypeQueuedSend : FfiConverterRustBuffer<List<Q
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<QueuedSend>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<QueuedSend>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeQueuedSend.write(it, buf)
@@ -4836,10 +4664,13 @@ public object FfiConverterSequenceTypeQueuedSend : FfiConverterRustBuffer<List<Q
     }
 }
 
+
+
+
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeTransfer : FfiConverterRustBuffer<List<Transfer>> {
+public object FfiConverterSequenceTypeTransfer: FfiConverterRustBuffer<List<Transfer>> {
     override fun read(buf: ByteBuffer): List<Transfer> {
         val len = buf.getInt()
         return List<Transfer>(len) {
@@ -4853,10 +4684,7 @@ public object FfiConverterSequenceTypeTransfer : FfiConverterRustBuffer<List<Tra
         return sizeForLength + sizeForItems
     }
 
-    override fun write(
-        value: List<Transfer>,
-        buf: ByteBuffer,
-    ) {
+    override fun write(value: List<Transfer>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeTransfer.write(it, buf)

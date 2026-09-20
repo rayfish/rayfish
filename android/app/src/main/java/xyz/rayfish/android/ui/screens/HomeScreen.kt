@@ -24,6 +24,8 @@ import uniffi.ray_mobile.NetworkConnState
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.QueuedSend
 import uniffi.ray_mobile.Status
+import uniffi.ray_mobile.Transfer
+import uniffi.ray_mobile.TransferState
 import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
@@ -56,6 +58,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     // the wrong person, or one aimed at a device that never comes back, can be
     // called off. Only these can be: a delivered offer is the recipient's.
     var queued by remember { mutableStateOf<List<QueuedSend>>(emptyList()) }
+    var transfers by remember { mutableStateOf<List<Transfer>>(emptyList()) }
 
     // Reflect the real data-plane state when status arrives, without stomping an in-flight toggle.
     LaunchedEffect(status?.running) {
@@ -139,6 +142,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 // would otherwise be invisible with no way to save them at all.
                 .filter { !(autoAccepting && it.ownDevice) || FileAutoAccept.hasGivenUp(it.id) }
             queued = runCatching { node.listQueuedSends() }.getOrDefault(emptyList())
+            transfers = runCatching { node.listTransfers() }.getOrDefault(emptyList())
             connects = runCatching { node.listConnectRequests() }.getOrDefault(emptyList())
             // Only registered networks can answer: an unregistered one has no
             // handler to ask, so polling it is a round trip that always fails.
@@ -224,8 +228,11 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         }
     }
 
+    val activeSends = transfers.filter {
+        it.outgoing && (it.state == TransferState.OFFERED || it.state == TransferState.TRANSFERRING)
+    }
     val hasNotifs = files.isNotEmpty() || connects.isNotEmpty() || joins.isNotEmpty() ||
-        accepting.isNotEmpty() || doneFiles.isNotEmpty() || queued.isNotEmpty()
+        accepting.isNotEmpty() || doneFiles.isNotEmpty() || queued.isNotEmpty() || activeSends.isNotEmpty()
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -267,6 +274,15 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                             title = q.filename,
                             subtitle = stringResource(R.string.home_waiting_for_peer, q.peer, formatSize(q.size)),
                             onCancel = { act { NodeHolder.get(context).cancelSend(q.id) } },
+                        )
+                    }
+                    activeSends.forEach { t ->
+                        ActiveSendRow(
+                            title = t.filename,
+                            subtitle = stringResource(R.string.home_sending_to_peer, t.peer, formatSize(t.size)),
+                            progress = if (t.size == 0uL) 0f else
+                                (t.transferred.toFloat() / t.size.toFloat()).coerceIn(0f, 1f),
+                            onCancel = { act { NodeHolder.get(context).cancelTransfer(t.id) } },
                         )
                     }
                     accepting.values.forEach { f -> FileTransferRow(f.filename, done = false) }
@@ -316,6 +332,23 @@ private fun QueuedSendRow(title: String, subtitle: String, onCancel: () -> Unit)
     Column {
         Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading, maxLines = 1)
         Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted)
+        TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+            Text(stringResource(R.string.action_cancel), color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun ActiveSendRow(title: String, subtitle: String, progress: Float, onCancel: () -> Unit) {
+    Column {
+        Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading, maxLines = 1)
+        Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted)
+        LinearProgressIndicator(
+            progress = { progress },
+            modifier = Modifier.fillMaxWidth(),
+            color = Rf.Rose500,
+            trackColor = Rf.CardBorder,
+        )
         TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
             Text(stringResource(R.string.action_cancel), color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
         }

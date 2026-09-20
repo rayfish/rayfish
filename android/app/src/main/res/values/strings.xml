@@ -81,6 +81,7 @@
     <string name="tunnel_running">running · this device %s</string>
     <string name="home_file_from">file · %1$s · from %2$s</string>
     <string name="home_waiting_for_peer">waiting for %1$s · %2$s</string>
+    <string name="home_sending_to_peer">sending to %1$s · %2$s</string>
     <string name="home_connect_request">connect request · %1$s · %2$ds</string>
     <string name="home_join_request">wants to join %1$s · %2$s</string>
     <plurals name="status_connected_networks">

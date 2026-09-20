@@ -240,7 +240,7 @@ pub(crate) fn queued_sends() -> ArgValueCompleter {
 
 fn file_queues() -> (Vec<ipc::PendingFileInfo>, Vec<ipc::OutboxFileInfo>) {
     ask(IpcMessage::ListFiles, |reply| match reply {
-        IpcMessage::FileList { files, outbox } => Some((files, outbox)),
+        IpcMessage::FileList { files, outbox, .. } => Some((files, outbox)),
         _ => None,
     })
     .unwrap_or_default()

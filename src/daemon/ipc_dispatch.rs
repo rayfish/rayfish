@@ -450,6 +450,7 @@ impl Daemon {
                 }
             }
             IpcMessage::CancelSend { id } => self.files.cancel_send(id),
+            IpcMessage::CancelTransfer { id } => self.files.cancel_transfer(id),
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => {
                 self.files.accept_file(id, output, peer_cred).await

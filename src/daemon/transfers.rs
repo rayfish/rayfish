@@ -213,6 +213,26 @@ impl TransferRegistry {
         }
     }
 
+    /// Cancel an outgoing offer or pull. Returns the blob identity so the
+    /// caller can release the sender's durable tag as well.
+    pub fn cancel(&self, id: u64) -> Option<(Hash, EndpointId)> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get_mut(&id)?;
+        if !entry.info.outgoing
+            || !matches!(
+                entry.info.state,
+                TransferState::Offered | TransferState::Transferring
+            )
+        {
+            return None;
+        }
+        let hash = entry.hash?;
+        let peer = entry.peer_id?;
+        finish_entry(entry, false, Some(FailureKind::Offer));
+        self.changed();
+        Some((hash, peer))
+    }
+
     /// A peer started pulling a blob. If the only entry for this `(hash, peer)`
     /// pair already finished as `Failed` from an aborted pull (not an offer that
     /// never reached the peer, see [`FailureKind`]), and it failed recently
