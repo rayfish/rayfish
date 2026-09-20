@@ -40,6 +40,7 @@ pub(crate) struct Transport {
     pub(crate) pkarr_relay_url: Url,
     /// Android keeps the TUN/DNS plane alive while suspending mesh transport
     /// after an idle period. The first packet resumes it before dialing.
+    #[cfg(target_os = "android")]
     pub(crate) suspended: Arc<AtomicBool>,
     #[cfg(target_os = "android")]
     pub(crate) activity_seq: Arc<AtomicU64>,
@@ -75,6 +76,7 @@ impl Transport {
             lan_peers: bootstrap.lan_peers,
             warm_lookup: bootstrap.warm_lookup,
             pkarr_relay_url: bootstrap.pkarr_relay_url,
+            #[cfg(target_os = "android")]
             suspended: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "android")]
             activity_seq: Arc::new(AtomicU64::new(0)),
@@ -83,6 +85,7 @@ impl Transport {
         }
     }
 
+    #[cfg(target_os = "android")]
     pub(crate) fn is_suspended(&self) -> bool {
         self.suspended.load(atomic::Ordering::Acquire)
     }
