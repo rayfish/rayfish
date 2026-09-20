@@ -258,12 +258,50 @@ impl NetworkRegistry {
         }
     }
 
+    /// Wake the transport without touching the TUN/DNS plane. Android uses this
+    /// when a packet arrives after the idle transport suspension.
+    #[cfg(target_os = "android")]
+    pub(crate) async fn wake_transport(&self) {
+        if self.transport.mark_awake() {
+            tracing::info!("waking suspended mesh transport");
+            for (url, config) in self.transport.relay_configs.iter() {
+                self.transport
+                    .endpoint
+                    .insert_relay(url.clone(), Arc::clone(config))
+                    .await;
+            }
+            self.transport.endpoint.network_change().await;
+            self.poll_nudge.notify_waiters();
+            tracing::info!("mesh transport restored after idle suspension");
+        }
+    }
+
+    /// Close mesh connections while keeping the endpoint, TUN and DNS alive.
+    /// Disconnect handling sees the suspended flag and must not start retries.
+    #[cfg(target_os = "android")]
+    pub(crate) async fn suspend_transport(&self) {
+        if !self.transport.mark_suspended() {
+            return;
+        }
+        tracing::info!("suspending idle mesh transport");
+        for (ip, conn) in self.peers.all_connections() {
+            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"android idle");
+            self.peers.remove(&ip);
+        }
+        for (url, _) in self.transport.relay_configs.iter() {
+            self.transport.endpoint.remove_relay(url).await;
+        }
+        tracing::info!("mesh transport suspended after idle timeout");
+    }
+
     /// The raw on-demand dial mechanism: connect to `target` across every shared
     /// network (bounded by [`LAZY_DIAL_TIMEOUT`]) and register its route, recording
     /// the outcome for status + cooldown. Returns whether a connection was
     /// established (the caller then flushes any buffered packets). The forwarding
     /// loop owns the buffering/dedup and calls this from a spawned task.
     pub(crate) async fn dial_target(self: &Arc<Self>, target: &peers::RouteTarget) -> bool {
+        #[cfg(target_os = "android")]
+        self.wake_transport().await;
         let targets: Vec<DialTarget> = target
             .networks
             .iter()

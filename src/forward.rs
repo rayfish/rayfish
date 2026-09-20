@@ -528,6 +528,14 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                 stats.record_drop(DropReason::Malformed);
                 continue;
             };
+            // Android keeps the TUN and DNS path alive while the iroh transport
+            // sleeps. Any packet is an explicit demand signal; wake before DNS
+            // handling or peer routing so the first mesh packet can be dialed.
+            #[cfg(target_os = "android")]
+            if let Some(reg) = dialer.as_ref() {
+                reg.transport.record_outgoing_activity();
+                reg.wake_transport().await;
+            }
             if is_magic_dns(&info) {
                 let Ok(permit) = Arc::clone(&dns_queries).try_acquire_owned() else {
                     stats.record_drop(DropReason::DnsConcurrency);
