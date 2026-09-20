@@ -6,8 +6,9 @@
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
 mod fragment;
+mod lazy_dial;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -28,6 +29,12 @@ use crate::firewall::{self, Direction, SharedFirewall};
 use crate::membership::is_overlay_ip;
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
+use lazy_dial::{LazyDialBuffers, MAX_IN_FLIGHT as LAZY_DIAL_MAX_IN_FLIGHT};
+#[cfg(test)]
+use lazy_dial::{
+    MAX_PACKETS_PER_PEER as LAZY_DIAL_MAX_PACKETS_PER_PEER,
+    MAX_PACKETS_TOTAL as LAZY_DIAL_MAX_PACKETS_TOTAL,
+};
 
 /// Maximum datagram size accepted from a peer, including the [`TAG_LEN`]-byte
 /// network handle prefix. Anything larger is dropped before being parsed or
@@ -72,19 +79,6 @@ pub(crate) fn untag_datagram(datagram: &[u8]) -> Option<(u16, &[u8])> {
 /// quinn and is freed as those datagrams are sent).
 const TX_POOL_CHUNK: usize = 64 * 1024;
 
-/// A disconnected peer gets enough retained traffic to cover a normal handshake
-/// without letting a burst to an offline route turn into an unbounded allocation.
-/// TCP, DNS, and QUIC all retry if their earliest packet is dropped, so preserving
-/// the oldest packets is more useful than queuing every new one during the
-/// five-second lazy-dial timeout.
-const LAZY_DIAL_MAX_PACKETS_PER_PEER: usize = 64;
-const LAZY_DIAL_MAX_BYTES_PER_PEER: usize = 128 * 1024;
-const LAZY_DIAL_MAX_PACKETS_TOTAL: usize = 512;
-const LAZY_DIAL_MAX_BYTES_TOTAL: usize = 1024 * 1024;
-/// Limit concurrent connection attempts.  The packet queues are bounded, but
-/// without this cap a large roster could still turn one local packet burst into
-/// one handshake task per unreachable peer.
-const LAZY_DIAL_MAX_IN_FLIGHT: usize = 16;
 /// Magic DNS forwarding may await an upstream resolver.  Keep enough requests
 /// in flight for normal browser parallelism while bounding task and socket use
 /// when a local app floods the resolver address.
@@ -101,60 +95,6 @@ pub(crate) const SSH_PORT: u16 = 22;
 /// source-port ranges so the outbound NAT (which matches `src_port == this`)
 /// can't collide with a kernel-assigned ephemeral port. See `crate::ssh`.
 pub(crate) const SSH_LISTEN_PORT: u16 = 30022;
-
-/// Packets retained while on-demand connection establishment is in flight.
-/// Owned solely by [`run_mesh`], so accounting needs no atomics or locks.
-#[derive(Default)]
-struct LazyDialBuffers {
-    by_peer: HashMap<EndpointId, LazyDialQueue>,
-    packets: usize,
-    bytes: usize,
-}
-
-#[derive(Default)]
-struct LazyDialQueue {
-    packets: VecDeque<Bytes>,
-    bytes: usize,
-}
-
-impl LazyDialBuffers {
-    /// Retain a packet if both the peer-local and process-wide budgets permit
-    /// it. At a limit we deliberately drop newest: packets already retained are
-    /// closer to the beginning of the flow and are more likely to make the first
-    /// connection useful.
-    fn push(&mut self, peer: EndpointId, packet: Bytes) -> bool {
-        let bytes = packet.len();
-        if self.packets >= LAZY_DIAL_MAX_PACKETS_TOTAL
-            || self.bytes.saturating_add(bytes) > LAZY_DIAL_MAX_BYTES_TOTAL
-        {
-            return false;
-        }
-
-        let queue = self.by_peer.entry(peer).or_default();
-        if queue.packets.len() >= LAZY_DIAL_MAX_PACKETS_PER_PEER
-            || queue.bytes.saturating_add(bytes) > LAZY_DIAL_MAX_BYTES_PER_PEER
-        {
-            return false;
-        }
-
-        queue.bytes += bytes;
-        queue.packets.push_back(packet);
-        self.packets += 1;
-        self.bytes += bytes;
-        true
-    }
-
-    /// Remove a peer's retained packets once its dial completes, returning them
-    /// in arrival order and releasing their budget immediately.
-    fn take(&mut self, peer: &EndpointId) -> VecDeque<Bytes> {
-        let Some(queue) = self.by_peer.remove(peer) else {
-            return VecDeque::new();
-        };
-        self.packets -= queue.packets.len();
-        self.bytes -= queue.bytes;
-        queue.packets
-    }
-}
 
 /// Userspace NAT that maps this node's mesh `:22` to/from the embedded SSH
 /// server's internal listen port ([`SSH_LISTEN_PORT`]). The kernel
@@ -499,6 +439,18 @@ pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
     info.dst_port == 53 && info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6)
 }
 
+/// The inputs and shared handles for one TUN forwarding loop.
+pub(crate) struct MeshForwarder<R> {
+    pub tun: R,
+    pub peers: PeerTable,
+    pub firewall: SharedFirewall,
+    pub token: CancellationToken,
+    pub stats: Arc<ForwardMetrics>,
+    pub resolver: Arc<dns::resolver::Resolver>,
+    pub tun_tx: mpsc::Sender<Bytes>,
+    pub dialer: Option<Arc<NetworkRegistry>>,
+}
+
 /// Main TUN read loop. Reads outgoing packets from the TUN device and sends each
 /// to its peer over QUIC. When there is no live connection to the destination, an
 /// on-demand node buffers the packet and dials the peer (see below); with no dialer
@@ -511,132 +463,134 @@ pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
 /// that reports back on `done`. When a dial completes the loop flushes that peer's
 /// buffered packets over the now-live route (or drops them if the dial failed). The
 /// dial itself runs off-loop, so a slow handshake never blocks forwarding.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
-    mut tun: R,
-    peers: PeerTable,
-    firewall: SharedFirewall,
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-    resolver: Arc<dns::resolver::Resolver>,
-    tun_tx: mpsc::Sender<Bytes>,
-    dialer: Option<Arc<NetworkRegistry>>,
-) -> Result<()> {
-    let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
-    // On-demand lazy-dial state, owned by this loop (no shared/locked buffer).
-    // `LazyDialBuffers` bounds retained bytes and packets both per peer and for
-    // the whole daemon, so an offline route cannot make the forwarding task grow
-    // without limit during a dial timeout.
-    let mut buffered = LazyDialBuffers::default();
-    let mut in_flight: HashSet<EndpointId> = HashSet::new();
-    let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
-    let dns_queries = Arc::new(Semaphore::new(DNS_QUERIES_MAX_IN_FLIGHT));
-    // Client-side exit-node selection (cheap Arc-backed clone), consulted for
-    // internet-bound packets. Default (no selection) when there is no registry.
-    let exit_client = dialer
-        .as_ref()
-        .map(|r| r.exit_client.clone())
-        .unwrap_or_default();
-    loop {
-        // Ensure a full MTU of contiguous spare capacity before reading (a short
-        // buffer would truncate the packet). `reserve` reuses the current chunk
-        // until it's exhausted, then allocates a fresh one, so allocation is
-        // amortized across many packets instead of paid per packet.
-        if pool.capacity() < MAX_PEER_DATAGRAM {
-            pool.reserve(TX_POOL_CHUNK);
-        }
-        // Race the read against cancellation and dial-completion. The read arm
-        // returns only the byte count so no borrow of `pool` escapes the `select!`
-        // (it's reused right below); the completion arm flushes inline and loops.
-        let n = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            result = tun.read_into(&mut pool) => result?,
-            Some((peer, connected)) = done_rx.recv() => {
-                in_flight.remove(&peer);
-                let pkts = buffered.take(&peer);
-                let ctx = SendCtx { firewall: &firewall, stats: &stats, tun_tx: &tun_tx };
-                flush_or_drop(&peers, &ctx, &exit_client, connected, pkts).await;
+impl<R: crate::tun::TunRead> MeshForwarder<R> {
+    pub(crate) async fn run(self) -> Result<()> {
+        let Self {
+            mut tun,
+            peers,
+            firewall,
+            token,
+            stats,
+            resolver,
+            tun_tx,
+            dialer,
+        } = self;
+        let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
+        // On-demand lazy-dial state, owned by this loop (no shared/locked buffer).
+        // `LazyDialBuffers` bounds retained bytes and packets both per peer and for
+        // the whole daemon, so an offline route cannot make the forwarding task grow
+        // without limit during a dial timeout.
+        let mut buffered = LazyDialBuffers::default();
+        let mut in_flight: HashSet<EndpointId> = HashSet::new();
+        let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
+        let dns_queries = Arc::new(Semaphore::new(DNS_QUERIES_MAX_IN_FLIGHT));
+        // Client-side exit-node selection (cheap Arc-backed clone), consulted for
+        // internet-bound packets. Default (no selection) when there is no registry.
+        let exit_client = dialer
+            .as_ref()
+            .map(|r| r.exit_client.clone())
+            .unwrap_or_default();
+        loop {
+            // Ensure a full MTU of contiguous spare capacity before reading (a short
+            // buffer would truncate the packet). `reserve` reuses the current chunk
+            // until it's exhausted, then allocates a fresh one, so allocation is
+            // amortized across many packets instead of paid per packet.
+            if pool.capacity() < MAX_PEER_DATAGRAM {
+                pool.reserve(TX_POOL_CHUNK);
+            }
+            // Race the read against cancellation and dial-completion. The read arm
+            // returns only the byte count so no borrow of `pool` escapes the `select!`
+            // (it's reused right below); the completion arm flushes inline and loops.
+            let n = tokio::select! {
+                _ = token.cancelled() => return Ok(()),
+                result = tun.read_into(&mut pool) => result?,
+                Some((peer, connected)) = done_rx.recv() => {
+                    in_flight.remove(&peer);
+                    let pkts = buffered.take(&peer);
+                    let ctx = SendCtx { firewall: &firewall, stats: &stats, tun_tx: &tun_tx };
+                    flush_or_drop(&peers, &ctx, &exit_client, connected, pkts).await;
+                    continue;
+                }
+            };
+            if n == 0 {
                 continue;
             }
-        };
-        if n == 0 {
-            continue;
-        }
-        // Zero-copy hand-off: slice the packet out of the pool as an owned
-        // `Bytes` sharing the chunk's allocation, no copy, no per-packet malloc.
-        let pkt = pool.split_to(n).freeze();
-        tracing::trace!(len = n, first_byte = pkt[0], "TUN read");
-        let Some(info) = firewall::parse_packet_info(&pkt) else {
-            // Not IP, truncated, or IPv6 carrying an extension header we refuse
-            // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
-            // logged: a UDP send past the TUN MTU arrives here as kernel-made
-            // fragments, and a silent drop reads as the link going quiet.
-            tracing::debug!(len = n, "outbound packet not classifiable, dropping");
-            stats.record_drop(DropReason::Malformed);
-            continue;
-        };
-        if is_magic_dns(&info) {
-            let Ok(permit) = Arc::clone(&dns_queries).try_acquire_owned() else {
-                stats.record_drop(DropReason::DnsConcurrency);
+            // Zero-copy hand-off: slice the packet out of the pool as an owned
+            // `Bytes` sharing the chunk's allocation, no copy, no per-packet malloc.
+            let pkt = pool.split_to(n).freeze();
+            tracing::trace!(len = n, first_byte = pkt[0], "TUN read");
+            let Some(info) = firewall::parse_packet_info(&pkt) else {
+                // Not IP, truncated, or IPv6 carrying an extension header we refuse
+                // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
+                // logged: a UDP send past the TUN MTU arrives here as kernel-made
+                // fragments, and a silent drop reads as the link going quiet.
+                tracing::debug!(len = n, "outbound packet not classifiable, dropping");
+                stats.record_drop(DropReason::Malformed);
                 continue;
             };
-            let resolver = Arc::clone(&resolver);
-            let tun_tx = tun_tx.clone();
-            let pkt = pkt.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                resolver.handle_tun_query(&pkt, &info, &tun_tx).await;
-            });
-            continue; // do not fall through to peer routing
-        }
-        let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
-            // No live connection to this destination (direct or via the exit peer).
-            // Dial the destination member itself for overlay traffic, or the
-            // configured exit peer for internet-bound traffic. Only known roster
-            // members are dialable.
-            let target = dialer.as_ref().and_then(|reg| {
-                let dst = dial_dst(&exit_client, info.dst_ip)?;
-                reg.resolve_route(dst)
-            });
-            let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
-                tracing::debug!(dst = %info.dst_ip, "no peer for dst");
-                stats.record_drop(DropReason::NoPeer);
-                continue;
-            };
-
-            let peer = target.endpoint_id;
-            if !in_flight.contains(&peer) && in_flight.len() >= LAZY_DIAL_MAX_IN_FLIGHT {
-                stats.record_drop(DropReason::LazyDialConcurrency);
-                continue;
-            }
-            // Buffer a bounded beginning of the flow so its first packets aren't
-            // lost once connected. A single dial per peer runs at a time
-            // (in_flight dedup) and is bounded by LAZY_DIAL_TIMEOUT; on completion
-            // `done` flushes the retained packets (success) or drops them
-            // (timeout/failure). Once either retention budget is full, drop newest
-            // rather than allowing an unreachable peer to accumulate unbounded
-            // memory.
-            if !buffered.push(peer, pkt) {
-                stats.record_drop(DropReason::LazyDialBufferFull);
-            }
-
-            if in_flight.insert(peer) {
-                let reg = Arc::clone(reg);
-                let done = done_tx.clone();
+            if is_magic_dns(&info) {
+                let Ok(permit) = Arc::clone(&dns_queries).try_acquire_owned() else {
+                    stats.record_drop(DropReason::DnsConcurrency);
+                    continue;
+                };
+                let resolver = Arc::clone(&resolver);
+                let tun_tx = tun_tx.clone();
+                let pkt = pkt.clone();
                 tokio::spawn(async move {
-                    let connected = reg.dial_target(&target).await;
-                    let _ = done.send((peer, connected)).await;
+                    let _permit = permit;
+                    resolver.handle_tun_query(&pkt, &info, &tun_tx).await;
                 });
+                continue; // do not fall through to peer routing
             }
+            let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
+                // No live connection to this destination (direct or via the exit peer).
+                // Dial the destination member itself for overlay traffic, or the
+                // configured exit peer for internet-bound traffic. Only known roster
+                // members are dialable.
+                let target = dialer.as_ref().and_then(|reg| {
+                    let dst = dial_dst(&exit_client, info.dst_ip)?;
+                    reg.resolve_route(dst)
+                });
+                let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
+                    tracing::debug!(dst = %info.dst_ip, "no peer for dst");
+                    stats.record_drop(DropReason::NoPeer);
+                    continue;
+                };
 
-            continue;
-        };
-        let ctx = SendCtx {
-            firewall: &firewall,
-            stats: &stats,
-            tun_tx: &tun_tx,
-        };
-        send_over_route(&ctx, &route, &info, pkt).await;
+                let peer = target.endpoint_id;
+                if !in_flight.contains(&peer) && in_flight.len() >= LAZY_DIAL_MAX_IN_FLIGHT {
+                    stats.record_drop(DropReason::LazyDialConcurrency);
+                    continue;
+                }
+                // Buffer a bounded beginning of the flow so its first packets aren't
+                // lost once connected. A single dial per peer runs at a time
+                // (in_flight dedup) and is bounded by LAZY_DIAL_TIMEOUT; on completion
+                // `done` flushes the retained packets (success) or drops them
+                // (timeout/failure). Once either retention budget is full, drop newest
+                // rather than allowing an unreachable peer to accumulate unbounded
+                // memory.
+                if !buffered.push(peer, pkt) {
+                    stats.record_drop(DropReason::LazyDialBufferFull);
+                }
+
+                if in_flight.insert(peer) {
+                    let reg = Arc::clone(reg);
+                    let done = done_tx.clone();
+                    tokio::spawn(async move {
+                        let connected = reg.dial_target(&target).await;
+                        let _ = done.send((peer, connected)).await;
+                    });
+                }
+
+                continue;
+            };
+            let ctx = SendCtx {
+                firewall: &firewall,
+                stats: &stats,
+                tun_tx: &tun_tx,
+            };
+            send_over_route(&ctx, &route, &info, pkt).await;
+        }
     }
 }
 

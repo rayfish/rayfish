@@ -54,25 +54,33 @@
 //! on this box", so admitting it would hand every local user a root shell. On
 //! the host itself, use the host sshd (`ssh localhost`), which authenticates.
 
+mod authz;
+mod host_keys;
+mod login;
+mod permissions;
+mod session;
+mod session_env;
+
 use std::collections::HashMap;
-use std::io::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 use bytes::Bytes;
 use iroh::EndpointId;
 use pty_process::Size;
-use russh::keys::{Algorithm, PrivateKey};
+#[cfg(test)]
+use russh::keys::Algorithm;
+use russh::keys::PrivateKey;
 use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
+#[cfg(test)]
 use smol_str::SmolStr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -82,6 +90,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::peers::{DeviceUserMap, PeerTable};
+pub use authz::{SshAuthz, new_authz};
+use authz::{UserPolicy, auth_banner, resolve_user_policy};
+use host_keys::{load_host_key, sftp_subsystem_command};
+#[cfg(test)]
+use host_keys::{parse_hostkey_paths, parse_sftp_subsystem};
+use login::{LoginInfo, resolve_login};
+use permissions::{account_can, hand_over};
+use session::{Exit, SessionSpec, signal_number};
+use session_env::{drop_privs, env_accepted, login_env, login_program, tty_name};
 
 // The port a stock `ssh` client targets (`ssh user@host.ray`) and the internal
 // port the embedded server actually binds. Both live in `crate::forward` (the
@@ -119,129 +136,6 @@ fn server_config(key: PrivateKey) -> Config {
         auth_rejection_time: Duration::from_secs(1),
         ..Default::default()
     }
-}
-
-/// Per-network SSH authorization snapshot: network name -> the network's SSH
-/// allow rules (peer + permitted login users). Held in an [`ArcSwap`] so
-/// `ray firewall ssh allow/deny` updates are picked up by a live listener
-/// without a restart.
-pub type SshAuthz = Arc<ArcSwap<HashMap<String, Vec<crate::config::SshRule>>>>;
-
-/// Build an empty authorization snapshot.
-pub fn new_authz() -> SshAuthz {
-    Arc::new(ArcSwap::from_pointee(HashMap::new()))
-}
-
-/// The set of local unix accounts a peer may log in as, accumulated across the
-/// networks shared with it. `*` (any user, including root) wins over everything;
-/// an allow rule with no explicit users grants the non-root default; explicit
-/// usernames grant exactly those. The per-user check is by **uid** so a uid-0
-/// account under a non-`root` name can't slip past the non-root default.
-#[derive(Default, Debug, PartialEq)]
-struct UserPolicy {
-    /// Some rule matched this peer (it may open a session at all).
-    matched: bool,
-    /// A rule granted `*`: any user, including root.
-    any: bool,
-    /// A rule granted the default (no explicit users): any non-root user.
-    nonroot: bool,
-    /// Explicitly named users.
-    users: std::collections::HashSet<String>,
-}
-
-impl UserPolicy {
-    /// Fold one matching rule's `users` list into the policy.
-    fn add(&mut self, users: &[String]) {
-        self.matched = true;
-        if users.iter().any(|u| u == "*") {
-            self.any = true;
-        } else if users.is_empty() {
-            self.nonroot = true;
-        } else {
-            self.users.extend(users.iter().cloned());
-        }
-    }
-
-    /// Whether the peer is authorized to open a session at all (before the
-    /// per-user check). No matching rule => reject every auth attempt.
-    fn authorized(&self) -> bool {
-        self.matched
-    }
-
-    /// Whether the requested login (`name`, resolved to `uid`) is permitted.
-    fn permits(&self, name: &str, uid: u32) -> bool {
-        self.any || self.users.contains(name) || (self.nonroot && uid != 0)
-    }
-
-    /// Which logins this policy grants, phrased for the SSH banner. `None` when
-    /// the policy allows every user, since there is nothing the client needs
-    /// warning about.
-    fn restriction(&self) -> Option<String> {
-        if self.any {
-            return None;
-        }
-        let mut named: Vec<&str> = self.users.iter().map(String::as_str).collect();
-        named.sort_unstable();
-        Some(match (self.nonroot, named.is_empty()) {
-            (true, true) => "any user except root".to_string(),
-            (true, false) => format!("any user except root, plus {}", named.join(", ")),
-            (false, false) => named.join(", "),
-            (false, true) => "no users".to_string(),
-        })
-    }
-}
-
-/// The banner shown before authentication, or `None` when this peer can log in
-/// unrestricted and there is nothing to explain.
-///
-/// Without it a rejection is invisible: mesh SSH offers only the `none` method,
-/// so a client that is refused silently falls through to whatever the *system*
-/// sshd offers and prompts for a password. Every mesh SSH authorization problem
-/// then presents as "why is it asking for a password", or worse as a network
-/// fault, with the real reason only in this node's log where the person
-/// connecting cannot see it. Say it on the wire instead.
-fn auth_banner(policy: &UserPolicy, peer: &EndpointId, networks: &[SmolStr]) -> Option<String> {
-    let net = networks
-        .iter()
-        .min()
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "<network>".to_string());
-    if !policy.authorized() {
-        return Some(format!(
-            "rayfish mesh SSH: peer {} is not authorized on this node.\r\n\
-             Authorize it here with: ray firewall ssh allow {net} {} [-u <users>]\r\n\
-             A password prompt after this line comes from the system sshd, not rayfish.\r\n",
-            peer.fmt_short(),
-            peer.fmt_short(),
-        ));
-    }
-    policy.restriction().map(|allowed| {
-        format!(
-            "rayfish mesh SSH: peer {} may log in as {allowed}.\r\n\
-             Widen it with: ray firewall ssh allow {net} {} -u '*'\r\n",
-            peer.fmt_short(),
-            peer.fmt_short(),
-        )
-    })
-}
-
-/// Accumulate the login policy for `user` (a peer's user identity) across the
-/// networks we currently share with it: every allow rule whose `peer` is `"*"`
-/// or this identity contributes its permitted users.
-fn resolve_user_policy(authz: &SshAuthz, user: &EndpointId, networks: &[SmolStr]) -> UserPolicy {
-    let map = authz.load();
-    let id = user.to_string();
-    let mut policy = UserPolicy::default();
-    for net in networks {
-        if let Some(rules) = map.get(net.as_str()) {
-            for rule in rules {
-                if rule.peer == "*" || rule.peer == id {
-                    policy.add(&rule.users);
-                }
-            }
-        }
-    }
-    policy
 }
 
 /// Handle to a running SSH server so the daemon can stop it on `ray down` /
@@ -1343,70 +1237,6 @@ impl Handler for SshHandler {
     }
 }
 
-/// How a session's process ended. SSH reports the two cases differently, and a
-/// client that gets a status for a signalled process prints a wrong exit code.
-enum Exit {
-    Code(u32),
-    Signal(Sig),
-}
-
-impl Exit {
-    fn from_status(status: std::process::ExitStatus) -> Self {
-        use std::os::unix::process::ExitStatusExt;
-        match (status.code(), status.signal()) {
-            (Some(code), _) => Exit::Code(code as u32),
-            (None, Some(sig)) => Exit::Signal(signal_name(sig)),
-            (None, None) => Exit::Code(0),
-        }
-    }
-}
-
-/// The SSH name of a unix signal number. The protocol names a fixed set; the
-/// rest go over the wire as their number, which is what OpenSSH does too.
-fn signal_name(sig: i32) -> Sig {
-    match sig {
-        libc::SIGABRT => Sig::ABRT,
-        libc::SIGALRM => Sig::ALRM,
-        libc::SIGFPE => Sig::FPE,
-        libc::SIGHUP => Sig::HUP,
-        libc::SIGILL => Sig::ILL,
-        libc::SIGINT => Sig::INT,
-        libc::SIGKILL => Sig::KILL,
-        libc::SIGPIPE => Sig::PIPE,
-        libc::SIGQUIT => Sig::QUIT,
-        libc::SIGSEGV => Sig::SEGV,
-        libc::SIGTERM => Sig::TERM,
-        libc::SIGUSR1 => Sig::USR1,
-        other => Sig::Custom(other.to_string()),
-    }
-}
-
-/// The unix signal a client's `signal` request names, or `None` for a name this
-/// host has no signal for.
-fn signal_number(sig: &Sig) -> Option<i32> {
-    Some(match sig {
-        Sig::ABRT => libc::SIGABRT,
-        Sig::ALRM => libc::SIGALRM,
-        Sig::FPE => libc::SIGFPE,
-        Sig::HUP => libc::SIGHUP,
-        Sig::ILL => libc::SIGILL,
-        Sig::INT => libc::SIGINT,
-        Sig::KILL => libc::SIGKILL,
-        Sig::PIPE => libc::SIGPIPE,
-        Sig::QUIT => libc::SIGQUIT,
-        Sig::SEGV => libc::SIGSEGV,
-        Sig::TERM => libc::SIGTERM,
-        Sig::USR1 => libc::SIGUSR1,
-        Sig::Custom(name) => match name.as_str() {
-            "USR2" => libc::SIGUSR2,
-            "TSTP" => libc::SIGTSTP,
-            "CONT" => libc::SIGCONT,
-            "WINCH" => libc::SIGWINCH,
-            _ => return None,
-        },
-    })
-}
-
 /// Pump an SSH channel and a local socket against each other until either side
 /// closes, then end the channel. Every forwarded connection is this: the
 /// channel *is* the socket, whichever side asked for it.
@@ -1452,14 +1282,6 @@ fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf
     Ok((dir, listener, path))
 }
 
-/// Environment variables a client may set on a session (`ssh -o SendEnv=` /
-/// `SetEnv=`). Locale and terminal hints only, the same shape as the stock
-/// `AcceptEnv LANG LC_*`: anything else lets the peer steer the login shell
-/// (`LD_PRELOAD`, `PATH`, `BASH_ENV`) instead of just describing itself.
-fn env_accepted(name: &str) -> bool {
-    matches!(name, "LANG" | "TZ" | "COLORTERM" | "TERM") || name.starts_with("LC_")
-}
-
 /// Which local address an `ssh -R` listener binds. A reverse forward publishes
 /// the *peer's* service on this host, so a wildcard or external bind address is
 /// narrowed to loopback, exactly what a stock sshd does with its default
@@ -1476,179 +1298,6 @@ fn reverse_bind_addr(address: &str) -> IpAddr {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         }
     }
-}
-
-/// Whether `info`'s account has `want` (a unix permission triad: 4 read, 2
-/// write, 1 execute/search) on `path`.
-///
-/// Unix-socket forwarding is the one place where the daemon's root privilege
-/// would buy the peer something a shell wouldn't: the filesystem *is* the
-/// access control on a socket, and connecting as root ignores it. So the
-/// permission the login account has is checked here first. Like any check made
-/// before the open, it is not atomic against a path swapped underneath it; it
-/// stops the peer reaching sockets its account plainly cannot, not a local user
-/// racing their own directory.
-fn account_can(path: &Path, info: &LoginInfo, want: u32) -> bool {
-    if info.uid == 0 {
-        return true;
-    }
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    let mode = meta.permissions().mode();
-    let bits = if meta.uid() == info.uid {
-        (mode >> 6) & 7
-    } else if meta.gid() == info.gid || in_group(info, meta.gid()) {
-        (mode >> 3) & 7
-    } else {
-        mode & 7
-    };
-    bits & want == want
-}
-
-/// Whether the account is a member of `gid` through its supplementary groups.
-fn in_group(info: &LoginInfo, gid: u32) -> bool {
-    uzers::get_user_groups(&info.name, info.gid)
-        .map(|groups| groups.iter().any(|g| g.gid() == gid))
-        .unwrap_or(false)
-}
-
-/// Hand `path` to the login account with `mode`, so a socket this root daemon
-/// created is usable by (and only by) the user whose session it belongs to.
-fn hand_over(path: &Path, info: &LoginInfo, mode: u32) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting mode on {}", path.display()))?;
-    std::os::unix::fs::chown(path, Some(info.uid), Some(info.gid))
-        .with_context(|| format!("handing {} to {}", path.display(), info.name))?;
-    Ok(())
-}
-
-/// The resolved local account a session logs in as. Held in an [`Arc`] on the
-/// handler and cloned per channel, since every session on one connection logs
-/// in as the same account.
-struct LoginInfo {
-    uid: u32,
-    gid: u32,
-    home: PathBuf,
-    shell: PathBuf,
-    name: String,
-}
-
-/// Resolve the requested unix user via `getpwnam`.
-fn resolve_login(login_user: &str) -> Result<LoginInfo> {
-    use uzers::os::unix::UserExt;
-    let pw = uzers::get_user_by_name(login_user)
-        .with_context(|| format!("no such local user: {login_user}"))?;
-    Ok(LoginInfo {
-        uid: pw.uid(),
-        gid: pw.primary_group_id(),
-        home: pw.home_dir().to_path_buf(),
-        shell: pw.shell().to_path_buf(),
-        name: pw.name().to_string_lossy().to_string(),
-    })
-}
-
-/// The `login(1)` this host has, or `None` when the handoff cannot be used.
-///
-/// It needs root (it does the setuid itself) and an actual login binary, so a
-/// daemon running unprivileged, or a host without one (a minimal container),
-/// falls back to spawning the shell directly. `RAYFISH_SSH_NO_LOGIN` turns the
-/// handoff off, for a host whose `login` does something surprising.
-fn login_program() -> Option<PathBuf> {
-    if uzers::get_effective_uid() != 0 || std::env::var_os("RAYFISH_SSH_NO_LOGIN").is_some() {
-        return None;
-    }
-    ["/bin/login", "/usr/bin/login"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| {
-            std::fs::metadata(p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
-}
-
-/// The terminal a pty's child end will see, for `SSH_TTY`.
-fn tty_name(pts: &impl std::os::fd::AsRawFd) -> Option<String> {
-    let mut buf = [0 as libc::c_char; 128];
-    // SAFETY: `buf` is a live array of `buf.len()` chars; ttyname_r writes a
-    // NUL-terminated name into it or returns non-zero without touching it.
-    let rc = unsafe { libc::ttyname_r(pts.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
-    if rc != 0 {
-        return None;
-    }
-    // SAFETY: ttyname_r returned success, so `buf` holds a NUL-terminated name.
-    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-    name.to_str().ok().map(str::to_string)
-}
-
-/// Build a `pre_exec` closure that drops the root daemon's privileges to the
-/// target user **completely**: supplementary groups first (`initgroups`, so the
-/// child does NOT inherit root's groups like gid 0/wheel), then `setgid`, then
-/// `setuid`, in that order. It runs as root in the forked child just before
-/// `exec`. **Fails closed:** if any step errors, the closure returns an error so
-/// `exec` never happens and the shell never runs with leftover privileges.
-fn drop_privs(
-    uid: u32,
-    gid: u32,
-    name: &str,
-) -> Result<impl FnMut() -> std::io::Result<()> + Send + Sync + 'static> {
-    let cname = std::ffi::CString::new(name).context("user name contains NUL")?;
-    // Nothing to drop when the server already *is* the target account. The
-    // daemon runs as root in production, so uid 0 never takes this branch and
-    // the drop below is unchanged there; it is the unprivileged case (a
-    // hand-run daemon, or the tests) where these calls would fail with EPERM
-    // and fail the session closed even though the child gains nothing.
-    // SAFETY: geteuid/getegid take no arguments and cannot fail.
-    let already_dropped =
-        uid != 0 && unsafe { libc::geteuid() } == uid && unsafe { libc::getegid() } == gid;
-    Ok(move || {
-        if already_dropped {
-            return Ok(());
-        }
-        // SAFETY: only direct syscalls, in the child after fork, before exec.
-        unsafe {
-            #[cfg(target_os = "macos")]
-            let basegroup = gid as libc::c_int;
-            #[cfg(not(target_os = "macos"))]
-            let basegroup = gid as libc::gid_t;
-            if libc::initgroups(cname.as_ptr(), basegroup) != 0 {
-                return Err(Error::last_os_error());
-            }
-            if libc::setgid(gid as libc::gid_t) != 0 {
-                return Err(Error::last_os_error());
-            }
-            if libc::setuid(uid as libc::uid_t) != 0 {
-                return Err(Error::last_os_error());
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Apply the common login environment to a command builder.
-fn login_env<'a>(home: &Path, shell: &Path, name: &str) -> [(&'a str, std::ffi::OsString); 5] {
-    [
-        ("HOME", home.into()),
-        ("USER", name.into()),
-        ("LOGNAME", name.into()),
-        ("SHELL", shell.into()),
-        (
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-        ),
-    ]
-}
-
-/// What a session runs and who it runs as: everything the two session paths
-/// need beyond the channel itself.
-struct SessionSpec {
-    info: Arc<LoginInfo>,
-    /// The `exec` command, or `None` for a login shell.
-    command: Option<String>,
-    env: Vec<(String, String)>,
-    child_proc: ChildProc,
-    origin: Origin,
 }
 
 /// Allocate a PTY, spawn the login shell (or `exec` command) as the requested
@@ -1877,147 +1526,6 @@ async fn run_pipe_session(
     let _ = err_task.await;
     stdin_task.abort();
     Ok(Exit::from_status(status))
-}
-
-/// Load the SSH host key the embedded server presents.
-///
-/// Prefers the machine's real OpenSSH ed25519 host key so a stock client that
-/// already trusts the host keeps seeing the same fingerprint once the mesh SSH
-/// NAT takes over `:22` (no `known_hosts` mismatch). Falls back to a persisted
-/// generated key when no usable host key is found.
-fn load_host_key() -> Result<PrivateKey> {
-    if let Some((path, key)) = discover_host_ed25519_key() {
-        info!(path = %path.display(), "mesh SSH: reusing host ed25519 key");
-        return Ok(key);
-    }
-    let key = load_or_generate_host_key()?;
-    // Loud, because the consequence lands on whoever connects, not here. With no
-    // system sshd key to reuse (a container with no `/etc/ssh`, a host with no
-    // sshd, an encrypted key) we present a key of our own, so a client that has
-    // this host in `known_hosts` from a LAN or public-IP session sees a different
-    // key for the same name and OpenSSH reports it as a possible MITM. Print the
-    // fingerprint so the operator can compare and confirm the swap themselves.
-    warn!(
-        fingerprint = %key.public_key().fingerprint(Default::default()),
-        "mesh SSH: no reusable system sshd host key found; serving a generated one. \
-         Clients that already know this host by another address will see a host-key \
-         change for the mesh name"
-    );
-    Ok(key)
-}
-
-/// Run `sshd -T` and return the first configured ed25519 host key that loads
-/// unencrypted, together with its path. Best-effort: any failure (no `sshd`,
-/// dump error, no ed25519 key, unreadable or encrypted key) yields `None`, so
-/// the caller falls back to the generated key. The daemon is root, so it can
-/// read the `0600` host key files.
-fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
-    let dump = run_sshd_dump()?;
-    for path in parse_hostkey_paths(&dump) {
-        let Ok(pem) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        match PrivateKey::from_openssh(&pem) {
-            Ok(key) if !key.is_encrypted() && key.algorithm() == Algorithm::Ed25519 => {
-                return Some((path, key));
-            }
-            _ => continue,
-        }
-    }
-    None
-}
-
-/// Dump the effective sshd config (`sshd -T`). Tries `sshd` on `PATH` then the
-/// common absolute locations, since the daemon's `PATH` may not include
-/// `/usr/sbin`. Returns `None` if none run successfully.
-fn run_sshd_dump() -> Option<String> {
-    for bin in ["sshd", "/usr/sbin/sshd", "/usr/local/sbin/sshd"] {
-        match std::process::Command::new(bin)
-            .arg("-T")
-            .stderr(Stdio::null())
-            .output()
-        {
-            Ok(out) if out.status.success() => return String::from_utf8(out.stdout).ok(),
-            _ => continue,
-        }
-    }
-    None
-}
-
-/// Extract the `hostkey <path>` entries from `sshd -T` output, in order. `sshd`
-/// prints one lowercase directive per line; other directives are ignored.
-fn parse_hostkey_paths(dump: &str) -> Vec<PathBuf> {
-    dump.lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let directive = parts.next()?;
-            directive
-                .eq_ignore_ascii_case("hostkey")
-                .then(|| parts.next().map(PathBuf::from))
-                .flatten()
-        })
-        .collect()
-}
-
-/// Where the OpenSSH sftp-server binary lives, per distribution. Used when the
-/// host has no sshd to ask (a container, or a machine where mesh SSH *is* the
-/// SSH server); all of these are shell-safe as written.
-const SFTP_SERVER_PATHS: [&str; 5] = [
-    "/usr/lib/openssh/sftp-server",     // Debian, Ubuntu
-    "/usr/libexec/openssh/sftp-server", // Fedora, RHEL, SUSE
-    "/usr/libexec/sftp-server",         // macOS, BSD
-    "/usr/lib/ssh/sftp-server",         // Arch, Alpine
-    "/usr/lib/sftp-server",             // last resort
-];
-
-/// The shell command that serves the `sftp` subsystem, or `None` when this host
-/// has no sftp-server to run.
-///
-/// Prefers whatever the host's own sshd is configured to use, arguments and all
-/// (`sshd -T` prints `subsystem sftp <command>`), so a non-default location or
-/// an admin's logging flags are honoured. Falls back to the standard paths.
-fn sftp_subsystem_command() -> Option<String> {
-    if let Some(cmd) = run_sshd_dump().as_deref().and_then(parse_sftp_subsystem) {
-        return Some(cmd);
-    }
-    SFTP_SERVER_PATHS
-        .iter()
-        .find(|path| Path::new(path).is_file())
-        .map(|path| (*path).to_string())
-}
-
-/// Extract the `subsystem sftp <command>` entry from `sshd -T` output, keeping
-/// any arguments. Rejects a command that isn't an absolute path: sshd's
-/// `internal-sftp` is code inside sshd itself, not a binary we can spawn.
-fn parse_sftp_subsystem(dump: &str) -> Option<String> {
-    dump.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        if !parts.next()?.eq_ignore_ascii_case("subsystem") || parts.next()? != "sftp" {
-            return None;
-        }
-        let rest = parts.collect::<Vec<_>>();
-        let binary = Path::new(rest.first()?);
-        (binary.is_absolute() && binary.is_file()).then(|| rest.join(" "))
-    })
-}
-
-/// Load the persisted SSH host key, generating and persisting one on first use.
-/// Stored as OpenSSH PEM at `<config_dir>/ssh_host_key`, mode 0600.
-fn load_or_generate_host_key() -> Result<PrivateKey> {
-    use russh::keys::ssh_key::LineEnding;
-
-    let path = crate::config::config_dir()?.join("ssh_host_key");
-    if path.exists() {
-        let pem = std::fs::read_to_string(&path).context("reading ssh host key")?;
-        return PrivateKey::from_openssh(&pem).context("parsing ssh host key");
-    }
-    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
-        .context("generating ssh host key")?;
-    let pem = key
-        .to_openssh(LineEnding::LF)
-        .context("encoding ssh host key")?;
-    crate::config::write_file(&path, pem.as_bytes(), true)?;
-    Ok(key)
 }
 
 #[cfg(test)]
