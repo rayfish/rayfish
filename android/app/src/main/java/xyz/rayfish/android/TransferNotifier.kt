@@ -270,6 +270,26 @@ object TransferNotifier {
             // swipe it away at all) for every send nobody ever accepts.
             .setOngoing(newState.transferring)
             .setOnlyAlertOnce(true)
+        if (t.outgoing && (t.state == TransferState.OFFERED || t.state == TransferState.TRANSFERRING)) {
+            val cancel = Intent(context, TransferCancelReceiver::class.java)
+                .putExtra(TransferCancelReceiver.EXTRA_ID, t.id.toLong())
+            val pending = PendingIntent.getBroadcast(
+                context,
+                notifId(t.id) + 1,
+                cancel,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    android.graphics.drawable.Icon.createWithResource(
+                        context,
+                        android.R.drawable.ic_menu_close_clear_cancel,
+                    ),
+                    context.getString(R.string.action_cancel),
+                    pending,
+                ).build(),
+            )
+        }
         if (waiting || t.size == 0uL) {
             builder.setProgress(0, 0, true)
         } else {

@@ -938,6 +938,18 @@ impl Node {
         }
     }
 
+    /// Cancel an outgoing transfer that has already been offered or started.
+    pub fn cancel_transfer(&self, id: u64) -> Result<(), RayError> {
+        let state = self.state()?;
+        match state.cancel_transfer(id) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!(
+                "unexpected cancel response: {other:?}"
+            ))),
+        }
+    }
+
     /// In-flight and recently finished transfers, both directions. Terminal entries
     /// linger for 60s so a poller can see them before they expire. Cheap: safe to
     /// poll on a timer while a notification is on screen.

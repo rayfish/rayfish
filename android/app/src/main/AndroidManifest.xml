@@ -35,6 +35,10 @@
             android:authorities="${applicationId}.SentryInitProvider"
             tools:node="remove" />
 
+        <receiver
+            android:name=".TransferCancelReceiver"
+            android:exported="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -70,10 +70,10 @@ impl FileService {
     ///
     /// Best-effort and detached: a failed reclaim wastes disk, it never fails
     /// the transfer that triggered it, so the error is logged and swallowed.
-    fn reclaim_blob(self: &Arc<Self>, tag: String) {
-        let svc = Arc::clone(self);
+    fn reclaim_blob(&self, tag: String) {
+        let store = self.transport.blob_store.clone();
         tokio::spawn(async move {
-            if let Err(e) = svc.transport.blob_store.tags().delete(&tag).await {
+            if let Err(e) = store.tags().delete(&tag).await {
                 tracing::warn!(%tag, error = %e, "could not drop blob tag");
             }
         });
@@ -913,6 +913,24 @@ impl FileService {
         }
     }
 
+    /// Cancel an outgoing transfer after its offer was delivered. A packet
+    /// already in flight may finish, but this transfer cannot be revived and
+    /// the local blob is released for GC.
+    pub(crate) fn cancel_transfer(&self, id: u64) -> IpcMessage {
+        match self.transfers.cancel(id) {
+            Some((hash, peer)) => {
+                self.reclaim_blob(blob_tags::send(
+                    &blake3::Hash::from_bytes(*hash.as_bytes()),
+                    &peer,
+                ));
+                IpcMessage::Ok {
+                    message: format!("canceled file transfer {id}"),
+                }
+            }
+            None => ipc_err(format!("no active outgoing transfer with id {id}")),
+        }
+    }
+
     /// Persist the outbox (atomic write via `config::write_file`). Filenames
     /// and peers are not secrets in the config-dir threat model, but keep the
     /// file root-only like the rest of the daemon state.
@@ -956,7 +974,30 @@ impl FileService {
                 size: e.size,
             })
             .collect();
-        IpcMessage::FileList { files, outbox }
+        let transfers = self
+            .transfers
+            .list()
+            .into_iter()
+            .map(|t| ipc::TransferFileInfo {
+                id: t.id,
+                outgoing: t.outgoing,
+                peer: t.peer,
+                filename: t.filename,
+                size: t.size,
+                transferred: t.transferred,
+                state: match t.state {
+                    transfers::TransferState::Offered => ipc::TransferFileState::Offered,
+                    transfers::TransferState::Transferring => ipc::TransferFileState::Transferring,
+                    transfers::TransferState::Done => ipc::TransferFileState::Done,
+                    transfers::TransferState::Failed => ipc::TransferFileState::Failed,
+                },
+            })
+            .collect();
+        IpcMessage::FileList {
+            files,
+            outbox,
+            transfers,
+        }
     }
 
     /// Decline a pending file offer: drop it from the queue without fetching the

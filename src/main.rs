@@ -1086,6 +1086,11 @@ pub(crate) enum FilesAction {
         #[arg(add = complete::queued_sends())]
         id: u64,
     },
+    /// Cancel an outgoing transfer that has already been offered or started
+    CancelTransfer {
+        /// Transfer ID (from 'ray files')
+        id: u64,
+    },
     /// Auto-accept offers from your own devices (on|off)
     ///
     /// Per network, and only for your own paired devices. `on` also drains any

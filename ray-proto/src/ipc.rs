@@ -267,6 +267,10 @@ pub enum IpcMessage {
     CancelSend {
         id: u64,
     },
+    /// Cancel an outgoing transfer that has already been offered or started.
+    CancelTransfer {
+        id: u64,
+    },
     AcceptFile {
         id: u64,
         output: Option<String>,
@@ -580,6 +584,9 @@ pub enum IpcMessage {
         /// that predate queued sends.
         #[serde(default)]
         outbox: Vec<OutboxFileInfo>,
+        /// In-flight and recently finished transfers.
+        #[serde(default)]
+        transfers: Vec<TransferFileInfo>,
     },
     PairingTicket {
         ticket: String,
@@ -828,6 +835,25 @@ pub struct PendingFileInfo {
     /// devices (used by the mobile UI to auto-accept own-device offers).
     #[serde(default)]
     pub own_device: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TransferFileInfo {
+    pub id: u64,
+    pub outgoing: bool,
+    pub peer: String,
+    pub filename: String,
+    pub size: u64,
+    pub transferred: u64,
+    pub state: TransferFileState,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TransferFileState {
+    Offered,
+    Transferring,
+    Done,
+    Failed,
 }
 
 /// A mesh-protocol version mismatch on a network: what its signed record
