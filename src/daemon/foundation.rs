@@ -12,6 +12,8 @@
 
 use super::*;
 use iroh::address_lookup::memory::MemoryLookup;
+#[cfg(target_os = "android")]
+use std::sync::atomic;
 use url::Url;
 
 // Fields are read starting in M2 (extracted services consume `Arc<Transport>`);
