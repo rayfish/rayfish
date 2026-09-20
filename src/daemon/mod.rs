@@ -46,8 +46,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "android")]
-use std::sync::atomic;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -244,6 +242,9 @@ pub(crate) use mesh_connection::MeshConnection;
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
 pub(crate) use network_registry::{DialTarget, NetworkRegistry, missing_networks};
+
+#[cfg(target_os = "android")]
+mod idle_transport;
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `Daemon` as fields rather than loose on the core. See each module.
@@ -932,41 +933,10 @@ impl Daemon {
             writer: writer_handle,
             mesh: mesh_handle,
             #[cfg(target_os = "android")]
-            idle_transport: {
-                let registry = Arc::clone(&self.registry);
-                let token = self.shutdown_token.child_token();
-                tokio::spawn(async move {
-                    const CHECK: Duration = Duration::from_secs(15);
-                    const IDLE: Duration = Duration::from_secs(120);
-                    let mut observed = registry
-                        .transport
-                        .activity_seq
-                        .load(atomic::Ordering::Relaxed);
-                    let mut unchanged_checks: u64 = 0;
-                    loop {
-                        tokio::select! {
-                            _ = token.cancelled() => break,
-                            _ = tokio::time::sleep(CHECK) => {
-                                let current = registry
-                                    .transport
-                                    .activity_seq
-                                    .load(atomic::Ordering::Relaxed);
-                                if current == observed {
-                                    unchanged_checks += 1;
-                                    if unchanged_checks * CHECK.as_secs()
-                                        >= IDLE.as_secs()
-                                    {
-                                        registry.suspend_transport().await;
-                                    }
-                                } else {
-                                    observed = current;
-                                    unchanged_checks = 0;
-                                }
-                            }
-                        }
-                    }
-                })
-            },
+            idle_transport: idle_transport::spawn(
+                Arc::clone(&self.registry),
+                self.shutdown_token.child_token(),
+            ),
         };
         let old = self.tun_tasks.lock().unwrap().replace(new_tasks);
         if let Some(old) = old {
