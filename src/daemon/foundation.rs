@@ -38,6 +38,13 @@ pub(crate) struct Transport {
     /// with the endpoint prevents a later embedded daemon from inheriting a
     /// prior instance's process-global setting.
     pub(crate) pkarr_relay_url: Url,
+    /// Android keeps the TUN/DNS plane alive while suspending mesh transport
+    /// after an idle period. The first packet resumes it before dialing.
+    pub(crate) suspended: Arc<AtomicBool>,
+    #[cfg(target_os = "android")]
+    pub(crate) activity_seq: Arc<AtomicU64>,
+    #[cfg(target_os = "android")]
+    pub(crate) relay_configs: Arc<Vec<(RelayUrl, Arc<RelayConfig>)>>,
 }
 
 /// Startup-only values bundled to keep [`Transport::new`] focused on its core
@@ -47,6 +54,8 @@ pub(crate) struct TransportBootstrap {
     pub(crate) lan_peers: Arc<LanPeers>,
     pub(crate) warm_lookup: MemoryLookup,
     pub(crate) pkarr_relay_url: Url,
+    #[cfg(target_os = "android")]
+    pub(crate) relay_configs: Vec<(RelayUrl, Arc<RelayConfig>)>,
 }
 
 impl Transport {
@@ -66,6 +75,30 @@ impl Transport {
             lan_peers: bootstrap.lan_peers,
             warm_lookup: bootstrap.warm_lookup,
             pkarr_relay_url: bootstrap.pkarr_relay_url,
+            suspended: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "android")]
+            activity_seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "android")]
+            relay_configs: Arc::new(bootstrap.relay_configs),
         }
+    }
+
+    pub(crate) fn is_suspended(&self) -> bool {
+        self.suspended.load(atomic::Ordering::Acquire)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn mark_suspended(&self) -> bool {
+        !self.suspended.swap(true, atomic::Ordering::AcqRel)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn mark_awake(&self) -> bool {
+        self.suspended.swap(false, atomic::Ordering::AcqRel)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn record_outgoing_activity(&self) {
+        self.activity_seq.fetch_add(1, atomic::Ordering::Relaxed);
     }
 }

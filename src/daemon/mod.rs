@@ -46,7 +46,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{self, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,8 @@ use anyhow::{Context, Result};
 use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::{Connection, Endpoint, VarInt};
 use iroh::{EndpointId, SecretKey};
+#[cfg(target_os = "android")]
+use iroh::{RelayConfig, RelayUrl};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
 use tokio::sync::Notify;
@@ -630,6 +632,8 @@ struct TunTasks {
     writer: JoinHandle<()>,
     /// The `run_mesh` reader loop task.
     mesh: JoinHandle<()>,
+    #[cfg(target_os = "android")]
+    idle_transport: JoinHandle<()>,
 }
 
 pub struct Daemon {
@@ -925,12 +929,50 @@ impl Daemon {
             cancel,
             writer: writer_handle,
             mesh: mesh_handle,
+            #[cfg(target_os = "android")]
+            idle_transport: {
+                let registry = Arc::clone(&self.registry);
+                let token = self.shutdown_token.child_token();
+                tokio::spawn(async move {
+                    const CHECK: Duration = Duration::from_secs(15);
+                    const IDLE: Duration = Duration::from_secs(120);
+                    let mut observed = registry
+                        .transport
+                        .activity_seq
+                        .load(atomic::Ordering::Relaxed);
+                    let mut unchanged_checks: u64 = 0;
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            _ = tokio::time::sleep(CHECK) => {
+                                let current = registry
+                                    .transport
+                                    .activity_seq
+                                    .load(atomic::Ordering::Relaxed);
+                                if current == observed {
+                                    unchanged_checks += 1;
+                                    if unchanged_checks * CHECK.as_secs()
+                                        >= IDLE.as_secs()
+                                    {
+                                        registry.suspend_transport().await;
+                                    }
+                                } else {
+                                    observed = current;
+                                    unchanged_checks = 0;
+                                }
+                            }
+                        }
+                    }
+                })
+            },
         };
         let old = self.tun_tasks.lock().unwrap().replace(new_tasks);
         if let Some(old) = old {
             old.cancel.cancel();
             old.writer.abort();
             old.mesh.abort();
+            #[cfg(target_os = "android")]
+            old.idle_transport.abort();
         }
         // Connections survive mobile VPN toggles; refresh the receive limit for
         // already-connected peers as well as announcing it on future connects.
@@ -966,6 +1008,8 @@ impl Daemon {
             tasks.cancel.cancel();
             tasks.writer.abort();
             tasks.mesh.abort();
+            #[cfg(target_os = "android")]
+            tasks.idle_transport.abort();
         } else {
             tracing::debug!("detach_tun: no TUN attached");
         }
@@ -1908,6 +1952,8 @@ mod accept_handler_tests {
                 lan_peers: Arc::new(LanPeers::new()),
                 warm_lookup: iroh::address_lookup::memory::MemoryLookup::new(),
                 pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
+                #[cfg(target_os = "android")]
+                relay_configs: Vec::new(),
             },
         ));
         let hostname_table = dns::new_hostname_table();

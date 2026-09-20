@@ -32,6 +32,12 @@ impl NetworkRegistry {
     }
 
     async fn handle_disconnect(self: Arc<Self>, ev: forward::DisconnectEvent) {
+        if self.transport.is_suspended() {
+            // Android's idle suspension deliberately closes links. Keep the
+            // roster/route state intact so the next TUN packet can wake and
+            // lazy-dial without treating this as a real peer failure.
+            return;
+        }
         // ABA guard: if the stored connection is newer than the one that died,
         // the peer already re-dialed. Ignore the stale event rather than tearing
         // down the live link (see DisconnectEvent::conn_stable_id).
