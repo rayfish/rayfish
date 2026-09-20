@@ -262,6 +262,12 @@ impl NetworkRegistry {
     /// when a packet arrives after the idle transport suspension.
     #[cfg(target_os = "android")]
     pub(crate) async fn wake_transport(&self) {
+        // Avoid an atomic read-modify-write for every packet while the
+        // transport is already active. Only the suspended path needs the
+        // state transition and relay restoration.
+        if !self.transport.is_suspended() {
+            return;
+        }
         if self.transport.mark_awake() {
             tracing::info!("waking suspended mesh transport");
             for (url, config) in self.transport.relay_configs.iter() {
