@@ -39,26 +39,15 @@ impl NetworkRegistry {
             // lazy-dial without treating this as a real peer failure.
             return;
         }
-        // ABA guard: if the stored connection is newer than the one that died,
-        // the peer already re-dialed. Ignore the stale event rather than tearing
-        // down the live link (see DisconnectEvent::conn_stable_id).
-        if let Some(id) = ev.conn_stable_id
-            && !self.peers.conn_is_current(&ev.ipv6, id)
-        {
+        // Compare and remove under one peer-table lock. A separate current-ID
+        // check and remove could delete a winner installed between the two.
+        let Some(nets) = self.peers.remove_connection(&ev.ipv6, ev.conn_stable_id) else {
             tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ipv6, "ignoring stale disconnect; peer already reconnected");
             return;
-        }
-
-        // The networks this peer was reachable on, captured before removal.
-        let nets: Vec<SmolStr> = self
-            .peers
-            .identity_and_networks(&ev.ipv6)
-            .map(|(_, nets)| nets)
-            .unwrap_or_default();
+        };
 
         // One connection carried every network, so the drop removes the peer
         // everywhere at once.
-        self.peers.remove(&ev.ipv6);
         tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ipv6, reason = ?ev.reason, "peer connection dropped");
 
         if ev.reason.prunes_member() {
@@ -373,13 +362,21 @@ impl NetworkRegistry {
         let peer_ip = derive_ipv6(&peer_id);
         let my_identity = self.transport.identity.local_identity();
         let device_cert = self.current_device_cert();
-        let conn = match transport::connect_to_peer_with_alpn(
-            &self.transport.endpoint,
-            peer_id,
-            &transport::mesh_alpn(),
-        )
-        .await
+        // An accept or another network's dial may already have established the
+        // peer. Reuse that connection and send the remaining network hellos on it.
+        let connected = if let Some(conn) = self.peers.conn_for_ip(&peer_ip)
+            && conn.close_reason().is_none()
         {
+            Ok(conn)
+        } else {
+            transport::connect_to_peer_with_alpn(
+                &self.transport.endpoint,
+                peer_id,
+                &transport::mesh_alpn(),
+            )
+            .await
+        };
+        let conn = match connected {
             Ok(c) => c,
             Err(e) => {
                 // Flag an incompatible-version peer (ALPN gate) so `ray status`
@@ -420,18 +417,23 @@ impl NetworkRegistry {
                 .mesh_ctx()
                 .register_peer_conn(&conn, peer_id, &t.network);
         }
-        // A live connection now exists (either freshly stored, or already current
-        // when `conn_changed` is false), so the peer is reachable either way.
-        self.reachability.note_ok(peer_id);
-        if !conn_changed {
+        // Registration may have kept a different, globally preferred connection.
+        // Success means a live selected connection exists, not that this dial won.
+        let Some(selected) = self
+            .peers
+            .conn_for_ip(&peer_ip)
+            .filter(|c| c.close_reason().is_none())
+        else {
             return false;
+        };
+        self.reachability.note_ok(peer_id);
+        if conn_changed && selected.stable_id() == conn.stable_id() {
+            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
+            let router = Arc::clone(self.protocol_router());
+            let dconn = conn.clone();
+            tokio::spawn(router.drive_mesh_connection(dconn, true));
         }
-        tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
-        // Drive the new connection's control demux + announce handles.
-        let router = Arc::clone(self.protocol_router());
-        let dconn = conn.clone();
-        tokio::spawn(router.drive_mesh_connection(dconn, true));
-        announce_network_handles(&self.peers, &conn, peer_ip).await;
+        announce_network_handles(&self.peers, &selected, peer_ip).await;
         true
     }
 

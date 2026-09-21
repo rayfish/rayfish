@@ -109,6 +109,10 @@ pub struct PeerEntry {
 
 struct ActiveConnection {
     conn: Connection,
+    /// Identical at both ends of this TLS session, unlike `stable_id()` which
+    /// only identifies a local connection object. Both peers keep the connection
+    /// with the lowest ID, regardless of initiator or registration order.
+    selection_id: [u8; 32],
     /// Inbound decode table: handle → network, taken from the peer's announced
     /// `NetworkHandles`. Used to resolve which network an inbound datagram from
     /// this peer belongs to.
@@ -129,6 +133,7 @@ struct ActiveConnection {
 impl ActiveConnection {
     fn new(conn: Connection) -> Self {
         Self {
+            selection_id: connection_selection_id(&conn),
             conn,
             in_handles: HashMap::new(),
             last_active: Arc::new(AtomicU64::new(now_ms())),
@@ -140,6 +145,16 @@ impl ActiveConnection {
     fn matches(&self, conn: &Connection) -> bool {
         self.conn.stable_id() == conn.stable_id()
     }
+}
+
+/// Domain-separated session identifier for duplicate selection. Called only on
+/// registration, never on the packet path. A completed iroh TLS handshake can
+/// always export this fixed, small amount of material.
+fn connection_selection_id(conn: &Connection) -> [u8; 32] {
+    let mut id = [0; 32];
+    conn.export_keying_material(&mut id, b"EXPORTER-rayfish-mesh-selection-v1", b"")
+        .expect("established TLS session exports a 32-byte connection ID");
+    id
 }
 
 /// Result of a routing lookup: the connection to send over, the peer identity,
@@ -197,18 +212,16 @@ impl PeerEntry {
     /// Install `conn` if it differs from the current connection. Connection-level
     /// state is created and replaced as one value so none survives a reconnect.
     ///
-    /// When both peers dial at once, each physical connection has opposite sides
-    /// at its two ends. Prefer one side based on the two endpoint ids so both
-    /// peers select the same connection. A non-preferred connection still works
-    /// as a fallback until the preferred one arrives.
-    fn install_connection(&mut self, conn: &Connection, prefer_client: Option<bool>) -> bool {
+    /// The lowest TLS session ID wins. Both ends rank every physical connection
+    /// identically even when concurrent handshakes register in opposite orders.
+    /// A closed connection never wins over a live replacement.
+    fn install_connection(&mut self, conn: &Connection) -> bool {
         if self.active.matches(conn) {
             self.active.last_active.store(now_ms(), Ordering::Relaxed);
             return false;
         }
-        if let Some(prefer_client) = prefer_client
-            && self.active.conn.side().is_client() == prefer_client
-            && conn.side().is_client() != prefer_client
+        if self.active.conn.close_reason().is_none()
+            && self.active.selection_id <= connection_selection_id(conn)
         {
             conn.close(
                 VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
@@ -353,8 +366,8 @@ impl PeerTable {
     /// Registers the peer's shared connection and records that we share
     /// `network` with it. The connection is per-identity: if the peer already
     /// has an entry, `network` is unioned into its set and the stored connection
-    /// is refreshed to `conn` (reconnect installs the fresh one; a same-identity
-    /// re-add over the live connection is a no-op replace). Replacing a connection
+    /// is selected by the shared TLS session ID (lowest wins). A dead connection
+    /// is always replaced; re-adding the selected connection is a no-op. Replacing a connection
     /// closes the old one so its task exits and cannot reclaim the route with a
     /// late control frame. Assigns an outbound handle for `network` if one isn't
     /// already held.
@@ -368,19 +381,6 @@ impl PeerTable {
         conn: Connection,
         endpoint_id: EndpointId,
         network: &str,
-    ) -> bool {
-        self.add_with_preference(ipv6, conn, endpoint_id, network, None)
-    }
-
-    /// As [`add`](Self::add), with the side that this node should prefer when
-    /// simultaneous dials create two connections to the same peer.
-    pub fn add_with_preference(
-        &self,
-        ipv6: Ipv6Addr,
-        conn: Connection,
-        endpoint_id: EndpointId,
-        network: &str,
-        prefer_client: Option<bool>,
     ) -> bool {
         let net = SmolStr::new(network);
         // Whether the peer had no prior entry at all (drives the audit connect
@@ -404,7 +404,7 @@ impl PeerTable {
                 Entry::Occupied(mut o) => {
                     let e = o.get_mut();
                     first_ever = false;
-                    conn_changed = e.install_connection(&conn, prefer_client);
+                    conn_changed = e.install_connection(&conn);
                     e.endpoint_id = endpoint_id;
                     if !e.out_handles.contains_key(&net) {
                         let h = next_free_handle(&e.out_handles);
@@ -725,6 +725,23 @@ impl PeerTable {
         if let (Some((_, entry)), Some(audit)) = (removed, &self.audit) {
             audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
         }
+    }
+
+    /// Atomically remove the connection named by a disconnect event and return
+    /// its networks. A delayed event for a replaced connection cannot remove the
+    /// new route, even if registration races with this operation.
+    pub fn remove_connection(
+        &self,
+        ip: &Ipv6Addr,
+        stable_id: Option<usize>,
+    ) -> Option<Vec<SmolStr>> {
+        let (_, entry) = self.peers.remove_if(ip, |_, e| {
+            stable_id.is_none_or(|id| e.active.conn.stable_id() == id)
+        })?;
+        if let Some(audit) = &self.audit {
+            audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
+        }
+        Some(entry.out_handles.into_keys().collect())
     }
 
     /// Stops sharing `network` with a peer. The peer entry (and its connection)
@@ -1078,28 +1095,150 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simultaneous_dials_keep_the_same_direction_at_both_ends() {
-        let (server, client, server_conn, _client_conn) = connected_pair().await;
-        let peer = server_conn.remote_id();
-        let ipv6 = crate::membership::derive_ipv6(&peer);
-        let table = PeerTable::new();
+    async fn same_direction_duplicates_converge_despite_opposite_registration_order() {
+        let (server, client, s1, c1) = connected_pair().await;
+        let (s2, c2) = dial(&server, &client).await;
+        assert_ne!(s1.stable_id(), s2.stable_id());
+        assert_ne!(c1.stable_id(), c2.stable_id());
+        assert_connection_selection_converges(&server, &client, s1, c1, s2, c2).await;
+    }
 
-        // This table represents `server`, which is the server side of the first
-        // connection. The reverse dial makes it the client side of a second one.
-        assert!(table.add_with_preference(ipv6, server_conn.clone(), peer, "n1", Some(false),));
-        let (_client_server_conn, server_client_conn) = dial(&client, &server).await;
-        assert!(server_conn.side().is_server());
-        assert!(server_client_conn.side().is_client());
+    #[tokio::test]
+    async fn opposite_direction_duplicates_converge_despite_opposite_registration_order() {
+        let (server, client, s1, c1) = connected_pair().await;
+        let (c2, s2) = dial(&client, &server).await;
+        assert_connection_selection_converges(&server, &client, s1, c1, s2, c2).await;
+    }
 
-        assert!(
-            !table.add_with_preference(ipv6, server_client_conn.clone(), peer, "n1", Some(false),),
-            "a duplicate in the non-canonical direction is not installed"
-        );
+    async fn assert_connection_selection_converges(
+        server: &Endpoint,
+        client: &Endpoint,
+        s1: Connection,
+        c1: Connection,
+        s2: Connection,
+        c2: Connection,
+    ) {
+        let server_table = PeerTable::new();
+        let client_table = PeerTable::new();
+        let server_ip = membership::derive_ipv6(&server.id());
+        let client_ip = membership::derive_ipv6(&client.id());
+        let expected_id = connection_selection_id(&s1).min(connection_selection_id(&s2));
+        // Two networks race to register different physical connections. Each end
+        // sees the very same connections, but in the opposite order. Do not yield
+        // here: both selections happen before QUIC delivers either close frame.
+        for (table, ip, id, conn, network) in [
+            (&server_table, client_ip, client.id(), s1, "net-a"),
+            (&client_table, server_ip, server.id(), c2, "net-b"),
+            (&server_table, client_ip, client.id(), s2, "net-b"),
+            (&client_table, server_ip, server.id(), c1, "net-a"),
+        ] {
+            table.add(ip, conn, id, network);
+        }
+        let server_conn = server_table.conn_for_ip(&client_ip).unwrap();
+        let client_conn = client_table.conn_for_ip(&server_ip).unwrap();
+        assert_eq!(connection_selection_id(&server_conn), expected_id);
+        assert_eq!(connection_selection_id(&client_conn), expected_id);
+        // Local stable_id values cannot be compared across endpoints. The TLS
+        // exporter identifies the physical session identically at both ends.
+        let session_id = |conn: &Connection| {
+            let mut id = [0; 32];
+            conn.export_keying_material(&mut id, b"rayfish/test/session-id", b"")
+                .unwrap();
+            id
+        };
         assert_eq!(
-            table.lookup_v6(&ipv6).unwrap().conn.stable_id(),
-            server_conn.stable_id()
+            session_id(&server_conn),
+            session_id(&client_conn),
+            "both peers must select the same physical connection"
         );
-        assert!(server_client_conn.close_reason().is_some());
+
+        // Verify that the chosen routes actually carry data in both directions,
+        // including the per-network tags (the two registration orders differ).
+        server_table.set_inbound_handles(
+            &client_ip,
+            &server_conn,
+            &client_table
+                .outbound_handles(&server_ip)
+                .into_iter()
+                .map(|(net, handle)| (handle, net))
+                .collect::<Vec<_>>(),
+        );
+        client_table.set_inbound_handles(
+            &server_ip,
+            &client_conn,
+            &server_table
+                .outbound_handles(&client_ip)
+                .into_iter()
+                .map(|(net, handle)| (handle, net))
+                .collect::<Vec<_>>(),
+        );
+        for network in ["net-a", "net-b"] {
+            for (sender, receiver, destination, source_id, receiving_conn) in [
+                (
+                    &server_table,
+                    &client_table,
+                    client_ip,
+                    server.id(),
+                    &client_conn,
+                ),
+                (
+                    &client_table,
+                    &server_table,
+                    server_ip,
+                    client.id(),
+                    &server_conn,
+                ),
+            ] {
+                let route = sender.route_on_network(&destination, network).unwrap();
+                route
+                    .conn
+                    .send_datagram(crate::forward::tag_datagram(route.handle, b"ping"))
+                    .unwrap();
+                let packet =
+                    tokio::time::timeout(Duration::from_secs(5), receiving_conn.read_datagram())
+                        .await
+                        .expect("selected connection carries data")
+                        .unwrap();
+                let (handle, payload) = crate::forward::untag_datagram(&packet).unwrap();
+                assert_eq!(payload, b"ping");
+                assert_eq!(
+                    receiver.resolve_inbound_by_id(&source_id, receiving_conn, handle),
+                    Some((membership::derive_ipv6(&source_id), SmolStr::new(network)))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_winner_allows_reconnect_and_its_late_disconnect_preserves_replacement() {
+        let (server, client, first, _c1) = connected_pair().await;
+        let (second, _c2) = dial(&server, &client).await;
+        let (lower, higher) = if connection_selection_id(&first) < connection_selection_id(&second)
+        {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let peer = client.id();
+        let ip = membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        assert!(table.add(ip, lower.clone(), peer, "net-a"));
+        lower.close(VarInt::from_u32(0), b"test disconnect");
+        assert!(
+            table.add(ip, higher.clone(), peer, "net-a"),
+            "a dead connection cannot keep winning against live replacements"
+        );
+        assert!(
+            table
+                .remove_connection(&ip, Some(lower.stable_id()))
+                .is_none()
+        );
+        assert!(table.conn_is_current(&ip, higher.stable_id()));
+        assert_eq!(
+            table.remove_connection(&ip, Some(higher.stable_id())),
+            Some(vec![SmolStr::new("net-a")])
+        );
+        assert!(table.conn_for_ip(&ip).is_none());
     }
 
     #[tokio::test]
@@ -1163,6 +1302,7 @@ mod tests {
         // The table normally receives the same identity on a new connection.
         // A second test connection supplies a different stable id here.
         let (_srv2, _cli2, replacement, _client2) = connected_pair().await;
+        conn.close(VarInt::from_u32(0), b"test reconnect");
         table.add(ip, replacement.clone(), peer, "net");
         let route = table.lookup_v6(&ip).unwrap();
         assert_eq!(route.receive_mtu(), 1280);
@@ -1331,6 +1471,7 @@ mod tests {
         // Second, distinct connection to the same server identity.
         let (conn2, _c2) = dial(&server, &client).await;
         assert_ne!(conn1.stable_id(), conn2.stable_id(), "distinct connections");
+        conn1.close(VarInt::from_u32(0), b"test reconnect");
         assert!(
             table.add(ipv6, conn2.clone(), peer, "n1"),
             "a reconnect (different connection) must report the connection as new"
