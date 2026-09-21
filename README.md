@@ -491,13 +491,15 @@ ray config set relay rayfish                 # use the rayfish relay (keeps n0 a
 ray config set relay https://r1,https://r2   # multiple custom relays
 ray config set discovery-dns rayfish         # custom discovery / pkarr server
 ray config set dns-upstreams 1.1.1.1,8.8.8.8 # forwarders for non-.ray names
+ray config set dns-upstreams 200::1234 --replace # send all non-.ray DNS to a mesh peer
 ray config set relay https://r1 --replace    # drop the n0 defaults entirely
 ray config unset relay                        # back to defaults
 ```
 
 Keys: `relay`, `discovery-dns`, `dns-upstreams`. Values are a comma list of
-presets (`rayfish`, `n0`), URLs, or IP addresses (`dns-upstreams` takes IPv6 ones
-too, which is what an exit-node tunnel forwards through). By default custom
+presets (`rayfish`, `n0`), URLs, or IP addresses. An IPv6 `dns-upstreams` address
+can be a mesh peer that runs a DNS resolver on UDP port 53; use `--replace` to
+send all non-`.ray` queries there. By default custom
 servers are added alongside the defaults; `--replace` swaps them out (a bad
 custom server with no fallback can isolate the node). Settings are saved to
 `settings.toml` and take effect on `sudo ray restart`.

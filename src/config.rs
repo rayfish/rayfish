@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::fs::Permissions;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -304,31 +304,21 @@ pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
 /// drops the captured set; otherwise custom upstreams are tried first, then the
 /// captured ones. Unset returns the captured set unchanged.
 ///
-/// IPv4 only, and deliberately so: the captured set this merges with comes from
-/// the OS DNS backends, every one of which reads an IPv4 nameserver. A configured
-/// IPv6 entry is not dropped so much as handled elsewhere, by
-/// [`crate::exit_node::tunnel_upstreams`], which is the one caller that has a
-/// path to reach it (an IPv6-only full tunnel, where the IPv4 ones are the
-/// unreachable half).
-pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
+/// Captured resolvers are IPv4 because that is what the desktop OS backends
+/// expose. Configured IPv6 addresses are retained so an overlay peer running a
+/// resolver can receive ordinary DNS queries over the mesh.
+pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<IpAddr> {
     if o.servers.is_empty() {
-        return captured;
+        return captured.into_iter().map(IpAddr::V4).collect();
     }
-    let custom: Vec<Ipv4Addr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
+    let custom: Vec<IpAddr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
     if o.replace {
-        // `dns_upstreams` takes any `IpAddr` since IPv6-only tunnels needed it, so
-        // an all-IPv6 `--replace` narrows to nothing here. Returning that empty
-        // list would leave both consumers with no server at all: the forwarder
-        // SERVFAILs every non-`.ray` name, and `control_plane_nameservers` falls
-        // back to iroh's own resolv.conf reader, which is the #111 circle. Keep
-        // the captured ones instead: the IPv6 entries are still honoured, by
-        // `exit_node::tunnel_upstreams`, which is the caller that can reach them.
-        if custom.is_empty() {
-            return captured;
-        }
         custom
     } else {
-        custom.into_iter().chain(captured).collect()
+        custom
+            .into_iter()
+            .chain(captured.into_iter().map(IpAddr::V4))
+            .collect()
     }
 }
 
@@ -342,7 +332,7 @@ pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv
 /// instead of saving it. A bare `!servers.is_empty()` was exactly that bug once
 /// `dns_upstreams` started accepting IPv6.
 pub fn has_usable_upstream(o: &ServerOverride) -> bool {
-    o.servers.iter().any(|s| s.parse::<Ipv4Addr>().is_ok())
+    o.servers.iter().any(|s| s.parse::<IpAddr>().is_ok())
 }
 
 /// Parse a comma list of entries (trimmed, empties dropped).
@@ -1544,6 +1534,8 @@ pub(crate) static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 mod tests {
 
     use super::*;
+    use std::net::Ipv6Addr;
+
     use iroh::EndpointId;
 
     /// `ray-mobile` used to publish its config directory by writing
@@ -2247,7 +2239,7 @@ name = "test"
         // Unset: captured unchanged.
         assert_eq!(
             resolve_upstreams(&ServerOverride::default(), captured.clone()),
-            captured
+            vec![IpAddr::V4(captured[0])]
         );
 
         // Augment: custom first, then captured.
@@ -2257,7 +2249,7 @@ name = "test"
         };
         assert_eq!(
             resolve_upstreams(&aug, captured.clone()),
-            vec![one, captured[0]]
+            vec![IpAddr::V4(one), IpAddr::V4(captured[0])]
         );
 
         // Replace: custom only.
@@ -2265,31 +2257,35 @@ name = "test"
             servers: vec!["1.1.1.1".into()],
             replace: true,
         };
-        assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
+        assert_eq!(
+            resolve_upstreams(&rep, captured.clone()),
+            vec![IpAddr::V4(one)]
+        );
     }
 
-    /// `dns-upstreams` takes IPv6 since the IPv6-only tunnel needed it, so an
-    /// all-IPv6 `--replace` narrows to nothing here. Returning that empty list
-    /// would leave the forwarder with no server and hand `control_plane_nameservers`
-    /// an empty set, putting the endpoint back on iroh's resolv.conf reader (#111).
+    /// An IPv6 upstream can be a resolver on a mesh peer. `--replace` must leave
+    /// that address intact so it receives every non-`.ray` lookup.
     #[test]
-    fn replace_with_only_ipv6_keeps_the_captured_upstreams() {
+    fn replace_with_only_ipv6_uses_the_configured_peer() {
         let captured = vec![Ipv4Addr::new(192, 168, 1, 1)];
+        let peer: Ipv6Addr = "200::1234".parse().unwrap();
         let v6_only = ServerOverride {
-            servers: vec!["2606:4700:4700::1111".into()],
+            servers: vec![peer.to_string()],
             replace: true,
         };
-        assert_eq!(resolve_upstreams(&v6_only, captured.clone()), captured);
+        assert_eq!(
+            resolve_upstreams(&v6_only, captured.clone()),
+            vec![IpAddr::V6(peer)]
+        );
 
-        // One usable IPv4 entry and `replace` still means replace: the guard is
-        // for "nothing survived the narrowing", not "some entries were dropped".
+        // Both families retain their order under `--replace`.
         let mixed = ServerOverride {
-            servers: vec!["2606:4700:4700::1111".into(), "1.1.1.1".into()],
+            servers: vec![peer.to_string(), "1.1.1.1".into()],
             replace: true,
         };
         assert_eq!(
             resolve_upstreams(&mixed, captured),
-            vec![Ipv4Addr::new(1, 1, 1, 1)]
+            vec![IpAddr::V6(peer), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]
         );
     }
 
@@ -2305,8 +2301,8 @@ name = "test"
     fn only_a_usable_upstream_waives_the_takeover_guard() {
         let captured: Vec<Ipv4Addr> = Vec::new();
         for (servers, usable) in [
-            (vec!["2606:4700:4700::1111"], false),
-            (vec!["2606:4700:4700::1111", "2001:4860:4860::8888"], false),
+            (vec!["2606:4700:4700::1111"], true),
+            (vec!["2606:4700:4700::1111", "2001:4860:4860::8888"], true),
             (vec!["1.1.1.1"], true),
             (vec!["2606:4700:4700::1111", "1.1.1.1"], true),
             (vec!["not-an-address"], false),

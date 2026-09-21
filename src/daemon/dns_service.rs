@@ -14,7 +14,9 @@
 //! `resolve` (reader side), on top of `configure` / `revert` (lifecycle).
 
 use super::*;
-use std::net::Ipv6Addr;
+#[cfg(target_os = "macos")]
+use std::net::IpAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 
 /// First and last backoff step for the OS-DNS configuration retry loop.
 const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
@@ -140,7 +142,8 @@ impl DnsService {
         // share with, and a live server behind us to decline *to*.
         let defer_off_mesh = c.shared_resolver().is_some() && !fallbacks.is_empty();
         tracing::info!(backend = c.name(), resolver_ip = %dns_config::resolver_addr(), upstreams = ?upstreams, defer_off_mesh, "Magic DNS active");
-        self.resolver.set_upstreams(upstreams);
+        self.resolver
+            .set_upstream_addrs(upstreams.into_iter().map(|ip| SocketAddr::from((ip, 53))));
         self.resolver.set_defer_off_mesh(defer_off_mesh);
         let c: Arc<dyn dns_config::DnsConfigurator> = Arc::from(c);
         *self.configurator.lock().unwrap() = Some(Arc::clone(&c));
@@ -256,14 +259,11 @@ impl DnsService {
                 continue;
             }
 
-            let current: Vec<Ipv4Addr> = self
+            let current: Vec<IpAddr> = self
                 .resolver
                 .upstreams()
                 .into_iter()
-                .filter_map(|a| match a.ip() {
-                    IpAddr::V4(v4) => Some(v4),
-                    IpAddr::V6(_) => None,
-                })
+                .map(|a| a.ip())
                 .collect();
             if answering != current {
                 tracing::info!(
@@ -271,7 +271,8 @@ impl DnsService {
                     upstreams = ?answering,
                     "system resolvers changed; re-pointing the DNS forwarder"
                 );
-                self.resolver.set_upstreams(answering);
+                self.resolver
+                    .set_upstream_addrs(answering.into_iter().map(|ip| SocketAddr::from((ip, 53))));
             }
         }
     }

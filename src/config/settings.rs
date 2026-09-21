@@ -89,10 +89,8 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
                 cfg.dns_upstreams = ServerOverride::default();
             } else {
                 // Either family. IPv4 entries are merged with the system-captured
-                // upstreams (`config::resolve_upstreams`); IPv6 ones are what an
-                // exit-node full tunnel forwards to, since that tunnel carries no
-                // IPv4 for a v4 resolver to be reached over
-                // (`exit_node::tunnel_upstreams`).
+                // upstreams; an IPv6 mesh address sends ordinary DNS to a resolver
+                // running on that peer.
                 for e in &entries {
                     e.parse::<IpAddr>()
                         .with_context(|| format!("invalid IP address: {e}"))?;
