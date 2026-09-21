@@ -720,13 +720,34 @@ struct Settings {
 fn rayfish_gid() -> Option<u32> {
     use std::ffi::CString;
     let name = CString::new("rayfish").ok()?;
-    // SAFETY: getgrnam returns a pointer to a static struct; we copy gr_gid out
-    // immediately before any further libc call could overwrite it.
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    // getgrnam_r, never getgrnam: the legacy call returns a pointer into a
+    // process-wide buffer that any concurrent getgr*/getpw* call is allowed
+    // to move or free. Config saves run on many threads at once, and on musl
+    // that race corrupted the heap and took the daemon down with SIGSEGV.
+    // The reentrant variant copies into our own buffer, which is the whole
+    // reason it exists.
+    let mut buf_len = 4096;
+    loop {
+        let mut buf = vec![0u8; buf_len];
+        let mut grbuf: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                &mut grbuf,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        return Some(unsafe { (*result).gr_gid });
     }
 }
 
