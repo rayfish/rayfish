@@ -1086,7 +1086,9 @@ pub(crate) enum FilesAction {
         #[arg(add = complete::queued_sends())]
         id: u64,
     },
-    /// Cancel an outgoing transfer that has already been offered or started
+    /// Cancel an outgoing transfer
+    ///
+    /// Cancels a transfer that has already been offered or started.
     CancelTransfer {
         /// Transfer ID (from 'ray files')
         id: u64,
