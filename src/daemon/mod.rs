@@ -1996,6 +1996,71 @@ mod accept_handler_tests {
     }
 
     #[tokio::test]
+    async fn reconnect_reuses_the_selected_connection_and_reports_success() {
+        let alpn = transport::mesh_alpn();
+        let local = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let remote = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let (conn, remote_conn) = tokio::join!(local.connect(remote.addr(), &alpn), async {
+            remote.accept().await.unwrap().await.unwrap()
+        },);
+        let conn = conn.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsStore::load(tmp.path()).await.unwrap();
+        let registry = sample_registry(
+            local.clone(),
+            IrohIdentityProvider::new(local.id()),
+            store,
+            local.id(),
+        );
+        let peer_ip = derive_ipv6(&remote.id());
+        registry
+            .peers
+            .add(peer_ip, conn.clone(), remote.id(), "net-a");
+        let targets = ["net-a", "net-b"].map(|network| DialTarget {
+            network: network.to_string(),
+            network_key: SecretKey::generate().public(),
+        });
+        // Previously an unchanged connection was reported as failure, so a
+        // reconnect loop kept dialing forever. It must also reuse this session
+        // when announcing another network instead of opening another connection.
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    registry.dial_peer_once(remote.id(), &targets)
+                )
+                .await
+                .expect("reuse completes without another dial")
+            );
+            assert!(registry.peers.conn_is_current(&peer_ip, conn.stable_id()));
+            for target in &targets {
+                let (_, mut recv) =
+                    tokio::time::timeout(Duration::from_secs(5), remote_conn.accept_bi())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let control::FrameRead::Frame(frame) =
+                    control::recv_frame(&mut recv).await.unwrap()
+                else {
+                    panic!("expected MeshHello frame");
+                };
+                assert_eq!(frame.net, Some(target.network_key));
+                assert!(matches!(frame.msg, ControlMsg::MeshHello { .. }));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn register_replaces_member_handler_with_coordinator() {
         // AcceptHandler exposes whether it is the coordinator variant.
         assert!(!sample_member_handler().await.is_coordinator());

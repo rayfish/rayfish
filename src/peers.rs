@@ -1210,6 +1210,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn three_connections_choose_one_global_minimum_for_every_registration_order() {
+        let a = loopback_endpoint().await;
+        let b = loopback_endpoint().await;
+        let a_ip = membership::derive_ipv6(&a.id());
+        let b_ip = membership::derive_ipv6(&b.id());
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for a_order in orders {
+            for b_order in orders {
+                // Mix both initiation directions, including two connections from
+                // the same initiator. Every ordering at A is paired with every
+                // ordering at B; fresh sessions avoid reusing closed losers.
+                let (a0, b0) = dial(&a, &b).await;
+                let (b1, a1) = dial(&b, &a).await;
+                let (a2, b2) = dial(&a, &b).await;
+                let a_conns = [a0, a1, a2];
+                let b_conns = [b0, b1, b2];
+                for i in 0..3 {
+                    assert_eq!(
+                        connection_selection_id(&a_conns[i]),
+                        connection_selection_id(&b_conns[i])
+                    );
+                }
+                let winner = (0..3)
+                    .min_by_key(|&i| connection_selection_id(&a_conns[i]))
+                    .unwrap();
+                let a_table = PeerTable::new();
+                let b_table = PeerTable::new();
+                for i in 0..3 {
+                    a_table.add(b_ip, a_conns[a_order[i]].clone(), b.id(), "net-a");
+                    b_table.add(a_ip, b_conns[b_order[i]].clone(), a.id(), "net-a");
+                }
+                let a_selected = a_table.conn_for_ip(&b_ip).unwrap();
+                let b_selected = b_table.conn_for_ip(&a_ip).unwrap();
+                assert_eq!(
+                    a_selected.stable_id(),
+                    a_conns[winner].stable_id(),
+                    "A order {a_order:?}, B order {b_order:?}"
+                );
+                assert_eq!(
+                    b_selected.stable_id(),
+                    b_conns[winner].stable_id(),
+                    "A order {a_order:?}, B order {b_order:?}"
+                );
+                // Yield to QUIC so any queued close frames are delivered. A
+                // table-only assertion could miss a winner the other end closed.
+                for (sender, receiver) in [(&a_selected, &b_selected), (&b_selected, &a_selected)] {
+                    sender
+                        .send_datagram(bytes::Bytes::from_static(b"still connected"))
+                        .unwrap();
+                    let packet =
+                        tokio::time::timeout(Duration::from_secs(5), receiver.read_datagram())
+                            .await
+                            .expect("global winner remains usable")
+                            .unwrap();
+                    assert_eq!(&packet[..], b"still connected");
+                }
+                a_selected.close(VarInt::from_u32(0), b"test done");
+                b_selected.close(VarInt::from_u32(0), b"test done");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn closed_winner_allows_reconnect_and_its_late_disconnect_preserves_replacement() {
         let (server, client, first, _c1) = connected_pair().await;
         let (second, _c2) = dial(&server, &client).await;
