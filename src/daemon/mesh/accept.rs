@@ -526,7 +526,7 @@ impl CoordinatorAcceptState {
             .flatten();
         let direct_record_published =
             grant_direct && record.as_ref().is_some_and(|signed| signed.published);
-        if control::send_msg(
+        if let Err(e) = control::send_msg(
             &mut send,
             Some(self.net_pubkey()),
             &ControlMsg::Welcome {
@@ -538,9 +538,12 @@ impl CoordinatorAcceptState {
             },
         )
         .await
-        .is_err()
         {
-            return None;
+            // Reconnect sends MeshHello without reading its reply, which can
+            // stop this stream before Welcome is written. The peer is already
+            // registered: continue so the demux announces its network handles
+            // and the remaining metadata refresh still runs.
+            tracing::debug!(peer = %remote_id.fmt_short(), error = %e, "failed to reply Welcome to registered member; continuing reconnect");
         }
 
         // Hand this (re)connecting member our current signed record over the mesh

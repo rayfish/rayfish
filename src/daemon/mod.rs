@@ -2061,6 +2061,97 @@ mod accept_handler_tests {
     }
 
     #[tokio::test]
+    async fn reconnect_registration_survives_a_stopped_welcome_reply() {
+        for stop_reply in [false, true] {
+            let alpn = transport::mesh_alpn();
+            let server = Endpoint::builder(iroh::endpoint::presets::N0)
+                .alpns(vec![alpn.clone()])
+                .relay_mode(iroh::RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap();
+            let client = Endpoint::builder(iroh::endpoint::presets::N0)
+                .alpns(vec![alpn.clone()])
+                .relay_mode(iroh::RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap();
+            let (outgoing, incoming) = tokio::join!(client.connect(server.addr(), &alpn), async {
+                server.accept().await.unwrap().await.unwrap()
+            },);
+            let outgoing = outgoing.unwrap();
+            let handler = sample_coordinator_handler().await;
+            let (state, ctx) = handler_parts(&handler);
+            let mut member = seated(client.id());
+            member.hostname = Some("member".to_string());
+            state.write().unwrap().members.add(member);
+            let ip = derive_ipv6(&client.id());
+            // The first network has already registered and announced itself.
+            // The coordinator's hello adds a second network to this connection.
+            ctx.peers
+                .add(ip, incoming.clone(), client.id(), "other-net");
+            let net_key = state.read().unwrap().network_public_key;
+            let (mut send, recv) = outgoing.open_bi().await.unwrap();
+            let mut recv = Some(recv);
+            if stop_reply {
+                // Match dial_peer_once: it discards the receive half immediately.
+                drop(recv.take());
+            }
+            control::send_msg(
+                &mut send,
+                Some(net_key),
+                &ControlMsg::MeshHello {
+                    identity: client.id(),
+                    hostname: Some("member".to_string()),
+                    device_cert: None,
+                },
+            )
+            .await
+            .unwrap();
+            let (reply, mut request) = incoming.accept_bi().await.unwrap();
+            let control::FrameRead::Frame(frame) = control::recv_frame(&mut request).await.unwrap()
+            else {
+                panic!("expected MeshHello");
+            };
+            if stop_reply {
+                // Ensure STOP_SENDING arrives before the handler writes Welcome,
+                // making the failure deterministic rather than timing-dependent.
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), reply.stopped())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    Some(VarInt::from_u32(0))
+                );
+            }
+            let registered = handler
+                .handle_frame(&incoming, reply, client.id(), frame.msg)
+                .await;
+            assert!(ctx.peers.shares_network_v6(&ip, "other-net"));
+            assert!(ctx.peers.shares_network_v6(&ip, "test-net"));
+            assert_eq!(
+                registered,
+                Some(ip),
+                "the demux must announce handles for the registered network even if Welcome fails"
+            );
+            assert_eq!(
+                ctx.hostname_table.read().await["test-net"]["member"],
+                ip,
+                "a failed reply must not skip the peer's DNS refresh"
+            );
+            if let Some(mut recv) = recv {
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(3), control::recv_msg(&mut recv))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    ControlMsg::Welcome { .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn register_replaces_member_handler_with_coordinator() {
         // AcceptHandler exposes whether it is the coordinator variant.
         assert!(!sample_member_handler().await.is_coordinator());
