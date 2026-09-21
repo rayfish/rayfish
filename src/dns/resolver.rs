@@ -379,6 +379,33 @@ async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::
     Ok(buf)
 }
 
+/// `. NS`: a caching resolver can answer from its knowledge of the root
+/// without touching the network, which keeps the probe cheap on healthy hosts.
+const ROOT_NS_QUERY: [u8; 17] = [
+    0x2b, 0x1d, // id (arbitrary, fixed: we only compare against the reply)
+    0x01, 0x00, // flags: standard query, recursion desired
+    0x00, 0x01, // qdcount 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
+    0x00, // qname: root
+    0x00, 0x02, // qtype NS
+    0x00, 0x01, // qclass IN
+];
+
+/// `example.com A`: a forwardable dotted question. Some consumer routers'
+/// forwarders go silent for root-zone queries while forwarding dotted names
+/// fine, so on those hosts the root probe alone reads a healthy resolver as
+/// dead — and the takeover then refuses to run, leaving the host without
+/// Magic DNS at all.
+const DOTTED_A_QUERY: [u8; 29] = [
+    0x5f, 0x3a, // id (arbitrary, fixed)
+    0x01, 0x00, // flags: standard query, recursion desired
+    0x00, 0x01, // qdcount 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
+    7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0x00,
+    0x00, 0x01, // qtype A
+    0x00, 0x01, // qclass IN
+];
+
 /// True if `up` answers a DNS query at all.
 ///
 /// Captured upstreams are only ever a *claim* about where DNS lives: on a box
@@ -386,19 +413,21 @@ async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::
 /// forwarding to it silently blackholes every non-`.ray` name (see #111). Any
 /// well-formed reply counts, including SERVFAIL: this asks "is something
 /// listening", not "is it a good resolver", and a dead upstream answers nothing.
+///
+/// Two questions are asked, because resolvers disagree on what they will
+/// answer. `. NS` settles it on every well-behaved resolver; if it draws
+/// silence, `example.com A` decides, since silence for the root zone does not
+/// mean silence for the names a forwarder will actually be asked to resolve.
 pub async fn probe_upstream(up: SocketAddr) -> bool {
-    // `. NS`, the cheapest question every resolver understands, and one that
-    // needs no upstream connectivity of its own to produce a reply.
-    let query = [
-        0x2b, 0x1d, // id (arbitrary, fixed: we only compare against the reply)
-        0x01, 0x00, // flags: standard query, recursion desired
-        0x00, 0x01, // qdcount 1
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
-        0x00, // qname: root
-        0x00, 0x02, // qtype NS
-        0x00, 0x01, // qclass IN
-    ];
-    match forward_once(&query, up, PROBE_TIMEOUT).await {
+    if probe_query(up, &ROOT_NS_QUERY).await {
+        return true;
+    }
+    probe_query(up, &DOTTED_A_QUERY).await
+}
+
+/// Send `query` to `up` and wait [`PROBE_TIMEOUT`] for a well-formed reply.
+async fn probe_query(up: SocketAddr, query: &[u8]) -> bool {
+    match forward_once(query, up, PROBE_TIMEOUT).await {
         // Match the transaction id so a stray datagram can't pass as an answer.
         Ok(resp) => resp.len() >= 12 && resp[..2] == query[..2],
         Err(_) => false,
@@ -908,6 +937,52 @@ mod tests {
     fn servfail_rejects_a_runt_packet() {
         // Shorter than a DNS header: there is nothing to turn into a response.
         assert!(servfail(&[0u8; 11]).is_none());
+    }
+
+    /// The fallback question parses and asks what it claims: example.com, A,
+    /// IN. A hand-rolled query with a byte-count mistake would otherwise only
+    /// show up as a resolver that never answers it.
+    #[test]
+    fn dotted_probe_query_is_well_formed() {
+        let pkt = Packet::parse(&DOTTED_A_QUERY).expect("parse the example.com A probe");
+        assert_eq!(pkt.questions.len(), 1);
+        assert_eq!(pkt.questions[0].qname.to_string(), "example.com");
+        assert_eq!(&DOTTED_A_QUERY[25..27], &[0x00, 0x01]); // qtype A
+        assert_eq!(&DOTTED_A_QUERY[27..29], &[0x00, 0x01]); // qclass IN
+    }
+
+    /// A consumer-router resolver: answers every dotted question, goes silent
+    /// for root-zone ones. The root probe alone must not read it as dead —
+    /// that verdict used to make the takeover refuse to run and left the host
+    /// without Magic DNS.
+    #[tokio::test]
+    async fn probe_survives_resolvers_that_drop_root_zone_queries() {
+        let server = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+                let q = &buf[..n];
+                // A root question's qname is the single zero byte after the
+                // header. Stay silent for those, echo the rest as answers.
+                if q.len() >= 13 && q[12] == 0 {
+                    continue;
+                }
+                let mut resp = q.to_vec();
+                resp[2] |= 0x80; // QR: this is a response
+                let _ = server.send_to(&resp, peer).await;
+            }
+        });
+
+        assert!(
+            !probe_query(addr, &ROOT_NS_QUERY).await,
+            "the mock answers nothing for the root probe, by construction"
+        );
+        assert!(
+            probe_upstream(addr).await,
+            "the dotted fallback is what keeps this upstream alive"
+        );
     }
 
     #[tokio::test]
