@@ -67,7 +67,7 @@ const ROOT: Groups = &[
     ),
     (
         "Diagnostics",
-        &["ping", "netcheck", "logs", "report", "mdns"],
+        &["ping", "netcheck", "logs", "report", "mdns", "dns"],
     ),
     (
         "Setup",
