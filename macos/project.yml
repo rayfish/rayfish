@@ -1,0 +1,50 @@
+name: Rayfish
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    macOS: "13.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: ""
+    PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.app
+targets:
+  Rayfish:
+    type: application
+    platform: macOS
+    sources:
+      - path: Rayfish/App
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.app
+        CODE_SIGN_ENTITLEMENTS: Rayfish/Rayfish.entitlements
+        INFOPLIST_FILE: Rayfish/Info.plist
+    dependencies:
+      - target: RayfishTunnelExtension
+        embed: true
+  RayfishTunnelExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: RayfishTunnelExtension
+      - path: Shared
+      - path: Generated
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.app.tunnel
+        CODE_SIGN_ENTITLEMENTS: RayfishTunnelExtension/RayfishTunnelExtension.entitlements
+        INFOPLIST_FILE: RayfishTunnelExtension/Info.plist
+        APPLICATION_EXTENSION_API_ONLY: YES
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/../target/release/libray_apple.a"
+    preBuildScripts:
+      - name: Build Rayfish Apple bridge
+        script: |
+          set -euo pipefail
+          cd "$SRCROOT/.."
+          cargo build --release -p ray-apple
+          mkdir -p "$SRCROOT/Generated"
+          cargo run -q -p ray-apple --bin uniffi-bindgen -- generate \
+            --library "$SRCROOT/../target/release/libray_apple.dylib" \
+            --language swift \
+            --out-dir "$SRCROOT/Generated"

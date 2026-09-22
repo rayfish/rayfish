@@ -1013,16 +1013,28 @@ pub struct PeerStatus {
 
 /// Three-state peer liveness for `ray status`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
 )]
 pub enum PeerState {
     /// A live mesh connection to the peer exists right now.
+    #[display("active")]
     Active,
     /// No live connection, but no failed reach either: presumed reachable (dialed
     /// lazily on demand). The optimistic default for a freshly booted node.
     #[default]
+    #[display("idle")]
     Idle,
     /// A recent reach attempt failed and wasn't cleared by a later success.
+    #[display("offline")]
     Offline,
 }
 
@@ -1038,11 +1050,24 @@ pub struct ConnectionInfo {
     pub lost_packets: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
+)]
 pub enum ConnType {
+    #[display("direct")]
     Direct,
+    #[display("relay")]
     Relay,
+    #[display("tor")]
     Tor,
+    #[display("unknown")]
     Unknown,
 }
 
