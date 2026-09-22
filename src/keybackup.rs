@@ -231,6 +231,20 @@ pub fn restore_metadata(backup: &RestoredBackup, same_identity: bool) -> Result<
     Ok(())
 }
 
+/// Decrypt and install an identity backup in the daemon-owned config tree.
+/// The caller is responsible for authenticating the request before calling
+/// this, since this changes the node's signing identity.
+pub fn restore_current_identity(code: &str, password: &str) -> Result<String> {
+    let backup = decrypt_backup(code, password)?;
+    let same_identity = crate::identity::load_existing()?
+        .is_some_and(|existing| existing.public() == backup.secret_key.public());
+    if !same_identity {
+        crate::identity::store_secret_key(&backup.secret_key)?;
+    }
+    restore_metadata(&backup, same_identity)?;
+    Ok(backup.secret_key.public().to_string())
+}
+
 /// An identity backup and the public key it restores to.
 pub struct Backup {
     pub code: String,
