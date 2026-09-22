@@ -72,7 +72,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 guard let node = node else {
                     return
                 }
-                try node.receivePackets(packets: packets.map(Array.init))
+                try node.receivePackets(packets: packets)
                 self.readPackets()
             } catch {
                 self.cancelTunnelWithError(error)
