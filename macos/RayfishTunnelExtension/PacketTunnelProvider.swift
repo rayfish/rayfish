@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import NetworkExtension
 
+@main
 final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     private var node: Node?
 

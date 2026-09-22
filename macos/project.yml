@@ -56,6 +56,8 @@ targets:
           - "$(SRCROOT)/Generated"
         OTHER_LDFLAGS:
           - "$(SRCROOT)/../target/release/libray_apple.a"
+          - "-framework"
+          - "SystemConfiguration"
         SWIFT_INCLUDE_PATHS:
           - "$(SRCROOT)/Generated"
         OTHER_SWIFT_FLAGS:
