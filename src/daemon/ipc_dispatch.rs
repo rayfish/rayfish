@@ -462,6 +462,25 @@ impl Daemon {
                 secret,
             } => self.pair_with_device(endpoint_id, secret).await,
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
+            IpcMessage::BackupIdentity { password } => {
+                match crate::keybackup::backup_current_identity(&password) {
+                    Ok(backup) => IpcMessage::IdentityBackup {
+                        code: backup.code,
+                        public_key: backup.public_key,
+                    },
+                    Err(error) => ipc_err(error.to_string()),
+                }
+            }
+            IpcMessage::RestoreIdentity { backup, password } => {
+                match crate::keybackup::restore_current_identity(&backup, &password) {
+                    Ok(public_key) => IpcMessage::Ok {
+                        message: format!(
+                            "Restored user identity: {public_key}. Restart the daemon for changes to take effect."
+                        ),
+                    },
+                    Err(error) => ipc_err(error.to_string()),
+                }
+            }
             IpcMessage::Unpair { device } => self.unpair(&device).await,
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
             IpcMessage::ListLanPeers => self.list_lan_peers(),

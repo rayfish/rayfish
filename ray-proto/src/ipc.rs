@@ -289,6 +289,17 @@ pub enum IpcMessage {
     /// List this user's paired devices (enumerated from the network rosters).
     /// Reply: [`IpcMessage::PairedDevices`].
     ListPairedDevices,
+    /// Create an encrypted identity backup in the daemon-owned config tree.
+    /// This is a mutation because it releases the local identity to an
+    /// authorized caller, wrapped by the caller-supplied password.
+    BackupIdentity {
+        password: String,
+    },
+    /// Restore an encrypted identity backup into the daemon-owned config tree.
+    RestoreIdentity {
+        backup: String,
+        password: String,
+    },
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
     /// Publishes a signed revocation record, drops the device locally, severs it
     /// from networks this node coordinates, and best-effort signals the device to
@@ -597,6 +608,11 @@ pub enum IpcMessage {
     /// This user's paired devices (reply to `ListPairedDevices`).
     PairedDevices {
         devices: Vec<PairedDeviceInfo>,
+    },
+    /// Encrypted identity backup returned by [`IpcMessage::BackupIdentity`].
+    IdentityBackup {
+        code: String,
+        public_key: String,
     },
     /// Nodes seen on the LAN over mDNS (reply to `ListLanPeers`).
     LanPeersList {

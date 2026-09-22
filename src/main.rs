@@ -3,8 +3,8 @@
 // client built on top.
 use rayfish::term::{layout, picker, progress, style};
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, keybackup,
-    logdir, membership, onepassword, shutdown, stats,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, invite, ipc, logdir, membership,
+    onepassword, shutdown, stats,
 };
 
 use std::sync::{Arc, atomic};
@@ -639,8 +639,8 @@ pub(crate) enum PairAction {
     List,
     /// Export an encrypted backup of the signing key
     Backup {
-        /// Store the backup in 1Password (via the `op` CLI) instead of printing it
-        #[arg(long = "1password", alias = "op")]
+        /// Store the backup in 1Password instead of printing it
+        #[arg(long = "1p", aliases = ["1password", "op"])]
         onepassword: bool,
         /// 1Password vault (defaults to your default vault)
         #[arg(long)]
@@ -651,10 +651,10 @@ pub(crate) enum PairAction {
     },
     /// Restore a signing key from an encrypted backup
     Restore {
-        /// The encrypted backup string (omit when using --1password)
+        /// The encrypted backup string (omit when using --1p)
         backup: Option<String>,
-        /// Read the backup from 1Password (via the `op` CLI)
-        #[arg(long = "1password", alias = "op")]
+        /// Read the backup from 1Password
+        #[arg(long = "1p", aliases = ["1password", "op"])]
         onepassword: bool,
         /// 1Password vault (defaults to your default vault)
         #[arg(long)]
@@ -1746,6 +1746,23 @@ mod tests {
     use super::*;
     use ipc::FirewallRuleView;
     use rayfish::update::{normalize_version, release_asset_name, version_is_newer};
+
+    #[test]
+    fn pair_backup_accepts_the_1password_flag_spellings() {
+        for flag in ["--1p", "--1password", "--op"] {
+            let cli = Cli::try_parse_from(["ray", "pair", "backup", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Pair {
+                    action: Some(PairAction::Backup {
+                        onepassword: true,
+                        ..
+                    }),
+                    ..
+                }
+            ));
+        }
+    }
 
     #[test]
     fn strip_deleted_suffix_sanitizes_replaced_binary_path() {
