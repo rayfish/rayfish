@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "macos")]
 mod apple_tun;
+mod migration;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,8 @@ pub enum AppleError {
     UnsupportedPlatform,
     #[error("the packet tunnel is already active")]
     AlreadyActive,
+    #[error("state migration must run before the node starts")]
+    AlreadyStarted,
     #[error("packet queue is full")]
     PacketQueueFull,
     #[error("{0}")]
@@ -70,6 +73,7 @@ pub trait PacketFlow: Send + Sync {
 /// One Rayfish node hosted by a packet tunnel provider.
 #[derive(uniffi::Object)]
 pub struct Node {
+    config_dir: PathBuf,
     runtime: Runtime,
     state: Mutex<Option<Arc<DaemonState>>>,
     #[cfg(target_os = "macos")]
@@ -91,12 +95,14 @@ impl Node {
 impl Node {
     #[uniffi::constructor]
     pub fn new(config_dir: String) -> Arc<Self> {
-        config::set_config_dir_override(PathBuf::from(config_dir));
+        let config_dir = PathBuf::from(config_dir);
+        config::set_config_dir_override(config_dir.clone());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("creating the Apple bridge runtime must succeed");
         Arc::new(Self {
+            config_dir,
             runtime,
             state: Mutex::new(None),
             #[cfg(target_os = "macos")]
@@ -124,6 +130,20 @@ impl Node {
             *slot = Some(state);
         }
         Ok(())
+    }
+
+    /// Copy legacy launchd state before starting the extension-owned node.
+    pub fn migrate_legacy_state(&self, source: String) -> Result<(), AppleError> {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(AppleError::AlreadyStarted);
+        }
+        migration::copy_legacy_state(PathBuf::from(source).as_path(), &self.config_dir)
+            .map_err(|error| AppleError::Network(error.to_string()))
     }
 
     /// The stable mesh address that the packet tunnel assigns to this device.

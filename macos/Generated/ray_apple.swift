@@ -530,6 +530,11 @@ public protocol NodeProtocol: AnyObject, Sendable {
     func joinNetwork(code: String) throws
 
     /**
+     * Copy legacy launchd state before starting the extension-owned node.
+     */
+    func migrateLegacyState(source: String) throws
+
+    /**
      * Deliver packets read from `NEPacketTunnelFlow` to the mesh forwarder.
      */
     func receivePackets(packets: [Data]) throws
@@ -652,6 +657,16 @@ open func ipv6Address()throws  -> String  {
 open func joinNetwork(code: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_join_network(self.uniffiClonePointer(),
         FfiConverterString.lower(code),$0
+    )
+}
+}
+
+    /**
+     * Copy legacy launchd state before starting the extension-owned node.
+     */
+open func migrateLegacyState(source: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_migrate_legacy_state(self.uniffiClonePointer(),
+        FfiConverterString.lower(source),$0
     )
 }
 }
@@ -1023,6 +1038,7 @@ public enum AppleError: Swift.Error {
     case NotStarted
     case UnsupportedPlatform
     case AlreadyActive
+    case AlreadyStarted
     case PacketQueueFull
     case Network(String
     )
@@ -1045,8 +1061,9 @@ public struct FfiConverterTypeAppleError: FfiConverterRustBuffer {
         case 1: return .NotStarted
         case 2: return .UnsupportedPlatform
         case 3: return .AlreadyActive
-        case 4: return .PacketQueueFull
-        case 5: return .Network(
+        case 4: return .AlreadyStarted
+        case 5: return .PacketQueueFull
+        case 6: return .Network(
             try FfiConverterString.read(from: &buf)
             )
 
@@ -1073,12 +1090,16 @@ public struct FfiConverterTypeAppleError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
 
 
-        case .PacketQueueFull:
+        case .AlreadyStarted:
             writeInt(&buf, Int32(4))
 
 
-        case let .Network(v1):
+        case .PacketQueueFull:
             writeInt(&buf, Int32(5))
+
+
+        case let .Network(v1):
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(v1, into: &buf)
 
         }
@@ -1385,6 +1406,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_join_network() != 54493) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_migrate_legacy_state() != 46002) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_receive_packets() != 53305) {
