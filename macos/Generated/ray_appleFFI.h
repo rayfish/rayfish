@@ -281,6 +281,11 @@ void uniffi_ray_apple_fn_free_node(void*_Nonnull ptr, RustCallStatus *_Nonnull o
 void*_Nonnull uniffi_ray_apple_fn_constructor_node_new(RustBuffer config_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_REQUEST
+void uniffi_ray_apple_fn_method_node_accept_request(void*_Nonnull ptr, RustBuffer network, RustBuffer id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACTIVATE
 void uniffi_ray_apple_fn_method_node_activate(void*_Nonnull ptr, uint64_t flow, RustCallStatus *_Nonnull out_status
@@ -299,6 +304,11 @@ void uniffi_ray_apple_fn_method_node_create_network(void*_Nonnull ptr, RustBuffe
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DEACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DEACTIVATE
 void uniffi_ray_apple_fn_method_node_deactivate(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DENY_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DENY_REQUEST
+void uniffi_ray_apple_fn_method_node_deny_request(void*_Nonnull ptr, RustBuffer network, RustBuffer id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_IPV6_ADDRESS
@@ -631,6 +641,12 @@ void ffi_ray_apple_rust_future_free_void(uint64_t handle
 void ffi_ray_apple_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_REQUEST
+uint16_t uniffi_ray_apple_checksum_method_node_accept_request(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACTIVATE
 uint16_t uniffi_ray_apple_checksum_method_node_activate(void
@@ -652,6 +668,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_create_network(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DEACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DEACTIVATE
 uint16_t uniffi_ray_apple_checksum_method_node_deactivate(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DENY_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DENY_REQUEST
+uint16_t uniffi_ray_apple_checksum_method_node_deny_request(void
 
 );
 #endif

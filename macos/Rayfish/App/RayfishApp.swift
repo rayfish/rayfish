@@ -110,6 +110,30 @@ private struct NetworksView: View {
                         .foregroundStyle(.orange)
                 }
 
+                if let status = controller.status, !status.pendingRequests.isEmpty {
+                    GroupBox("Needs attention") {
+                        ForEach(status.pendingRequests) { request in
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text("\(request.hostname ?? request.id) wants to join \(request.network)")
+                                    Text("Waiting \(request.waitingSecs)s")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("Deny", role: .destructive) {
+                                    Task { await controller.deny(request: request) }
+                                }
+                                Button("Approve") {
+                                    Task { await controller.accept(request: request) }
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+
                 if let status = controller.status, !status.networks.isEmpty {
                     ForEach(status.networks) { network in
                         NetworkCard(

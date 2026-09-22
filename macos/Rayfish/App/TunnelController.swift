@@ -98,6 +98,20 @@ final class TunnelController: ObservableObject {
         )
     }
 
+    func accept(request: ProviderJoinRequest) async {
+        await perform(
+            ProviderRequest(action: .acceptRequest, name: request.network, id: request.id),
+            replaceStatus: true
+        )
+    }
+
+    func deny(request: ProviderJoinRequest) async {
+        await perform(
+            ProviderRequest(action: .denyRequest, name: request.network, id: request.id),
+            replaceStatus: true
+        )
+    }
+
     func poll() async {
         while !Task.isCancelled {
             if status != nil {

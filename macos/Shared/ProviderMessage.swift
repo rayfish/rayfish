@@ -8,12 +8,15 @@ struct ProviderRequest: Codable {
         case invite
         case leave
         case setHostname
+        case acceptRequest
+        case denyRequest
     }
 
     var action: Action
     var name: String? = nil
     var code: String? = nil
     var hostname: String? = nil
+    var id: String? = nil
 }
 
 struct ProviderResponse: Codable {
@@ -27,6 +30,14 @@ struct ProviderStatus: Codable, Equatable {
     var active: Bool
     var ipv6: String
     var networks: [ProviderNetwork]
+    var pendingRequests: [ProviderJoinRequest]
+}
+
+struct ProviderJoinRequest: Codable, Equatable, Identifiable {
+    var network: String
+    var id: String
+    var hostname: String?
+    var waitingSecs: UInt64
 }
 
 struct ProviderNetwork: Codable, Equatable, Identifiable {

@@ -44,6 +44,7 @@ pub struct NodeStatus {
     pub active: bool,
     pub ipv6: String,
     pub networks: Vec<Network>,
+    pub pending_requests: Vec<JoinRequest>,
 }
 
 #[derive(uniffi::Record)]
@@ -62,6 +63,14 @@ pub struct Peer {
     pub state: String,
     pub latency_ms: Option<u32>,
     pub is_own_device: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct JoinRequest {
+    pub network: String,
+    pub id: String,
+    pub hostname: Option<String>,
+    pub waiting_secs: u64,
 }
 
 #[uniffi::export(callback_interface)]
@@ -171,6 +180,22 @@ impl Node {
                 "node returned an invalid status response".to_owned(),
             ));
         };
+        let pending_requests = networks
+            .iter()
+            .filter(|network| network.pending_requests > 0)
+            .flat_map(|network| match state.list_requests(&network.name) {
+                IpcMessage::PendingRequests { requests } => requests
+                    .into_iter()
+                    .map(|request| JoinRequest {
+                        network: network.name.clone(),
+                        id: request.short_id,
+                        hostname: request.hostname,
+                        waiting_secs: request.waiting_secs,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
         Ok(NodeStatus {
             active,
             ipv6: membership::derive_ipv6(&endpoint_id).to_string(),
@@ -203,6 +228,7 @@ impl Node {
                         .collect(),
                 })
                 .collect(),
+            pending_requests,
         })
     }
 
@@ -285,6 +311,28 @@ impl Node {
             IpcMessage::Error { message } => Err(AppleError::Network(message)),
             _ => Err(AppleError::Network(
                 "node returned an invalid hostname response".to_owned(),
+            )),
+        }
+    }
+
+    pub fn accept_request(&self, network: String, id: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.accept_request(&network, &id)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "node returned an invalid approval response".to_owned(),
+            )),
+        }
+    }
+
+    pub fn deny_request(&self, network: String, id: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        match state.deny_request(&network, &id) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "node returned an invalid denial response".to_owned(),
             )),
         }
     }
