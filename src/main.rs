@@ -77,6 +77,7 @@ fn json_requested(command: &Command) -> bool {
         | Command::Firewall { json, .. }
         | Command::ExitNode { json, .. }
         | Command::Mdns { json, .. }
+        | Command::Dns { json, .. }
         | Command::Files { json, .. }
         | Command::Pair { json, .. }
         | Command::Identityof { json, .. }
@@ -480,6 +481,14 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// Enable or disable Magic DNS system integration
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// The old spelling of `ray config set auto-update on|off`.
     #[command(name = "auto-update", hide = true)]
     AutoUpdate {
@@ -798,6 +807,14 @@ pub(crate) enum MdnsAction {
     /// Seeing a node grants it nothing: linking up still needs `ray connect`
     /// and the other side's approval.
     Scan,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DnsAction {
+    /// Configure the system resolver for .ray names
+    On,
+    /// Remove Rayfish's system DNS configuration
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1534,6 +1551,7 @@ async fn run() -> Result<()> {
             json,
         } => cmd_alias(&network, action, json).await,
         Command::Mdns { action, json: _ } => cmd_mdns(action).await,
+        Command::Dns { action, json: _ } => cmd_dns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action, json } => cmd_config(action, json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
@@ -1602,6 +1620,20 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
     };
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
+        value: state.to_string(),
+        replace: false,
+    })
+    .await
+}
+
+/// `ray dns on|off`: apply or remove Magic DNS without changing the data plane.
+async fn cmd_dns(action: DnsAction) -> Result<()> {
+    let state = match action {
+        DnsAction::On => "on",
+        DnsAction::Off => "off",
+    };
+    ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: ipc::NodeKey::Global(ipc::GlobalKey::Dns),
         value: state.to_string(),
         replace: false,
     })

@@ -79,6 +79,7 @@ setting_keys! {
         Mdns = "mdns", "LAN peer discovery over mDNS (on|off)";
         Relay = "relay", "iroh relay servers (preset or URL, comma-separated)";
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
+        Dns = "dns", "Magic DNS system integration (on|off)";
         DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders, including mesh peer IPv6 addresses (comma-separated)";
         AutoUpdate = "auto-update", "install new releases automatically (on|off)";
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";

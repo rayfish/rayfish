@@ -302,24 +302,38 @@ pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
 
 /// Merge configured DNS upstreams with the system-captured ones. `replace`
 /// drops the captured set; otherwise custom upstreams are tried first, then the
-/// captured ones. Unset returns the captured set unchanged.
+/// captured ones. When present, Tailscale's Magic DNS resolver is preferred over
+/// every other upstream. Unset returns the captured set unchanged.
 ///
 /// Captured resolvers are IPv4 because that is what the desktop OS backends
 /// expose. Configured IPv6 addresses are retained so an overlay peer running a
 /// resolver can receive ordinary DNS queries over the mesh.
 pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<IpAddr> {
-    if o.servers.is_empty() {
-        return captured.into_iter().map(IpAddr::V4).collect();
-    }
-    let custom: Vec<IpAddr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
-    if o.replace {
-        custom
+    let upstreams = if o.servers.is_empty() {
+        captured.into_iter().map(IpAddr::V4).collect()
     } else {
-        custom
-            .into_iter()
-            .chain(captured.into_iter().map(IpAddr::V4))
-            .collect()
+        let custom: Vec<IpAddr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
+        if o.replace {
+            custom
+        } else {
+            custom
+                .into_iter()
+                .chain(captured.into_iter().map(IpAddr::V4))
+                .collect()
+        }
+    };
+    prefer_tailscale_dns(upstreams)
+}
+
+/// Tailscale's Magic DNS resolver owns its split-DNS rules. Keep it first when
+/// present while Rayfish intercepts `.ray` queries and forwards other names.
+fn prefer_tailscale_dns(mut upstreams: Vec<IpAddr>) -> Vec<IpAddr> {
+    let tailscale = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100));
+    if let Some(index) = upstreams.iter().position(|ip| *ip == tailscale) {
+        let resolver = upstreams.remove(index);
+        upstreams.insert(0, resolver);
     }
+    upstreams
 }
 
 /// Whether `o` contributes anything to [`resolve_upstreams`], i.e. names at least
@@ -450,6 +464,9 @@ pub struct AppConfig {
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
     #[serde(default)]
     pub dns_upstreams: ServerOverride,
+    /// Whether Rayfish configures the host resolver for Magic DNS.
+    #[serde(default = "default_true")]
+    pub dns_enabled: bool,
     /// Recently successful peer transport paths.  These are only connection
     /// hints: iroh still authenticates the endpoint identity in TLS and falls
     /// back to its normal discovery services when a hint is stale.  Keeping
@@ -541,6 +558,7 @@ impl Default for AppConfig {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            dns_enabled: true,
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
             v4_bridge: true,
@@ -685,6 +703,8 @@ struct Settings {
     discovery_dns: ServerOverride,
     #[serde(default)]
     dns_upstreams: ServerOverride,
+    #[serde(default = "default_true")]
+    dns_enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
@@ -1222,6 +1242,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
+        dns_enabled: settings.dns_enabled,
         endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         v4_bridge: settings.v4_bridge,
@@ -1291,6 +1312,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
+        dns_enabled: config.dns_enabled,
         endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         v4_bridge: config.v4_bridge,
@@ -2260,6 +2282,18 @@ name = "test"
         assert_eq!(
             resolve_upstreams(&rep, captured.clone()),
             vec![IpAddr::V4(one)]
+        );
+
+        // Tailscale remains the preferred upstream even when the user added a
+        // different resolver, while Rayfish itself still intercepts `.ray`.
+        let tailscale = Ipv4Addr::new(100, 100, 100, 100);
+        assert_eq!(
+            resolve_upstreams(&aug, vec![captured[0], tailscale],),
+            vec![
+                IpAddr::V4(tailscale),
+                IpAddr::V4(one),
+                IpAddr::V4(captured[0])
+            ]
         );
     }
 

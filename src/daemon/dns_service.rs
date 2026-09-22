@@ -102,6 +102,9 @@ impl DnsService {
         if cfg!(target_os = "android") {
             return;
         }
+        if !config::load().map(|c| c.dns_enabled).unwrap_or(true) {
+            return;
+        }
         // Configure system DNS to route .ray queries to our in-daemon resolver.
         dns_config::restore_stale_backups();
         if let Some(retry) = self.configure_retry.lock().unwrap().take() {
