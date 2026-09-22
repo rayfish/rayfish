@@ -347,6 +347,7 @@ private struct EmptyState: View {
 private struct SettingsView: View {
     @ObservedObject var controller: TunnelController
     @State private var legacyStateDirectory = ""
+    @State private var shellCommandMessage: String?
 
     var body: some View {
         Form {
@@ -359,10 +360,26 @@ private struct SettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
-            Section("Advanced") {
+            Section("Command line") {
                 LabeledContent("Command line") {
                     Text("ray status")
                         .fontDesign(.monospaced)
+                }
+                Text("Makes ray available in new \(ShellCommandInstaller.shellName()) terminals.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Button("Install shell command") {
+                    do {
+                        let configuration = try ShellCommandInstaller.install()
+                        shellCommandMessage = "Installed in \(configuration.lastPathComponent). Open a new terminal to use ray."
+                    } catch {
+                        shellCommandMessage = error.localizedDescription
+                    }
+                }
+                if let shellCommandMessage {
+                    Text(shellCommandMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
             }
             Section("Migrate existing Rayfish") {

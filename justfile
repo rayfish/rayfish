@@ -29,6 +29,18 @@ apk:
 # The sibling repos in this tree name this recipe `android`, so accept both.
 alias android := apk
 
+# Generate and open the native macOS app project. The app needs normal Xcode
+# signing configuration before its system extension can run on a local Mac.
+macos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname)" != "Darwin" ]; then
+        echo "just macos must run on macOS" >&2
+        exit 1
+    fi
+    xcodegen generate --spec macos/project.yml --project macos
+    open macos/Rayfish.xcodeproj
+
 # Compile the Android core for both APK ABIs without an NDK on this machine:
 # cross builds it in a container (see cross/Dockerfile.android). Catches the
 # `#[cfg(target_os = "android")]` code that no desktop build ever sees. `just
