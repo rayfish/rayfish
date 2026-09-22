@@ -142,7 +142,8 @@ final class TunnelController: ObservableObject {
     }
 
     private func loadManager() async throws -> NETunnelProviderManager {
-        let managers = try await withCheckedThrowingContinuation { continuation in
+        let managers: [NETunnelProviderManager] = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[NETunnelProviderManager], Error>) in
             NETunnelProviderManager.loadAllFromPreferences { managers, error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -161,7 +162,8 @@ final class TunnelController: ObservableObject {
     }
 
     private func configuredManager(legacyStateDirectory: String?) async throws -> NETunnelProviderManager {
-        let managers = try await withCheckedThrowingContinuation { continuation in
+        let managers: [NETunnelProviderManager] = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[NETunnelProviderManager], Error>) in
             NETunnelProviderManager.loadAllFromPreferences { managers, error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -183,7 +185,8 @@ final class TunnelController: ObservableObject {
         manager.protocolConfiguration = configuration
         manager.localizedDescription = "Rayfish"
         manager.isEnabled = true
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
             manager.saveToPreferences { error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -192,7 +195,8 @@ final class TunnelController: ObservableObject {
                 }
             }
         }
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
             manager.loadFromPreferences { error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -204,10 +208,14 @@ final class TunnelController: ObservableObject {
         return manager
     }
 
-    private func send(_ data: Data, through connection: NETunnelProviderSession) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
+    private func send(_ data: Data, through connection: NEVPNConnection) async throws -> Data {
+        guard let session = connection as? NETunnelProviderSession else {
+            throw TunnelError.notTunnelSession
+        }
+        return try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Data, Error>) in
             do {
-                try connection.sendProviderMessage(data) { response in
+                try session.sendProviderMessage(data) { response in
                     guard let response else {
                         continuation.resume(throwing: TunnelError.noResponse)
                         return
@@ -223,6 +231,7 @@ final class TunnelController: ObservableObject {
 
 private enum TunnelError: LocalizedError {
     case notInstalled
+    case notTunnelSession
     case noResponse
     case provider(String)
 
@@ -230,6 +239,8 @@ private enum TunnelError: LocalizedError {
         switch self {
         case .notInstalled:
             "Install and connect Rayfish before using it."
+        case .notTunnelSession:
+            "The Rayfish VPN configuration is not a packet tunnel."
         case .noResponse:
             "The Rayfish tunnel did not respond."
         case let .provider(message):
