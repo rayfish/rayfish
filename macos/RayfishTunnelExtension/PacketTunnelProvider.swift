@@ -11,7 +11,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         completionHandler: @escaping (Error?) -> Void
     ) {
         do {
-            let node = Node(configDir: stateDirectory().path)
+            let node = Node(configDir: try stateDirectory().path)
             if let legacyStateDirectory = (protocolConfiguration as? NETunnelProviderProtocol)?
                 .providerConfiguration?["legacyStateDirectory"] as? String,
                !legacyStateDirectory.isEmpty {
@@ -93,12 +93,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         return settings
     }
 
-    private func stateDirectory() -> URL {
+    private func stateDirectory() throws -> URL {
         let manager = FileManager.default
-        let root = manager.containerURL(forSecurityApplicationGroupIdentifier: "group.xyz.rayfish")
-            ?? manager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        guard let root = manager.containerURL(forSecurityApplicationGroupIdentifier: "group.xyz.rayfish") else {
+            throw ProviderError.missingAppGroup
+        }
         let path = root.appendingPathComponent("rayfish", isDirectory: true)
-        try? manager.createDirectory(at: path, withIntermediateDirectories: true)
+        try manager.createDirectory(at: path, withIntermediateDirectories: true)
         return path
     }
 
@@ -149,6 +150,7 @@ private enum ProviderError: LocalizedError {
     case providerReleased
     case notStarted
     case missingInviteCode
+    case missingAppGroup
 
     var errorDescription: String? {
         switch self {
@@ -158,6 +160,8 @@ private enum ProviderError: LocalizedError {
             "Rayfish is not connected"
         case .missingInviteCode:
             "An invite code is required"
+        case .missingAppGroup:
+            "Rayfish shared storage is unavailable"
         }
     }
 }
