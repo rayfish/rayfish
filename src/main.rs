@@ -1916,14 +1916,17 @@ mod tests {
     }
 
     #[test]
-    fn up_parses_controller_ticket_as_an_opaque_type() {
-        let cli = Cli::try_parse_from(["ray", "up", "--controller", "ticket-value"]).unwrap();
+    fn up_parses_controller_ticket() {
+        let controller = iroh::EndpointAddr::from(iroh::SecretKey::generate().public());
+        let expected = ipc::EnrollmentTicket::new(controller, [7; 32]);
+        let encoded = expected.to_string();
+        let cli = Cli::try_parse_from(["ray", "up", "--controller", encoded.as_str()]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Up {
                 controller: Some(ticket),
                 ..
-            } if ticket.expose() == "ticket-value"
+            } if ticket == expected
         ));
     }
 

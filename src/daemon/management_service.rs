@@ -8,7 +8,7 @@ use crate::management::{
 use futures::future::join_all;
 use ray_proto::ipc::{
     ControllerSelector, EnrollmentCredentialSelector, MachineHostname, ManagedMachineSelector,
-    NetworkName, UnixTimestamp,
+    NetworkName, UnixTimestampSecs,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,8 +18,8 @@ const MANAGEMENT_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_ENROLLMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-fn now() -> UnixTimestamp {
-    UnixTimestamp::from_secs(
+fn now() -> UnixTimestampSecs {
+    UnixTimestampSecs::from_secs(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -32,7 +32,7 @@ fn record_enrollment(
     machine: EndpointId,
     secret_hash: blake3::Hash,
     hostname: &MachineHostname,
-    enrolled_at: UnixTimestamp,
+    enrolled_at: UnixTimestampSecs,
 ) -> anyhow::Result<()> {
     let credential = settings
         .enrollment_credentials
@@ -78,6 +78,7 @@ fn record_enrollment(
     Ok(())
 }
 
+/// Handles enrollment, controller authorization, and delegated network actions.
 pub(crate) struct ManagementService {
     transport: Arc<Transport>,
     registry: Arc<NetworkRegistry>,
@@ -87,6 +88,7 @@ pub(crate) struct ManagementService {
 }
 
 impl ManagementService {
+    /// Creates the management service for the process-wide transport and registry.
     pub(crate) fn new(transport: Arc<Transport>, registry: Arc<NetworkRegistry>) -> Self {
         Self {
             transport,
@@ -95,6 +97,7 @@ impl ManagementService {
         }
     }
 
+    /// Creates and persists a machine-enrollment credential.
     pub(crate) fn create_enrollment(&self, expires_in: Duration, reusable: bool) -> IpcMessage {
         let expires_in = if expires_in.is_zero() {
             DEFAULT_ENROLLMENT_TTL
@@ -121,12 +124,13 @@ impl ManagementService {
         }
         IpcMessage::MachineEnrollmentCreated {
             id,
-            ticket: crate::management::encode_ticket(self.transport.endpoint.id(), &secret),
+            ticket: ipc::EnrollmentTicket::new(self.transport.endpoint.addr(), secret.to_bytes()),
             expires_at,
             reusable,
         }
     }
 
+    /// Lists enrollment credentials without exposing their secrets.
     pub(crate) fn list_enrollments(&self) -> IpcMessage {
         let now = now();
         match config::load() {
@@ -155,6 +159,7 @@ impl ManagementService {
         }
     }
 
+    /// Revokes the unique enrollment credential matching `selector`.
     pub(crate) fn revoke_enrollment(&self, selector: &EnrollmentCredentialSelector) -> IpcMessage {
         let result = config::update_settings(|settings| {
             let matches: Vec<usize> = settings
@@ -177,11 +182,10 @@ impl ManagementService {
         }
     }
 
+    /// Enrolls this machine with the controller named by `ticket`.
     pub(crate) async fn enroll_with_ticket(&self, ticket: &ipc::EnrollmentTicket) -> IpcMessage {
-        let (controller, secret) = match crate::management::decode_ticket(ticket) {
-            Ok(decoded) => decoded,
-            Err(error) => return ipc_err(error.to_string()),
-        };
+        let controller = ticket.controller().id;
+        let secret = EnrollmentSecret::from_bytes(*ticket.secret());
         if controller == self.transport.endpoint.id() {
             return ipc_err("a machine cannot control itself");
         }
@@ -191,10 +195,9 @@ impl ManagementService {
         };
         let connection = match tokio::time::timeout(
             MANAGEMENT_CONNECT_TIMEOUT,
-            self.transport.endpoint.connect(
-                iroh::EndpointAddr::from(controller),
-                crate::management::ALPN,
-            ),
+            self.transport
+                .endpoint
+                .connect(ticket.controller().clone(), crate::management::ALPN),
         )
         .await
         {
@@ -271,6 +274,7 @@ impl ManagementService {
         Ok(hostname.parse()?)
     }
 
+    /// Lists controllers authorized to manage this machine.
     pub(crate) fn list_controllers(&self) -> IpcMessage {
         match config::load() {
             Ok(settings) => IpcMessage::Controllers {
@@ -287,6 +291,7 @@ impl ManagementService {
         }
     }
 
+    /// Revokes one matching controller, or every controller when no selector is given.
     pub(crate) async fn revoke_controller(
         &self,
         identity_prefix: Option<&ControllerSelector>,
@@ -325,6 +330,7 @@ impl ManagementService {
         }
     }
 
+    /// Lists enrolled machines and optionally probes their current status.
     pub(crate) async fn list_machines(&self, probe: bool) -> IpcMessage {
         let machines = match config::load() {
             Ok(settings) => settings.managed_machines,
@@ -382,6 +388,7 @@ impl ManagementService {
         IpcMessage::ManagedMachinesResponse { machines: results }
     }
 
+    /// Asks an enrolled machine to join a network controlled by this node.
     pub(crate) async fn delegated_join(
         &self,
         machine: &ManagedMachineSelector,
@@ -432,6 +439,7 @@ impl ManagementService {
         }
     }
 
+    /// Asks an enrolled machine to leave a network controlled by this node.
     pub(crate) async fn delegated_leave(
         &self,
         machine: &ManagedMachineSelector,
@@ -497,6 +505,7 @@ impl ManagementService {
         }
     }
 
+    /// Removes an enrolled machine from this controller's local inventory.
     pub(crate) fn forget_machine(&self, machine: &ManagedMachineSelector) -> IpcMessage {
         let target = match self.resolve_machine(machine) {
             Ok(target) => target,
@@ -587,6 +596,7 @@ impl ManagementService {
         }
     }
 
+    /// Handles one inbound enrollment or authenticated management request.
     pub(crate) async fn accept_connection(&self, connection: Connection) {
         let remote = connection.remote_id();
         let Ok((mut send, mut recv)) = connection.accept_bi().await else {
@@ -739,7 +749,7 @@ mod tests {
             .push(config::EnrollmentCredential {
                 id: ipc::EnrollmentCredentialId::new("abc123".to_string()),
                 secret_hash,
-                expires_at: UnixTimestamp::from_secs(200),
+                expires_at: UnixTimestampSecs::from_secs(200),
                 reusable,
                 enrolled_machines: Vec::new(),
                 revoked: false,
@@ -753,7 +763,7 @@ mod tests {
         let first = endpoint(1);
         let other = endpoint(2);
         let hostname: MachineHostname = "build-box".parse().unwrap();
-        let at = UnixTimestamp::from_secs(100);
+        let at = UnixTimestampSecs::from_secs(100);
 
         record_enrollment(&mut settings, first, secret_hash, &hostname, at).unwrap();
         record_enrollment(&mut settings, first, secret_hash, &hostname, at).unwrap();
@@ -772,7 +782,7 @@ mod tests {
         let (mut settings, secret_hash) = settings_with_credential(true);
         let first = endpoint(1);
         let other = endpoint(2);
-        let at = UnixTimestamp::from_secs(100);
+        let at = UnixTimestampSecs::from_secs(100);
 
         record_enrollment(
             &mut settings,

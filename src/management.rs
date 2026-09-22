@@ -6,15 +6,12 @@
 
 use std::fmt;
 
-use anyhow::{Result, bail};
-use iroh::EndpointId;
-use ray_proto::ipc::{EnrollmentTicket, MachineHostname, NetworkName};
+use ray_proto::ipc::{MachineHostname, NetworkName};
 use serde::{Deserialize, Serialize};
 
+/// ALPN negotiated for direct controller-to-machine connections.
 pub const ALPN: &[u8] = b"rayfish/manage/1";
 const SECRET_LEN: usize = 32;
-const PAYLOAD_LEN: usize = 32 + SECRET_LEN;
-const CHECKSUM_LEN: usize = 4;
 
 /// Enrollment secret carried only in the ticket and enrollment handshake.
 /// Its debug form is deliberately redacted.
@@ -22,12 +19,24 @@ const CHECKSUM_LEN: usize = 4;
 pub struct EnrollmentSecret([u8; SECRET_LEN]);
 
 impl EnrollmentSecret {
+    /// Generates a new random enrollment secret.
     pub fn generate() -> Self {
         Self(rand::random())
     }
 
+    /// Returns the hash persisted by the controller.
     pub fn hash(&self) -> blake3::Hash {
         blake3::hash(&self.0)
+    }
+
+    /// Creates a secret from the bytes carried in an enrollment ticket.
+    pub(crate) fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the bytes to place in an enrollment ticket.
+    pub(crate) fn to_bytes(&self) -> [u8; SECRET_LEN] {
+        self.0
     }
 }
 
@@ -37,14 +46,17 @@ impl fmt::Debug for EnrollmentSecret {
     }
 }
 
+/// Network invite carried in an authenticated management request.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkInvite(String);
 
 impl NetworkInvite {
+    /// Wraps an encoded network invite.
     pub fn new(value: String) -> Self {
         Self(value)
     }
 
+    /// Returns the encoded invite.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -56,15 +68,18 @@ impl fmt::Debug for NetworkInvite {
     }
 }
 
+/// Correlates a management response with its request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagementRequestId(u64);
 
 impl ManagementRequestId {
+    /// Generates a random request identifier.
     pub fn generate() -> Self {
         Self(rand::random())
     }
 }
 
+/// Operation requested by an authorized controller.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ManagementAction {
     Status,
@@ -106,6 +121,7 @@ impl fmt::Debug for ManagementAction {
     }
 }
 
+/// Result of a controller management request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ManagementResult {
     Status {
@@ -121,6 +137,7 @@ pub enum ManagementResult {
     },
 }
 
+/// Message exchanged over the direct management protocol.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ManagementMsg {
     Enroll {
@@ -172,73 +189,5 @@ impl fmt::Debug for ManagementMsg {
                 .field("result", result)
                 .finish(),
         }
-    }
-}
-
-fn checksum(payload: &[u8]) -> [u8; CHECKSUM_LEN] {
-    let hash = blake3::hash(payload);
-    let mut out = [0; CHECKSUM_LEN];
-    out.copy_from_slice(&hash.as_bytes()[..CHECKSUM_LEN]);
-    out
-}
-
-pub fn encode_ticket(controller: EndpointId, secret: &EnrollmentSecret) -> EnrollmentTicket {
-    let mut bytes = Vec::with_capacity(PAYLOAD_LEN + CHECKSUM_LEN);
-    bytes.extend_from_slice(controller.as_bytes());
-    bytes.extend_from_slice(&secret.0);
-    bytes.extend_from_slice(&checksum(&bytes));
-    EnrollmentTicket::new(bs58::encode(bytes).into_string())
-}
-
-pub fn decode_ticket(ticket: &EnrollmentTicket) -> Result<(EndpointId, EnrollmentSecret)> {
-    let bytes = bs58::decode(ticket.expose().trim())
-        .into_vec()
-        .map_err(|error| anyhow::anyhow!("invalid controller ticket: {error}"))?;
-    if bytes.len() != PAYLOAD_LEN + CHECKSUM_LEN {
-        bail!(
-            "invalid controller ticket: expected {} bytes, got {}",
-            PAYLOAD_LEN + CHECKSUM_LEN,
-            bytes.len()
-        );
-    }
-    let (payload, supplied_checksum) = bytes.split_at(PAYLOAD_LEN);
-    if supplied_checksum != checksum(payload) {
-        bail!("invalid controller ticket: checksum mismatch");
-    }
-    let controller_bytes: [u8; 32] = payload[..32]
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid controller identity"))?;
-    let secret_bytes: [u8; SECRET_LEN] = payload[32..]
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid controller ticket secret"))?;
-    let controller = EndpointId::from_bytes(&controller_bytes)
-        .map_err(|error| anyhow::anyhow!("invalid controller identity: {error}"))?;
-    Ok((controller, EnrollmentSecret(secret_bytes)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use iroh::SecretKey;
-
-    #[test]
-    fn ticket_roundtrip() {
-        let controller = SecretKey::generate().public();
-        let secret = EnrollmentSecret::generate();
-        let ticket = encode_ticket(controller, &secret);
-        let (decoded_controller, decoded_secret) = decode_ticket(&ticket).unwrap();
-        assert_eq!(decoded_controller, controller);
-        assert_eq!(decoded_secret, secret);
-    }
-
-    #[test]
-    fn ticket_rejects_damage() {
-        let controller = SecretKey::generate().public();
-        let secret = EnrollmentSecret::generate();
-        let ticket = encode_ticket(controller, &secret);
-        let mut bytes = bs58::decode(ticket.expose()).into_vec().unwrap();
-        bytes[10] ^= 1;
-        let damaged = EnrollmentTicket::new(bs58::encode(bytes).into_string());
-        assert!(decode_ticket(&damaged).is_err());
     }
 }
