@@ -1,8 +1,9 @@
 //! Password-encrypted backups of the device identity and its saved networks.
 //!
-//! Backups are base58-encoded encrypted blobs. `enc1` contains only the device
-//! key; `enc2` contains a msgpack payload with the key, pairing certificate,
-//! and saved network configs:
+//! Backups are base58-encoded blobs. `enc1` contains only the device key;
+//! `enc2` contains an encrypted msgpack payload with the key, pairing
+//! certificate, and saved network configs. `opb1` is the same payload held only
+//! in 1Password, where vault encryption is the protection:
 //!
 //! ```text
 //! enc1/enc2   4 bytes   magic + version
@@ -31,6 +32,7 @@ use crate::control::DeviceCert;
 
 const MAGIC_V1: [u8; 4] = *b"enc1";
 const MAGIC_V2: [u8; 4] = *b"enc2";
+const MAGIC_ONEPASSWORD: [u8; 4] = *b"opb1";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 /// The 32-byte secret key plus Poly1305's 16-byte tag.
@@ -103,6 +105,16 @@ pub fn decrypt(code: &str, password: &str) -> Result<SecretKey> {
 }
 
 pub fn decrypt_backup(code: &str, password: &str) -> Result<RestoredBackup> {
+    decrypt_backup_inner(code, Some(password))
+}
+
+/// Decrypt a backup held in 1Password. It is not additionally password
+/// encrypted because the 1Password vault is its encryption boundary.
+pub fn decrypt_onepassword_backup(code: &str) -> Result<RestoredBackup> {
+    decrypt_backup_inner(code, None)
+}
+
+fn decrypt_backup_inner(code: &str, password: Option<&str>) -> Result<RestoredBackup> {
     anyhow::ensure!(code.len() <= MAX_CODE_LEN, "invalid backup code: too large");
     let blob = bs58::decode(code.trim())
         .into_vec()
@@ -112,7 +124,8 @@ pub fn decrypt_backup(code: &str, password: &str) -> Result<RestoredBackup> {
     }
     let is_v1 = blob[..MAGIC_V1.len()] == MAGIC_V1;
     let is_v2 = blob[..MAGIC_V2.len()] == MAGIC_V2;
-    if !is_v1 && !is_v2 {
+    let is_onepassword = blob[..MAGIC_ONEPASSWORD.len()] == MAGIC_ONEPASSWORD;
+    if !is_v1 && !is_v2 && !is_onepassword {
         bail!("invalid backup code: unknown format");
     }
     if is_v1 && blob.len() != BLOB_LEN {
@@ -120,6 +133,15 @@ pub fn decrypt_backup(code: &str, password: &str) -> Result<RestoredBackup> {
             "invalid backup code: expected {BLOB_LEN} bytes, got {}",
             blob.len()
         );
+    }
+    if is_onepassword {
+        anyhow::ensure!(
+            password.is_none(),
+            "this backup is stored in 1Password; restore it with --1p"
+        );
+        let payload = rmp_serde::from_slice::<BackupPayload>(&blob[MAGIC_ONEPASSWORD.len()..])
+            .context("invalid backup contents")?;
+        return restored_payload(payload);
     }
     if blob.len() < MAGIC_V2.len() + SALT_LEN + NONCE_LEN + 16
         || blob.len() > MAGIC_V2.len() + SALT_LEN + NONCE_LEN + MAX_PLAINTEXT_LEN + 16
@@ -131,6 +153,7 @@ pub fn decrypt_backup(code: &str, password: &str) -> Result<RestoredBackup> {
     let nonce_bytes = &blob[4 + SALT_LEN..4 + SALT_LEN + NONCE_LEN];
     let ciphertext = &blob[4 + SALT_LEN + NONCE_LEN..];
 
+    let password = password.context("this backup requires its backup password")?;
     let derived = derive(password, salt)?;
     let plaintext = XChaCha20Poly1305::new((&derived).into())
         .decrypt(XNonce::from_slice(nonce_bytes), ciphertext)
@@ -148,6 +171,10 @@ pub fn decrypt_backup(code: &str, password: &str) -> Result<RestoredBackup> {
     } else {
         rmp_serde::from_slice::<BackupPayload>(&plaintext).context("invalid backup contents")?
     };
+    restored_payload(payload)
+}
+
+fn restored_payload(payload: BackupPayload) -> Result<RestoredBackup> {
     let secret_key = SecretKey::from_bytes(&payload.secret_key);
     if let Some(cert) = &payload.device_cert {
         anyhow::ensure!(cert.verify(), "invalid backup device certificate");
@@ -167,6 +194,29 @@ pub fn decrypt_backup(code: &str, password: &str) -> Result<RestoredBackup> {
 /// public key it belongs to (so a caller can show the user which identity it
 /// just wrote out).
 pub fn backup_current_identity(password: &str) -> Result<Backup> {
+    let payload = current_payload()?;
+    let key = SecretKey::from_bytes(&payload.secret_key);
+    let plaintext = rmp_serde::to_vec_named(&payload).context("encode backup")?;
+    Ok(Backup {
+        code: encrypt_bytes(&MAGIC_V2, &plaintext, password)?,
+        public_key: key.public().to_string(),
+    })
+}
+
+/// Export the identity for storage in 1Password. 1Password's encrypted vault,
+/// rather than a second password, protects this format.
+pub fn backup_current_identity_for_onepassword() -> Result<Backup> {
+    let payload = current_payload()?;
+    let key = SecretKey::from_bytes(&payload.secret_key);
+    let mut blob = Vec::from(MAGIC_ONEPASSWORD);
+    blob.extend(rmp_serde::to_vec_named(&payload).context("encode backup")?);
+    Ok(Backup {
+        code: bs58::encode(blob).into_string(),
+        public_key: key.public().to_string(),
+    })
+}
+
+fn current_payload() -> Result<BackupPayload> {
     let key = crate::identity::load_or_create().context("load identity")?;
     let device_cert = crate::identity::load_device_cert().context("load device certificate")?;
     if let Some(cert) = &device_cert {
@@ -176,15 +226,10 @@ pub fn backup_current_identity(password: &str) -> Result<Backup> {
         );
     }
     let networks = config::load().context("load saved networks")?.networks;
-    let payload = BackupPayload {
+    Ok(BackupPayload {
         secret_key: key.to_bytes(),
         device_cert,
         networks,
-    };
-    let plaintext = rmp_serde::to_vec_named(&payload).context("encode backup")?;
-    Ok(Backup {
-        code: encrypt_bytes(&MAGIC_V2, &plaintext, password)?,
-        public_key: key.public().to_string(),
     })
 }
 
@@ -234,8 +279,11 @@ pub fn restore_metadata(backup: &RestoredBackup, same_identity: bool) -> Result<
 /// Decrypt and install an identity backup in the daemon-owned config tree.
 /// The caller is responsible for authenticating the request before calling
 /// this, since this changes the node's signing identity.
-pub fn restore_current_identity(code: &str, password: &str) -> Result<String> {
-    let backup = decrypt_backup(code, password)?;
+pub fn restore_current_identity(code: &str, password: Option<&str>) -> Result<String> {
+    let backup = match password {
+        Some(password) => decrypt_backup(code, password)?,
+        None => decrypt_onepassword_backup(code)?,
+    };
     let same_identity = crate::identity::load_existing()?
         .is_some_and(|existing| existing.public() == backup.secret_key.public());
     if !same_identity {
@@ -262,6 +310,23 @@ mod tests {
         let code = encrypt(&key, "correct horse").unwrap();
         let restored = decrypt(&code, "correct horse").unwrap();
         assert_eq!(restored.to_bytes(), key.to_bytes());
+    }
+
+    #[test]
+    fn onepassword_backup_round_trips_without_a_password() {
+        let key = SecretKey::generate();
+        let payload = BackupPayload {
+            secret_key: key.to_bytes(),
+            device_cert: None,
+            networks: Vec::new(),
+        };
+        let mut blob = Vec::from(MAGIC_ONEPASSWORD);
+        blob.extend(rmp_serde::to_vec_named(&payload).unwrap());
+        let code = bs58::encode(blob).into_string();
+
+        let restored = decrypt_onepassword_backup(&code).unwrap();
+        assert_eq!(restored.secret_key.to_bytes(), key.to_bytes());
+        assert!(decrypt_backup(&code, "password").is_err());
     }
 
     #[test]
