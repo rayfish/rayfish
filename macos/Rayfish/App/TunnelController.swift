@@ -48,12 +48,18 @@ final class TunnelController: ObservableObject {
         }
     }
 
-    func create(name: String?) async {
-        await perform(ProviderRequest(action: .create, name: name, code: nil), replaceStatus: true)
+    func create(name: String?, hostname: String?) async {
+        await perform(
+            ProviderRequest(action: .create, name: name, code: nil, hostname: hostname),
+            replaceStatus: true
+        )
     }
 
-    func join(code: String) async {
-        await perform(ProviderRequest(action: .join, name: nil, code: code), replaceStatus: true)
+    func join(code: String, hostname: String?) async {
+        await perform(
+            ProviderRequest(action: .join, name: nil, code: code, hostname: hostname),
+            replaceStatus: true
+        )
     }
 
     func invite(network: String) async -> String? {
@@ -61,7 +67,9 @@ final class TunnelController: ObservableObject {
         defer { isLoading = false }
         do {
             let manager = try await loadManager()
-            let data = try JSONEncoder().encode(ProviderRequest(action: .invite, name: network, code: nil))
+            let data = try JSONEncoder().encode(
+                ProviderRequest(action: .invite, name: network, code: nil, hostname: nil)
+            )
             let responseData = try await send(data, through: manager.connection)
             let response = try JSONDecoder().decode(ProviderResponse.self, from: responseData)
             guard response.success, let inviteCode = response.inviteCode else {
@@ -77,7 +85,10 @@ final class TunnelController: ObservableObject {
     }
 
     func leave(network: String) async {
-        await perform(ProviderRequest(action: .leave, name: network, code: nil), replaceStatus: true)
+        await perform(
+            ProviderRequest(action: .leave, name: network, code: nil, hostname: nil),
+            replaceStatus: true
+        )
     }
 
     func poll() async {

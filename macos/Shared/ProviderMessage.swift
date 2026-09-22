@@ -10,8 +10,9 @@ struct ProviderRequest: Codable {
     }
 
     var action: Action
-    var name: String?
-    var code: String?
+    var name: String? = nil
+    var code: String? = nil
+    var hostname: String? = nil
 }
 
 struct ProviderResponse: Codable {

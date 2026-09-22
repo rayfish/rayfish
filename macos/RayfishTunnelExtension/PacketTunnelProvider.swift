@@ -111,12 +111,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         case .status:
             return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
         case .create:
-            try node.createNetwork(name: request.name)
+            try node.createNetwork(name: request.name, hostname: request.hostname)
         case .join:
             guard let code = request.code, !code.isEmpty else {
                 throw ProviderError.missingInviteCode
             }
-            try node.joinNetwork(code: code)
+            try node.joinNetwork(code: code, hostname: request.hostname)
         case .invite:
             guard let name = request.name, !name.isEmpty else {
                 throw ProviderError.missingNetworkName

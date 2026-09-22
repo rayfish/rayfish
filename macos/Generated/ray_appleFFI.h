@@ -293,7 +293,7 @@ RustBuffer uniffi_ray_apple_fn_method_node_create_invite(void*_Nonnull ptr, Rust
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_NETWORK
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_NETWORK
-void uniffi_ray_apple_fn_method_node_create_network(void*_Nonnull ptr, RustBuffer name, RustCallStatus *_Nonnull out_status
+void uniffi_ray_apple_fn_method_node_create_network(void*_Nonnull ptr, RustBuffer name, RustBuffer hostname, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DEACTIVATE
@@ -308,7 +308,7 @@ RustBuffer uniffi_ray_apple_fn_method_node_ipv6_address(void*_Nonnull ptr, RustC
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_JOIN_NETWORK
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_JOIN_NETWORK
-void uniffi_ray_apple_fn_method_node_join_network(void*_Nonnull ptr, RustBuffer code, RustCallStatus *_Nonnull out_status
+void uniffi_ray_apple_fn_method_node_join_network(void*_Nonnull ptr, RustBuffer code, RustBuffer hostname, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_LEAVE_NETWORK
