@@ -18,6 +18,8 @@ final class TunnelController: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
+            let installer = SystemExtensionInstaller(identifier: Self.providerBundleIdentifier)
+            try await installer.install()
             let manager = try await configuredManager()
             try manager.connection.startVPNTunnel()
             error = nil
