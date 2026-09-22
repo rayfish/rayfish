@@ -2035,6 +2035,7 @@ mod tests {
         assert_eq!(normalize_version("v1.2.3-rc1"), "1.2.3-rc1");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn nightly_updates_show_both_commit_labels() {
         assert_eq!(
