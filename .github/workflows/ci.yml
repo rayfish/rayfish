@@ -91,7 +91,7 @@ jobs:
 
       - name: Build native app
         run: |
-          xcodegen generate --spec macos/project.yml --project macos/Rayfish.xcodeproj
+          xcodegen generate --spec macos/project.yml --project macos
           xcodebuild \
             -project macos/Rayfish.xcodeproj \
             -scheme Rayfish \
