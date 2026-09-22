@@ -231,9 +231,12 @@ pub fn has_membership_wildcard(firewall: &SuggestedFirewall) -> bool {
     })
 }
 
+/// Managed-machine joins and leaves needed to reach the desired membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipDiff {
+    /// Hostnames absent from the live roster.
     pub joins: Vec<MachineHostname>,
+    /// Hostnames present in the live roster but absent from the spec.
     pub leaves: Vec<MachineHostname>,
 }
 

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
-use ray_proto::ipc::{MachineHostname, UnixTimestamp};
+use ray_proto::ipc::{MachineHostname, UnixTimestampSecs};
 use serde::{Deserialize, Serialize};
 
 use crate::membership::GroupMode;
@@ -442,7 +442,7 @@ pub struct PendingJoinEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerGrant {
     pub identity: EndpointId,
-    pub enrolled_at: UnixTimestamp,
+    pub enrolled_at: UnixTimestampSecs,
 }
 
 /// A machine enrolled with this controller. `hostname` is the stable name used
@@ -451,9 +451,9 @@ pub struct ControllerGrant {
 pub struct ManagedMachine {
     pub identity: EndpointId,
     pub hostname: MachineHostname,
-    pub enrolled_at: UnixTimestamp,
+    pub enrolled_at: UnixTimestampSecs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_seen: Option<UnixTimestamp>,
+    pub last_seen: Option<UnixTimestampSecs>,
 }
 
 /// A controller-side enrollment credential. Only its hash is persisted.
@@ -462,7 +462,7 @@ pub struct ManagedMachine {
 pub struct EnrollmentCredential {
     pub id: ray_proto::ipc::EnrollmentCredentialId,
     pub secret_hash: blake3::Hash,
-    pub expires_at: UnixTimestamp,
+    pub expires_at: UnixTimestampSecs,
     pub reusable: bool,
     #[serde(default)]
     pub enrolled_machines: Vec<EndpointId>,
@@ -2169,8 +2169,8 @@ name = "test"
         let dir = tmp.path();
         let controller = test_id(31);
         let machine = test_id(32);
-        let enrolled_at = UnixTimestamp::from_secs(100);
-        let last_seen = UnixTimestamp::from_secs(200);
+        let enrolled_at = UnixTimestampSecs::from_secs(100);
+        let last_seen = UnixTimestampSecs::from_secs(200);
         let cfg = AppConfig {
             controllers: vec![ControllerGrant {
                 identity: controller,
@@ -2185,7 +2185,7 @@ name = "test"
             enrollment_credentials: vec![EnrollmentCredential {
                 id: ray_proto::ipc::EnrollmentCredentialId::new("abc123".to_string()),
                 secret_hash: blake3::hash(b"fabricated enrollment secret"),
-                expires_at: UnixTimestamp::from_secs(300),
+                expires_at: UnixTimestampSecs::from_secs(300),
                 reusable: true,
                 enrolled_machines: vec![machine],
                 revoked: false,
