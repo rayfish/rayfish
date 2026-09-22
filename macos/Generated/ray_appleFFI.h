@@ -286,6 +286,11 @@ void*_Nonnull uniffi_ray_apple_fn_constructor_node_new(RustBuffer config_dir, Ru
 void uniffi_ray_apple_fn_method_node_activate(void*_Nonnull ptr, uint64_t flow, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_INVITE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_INVITE
+RustBuffer uniffi_ray_apple_fn_method_node_create_invite(void*_Nonnull ptr, RustBuffer network, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_NETWORK
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_NETWORK
 void uniffi_ray_apple_fn_method_node_create_network(void*_Nonnull ptr, RustBuffer name, RustCallStatus *_Nonnull out_status
@@ -619,6 +624,12 @@ void ffi_ray_apple_rust_future_complete_void(uint64_t handle, RustCallStatus *_N
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACTIVATE
 uint16_t uniffi_ray_apple_checksum_method_node_activate(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_CREATE_INVITE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_CREATE_INVITE
+uint16_t uniffi_ray_apple_checksum_method_node_create_invite(void
 
 );
 #endif

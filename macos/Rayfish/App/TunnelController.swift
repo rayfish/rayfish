@@ -49,6 +49,26 @@ final class TunnelController: ObservableObject {
         await perform(ProviderRequest(action: .join, name: nil, code: code), replaceStatus: true)
     }
 
+    func invite(network: String) async -> String? {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let manager = try await loadManager()
+            let data = try JSONEncoder().encode(ProviderRequest(action: .invite, name: network, code: nil))
+            let responseData = try await send(data, through: manager.connection)
+            let response = try JSONDecoder().decode(ProviderResponse.self, from: responseData)
+            guard response.success, let inviteCode = response.inviteCode else {
+                throw TunnelError.provider(response.error ?? "The tunnel could not create an invite")
+            }
+            status = response.status
+            error = nil
+            return inviteCode
+        } catch {
+            self.error = error.localizedDescription
+            return nil
+        }
+    }
+
     private func perform(_ request: ProviderRequest, replaceStatus: Bool) async {
         isLoading = true
         defer { isLoading = false }

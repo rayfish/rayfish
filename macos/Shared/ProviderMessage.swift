@@ -5,6 +5,7 @@ struct ProviderRequest: Codable {
         case status
         case create
         case join
+        case invite
     }
 
     var action: Action
@@ -16,6 +17,7 @@ struct ProviderResponse: Codable {
     var success: Bool
     var error: String?
     var status: ProviderStatus?
+    var inviteCode: String?
 }
 
 struct ProviderStatus: Codable, Equatable {

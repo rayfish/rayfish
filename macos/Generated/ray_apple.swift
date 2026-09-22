@@ -515,6 +515,11 @@ public protocol NodeProtocol: AnyObject, Sendable {
      */
     func activate(flow: PacketFlow) throws
 
+    /**
+     * Mint a single-use invite that expires after seven days.
+     */
+    func createInvite(network: String) throws  -> String
+
     func createNetwork(name: String?) throws
 
     /**
@@ -626,6 +631,17 @@ open func activate(flow: PacketFlow)throws   {try rustCallWithError(FfiConverter
         FfiConverterCallbackInterfacePacketFlow_lower(flow),$0
     )
 }
+}
+
+    /**
+     * Mint a single-use invite that expires after seven days.
+     */
+open func createInvite(network: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_create_invite(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),$0
+    )
+})
 }
 
 open func createNetwork(name: String?)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
@@ -1394,6 +1410,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_activate() != 47813) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_create_invite() != 34104) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_create_network() != 13138) {
