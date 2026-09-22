@@ -84,9 +84,13 @@ struct RayfishCommand {
     private static func send(_ request: ProviderRequest) async throws -> ProviderResponse {
         let manager = try await manager()
         let data = try JSONEncoder().encode(request)
-        let responseData = try await withCheckedThrowingContinuation { continuation in
+        guard let session = manager.connection as? NETunnelProviderSession else {
+            throw CommandError.notTunnelSession
+        }
+        let responseData: Data = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Data, Error>) in
             do {
-                try manager.connection.sendProviderMessage(data) { response in
+                try session.sendProviderMessage(data) { response in
                     guard let response else {
                         continuation.resume(throwing: CommandError.noResponse)
                         return
@@ -137,7 +141,8 @@ struct RayfishCommand {
     }
 
     private static func loadManagers() async throws -> [NETunnelProviderManager] {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[NETunnelProviderManager], Error>) in
             NETunnelProviderManager.loadAllFromPreferences { managers, error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -149,7 +154,8 @@ struct RayfishCommand {
     }
 
     private static func save(_ manager: NETunnelProviderManager) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
             manager.saveToPreferences { error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -161,7 +167,8 @@ struct RayfishCommand {
     }
 
     private static func load(_ manager: NETunnelProviderManager) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
             manager.loadFromPreferences { error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -178,6 +185,7 @@ private enum CommandError: LocalizedError {
     case notInstalled
     case noResponse
     case noStatus
+    case notTunnelSession
     case provider(String)
 
     var errorDescription: String? {
@@ -190,6 +198,8 @@ private enum CommandError: LocalizedError {
             "The Rayfish tunnel did not respond"
         case .noStatus:
             "The Rayfish tunnel returned no status"
+        case .notTunnelSession:
+            "The Rayfish VPN configuration is not a packet tunnel"
         case let .provider(message):
             message
         }
