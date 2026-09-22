@@ -144,14 +144,15 @@ private struct NetworksView: View {
                         )
                     }
                 } else {
-                GroupBox {
-                    ContentUnavailableView(
-                        "No networks yet",
-                        systemImage: "circle.hexagongrid",
-                        description: Text("A network is a private space for the devices and people you invite."))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 48)
-                }
+                    GroupBox {
+                        EmptyState(
+                            title: "No networks yet",
+                            systemImage: "circle.hexagongrid",
+                            description: "A network is a private space for the devices and people you invite."
+                        )
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 48)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -295,10 +296,11 @@ private struct DevicesView: View {
                 ).values
             )
             if peers.isEmpty {
-                ContentUnavailableView(
-                    "No devices to show",
+                EmptyState(
+                    title: "No devices to show",
                     systemImage: "desktopcomputer",
-                    description: Text("Devices appear here once this Mac joins a network."))
+                    description: "Devices appear here once this Mac joins a network."
+                )
             } else {
                 List(peers) { peer in
                     HStack(spacing: 12) {
@@ -319,6 +321,26 @@ private struct DevicesView: View {
             }
         }
         .navigationTitle("Devices")
+    }
+}
+
+private struct EmptyState: View {
+    let title: String
+    let systemImage: String
+    let description: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text(title)
+                .font(.headline)
+            Text(description)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(32)
     }
 }
 
