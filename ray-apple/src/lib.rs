@@ -275,6 +275,20 @@ impl Node {
         }
     }
 
+    pub fn set_hostname(&self, network: String, hostname: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        match self
+            .runtime
+            .block_on(state.set_hostname(&network, &hostname))
+        {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "node returned an invalid hostname response".to_owned(),
+            )),
+        }
+    }
+
     /// Attach the system packet flow and start forwarding packets.
     pub fn activate(&self, flow: Box<dyn PacketFlow>) -> Result<(), AppleError> {
         #[cfg(not(target_os = "macos"))]

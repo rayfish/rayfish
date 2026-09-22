@@ -546,6 +546,8 @@ public protocol NodeProtocol: AnyObject, Sendable {
      */
     func receivePackets(packets: [Data]) throws
 
+    func setHostname(network: String, hostname: String) throws
+
     /**
      * Start the control plane. This is safe to call more than once.
      */
@@ -704,6 +706,14 @@ open func migrateLegacyState(source: String)throws   {try rustCallWithError(FfiC
 open func receivePackets(packets: [Data])throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_receive_packets(self.uniffiClonePointer(),
         FfiConverterSequenceData.lower(packets),$0
+    )
+}
+}
+
+open func setHostname(network: String, hostname: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_set_hostname(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterString.lower(hostname),$0
     )
 }
 }
@@ -1445,6 +1455,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_receive_packets() != 53305) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_set_hostname() != 15380) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_start() != 7498) {

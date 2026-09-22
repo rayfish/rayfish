@@ -326,6 +326,11 @@ void uniffi_ray_apple_fn_method_node_migrate_legacy_state(void*_Nonnull ptr, Rus
 void uniffi_ray_apple_fn_method_node_receive_packets(void*_Nonnull ptr, RustBuffer packets, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
+void uniffi_ray_apple_fn_method_node_set_hostname(void*_Nonnull ptr, RustBuffer network, RustBuffer hostname, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_START
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_START
 void uniffi_ray_apple_fn_method_node_start(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -677,6 +682,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_migrate_legacy_state(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_RECEIVE_PACKETS
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_RECEIVE_PACKETS
 uint16_t uniffi_ray_apple_checksum_method_node_receive_packets(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
+uint16_t uniffi_ray_apple_checksum_method_node_set_hostname(void
 
 );
 #endif
