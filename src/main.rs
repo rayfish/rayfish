@@ -1902,6 +1902,15 @@ mod tests {
     }
 
     #[test]
+    fn nightly_updates_show_both_commit_labels() {
+        assert_eq!(
+            update_label("0.4.2", "nightly (abcdef12)"),
+            format!("nightly ({})", env!("RAY_GIT_SHA"))
+        );
+        assert_eq!(update_label("0.4.2", "v0.4.3"), "v0.4.2");
+    }
+
+    #[test]
     fn version_is_newer_orders_semver() {
         assert!(version_is_newer("0.2.0", "0.1.0"));
         assert!(version_is_newer("1.0.0", "0.9.9"));

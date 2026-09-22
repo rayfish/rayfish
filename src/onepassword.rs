@@ -113,13 +113,8 @@ pub fn store(vault: Option<&str>, title: &str, blob: &str, public_key: &str) -> 
 
     let create = run_op(&create_args, Some(&template))?;
     if !create.status.success() {
-        let get_err = String::from_utf8_lossy(&get.stderr);
         let create_err = String::from_utf8_lossy(&create.stderr);
-        bail!(
-            "failed to store backup in 1Password.\n  get: {}\n  create: {}",
-            get_err.trim(),
-            create_err.trim()
-        );
+        bail!("failed to store backup in 1Password: {}", create_err.trim());
     }
     Ok(())
 }
@@ -159,42 +154,6 @@ fn update_field(
         field["purpose"] = serde_json::Value::String(purpose.to_string());
     }
     fields.push(field);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn update_template_replaces_our_fields_without_dropping_others() {
-        let mut template = serde_json::json!({
-            "title": "Rayfish Identity",
-            "fields": [
-                { "id": "backup", "label": "backup", "value": "old" },
-                { "label": "public_key", "value": "old-key" },
-                { "label": "unrelated", "value": "keep" },
-            ],
-        });
-
-        update_template(&mut template, "new-backup", "new-key").unwrap();
-
-        let fields = template["fields"].as_array().unwrap();
-        assert_eq!(fields[0]["value"], "new-backup");
-        assert_eq!(fields[1]["value"], "new-key");
-        assert_eq!(fields[2]["value"], "keep");
-    }
-
-    #[test]
-    fn update_template_adds_missing_fields() {
-        let mut template = serde_json::json!({ "fields": [] });
-
-        update_template(&mut template, "backup", "key").unwrap();
-
-        let fields = template["fields"].as_array().unwrap();
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0]["value"], "backup");
-        assert_eq!(fields[1]["value"], "key");
-    }
 }
 
 /// Read the backup blob back from a 1Password item.
@@ -243,4 +202,40 @@ pub fn read(vault: Option<&str>, title: &str) -> Result<String> {
         bail!("1Password item `backup` field is empty");
     }
     Ok(blob)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_template_replaces_our_fields_without_dropping_others() {
+        let mut template = serde_json::json!({
+            "title": "Rayfish Identity",
+            "fields": [
+                { "id": "backup", "label": "backup", "value": "old" },
+                { "label": "public_key", "value": "old-key" },
+                { "label": "unrelated", "value": "keep" },
+            ],
+        });
+
+        update_template(&mut template, "new-backup", "new-key").unwrap();
+
+        let fields = template["fields"].as_array().unwrap();
+        assert_eq!(fields[0]["value"], "new-backup");
+        assert_eq!(fields[1]["value"], "new-key");
+        assert_eq!(fields[2]["value"], "keep");
+    }
+
+    #[test]
+    fn update_template_adds_missing_fields() {
+        let mut template = serde_json::json!({ "fields": [] });
+
+        update_template(&mut template, "backup", "key").unwrap();
+
+        let fields = template["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["value"], "backup");
+        assert_eq!(fields[1]["value"], "key");
+    }
 }
