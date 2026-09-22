@@ -8,14 +8,25 @@ static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 const MIGRATION_MARKER: &str = ".legacy-state-migrated";
 
 pub(crate) fn copy_legacy_state(source: &Path, destination: &Path) -> Result<()> {
-    if destination.join(MIGRATION_MARKER).is_file() {
-        return Ok(());
-    }
-    if !source.is_dir() {
+    let source_type = fs::symlink_metadata(source)
+        .with_context(|| format!("reading {}", source.display()))?
+        .file_type();
+    if source_type.is_symlink() || !source_type.is_dir() {
         bail!("legacy Rayfish state directory is unavailable");
     }
     if source == destination {
         bail!("legacy and extension state directories are the same");
+    }
+    if destination.exists()
+        && fs::symlink_metadata(destination)
+            .with_context(|| format!("reading {}", destination.display()))?
+            .file_type()
+            .is_symlink()
+    {
+        bail!("extension state directory must not be a symbolic link");
+    }
+    if destination.join(MIGRATION_MARKER).is_file() {
+        return Ok(());
     }
     if destination.exists()
         && fs::read_dir(destination)
@@ -131,5 +142,21 @@ mod tests {
             fs::read_to_string(destination.join("secret_key")).unwrap(),
             "different"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlinked_legacy_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary directory should exist");
+        let source = root.path().join("legacy");
+        let linked_source = root.path().join("linked-legacy");
+        let destination = root.path().join("extension");
+        fs::create_dir(&source).expect("legacy tree should exist");
+        symlink(&source, &linked_source).expect("legacy symlink should exist");
+
+        assert!(copy_legacy_state(&linked_source, &destination).is_err());
+        assert!(!destination.exists());
     }
 }
