@@ -14,13 +14,13 @@ final class TunnelController: ObservableObject {
         await perform(ProviderRequest(action: .status), replaceStatus: true)
     }
 
-    func connect() async {
+    func connect(legacyStateDirectory: String? = nil) async {
         isLoading = true
         defer { isLoading = false }
         do {
             let installer = SystemExtensionInstaller(identifier: Self.providerBundleIdentifier)
             try await installer.install()
-            let manager = try await configuredManager()
+            let manager = try await configuredManager(legacyStateDirectory: legacyStateDirectory)
             try manager.connection.startVPNTunnel()
             error = nil
         } catch {
@@ -75,7 +75,7 @@ final class TunnelController: ObservableObject {
         return manager
     }
 
-    private func configuredManager() async throws -> NETunnelProviderManager {
+    private func configuredManager(legacyStateDirectory: String?) async throws -> NETunnelProviderManager {
         let managers = try await withCheckedThrowingContinuation { continuation in
             NETunnelProviderManager.loadAllFromPreferences { managers, error in
                 if let error {
@@ -92,6 +92,9 @@ final class TunnelController: ObservableObject {
         let configuration = NETunnelProviderProtocol()
         configuration.providerBundleIdentifier = Self.providerBundleIdentifier
         configuration.serverAddress = "Rayfish"
+        if let legacyStateDirectory {
+            configuration.providerConfiguration = ["legacyStateDirectory": legacyStateDirectory]
+        }
         manager.protocolConfiguration = configuration
         manager.localizedDescription = "Rayfish"
         manager.isEnabled = true

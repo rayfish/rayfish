@@ -12,6 +12,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     ) {
         do {
             let node = Node(configDir: stateDirectory().path)
+            if let legacyStateDirectory = (protocolConfiguration as? NETunnelProviderProtocol)?
+                .providerConfiguration?["legacyStateDirectory"] as? String,
+               !legacyStateDirectory.isEmpty {
+                try node.migrateLegacyState(source: legacyStateDirectory)
+            }
             try node.start()
             let settings = try networkSettings(address: node.ipv6Address())
             setTunnelNetworkSettings(settings) { [weak self] error in

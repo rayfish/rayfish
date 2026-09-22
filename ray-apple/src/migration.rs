@@ -5,8 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 
 static STAGING_ID: AtomicU64 = AtomicU64::new(0);
+const MIGRATION_MARKER: &str = ".legacy-state-migrated";
 
 pub(crate) fn copy_legacy_state(source: &Path, destination: &Path) -> Result<()> {
+    if destination.join(MIGRATION_MARKER).is_file() {
+        return Ok(());
+    }
     if !source.is_dir() {
         bail!("legacy Rayfish state directory is unavailable");
     }
@@ -38,6 +42,8 @@ pub(crate) fn copy_legacy_state(source: &Path, destination: &Path) -> Result<()>
     let result = (|| {
         fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
         copy_directory(source, &staging)?;
+        fs::write(staging.join(MIGRATION_MARKER), "migrated\n")
+            .context("writing migration marker")?;
         if destination.exists() {
             fs::remove_dir(destination)
                 .with_context(|| format!("removing empty {}", destination.display()))?;

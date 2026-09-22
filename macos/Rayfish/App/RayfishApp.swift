@@ -46,7 +46,7 @@ private struct ContentView: View {
             case .devices:
                 DevicesView()
             case .settings:
-                SettingsView()
+                SettingsView(controller: controller)
             }
         }
         .frame(minWidth: 820, minHeight: 560)
@@ -173,6 +173,9 @@ private struct DevicesView: View {
 }
 
 private struct SettingsView: View {
+    @ObservedObject var controller: TunnelController
+    @State private var legacyStateDirectory = ""
+
     var body: some View {
         Form {
             Section("VPN") {
@@ -189,6 +192,23 @@ private struct SettingsView: View {
                     Text("ray status")
                         .fontDesign(.monospaced)
                 }
+            }
+            Section("Migrate existing Rayfish") {
+                Text("Stop the legacy Rayfish service first, then enter its state directory. Migration copies the identity and saved networks without changing the old state.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                TextField("Legacy state directory", text: $legacyStateDirectory)
+                    .textFieldStyle(.roundedBorder)
+                Button("Migrate and connect") {
+                    Task {
+                        await controller.connect(
+                            legacyStateDirectory: legacyStateDirectory.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            )
+                        )
+                    }
+                }
+                .disabled(legacyStateDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .formStyle(.grouped)
