@@ -178,9 +178,16 @@ pub(crate) async fn cmd_pair_backup(
         onepassword::op_available()?;
     }
 
-    let password = backup_password()?;
+    let password = (!onepassword).then(backup_password).transpose()?;
     let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::BackupIdentity { password }).await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::BackupIdentity {
+            password,
+            onepassword,
+        },
+    )
+    .await?;
     let (code, public_key) = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::IdentityBackup { code, public_key } => (code, public_key),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
@@ -221,7 +228,11 @@ pub(crate) async fn cmd_pair_restore(
             .context("provide a backup code, or use --1p to read it from 1Password")?
     };
 
-    let password = rpassword::prompt_password("Enter backup password: ")?;
+    let password = if onepassword {
+        None
+    } else {
+        Some(rpassword::prompt_password("Enter backup password: ")?)
+    };
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,

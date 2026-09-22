@@ -503,8 +503,19 @@ impl Daemon {
                 secret,
             } => self.pair_with_device(endpoint_id, secret).await,
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
-            IpcMessage::BackupIdentity { password } => {
-                match crate::keybackup::backup_current_identity(&password) {
+            IpcMessage::BackupIdentity {
+                password,
+                onepassword,
+            } => {
+                let backup = if onepassword {
+                    crate::keybackup::backup_current_identity_for_onepassword()
+                } else {
+                    let Some(password) = password.as_deref() else {
+                        return ipc_err("backup password is required");
+                    };
+                    crate::keybackup::backup_current_identity(password)
+                };
+                match backup {
                     Ok(backup) => IpcMessage::IdentityBackup {
                         code: backup.code,
                         public_key: backup.public_key,
@@ -513,7 +524,7 @@ impl Daemon {
                 }
             }
             IpcMessage::RestoreIdentity { backup, password } => {
-                match crate::keybackup::restore_current_identity(&backup, &password) {
+                match crate::keybackup::restore_current_identity(&backup, password.as_deref()) {
                     Ok(public_key) => IpcMessage::Ok {
                         message: format!(
                             "Restored user identity: {public_key}. Restart the daemon for changes to take effect."

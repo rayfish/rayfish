@@ -293,12 +293,13 @@ pub enum IpcMessage {
     /// This is a mutation because it releases the local identity to an
     /// authorized caller, wrapped by the caller-supplied password.
     BackupIdentity {
-        password: String,
+        password: Option<String>,
+        onepassword: bool,
     },
     /// Restore an encrypted identity backup into the daemon-owned config tree.
     RestoreIdentity {
         backup: String,
-        password: String,
+        password: Option<String>,
     },
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
     /// Publishes a signed revocation record, drops the device locally, severs it
