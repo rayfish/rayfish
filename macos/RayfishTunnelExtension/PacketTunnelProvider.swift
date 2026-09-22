@@ -128,6 +128,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 throw ProviderError.missingNetworkName
             }
             try node.leaveNetwork(network: name)
+        case .setHostname:
+            guard let name = request.name, !name.isEmpty, let hostname = request.hostname, !hostname.isEmpty else {
+                throw ProviderError.missingNetworkName
+            }
+            try node.setHostname(network: name, hostname: hostname)
         }
         return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
     }

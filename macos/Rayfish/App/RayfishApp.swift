@@ -76,6 +76,7 @@ private struct NetworksView: View {
     @Binding var showJoin: Bool
     @State private var inviteCode: String?
     @State private var leavingNetwork: ProviderNetwork?
+    @State private var renamingNetwork: ProviderNetwork?
 
     var body: some View {
         ScrollView {
@@ -114,7 +115,8 @@ private struct NetworksView: View {
                         NetworkCard(
                             network: network,
                             invite: { Task { inviteCode = await controller.invite(network: network.name) } },
-                            leave: { leavingNetwork = network }
+                            leave: { leavingNetwork = network },
+                            rename: { renamingNetwork = network }
                         )
                     }
                 } else {
@@ -167,6 +169,9 @@ private struct NetworksView: View {
         } message: {
             Text("This Mac will lose access to the network until it joins again.")
         }
+        .sheet(item: $renamingNetwork) { network in
+            RenameHostSheet(controller: controller, network: network)
+        }
     }
 }
 
@@ -174,6 +179,7 @@ private struct NetworkCard: View {
     let network: ProviderNetwork
     let invite: () -> Void
     let leave: () -> Void
+    let rename: () -> Void
 
     var body: some View {
         GroupBox {
@@ -193,6 +199,8 @@ private struct NetworkCard: View {
                         Button("Invite", action: invite)
                             .buttonStyle(.bordered)
                     }
+                    Button("Rename", action: rename)
+                        .buttonStyle(.bordered)
                     Button("Leave", role: .destructive, action: leave)
                         .buttonStyle(.bordered)
                 }
@@ -210,6 +218,43 @@ private struct NetworkCard: View {
             }
             .padding(4)
         }
+    }
+}
+
+private struct RenameHostSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var controller: TunnelController
+    let network: ProviderNetwork
+    @State private var hostname: String
+
+    init(controller: TunnelController, network: ProviderNetwork) {
+        self.controller = controller
+        self.network = network
+        _hostname = State(initialValue: network.hostname)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Rename this Mac")
+                .font(.title2.weight(.semibold))
+            Text("The new name will be \(hostname.isEmpty ? "available" : "\(hostname).\(network.name).ray").")
+                .foregroundStyle(.secondary)
+            TextField("Hostname", text: $hostname)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Save") {
+                    Task {
+                        await controller.setHostname(network: network.name, hostname: hostname)
+                        if controller.error == nil { dismiss() }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(hostname.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
     }
 }
 

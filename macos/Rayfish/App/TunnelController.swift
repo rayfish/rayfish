@@ -91,6 +91,13 @@ final class TunnelController: ObservableObject {
         )
     }
 
+    func setHostname(network: String, hostname: String) async {
+        await perform(
+            ProviderRequest(action: .setHostname, name: network, code: nil, hostname: hostname),
+            replaceStatus: true
+        )
+    }
+
     func poll() async {
         while !Task.isCancelled {
             if status != nil {
