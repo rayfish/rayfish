@@ -35,16 +35,15 @@ targets:
         CODE_SIGN_ENTITLEMENTS: RayfishTunnelExtension/RayfishTunnelExtension.entitlements
         INFOPLIST_FILE: RayfishTunnelExtension/Info.plist
         APPLICATION_EXTENSION_API_ONLY: YES
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/Generated"
         OTHER_LDFLAGS:
           - "$(SRCROOT)/../target/release/libray_apple.a"
+        SWIFT_INCLUDE_PATHS:
+          - "$(SRCROOT)/Generated"
     preBuildScripts:
       - name: Build Rayfish Apple bridge
         script: |
           set -euo pipefail
           cd "$SRCROOT/.."
           cargo build --release -p ray-apple
-          mkdir -p "$SRCROOT/Generated"
-          cargo run -q -p ray-apple --bin uniffi-bindgen -- generate \
-            --library "$SRCROOT/../target/release/libray_apple.dylib" \
-            --language swift \
-            --out-dir "$SRCROOT/Generated"
