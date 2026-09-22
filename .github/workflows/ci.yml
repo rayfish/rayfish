@@ -8,6 +8,7 @@ on:
   # its own, without waiting for another push.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
