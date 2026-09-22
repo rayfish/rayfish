@@ -311,6 +311,11 @@ RustBuffer uniffi_ray_apple_fn_method_node_ipv6_address(void*_Nonnull ptr, RustC
 void uniffi_ray_apple_fn_method_node_join_network(void*_Nonnull ptr, RustBuffer code, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_LEAVE_NETWORK
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_LEAVE_NETWORK
+void uniffi_ray_apple_fn_method_node_leave_network(void*_Nonnull ptr, RustBuffer network, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_MIGRATE_LEGACY_STATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_MIGRATE_LEGACY_STATE
 void uniffi_ray_apple_fn_method_node_migrate_legacy_state(void*_Nonnull ptr, RustBuffer source, RustCallStatus *_Nonnull out_status
@@ -654,6 +659,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_ipv6_address(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_JOIN_NETWORK
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_JOIN_NETWORK
 uint16_t uniffi_ray_apple_checksum_method_node_join_network(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_LEAVE_NETWORK
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_LEAVE_NETWORK
+uint16_t uniffi_ray_apple_checksum_method_node_leave_network(void
 
 );
 #endif

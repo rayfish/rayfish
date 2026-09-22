@@ -69,6 +69,10 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    func leave(network: String) async {
+        await perform(ProviderRequest(action: .leave, name: network, code: nil), replaceStatus: true)
+    }
+
     private func perform(_ request: ProviderRequest, replaceStatus: Bool) async {
         isLoading = true
         defer { isLoading = false }

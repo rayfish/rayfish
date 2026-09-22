@@ -72,6 +72,7 @@ private struct NetworksView: View {
     @Binding var showCreate: Bool
     @Binding var showJoin: Bool
     @State private var inviteCode: String?
+    @State private var leavingNetwork: ProviderNetwork?
 
     var body: some View {
         ScrollView {
@@ -107,9 +108,11 @@ private struct NetworksView: View {
 
                 if let status = controller.status, !status.networks.isEmpty {
                     ForEach(status.networks) { network in
-                        NetworkCard(network: network) {
-                            Task { inviteCode = await controller.invite(network: network.name) }
-                        }
+                        NetworkCard(
+                            network: network,
+                            invite: { Task { inviteCode = await controller.invite(network: network.name) } },
+                            leave: { leavingNetwork = network }
+                        )
                     }
                 } else {
                 GroupBox {
@@ -148,12 +151,26 @@ private struct NetworksView: View {
         } message: {
             Text(inviteCode ?? "")
         }
+        .confirmationDialog(
+            "Leave \(leavingNetwork?.name ?? "network")?",
+            isPresented: Binding(get: { leavingNetwork != nil }, set: { if !$0 { leavingNetwork = nil } })
+        ) {
+            Button("Leave network", role: .destructive) {
+                if let leavingNetwork {
+                    Task { await controller.leave(network: leavingNetwork.name) }
+                }
+                leavingNetwork = nil
+            }
+        } message: {
+            Text("This Mac will lose access to the network until it joins again.")
+        }
     }
 }
 
 private struct NetworkCard: View {
     let network: ProviderNetwork
     let invite: () -> Void
+    let leave: () -> Void
 
     var body: some View {
         GroupBox {
@@ -173,6 +190,8 @@ private struct NetworkCard: View {
                         Button("Invite", action: invite)
                             .buttonStyle(.bordered)
                     }
+                    Button("Leave", role: .destructive, action: leave)
+                        .buttonStyle(.bordered)
                 }
                 ForEach(network.peers) { peer in
                     HStack(spacing: 10) {
