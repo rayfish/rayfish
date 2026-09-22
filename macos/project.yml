@@ -58,6 +58,9 @@ targets:
           - "$(SRCROOT)/../target/release/libray_apple.a"
         SWIFT_INCLUDE_PATHS:
           - "$(SRCROOT)/Generated"
+        OTHER_SWIFT_FLAGS:
+          - "-Xcc"
+          - "-fmodule-map-file=$(SRCROOT)/Generated/ray_appleFFI.modulemap"
     preBuildScripts:
       - name: Build Rayfish Apple bridge
         script: |
