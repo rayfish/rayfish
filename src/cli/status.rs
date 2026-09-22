@@ -236,6 +236,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             lan_peers,
             ..
         } => {
+            let (controllers, managed_machines) = ipc_management_overview().await;
             if json_enabled() {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
@@ -255,6 +256,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
                     "daemon_version": daemon_version,
                     "networks": networks,
                     "inactive_networks": inactive_networks,
+                    "controllers": controllers,
+                    "managed_machines": managed_machines,
                     "traffic": {
                         "packets_rx": packets_rx, "packets_tx": packets_tx,
                         "bytes_rx": bytes_rx, "bytes_tx": bytes_tx,
@@ -325,6 +328,39 @@ pub(crate) async fn ipc_status() -> Result<()> {
             }
 
             print_nearby(&lan_peers);
+
+            if !controllers.is_empty() {
+                println!();
+                println!("  {}", style::faint("controlled by:"));
+                for controller in &controllers {
+                    let short_id = controller.identity.fmt_short().to_string();
+                    println!(
+                        "    {}  {}",
+                        style::rose(&short_id),
+                        style::faint(&controller.identity.to_string())
+                    );
+                }
+            }
+
+            if !managed_machines.is_empty() {
+                println!();
+                println!("  {}", style::faint("managed machines:"));
+                for machine in &managed_machines {
+                    let short_id = machine.identity.fmt_short().to_string();
+                    let state = match machine.state {
+                        ipc::ManagedMachineState::Online => style::green("online"),
+                        ipc::ManagedMachineState::Offline => style::faint("offline"),
+                        ipc::ManagedMachineState::Unauthorized => style::red("unauthorized"),
+                        ipc::ManagedMachineState::Unknown => style::faint("unknown"),
+                    };
+                    println!(
+                        "    {}  {}  {}",
+                        style::value(machine.hostname.as_str()),
+                        style::rose(&short_id),
+                        state
+                    );
+                }
+            }
 
             print_pending_summary(&networks, pending_files, pending_connects);
 

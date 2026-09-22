@@ -1,5 +1,7 @@
 //! CLI firewall + declarative-apply handlers and their parsers/renderers.
 
+use std::collections::HashSet;
+
 use crate::*;
 use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
@@ -515,12 +517,13 @@ pub(crate) async fn ipc_firewall_suggest(
 /// isn't active, then publish the spec's `firewall` block as suggestions
 /// (idempotent: always replaces the live set). `--prune` limits the published
 /// set to subjects present in the spec, dropping any live suggestions for
-/// hosts no longer mentioned. Never joins.
+/// hosts no longer mentioned. Enrolled machines are joined or removed from the
+/// per-network membership diff.
 ///
 /// B3, membership diff: expected hosts = union of hostnames in the spec's
-/// `firewall:` blocks; joined hosts = hostnames from `Status` (this node +
-/// peers). Reports the gap and prints hostname-bound invite commands; with
-/// `--invite-missing` mints them via IPC.
+/// network firewall block; joined hosts = hostnames from `Status` (this node +
+/// peers). Controlled machines are reconciled directly. Other missing hosts get
+/// hostname-bound invite commands; `--invite-missing` mints those via IPC.
 pub(crate) async fn ipc_apply(
     spec_path: Option<String>,
     prune: bool,
@@ -539,17 +542,6 @@ pub(crate) async fn ipc_apply(
     if spec.networks.is_empty() {
         anyhow::bail!("spec contains no networks");
     }
-    let has_dynamic = !spec.aliases.is_empty() || !spec.groups.is_empty();
-
-    // A dry-run with no aliases/groups needs nothing from the daemon: just echo
-    // the normalized spec (the historical behavior).
-    if dry_run && !has_dynamic {
-        println!("{}", style::bold("Spec (normalized):"));
-        print!("{}", apply::to_yaml(&spec)?);
-        println!("{}", style::faint("(dry-run; no changes applied)"));
-        return Ok(());
-    }
-
     // Validate alias identity strings CLI-side (where iroh parsing lives) and
     // canonicalize them so comparison against peer ids is format-insensitive.
     let aliases = canonicalize_aliases(&spec.aliases)?;
@@ -588,11 +580,41 @@ pub(crate) async fn ipc_apply(
     if dry_run {
         println!("{}", style::bold("Spec (expanded):"));
         print!("{}", apply::to_yaml(&expanded)?);
+        println!("{}", style::bold("Membership diff:"));
+        let mut changes = 0usize;
+        for (network_name, firewall) in &expanded.networks {
+            let current: HashSet<ipc::MachineHostname> =
+                joined_hostnames(&status_networks, network_name)
+                    .into_iter()
+                    .map(|hostname| hostname.parse())
+                    .collect::<std::result::Result<_, _>>()?;
+            let membership = apply::membership_diff(firewall, &current)?;
+            for hostname in membership.joins {
+                changes += 1;
+                println!("  join   {hostname} to {network_name}");
+            }
+            let local_hostname = status_networks
+                .iter()
+                .find(|network| network.name == *network_name)
+                .and_then(|network| network.my_hostname.as_deref());
+            for hostname in membership.leaves {
+                if local_hostname == Some(hostname.as_str()) {
+                    continue;
+                }
+                changes += 1;
+                println!("  leave  {hostname} from {network_name}");
+            }
+        }
+        if changes == 0 {
+            println!("  no membership changes");
+        }
         println!("{}", style::faint("(dry-run; no changes applied)"));
         return Ok(());
     }
 
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
+    let mut removal_failures = false;
+    let managed_machines = ipc_managed_machines_for_apply().await.unwrap_or_default();
 
     for (net_name, net_firewall) in &expanded.networks {
         let is_active = active_names.contains(net_name.as_str());
@@ -635,18 +657,84 @@ pub(crate) async fn ipc_apply(
             Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
         }
 
-        // B3, membership diff for this network.
-        let joined = joined_hostnames(&status_networks, net_name);
-        for host in apply::expected_hosts(&expanded) {
-            if !joined.iter().any(|j| j == &host) {
-                missing_hosts.push((net_name.clone(), host));
+        // Reconcile this network's desired hostnames against its live roster.
+        // Wildcards preserve the current population; concrete names can still
+        // add controlled machines alongside it.
+        let current: HashSet<ipc::MachineHostname> = joined_hostnames(&status_networks, net_name)
+            .into_iter()
+            .map(|hostname| hostname.parse())
+            .collect::<std::result::Result<_, _>>()?;
+        let membership = apply::membership_diff(net_firewall, &current)?;
+
+        for host in membership.joins {
+            if managed_machines
+                .iter()
+                .any(|machine| machine.hostname == host)
+            {
+                let machine = ipc::ManagedMachineSelector::new(host.to_string());
+                let network = ipc::NetworkName::new(net_name.clone());
+                match ipc_delegated_join_request(&machine, &network, Some(host.clone()), true, true)
+                    .await
+                {
+                    Ok(message) => println!("{}  {message}", style::faint("managed:")),
+                    Err(error) => {
+                        eprintln!(
+                            "{}  {net_name}: failed to join managed machine '{host}': {error}",
+                            style::red("  !")
+                        );
+                        missing_hosts.push((net_name.clone(), host.to_string()));
+                    }
+                }
+            } else {
+                missing_hosts.push((net_name.clone(), host.to_string()));
+            }
+        }
+
+        for host in membership.leaves {
+            let is_local = status_networks
+                .iter()
+                .find(|network| network.name == *net_name)
+                .and_then(|network| network.my_hostname.as_deref())
+                == Some(host.as_str());
+            if is_local {
+                continue;
+            }
+            if managed_machines
+                .iter()
+                .any(|machine| machine.hostname == host)
+            {
+                let machine = ipc::ManagedMachineSelector::new(host.to_string());
+                let network = ipc::NetworkName::new(net_name.clone());
+                match ipc_delegated_leave_request(&machine, &network).await {
+                    Ok(message) => println!("{}  {message}", style::faint("managed:")),
+                    Err(error) => {
+                        removal_failures = true;
+                        eprintln!(
+                            "{}  {net_name}: failed to remove managed machine '{host}': {error}",
+                            style::red("  !")
+                        );
+                    }
+                }
+            } else {
+                removal_failures = true;
+                eprintln!(
+                    "{}  {net_name}: host '{host}' is not controlled; cannot request leave",
+                    style::red("  !")
+                );
             }
         }
     }
 
     // B3, report the membership gap.
     if missing_hosts.is_empty() {
-        println!("{}", style::green("All expected hosts have joined."));
+        if removal_failures {
+            eprintln!(
+                "{} some managed removals remain unresolved",
+                style::red("  !")
+            );
+        } else {
+            println!("{}", style::green("All expected hosts have joined."));
+        }
     } else {
         println!(
             "\n{} Missing hosts (spec expects them):",
@@ -680,6 +768,20 @@ pub(crate) async fn ipc_apply(
         }
     }
     Ok(())
+}
+
+async fn ipc_managed_machines_for_apply() -> Result<Vec<ipc::ManagedMachineInfo>> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::ManagedMachines { probe: false },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::ManagedMachinesResponse { machines } => Ok(machines),
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected managed-machines response: {other:?}"),
+    }
 }
 
 /// Joined hostnames on `network` (this node's hostname + every peer's hostname).

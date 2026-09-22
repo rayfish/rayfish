@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::fmt;
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
@@ -6,12 +8,13 @@ use std::net::Ipv6Addr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(unix)]
@@ -308,6 +311,38 @@ pub enum IpcMessage {
     Unpair {
         /// Device identifier: hostname, mesh IP, short id, or full endpoint id.
         device: String,
+    },
+    MachineEnrollmentCreate {
+        expires_in: Duration,
+        reusable: bool,
+    },
+    MachineEnrollmentList,
+    MachineEnrollmentRevoke {
+        credential: EnrollmentCredentialSelector,
+    },
+    EnrollController {
+        ticket: EnrollmentTicket,
+    },
+    ControllerList,
+    ControllerRevoke {
+        identity: Option<ControllerSelector>,
+    },
+    ManagedMachines {
+        probe: bool,
+    },
+    ManagedMachineForget {
+        machine: ManagedMachineSelector,
+    },
+    DelegatedJoin {
+        machine: ManagedMachineSelector,
+        network: NetworkName,
+        hostname: Option<MachineHostname>,
+        auto_accept_firewall: bool,
+        auto_accept_files: bool,
+    },
+    DelegatedLeave {
+        machine: ManagedMachineSelector,
+        network: NetworkName,
     },
     /// Authorize a local user (by UID) to control the daemon without root, the
     /// way `tailscale up --operator` does. Root-only.
@@ -610,6 +645,21 @@ pub enum IpcMessage {
     PairedDevices {
         devices: Vec<PairedDeviceInfo>,
     },
+    MachineEnrollmentCreated {
+        id: EnrollmentCredentialId,
+        ticket: EnrollmentTicket,
+        expires_at: UnixTimestamp,
+        reusable: bool,
+    },
+    MachineEnrollments {
+        enrollments: Vec<MachineEnrollmentInfo>,
+    },
+    Controllers {
+        controllers: Vec<ControllerInfo>,
+    },
+    ManagedMachinesResponse {
+        machines: Vec<ManagedMachineInfo>,
+    },
     /// Encrypted identity backup returned by [`IpcMessage::BackupIdentity`].
     IdentityBackup {
         code: String,
@@ -776,6 +826,315 @@ pub struct PairedDeviceInfo {
     pub hostname: Option<String>,
     /// Networks this device is currently a member of.
     pub networks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineEnrollmentInfo {
+    pub id: EnrollmentCredentialId,
+    pub expires_at: UnixTimestamp,
+    pub reusable: bool,
+    pub uses: u64,
+    pub status: MachineEnrollmentStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineEnrollmentStatus {
+    Pending,
+    Used,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerInfo {
+    pub identity: EndpointId,
+    pub enrolled_at: UnixTimestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedMachineInfo {
+    pub identity: EndpointId,
+    pub hostname: MachineHostname,
+    pub enrolled_at: UnixTimestamp,
+    pub last_seen: Option<UnixTimestamp>,
+    pub state: ManagedMachineState,
+    #[serde(default)]
+    pub networks: Vec<NetworkName>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedMachineState {
+    Online,
+    Offline,
+    Unauthorized,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnixTimestamp(u64);
+
+impl UnixTimestamp {
+    pub fn from_secs(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    pub fn as_secs(self) -> u64 {
+        self.0
+    }
+
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration.as_secs()))
+    }
+}
+
+impl fmt::Display for UnixTimestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct MachineHostname(String);
+
+impl MachineHostname {
+    pub fn new(value: String) -> Result<Self, InvalidMachineHostname> {
+        if value.is_empty()
+            || value.len() > 63
+            || value.starts_with('-')
+            || value.ends_with('-')
+            || !value.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            })
+        {
+            return Err(InvalidMachineHostname);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for MachineHostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for MachineHostname {
+    type Err = InvalidMachineHostname;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for MachineHostname {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidMachineHostname;
+
+impl fmt::Display for InvalidMachineHostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("hostname must be a lowercase DNS label of at most 63 characters")
+    }
+}
+
+impl std::error::Error for InvalidMachineHostname {}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NetworkName(String);
+
+impl NetworkName {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for NetworkName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for NetworkName {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentCredentialId(String);
+
+impl EnrollmentCredentialId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnrollmentCredentialId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EnrollmentCredentialId {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentCredentialSelector(String);
+
+impl EnrollmentCredentialSelector {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnrollmentCredentialSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EnrollmentCredentialSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentTicket(String);
+
+impl EnrollmentTicket {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EnrollmentTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnrollmentTicket([redacted])")
+    }
+}
+
+impl fmt::Display for EnrollmentTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EnrollmentTicket {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ManagedMachineSelector(String);
+
+impl ManagedMachineSelector {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedMachineSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ManagedMachineSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControllerSelector(String);
+
+impl ControllerSelector {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ControllerSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ControllerSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
 }
 
 /// One roster row a pending kick would remove (reply to an unconfirmed
@@ -1813,6 +2172,48 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn managed_hostname_rejects_non_dns_labels() {
+        assert!("build-box".parse::<MachineHostname>().is_ok());
+        assert!("Build Box".parse::<MachineHostname>().is_err());
+        assert!("-build-box".parse::<MachineHostname>().is_err());
+        let encoded = rmp_serde::to_vec_named("Build Box").unwrap();
+        assert!(rmp_serde::from_slice::<MachineHostname>(&encoded).is_err());
+    }
+
+    #[test]
+    fn delegated_join_roundtrip_preserves_domain_types() {
+        let request = IpcMessage::DelegatedJoin {
+            machine: ManagedMachineSelector::new("build-box".to_string()),
+            network: NetworkName::new("infra".to_string()),
+            hostname: Some("build-box".parse().unwrap()),
+            auto_accept_firewall: true,
+            auto_accept_files: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&request).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::DelegatedJoin {
+                machine,
+                network,
+                hostname,
+                ..
+            } => {
+                assert_eq!(machine.as_str(), "build-box");
+                assert_eq!(network.as_str(), "infra");
+                assert_eq!(hostname.unwrap().as_str(), "build-box");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrollment_ticket_debug_is_redacted() {
+        let ticket = EnrollmentTicket::new("sensitive-ticket".to_string());
+        let debug = format!("{ticket:?}");
+        assert!(!debug.contains(ticket.expose()));
     }
 
     #[test]
