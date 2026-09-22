@@ -44,7 +44,7 @@ private struct ContentView: View {
             case .networks:
                 NetworksView(controller: controller, showCreate: $showCreate, showJoin: $showJoin)
             case .devices:
-                DevicesView()
+                DevicesView(controller: controller)
             case .settings:
                 SettingsView(controller: controller)
             }
@@ -83,10 +83,16 @@ private struct NetworksView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button(controller.status?.active == true ? "Connected" : "Connect") {
-                        Task { await controller.connect() }
+                    Button(controller.status?.active == true ? "Disconnect" : "Connect") {
+                        Task {
+                            if controller.status?.active == true {
+                                await controller.disconnect()
+                            } else {
+                                await controller.connect()
+                            }
+                        }
                     }
-                    .disabled(controller.status?.active == true || controller.isLoading)
+                    .disabled(controller.isLoading)
                     Button("Join with a code") { showJoin = true }
                     Button("Create network") { showCreate = true }
                         .buttonStyle(.borderedProminent)
@@ -163,12 +169,42 @@ private struct NetworkCard: View {
 }
 
 private struct DevicesView: View {
+    @ObservedObject var controller: TunnelController
+
     var body: some View {
-        ContentUnavailableView(
-            "No devices to show",
-            systemImage: "desktopcomputer",
-            description: Text("Devices appear here once this Mac joins a network."))
-            .navigationTitle("Devices")
+        Group {
+            let allPeers = controller.status?.networks.flatMap { $0.peers } ?? []
+            let peers = Array(
+                Dictionary(
+                    allPeers.map { ($0.ipv6, $0) },
+                    uniquingKeysWith: { first, _ in first }
+                ).values
+            )
+            if peers.isEmpty {
+                ContentUnavailableView(
+                    "No devices to show",
+                    systemImage: "desktopcomputer",
+                    description: Text("Devices appear here once this Mac joins a network."))
+            } else {
+                List(peers) { peer in
+                    HStack(spacing: 12) {
+                        Image(systemName: peer.isOwnDevice ? "laptopcomputer" : "desktopcomputer")
+                            .foregroundStyle(peer.state == "direct" ? .green : .secondary)
+                        VStack(alignment: .leading) {
+                            Text(peer.hostname)
+                            Text(peer.ipv6)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(peer.latencyMs.map { "\($0) ms" } ?? peer.state)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Devices")
     }
 }
 
@@ -180,7 +216,7 @@ private struct SettingsView: View {
         Form {
             Section("VPN") {
                 LabeledContent("Status") {
-                    Text("Not connected")
+                    Text(controller.status?.active == true ? "Connected" : "Not connected")
                         .foregroundStyle(.secondary)
                 }
                 Text("The Rayfish system extension manages the VPN connection.")

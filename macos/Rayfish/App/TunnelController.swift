@@ -28,6 +28,19 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    func disconnect() async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let manager = try await loadManager()
+            manager.connection.stopVPNTunnel()
+            status = nil
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
     func create(name: String?) async {
         await perform(ProviderRequest(action: .create, name: name, code: nil), replaceStatus: true)
     }
