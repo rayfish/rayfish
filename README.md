@@ -401,8 +401,21 @@ shell directly, since `login` won't take a root session on a pseudo-terminal.
 
 For fleets and repeatable setups, `ray apply deploy.yaml` reconciles your
 networks against a YAML spec instead of running commands by hand. It creates any
-missing networks and publishes their firewall suggestions, so the spec is the
-source of truth you can keep in git.
+missing networks, reconciles enrolled machines by hostname, and publishes
+firewall suggestions, so the spec is the source of truth you can keep in git.
+
+Enroll machines once with a one-time or reusable controller ticket:
+
+```bash
+ray machines enroll --reusable       # run on the controller
+ray up --controller <ticket>          # run once on each managed machine
+ray machines                          # list managed machines
+ray join infra --delegate build-box   # direct management without apply
+ray leave infra --delegate build-box
+```
+
+The managed machine can revoke access locally at any time with
+`ray controller revoke <controller-id>` or `ray controller revoke --all`.
 
 A spec has three top-level keys, all optional except `networks:`:
 
@@ -450,16 +463,24 @@ Run it, and iterate safely:
 
 ```bash
 ray apply --example              # print a fully-commented starter spec
-ray apply deploy.yaml --dry-run  # show what would change, apply nothing
-ray apply deploy.yaml            # create missing networks, publish suggestions
+ray apply deploy.yaml --dry-run  # show network, membership, and policy changes
+ray apply deploy.yaml            # reconcile networks, machines, and suggestions
 ray apply deploy.yaml --invite-missing   # also mint invites for expected-but-absent hosts
 ray apply deploy.yaml --prune            # drop suggestions for hosts no longer in the spec
 ```
 
+For each network, concrete hostnames named as subjects or peers form the desired
+membership. `ray apply` compares them with the live roster using a per-network
+set diff. Missing enrolled machines receive a join request automatically;
+enrolled machines no longer named receive a leave request. A wildcard expands
+to the current roster, so wildcard policy preserves existing members. Hosts not
+enrolled with this controller are reported and can still use
+`--invite-missing`.
+
 Suggestions are still advisory on the receiving end: each node queues them for
 `ray firewall accept`, or auto-installs them if it joined with
-`--auto-accept-firewall`. `ray apply` never joins a node for you and never edits
-a peer's local rules. To seed a spec's `aliases:` from a machine you're on,
+`--auto-accept-firewall`. A delegated apply enables auto-accept for the managed
+machine. To seed a spec's `aliases:` from a machine you're on,
 `ray alias <net> set <host> <name>` saves the alias locally (it also shows inline
 in `ray status`) so you don't have to paste the identity by hand.
 

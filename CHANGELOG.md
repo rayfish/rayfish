@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Controllers can enroll and manage machines directly.** A machine runs
+  `ray up --controller <ticket>` once, then its controller can inspect it and
+  delegate network joins and leaves. Enrollment tickets may be one-time or
+  reusable and can be revoked without affecting machines already enrolled.
+  `ray apply` matches enrolled machines by hostname and reconciles their network
+  membership from the live per-network diff.
+
 - **Android: an opt-in periodic diagnostics report.** Off by default, under
   Periodic diagnostics in You, and only available while crash reporting is on.
   With it on, the app sends one diagnostics report every eight hours, but only

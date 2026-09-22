@@ -80,6 +80,8 @@ fn json_requested(command: &Command) -> bool {
         | Command::Dns { json, .. }
         | Command::Files { json, .. }
         | Command::Pair { json, .. }
+        | Command::Machines { json, .. }
+        | Command::Controller { json, .. }
         | Command::Identityof { json, .. }
         | Command::Alias { json, .. }
         | Command::Config { json, .. } => *json,
@@ -111,7 +113,7 @@ pub(crate) enum Command {
     },
     /// Join an existing network using its room id or an invite code
     Join {
-        /// The network public key (room id) or a one-time invite code
+        /// Network public key, invite code, or local name with --delegate
         network_key: String,
         /// Optional local alias for the network
         #[arg(long)]
@@ -133,6 +135,9 @@ pub(crate) enum Command {
         /// devices, identity-checked); pass this to require manual acceptance.
         #[arg(long)]
         no_auto_accept_files: bool,
+        /// Run the join on an enrolled machine instead of this one.
+        #[arg(long)]
+        delegate: Option<ipc::ManagedMachineSelector>,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -140,6 +145,9 @@ pub(crate) enum Command {
         /// Three-word network name
         #[arg(add = complete::networks())]
         name: String,
+        /// Run the leave on an enrolled machine instead of this one.
+        #[arg(long)]
+        delegate: Option<ipc::ManagedMachineSelector>,
     },
     /// Destroy a network (coordinator only)
     Nuke {
@@ -213,6 +221,9 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Enroll this machine with a controller after bringing the daemon up.
+        #[arg(long)]
+        controller: Option<ipc::EnrollmentTicket>,
     },
     /// Standby: take the data plane offline, staying connected to peers
     ///
@@ -425,8 +436,7 @@ pub(crate) enum Command {
     /// Reconcile trusted networks against a deploy spec file
     ///
     /// Creates missing trusted networks, publishes idempotent firewall
-    /// suggestions, and reports the membership gap (expected vs joined hosts).
-    /// Never joins.
+    /// suggestions, and reconciles enrolled machines by hostname.
     Apply {
         /// Path to a TOML spec file (see `ray apply --example`).
         #[arg(value_hint = clap::ValueHint::FilePath)]
@@ -547,6 +557,22 @@ pub(crate) enum Command {
         /// (see `ray pair list`)
         #[arg(add = complete::paired_devices())]
         device: String,
+    },
+    /// List and enroll machines controlled by this node
+    Machines {
+        #[command(subcommand)]
+        action: Option<MachinesAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Manage controllers authorized by this machine
+    Controller {
+        #[command(subcommand)]
+        action: Option<ControllerAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Handle a rayfish:// deep link (join or pair)
     ///
@@ -671,6 +697,43 @@ pub(crate) enum PairAction {
         /// 1Password item title
         #[arg(long, default_value = "Rayfish Identity")]
         item: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MachinesAction {
+    /// Mint a machine-enrollment ticket
+    Enroll {
+        /// Allow this ticket to enroll more than one machine
+        #[arg(long)]
+        reusable: bool,
+        /// How long the ticket remains valid, such as 30m or 7d
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// List enrollment tickets and their status
+    Enrollments,
+    /// Revoke an enrollment ticket
+    RevokeEnrollment {
+        credential: ipc::EnrollmentCredentialSelector,
+    },
+    /// Forget an enrolled machine from this controller
+    Forget {
+        machine: ipc::ManagedMachineSelector,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ControllerAction {
+    /// Enroll this machine using a controller ticket
+    Add { ticket: ipc::EnrollmentTicket },
+    /// List authorized controllers
+    List,
+    /// Revoke one controller, or all controllers with --all
+    Revoke {
+        identity: Option<ipc::ControllerSelector>,
+        #[arg(long, conflicts_with = "identity")]
+        all: bool,
     },
 }
 
@@ -1422,7 +1485,13 @@ async fn run() -> Result<()> {
     let _log_guard = init_tracing(matches!(cli.command, Command::Daemon));
 
     match cli.command {
-        Command::Leave { name } => ipc_leave(&name).await,
+        Command::Leave { name, delegate } => match delegate {
+            Some(machine) => {
+                let network = ipc::NetworkName::new(name);
+                ipc_delegated_leave(&machine, &network).await
+            }
+            None => ipc_leave(&name).await,
+        },
         Command::Create {
             open,
             closed: _,
@@ -1444,17 +1513,35 @@ async fn run() -> Result<()> {
             tor,
             auto_accept_firewall,
             no_auto_accept_files,
-        } => {
-            ipc_join(
-                &network_key,
-                name.as_deref(),
-                hostname,
-                tor,
-                auto_accept_firewall,
-                !no_auto_accept_files,
-            )
-            .await
-        }
+            delegate,
+        } => match delegate {
+            Some(machine) => {
+                if tor || name.is_some() {
+                    anyhow::bail!("--delegate does not support --tor or --name")
+                }
+                let network = ipc::NetworkName::new(network_key);
+                let hostname = hostname.map(|value| value.parse()).transpose()?;
+                ipc_delegated_join(
+                    &machine,
+                    &network,
+                    hostname,
+                    auto_accept_firewall,
+                    !no_auto_accept_files,
+                )
+                .await
+            }
+            None => {
+                ipc_join(
+                    &network_key,
+                    name.as_deref(),
+                    hostname,
+                    tor,
+                    auto_accept_firewall,
+                    !no_auto_accept_files,
+                )
+                .await
+            }
+        },
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Kick { network, peer, yes } => ipc_kick(&network, &peer, yes).await,
         Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
@@ -1473,7 +1560,10 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up { hostname } => cmd_up(hostname).await,
+        Command::Up {
+            hostname,
+            controller,
+        } => cmd_up(hostname, controller).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
@@ -1563,6 +1653,8 @@ async fn run() -> Result<()> {
             json: _,
         } => cmd_pair(action, ticket).await,
         Command::Unpair { device } => ipc_unpair(&device).await,
+        Command::Machines { action, json: _ } => ipc_machines(action).await,
+        Command::Controller { action, json: _ } => ipc_controller(action).await,
         Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
             println!("ray {FULL_VERSION}");
@@ -1794,6 +1886,45 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn delegated_network_commands_parse_machine_and_network_types() {
+        let join =
+            Cli::try_parse_from(["ray", "join", "--delegate", "build-box", "infra"]).unwrap();
+        match join.command {
+            Command::Join {
+                network_key,
+                delegate: Some(machine),
+                ..
+            } => {
+                assert_eq!(network_key, "infra");
+                assert_eq!(machine.as_str(), "build-box");
+            }
+            _ => panic!("wrong command"),
+        }
+
+        let leave =
+            Cli::try_parse_from(["ray", "leave", "--delegate", "build-box", "infra"]).unwrap();
+        assert!(matches!(
+            leave.command,
+            Command::Leave {
+                name,
+                delegate: Some(machine),
+            } if name == "infra" && machine.as_str() == "build-box"
+        ));
+    }
+
+    #[test]
+    fn up_parses_controller_ticket_as_an_opaque_type() {
+        let cli = Cli::try_parse_from(["ray", "up", "--controller", "ticket-value"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Up {
+                controller: Some(ticket),
+                ..
+            } if ticket.expose() == "ticket-value"
+        ));
     }
 
     #[test]

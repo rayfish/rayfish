@@ -2,9 +2,9 @@
 //!
 //! The spec is a read-only description of the *intended* network state: which
 //! networks should exist and the suggested firewall rules for each. `ray apply`
-//! reconciles the live state against it (creating missing (closed) networks and
-//! publishing suggestions) but never joins or mutates membership directly (it
-//! only reports the membership gap and offers to mint hostname-bound invites).
+//! reconciles the live state against it: creating missing closed networks,
+//! publishing suggestions, and asking enrolled machines to join or leave from
+//! the per-network hostname diff.
 //!
 //! The spec reuses [`ray_proto::policy::SuggestedFirewall`] verbatim, so the
 //! wire/blob shape and the authoring shape are identical: an admin authors the
@@ -20,9 +20,11 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use ray_proto::ipc::MachineHostname;
 use ray_proto::policy::SuggestedFirewall;
 use serde::{Deserialize, Serialize};
 
@@ -195,18 +197,69 @@ networks:
 pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for firewall in spec.networks.values() {
-        for (subject, rules) in firewall {
-            if subject != "*" {
-                set.insert(subject.clone());
-            }
-            for peer in rules.allows.keys().chain(rules.denies.keys()) {
-                if peer != "*" {
-                    set.insert(peer.clone());
-                }
+        set.extend(expected_hosts_for_network(firewall));
+    }
+    set.into_iter().collect()
+}
+
+/// Concrete hostnames expected on one network. Wildcards are excluded; the
+/// apply reconciler expands them against the live roster before taking a diff.
+pub fn expected_hosts_for_network(firewall: &SuggestedFirewall) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for (subject, rules) in firewall {
+        if subject != "*" {
+            set.insert(subject.clone());
+        }
+        for peer in rules.allows.keys().chain(rules.denies.keys()) {
+            if peer != "*" {
+                set.insert(peer.clone());
             }
         }
     }
-    set.into_iter().collect()
+    set
+}
+
+/// A wildcard refers to the live population rather than declaring it absent.
+pub fn has_membership_wildcard(firewall: &SuggestedFirewall) -> bool {
+    firewall.iter().any(|(subject, rules)| {
+        subject == "*"
+            || rules
+                .allows
+                .keys()
+                .chain(rules.denies.keys())
+                .any(|peer| peer == "*")
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipDiff {
+    pub joins: Vec<MachineHostname>,
+    pub leaves: Vec<MachineHostname>,
+}
+
+/// Compare one network's live roster with the concrete hostnames named by its
+/// new spec. A wildcard expands to the current roster, so wildcard policy does
+/// not remove machines merely because it does not spell out their names.
+pub fn membership_diff(
+    firewall: &SuggestedFirewall,
+    current: &HashSet<MachineHostname>,
+) -> Result<MembershipDiff> {
+    let mut desired: HashSet<MachineHostname> = expected_hosts_for_network(firewall)
+        .into_iter()
+        .map(|hostname| {
+            hostname
+                .parse()
+                .with_context(|| format!("invalid hostname '{hostname}' in deploy spec"))
+        })
+        .collect::<Result<_>>()?;
+    if has_membership_wildcard(firewall) {
+        desired.extend(current.iter().cloned());
+    }
+    let mut joins: Vec<MachineHostname> = desired.difference(current).cloned().collect();
+    let mut leaves: Vec<MachineHostname> = current.difference(&desired).cloned().collect();
+    joins.sort();
+    leaves.sort();
+    Ok(MembershipDiff { joins, leaves })
 }
 
 /// Expand all group/alias references in one network's firewall into a pure,
@@ -482,6 +535,41 @@ networks:
         assert_eq!(
             hosts,
             vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
+    }
+
+    #[test]
+    fn membership_diff_is_scoped_to_one_network() {
+        let mut firewall = SuggestedFirewall::new();
+        firewall.insert("alice".to_string(), HostSuggestions::default());
+        firewall.insert("bob".to_string(), HostSuggestions::default());
+        let current = ["alice", "carol"]
+            .into_iter()
+            .map(|hostname| hostname.parse().unwrap())
+            .collect();
+        assert_eq!(
+            membership_diff(&firewall, &current).unwrap(),
+            MembershipDiff {
+                joins: vec!["bob".parse().unwrap()],
+                leaves: vec!["carol".parse().unwrap()],
+            }
+        );
+    }
+
+    #[test]
+    fn membership_diff_preserves_current_hosts_for_wildcards() {
+        let mut firewall = SuggestedFirewall::new();
+        firewall.insert("*".to_string(), allows(&[("*", "tcp:22")]));
+        let current = ["alice", "bob"]
+            .into_iter()
+            .map(|hostname| hostname.parse().unwrap())
+            .collect();
+        assert_eq!(
+            membership_diff(&firewall, &current).unwrap(),
+            MembershipDiff {
+                joins: Vec::new(),
+                leaves: Vec::new(),
+            }
         );
     }
 

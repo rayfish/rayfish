@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
+use ray_proto::ipc::{MachineHostname, UnixTimestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::membership::GroupMode;
@@ -435,6 +436,40 @@ pub struct PendingJoinEntry {
     pub name: Option<String>,
 }
 
+/// A controller this machine has explicitly authorized to issue management
+/// requests. Authority is bound to the controller's transport endpoint id,
+/// which iroh authenticates during the QUIC handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerGrant {
+    pub identity: EndpointId,
+    pub enrolled_at: UnixTimestamp,
+}
+
+/// A machine enrolled with this controller. `hostname` is the stable name used
+/// by delegated commands and by `ray apply` when matching a missing host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedMachine {
+    pub identity: EndpointId,
+    pub hostname: MachineHostname,
+    pub enrolled_at: UnixTimestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<UnixTimestamp>,
+}
+
+/// A controller-side enrollment credential. Only its hash is persisted.
+/// Reusable credentials may enroll multiple machines until revoked or expired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollmentCredential {
+    pub id: ray_proto::ipc::EnrollmentCredentialId,
+    pub secret_hash: blake3::Hash,
+    pub expires_at: UnixTimestamp,
+    pub reusable: bool,
+    #[serde(default)]
+    pub enrolled_machines: Vec<EndpointId>,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_true")]
@@ -546,6 +581,15 @@ pub struct AppConfig {
     /// here when it re-pairs (re-auth). See `Daemon::unpair`/`reauth_device`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_devices: Vec<String>,
+    /// Remote controllers authorized by this machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controllers: Vec<ControllerGrant>,
+    /// Machines that enrolled with this node as their controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_machines: Vec<ManagedMachine>,
+    /// Pending and reusable machine-enrollment credentials minted here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrollment_credentials: Vec<EnrollmentCredential>,
 }
 
 impl Default for AppConfig {
@@ -574,6 +618,9 @@ impl Default for AppConfig {
             pending_joins: Vec::new(),
             cert_generation: 0,
             revoked_devices: Vec::new(),
+            controllers: Vec::new(),
+            managed_machines: Vec::new(),
+            enrollment_credentials: Vec::new(),
         }
     }
 }
@@ -733,6 +780,12 @@ struct Settings {
     cert_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     revoked_devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    controllers: Vec<ControllerGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    managed_machines: Vec<ManagedMachine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    enrollment_credentials: Vec<EnrollmentCredential>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -1258,6 +1311,9 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         pending_joins: settings.pending_joins,
         cert_generation: settings.cert_generation,
         revoked_devices: settings.revoked_devices,
+        controllers: settings.controllers,
+        managed_machines: settings.managed_machines,
+        enrollment_credentials: settings.enrollment_credentials,
     })
 }
 
@@ -1327,6 +1383,9 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         pending_joins: config.pending_joins.clone(),
         cert_generation: config.cert_generation,
         revoked_devices: config.revoked_devices.clone(),
+        controllers: config.controllers.clone(),
+        managed_machines: config.managed_machines.clone(),
+        enrollment_credentials: config.enrollment_credentials.clone(),
     };
     toml::to_string_pretty(&settings).context("serializing settings")
 }
@@ -2102,6 +2161,43 @@ name = "test"
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.download_dir.as_deref(), Some("/srv/incoming"));
         assert_eq!(loaded.download_user, Some(1000));
+    }
+
+    #[test]
+    fn management_state_roundtrips_with_typed_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let controller = test_id(31);
+        let machine = test_id(32);
+        let enrolled_at = UnixTimestamp::from_secs(100);
+        let last_seen = UnixTimestamp::from_secs(200);
+        let cfg = AppConfig {
+            controllers: vec![ControllerGrant {
+                identity: controller,
+                enrolled_at,
+            }],
+            managed_machines: vec![ManagedMachine {
+                identity: machine,
+                hostname: "build-box".parse().unwrap(),
+                enrolled_at,
+                last_seen: Some(last_seen),
+            }],
+            enrollment_credentials: vec![EnrollmentCredential {
+                id: ray_proto::ipc::EnrollmentCredentialId::new("abc123".to_string()),
+                secret_hash: blake3::hash(b"fabricated enrollment secret"),
+                expires_at: UnixTimestamp::from_secs(300),
+                reusable: true,
+                enrolled_machines: vec![machine],
+                revoked: false,
+            }],
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.controllers, cfg.controllers);
+        assert_eq!(loaded.managed_machines, cfg.managed_machines);
+        assert_eq!(loaded.enrollment_credentials, cfg.enrollment_credentials);
     }
 
     #[test]
