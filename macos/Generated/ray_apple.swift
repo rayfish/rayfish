@@ -520,7 +520,7 @@ public protocol NodeProtocol: AnyObject, Sendable {
      */
     func createInvite(network: String) throws  -> String
 
-    func createNetwork(name: String?) throws
+    func createNetwork(name: String?, hostname: String?) throws
 
     /**
      * Detach the packet flow but leave mesh control connections alive.
@@ -532,7 +532,7 @@ public protocol NodeProtocol: AnyObject, Sendable {
      */
     func ipv6Address() throws  -> String
 
-    func joinNetwork(code: String) throws
+    func joinNetwork(code: String, hostname: String?) throws
 
     func leaveNetwork(network: String) throws
 
@@ -646,9 +646,10 @@ open func createInvite(network: String)throws  -> String  {
 })
 }
 
-open func createNetwork(name: String?)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+open func createNetwork(name: String?, hostname: String?)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_create_network(self.uniffiClonePointer(),
-        FfiConverterOptionString.lower(name),$0
+        FfiConverterOptionString.lower(name),
+        FfiConverterOptionString.lower(hostname),$0
     )
 }
 }
@@ -672,9 +673,10 @@ open func ipv6Address()throws  -> String  {
 })
 }
 
-open func joinNetwork(code: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+open func joinNetwork(code: String, hostname: String?)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_join_network(self.uniffiClonePointer(),
-        FfiConverterString.lower(code),$0
+        FfiConverterString.lower(code),
+        FfiConverterOptionString.lower(hostname),$0
     )
 }
 }
@@ -1424,7 +1426,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_method_node_create_invite() != 34104) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_apple_checksum_method_node_create_network() != 13138) {
+    if (uniffi_ray_apple_checksum_method_node_create_network() != 58507) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_deactivate() != 57091) {
@@ -1433,7 +1435,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_method_node_ipv6_address() != 24181) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_apple_checksum_method_node_join_network() != 54493) {
+    if (uniffi_ray_apple_checksum_method_node_join_network() != 53959) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_leave_network() != 26897) {

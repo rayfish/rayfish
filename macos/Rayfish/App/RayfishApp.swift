@@ -316,7 +316,10 @@ private struct CreateNetworkSheet: View {
                 Button("Cancel") { dismiss() }
                 Button("Create") {
                     Task {
-                        await controller.create(name: name.isEmpty ? nil : name)
+                        await controller.create(
+                            name: name.isEmpty ? nil : name,
+                            hostname: hostname.isEmpty ? nil : hostname
+                        )
                         if controller.error == nil { dismiss() }
                     }
                 }
@@ -332,6 +335,7 @@ private struct JoinNetworkSheet: View {
     @ObservedObject var controller: TunnelController
     @Environment(\.dismiss) private var dismiss
     @State private var code = ""
+    @State private var hostname = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -342,12 +346,13 @@ private struct JoinNetworkSheet: View {
             TextEditor(text: $code)
                 .fontDesign(.monospaced)
                 .frame(height: 100)
+            TextField("This Mac's name, optional", text: $hostname)
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Join") {
                     Task {
-                        await controller.join(code: code)
+                        await controller.join(code: code, hostname: hostname.isEmpty ? nil : hostname)
                         if controller.error == nil { dismiss() }
                     }
                 }

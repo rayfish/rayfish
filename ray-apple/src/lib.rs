@@ -206,11 +206,15 @@ impl Node {
         })
     }
 
-    pub fn create_network(&self, name: Option<String>) -> Result<(), AppleError> {
+    pub fn create_network(
+        &self,
+        name: Option<String>,
+        hostname: Option<String>,
+    ) -> Result<(), AppleError> {
         let state = self.state()?;
         match self
             .runtime
-            .block_on(state.create_network(GroupMode::default(), name, None))
+            .block_on(state.create_network(GroupMode::default(), name, hostname))
         {
             IpcMessage::Created { .. } => Ok(()),
             IpcMessage::Error { message } => Err(AppleError::Network(message)),
@@ -220,7 +224,7 @@ impl Node {
         }
     }
 
-    pub fn join_network(&self, code: String) -> Result<(), AppleError> {
+    pub fn join_network(&self, code: String, hostname: Option<String>) -> Result<(), AppleError> {
         let state = self.state()?;
         let (network_key, invite, coordinator) = match invite::decode_invite_code(&code) {
             Ok((network_key, coordinator, secret)) => {
@@ -231,7 +235,7 @@ impl Node {
         match self.runtime.block_on(state.join_network(
             &network_key,
             None,
-            None,
+            hostname,
             invite,
             coordinator,
             false,
