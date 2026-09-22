@@ -4862,6 +4862,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ray-apple"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "rayfish",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "uniffi",
+]
+
+[[package]]
 name = "ray-mobile"
 version = "0.1.4"
 dependencies = [

@@ -1,0 +1,260 @@
+import SwiftUI
+
+@main
+struct RayfishApp: App {
+    var body: some Scene {
+        MenuBarExtra("Rayfish", systemImage: "fish") {
+            Button("Open Rayfish") {
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            Divider()
+            Button("Quit Rayfish") {
+                NSApp.terminate(nil)
+            }
+        }
+        WindowGroup("Rayfish") {
+            ContentView()
+        }
+    }
+}
+
+private struct ContentView: View {
+    @StateObject private var controller = TunnelController()
+    @State private var selection: SidebarItem? = .networks
+    @State private var showCreate = false
+    @State private var showJoin = false
+
+    var body: some View {
+        NavigationSplitView {
+            List(selection: $selection) {
+                Section {
+                    Label("Networks", systemImage: "circle.hexagongrid.fill")
+                        .tag(SidebarItem.networks)
+                    Label("Devices", systemImage: "desktopcomputer")
+                        .tag(SidebarItem.devices)
+                }
+                Section {
+                    Label("Settings", systemImage: "gearshape")
+                        .tag(SidebarItem.settings)
+                }
+            }
+            .navigationTitle("Rayfish")
+        } detail: {
+            switch selection ?? .networks {
+            case .networks:
+                NetworksView(controller: controller, showCreate: $showCreate, showJoin: $showJoin)
+            case .devices:
+                DevicesView()
+            case .settings:
+                SettingsView()
+            }
+        }
+        .frame(minWidth: 820, minHeight: 560)
+        .sheet(isPresented: $showCreate) {
+            CreateNetworkSheet(controller: controller)
+        }
+        .sheet(isPresented: $showJoin) {
+            JoinNetworkSheet(controller: controller)
+        }
+        .task { await controller.refresh() }
+    }
+}
+
+private enum SidebarItem: Hashable {
+    case networks
+    case devices
+    case settings
+}
+
+private struct NetworksView: View {
+    @ObservedObject var controller: TunnelController
+    @Binding var showCreate: Bool
+    @Binding var showJoin: Bool
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label(controller.status?.active == true ? "Rayfish is connected" : "Rayfish is ready", systemImage: "checkmark.circle.fill")
+                            .font(.title2.weight(.semibold))
+                            .foregroundStyle(.green)
+                        Text("Create a private network or join one with an invite code.")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(controller.status?.active == true ? "Connected" : "Connect") {
+                        Task { await controller.connect() }
+                    }
+                    .disabled(controller.status?.active == true || controller.isLoading)
+                    Button("Join with a code") { showJoin = true }
+                    Button("Create network") { showCreate = true }
+                        .buttonStyle(.borderedProminent)
+                }
+
+                if let error = controller.error {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+
+                if let status = controller.status, !status.networks.isEmpty {
+                    ForEach(status.networks) { network in
+                        NetworkCard(network: network)
+                    }
+                } else {
+                GroupBox {
+                    ContentUnavailableView(
+                        "No networks yet",
+                        systemImage: "circle.hexagongrid",
+                        description: Text("A network is a private space for the devices and people you invite."))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 48)
+                }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("What happens next")
+                        .font(.headline)
+                    Label("Your Mac gets a stable private address.", systemImage: "checkmark")
+                    Label("Invitees join with a one-time code.", systemImage: "checkmark")
+                    Label("Names like laptop.home.ray work automatically.", systemImage: "checkmark")
+                }
+                .foregroundStyle(.secondary)
+            }
+            .padding(28)
+        }
+        .navigationTitle("Networks")
+    }
+}
+
+private struct NetworkCard: View {
+    let network: ProviderNetwork
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text(network.name).font(.headline)
+                        Text("\(network.hostname).\(network.name).ray")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(network.role.capitalized)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(network.peers) { peer in
+                    HStack(spacing: 10) {
+                        Circle().fill(peer.state == "direct" ? .green : .secondary).frame(width: 8, height: 8)
+                        Text(peer.hostname)
+                        if peer.isOwnDevice { Text("YOUR DEVICE").font(.caption2).foregroundStyle(.secondary) }
+                        Spacer()
+                        Text(peer.latencyMs.map { "\($0) ms" } ?? peer.state)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(4)
+        }
+    }
+}
+
+private struct DevicesView: View {
+    var body: some View {
+        ContentUnavailableView(
+            "No devices to show",
+            systemImage: "desktopcomputer",
+            description: Text("Devices appear here once this Mac joins a network."))
+            .navigationTitle("Devices")
+    }
+}
+
+private struct SettingsView: View {
+    var body: some View {
+        Form {
+            Section("VPN") {
+                LabeledContent("Status") {
+                    Text("Not connected")
+                        .foregroundStyle(.secondary)
+                }
+                Text("The Rayfish system extension manages the VPN connection.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Advanced") {
+                LabeledContent("Command line") {
+                    Text("ray status")
+                        .fontDesign(.monospaced)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Settings")
+    }
+}
+
+private struct CreateNetworkSheet: View {
+    @ObservedObject var controller: TunnelController
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var hostname = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Create a network")
+                .font(.title2.weight(.semibold))
+            Text("Only people you invite can join.")
+                .foregroundStyle(.secondary)
+            TextField("Network name, optional", text: $name)
+            TextField("This Mac's name, optional", text: $hostname)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Create") {
+                    Task {
+                        await controller.create(name: name.isEmpty ? nil : name)
+                        if controller.error == nil { dismiss() }
+                    }
+                }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
+    }
+}
+
+private struct JoinNetworkSheet: View {
+    @ObservedObject var controller: TunnelController
+    @Environment(\.dismiss) private var dismiss
+    @State private var code = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Join a network")
+                .font(.title2.weight(.semibold))
+            Text("Paste the invite code you received.")
+                .foregroundStyle(.secondary)
+            TextEditor(text: $code)
+                .fontDesign(.monospaced)
+                .frame(height: 100)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Join") {
+                    Task {
+                        await controller.join(code: code)
+                        if controller.error == nil { dismiss() }
+                    }
+                }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+    }
+}
