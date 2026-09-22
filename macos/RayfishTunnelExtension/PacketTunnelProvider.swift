@@ -56,7 +56,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
 
     func writePacket(_ packet: [UInt8]) {
         let data = Data(packet)
-        packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET6)])
+        let family = packet.first.map { $0 >> 4 } == 6 ? AF_INET6 : AF_INET
+        packetFlow.writePackets([data], withProtocols: [NSNumber(value: family)])
     }
 
     private func readPackets() {
