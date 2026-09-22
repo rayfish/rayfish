@@ -24,6 +24,11 @@ targets:
         embed: true
       - target: RayfishCommand
         embed: true
+    postBuildScripts:
+      - name: Place ray beside the app executable
+        script: |
+          set -euo pipefail
+          install -m 755 "$BUILT_PRODUCTS_DIR/ray" "$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray"
   RayfishCommand:
     type: tool
     platform: macOS
