@@ -22,6 +22,18 @@ targets:
     dependencies:
       - target: RayfishTunnelExtension
         embed: true
+      - target: RayfishCommand
+        embed: true
+  RayfishCommand:
+    type: tool
+    platform: macOS
+    sources:
+      - path: RayfishCommand
+      - path: Rayfish/App/SystemExtensionInstaller.swift
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_NAME: ray
   RayfishTunnelExtension:
     type: system-extension
     platform: macOS
