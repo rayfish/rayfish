@@ -56,6 +56,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Mesh SSH sessions no longer drop on the second command when the client asks
+  for compression.** `Compression yes` in `ssh_config` selected a zlib path that
+  fails to decompress the second message a client sends, so a session opened,
+  printed the motd, ran one command, and then died with only "closed by remote
+  host" to show for it. The mesh SSH server offers no compression at all now.
+
 - **Network changes no longer leave control ping working while ordinary mesh
   traffic disappears.** A delayed handshake from a replaced peer connection
   could put its stale route back into the forwarding table. The live connection
