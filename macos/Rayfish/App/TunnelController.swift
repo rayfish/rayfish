@@ -23,6 +23,13 @@ final class TunnelController: ObservableObject {
             let manager = try await configuredManager(legacyStateDirectory: legacyStateDirectory)
             try manager.connection.startVPNTunnel()
             error = nil
+            for _ in 0..<10 {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                await refresh()
+                if status != nil {
+                    break
+                }
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -71,6 +78,15 @@ final class TunnelController: ObservableObject {
 
     func leave(network: String) async {
         await perform(ProviderRequest(action: .leave, name: network, code: nil), replaceStatus: true)
+    }
+
+    func poll() async {
+        while !Task.isCancelled {
+            if status != nil {
+                await refresh()
+            }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
     }
 
     private func perform(_ request: ProviderRequest, replaceStatus: Bool) async {

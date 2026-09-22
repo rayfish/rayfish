@@ -57,7 +57,10 @@ private struct ContentView: View {
         .sheet(isPresented: $showJoin) {
             JoinNetworkSheet(controller: controller)
         }
-        .task { await controller.refresh() }
+        .task {
+            await controller.refresh()
+            await controller.poll()
+        }
     }
 }
 
