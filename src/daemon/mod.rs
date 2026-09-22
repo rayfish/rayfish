@@ -1171,6 +1171,14 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
                 "disabled"
             }
         ),
+        GlobalKey::Dns => format!(
+            "DNS {}.",
+            if cfg.dns_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {

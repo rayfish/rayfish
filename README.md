@@ -494,6 +494,7 @@ ray config set dns-upstreams 1.1.1.1,8.8.8.8 # forwarders for non-.ray names
 ray config set dns-upstreams 200::1234 --replace # send all non-.ray DNS to a mesh peer
 ray config set relay https://r1 --replace    # drop the n0 defaults entirely
 ray config unset relay                        # back to defaults
+ray dns off                                   # remove Magic DNS from the system resolver
 ```
 
 Keys: `relay`, `discovery-dns`, `dns-upstreams`. Values are a comma list of
@@ -503,6 +504,10 @@ send all non-`.ray` queries there. By default custom
 servers are added alongside the defaults; `--replace` swaps them out (a bad
 custom server with no fallback can isolate the node). Settings are saved to
 `settings.toml` and take effect on `sudo ray restart`.
+
+`ray dns off` removes Rayfish's DNS configuration immediately and keeps it off
+across restarts. Use `ray dns on` to restore it. When Tailscale Magic DNS is
+available, Rayfish forwards non-`.ray` names to it before any other upstream.
 
 ## Running alongside another VPN
 
