@@ -422,6 +422,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -510,6 +526,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  */
 public protocol NodeProtocol: AnyObject, Sendable {
 
+    func acceptRequest(network: String, id: String) throws
+
     /**
      * Attach the system packet flow and start forwarding packets.
      */
@@ -526,6 +544,8 @@ public protocol NodeProtocol: AnyObject, Sendable {
      * Detach the packet flow but leave mesh control connections alive.
      */
     func deactivate() throws
+
+    func denyRequest(network: String, id: String) throws
 
     /**
      * The stable mesh address that the packet tunnel assigns to this device.
@@ -627,6 +647,14 @@ public convenience init(configDir: String) {
 
 
 
+open func acceptRequest(network: String, id: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_accept_request(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterString.lower(id),$0
+    )
+}
+}
+
     /**
      * Attach the system packet flow and start forwarding packets.
      */
@@ -661,6 +689,14 @@ open func createNetwork(name: String?, hostname: String?)throws   {try rustCallW
      */
 open func deactivate()throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_deactivate(self.uniffiClonePointer(),$0
+    )
+}
+}
+
+open func denyRequest(network: String, id: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_deny_request(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterString.lower(id),$0
     )
 }
 }
@@ -802,6 +838,92 @@ public func FfiConverterTypeNode_lower(_ value: Node) -> UnsafeMutableRawPointer
 
 
 
+public struct JoinRequest {
+    public var network: String
+    public var id: String
+    public var hostname: String?
+    public var waitingSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(network: String, id: String, hostname: String?, waitingSecs: UInt64) {
+        self.network = network
+        self.id = id
+        self.hostname = hostname
+        self.waitingSecs = waitingSecs
+    }
+}
+
+#if compiler(>=6)
+extension JoinRequest: Sendable {}
+#endif
+
+
+extension JoinRequest: Equatable, Hashable {
+    public static func ==(lhs: JoinRequest, rhs: JoinRequest) -> Bool {
+        if lhs.network != rhs.network {
+            return false
+        }
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.hostname != rhs.hostname {
+            return false
+        }
+        if lhs.waitingSecs != rhs.waitingSecs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(network)
+        hasher.combine(id)
+        hasher.combine(hostname)
+        hasher.combine(waitingSecs)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeJoinRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> JoinRequest {
+        return
+            try JoinRequest(
+                network: FfiConverterString.read(from: &buf),
+                id: FfiConverterString.read(from: &buf),
+                hostname: FfiConverterOptionString.read(from: &buf),
+                waitingSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: JoinRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.network, into: &buf)
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.hostname, into: &buf)
+        FfiConverterUInt64.write(value.waitingSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJoinRequest_lift(_ buf: RustBuffer) throws -> JoinRequest {
+    return try FfiConverterTypeJoinRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJoinRequest_lower(_ value: JoinRequest) -> RustBuffer {
+    return FfiConverterTypeJoinRequest.lower(value)
+}
+
+
 public struct Network {
     public var name: String
     public var hostname: String
@@ -900,13 +1022,15 @@ public struct NodeStatus {
     public var active: Bool
     public var ipv6: String
     public var networks: [Network]
+    public var pendingRequests: [JoinRequest]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(active: Bool, ipv6: String, networks: [Network]) {
+    public init(active: Bool, ipv6: String, networks: [Network], pendingRequests: [JoinRequest]) {
         self.active = active
         self.ipv6 = ipv6
         self.networks = networks
+        self.pendingRequests = pendingRequests
     }
 }
 
@@ -926,6 +1050,9 @@ extension NodeStatus: Equatable, Hashable {
         if lhs.networks != rhs.networks {
             return false
         }
+        if lhs.pendingRequests != rhs.pendingRequests {
+            return false
+        }
         return true
     }
 
@@ -933,6 +1060,7 @@ extension NodeStatus: Equatable, Hashable {
         hasher.combine(active)
         hasher.combine(ipv6)
         hasher.combine(networks)
+        hasher.combine(pendingRequests)
     }
 }
 
@@ -947,7 +1075,8 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
             try NodeStatus(
                 active: FfiConverterBool.read(from: &buf),
                 ipv6: FfiConverterString.read(from: &buf),
-                networks: FfiConverterSequenceTypeNetwork.read(from: &buf)
+                networks: FfiConverterSequenceTypeNetwork.read(from: &buf),
+                pendingRequests: FfiConverterSequenceTypeJoinRequest.read(from: &buf)
         )
     }
 
@@ -955,6 +1084,7 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
         FfiConverterBool.write(value.active, into: &buf)
         FfiConverterString.write(value.ipv6, into: &buf)
         FfiConverterSequenceTypeNetwork.write(value.networks, into: &buf)
+        FfiConverterSequenceTypeJoinRequest.write(value.pendingRequests, into: &buf)
     }
 }
 
@@ -1368,6 +1498,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeJoinRequest: FfiConverterRustBuffer {
+    typealias SwiftType = [JoinRequest]
+
+    public static func write(_ value: [JoinRequest], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeJoinRequest.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [JoinRequest] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [JoinRequest]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeJoinRequest.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeNetwork: FfiConverterRustBuffer {
     typealias SwiftType = [Network]
 
@@ -1430,6 +1585,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_ray_apple_checksum_method_node_accept_request() != 19133) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ray_apple_checksum_method_node_activate() != 47813) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1440,6 +1598,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_deactivate() != 57091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_deny_request() != 55734) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_ipv6_address() != 24181) {

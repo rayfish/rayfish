@@ -133,6 +133,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 throw ProviderError.missingNetworkName
             }
             try node.setHostname(network: name, hostname: hostname)
+        case .acceptRequest:
+            guard let name = request.name, let id = request.id else {
+                throw ProviderError.missingNetworkName
+            }
+            try node.acceptRequest(network: name, id: id)
+        case .denyRequest:
+            guard let name = request.name, let id = request.id else {
+                throw ProviderError.missingNetworkName
+            }
+            try node.denyRequest(network: name, id: id)
         }
         return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
     }
@@ -156,6 +166,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                             isOwnDevice: peer.isOwnDevice
                         )
                     }
+                )
+            },
+            pendingRequests: status.pendingRequests.map { request in
+                ProviderJoinRequest(
+                    network: request.network,
+                    id: request.id,
+                    hostname: request.hostname,
+                    waitingSecs: request.waitingSecs
                 )
             }
         )
