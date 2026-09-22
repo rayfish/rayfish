@@ -313,6 +313,7 @@ pub(crate) async fn cmd_update(
     .await
 }
 
+#[cfg(not(windows))]
 pub(crate) fn update_label(current: &str, remote_label: &str) -> String {
     if remote_label.starts_with("nightly") {
         format!("nightly ({})", env!("RAY_GIT_SHA"))
