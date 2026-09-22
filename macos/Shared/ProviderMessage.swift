@@ -6,6 +6,7 @@ struct ProviderRequest: Codable {
         case create
         case join
         case invite
+        case leave
     }
 
     var action: Action

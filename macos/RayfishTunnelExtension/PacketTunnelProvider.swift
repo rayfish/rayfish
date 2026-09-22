@@ -123,6 +123,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
             }
             let code = try node.createInvite(network: name)
             return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: code)
+        case .leave:
+            guard let name = request.name, !name.isEmpty else {
+                throw ProviderError.missingNetworkName
+            }
+            try node.leaveNetwork(network: name)
         }
         return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
     }

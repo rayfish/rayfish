@@ -534,6 +534,8 @@ public protocol NodeProtocol: AnyObject, Sendable {
 
     func joinNetwork(code: String) throws
 
+    func leaveNetwork(network: String) throws
+
     /**
      * Copy legacy launchd state before starting the extension-owned node.
      */
@@ -673,6 +675,13 @@ open func ipv6Address()throws  -> String  {
 open func joinNetwork(code: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_join_network(self.uniffiClonePointer(),
         FfiConverterString.lower(code),$0
+    )
+}
+}
+
+open func leaveNetwork(network: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_leave_network(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),$0
     )
 }
 }
@@ -1425,6 +1434,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_join_network() != 54493) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_leave_network() != 26897) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_migrate_legacy_state() != 46002) {

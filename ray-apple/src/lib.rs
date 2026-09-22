@@ -260,6 +260,17 @@ impl Node {
         }
     }
 
+    pub fn leave_network(&self, network: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.leave_network(&network)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "node returned an invalid leave response".to_owned(),
+            )),
+        }
+    }
+
     /// Attach the system packet flow and start forwarding packets.
     pub fn activate(&self, flow: Box<dyn PacketFlow>) -> Result<(), AppleError> {
         #[cfg(not(target_os = "macos"))]
