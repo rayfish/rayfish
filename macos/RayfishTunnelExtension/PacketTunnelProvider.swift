@@ -1,7 +1,6 @@
 import Darwin
 import Foundation
 import NetworkExtension
-import RayApple
 
 final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     private var node: Node?
