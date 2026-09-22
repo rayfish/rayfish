@@ -245,6 +245,21 @@ impl Node {
         }
     }
 
+    /// Mint a single-use invite that expires after seven days.
+    pub fn create_invite(&self, network: String) -> Result<String, AppleError> {
+        let state = self.state()?;
+        match self
+            .runtime
+            .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false))
+        {
+            IpcMessage::InviteCreated { code, .. } => Ok(code),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "node returned an invalid invite response".to_owned(),
+            )),
+        }
+    }
+
     /// Attach the system packet flow and start forwarding packets.
     pub fn activate(&self, flow: Box<dyn PacketFlow>) -> Result<(), AppleError> {
         #[cfg(not(target_os = "macos"))]

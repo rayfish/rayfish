@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -70,6 +71,7 @@ private struct NetworksView: View {
     @ObservedObject var controller: TunnelController
     @Binding var showCreate: Bool
     @Binding var showJoin: Bool
+    @State private var inviteCode: String?
 
     var body: some View {
         ScrollView {
@@ -105,7 +107,9 @@ private struct NetworksView: View {
 
                 if let status = controller.status, !status.networks.isEmpty {
                     ForEach(status.networks) { network in
-                        NetworkCard(network: network)
+                        NetworkCard(network: network) {
+                            Task { inviteCode = await controller.invite(network: network.name) }
+                        }
                     }
                 } else {
                 GroupBox {
@@ -130,11 +134,26 @@ private struct NetworksView: View {
             .padding(28)
         }
         .navigationTitle("Networks")
+        .alert("Invite code", isPresented: Binding(
+            get: { inviteCode != nil },
+            set: { if !$0 { inviteCode = nil } }
+        )) {
+            Button("Copy") {
+                if let inviteCode {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(inviteCode, forType: .string)
+                }
+            }
+            Button("Done", role: .cancel) {}
+        } message: {
+            Text(inviteCode ?? "")
+        }
     }
 }
 
 private struct NetworkCard: View {
     let network: ProviderNetwork
+    let invite: () -> Void
 
     var body: some View {
         GroupBox {
@@ -150,6 +169,10 @@ private struct NetworkCard: View {
                     Text(network.role.capitalized)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
+                    if network.role == "coordinator" {
+                        Button("Invite", action: invite)
+                            .buttonStyle(.bordered)
+                    }
                 }
                 ForEach(network.peers) { peer in
                     HStack(spacing: 10) {

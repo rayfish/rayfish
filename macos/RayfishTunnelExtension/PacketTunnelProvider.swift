@@ -54,7 +54,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
             let response = try handle(request)
             completionHandler?(try JSONEncoder().encode(response))
         } catch {
-            let response = ProviderResponse(success: false, error: error.localizedDescription, status: nil)
+            let response = ProviderResponse(success: false, error: error.localizedDescription, status: nil, inviteCode: nil)
             completionHandler?(try? JSONEncoder().encode(response))
         }
     }
@@ -109,7 +109,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         }
         switch request.action {
         case .status:
-            return ProviderResponse(success: true, error: nil, status: status(from: try node.status()))
+            return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
         case .create:
             try node.createNetwork(name: request.name)
         case .join:
@@ -117,8 +117,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 throw ProviderError.missingInviteCode
             }
             try node.joinNetwork(code: code)
+        case .invite:
+            guard let name = request.name, !name.isEmpty else {
+                throw ProviderError.missingNetworkName
+            }
+            let code = try node.createInvite(network: name)
+            return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: code)
         }
-        return ProviderResponse(success: true, error: nil, status: status(from: try node.status()))
+        return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
     }
 
     private func status(from status: NodeStatus) -> ProviderStatus {
@@ -150,6 +156,7 @@ private enum ProviderError: LocalizedError {
     case providerReleased
     case notStarted
     case missingInviteCode
+    case missingNetworkName
     case missingAppGroup
 
     var errorDescription: String? {
@@ -160,6 +167,8 @@ private enum ProviderError: LocalizedError {
             "Rayfish is not connected"
         case .missingInviteCode:
             "An invite code is required"
+        case .missingNetworkName:
+            "A network name is required"
         case .missingAppGroup:
             "Rayfish shared storage is unavailable"
         }
