@@ -38,6 +38,13 @@ macos:
         echo "just macos must run on macOS" >&2
         exit 1
     fi
+    if ! command -v xcodegen >/dev/null; then
+        if ! command -v brew >/dev/null; then
+            echo "XcodeGen is required. Install Homebrew, then run just macos again." >&2
+            exit 1
+        fi
+        brew install xcodegen
+    fi
     xcodegen generate --spec macos/project.yml --project macos
     open macos/Rayfish.xcodeproj
 
