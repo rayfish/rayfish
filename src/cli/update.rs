@@ -313,6 +313,14 @@ pub(crate) async fn cmd_update(
     .await
 }
 
+pub(crate) fn update_label(current: &str, remote_label: &str) -> String {
+    if remote_label.starts_with("nightly") {
+        format!("nightly ({})", env!("RAY_GIT_SHA"))
+    } else {
+        format!("v{current}")
+    }
+}
+
 /// `ray update --list`: enumerate published releases (newest first) and exit.
 /// No root, no install.
 async fn cmd_update_list(client: &Client, token: &Option<String>, current: &str) -> Result<()> {
@@ -355,7 +363,7 @@ async fn download_verify_and_install(
     bin_url: &str,
     expected: &str,
     asset: &str,
-    current: &str,
+    _current: &str,
     remote_label: &str,
     target_identity: &str,
 ) -> Result<()> {
@@ -372,7 +380,7 @@ async fn download_verify_and_install(
         let previous = installed_msi_version()
             .ok()
             .flatten()
-            .unwrap_or_else(|| current.to_string());
+            .unwrap_or_else(|| _current.to_string());
         schedule_msi_update(&msi, target_identity, expected)?;
         println!("scheduled detached Windows MSI update v{previous} → {remote_label}");
         Ok(())
@@ -399,7 +407,10 @@ async fn download_verify_and_install(
         spinner.finish_and_clear();
         res?;
 
-        println!("updated rayfish v{current} → {remote_label}");
+        println!(
+            "updated rayfish {} → {remote_label}",
+            update_label(_current, remote_label)
+        );
 
         // If the service is installed, the daemon is still running the old binary.
         // Go through the full install path: rewrite the unit (its exec path may have
