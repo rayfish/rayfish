@@ -61,6 +61,7 @@ mod permissions;
 mod session;
 mod session_env;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::os::fd::AsFd;
@@ -77,7 +78,7 @@ use pty_process::Size;
 use russh::keys::Algorithm;
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
+use russh::{Channel, ChannelId, MethodKind, MethodSet, Preferred, Sig, compression};
 #[cfg(test)]
 use smol_str::SmolStr;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -136,6 +137,18 @@ fn server_config(key: PrivateKey) -> Config {
         // 60 seconds since the last received SSH packet, even with output flowing.
         keepalive_max: 3,
         auth_rejection_time: Duration::from_secs(1),
+        // Offer "none" only. Russh's zlib is broken on the receive side: with
+        // `zlib@openssh.com` negotiated, the second SSH_MSG_CHANNEL_DATA the
+        // client sends fails to decompress and the connection dies with
+        // `SshEncoding: length invalid`. A stock OpenSSH client picks zlib
+        // whenever `Compression yes` is set in its config, so anyone with that
+        // setting gets a session that drops the moment they type a second
+        // command. Traffic on the mesh link is already small and latency-bound;
+        // compressing it buys nothing worth that.
+        preferred: Preferred {
+            compression: Cow::Borrowed(&[compression::NONE]),
+            ..Preferred::DEFAULT
+        },
         ..Default::default()
     }
 }
@@ -2161,6 +2174,90 @@ mod tests {
             }
         }
         assert!(ran, "the login shell never ran our command: {out:?}");
+    }
+
+    /// The server must offer "none" alone as its compression. Russh's zlib is
+    /// broken on the receive side: with `zlib@openssh.com` negotiated, the
+    /// second SSH_MSG_CHANNEL_DATA an OpenSSH client sends fails to decompress
+    /// and the connection dies with `SshEncoding: length invalid`. `Compression
+    /// yes` is common enough in people's ssh_config that this is the path they
+    /// hit first -- the session drops the moment they type a second command --
+    /// so the advertisement itself is what this pins. Russh's own client
+    /// interoperates with russh's zlib, so only the wire tells the truth here.
+    #[tokio::test]
+    async fn the_server_offers_no_compression() {
+        let mut sock = connect_with_grace(LOGIN_GRACE).await;
+        sock.write_all(b"SSH-2.0-rayfish-test\r\n")
+            .await
+            .expect("send our version string");
+
+        // Enough for the version line and the KEXINIT behind it, which is still
+        // in the clear this early.
+        let mut buf = vec![0u8; 8192];
+        let mut have = 0;
+        let kexinit = loop {
+            let n = timeout(Duration::from_secs(10), sock.read(&mut buf[have..]))
+                .await
+                .expect("the server never sent its KEXINIT")
+                .expect("read from the server");
+            assert!(n > 0, "the server hung up before its KEXINIT");
+            have += n;
+            if let Some(payload) = first_packet_payload(&buf[..have]) {
+                break payload.to_vec();
+            }
+        };
+
+        const SSH_MSG_KEXINIT: u8 = 20;
+        assert_eq!(
+            kexinit.first().copied(),
+            Some(SSH_MSG_KEXINIT),
+            "the server's first packet is its KEXINIT"
+        );
+        // msg type, then a 16-byte cookie, then the algorithm name-lists.
+        let lists = name_lists(&kexinit[17..]);
+        // kex, host key, cipher c2s, cipher s2c, mac c2s, mac s2c, then the two
+        // compression lists.
+        assert_eq!(
+            (
+                lists.get(6).map(String::as_str),
+                lists.get(7).map(String::as_str)
+            ),
+            (Some("none"), Some("none")),
+            "the server must not offer zlib: {lists:?}"
+        );
+    }
+
+    /// Split off the payload of the first complete binary packet in `bytes`,
+    /// skipping the version line ahead of it. `None` until all of it has
+    /// arrived. Unencrypted packets only, which is all this early in a session.
+    fn first_packet_payload(bytes: &[u8]) -> Option<&[u8]> {
+        let line_end = bytes.windows(2).position(|w| w == b"\r\n")? + 2;
+        let packet = bytes.get(line_end..)?;
+        let length = u32::from_be_bytes(packet.get(..4)?.try_into().ok()?) as usize;
+        let padding = *packet.get(4)? as usize;
+        let payload_len = length.checked_sub(padding + 1)?;
+        packet.get(5..5 + payload_len)
+    }
+
+    /// The `name-list` sequence of a KEXINIT body: each one a u32 length and
+    /// that many bytes of comma-separated names.
+    fn name_lists(mut bytes: &[u8]) -> Vec<String> {
+        let mut lists = Vec::new();
+        while bytes.len() >= 4 {
+            let (len_bytes, rest) = bytes.split_at(4);
+            let Ok(len) = u32::from_be_bytes(len_bytes.try_into().unwrap_or([0; 4])).try_into()
+            else {
+                break;
+            };
+            let len: usize = len;
+            if rest.len() < len {
+                break;
+            }
+            let (list, rest) = rest.split_at(len);
+            lists.push(String::from_utf8_lossy(list).into_owned());
+            bytes = rest;
+        }
+        lists
     }
 
     #[tokio::test]

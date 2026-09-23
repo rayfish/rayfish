@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
+use ray_proto::ipc::{MachineHostname, UnixTimestampSecs};
 use serde::{Deserialize, Serialize};
 
 use crate::membership::GroupMode;
@@ -302,24 +303,38 @@ pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
 
 /// Merge configured DNS upstreams with the system-captured ones. `replace`
 /// drops the captured set; otherwise custom upstreams are tried first, then the
-/// captured ones. Unset returns the captured set unchanged.
+/// captured ones. When present, Tailscale's Magic DNS resolver is preferred over
+/// every other upstream. Unset returns the captured set unchanged.
 ///
 /// Captured resolvers are IPv4 because that is what the desktop OS backends
 /// expose. Configured IPv6 addresses are retained so an overlay peer running a
 /// resolver can receive ordinary DNS queries over the mesh.
 pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<IpAddr> {
-    if o.servers.is_empty() {
-        return captured.into_iter().map(IpAddr::V4).collect();
-    }
-    let custom: Vec<IpAddr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
-    if o.replace {
-        custom
+    let upstreams = if o.servers.is_empty() {
+        captured.into_iter().map(IpAddr::V4).collect()
     } else {
-        custom
-            .into_iter()
-            .chain(captured.into_iter().map(IpAddr::V4))
-            .collect()
+        let custom: Vec<IpAddr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
+        if o.replace {
+            custom
+        } else {
+            custom
+                .into_iter()
+                .chain(captured.into_iter().map(IpAddr::V4))
+                .collect()
+        }
+    };
+    prefer_tailscale_dns(upstreams)
+}
+
+/// Tailscale's Magic DNS resolver owns its split-DNS rules. Keep it first when
+/// present while Rayfish intercepts `.ray` queries and forwards other names.
+fn prefer_tailscale_dns(mut upstreams: Vec<IpAddr>) -> Vec<IpAddr> {
+    let tailscale = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100));
+    if let Some(index) = upstreams.iter().position(|ip| *ip == tailscale) {
+        let resolver = upstreams.remove(index);
+        upstreams.insert(0, resolver);
     }
+    upstreams
 }
 
 /// Whether `o` contributes anything to [`resolve_upstreams`], i.e. names at least
@@ -421,6 +436,40 @@ pub struct PendingJoinEntry {
     pub name: Option<String>,
 }
 
+/// A controller this machine has explicitly authorized to issue management
+/// requests. Authority is bound to the controller's transport endpoint id,
+/// which iroh authenticates during the QUIC handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerGrant {
+    pub identity: EndpointId,
+    pub enrolled_at: UnixTimestampSecs,
+}
+
+/// A machine enrolled with this controller. `hostname` is the stable name used
+/// by delegated commands and by `ray apply` when matching a missing host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedMachine {
+    pub identity: EndpointId,
+    pub hostname: MachineHostname,
+    pub enrolled_at: UnixTimestampSecs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<UnixTimestampSecs>,
+}
+
+/// A controller-side enrollment credential. Only its hash is persisted.
+/// Reusable credentials may enroll multiple machines until revoked or expired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollmentCredential {
+    pub id: ray_proto::ipc::EnrollmentCredentialId,
+    pub secret_hash: blake3::Hash,
+    pub expires_at: UnixTimestampSecs,
+    pub reusable: bool,
+    #[serde(default)]
+    pub enrolled_machines: Vec<EndpointId>,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_true")]
@@ -450,6 +499,9 @@ pub struct AppConfig {
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
     #[serde(default)]
     pub dns_upstreams: ServerOverride,
+    /// Whether Rayfish configures the host resolver for Magic DNS.
+    #[serde(default = "default_true")]
+    pub dns_enabled: bool,
     /// Recently successful peer transport paths.  These are only connection
     /// hints: iroh still authenticates the endpoint identity in TLS and falls
     /// back to its normal discovery services when a hint is stale.  Keeping
@@ -529,6 +581,15 @@ pub struct AppConfig {
     /// here when it re-pairs (re-auth). See `Daemon::unpair`/`reauth_device`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_devices: Vec<String>,
+    /// Remote controllers authorized by this machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controllers: Vec<ControllerGrant>,
+    /// Machines that enrolled with this node as their controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_machines: Vec<ManagedMachine>,
+    /// Pending and reusable machine-enrollment credentials minted here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrollment_credentials: Vec<EnrollmentCredential>,
 }
 
 impl Default for AppConfig {
@@ -541,6 +602,7 @@ impl Default for AppConfig {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            dns_enabled: true,
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
             v4_bridge: true,
@@ -556,6 +618,9 @@ impl Default for AppConfig {
             pending_joins: Vec::new(),
             cert_generation: 0,
             revoked_devices: Vec::new(),
+            controllers: Vec::new(),
+            managed_machines: Vec::new(),
+            enrollment_credentials: Vec::new(),
         }
     }
 }
@@ -685,6 +750,8 @@ struct Settings {
     discovery_dns: ServerOverride,
     #[serde(default)]
     dns_upstreams: ServerOverride,
+    #[serde(default = "default_true")]
+    dns_enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
@@ -713,20 +780,47 @@ struct Settings {
     cert_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     revoked_devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    controllers: Vec<ControllerGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    managed_machines: Vec<ManagedMachine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    enrollment_credentials: Vec<EnrollmentCredential>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
 #[cfg(target_os = "linux")]
 fn rayfish_gid() -> Option<u32> {
-    use std::ffi::CString;
+    use std::{ffi::CString, mem::zeroed, ptr::null_mut};
     let name = CString::new("rayfish").ok()?;
-    // SAFETY: getgrnam returns a pointer to a static struct; we copy gr_gid out
-    // immediately before any further libc call could overwrite it.
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    // getgrnam_r, never getgrnam: the legacy call returns a pointer into a
+    // process-wide buffer that any concurrent getgr*/getpw* call is allowed
+    // to move or free. Config saves run on many threads at once, and on musl
+    // that race corrupted the heap and took the daemon down with SIGSEGV.
+    // The reentrant variant copies into our own buffer, which is the whole
+    // reason it exists.
+    let mut buf_len = 4096;
+    loop {
+        let mut buf = vec![0u8; buf_len];
+        let mut grbuf: libc::group = unsafe { zeroed() };
+        let mut result: *mut libc::group = null_mut();
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                &mut grbuf,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        return Some(unsafe { (*result).gr_gid });
     }
 }
 
@@ -1182,10 +1276,11 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         let s = std::fs::read_to_string(&settings_path).context("reading settings.toml")?;
         toml::from_str(&s).context("parsing settings.toml")?
     } else {
-        // Fresh install: mDNS discovery is on by default, everything else is the
-        // type-default.
+        // Fresh install: discovery and Magic DNS are on by default, everything
+        // else is the type-default.
         Settings {
             mdns_enabled: true,
+            dns_enabled: true,
             ..Default::default()
         }
     };
@@ -1222,6 +1317,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
+        dns_enabled: settings.dns_enabled,
         endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         v4_bridge: settings.v4_bridge,
@@ -1237,6 +1333,9 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         pending_joins: settings.pending_joins,
         cert_generation: settings.cert_generation,
         revoked_devices: settings.revoked_devices,
+        controllers: settings.controllers,
+        managed_machines: settings.managed_machines,
+        enrollment_credentials: settings.enrollment_credentials,
     })
 }
 
@@ -1291,6 +1390,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
+        dns_enabled: config.dns_enabled,
         endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         v4_bridge: config.v4_bridge,
@@ -1305,6 +1405,9 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         pending_joins: config.pending_joins.clone(),
         cert_generation: config.cert_generation,
         revoked_devices: config.revoked_devices.clone(),
+        controllers: config.controllers.clone(),
+        managed_machines: config.managed_machines.clone(),
+        enrollment_credentials: config.enrollment_credentials.clone(),
     };
     toml::to_string_pretty(&settings).context("serializing settings")
 }
@@ -2083,6 +2186,43 @@ name = "test"
     }
 
     #[test]
+    fn management_state_roundtrips_with_typed_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let controller = test_id(31);
+        let machine = test_id(32);
+        let enrolled_at = UnixTimestampSecs::from_secs(100);
+        let last_seen = UnixTimestampSecs::from_secs(200);
+        let cfg = AppConfig {
+            controllers: vec![ControllerGrant {
+                identity: controller,
+                enrolled_at,
+            }],
+            managed_machines: vec![ManagedMachine {
+                identity: machine,
+                hostname: "build-box".parse().unwrap(),
+                enrolled_at,
+                last_seen: Some(last_seen),
+            }],
+            enrollment_credentials: vec![EnrollmentCredential {
+                id: ray_proto::ipc::EnrollmentCredentialId::new("abc123".to_string()),
+                secret_hash: blake3::hash(b"fabricated enrollment secret"),
+                expires_at: UnixTimestampSecs::from_secs(300),
+                reusable: true,
+                enrolled_machines: vec![machine],
+                revoked: false,
+            }],
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.controllers, cfg.controllers);
+        assert_eq!(loaded.managed_machines, cfg.managed_machines);
+        assert_eq!(loaded.enrollment_credentials, cfg.enrollment_credentials);
+    }
+
+    #[test]
     fn settings_endpoint_hints_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -2122,6 +2262,13 @@ name = "test"
         let loaded = load_in(tmp.path()).unwrap();
         assert_eq!(loaded.download_dir, None);
         assert_eq!(loaded.download_user, None);
+    }
+
+    #[test]
+    fn fresh_install_enables_dns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_in(tmp.path()).unwrap();
+        assert!(loaded.dns_enabled);
     }
 
     #[test]
@@ -2260,6 +2407,18 @@ name = "test"
         assert_eq!(
             resolve_upstreams(&rep, captured.clone()),
             vec![IpAddr::V4(one)]
+        );
+
+        // Tailscale remains the preferred upstream even when the user added a
+        // different resolver, while Rayfish itself still intercepts `.ray`.
+        let tailscale = Ipv4Addr::new(100, 100, 100, 100);
+        assert_eq!(
+            resolve_upstreams(&aug, vec![captured[0], tailscale],),
+            vec![
+                IpAddr::V4(tailscale),
+                IpAddr::V4(one),
+                IpAddr::V4(captured[0])
+            ]
         );
     }
 
