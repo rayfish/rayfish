@@ -6,7 +6,7 @@ options:
 settings:
   base:
     DEVELOPMENT_TEAM: ""
-    PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.app
+    PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app
 targets:
   Rayfish:
     type: application
@@ -16,7 +16,7 @@ targets:
       - path: Shared
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app
         CODE_SIGN_ENTITLEMENTS: Rayfish/Rayfish.entitlements
         INFOPLIST_FILE: Rayfish/Info.plist
     dependencies:
@@ -48,7 +48,7 @@ targets:
       - path: Generated
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.app.tunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app.tunnel
         CODE_SIGN_ENTITLEMENTS: RayfishTunnelExtension/RayfishTunnelExtension.entitlements
         INFOPLIST_FILE: RayfishTunnelExtension/Info.plist
         APPLICATION_EXTENSION_API_ONLY: YES

@@ -93,7 +93,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
 
     private func stateDirectory() throws -> URL {
         let manager = FileManager.default
-        guard let root = manager.containerURL(forSecurityApplicationGroupIdentifier: "group.xyz.rayfish") else {
+        guard let root = manager.containerURL(forSecurityApplicationGroupIdentifier: "group.com.rayfish.app") else {
             throw ProviderError.missingAppGroup
         }
         let path = root.appendingPathComponent("rayfish", isDirectory: true)
