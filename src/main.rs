@@ -1899,7 +1899,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(network_key, "infra");
-                assert_eq!(machine.as_str(), "build-box");
+                assert_eq!(machine.as_ref(), "build-box");
             }
             _ => panic!("wrong command"),
         }
@@ -1911,7 +1911,7 @@ mod tests {
             Command::Leave {
                 name,
                 delegate: Some(machine),
-            } if name == "infra" && machine.as_str() == "build-box"
+            } if name == "infra" && machine.as_ref() == "build-box"
         ));
     }
 
