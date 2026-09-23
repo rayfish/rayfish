@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Controllers can enroll and manage machines directly.** A machine runs
+  `ray up --controller <ticket>` once, then its controller can inspect it and
+  delegate network joins and leaves. Enrollment tickets may be one-time or
+  reusable and can be revoked without affecting machines already enrolled.
+  `ray apply` reconciles their network membership from the live per-network
+  diff, using endpoint identity when a machine has a network-specific hostname.
+
 - **Android: an opt-in periodic diagnostics report.** Off by default, under
   Periodic diagnostics in You, and only available while crash reporting is on.
   With it on, the app sends one diagnostics report every eight hours, but only
@@ -62,6 +69,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run, leaving `.ray` names unresolvable on the host. A silent root probe is
   now followed by a plain `example.com A` question before the upstream is
   given up on.
+
+- **Fresh installs enable Magic DNS by default.** The DNS toggle previously
+  started off until it was enabled explicitly.
+
+- **Delegated joins accept the public network key printed by `ray status`.**
+  A controller can now identify its active network by local name or public key.
+
+- **Mesh SSH sessions no longer drop on the second command when the client asks
+  for compression.** `Compression yes` in `ssh_config` selected a zlib path that
+  fails to decompress the second message a client sends, so a session opened,
+  printed the motd, ran one command, and then died with only "closed by remote
+  host" to show for it. The mesh SSH server offers no compression at all now.
+
+- **Linux config saves no longer crash the daemon on musl.** User and group
+  lookups now use caller-owned buffers, so concurrent saves cannot corrupt
+  process memory.
 
 - **Network changes no longer leave control ping working while ordinary mesh
   traffic disappears.** A delayed handshake from a replaced peer connection

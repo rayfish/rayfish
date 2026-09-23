@@ -3,8 +3,8 @@
 // client built on top.
 use rayfish::term::{layout, picker, progress, style};
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, keybackup,
-    logdir, membership, onepassword, shutdown, stats,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, invite, ipc, logdir, membership,
+    onepassword, shutdown, stats,
 };
 
 use std::sync::{Arc, atomic};
@@ -77,8 +77,11 @@ fn json_requested(command: &Command) -> bool {
         | Command::Firewall { json, .. }
         | Command::ExitNode { json, .. }
         | Command::Mdns { json, .. }
+        | Command::Dns { json, .. }
         | Command::Files { json, .. }
         | Command::Pair { json, .. }
+        | Command::Machines { json, .. }
+        | Command::Controller { json, .. }
         | Command::Identityof { json, .. }
         | Command::Alias { json, .. }
         | Command::Config { json, .. } => *json,
@@ -110,7 +113,7 @@ pub(crate) enum Command {
     },
     /// Join an existing network using its room id or an invite code
     Join {
-        /// The network public key (room id) or a one-time invite code
+        /// Network public key, invite code, or local network name with --delegate
         network_key: String,
         /// Optional local alias for the network
         #[arg(long)]
@@ -132,6 +135,9 @@ pub(crate) enum Command {
         /// devices, identity-checked); pass this to require manual acceptance.
         #[arg(long)]
         no_auto_accept_files: bool,
+        /// Run the join on an enrolled machine instead of this one.
+        #[arg(long)]
+        delegate: Option<ipc::ManagedMachineSelector>,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -139,6 +145,9 @@ pub(crate) enum Command {
         /// Three-word network name
         #[arg(add = complete::networks())]
         name: String,
+        /// Run the leave on an enrolled machine instead of this one.
+        #[arg(long)]
+        delegate: Option<ipc::ManagedMachineSelector>,
     },
     /// Destroy a network (coordinator only)
     Nuke {
@@ -212,6 +221,9 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Enroll this machine with a controller after bringing the daemon up.
+        #[arg(long)]
+        controller: Option<ipc::EnrollmentTicket>,
     },
     /// Standby: take the data plane offline, staying connected to peers
     ///
@@ -424,8 +436,7 @@ pub(crate) enum Command {
     /// Reconcile trusted networks against a deploy spec file
     ///
     /// Creates missing trusted networks, publishes idempotent firewall
-    /// suggestions, and reports the membership gap (expected vs joined hosts).
-    /// Never joins.
+    /// suggestions, and reconciles enrolled machines by hostname.
     Apply {
         /// Path to a TOML spec file (see `ray apply --example`).
         #[arg(value_hint = clap::ValueHint::FilePath)]
@@ -476,6 +487,14 @@ pub(crate) enum Command {
     Mdns {
         #[command(subcommand)]
         action: MdnsAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Enable or disable Magic DNS system integration
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
         json: bool,
@@ -538,6 +557,22 @@ pub(crate) enum Command {
         /// (see `ray pair list`)
         #[arg(add = complete::paired_devices())]
         device: String,
+    },
+    /// List and enroll machines controlled by this node
+    Machines {
+        #[command(subcommand)]
+        action: Option<MachinesAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Manage controllers authorized by this machine
+    Controller {
+        #[command(subcommand)]
+        action: Option<ControllerAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Handle a rayfish:// deep link (join or pair)
     ///
@@ -639,8 +674,8 @@ pub(crate) enum PairAction {
     List,
     /// Export an encrypted backup of the signing key
     Backup {
-        /// Store the backup in 1Password (via the `op` CLI) instead of printing it
-        #[arg(long = "1password", alias = "op")]
+        /// Store the backup in 1Password instead of printing it
+        #[arg(long = "1p", aliases = ["1password", "op"])]
         onepassword: bool,
         /// 1Password vault (defaults to your default vault)
         #[arg(long)]
@@ -651,10 +686,10 @@ pub(crate) enum PairAction {
     },
     /// Restore a signing key from an encrypted backup
     Restore {
-        /// The encrypted backup string (omit when using --1password)
+        /// The encrypted backup string (omit when using --1p)
         backup: Option<String>,
-        /// Read the backup from 1Password (via the `op` CLI)
-        #[arg(long = "1password", alias = "op")]
+        /// Read the backup from 1Password
+        #[arg(long = "1p", aliases = ["1password", "op"])]
         onepassword: bool,
         /// 1Password vault (defaults to your default vault)
         #[arg(long)]
@@ -662,6 +697,43 @@ pub(crate) enum PairAction {
         /// 1Password item title
         #[arg(long, default_value = "Rayfish Identity")]
         item: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MachinesAction {
+    /// Mint a machine-enrollment ticket
+    Enroll {
+        /// Allow this ticket to enroll more than one machine
+        #[arg(long)]
+        reusable: bool,
+        /// How long the ticket remains valid, such as 30m or 7d
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// List enrollment tickets and their status
+    Enrollments,
+    /// Revoke an enrollment ticket
+    RevokeEnrollment {
+        credential: ipc::EnrollmentCredentialSelector,
+    },
+    /// Forget an enrolled machine from this controller
+    Forget {
+        machine: ipc::ManagedMachineSelector,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ControllerAction {
+    /// Enroll this machine using a controller ticket
+    Add { ticket: ipc::EnrollmentTicket },
+    /// List authorized controllers
+    List,
+    /// Revoke one controller, or all controllers with --all
+    Revoke {
+        identity: Option<ipc::ControllerSelector>,
+        #[arg(long, conflicts_with = "identity")]
+        all: bool,
     },
 }
 
@@ -798,6 +870,14 @@ pub(crate) enum MdnsAction {
     /// Seeing a node grants it nothing: linking up still needs `ray connect`
     /// and the other side's approval.
     Scan,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DnsAction {
+    /// Configure the system resolver for .ray names
+    On,
+    /// Remove Rayfish's system DNS configuration
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1405,7 +1485,13 @@ async fn run() -> Result<()> {
     let _log_guard = init_tracing(matches!(cli.command, Command::Daemon));
 
     match cli.command {
-        Command::Leave { name } => ipc_leave(&name).await,
+        Command::Leave { name, delegate } => match delegate {
+            Some(machine) => {
+                let network = ipc::NetworkName::new(name);
+                ipc_delegated_leave(&machine, &network).await
+            }
+            None => ipc_leave(&name).await,
+        },
         Command::Create {
             open,
             closed: _,
@@ -1427,17 +1513,35 @@ async fn run() -> Result<()> {
             tor,
             auto_accept_firewall,
             no_auto_accept_files,
-        } => {
-            ipc_join(
-                &network_key,
-                name.as_deref(),
-                hostname,
-                tor,
-                auto_accept_firewall,
-                !no_auto_accept_files,
-            )
-            .await
-        }
+            delegate,
+        } => match delegate {
+            Some(machine) => {
+                if tor || name.is_some() {
+                    anyhow::bail!("--delegate does not support --tor or --name")
+                }
+                let network = ipc::NetworkName::new(network_key);
+                let hostname = hostname.map(|value| value.parse()).transpose()?;
+                ipc_delegated_join(
+                    &machine,
+                    &network,
+                    hostname,
+                    auto_accept_firewall,
+                    !no_auto_accept_files,
+                )
+                .await
+            }
+            None => {
+                ipc_join(
+                    &network_key,
+                    name.as_deref(),
+                    hostname,
+                    tor,
+                    auto_accept_firewall,
+                    !no_auto_accept_files,
+                )
+                .await
+            }
+        },
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Kick { network, peer, yes } => ipc_kick(&network, &peer, yes).await,
         Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
@@ -1456,7 +1560,10 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up { hostname } => cmd_up(hostname).await,
+        Command::Up {
+            hostname,
+            controller,
+        } => cmd_up(hostname, controller).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
@@ -1534,6 +1641,7 @@ async fn run() -> Result<()> {
             json,
         } => cmd_alias(&network, action, json).await,
         Command::Mdns { action, json: _ } => cmd_mdns(action).await,
+        Command::Dns { action, json: _ } => cmd_dns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action, json } => cmd_config(action, json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
@@ -1545,6 +1653,8 @@ async fn run() -> Result<()> {
             json: _,
         } => cmd_pair(action, ticket).await,
         Command::Unpair { device } => ipc_unpair(&device).await,
+        Command::Machines { action, json: _ } => ipc_machines(action).await,
+        Command::Controller { action, json: _ } => ipc_controller(action).await,
         Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
             println!("ray {FULL_VERSION}");
@@ -1602,6 +1712,20 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
     };
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
+        value: state.to_string(),
+        replace: false,
+    })
+    .await
+}
+
+/// `ray dns on|off`: apply or remove Magic DNS without changing the data plane.
+async fn cmd_dns(action: DnsAction) -> Result<()> {
+    let state = match action {
+        DnsAction::On => "on",
+        DnsAction::Off => "off",
+    };
+    ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: ipc::NodeKey::Global(ipc::GlobalKey::Dns),
         value: state.to_string(),
         replace: false,
     })
@@ -1693,13 +1817,35 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     return user.parse::<u32>().ok();
     #[cfg(unix)]
     {
-        use std::ffi::CString;
+        use std::{ffi::CString, mem::zeroed, ptr::null_mut};
         let cname = CString::new(user).ok()?;
-        let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-        if !pw.is_null() {
-            return Some(unsafe { (*pw).pw_uid });
+        // getpwnam_r, not getpwnam, for the same reason rayfish_gid uses
+        // getgrnam_r: the legacy call's answer lives in a process-wide buffer
+        // that any other lookup is allowed to move or free mid-read, which
+        // corrupts the heap on musl when callers run concurrently.
+        let mut buf_len = 4096;
+        loop {
+            let mut buf = vec![0u8; buf_len];
+            let mut pwbuf: libc::passwd = unsafe { zeroed() };
+            let mut result: *mut libc::passwd = null_mut();
+            let rc = unsafe {
+                libc::getpwnam_r(
+                    cname.as_ptr(),
+                    &mut pwbuf,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE {
+                buf_len *= 2;
+                continue;
+            }
+            if rc == 0 && !result.is_null() {
+                return Some(unsafe { (*result).pw_uid });
+            }
+            return user.parse::<u32>().ok();
         }
-        user.parse::<u32>().ok()
     }
 }
 
@@ -1746,6 +1892,65 @@ mod tests {
     use super::*;
     use ipc::FirewallRuleView;
     use rayfish::update::{normalize_version, release_asset_name, version_is_newer};
+
+    #[test]
+    fn pair_backup_accepts_the_1password_flag_spellings() {
+        for flag in ["--1p", "--1password", "--op"] {
+            let cli = Cli::try_parse_from(["ray", "pair", "backup", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Pair {
+                    action: Some(PairAction::Backup {
+                        onepassword: true,
+                        ..
+                    }),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn delegated_network_commands_parse_machine_and_network_types() {
+        let join =
+            Cli::try_parse_from(["ray", "join", "--delegate", "build-box", "infra"]).unwrap();
+        match join.command {
+            Command::Join {
+                network_key,
+                delegate: Some(machine),
+                ..
+            } => {
+                assert_eq!(network_key, "infra");
+                assert_eq!(machine.as_ref(), "build-box");
+            }
+            _ => panic!("wrong command"),
+        }
+
+        let leave =
+            Cli::try_parse_from(["ray", "leave", "--delegate", "build-box", "infra"]).unwrap();
+        assert!(matches!(
+            leave.command,
+            Command::Leave {
+                name,
+                delegate: Some(machine),
+            } if name == "infra" && machine.as_ref() == "build-box"
+        ));
+    }
+
+    #[test]
+    fn up_parses_controller_ticket() {
+        let controller = iroh::EndpointAddr::from(iroh::SecretKey::generate().public());
+        let expected = ipc::EnrollmentTicket::new(controller, [7; 32]);
+        let encoded = expected.to_string();
+        let cli = Cli::try_parse_from(["ray", "up", "--controller", encoded.as_str()]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Up {
+                controller: Some(ticket),
+                ..
+            } if ticket == expected
+        ));
+    }
 
     #[test]
     fn strip_deleted_suffix_sanitizes_replaced_binary_path() {
@@ -1850,6 +2055,16 @@ mod tests {
         assert_eq!(normalize_version("v0.1.0"), "0.1.0");
         assert_eq!(normalize_version("0.1.0"), "0.1.0");
         assert_eq!(normalize_version("v1.2.3-rc1"), "1.2.3-rc1");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn nightly_updates_show_both_commit_labels() {
+        assert_eq!(
+            update_label("0.4.2", "nightly (abcdef12)"),
+            format!("nightly ({})", env!("RAY_GIT_SHA"))
+        );
+        assert_eq!(update_label("0.4.2", "v0.4.3"), "v0.4.2");
     }
 
     #[test]
