@@ -399,6 +399,10 @@ impl ManagementService {
             Ok(target) => target,
             Err(error) => return ipc_err(error),
         };
+        let network = match self.registry.active_network_name(network.as_ref()) {
+            Some(name) => NetworkName::new(name),
+            None => return ipc_err(format!("network '{network}' not active")),
+        };
         let hostname = hostname.unwrap_or_else(|| target.hostname.clone());
         let invite = match self
             .registry
@@ -419,7 +423,7 @@ impl ManagementService {
                 target.identity,
                 ManagementAction::Join {
                     invite: NetworkInvite::new(invite),
-                    network_name: network.clone(),
+                    network_name: network,
                     hostname,
                     auto_accept_firewall,
                     auto_accept_files,

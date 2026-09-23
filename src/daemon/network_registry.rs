@@ -27,6 +27,14 @@ const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// the endpoint id in the QUIC certificate remains the authentication boundary.
 const MAX_WARM_ENDPOINT_HINTS: usize = 64;
 
+fn network_key_from_selector(selector: &str) -> Option<EndpointId> {
+    selector.parse().ok().or_else(|| {
+        crate::invite::decode_invite_code(selector)
+            .ok()
+            .map(|(network_key, _, _)| network_key)
+    })
+}
+
 /// One network to (re)handshake when dialing a peer: its name and the per-network
 /// public key that signs the `MeshHello`. A peer's single connection carries every
 /// shared network, so a dial takes a slice of these.
@@ -587,6 +595,17 @@ impl NetworkRegistry {
             )));
         }
         Ok((handle.network_key, Arc::clone(&handle.invite_lock)))
+    }
+
+    /// Resolve an active network by its local name, public key, or invite code.
+    pub(crate) fn active_network_name(&self, selector: &str) -> Option<String> {
+        if self.networks.contains_key(selector) {
+            return Some(selector.to_string());
+        }
+        let network_key = network_key_from_selector(selector)?;
+        self.networks
+            .iter()
+            .find_map(|handle| (handle.network_key == network_key).then(|| handle.key().clone()))
     }
 
     /// The name of any network whose roster already holds `peer`, if any. Used
@@ -1260,6 +1279,24 @@ impl NetworkRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_selector_accepts_public_key_and_invite_code() {
+        let network_key = SecretKey::generate().public();
+        let coordinator = SecretKey::generate().public();
+        let invite = crate::invite::encode_invite_code(
+            &network_key,
+            &coordinator,
+            &crate::invite::generate_secret(),
+        );
+
+        assert_eq!(
+            network_key_from_selector(&network_key.to_string()),
+            Some(network_key)
+        );
+        assert_eq!(network_key_from_selector(&invite), Some(network_key));
+        assert_eq!(network_key_from_selector("field"), None);
+    }
 
     fn net(name: &str) -> config::NetworkConfig {
         config::NetworkConfig {

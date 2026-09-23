@@ -113,7 +113,7 @@ pub(crate) enum Command {
     },
     /// Join an existing network using its room id or an invite code
     Join {
-        /// Network public key, invite code, or local name with --delegate
+        /// Network public key, invite code, or local network name with --delegate
         network_key: String,
         /// Optional local alias for the network
         #[arg(long)]
