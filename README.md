@@ -530,6 +530,21 @@ custom server with no fallback can isolate the node). Settings are saved to
 across restarts. Use `ray dns on` to restore it. When Tailscale Magic DNS is
 available, Rayfish forwards non-`.ray` names to it before any other upstream.
 
+FreeBSD requires manual system resolver configuration. Enable `local_unbound`
+and add `/var/unbound/conf.d/ray-forward.conf`:
+
+```text
+server:
+    domain-insecure: "ray."
+
+forward-zone:
+    name: "ray."
+    forward-addr: 200::53
+```
+
+Rayfish keeps the resolver at `200::53` available but does not change FreeBSD's
+DNS configuration.
+
 ## Running alongside another VPN
 
 Nothing to configure, with one exception on macOS covered at the end of this
