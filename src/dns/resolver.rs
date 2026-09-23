@@ -401,8 +401,8 @@ const DOTTED_A_QUERY: [u8; 29] = [
     0x01, 0x00, // flags: standard query, recursion desired
     0x00, 0x01, // qdcount 1
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
-    7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0x00,
-    0x00, 0x01, // qtype A
+    7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0x00, 0x00,
+    0x01, // qtype A
     0x00, 0x01, // qclass IN
 ];
 
