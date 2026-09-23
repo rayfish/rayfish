@@ -36,6 +36,9 @@ impl Daemon {
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
                 | IpcMessage::ListPairedDevices
+                | IpcMessage::MachineEnrollmentList
+                | IpcMessage::ControllerList
+                | IpcMessage::ManagedMachines { .. }
                 | IpcMessage::ListLanPeers
                 | IpcMessage::ConfigGet { .. }
                 | IpcMessage::NetConfigGet { .. }
@@ -163,7 +166,7 @@ impl Daemon {
     /// passthrough side effects. Only a plain global key takes the
     /// load/mutate/save below. A per-network key cannot reach here: `ConfigSet`
     /// carries a `NodeKey`, which has no variant for one.
-    fn config_apply(
+    async fn config_apply(
         self: &Arc<Self>,
         key: NodeKey,
         value: &str,
@@ -172,6 +175,7 @@ impl Daemon {
     ) -> IpcMessage {
         let key = match key {
             NodeKey::Firewall(k) => return self.registry.firewall_config_set(k, value),
+            NodeKey::Global(GlobalKey::Dns) => return self.dns_config_set(value).await,
             // Not a plain config write: see `Daemon::ssh_config_set`.
             NodeKey::Global(GlobalKey::Ssh) => return self.ssh_config_set(value),
             // Likewise: the bridge's listeners follow the setting live.
@@ -215,6 +219,46 @@ impl Daemon {
         IpcMessage::Ok {
             message: global_set_message(&app_config, key, reset),
         }
+    }
+
+    /// Apply `ray dns on|off` immediately. Unlike the other settings, DNS owns
+    /// host state that must be restored before the command reports success.
+    async fn dns_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        let mut set_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = config::config_set(cfg, GlobalKey::Dns, value, false) {
+                set_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = set_err {
+            return ipc_err(e);
+        }
+        let enabled = match saved {
+            Ok(cfg) => cfg.dns_enabled,
+            Err(e) => return ipc_err(format!("failed to save config: {e}")),
+        };
+        let tun_name = self.tun_name.load().as_str().to_owned();
+        if !enabled {
+            self.dns.revert(&tun_name).await;
+            return IpcMessage::Ok {
+                message: "DNS disabled and Rayfish's system DNS configuration removed.".to_string(),
+            };
+        }
+        if !self.active.load(Ordering::SeqCst) {
+            return IpcMessage::Ok {
+                message: "DNS enabled. It will be configured when Rayfish is up.".to_string(),
+            };
+        }
+        let mut warnings = Vec::new();
+        self.dns.configure(&tun_name, &mut warnings).await;
+        let mut message = "DNS enabled.".to_string();
+        if !warnings.is_empty() {
+            message.push(' ');
+            message.push_str(&warnings.join(" "));
+        }
+        IpcMessage::Ok { message }
     }
 
     /// Read node config rows for `ray config get` from the daemon's own config.
@@ -462,15 +506,84 @@ impl Daemon {
                 secret,
             } => self.pair_with_device(endpoint_id, secret).await,
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
+            IpcMessage::BackupIdentity {
+                password,
+                onepassword,
+            } => {
+                let backup = if onepassword {
+                    crate::keybackup::backup_current_identity_for_onepassword()
+                } else {
+                    let Some(password) = password.as_deref() else {
+                        return ipc_err("backup password is required");
+                    };
+                    crate::keybackup::backup_current_identity(password)
+                };
+                match backup {
+                    Ok(backup) => IpcMessage::IdentityBackup {
+                        code: backup.code,
+                        public_key: backup.public_key,
+                    },
+                    Err(error) => ipc_err(error.to_string()),
+                }
+            }
+            IpcMessage::RestoreIdentity { backup, password } => {
+                match crate::keybackup::restore_current_identity(&backup, password.as_deref()) {
+                    Ok(public_key) => IpcMessage::Ok {
+                        message: format!(
+                            "Restored user identity: {public_key}. Restart the daemon for changes to take effect."
+                        ),
+                    },
+                    Err(error) => ipc_err(error.to_string()),
+                }
+            }
             IpcMessage::Unpair { device } => self.unpair(&device).await,
+            IpcMessage::MachineEnrollmentCreate {
+                expires_in,
+                reusable,
+            } => self.management.create_enrollment(expires_in, reusable),
+            IpcMessage::MachineEnrollmentList => self.management.list_enrollments(),
+            IpcMessage::MachineEnrollmentRevoke { credential } => {
+                self.management.revoke_enrollment(&credential)
+            }
+            IpcMessage::EnrollController { ticket } => {
+                self.management.enroll_with_ticket(&ticket).await
+            }
+            IpcMessage::ControllerList => self.management.list_controllers(),
+            IpcMessage::ControllerRevoke { identity } => {
+                self.management.revoke_controller(identity.as_ref()).await
+            }
+            IpcMessage::ManagedMachines { probe } => self.management.list_machines(probe).await,
+            IpcMessage::ManagedMachineForget { machine } => {
+                self.management.forget_machine(&machine)
+            }
+            IpcMessage::DelegatedJoin {
+                machine,
+                network,
+                hostname,
+                auto_accept_firewall,
+                auto_accept_files,
+            } => {
+                self.management
+                    .delegated_join(
+                        &machine,
+                        &network,
+                        hostname,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                    )
+                    .await
+            }
+            IpcMessage::DelegatedLeave { machine, network } => {
+                self.management.delegated_leave(&machine, &network).await
+            }
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
             IpcMessage::ListLanPeers => self.list_lan_peers(),
             IpcMessage::ConfigSet {
                 key,
                 value,
                 replace,
-            } => self.config_apply(key, &value, replace, false),
-            IpcMessage::ConfigUnset { key } => self.config_apply(key, "", false, true),
+            } => self.config_apply(key, &value, replace, false).await,
+            IpcMessage::ConfigUnset { key } => self.config_apply(key, "", false, true).await,
             IpcMessage::ConfigGet { key } => self.config_get(key),
             IpcMessage::NetConfigSet {
                 network,

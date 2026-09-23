@@ -92,7 +92,10 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
+pub(crate) async fn cmd_up(
+    hostname: Option<String>,
+    controller: Option<ipc::EnrollmentTicket>,
+) -> Result<()> {
     #[cfg(windows)]
     let mut operator_claim = WindowsOperatorClaim::begin()?;
     if let Ok(mut stream) = ipc::connect().await {
@@ -104,7 +107,10 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
                 // else leaves the claim to be rolled back on drop.
                 #[cfg(windows)]
                 operator_claim.commit();
-                println!("{message}")
+                println!("{message}");
+                if let Some(ticket) = controller {
+                    ipc_enroll_controller(&ticket).await?;
+                }
             }
             ipc::IpcMessage::Error { message } => fail_with("error", &message),
             other => fail_unexpected(&other),
@@ -124,7 +130,11 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service(hostname).await
+    install_and_start_service(hostname).await?;
+    if let Some(ticket) = controller {
+        ipc_enroll_controller(&ticket).await?;
+    }
+    Ok(())
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.

@@ -259,6 +259,8 @@ pub mod transfers;
 
 mod connect_service;
 pub(crate) use connect_service::ConnectService;
+mod management_service;
+pub(crate) use management_service::ManagementService;
 
 // Nodes seen on the local network over mDNS (`ray mdns scan`).
 mod lan_discovery;
@@ -709,6 +711,8 @@ pub struct Daemon {
     /// `ray connect` state + ALPN accept arm (see [`ConnectService`]). Shared with
     /// [`ProtocolRouter`], which runs the accept arm.
     connect: Arc<ConnectService>,
+    /// Delegated machine enrollment and direct management protocol.
+    management: Arc<ManagementService>,
     device_cert: Option<control::DeviceCert>,
     /// This node's contact id (`ray connect`): the public half of the rotatable
     /// contact key. The secret lives in config (read fresh by the publisher and
@@ -1166,6 +1170,14 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         GlobalKey::Mdns => format!(
             "mDNS discovery {}. {restart}",
             if cfg.mdns_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        GlobalKey::Dns => format!(
+            "DNS {}.",
+            if cfg.dns_enabled {
                 "enabled"
             } else {
                 "disabled"
