@@ -37,6 +37,7 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
     let reset = entries.is_empty() || entries == ["n0"];
     match key {
         GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
+        GlobalKey::Dns => cfg.dns_enabled = parse_bool(value, true)?,
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
@@ -129,6 +130,7 @@ fn server_override(
 pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
+        GlobalKey::Dns => on_off(cfg.dns_enabled),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
@@ -420,6 +422,16 @@ mod tests {
         assert_eq!(cfg.relay.servers, vec!["rayfish".to_string()]);
         assert!(cfg.relay.replace);
         assert!(apply_global(&mut cfg, GlobalKey::Relay, "not a url", false).is_err());
+    }
+
+    #[test]
+    fn dns_toggle_defaults_on_and_round_trips() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::Dns, "off", false).unwrap();
+        assert!(!cfg.dns_enabled);
+        assert_eq!(render_global(&cfg, GlobalKey::Dns), "off");
+        apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
+        assert!(cfg.dns_enabled);
     }
 
     #[test]
