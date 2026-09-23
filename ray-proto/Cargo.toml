@@ -19,6 +19,8 @@ bytes = "1"
 derive_more = { version = "2", features = ["is_variant", "display"] }
 futures = "0.3"
 iroh = { version = "1" }
+iroh-tickets = "1"
+postcard = { version = "1", features = ["use-std"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net"] }

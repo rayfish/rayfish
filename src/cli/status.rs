@@ -2,10 +2,40 @@
 //! (`table`, `print_error`, …): status, down, report, set-hostname.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use iroh::EndpointId;
 
 use crate::*;
+
+trait DisplayTerminal {
+    type Output: fmt::Display;
+
+    fn display_terminal(self) -> Self::Output;
+}
+
+struct ManagedMachineStateOutput(ipc::ManagedMachineState);
+
+impl DisplayTerminal for ipc::ManagedMachineState {
+    type Output = ManagedMachineStateOutput;
+
+    fn display_terminal(self) -> Self::Output {
+        ManagedMachineStateOutput(self)
+    }
+}
+
+impl fmt::Display for ManagedMachineStateOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self.0.as_str();
+        match self.0 {
+            ipc::ManagedMachineState::Online => style::green_display(value).fmt(f),
+            ipc::ManagedMachineState::Offline | ipc::ManagedMachineState::Unknown => {
+                style::faint_display(value).fmt(f)
+            }
+            ipc::ManagedMachineState::Unauthorized => style::red_display(value).fmt(f),
+        }
+    }
+}
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
 pub(crate) fn format_bytes(b: u64) -> String {
@@ -236,6 +266,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             lan_peers,
             ..
         } => {
+            let (controllers, managed_machines) = ipc_management_overview().await;
             if json_enabled() {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
@@ -255,6 +286,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
                     "daemon_version": daemon_version,
                     "networks": networks,
                     "inactive_networks": inactive_networks,
+                    "controllers": controllers,
+                    "managed_machines": managed_machines,
                     "traffic": {
                         "packets_rx": packets_rx, "packets_tx": packets_tx,
                         "bytes_rx": bytes_rx, "bytes_tx": bytes_tx,
@@ -325,6 +358,34 @@ pub(crate) async fn ipc_status() -> Result<()> {
             }
 
             print_nearby(&lan_peers);
+
+            if !controllers.is_empty() {
+                println!();
+                println!("  {}", style::faint("controlled by:"));
+                for controller in &controllers {
+                    let short_id = controller.identity.fmt_short().to_string();
+                    println!(
+                        "    {}  {}",
+                        style::rose(&short_id),
+                        style::faint(&controller.identity.to_string())
+                    );
+                }
+            }
+
+            if !managed_machines.is_empty() {
+                println!();
+                println!("  {}", style::faint("managed machines:"));
+                for machine in &managed_machines {
+                    let short_id = machine.identity.fmt_short().to_string();
+                    let state = machine.state.display_terminal();
+                    println!(
+                        "    {}  {}  {}",
+                        style::value(machine.hostname.as_ref()),
+                        style::rose(&short_id),
+                        state
+                    );
+                }
+            }
 
             print_pending_summary(&networks, pending_files, pending_connects);
 

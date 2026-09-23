@@ -36,6 +36,9 @@ impl Daemon {
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
                 | IpcMessage::ListPairedDevices
+                | IpcMessage::MachineEnrollmentList
+                | IpcMessage::ControllerList
+                | IpcMessage::ManagedMachines { .. }
                 | IpcMessage::ListLanPeers
                 | IpcMessage::ConfigGet { .. }
                 | IpcMessage::NetConfigGet { .. }
@@ -534,6 +537,45 @@ impl Daemon {
                 }
             }
             IpcMessage::Unpair { device } => self.unpair(&device).await,
+            IpcMessage::MachineEnrollmentCreate {
+                expires_in,
+                reusable,
+            } => self.management.create_enrollment(expires_in, reusable),
+            IpcMessage::MachineEnrollmentList => self.management.list_enrollments(),
+            IpcMessage::MachineEnrollmentRevoke { credential } => {
+                self.management.revoke_enrollment(&credential)
+            }
+            IpcMessage::EnrollController { ticket } => {
+                self.management.enroll_with_ticket(&ticket).await
+            }
+            IpcMessage::ControllerList => self.management.list_controllers(),
+            IpcMessage::ControllerRevoke { identity } => {
+                self.management.revoke_controller(identity.as_ref()).await
+            }
+            IpcMessage::ManagedMachines { probe } => self.management.list_machines(probe).await,
+            IpcMessage::ManagedMachineForget { machine } => {
+                self.management.forget_machine(&machine)
+            }
+            IpcMessage::DelegatedJoin {
+                machine,
+                network,
+                hostname,
+                auto_accept_firewall,
+                auto_accept_files,
+            } => {
+                self.management
+                    .delegated_join(
+                        &machine,
+                        &network,
+                        hostname,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                    )
+                    .await
+            }
+            IpcMessage::DelegatedLeave { machine, network } => {
+                self.management.delegated_leave(&machine, &network).await
+            }
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
             IpcMessage::ListLanPeers => self.list_lan_peers(),
             IpcMessage::ConfigSet {
