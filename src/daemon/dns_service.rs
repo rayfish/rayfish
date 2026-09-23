@@ -105,16 +105,6 @@ impl DnsService {
         if !config::load().map(|c| c.dns_enabled).unwrap_or(true) {
             return;
         }
-        // FreeBSD has no automatic backend. Keep the in-daemon resolver
-        // available for local_unbound, but do not retry a permanent failure.
-        if cfg!(target_os = "freebsd") {
-            tracing::info!(
-                resolver_ip = %dns_config::resolver_addr(),
-                "automatic system DNS configuration is not supported on FreeBSD; \
-                 configure local_unbound to forward .ray queries"
-            );
-            return;
-        }
         // Configure system DNS to route .ray queries to our in-daemon resolver.
         dns_config::restore_stale_backups();
         if let Some(retry) = self.configure_retry.lock().unwrap().take() {

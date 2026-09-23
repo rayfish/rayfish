@@ -63,9 +63,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **FreeBSD no longer retries unsupported automatic DNS configuration.** The
-  daemon logs one `local_unbound` setup hint and keeps its resolver available at
-  `200::53` for manual configuration.
+- **Magic DNS configures itself on FreeBSD.** Rayfish enables `local_unbound`
+  and registers `.ray` as a private `resolvconf` domain instead of retrying an
+  unsupported desktop backend every minute.
 
 - **Fresh installs enable Magic DNS by default.** The DNS toggle previously
   started off until it was enabled explicitly.

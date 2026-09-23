@@ -4,6 +4,7 @@
 //! `[200::53]:53`.
 //! macOS: SCDynamicStore with session keys (auto-cleanup on process exit).
 //! Linux: systemd-resolved / resolvconf / direct /etc/resolv.conf.
+//! FreeBSD: private resolvconf registration through local_unbound.
 
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -193,9 +194,14 @@ pub async fn detect_and_configure(
     tun_name: &str,
     mesh_v6: std::net::Ipv6Addr,
 ) -> Result<Box<dyn DnsConfigurator>> {
-    // Only the macOS/Linux branches consume `tun_name`; on any other target
-    // (e.g. Android) the function falls through to the unsupported-platform bail.
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    // Only desktop backends consume `tun_name`; other targets fall through to
+    // the unsupported-platform bail.
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "freebsd"
+    )))]
     let _ = tun_name;
     #[cfg(not(target_os = "macos"))]
     let _ = mesh_v6;
@@ -251,6 +257,13 @@ pub async fn detect_and_configure(
     #[cfg(windows)]
     {
         let configurator = WindowsDns::new(tun_name).await?;
+        configurator.apply().await?;
+        return Ok(Box::new(configurator));
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        let configurator = FreeBsdLocalUnbound::new(tun_name);
         configurator.apply().await?;
         return Ok(Box::new(configurator));
     }
@@ -394,6 +407,11 @@ pub(crate) async fn set_manager_search_domains(
 mod windows;
 #[cfg(windows)]
 use windows::*;
+
+#[cfg(any(target_os = "freebsd", test))]
+mod freebsd;
+#[cfg(target_os = "freebsd")]
+use freebsd::FreeBsdLocalUnbound;
 
 // ---------------------------------------------------------------------------
 // macOS: SCDynamicStore
