@@ -63,6 +63,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Mesh SSH sessions no longer drop on the second command when the client asks
+  for compression.** `Compression yes` in `ssh_config` selected a zlib path that
+  fails to decompress the second message a client sends, so a session opened,
+  printed the motd, ran one command, and then died with only "closed by remote
+  host" to show for it. The mesh SSH server offers no compression at all now.
+
 - **Linux config saves no longer crash the daemon on musl.** User and group
   lookups now use caller-owned buffers, so concurrent saves cannot corrupt
   process memory.
