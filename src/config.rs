@@ -1276,10 +1276,11 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         let s = std::fs::read_to_string(&settings_path).context("reading settings.toml")?;
         toml::from_str(&s).context("parsing settings.toml")?
     } else {
-        // Fresh install: mDNS discovery is on by default, everything else is the
-        // type-default.
+        // Fresh install: discovery and Magic DNS are on by default, everything
+        // else is the type-default.
         Settings {
             mdns_enabled: true,
+            dns_enabled: true,
             ..Default::default()
         }
     };
@@ -2261,6 +2262,13 @@ name = "test"
         let loaded = load_in(tmp.path()).unwrap();
         assert_eq!(loaded.download_dir, None);
         assert_eq!(loaded.download_user, None);
+    }
+
+    #[test]
+    fn fresh_install_enables_dns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_in(tmp.path()).unwrap();
+        assert!(loaded.dns_enabled);
     }
 
     #[test]

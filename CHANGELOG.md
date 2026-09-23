@@ -63,6 +63,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Fresh installs enable Magic DNS by default.** The DNS toggle previously
+  started off until it was enabled explicitly.
+
 - **Delegated joins accept the public network key printed by `ray status`.**
   A controller can now identify its active network by local name or public key.
 
