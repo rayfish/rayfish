@@ -2,22 +2,37 @@
 //! (`table`, `print_error`, …): status, down, report, set-hostname.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use iroh::EndpointId;
 
 use crate::*;
 
-trait IntoOutputStr {
-    fn into_output_str(self) -> String;
+trait DisplayTerminal {
+    type Output: fmt::Display;
+
+    fn display_terminal(self) -> Self::Output;
 }
 
-impl IntoOutputStr for ipc::ManagedMachineState {
-    fn into_output_str(self) -> String {
-        let value = self.as_str();
-        match self {
-            Self::Online => style::green(value),
-            Self::Offline | Self::Unknown => style::faint(value),
-            Self::Unauthorized => style::red(value),
+struct ManagedMachineStateOutput(ipc::ManagedMachineState);
+
+impl DisplayTerminal for ipc::ManagedMachineState {
+    type Output = ManagedMachineStateOutput;
+
+    fn display_terminal(self) -> Self::Output {
+        ManagedMachineStateOutput(self)
+    }
+}
+
+impl fmt::Display for ManagedMachineStateOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self.0.as_str();
+        match self.0 {
+            ipc::ManagedMachineState::Online => style::green_display(value).fmt(f),
+            ipc::ManagedMachineState::Offline | ipc::ManagedMachineState::Unknown => {
+                style::faint_display(value).fmt(f)
+            }
+            ipc::ManagedMachineState::Unauthorized => style::red_display(value).fmt(f),
         }
     }
 }
@@ -362,7 +377,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 println!("  {}", style::faint("managed machines:"));
                 for machine in &managed_machines {
                     let short_id = machine.identity.fmt_short().to_string();
-                    let state = machine.state.into_output_str();
+                    let state = machine.state.display_terminal();
                     println!(
                         "    {}  {}  {}",
                         style::value(machine.hostname.as_ref()),
