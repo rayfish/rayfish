@@ -63,6 +63,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Delegated joins accept the public network key printed by `ray status`.**
+  A controller can now identify its active network by local name or public key.
+
 - **Mesh SSH sessions no longer drop on the second command when the client asks
   for compression.** `Compression yes` in `ssh_config` selected a zlib path that
   fails to decompress the second message a client sends, so a session opened,
