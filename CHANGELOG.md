@@ -63,6 +63,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Linux config saves no longer crash the daemon on musl.** User and group
+  lookups now use caller-owned buffers, so concurrent saves cannot corrupt
+  process memory.
+
 - **Network changes no longer leave control ping working while ordinary mesh
   traffic disappears.** A delayed handshake from a replaced peer connection
   could put its stale route back into the forwarding table. The live connection

@@ -791,7 +791,7 @@ struct Settings {
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
 #[cfg(target_os = "linux")]
 fn rayfish_gid() -> Option<u32> {
-    use std::ffi::CString;
+    use std::{ffi::CString, mem::zeroed, ptr::null_mut};
     let name = CString::new("rayfish").ok()?;
     // getgrnam_r, never getgrnam: the legacy call returns a pointer into a
     // process-wide buffer that any concurrent getgr*/getpw* call is allowed
@@ -802,8 +802,8 @@ fn rayfish_gid() -> Option<u32> {
     let mut buf_len = 4096;
     loop {
         let mut buf = vec![0u8; buf_len];
-        let mut grbuf: libc::group = unsafe { std::mem::zeroed() };
-        let mut result: *mut libc::group = std::ptr::null_mut();
+        let mut grbuf: libc::group = unsafe { zeroed() };
+        let mut result: *mut libc::group = null_mut();
         let rc = unsafe {
             libc::getgrnam_r(
                 name.as_ptr(),

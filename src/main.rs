@@ -1817,7 +1817,7 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     return user.parse::<u32>().ok();
     #[cfg(unix)]
     {
-        use std::ffi::CString;
+        use std::{ffi::CString, mem::zeroed, ptr::null_mut};
         let cname = CString::new(user).ok()?;
         // getpwnam_r, not getpwnam, for the same reason rayfish_gid uses
         // getgrnam_r: the legacy call's answer lives in a process-wide buffer
@@ -1826,8 +1826,8 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
         let mut buf_len = 4096;
         loop {
             let mut buf = vec![0u8; buf_len];
-            let mut pwbuf: libc::passwd = unsafe { std::mem::zeroed() };
-            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let mut pwbuf: libc::passwd = unsafe { zeroed() };
+            let mut result: *mut libc::passwd = null_mut();
             let rc = unsafe {
                 libc::getpwnam_r(
                     cname.as_ptr(),
