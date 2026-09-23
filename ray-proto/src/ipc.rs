@@ -913,6 +913,18 @@ pub enum ManagedMachineState {
     Unknown,
 }
 
+impl ManagedMachineState {
+    /// Returns the protocol name of this state.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Unauthorized => "unauthorized",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Whole seconds since the Unix epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -961,15 +973,17 @@ impl MachineHostname {
         }
         Ok(Self(value))
     }
+}
 
-    /// Returns the hostname as a string slice.
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for MachineHostname {
+    fn as_ref(&self) -> &str {
         &self.0
     }
+}
 
-    /// Consumes the hostname and returns its string.
-    pub fn into_string(self) -> String {
-        self.0
+impl From<MachineHostname> for String {
+    fn from(hostname: MachineHostname) -> Self {
+        hostname.0
     }
 }
 
@@ -1019,15 +1033,17 @@ impl NetworkName {
     pub fn new(value: String) -> Self {
         Self(value)
     }
+}
 
-    /// Returns the network name as a string slice.
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for NetworkName {
+    fn as_ref(&self) -> &str {
         &self.0
     }
+}
 
-    /// Consumes the network name and returns its string.
-    pub fn into_string(self) -> String {
-        self.0
+impl From<NetworkName> for String {
+    fn from(network: NetworkName) -> Self {
+        network.0
     }
 }
 
@@ -1055,9 +1071,10 @@ impl EnrollmentCredentialId {
     pub fn new(value: String) -> Self {
         Self(value)
     }
+}
 
-    /// Returns the credential identifier as a string slice.
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for EnrollmentCredentialId {
+    fn as_ref(&self) -> &str {
         &self.0
     }
 }
@@ -1086,9 +1103,10 @@ impl EnrollmentCredentialSelector {
     pub fn new(value: String) -> Self {
         Self(value)
     }
+}
 
-    /// Returns the selector as a string slice.
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for EnrollmentCredentialSelector {
+    fn as_ref(&self) -> &str {
         &self.0
     }
 }
@@ -1210,9 +1228,10 @@ impl ManagedMachineSelector {
     pub fn new(value: String) -> Self {
         Self(value)
     }
+}
 
-    /// Returns the selector as a string slice.
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for ManagedMachineSelector {
+    fn as_ref(&self) -> &str {
         &self.0
     }
 }
@@ -1241,9 +1260,10 @@ impl ControllerSelector {
     pub fn new(value: String) -> Self {
         Self(value)
     }
+}
 
-    /// Returns the selector as a string slice.
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for ControllerSelector {
+    fn as_ref(&self) -> &str {
         &self.0
     }
 }
@@ -2326,9 +2346,9 @@ mod tests {
                 hostname,
                 ..
             } => {
-                assert_eq!(machine.as_str(), "build-box");
-                assert_eq!(network.as_str(), "infra");
-                assert_eq!(hostname.unwrap().as_str(), "build-box");
+                assert_eq!(machine.as_ref(), "build-box");
+                assert_eq!(network.as_ref(), "infra");
+                assert_eq!(hostname.unwrap().as_ref(), "build-box");
             }
             other => panic!("wrong variant: {other:?}"),
         }

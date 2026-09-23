@@ -598,7 +598,7 @@ pub(crate) async fn ipc_apply(
                 .find(|network| network.name == *network_name)
                 .and_then(|network| network.my_hostname.as_deref());
             for hostname in membership.leaves {
-                if local_hostname == Some(hostname.as_str()) {
+                if local_hostname == Some(hostname.as_ref()) {
                     continue;
                 }
                 changes += 1;
@@ -695,7 +695,7 @@ pub(crate) async fn ipc_apply(
                 .iter()
                 .find(|network| network.name == *net_name)
                 .and_then(|network| network.my_hostname.as_deref())
-                == Some(host.as_str());
+                == Some(host.as_ref());
             if is_local {
                 continue;
             }

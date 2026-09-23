@@ -166,7 +166,7 @@ impl ManagementService {
                 .enrollment_credentials
                 .iter()
                 .enumerate()
-                .filter(|(_, credential)| credential.id.as_str().starts_with(selector.as_str()))
+                .filter(|(_, credential)| credential.id.as_ref().starts_with(selector.as_ref()))
                 .map(|(index, _)| index)
                 .collect();
             anyhow::ensure!(!matches.is_empty(), "enrollment credential not found");
@@ -299,7 +299,7 @@ impl ManagementService {
         let _guard = self.controller_gate.lock().await;
         let result = config::update_settings(|settings| {
             if let Some(selector) = identity_prefix {
-                let prefix = selector.as_str();
+                let prefix = selector.as_ref();
                 let matches: Vec<EndpointId> = settings
                     .controllers
                     .iter()
@@ -405,7 +405,7 @@ impl ManagementService {
         let invite = match self
             .registry
             .invite_create(
-                network.as_str(),
+                network.as_ref(),
                 7 * 24 * 60 * 60,
                 Some(hostname.to_string()),
                 false,
@@ -466,7 +466,7 @@ impl ManagementService {
                 // the target's successful local leave is still authoritative.
                 let _ = self
                     .registry
-                    .kick_member(network.as_str(), &target.identity.to_string(), true)
+                    .kick_member(network.as_ref(), &target.identity.to_string(), true)
                     .await;
                 IpcMessage::Ok { message }
             }
@@ -479,7 +479,7 @@ impl ManagementService {
             }) => {
                 match self
                     .registry
-                    .kick_member(network.as_str(), &target.identity.to_string(), true)
+                    .kick_member(network.as_ref(), &target.identity.to_string(), true)
                     .await
                 {
                     IpcMessage::Ok { .. } => IpcMessage::Ok {
@@ -528,13 +528,13 @@ impl ManagementService {
         &self,
         selector: &ManagedMachineSelector,
     ) -> Result<config::ManagedMachine, String> {
-        let name = selector.as_str();
+        let name = selector.as_ref();
         let settings = config::load().map_err(|error| error.to_string())?;
         let matches: Vec<_> = settings
             .managed_machines
             .into_iter()
             .filter(|machine| {
-                machine.hostname.as_str() == name
+                machine.hostname.as_ref() == name
                     || machine.identity.to_string().starts_with(name)
                     || machine.identity.fmt_short().to_string().starts_with(name)
             })
@@ -698,8 +698,8 @@ impl ManagementService {
                     .registry
                     .join_network(
                         &network_key.to_string(),
-                        Some(network_name.as_str()),
-                        Some(hostname.into_string()),
+                        Some(network_name.as_ref()),
+                        Some(hostname.into()),
                         Some(secret),
                         Some(coordinator),
                         auto_accept_firewall,
@@ -718,7 +718,7 @@ impl ManagementService {
                 }
             }
             ManagementAction::Leave { network_name } => {
-                match self.registry.leave_network(network_name.as_str()).await {
+                match self.registry.leave_network(network_name.as_ref()).await {
                     IpcMessage::Ok { message } => ManagementResult::Applied { message },
                     IpcMessage::Error { message } => ManagementResult::Error { message },
                     other => ManagementResult::Error {

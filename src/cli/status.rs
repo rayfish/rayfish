@@ -7,6 +7,21 @@ use iroh::EndpointId;
 
 use crate::*;
 
+trait IntoOutputStr {
+    fn into_output_str(self) -> String;
+}
+
+impl IntoOutputStr for ipc::ManagedMachineState {
+    fn into_output_str(self) -> String {
+        let value = self.as_str();
+        match self {
+            Self::Online => style::green(value),
+            Self::Offline | Self::Unknown => style::faint(value),
+            Self::Unauthorized => style::red(value),
+        }
+    }
+}
+
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
 pub(crate) fn format_bytes(b: u64) -> String {
     bytesize::ByteSize(b).to_string()
@@ -347,15 +362,10 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 println!("  {}", style::faint("managed machines:"));
                 for machine in &managed_machines {
                     let short_id = machine.identity.fmt_short().to_string();
-                    let state = match machine.state {
-                        ipc::ManagedMachineState::Online => style::green("online"),
-                        ipc::ManagedMachineState::Offline => style::faint("offline"),
-                        ipc::ManagedMachineState::Unauthorized => style::red("unauthorized"),
-                        ipc::ManagedMachineState::Unknown => style::faint("unknown"),
-                    };
+                    let state = machine.state.into_output_str();
                     println!(
                         "    {}  {}  {}",
-                        style::value(machine.hostname.as_str()),
+                        style::value(machine.hostname.as_ref()),
                         style::rose(&short_id),
                         state
                     );

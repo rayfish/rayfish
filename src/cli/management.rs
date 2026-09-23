@@ -41,16 +41,11 @@ pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
                             .map(ToString::to_string)
                             .collect::<Vec<_>>()
                             .join(", ");
-                        let state = match machine.state {
-                            ipc::ManagedMachineState::Online => "online",
-                            ipc::ManagedMachineState::Offline => "offline",
-                            ipc::ManagedMachineState::Unauthorized => "unauthorized",
-                            ipc::ManagedMachineState::Unknown => "unknown",
-                        };
+                        let state = machine.state.as_str();
                         vec![
                             layout::Cell::new(
                                 machine.hostname.to_string(),
-                                style::value(machine.hostname.as_str()),
+                                style::value(machine.hostname.as_ref()),
                             ),
                             layout::Cell::new(short_id.clone(), style::rose(&short_id)),
                             layout::Cell::new(state, style::faint(state)),
