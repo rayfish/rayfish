@@ -642,7 +642,13 @@ impl ManagementService {
                 message: "unexpected management message".to_string(),
             },
         };
-        let _ = control::send_framed(&mut send, &reply).await;
+        if let Err(error) = control::send_framed(&mut send, &reply).await {
+            tracing::warn!(peer = %remote.fmt_short(), %error, "failed to send management response");
+            return;
+        }
+        // Keep the connection alive until the caller reads the reply. Returning
+        // drops it and can reset the stream before the frame header arrives.
+        let _ = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
     }
 
     fn accept_enrollment(

@@ -35,6 +35,7 @@ tests/e2e.sh <scenario> # shell, not cargo; see tests/e2e/README.md
 - Service management goes through `init_system::InitSystem` (systemd / OpenRC / SysV), never `systemctl` directly. macOS launchd is a `#[cfg]` branch at the call site.
 - The daemon runs as root and does the privileged work; clients are unprivileged. Authority is a per-request `SO_PEERCRED` UID check (`Daemon::check_authorized`), not the `0666` socket's permissions. Reads are open to any local user; mutations need root or `operator_uid`.
 - IPC is one request, one response. `ray logs` is the sole streaming exception.
+- An iroh handler that owns a connection and sends a final response must finish the send stream, then keep the connection alive with a bounded wait on `connection.closed()`. Do not return immediately after sending: dropping the connection can reset the stream before the peer reads the response.
 - Logging is `tracing`: console at `info`, daily files at `rayfish=debug`. The panic hook restores DNS then `abort()`s so the service manager restarts it.
 - CLI help groups live in `src/cli/help.rs` (`PAGES`); a new command must join its page's groups or it appears nowhere. `about` is one line under 80 columns. `hide = true` also drops a command from tab completion.
 - For the command surface read `ray --help`, not a list here.
