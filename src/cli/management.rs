@@ -8,10 +8,9 @@ pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
     let request = match action {
         None => ipc::IpcMessage::ManagedMachines { probe: true },
         Some(MachinesAction::Enroll { reusable, expires }) => {
-            let default = if reusable { "30d" } else { "7d" };
-            let expires_secs = parse_duration_secs(expires.as_deref().unwrap_or(default))?;
+            let expires_in = enrollment_ttl(reusable, expires.as_deref())?;
             ipc::IpcMessage::MachineEnrollmentCreate {
-                expires_in: Duration::from_secs(expires_secs),
+                expires_in,
                 reusable,
             }
         }
@@ -101,7 +100,7 @@ pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
                 }
             }
         }
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_management_message(&message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
@@ -238,11 +237,29 @@ pub(crate) async fn ipc_management_overview()
 
 fn print_simple_response(response: ipc::IpcMessage) -> Result<()> {
     match response {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_management_message(&message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
     Ok(())
+}
+
+fn print_management_message(message: &str) {
+    if json_enabled() {
+        print_json(&serde_json::json!({ "message": message }));
+    } else {
+        println!("{message}");
+    }
+}
+
+fn enrollment_ttl(reusable: bool, expires: Option<&str>) -> Result<Duration> {
+    let default = if reusable { "30d" } else { "7d" };
+    let expires_secs = parse_duration_secs(expires.unwrap_or(default))?;
+    anyhow::ensure!(
+        expires_secs > 0,
+        "enrollment expiration must be greater than zero"
+    );
+    Ok(Duration::from_secs(expires_secs))
 }
 
 fn result_message(response: ipc::IpcMessage) -> Result<String> {
@@ -250,5 +267,31 @@ fn result_message(response: ipc::IpcMessage) -> Result<String> {
         ipc::IpcMessage::Ok { message } => Ok(message),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!(unexpected_detail(&other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrollment_ttl_rejects_zero() {
+        let error = enrollment_ttl(false, Some("0s")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "enrollment expiration must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn enrollment_ttl_uses_kind_specific_default() {
+        assert_eq!(
+            enrollment_ttl(false, None).unwrap(),
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            enrollment_ttl(true, None).unwrap(),
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
     }
 }
