@@ -1819,11 +1819,33 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     {
         use std::ffi::CString;
         let cname = CString::new(user).ok()?;
-        let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-        if !pw.is_null() {
-            return Some(unsafe { (*pw).pw_uid });
+        // getpwnam_r, not getpwnam, for the same reason rayfish_gid uses
+        // getgrnam_r: the legacy call's answer lives in a process-wide buffer
+        // that any other lookup is allowed to move or free mid-read, which
+        // corrupts the heap on musl when callers run concurrently.
+        let mut buf_len = 4096;
+        loop {
+            let mut buf = vec![0u8; buf_len];
+            let mut pwbuf: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getpwnam_r(
+                    cname.as_ptr(),
+                    &mut pwbuf,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE {
+                buf_len *= 2;
+                continue;
+            }
+            if rc == 0 && !result.is_null() {
+                return Some(unsafe { (*result).pw_uid });
+            }
+            return user.parse::<u32>().ok();
         }
-        user.parse::<u32>().ok()
     }
 }
 
