@@ -16,7 +16,6 @@ const MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGEMENT_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_ENROLLMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn now() -> UnixTimestampSecs {
     UnixTimestampSecs::from_secs(
@@ -25,6 +24,10 @@ fn now() -> UnixTimestampSecs {
             .unwrap_or_default()
             .as_secs(),
     )
+}
+
+fn enrollment_expiration(created_at: UnixTimestampSecs, expires_in: Duration) -> UnixTimestampSecs {
+    created_at.saturating_add(expires_in)
 }
 
 fn record_enrollment(
@@ -99,15 +102,10 @@ impl ManagementService {
 
     /// Creates and persists a machine-enrollment credential.
     pub(crate) fn create_enrollment(&self, expires_in: Duration, reusable: bool) -> IpcMessage {
-        let expires_in = if expires_in.is_zero() {
-            DEFAULT_ENROLLMENT_TTL
-        } else {
-            expires_in
-        };
         let secret = EnrollmentSecret::generate();
         let secret_hash = secret.hash();
         let id = ipc::EnrollmentCredentialId::new(secret_hash.to_hex()[..12].to_string());
-        let expires_at = now().saturating_add(expires_in);
+        let expires_at = enrollment_expiration(now(), expires_in);
         let credential = config::EnrollmentCredential {
             id: id.clone(),
             secret_hash,
@@ -804,6 +802,15 @@ mod tests {
         assert_eq!(
             settings.enrollment_credentials[0].enrolled_machines,
             [first, other]
+        );
+    }
+
+    #[test]
+    fn zero_enrollment_ttl_expires_immediately() {
+        let created_at = UnixTimestampSecs::from_secs(100);
+        assert_eq!(
+            enrollment_expiration(created_at, Duration::ZERO),
+            created_at
         );
     }
 }

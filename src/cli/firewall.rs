@@ -691,19 +691,19 @@ pub(crate) async fn ipc_apply(
         }
 
         for host in membership.leaves {
-            let is_local = status_networks
+            let status_network = status_networks
                 .iter()
-                .find(|network| network.name == *net_name)
-                .and_then(|network| network.my_hostname.as_deref())
+                .find(|network| network.name == *net_name);
+            let is_local = status_network.and_then(|network| network.my_hostname.as_deref())
                 == Some(host.as_ref());
             if is_local {
                 continue;
             }
-            if managed_machines
-                .iter()
-                .any(|machine| machine.hostname == host)
+            if let Some(managed_machine) =
+                managed_machine_for_hostname(status_network, &host, &managed_machines)
             {
-                let machine = ipc::ManagedMachineSelector::new(host.to_string());
+                let machine =
+                    ipc::ManagedMachineSelector::new(managed_machine.identity.to_string());
                 let network = ipc::NetworkName::new(net_name.clone());
                 match ipc_delegated_leave_request(&machine, &network).await {
                     Ok(message) => println!("{}  {message}", style::faint("managed:")),
@@ -768,6 +768,26 @@ pub(crate) async fn ipc_apply(
         }
     }
     Ok(())
+}
+
+fn managed_machine_for_hostname<'a>(
+    network: Option<&ipc::NetworkStatus>,
+    hostname: &ipc::MachineHostname,
+    managed_machines: &'a [ipc::ManagedMachineInfo],
+) -> Option<&'a ipc::ManagedMachineInfo> {
+    managed_machines
+        .iter()
+        .find(|machine| machine.hostname == *hostname)
+        .or_else(|| {
+            let endpoint_id = network?
+                .peers
+                .iter()
+                .find(|peer| peer.hostname.as_deref() == Some(hostname.as_ref()))?
+                .endpoint_id;
+            managed_machines
+                .iter()
+                .find(|machine| machine.identity == endpoint_id)
+        })
 }
 
 async fn ipc_managed_machines_for_apply() -> Result<Vec<ipc::ManagedMachineInfo>> {
@@ -1172,5 +1192,27 @@ mod tests {
     fn resolve_unknown_hostname_is_none() {
         let n = net(Some("me"), vec![peer("alice", None)]);
         assert_eq!(resolve_host_identity(&n, "self-id", "ghost"), None);
+    }
+
+    #[test]
+    fn managed_machine_matches_network_hostname_by_endpoint_identity() {
+        let identity = iroh::SecretKey::generate().public();
+        let mut roster_peer = peer("web", None);
+        roster_peer.endpoint_id = identity;
+        let network = net(Some("controller"), vec![roster_peer]);
+        let machines = vec![ipc::ManagedMachineInfo {
+            identity,
+            hostname: "build-box".parse().unwrap(),
+            enrolled_at: ipc::UnixTimestampSecs::from_secs(100),
+            last_seen: None,
+            state: ipc::ManagedMachineState::Unknown,
+            networks: Vec::new(),
+        }];
+        let hostname = "web".parse().unwrap();
+
+        let machine = managed_machine_for_hostname(Some(&network), &hostname, &machines).unwrap();
+
+        assert_eq!(machine.identity, identity);
+        assert_eq!(machine.hostname.as_ref(), "build-box");
     }
 }
