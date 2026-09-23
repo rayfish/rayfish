@@ -56,6 +56,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Magic DNS activates on hosts whose resolver ignores root-zone queries.**
+  Some consumer-router forwarders answer dotted names but stay silent for
+  `. NS` probes, which the takeover treated as a dead upstream and refused to
+  run, leaving `.ray` names unresolvable on the host. A silent root probe is
+  now followed by a plain `example.com A` question before the upstream is
+  given up on.
+
 - **Network changes no longer leave control ping working while ordinary mesh
   traffic disappears.** A delayed handshake from a replaced peer connection
   could put its stale route back into the forwarding table. The live connection
