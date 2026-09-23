@@ -4,7 +4,7 @@ import NetworkExtension
 
 @MainActor
 final class TunnelController: ObservableObject {
-    private static let providerBundleIdentifier = "xyz.rayfish.app.tunnel"
+    private static let providerBundleIdentifier = "com.rayfish.app.tunnel"
 
     @Published var status: ProviderStatus?
     @Published var error: String?

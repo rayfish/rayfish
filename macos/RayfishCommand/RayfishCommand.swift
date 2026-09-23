@@ -6,7 +6,7 @@ import SystemExtensions
 @main
 @MainActor
 struct RayfishCommand {
-    private static let providerBundleIdentifier = "xyz.rayfish.app.tunnel"
+    private static let providerBundleIdentifier = "com.rayfish.app.tunnel"
 
     static func main() async {
         do {
