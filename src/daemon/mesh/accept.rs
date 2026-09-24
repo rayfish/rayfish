@@ -7,6 +7,8 @@
 //! `blobs`/`files`/`pair`/`connect` arms). `MeshCtx` and the roster-projection
 //! helpers stay in `daemon/mod.rs` since they are shared infrastructure.
 
+use std::fmt;
+
 use crate::daemon;
 
 use super::super::*;
@@ -1785,6 +1787,8 @@ struct PairProtocol(Arc<FileService>);
 #[derive(Clone)]
 struct ConnectProtocol(Arc<ConnectService>);
 
+struct ManagementProtocol(Arc<ManagementService>);
+
 impl std::fmt::Debug for MeshProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MeshProtocol")
@@ -1836,6 +1840,19 @@ impl iroh::protocol::ProtocolHandler for ConnectProtocol {
     }
 }
 
+impl fmt::Debug for ManagementProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ManagementProtocol")
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for ManagementProtocol {
+    async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        self.0.accept_connection(conn).await;
+        Ok(())
+    }
+}
+
 pub(crate) struct ProtocolRouter {
     blobs: Arc<BlobsProtocol>,
     /// File-transfer + pairing state and their ALPN accept arms. The accept loop
@@ -1846,6 +1863,7 @@ pub(crate) struct ProtocolRouter {
     /// accept arm. The accept loop delegates to this; `Daemon` holds the same
     /// handle for the IPC-side connect commands.
     connect: Arc<ConnectService>,
+    management: Arc<ManagementService>,
     /// The per-peer mesh connection driver: owns the per-network handler registry,
     /// the frame demux, and the ping-probe map. The mesh ALPN is delegated here;
     /// register/handler_for/`pending_pongs` calls pass through to it.
@@ -1857,12 +1875,14 @@ impl ProtocolRouter {
         blobs: BlobsProtocol,
         files: Arc<FileService>,
         connect: Arc<ConnectService>,
+        management: Arc<ManagementService>,
         conn: Arc<ConnectionManager>,
     ) -> Self {
         Self {
             blobs: Arc::new(blobs),
             files,
             connect,
+            management,
             conn_mngr: conn,
         }
     }
@@ -1905,6 +1925,10 @@ impl ProtocolRouter {
             .accept(
                 transport::CONNECT_ALPN,
                 ConnectProtocol(Arc::clone(&self.connect)),
+            )
+            .accept(
+                crate::management::ALPN,
+                ManagementProtocol(Arc::clone(&self.management)),
             );
         for alpn in transport::mesh_alpns() {
             builder = builder.accept(alpn, MeshProtocol(Arc::clone(&self.conn_mngr)));

@@ -121,6 +121,7 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
         transport::FILES_ALPN.to_vec(),
         PAIR_ALPN.to_vec(),
         transport::CONNECT_ALPN.to_vec(),
+        crate::management::ALPN.to_vec(),
     ]);
     alpns
 }
@@ -596,10 +597,15 @@ async fn build_daemon_inner(
         Arc::clone(&active),
         Arc::clone(&registry),
     ));
+    let management = Arc::new(ManagementService::new(
+        Arc::clone(&transport),
+        Arc::clone(&registry),
+    ));
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
         Arc::clone(&files),
         Arc::clone(&connect),
+        Arc::clone(&management),
         Arc::clone(&conn),
     ));
     // The registry (re)connect paths drive a dialed connection's demux through the
@@ -705,6 +711,7 @@ async fn build_daemon_inner(
         files,
         transfers,
         connect,
+        management,
         device_cert,
         contact_public,
         active: Arc::clone(&active),

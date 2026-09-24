@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::fmt;
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
@@ -6,12 +8,14 @@ use std::net::Ipv6Addr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
-use iroh::EndpointId;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use iroh::{EndpointAddr, EndpointId};
+use iroh_tickets::{ParseError as TicketParseError, Ticket};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(unix)]
@@ -308,6 +312,48 @@ pub enum IpcMessage {
     Unpair {
         /// Device identifier: hostname, mesh IP, short id, or full endpoint id.
         device: String,
+    },
+    /// Creates a controller ticket for enrolling one or more machines.
+    MachineEnrollmentCreate {
+        expires_in: Duration,
+        reusable: bool,
+    },
+    /// Lists controller tickets and their current status.
+    MachineEnrollmentList,
+    /// Revokes a controller ticket.
+    MachineEnrollmentRevoke {
+        credential: EnrollmentCredentialSelector,
+    },
+    /// Enrolls this machine with the controller identified by `ticket`.
+    EnrollController {
+        ticket: EnrollmentTicket,
+    },
+    /// Lists controllers authorized to manage this machine.
+    ControllerList,
+    /// Revokes one controller, or all controllers when `identity` is absent.
+    ControllerRevoke {
+        identity: Option<ControllerSelector>,
+    },
+    /// Lists machines enrolled with this controller.
+    ManagedMachines {
+        probe: bool,
+    },
+    /// Removes one enrolled machine from this controller.
+    ManagedMachineForget {
+        machine: ManagedMachineSelector,
+    },
+    /// Asks an enrolled machine to join a network.
+    DelegatedJoin {
+        machine: ManagedMachineSelector,
+        network: NetworkName,
+        hostname: Option<MachineHostname>,
+        auto_accept_firewall: bool,
+        auto_accept_files: bool,
+    },
+    /// Asks an enrolled machine to leave a network.
+    DelegatedLeave {
+        machine: ManagedMachineSelector,
+        network: NetworkName,
     },
     /// Authorize a local user (by UID) to control the daemon without root, the
     /// way `tailscale up --operator` does. Root-only.
@@ -610,6 +656,25 @@ pub enum IpcMessage {
     PairedDevices {
         devices: Vec<PairedDeviceInfo>,
     },
+    /// Returns a newly created machine-enrollment ticket.
+    MachineEnrollmentCreated {
+        id: EnrollmentCredentialId,
+        ticket: EnrollmentTicket,
+        expires_at: UnixTimestampSecs,
+        reusable: bool,
+    },
+    /// Returns controller tickets and their current status.
+    MachineEnrollments {
+        enrollments: Vec<MachineEnrollmentInfo>,
+    },
+    /// Returns controllers authorized to manage this machine.
+    Controllers {
+        controllers: Vec<ControllerInfo>,
+    },
+    /// Returns machines enrolled with this controller.
+    ManagedMachinesResponse {
+        machines: Vec<ManagedMachineInfo>,
+    },
     /// Encrypted identity backup returned by [`IpcMessage::BackupIdentity`].
     IdentityBackup {
         code: String,
@@ -776,6 +841,445 @@ pub struct PairedDeviceInfo {
     pub hostname: Option<String>,
     /// Networks this device is currently a member of.
     pub networks: Vec<String>,
+}
+
+/// Status of one controller ticket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineEnrollmentInfo {
+    /// Short identifier used to select the credential.
+    pub id: EnrollmentCredentialId,
+    /// Expiration time in seconds since the Unix epoch.
+    pub expires_at: UnixTimestampSecs,
+    /// Whether the credential may enroll more than one machine.
+    pub reusable: bool,
+    /// Number of distinct machines enrolled with the credential.
+    pub uses: u64,
+    /// Current credential status.
+    pub status: MachineEnrollmentStatus,
+}
+
+/// Lifecycle state of a controller ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineEnrollmentStatus {
+    /// Valid and unused.
+    Pending,
+    /// Consumed by a machine and not reusable.
+    Used,
+    /// Past its expiration time.
+    Expired,
+    /// Explicitly revoked by the controller.
+    Revoked,
+}
+
+/// Controller authorized to manage the local machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerInfo {
+    /// Controller endpoint identity.
+    pub identity: EndpointId,
+    /// Enrollment time in seconds since the Unix epoch.
+    pub enrolled_at: UnixTimestampSecs,
+}
+
+/// Machine enrolled with the local controller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedMachineInfo {
+    /// Machine endpoint identity.
+    pub identity: EndpointId,
+    /// Stable hostname used by delegated commands.
+    pub hostname: MachineHostname,
+    /// Enrollment time in seconds since the Unix epoch.
+    pub enrolled_at: UnixTimestampSecs,
+    /// Last successful contact time in seconds since the Unix epoch.
+    pub last_seen: Option<UnixTimestampSecs>,
+    /// Result of the latest status probe.
+    pub state: ManagedMachineState,
+    /// Networks reported by the latest successful status probe.
+    #[serde(default)]
+    pub networks: Vec<NetworkName>,
+}
+
+/// Reachability and authorization state of an enrolled machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedMachineState {
+    /// The machine responded and authorized this controller.
+    Online,
+    /// The machine did not respond.
+    Offline,
+    /// The machine responded but no longer authorizes this controller.
+    Unauthorized,
+    /// The machine was not probed.
+    Unknown,
+}
+
+impl ManagedMachineState {
+    /// Returns the protocol name of this state.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Unauthorized => "unauthorized",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whole seconds since the Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnixTimestampSecs(u64);
+
+impl UnixTimestampSecs {
+    /// Creates a timestamp from whole seconds since the Unix epoch.
+    pub fn from_secs(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    /// Returns whole seconds since the Unix epoch.
+    pub fn as_secs(self) -> u64 {
+        self.0
+    }
+
+    /// Adds a duration, saturating at [`u64::MAX`].
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration.as_secs()))
+    }
+}
+
+impl fmt::Display for UnixTimestampSecs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Valid lowercase DNS label used to identify a managed machine.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct MachineHostname(String);
+
+impl MachineHostname {
+    /// Validates and creates a machine hostname.
+    pub fn new(value: String) -> Result<Self, InvalidMachineHostname> {
+        if value.is_empty()
+            || value.len() > 63
+            || value.starts_with('-')
+            || value.ends_with('-')
+            || !value.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            })
+        {
+            return Err(InvalidMachineHostname);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl AsRef<str> for MachineHostname {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<MachineHostname> for String {
+    fn from(hostname: MachineHostname) -> Self {
+        hostname.0
+    }
+}
+
+impl fmt::Display for MachineHostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for MachineHostname {
+    type Err = InvalidMachineHostname;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for MachineHostname {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Error returned when a machine hostname is not a lowercase DNS label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidMachineHostname;
+
+impl fmt::Display for InvalidMachineHostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("hostname must be a lowercase DNS label of at most 63 characters")
+    }
+}
+
+impl std::error::Error for InvalidMachineHostname {}
+
+/// Network name carried across the IPC and management protocols.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NetworkName(String);
+
+impl NetworkName {
+    /// Wraps a network name.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for NetworkName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<NetworkName> for String {
+    fn from(network: NetworkName) -> Self {
+        network.0
+    }
+}
+
+impl fmt::Display for NetworkName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for NetworkName {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Short identifier for a stored enrollment credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentCredentialId(String);
+
+impl EnrollmentCredentialId {
+    /// Wraps an enrollment credential identifier.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for EnrollmentCredentialId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnrollmentCredentialId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EnrollmentCredentialId {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Full or prefix selector for an enrollment credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentCredentialSelector(String);
+
+impl EnrollmentCredentialSelector {
+    /// Wraps an enrollment credential selector.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for EnrollmentCredentialSelector {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnrollmentCredentialSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EnrollmentCredentialSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Shareable capability for enrolling a machine with a controller.
+///
+/// The ticket contains current dialing information for the controller and a
+/// secret enrollment credential. Treat its string form as a secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnrollmentTicket {
+    controller: EndpointAddr,
+    secret: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+enum EnrollmentTicketWireFormat {
+    Variant1 {
+        controller: EndpointAddr,
+        secret: [u8; 32],
+    },
+}
+
+impl EnrollmentTicket {
+    /// Creates a ticket for `controller` using the supplied enrollment secret.
+    pub fn new(controller: EndpointAddr, secret: [u8; 32]) -> Self {
+        Self { controller, secret }
+    }
+
+    /// Returns the controller address carried by the ticket.
+    pub fn controller(&self) -> &EndpointAddr {
+        &self.controller
+    }
+
+    /// Returns the secret credential carried by the ticket.
+    pub fn secret(&self) -> &[u8; 32] {
+        &self.secret
+    }
+}
+
+impl Ticket for EnrollmentTicket {
+    const KIND: &'static str = "raymachine";
+
+    fn encode_bytes(&self) -> Vec<u8> {
+        let wire = EnrollmentTicketWireFormat::Variant1 {
+            controller: self.controller.clone(),
+            secret: self.secret,
+        };
+        postcard::to_stdvec(&wire)
+            .expect("enrollment ticket fields always have a valid postcard representation")
+    }
+
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, TicketParseError> {
+        let EnrollmentTicketWireFormat::Variant1 { controller, secret } =
+            postcard::from_bytes(bytes)?;
+        Ok(Self { controller, secret })
+    }
+}
+
+impl fmt::Debug for EnrollmentTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnrollmentTicket([redacted])")
+    }
+}
+
+impl fmt::Display for EnrollmentTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.encode_string())
+    }
+}
+
+impl FromStr for EnrollmentTicket {
+    type Err = TicketParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::decode_string(value.trim())
+    }
+}
+
+impl Serialize for EnrollmentTicket {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.encode_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for EnrollmentTicket {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Hostname, short identity, or full identity selecting a managed machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ManagedMachineSelector(String);
+
+impl ManagedMachineSelector {
+    /// Wraps a managed-machine selector.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for ManagedMachineSelector {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedMachineSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ManagedMachineSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Full or prefix endpoint identity selecting a controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControllerSelector(String);
+
+impl ControllerSelector {
+    /// Wraps a controller selector.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for ControllerSelector {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ControllerSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ControllerSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
 }
 
 /// One roster row a pending kick would remove (reply to an unconfirmed
@@ -1838,6 +2342,71 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn managed_hostname_rejects_non_dns_labels() {
+        assert!("build-box".parse::<MachineHostname>().is_ok());
+        assert!("Build Box".parse::<MachineHostname>().is_err());
+        assert!("-build-box".parse::<MachineHostname>().is_err());
+        let encoded = rmp_serde::to_vec_named("Build Box").unwrap();
+        assert!(rmp_serde::from_slice::<MachineHostname>(&encoded).is_err());
+    }
+
+    #[test]
+    fn delegated_join_roundtrip_preserves_domain_types() {
+        let request = IpcMessage::DelegatedJoin {
+            machine: ManagedMachineSelector::new("build-box".to_string()),
+            network: NetworkName::new("infra".to_string()),
+            hostname: Some("build-box".parse().unwrap()),
+            auto_accept_firewall: true,
+            auto_accept_files: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&request).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::DelegatedJoin {
+                machine,
+                network,
+                hostname,
+                ..
+            } => {
+                assert_eq!(machine.as_ref(), "build-box");
+                assert_eq!(network.as_ref(), "infra");
+                assert_eq!(hostname.unwrap().as_ref(), "build-box");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrollment_ticket_debug_is_redacted() {
+        let controller = EndpointAddr::from(iroh::SecretKey::generate().public());
+        let ticket = EnrollmentTicket::new(controller, [7; 32]);
+        let debug = format!("{ticket:?}");
+        assert_eq!(debug, "EnrollmentTicket([redacted])");
+    }
+
+    #[test]
+    fn enrollment_ticket_string_and_ipc_roundtrip() {
+        let controller = EndpointAddr::from(iroh::SecretKey::generate().public());
+        let ticket = EnrollmentTicket::new(controller.clone(), [7; 32]);
+
+        let encoded = ticket.to_string();
+        assert!(encoded.starts_with("raymachine"));
+        let decoded: EnrollmentTicket = encoded.parse().unwrap();
+        assert_eq!(decoded.controller(), &controller);
+        assert_eq!(decoded.secret(), &[7; 32]);
+
+        let ipc_bytes = rmp_serde::to_vec_named(&ticket).unwrap();
+        let ipc_decoded: EnrollmentTicket = rmp_serde::from_slice(&ipc_bytes).unwrap();
+        assert_eq!(ipc_decoded, ticket);
+    }
+
+    #[test]
+    fn enrollment_ticket_rejects_another_ticket_kind() {
+        let error = "endpointaaaa".parse::<EnrollmentTicket>().unwrap_err();
+        assert!(error.to_string().contains("wrong prefix"));
     }
 
     #[test]
