@@ -63,8 +63,8 @@ Each of these has a fuller treatment further down; this is the one-line tour.
 Here's the whole tour: install once, create a network, invite a friend, and
 reach each other by name. Two machines, about five minutes.
 
-Rayfish runs on **Linux and macOS**; **Windows x64 is experimental** (Android is
-early and experimental). Windows uses a LocalSystem service, signed Wintun, and
+Rayfish runs on **Linux and macOS (Apple Silicon)**; **Windows x64 is experimental**
+(Android is early and experimental). Windows uses a LocalSystem service, signed Wintun, and
 named-pipe IPC. Install the Windows MSI, then run `ray up` from an elevated
 terminal once to register the operator SID. Windows SSH/PTY commands are not
 available in this first port; use `ray.exe` in terminals and scripts.
@@ -74,7 +74,11 @@ current without rebuilding.
 
 ### 1. Install & start
 
-Install the latest release, then bring the VPN up:
+On macOS, choose the native app DMG from [Releases](https://github.com/rayfish/rayfish/releases)
+or the standalone CLI and background daemon below. Both support Apple Silicon.
+For the app, drag Rayfish into Applications, open it, and connect from its menu.
+
+To install the standalone daemon on Linux or macOS, then bring the VPN up:
 
 ```bash
 curl -fsSL https://rayfish.xyz/install.sh | sh

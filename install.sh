@@ -68,6 +68,9 @@ detect_asset() {
     aarch64|arm64) arch="aarch64" ;;
     *) die "unsupported architecture: $arch" ;;
   esac
+  if [ "$OS" = "macos" ] && [ "$arch" != "aarch64" ]; then
+    die "macOS releases require Apple Silicon (arm64)"
+  fi
   ASSET="${BIN}-${OS}-${arch}"
 }
 

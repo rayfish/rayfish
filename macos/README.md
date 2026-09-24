@@ -1,0 +1,78 @@
+# macOS releases
+
+macOS releases support Apple Silicon (arm64). Users can choose either:
+
+- The signed, notarized DMG for Apple Silicon (arm64), with the native app and
+  packet tunnel system extension.
+- The standalone `ray-macos-aarch64` binary with the CLI and launchd daemon,
+  including `ray gui` and `ray set-operator`.
+
+Versioned releases build both. DMGs can also be built manually; nightly releases
+build only the standalone binary for macOS. The **macOS app release** workflow
+builds the DMG with Xcode 26.6. The app also bundles the Rust `ray` CLI, using the
+repository's Cargo version.
+The DMG uses Rayfish's logo, fonts, and colors, with a drag-to-Applications layout.
+Nightly releases include `ray-macos-aarch64`, rebuilt from each push to master.
+
+Configure these repository secrets before running it:
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_CERTIFICATE_P12` | Base64 of a Developer ID Application `.p12`, including its private key |
+| `MACOS_CERTIFICATE_PASSWORD` | Password protecting that `.p12` |
+| `MACOS_APP_PROFILE` | Base64 of the Developer ID distribution profile for `com.rayfish.app` |
+| `MACOS_TUNNEL_PROFILE` | Base64 of the Developer ID distribution profile for `com.rayfish.app.tunnel` |
+| `APPLE_API_PRIVATE_KEY` | Contents of an App Store Connect team API `.p8` key |
+| `APPLE_API_KEY_ID` | That API key's ID |
+| `APPLE_API_ISSUER_ID` | That API key's issuer ID |
+
+The profiles must belong to team `3D9W8F63CL` and allow the capabilities in the
+Release entitlements, including the packet tunnel system extension and app group.
+Use Developer ID distribution profiles, not Apple Development profiles.
+GitHub's [certificate setup guide](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications)
+explains exporting and storing signing material. Keep secrets out of the repo.
+
+Run the workflow manually on the branch to test production packaging. It uploads
+the notarized DMGs and checksums as workflow artifacts without publishing a
+release. A workflow must exist on the default branch before GitHub exposes its
+manual Run workflow button.
+
+Before merging a new app workflow, dispatch the existing **CI** workflow on the
+branch with `macos_dmg=true`:
+
+```sh
+gh workflow run ci.yml --ref feat/macos-native-app -f macos_dmg=true
+```
+
+This uses the same signing and notarization steps and uploads artifacts without
+publishing a release.
+
+The existing **Release** workflow calls it for version tags and manual releases.
+The tag must match Cargo's version and point to the commit being
+built. The app must pass signing checks and Apple notarization before its DMG is
+attached to the existing release. Missing credentials or failed notarization
+fail the job; there is no unsigned fallback. Other platform release jobs remain
+independent.
+
+Notarization first covers the app, then the final DMG. Tickets are stapled to both
+so installation does not depend on fetching the ticket from Apple. Users drag
+Rayfish into Applications and approve its network extension on first connection.
+Build logs, submission IDs, and notarization reports are saved in the diagnostics
+artifacts. A timeout stops publication; inspect that submission before retrying.
+
+PR CI runs tests, linting, and the Apple bindings check without building the full
+app. Full app and DMG builds run for versioned releases or manual builds.
+Real VPN connection and extension approval still need a Mac smoke test. Production builds use
+`1000 + GITHUB_RUN_NUMBER` as their extension build number; Debug builds retain the
+version in `project.yml`.
+
+To preview the installer locally without submitting a release:
+
+```sh
+brew install create-dmg
+bash scripts/package-macos-dmg.sh \
+  target/macos-development/Build/Products/Debug/Rayfish.app \
+  target/Rayfish-installer-preview.dmg
+```
+
+This preview contains the app passed to the script and is not a production release.

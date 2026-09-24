@@ -8,11 +8,26 @@ on:
   # its own, without waiting for another push.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      macos_dmg:
+        description: Build signed and notarized macOS DMGs as artifacts
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-dmg:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_dmg
+    permissions:
+      contents: write
+    uses: ./.github/workflows/macos-release.yml
+    with:
+      release_tag: ''
+    secrets: inherit
+
   check:
     runs-on: ubuntu-22.04
     steps:
@@ -72,6 +87,29 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Check bundled macOS CLI
+        run: |
+          cargo -q clippy --workspace --all-targets --locked --features macos-app -- -D warnings
+          cargo -q test -p rayfish --bin ray --locked --features macos-app cli::help::tests
+
+      - name: Install macOS test runner
+        run: brew install just
+
+      - name: Test native app
+        run: just macos-test macos-ipc-test macos-ui-test
+
+      - name: Check Apple bindings
+        run: |
+          cargo build -p ray-apple --locked
+          cargo run -q -p ray-apple --bin uniffi-bindgen -- generate \
+            --library target/debug/libray_apple.dylib \
+            --language swift \
+            --out-dir macos/Generated \
+            --no-format
+          sed -i '' 's/[[:space:]]*$//' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
+          perl -0pi -e 's/\n+\z/\n/' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
+          git diff --exit-code macos/Generated
 
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and

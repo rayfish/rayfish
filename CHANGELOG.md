@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The macOS Devices page shows machines you control,** including their status
+  and networks, and supports direct peer connection requests and approvals.
+
+- **macOS Settings includes Magic DNS and mDNS discovery toggles.** DNS changes
+  apply immediately; mDNS changes briefly reconnect the VPN.
+
+- **Production macOS app builds run in GitHub Actions.** Versioned releases
+  produce signed, notarized Apple Silicon disk images, with manual builds
+  available as workflow artifacts. The installer has a Retina-ready Rayfish
+  design with drag-to-Applications installation.
+
+- **The macOS app bundles the original Rust `ray` CLI.** It uses the same
+  commands and output as the standalone binary and talks directly to the
+  running tunnel over Rayfish's normal local socket. Use the app to connect,
+  disconnect, and quit the NetworkExtension session.
+
+- **macOS has a compact native menu bar menu alongside its full window.** Connect or
+  disconnect, see networks, and copy device addresses without opening the dashboard.
+
+- **macOS imports an existing Rayfish service automatically on first launch.**
+  The app detects the service's state directory, stops and disables the old
+  service, and copies its identity and saved networks before connecting.
+  The original state is kept, and a failed import restores the service.
+
 - **Controllers can enroll and manage machines directly.** A machine runs
   `ray up --controller <ticket>` once, then its controller can inspect it and
   delegate network joins and leaves. Enrollment tickets may be one-time or
@@ -26,6 +50,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence has already been evicted from the log ring.
 
 ### Changed
+
+- **macOS Settings aligns the DNS and mDNS switches to the right of each row.**
+
+- **macOS releases support Apple Silicon (arm64) only.** Both the native app DMG
+  and the standalone CLI with daemon support remain available. Intel macOS builds
+  are no longer published.
+
+- **The CLI bundled with the macOS app omits `ray gui` and `ray set-operator`.**
+  Standalone CLI builds retain both commands, including on macOS.
+
+- **The macOS menu bar has a connection switch.** The header shows Rayfish and
+  its current status, with an on/off switch to connect or disconnect.
+
+- **macOS copies peers' full domain names,** such as `remote-device.testnet.ray`,
+  from the menu bar and device context menus.
+
+- **Quitting the macOS app disconnects its VPN before exiting.** Closing only
+  the main window leaves the menu bar app running.
+- **macOS records startup, connection changes, and failures in Console** under
+  the `com.rayfish.app` subsystem.
+
+- **macOS matches the website and web dashboard's colors, fonts, and compact
+  network cards, with the Rayfish logo for its app and menu-bar icons.**
 
 - **Android updates background file notifications when file state changes.**
   Idle standby no longer checks for offers and transfers every four seconds.
@@ -62,6 +109,78 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already named its adapter `rayfish`.
 
 ### Fixed
+
+- **The macOS tray stays open when toggling the VPN connection,** so connection
+  progress and updated status remain visible.
+
+- **The macOS shell command works when the app's path contains spaces or
+  apostrophes.** Installing it again preserves the rest of the shell configuration.
+
+- **macOS migration reports failures to restore a disabled legacy service,**
+  instead of silently leaving its launchd override enabled.
+
+- **Failed macOS tunnel startup shuts down the Rust node,** releasing its
+  sockets and state files before another connection attempt.
+
+- **The macOS UI can reach the tunnel after extension upgrades** without relying
+  on a separately registered command service. The app uses macOS provider messaging.
+
+- **Opening the macOS dashboard brings it to the current desktop,** instead of
+  switching back to the desktop where it was last shown. Open Rayfish uses
+  Cmd+O in both the tray and app menus.
+
+- **The macOS tray updates while open,** including connection activity, errors,
+  networks, and peer status. Closing the dashboard hides it to the tray without
+  quitting or disconnecting the VPN.
+
+- **macOS disconnect no longer panics while stopping the Rust node.** Network
+  connections, protocol cleanup, and CLI shutdown run concurrently, and system
+  logs record how long disconnect takes.
+
+- **macOS displays IP addresses as plain text with copy actions,** avoiding
+  inverted glyphs in selectable address text on newer macOS versions.
+
+- **macOS waits for a new VPN connection to start before reporting failure,**
+  avoiding a stale disconnect error immediately after clicking Connect.
+
+- **macOS updates an older running tunnel extension when the app starts,**
+  instead of showing missing networks or timeouts after replacing the app.
+
+- **macOS no longer flashes "connecting" during status refreshes.** Both views
+  show the VPN's connection state, and updates continue when the main window closes.
+
+- **The macOS UI and CLI can talk to the tunnel at the same time.**
+  Separate authenticated connections prevent intermittent "tunnel did not
+  respond" errors while the app is open.
+
+- **macOS keeps packet forwarding active after its VPN connects.** The app now
+  uses the interface and DNS settings supplied by macOS instead of trying to
+  configure a separate daemon interface and silently returning to standby.
+
+- **macOS tunnel startup uses a valid IP address in its network settings,**
+  fixing the "Invalid NETunnelNetworkSettings tunnelRemoteAddress" error.
+
+- **macOS shows when the network extension needs approval in System Settings,**
+  instead of displaying an import spinner while waiting for permission.
+
+- **macOS development builds use Apple Development signing and matching
+  provisioning profiles for local testing without release notarization.**
+
+- **macOS correctly registers and keeps its tunnel system extension running.**
+  The bundled extension's filename now matches its identifier, fixing
+  "Extension not found in App bundle" when connecting.
+  Its package type also identifies it as a system extension so macOS recognizes
+  the tunnel category.
+
+- **macOS opens its main window on launch and from the menu bar or Dock.**
+
+- **macOS builds use the app's current entitlements file and valid system-extension
+  signing entitlements.**
+  Release builds enable hardened runtime and omit debugging entitlements for
+  Developer ID notarization.
+
+- **macOS app and CLI use the tunnel identifier and shared storage group from
+  the provisioning profiles.**
 
 - **Magic DNS activates on hosts whose resolver ignores root-zone queries.**
   Some consumer-router forwarders answer dotted names but stay silent for

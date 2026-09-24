@@ -15,7 +15,7 @@ categories = ["network-programming", "command-line-utilities"]
 # The repo root is both the `rayfish` package (binary `ray`) and the workspace
 # root. `ray-proto` is a member crate holding the shared IPC wire protocol.
 [workspace]
-members = ["ray-proto", "ray-mobile"]
+members = ["ray-proto", "ray-mobile", "ray-apple"]
 
 [workspace.metadata.release]
 publish = false
@@ -39,6 +39,9 @@ required-features = ["desktop"]
 
 [features]
 default = ["desktop"]
+# The CLI bundled inside Rayfish.app uses the native UI and its user session.
+# Standalone macOS CLI builds keep the browser GUI and operator commands.
+macos-app = ["desktop"]
 # Desktop-only surface: the TUN-backed daemon binary, the embedded mesh SSH
 # server (russh/pty-process/uzers), interactive password prompts (rpassword),
 # and in-place self-update (self-replace). Off for the Android library build,
