@@ -104,6 +104,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The macOS tray stays open when toggling the VPN connection,** so connection
+  progress and updated status remain visible.
+
 - **The macOS shell command works when the app's path contains spaces or
   apostrophes.** Installing it again preserves the rest of the shell configuration.
 
