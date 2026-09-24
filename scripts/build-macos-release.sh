@@ -45,7 +45,7 @@ xcodebuild -quiet \
 app="$output/build/Build/Products/Release/Rayfish.app"
 for binary in "$app/Contents/MacOS/Rayfish" "$app/Contents/MacOS/ray" \
     "$app/Contents/Library/SystemExtensions/com.rayfish.app.tunnel.systemextension/Contents/MacOS/com.rayfish.app.tunnel"; do
-    lipo -verify_arch "$MACOS_ARCH" "$binary"
+    lipo "$binary" -verify_arch "$MACOS_ARCH"
 done
 just macos-validate "$app"
 "$app/Contents/MacOS/ray" --version
