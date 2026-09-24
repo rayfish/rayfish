@@ -10,6 +10,7 @@ final class RayfishWindow: NSWindow, NSWindowDelegate {
         contentView = content
         contentMinSize = NSSize(width: 820, height: 560)
         isReleasedWhenClosed = false
+        collectionBehavior.insert(.moveToActiveSpace)
         delegate = self
         center()
     }
