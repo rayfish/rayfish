@@ -26,6 +26,6 @@ cargo -q clippy
 
 - [ ] Title is a conventional commit subject (`feat`/`fix`/`docs`/`style`/`ci`/...).
 - [ ] `cargo -q build`, `cargo -q test`, and `cargo -q clippy` pass.
-- [ ] Docs updated (`README.md` / `CLAUDE.md`) if behavior changed.
+- [ ] Docs updated (`README.md` / `AGENTS.md`) if behavior changed.
 - [ ] `CHANGELOG.md` updated under `## [Unreleased]` if the change is user-visible.
 - [ ] Bumped the relevant ALPN version if a wire protocol changed incompatibly.
