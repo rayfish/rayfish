@@ -260,7 +260,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/..\"\ncargo -q build --release -p ray-apple\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/..\"\ncargo -q build --release --locked -p ray-apple\n";
 		};
 		4291C25C81A92889E7B6D181 /* Bundle the Rust ray command */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -278,7 +278,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/..\"\ncargo -q build --release -p rayfish --bin ray\ndestination=\"$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray\"\ninstall -m 755 target/release/ray \"$destination\"\nif [ \"$CODE_SIGNING_ALLOWED\" != \"NO\" ]; then\n  codesign --force --options runtime --timestamp --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" \"$destination\"\nfi\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/..\"\ncargo -q build --release --locked -p rayfish --bin ray\ndestination=\"$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray\"\ninstall -m 755 target/release/ray \"$destination\"\nif [ \"$CODE_SIGNING_ALLOWED\" != \"NO\" ]; then\n  codesign --force --options runtime --timestamp --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" \"$destination\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -358,7 +358,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -530,7 +530,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
