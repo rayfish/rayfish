@@ -116,10 +116,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: bash scripts/build-macos-release.sh
 
-      - name: Test migration and authenticated IPC
+      - name: Test migration and provider messaging
         run: |
           just macos-test
-          just macos-ipc-test 'Developer ID Application'
+          just macos-ipc-test
 
       - name: Notarize and package
         env:

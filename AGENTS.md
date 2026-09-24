@@ -25,7 +25,7 @@ just android-check      # compile the Android target in a container, no NDK
 tests/e2e.sh <scenario> # shell, not cargo; see tests/e2e/README.md
 just macos-dev         # signed local Debug app; requires macOS and Xcode
 just macos-test        # legacy daemon detection and migration
-just macos-ipc-test    # signed XPC authentication, concurrency, and timeout tests
+just macos-ipc-test    # provider message concurrency, send failures, and timeouts
 just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 ```
 
@@ -56,7 +56,7 @@ just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 
 ## macOS
 
-- The network extension hosts the same Rust core as the daemon. The GUI uses authenticated XPC; the bundled Rust CLI uses the standard Unix socket. Do not recreate the CLI in Swift.
+- The network extension hosts the same Rust core as the daemon. The GUI uses NetworkExtension provider messages; the bundled Rust CLI uses the standard Unix socket. Do not recreate the CLI in Swift.
 - NetworkExtension owns the interface, routes, DNS, and VPN lifetime. Use `attach_external_tun`; desktop daemon activation must not reconfigure its interface. Connect and disconnect through the app.
 - Closing a window keeps the tray app alive. Cmd+Q disconnects the VPN before exiting.
 - Keep Swift logging in `OSLog` under `com.rayfish.app`; keep Rust logging in `tracing`. Do not log keys, invite codes, or other credentials.

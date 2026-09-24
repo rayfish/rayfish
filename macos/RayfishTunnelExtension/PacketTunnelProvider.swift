@@ -5,7 +5,6 @@ import OSLog
 
 final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     private var node: Node?
-    private var messageListener: TunnelMessageListener?
 
     override func startTunnel(
         options: [String: NSObject]?,
@@ -13,7 +12,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     ) {
         RayfishLog.tunnel.info("Starting tunnel build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown", privacy: .public)")
         do {
-            let clientRequirement = try TunnelIPC.requirement(for: "com.rayfish.app")
             let directory = try stateDirectory()
             let node = Node(configDir: directory.path)
             if let legacy = try LegacyDaemon.discover() {
@@ -37,15 +35,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 do {
                     try node.activate(flow: self)
                     self.node = node
-                    self.messageListener = TunnelMessageListener(
-                        listener: NSXPCListener(machServiceName: TunnelIPC.serviceName),
-                        clientRequirement: clientRequirement
-                    ) { [weak self] data, reply in
-                        guard let self else { reply(nil); return }
-                        self.handleAppMessage(data, completionHandler: reply)
-                    }
                     self.readPackets()
-                    RayfishLog.tunnel.info("Tunnel is ready; command listener started")
+                    RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
                 } catch {
                     RayfishLog.tunnel.error("Tunnel activation failed: \(error.localizedDescription, privacy: .public)")
@@ -61,8 +52,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         let started = DispatchTime.now().uptimeNanoseconds
         RayfishLog.tunnel.info("Stopping tunnel, reason \(reason.rawValue)")
-        messageListener?.invalidate()
-        messageListener = nil
         do {
             let stoppingNode = node
             node = nil
@@ -74,6 +63,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { completionHandler?(nil); return }
+            self.handleMessage(messageData, completionHandler: completionHandler)
+        }
+    }
+
+    private func handleMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         do {
             let request = try JSONDecoder().decode(ProviderRequest.self, from: messageData)
             RayfishLog.tunnel.debug("Handling \(request.action.rawValue, privacy: .public)")
