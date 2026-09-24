@@ -9,17 +9,22 @@
     <key>CFBundleIdentifier</key>
     <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundlePackageType</key>
-    <string>XPC!</string>
+    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>CFBundleShortVersionString</key>
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
-    <key>NSExtension</key>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>Rayfish uses a network extension to connect this Mac to your private networks.</string>
+    <key>NetworkExtension</key>
     <dict>
-        <key>NSExtensionPointIdentifier</key>
-        <string>com.apple.networkextension.packet-tunnel</string>
-        <key>NSExtensionPrincipalClass</key>
-        <string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+        <key>NEMachServiceName</key>
+        <string>group.com.rayfish.app.tunnel</string>
+        <key>NEProviderClasses</key>
+        <dict>
+            <key>com.apple.networkextension.packet-tunnel</key>
+            <string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+        </dict>
     </dict>
 </dict>
 </plist>

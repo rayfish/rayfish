@@ -7,40 +7,52 @@ settings:
   base:
     DEVELOPMENT_TEAM: ""
     PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app
+    MARKETING_VERSION: "0.4.2"
+    CURRENT_PROJECT_VERSION: "9"
+  configs:
+    Debug:
+      CODE_SIGN_STYLE: Automatic
+      CODE_SIGN_IDENTITY: "Apple Development"
+    Release:
+      ENABLE_HARDENED_RUNTIME: YES
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+      OTHER_CODE_SIGN_FLAGS: "--timestamp"
 targets:
   Rayfish:
     type: application
     platform: macOS
     sources:
       - path: Rayfish/App
+      - path: Rayfish/Assets.xcassets
+      - path: Rayfish/Fonts
+        type: folder
       - path: Shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app
-        CODE_SIGN_ENTITLEMENTS: Rayfish/RayfishSigning.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Rayfish/Rayfish.entitlements
         INFOPLIST_FILE: Rayfish/Info.plist
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: Rayfish/RayfishDevelopment.entitlements
     dependencies:
       - target: RayfishTunnelExtension
         embed: true
-      - target: RayfishCommand
-        embed: true
     postBuildScripts:
-      - name: Place ray beside the app executable
+      - name: Bundle the Rust ray command
         script: |
           set -euo pipefail
-          install -m 755 "$BUILT_PRODUCTS_DIR/ray" "$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray"
-  RayfishCommand:
-    type: tool
-    platform: macOS
-    sources:
-      - path: RayfishCommand
-      - path: Rayfish/App/SystemExtensionInstaller.swift
-      - path: Shared
-    settings:
-      base:
-        PRODUCT_NAME: ray
+          cd "$SRCROOT/.."
+          cargo -q build --release -p rayfish --bin ray
+          destination="$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray"
+          install -m 755 target/release/ray "$destination"
+          if [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
+            codesign --force --options runtime --timestamp --sign "$EXPANDED_CODE_SIGN_IDENTITY" "$destination"
+          fi
   RayfishTunnelExtension:
     type: system-extension
+    productName: com.rayfish.app.tunnel
     platform: macOS
     sources:
       - path: RayfishTunnelExtension
@@ -49,6 +61,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app.tunnel
+        PRODUCT_NAME: com.rayfish.app.tunnel
+        PRODUCT_MODULE_NAME: RayfishTunnelExtension
         CODE_SIGN_ENTITLEMENTS: RayfishTunnelExtension/RayfishTunnelExtension.entitlements
         INFOPLIST_FILE: RayfishTunnelExtension/Info.plist
         APPLICATION_EXTENSION_API_ONLY: YES
@@ -63,9 +77,12 @@ targets:
         OTHER_SWIFT_FLAGS:
           - "-Xcc"
           - "-fmodule-map-file=$(SRCROOT)/Generated/ray_appleFFI.modulemap"
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: RayfishTunnelExtension/RayfishTunnelDevelopment.entitlements
     preBuildScripts:
       - name: Build Rayfish Apple bridge
         script: |
           set -euo pipefail
           cd "$SRCROOT/.."
-          cargo build --release -p ray-apple
+          cargo -q build --release -p ray-apple

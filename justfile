@@ -48,6 +48,32 @@ macos:
     xcodegen generate --spec macos/project.yml --project macos
     open macos/Rayfish.xcodeproj
 
+# Test macOS legacy-service detection and migration without touching launchd.
+macos-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc macos/Shared/LegacyDaemon.swift macos/Tests/LegacyDaemonTests.swift -o target/macos-tests/migration-tests
+    target/macos-tests/migration-tests
+
+# Exercise concurrent XPC clients, signature rejection, and request timeouts.
+macos-ipc-test identity="Apple Development":
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/TunnelIPC.swift macos/Shared/ProviderMessage.swift macos/Tests/TunnelIPCTests.swift -o target/macos-tests/tunnel-ipc-tests
+    codesign --force --sign "{{identity}}" --identifier com.rayfish.app target/macos-tests/tunnel-ipc-tests
+    target/macos-tests/tunnel-ipc-tests
+
+# Build a locally testable app with automatic Apple Development signing.
+macos-dev:
+    env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration Debug -destination platform=macOS,arch=arm64 ARCHS=arm64 -derivedDataPath target/macos-development -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+
+# Check the actual signed release before installing it.
+macos-validate app="target/macos/Build/Products/Release/Rayfish.app":
+    xcrun swift macos/Tests/ValidateBundle.swift "{{app}}"
+
+# Require Apple notarization before handing over a release for installation.
+macos-assess app="target/macos/Build/Products/Release/Rayfish.app":
+    spctl --assess --type execute --verbose=2 "{{app}}"
+    codesign --verify --strict -R='notarized' "{{app}}/Contents/Library/SystemExtensions/com.rayfish.app.tunnel.systemextension"
+
 # Compile the Android core for both APK ABIs without an NDK on this machine:
 # cross builds it in a container (see cross/Dockerfile.android). Catches the
 # `#[cfg(target_os = "android")]` code that no desktop build ever sees. `just

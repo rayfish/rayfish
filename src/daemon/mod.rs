@@ -93,6 +93,7 @@ use crate::transport;
 // where the packet interface is a `VpnService` fd supplied from Kotlin.
 #[cfg(not(target_os = "android"))]
 use crate::tun;
+use crate::tun::{TunRead, TunWrite};
 use ray_proto::SuggestedFirewall;
 use smol_str::SmolStr;
 
@@ -222,6 +223,8 @@ pub(crate) use mesh::*;
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
+#[cfg(unix)]
+pub use mesh::start_embedded_ipc;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
@@ -959,6 +962,20 @@ impl Daemon {
                 }
             });
         }
+    }
+
+    /// Start forwarding through an interface whose link, routes, and DNS are
+    /// already configured by the embedder (for example, NetworkExtension).
+    /// Unlike `activate`, this does not change the host network configuration.
+    /// Stop it with `detach_tun` before the embedder removes the interface.
+    pub async fn attach_external_tun<R: TunRead, W: TunWrite>(
+        self: &Arc<Self>,
+        reader: R,
+        writer: W,
+    ) {
+        self.attach_tun(reader, writer).await;
+        self.active.store(true, Ordering::SeqCst);
+        self.registry.poll_nudge.notify_waiters();
     }
 
     /// Part of the embedding API (used by `ray-mobile`'s `down`): stop the
@@ -3110,8 +3127,6 @@ mod headless_tests {
                 .expect("build_headless should not hang")
                 .expect("build_headless should succeed");
 
-        use std::sync::atomic::Ordering;
-
         // Helper: send one packet through the same `tun_tx` cell the peer-reader
         // and DNS-injection paths use, then wait for the given writer to see it.
         async fn send_pkt(daemon: &Arc<DaemonState>, pkt: &'static [u8]) {
@@ -3140,14 +3155,17 @@ mod headless_tests {
         let writer1 = FakeTunWriter::default();
         let sink1 = Arc::clone(&writer1.written);
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::new(()),
                 },
                 writer1,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            daemon.status(),
+            IpcMessage::StatusResponse { active: true, .. }
+        ));
 
         send_pkt(&daemon, b"packet-1").await;
         assert!(
@@ -3158,6 +3176,10 @@ mod headless_tests {
         // 2. Toggle: detach, then re-attach reader2 + writer2. This is the path
         //    that used to silently break before the fresh-channel-per-attach fix.
         daemon.detach_tun();
+        assert!(matches!(
+            daemon.status(),
+            IpcMessage::StatusResponse { active: false, .. }
+        ));
         let writer2 = FakeTunWriter {
             mtu: Some(1280),
             ..Default::default()
@@ -3165,14 +3187,13 @@ mod headless_tests {
         let sink2 = Arc::clone(&writer2.written);
         let alive2 = Arc::new(());
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::clone(&alive2),
                 },
                 writer2,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
 
         // A packet queued across the MTU change must not reach the smaller TUN.
         // The small packet acts as a barrier after the oversized packet.
@@ -3194,14 +3215,13 @@ mod headless_tests {
         let writer3 = FakeTunWriter::default();
         let sink3 = Arc::clone(&writer3.written);
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::new(()),
                 },
                 writer3,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
 
         send_pkt(&daemon, b"packet-3").await;
         assert_eq!(daemon.registry.peers.local_mtu(), 1500);
