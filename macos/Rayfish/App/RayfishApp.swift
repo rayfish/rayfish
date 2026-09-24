@@ -55,13 +55,19 @@ private struct RayfishMenu: View {
 
     var body: some View {
         Group {
-            Text("Rayfish: \(controller.connectionLabel.capitalized)")
-            Button(controller.isConnected ? "Disconnect" : "Connect") {
-                Task {
-                    if controller.isConnected { await controller.disconnect() }
-                    else { await controller.connect() }
+            Toggle(controller.connectionLabel.capitalized, isOn: Binding(
+                get: { controller.isConnected },
+                set: { connected in
+                    Task {
+                        if connected { await controller.connect() }
+                        else { await controller.disconnect() }
+                    }
                 }
-            }.disabled(controller.isLoading)
+            ))
+            .disabled(controller.isLoading
+                      || controller.connectionStatus == .connecting
+                      || controller.connectionStatus == .reasserting
+                      || controller.connectionStatus == .disconnecting)
 
             if let status = controller.status {
                 Button("Copy This Mac's IP Address") { copyAddress(status.ipv6) }

@@ -8,12 +8,16 @@ settings:
     DEVELOPMENT_TEAM: ""
     PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app
     MARKETING_VERSION: "0.4.2"
-    CURRENT_PROJECT_VERSION: "9"
+    CURRENT_PROJECT_VERSION: "10"
+    RAYFISH_APP_PROFILE: Rayfish
+    RAYFISH_TUNNEL_PROFILE: "Rayfish tunnel"
   configs:
     Debug:
       CODE_SIGN_STYLE: Automatic
       CODE_SIGN_IDENTITY: "Apple Development"
     Release:
+      CODE_SIGN_STYLE: Manual
+      CODE_SIGN_IDENTITY: "Developer ID Application"
       ENABLE_HARDENED_RUNTIME: YES
       CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
       OTHER_CODE_SIGN_FLAGS: "--timestamp"
@@ -36,6 +40,8 @@ targets:
       configs:
         Debug:
           CODE_SIGN_ENTITLEMENTS: Rayfish/RayfishDevelopment.entitlements
+        Release:
+          PROVISIONING_PROFILE_SPECIFIER: "$(RAYFISH_APP_PROFILE)"
     dependencies:
       - target: RayfishTunnelExtension
         embed: true
@@ -44,7 +50,7 @@ targets:
         script: |
           set -euo pipefail
           cd "$SRCROOT/.."
-          cargo -q build --release -p rayfish --bin ray
+          cargo -q build --release --locked -p rayfish --bin ray
           destination="$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray"
           install -m 755 target/release/ray "$destination"
           if [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
@@ -80,9 +86,11 @@ targets:
       configs:
         Debug:
           CODE_SIGN_ENTITLEMENTS: RayfishTunnelExtension/RayfishTunnelDevelopment.entitlements
+        Release:
+          PROVISIONING_PROFILE_SPECIFIER: "$(RAYFISH_TUNNEL_PROFILE)"
     preBuildScripts:
       - name: Build Rayfish Apple bridge
         script: |
           set -euo pipefail
           cd "$SRCROOT/.."
-          cargo -q build --release -p ray-apple
+          cargo -q build --release --locked -p ray-apple

@@ -157,6 +157,15 @@ jobs:
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
 
+  macos-app:
+    needs: create-release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/macos-release.yml
+    with:
+      release_tag: ${{ needs.create-release.outputs.tag }}
+    secrets: inherit
+
   windows:
     needs: create-release
     runs-on: windows-latest

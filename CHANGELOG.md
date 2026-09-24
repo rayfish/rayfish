@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Production macOS app builds run in GitHub Actions.** Release builds produce
+  signed, notarized Apple Silicon and Intel disk images, with manual builds
+  available as workflow artifacts. The installer has a Retina-ready Rayfish
+  design with drag-to-Applications installation.
+
 - **The macOS app bundles the original Rust `ray` CLI.** It uses the same
   commands and output as the standalone binary and talks directly to the
   running tunnel over Rayfish's normal local socket. Use the app to connect,
@@ -32,6 +37,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence has already been evicted from the log ring.
 
 ### Changed
+
+- **The macOS menu bar connection status is a toggle.** Click Connected to
+  disconnect or Disconnected to connect.
 
 - **Quitting the macOS app disconnects its VPN before exiting.** Closing only
   the main window leaves the menu bar app running.
