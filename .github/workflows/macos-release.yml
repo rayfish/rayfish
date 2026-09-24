@@ -29,21 +29,13 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-26
-            arch: arm64
-          - runner: macos-26-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: '13.0'
       CARGO_PROFILE_RELEASE_STRIP: none
-      MACOS_ARCH: ${{ matrix.arch }}
+      MACOS_ARCH: arm64
       APPLE_TEAM_ID: '3D9W8F63CL'
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +66,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-app-release-${{ matrix.arch }}
+          shared-key: macos-app-release-arm64
           cache-on-failure: true
 
       - name: Install build tools
@@ -131,7 +123,7 @@ jobs:
       - name: Upload verified disk image
         uses: actions/upload-artifact@v4
         with:
-          name: rayfish-macos-${{ matrix.arch }}
+          name: rayfish-macos-arm64
           path: |
             target/macos-release/dist/*.dmg
             target/macos-release/dist/*.sha256
@@ -141,7 +133,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-diagnostics-${{ matrix.arch }}
+          name: macos-diagnostics-arm64
           path: |
             target/macos-release/*.log
             target/macos-release/notary-*.json
@@ -174,7 +166,7 @@ jobs:
           pattern: rayfish-macos-*
           merge-multiple: true
           path: dist
-      - name: Attach both architectures to the release
+      - name: Attach the disk image to the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

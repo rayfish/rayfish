@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${MACOS_ARCH:?Set MACOS_ARCH to arm64 or x86_64}"
+: "${MACOS_ARCH:?Set MACOS_ARCH to arm64}"
 : "${APPLE_TEAM_ID:?Set APPLE_TEAM_ID}"
 : "${RAYFISH_APP_PROFILE:?Set the app distribution profile UUID or name}"
 : "${RAYFISH_TUNNEL_PROFILE:?Set the tunnel distribution profile UUID or name}"
 : "${GITHUB_RUN_NUMBER:?Run this script through the macOS app release workflow}"
 
-if [[ "$(uname -s)" != Darwin || "$(uname -m)" != "$MACOS_ARCH" ]]; then
-    echo 'Build each architecture on a matching macOS runner.' >&2
+if [[ "$MACOS_ARCH" != arm64 || "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
+    echo 'Build the macOS app on an Apple Silicon runner.' >&2
     exit 1
 fi
 
