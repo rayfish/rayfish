@@ -1,6 +1,6 @@
 //! Swift bindings for the Rayfish core running in an Apple packet tunnel.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 mod apple_tun;
 mod migration;
 
@@ -17,7 +17,12 @@ use rayfish::ipc::IpcMessage;
 use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
+#[cfg(target_os = "macos")]
+use tokio::sync::mpsc;
+
+#[cfg(target_os = "macos")]
+use apple_tun::{AppleTunReader, AppleTunWriter, PACKET_QUEUE_CAPACITY};
 #[cfg(target_os = "macos")]
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -92,7 +97,7 @@ pub struct Node {
     #[cfg(target_os = "macos")]
     ipc_task: Mutex<Option<JoinHandle<()>>>,
     #[cfg(target_os = "macos")]
-    packet_tx: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    packet_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
 
 impl Node {
@@ -112,7 +117,7 @@ impl Node {
     pub fn new(config_dir: String) -> Arc<Self> {
         let config_dir = PathBuf::from(config_dir);
         config::set_config_dir_override(config_dir.clone());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("creating the Apple bridge runtime must succeed");
@@ -129,12 +134,8 @@ impl Node {
 
     /// Start the control plane. This is safe to call more than once.
     pub fn start(&self) -> Result<(), AppleError> {
-        if self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
+        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
             return Ok(());
         }
         let state = self
@@ -153,21 +154,14 @@ impl Node {
             };
             *self.ipc_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
         }
-        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_none() {
-            *slot = Some(state);
-        }
+        *slot = Some(state);
         Ok(())
     }
 
     /// Copy legacy launchd state before starting the extension-owned node.
     pub fn migrate_legacy_state(&self, source: String) -> Result<(), AppleError> {
-        if self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
+        let slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
             return Err(AppleError::AlreadyStarted);
         }
         migration::copy_legacy_state(PathBuf::from(source).as_path(), &self.config_dir)
@@ -177,7 +171,7 @@ impl Node {
     /// The stable mesh address that the packet tunnel assigns to this device.
     pub fn ipv6_address(&self) -> Result<String, AppleError> {
         let state = self.state()?;
-        let rayfish::ipc::IpcMessage::StatusResponse { endpoint_id, .. } = state.status() else {
+        let IpcMessage::StatusResponse { endpoint_id, .. } = state.status() else {
             return Err(AppleError::Network(
                 "node returned an invalid status response".to_owned(),
             ));
@@ -311,49 +305,32 @@ impl Node {
 
     pub fn leave_network(&self, network: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.leave_network(&network)) {
-            IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid leave response".to_owned(),
-            )),
-        }
+        expect_ok(
+            self.runtime.block_on(state.leave_network(&network)),
+            "leave",
+        )
     }
 
     pub fn set_hostname(&self, network: String, hostname: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        match self
-            .runtime
-            .block_on(state.set_hostname(&network, &hostname))
-        {
-            IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid hostname response".to_owned(),
-            )),
-        }
+        expect_ok(
+            self.runtime
+                .block_on(state.set_hostname(&network, &hostname)),
+            "hostname",
+        )
     }
 
     pub fn accept_request(&self, network: String, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.accept_request(&network, &id)) {
-            IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid approval response".to_owned(),
-            )),
-        }
+        expect_ok(
+            self.runtime.block_on(state.accept_request(&network, &id)),
+            "approval",
+        )
     }
 
     pub fn deny_request(&self, network: String, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        match state.deny_request(&network, &id) {
-            IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid denial response".to_owned(),
-            )),
-        }
+        expect_ok(state.deny_request(&network, &id), "denial")
     }
 
     /// Attach the system packet flow and start forwarding packets.
@@ -370,12 +347,11 @@ impl Node {
             if packet_tx.is_some() {
                 return Err(AppleError::AlreadyActive);
             }
-            let (tx, rx) = tokio::sync::mpsc::channel(apple_tun::PACKET_QUEUE_CAPACITY);
-            let reader = apple_tun::AppleTunReader::new(rx);
-            let writer = apple_tun::AppleTunWriter::new(flow);
-            self.runtime.block_on(async {
-                state.attach_external_tun(reader, writer).await;
-            });
+            let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+            let reader = AppleTunReader::new(rx);
+            let writer = AppleTunWriter::new(flow);
+            self.runtime
+                .block_on(state.attach_external_tun(reader, writer));
             *packet_tx = Some(tx);
             Ok(())
         }
@@ -419,7 +395,9 @@ impl Node {
 
     /// Stop the mesh node and release all persistent-store locks.
     pub fn stop(&self) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Keep startup waiting until the old node releases its store locks.
+        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = slot.take();
         #[cfg(target_os = "macos")]
         self.packet_tx
             .lock()
@@ -465,11 +443,42 @@ impl Node {
     }
 }
 
+fn expect_ok(response: IpcMessage, operation: &str) -> Result<(), AppleError> {
+    match response {
+        IpcMessage::Ok { .. } => Ok(()),
+        IpcMessage::Error { message } => Err(AppleError::Network(message)),
+        _ => Err(AppleError::Network(format!(
+            "node returned an invalid {operation} response"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn command_results_preserve_daemon_errors_and_reject_other_responses() {
+        assert!(
+            expect_ok(
+                IpcMessage::Ok {
+                    message: "done".into()
+                },
+                "leave"
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            expect_ok(IpcMessage::Error { message: "denied".into() }, "leave"),
+            Err(AppleError::Network(message)) if message == "denied"
+        ));
+        assert!(matches!(
+            expect_ok(IpcMessage::Status, "leave"),
+            Err(AppleError::Network(message)) if message == "node returned an invalid leave response"
+        ));
+    }
 
     #[test]
     fn stop_from_host_thread_releases_state_and_allows_restart() {
@@ -491,5 +500,25 @@ mod tests {
             assert!(matches!(node.state(), Err(AppleError::NotStarted)));
         }
         node.stop();
+
+        // The installed macOS socket is deliberately not used by this test.
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::sync::Barrier;
+            use std::thread;
+
+            let ready = Barrier::new(2);
+            thread::scope(|scope| {
+                let start = || {
+                    ready.wait();
+                    node.start().unwrap();
+                    node.state().unwrap()
+                };
+                let first = scope.spawn(start);
+                let second = scope.spawn(start);
+                assert!(Arc::ptr_eq(&first.join().unwrap(), &second.join().unwrap()));
+            });
+            node.stop();
+        }
     }
 }

@@ -9,10 +9,9 @@ func require(_ condition: Bool, _ message: String) throws {
     if !condition { throw ValidationError(message: message) }
 }
 
-func plist(at url: URL) throws -> [String: Any] {
-    let data = try Data(contentsOf: url)
+func plist(_ data: Data) throws -> [String: Any] {
     guard let value = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
-        throw ValidationError(message: "Invalid property list: \(url.path)")
+        throw ValidationError(message: "Expected a property list dictionary")
     }
     return value
 }
@@ -39,7 +38,7 @@ do {
     let names = try FileManager.default.contentsOfDirectory(atPath: extensions.path)
     try require(names == ["\(identifier).systemextension"], "Expected exactly \(identifier).systemextension, found \(names)")
     let bundle = extensions.appendingPathComponent(names[0])
-    let info = try plist(at: bundle.appendingPathComponent("Contents/Info.plist"))
+    let info = try plist(Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist")))
     try require(info["CFBundleIdentifier"] as? String == identifier, "Tunnel bundle identifier mismatch")
     try require(info["CFBundlePackageType"] as? String == "SYSX", "Tunnel CFBundlePackageType must be SYSX")
     guard let executable = info["CFBundleExecutable"] as? String else {
@@ -49,12 +48,6 @@ do {
     let network = info["NetworkExtension"] as? [String: Any] ?? [:]
     let providers = network["NEProviderClasses"] as? [String: String] ?? [:]
     try require(providers["com.apple.networkextension.packet-tunnel"] == "RayfishTunnelExtension.PacketTunnelProvider", "Missing packet tunnel provider class")
-    let data = try codesign(["-d", "--entitlements", "-", "--xml", bundle.path])
-    let entitlements = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] ?? [:]
-    let capabilities = entitlements["com.apple.developer.networking.networkextension"] as? [String] ?? []
-    try require(capabilities.contains("packet-tunnel-provider-systemextension"), "Missing signed packet tunnel system-extension entitlement")
-    let groups = entitlements["com.apple.security.application-groups"] as? [String] ?? []
-    try require(groups.contains("group.com.rayfish.app"), "Missing shared state app group")
     for code in [app, bundle, app.appendingPathComponent("Contents/MacOS/ray")] {
         _ = try codesign(["--verify", "--strict", code.path])
         let signature = try codesign(["-dv", "--verbose=2", code.path], captureErrors: true)
@@ -63,16 +56,23 @@ do {
         try require(details.contains("(runtime)"), "Hardened runtime is disabled: \(code.path)")
         try require(details.contains("Timestamp="), "Missing secure signing timestamp: \(code.path)")
         let signedData = try codesign(["-d", "--entitlements", "-", "--xml", code.path])
-        if code == app { try require(!signedData.isEmpty, "Missing app entitlements") }
-        if !signedData.isEmpty {
-            let signedEntitlements = try PropertyListSerialization.propertyList(from: signedData, format: nil) as? [String: Any] ?? [:]
-            if code == app {
-                let team = signedEntitlements["com.apple.developer.team-identifier"] as? String ?? ""
-                try require(!team.isEmpty && signedEntitlements["com.apple.application-identifier"] as? String == "\(team).com.rayfish.app",
-                            "Missing application identity for NetworkExtension messaging")
-            }
-            try require(signedEntitlements["com.apple.security.get-task-allow"] as? Bool != true, "Release includes debugging entitlement: \(code.path)")
+        if signedData.isEmpty {
+            try require(code != app && code != bundle, "Missing entitlements: \(code.path)")
+            continue
         }
+        let signedEntitlements = try plist(signedData)
+        if code == app {
+            let team = signedEntitlements["com.apple.developer.team-identifier"] as? String ?? ""
+            try require(!team.isEmpty && signedEntitlements["com.apple.application-identifier"] as? String == "\(team).com.rayfish.app",
+                        "Missing application identity for NetworkExtension messaging")
+        }
+        if code == bundle {
+            let capabilities = signedEntitlements["com.apple.developer.networking.networkextension"] as? [String] ?? []
+            try require(capabilities.contains("packet-tunnel-provider-systemextension"), "Missing signed packet tunnel system-extension entitlement")
+            let groups = signedEntitlements["com.apple.security.application-groups"] as? [String] ?? []
+            try require(groups.contains("group.com.rayfish.app"), "Missing shared state app group")
+        }
+        try require(signedEntitlements["com.apple.security.get-task-allow"] as? Bool != true, "Release includes debugging entitlement: \(code.path)")
     }
     print("Rayfish release packaging and signing checks passed; notarization is checked separately with macos-assess")
 } catch {

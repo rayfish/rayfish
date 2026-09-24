@@ -74,8 +74,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install macOS build tools
+        run: brew install xcodegen just
+
+      - name: Test native app
+        run: just macos-test macos-ipc-test macos-ui-test
 
       - name: Check Apple bindings
         run: |

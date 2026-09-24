@@ -1,10 +1,8 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
-static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 const MIGRATION_MARKER: &str = ".legacy-state-migrated";
 
 pub(crate) fn copy_legacy_state(source: &Path, destination: &Path) -> Result<()> {
@@ -41,37 +39,24 @@ pub(crate) fn copy_legacy_state(source: &Path, destination: &Path) -> Result<()>
         .parent()
         .context("extension state directory has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let sequence = STAGING_ID.fetch_add(1, Ordering::Relaxed);
-    let staging = parent.join(format!(
-        ".rayfish-migration-{}-{sequence}",
-        std::process::id()
-    ));
-    if staging.exists() {
-        bail!("migration staging directory already exists");
+    let staging = tempfile::Builder::new()
+        .prefix(".rayfish-migration-")
+        .tempdir_in(parent)
+        .context("creating migration staging directory")?;
+    copy_directory(source, staging.path())?;
+    fs::write(staging.path().join(MIGRATION_MARKER), "migrated\n")
+        .context("writing migration marker")?;
+    if destination.exists() {
+        fs::remove_dir(destination)
+            .with_context(|| format!("removing empty {}", destination.display()))?;
     }
-
-    let result = (|| {
-        fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
-        copy_directory(source, &staging)?;
-        fs::write(staging.join(MIGRATION_MARKER), "migrated\n")
-            .context("writing migration marker")?;
-        if destination.exists() {
-            fs::remove_dir(destination)
-                .with_context(|| format!("removing empty {}", destination.display()))?;
-        }
-        fs::rename(&staging, destination).with_context(|| {
-            format!(
-                "moving migrated state from {} to {}",
-                staging.display(),
-                destination.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if result.is_err() && staging.exists() {
-        let _ = fs::remove_dir_all(&staging);
-    }
-    result
+    fs::rename(staging.path(), destination).with_context(|| {
+        format!(
+            "moving migrated state from {} to {}",
+            staging.path().display(),
+            destination.display()
+        )
+    })
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
@@ -125,6 +110,38 @@ mod tests {
             fs::read_to_string(destination.join("networks/home.toml")).unwrap(),
             "name = 'home'"
         );
+    }
+
+    #[test]
+    fn completed_migration_is_not_repeated() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("legacy");
+        let destination = root.path().join("extension");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("secret_key"), "original").unwrap();
+        copy_legacy_state(&source, &destination).unwrap();
+        fs::write(source.join("secret_key"), "changed").unwrap();
+        copy_legacy_state(&source, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("secret_key")).unwrap(),
+            "original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_copy_removes_staging_and_leaves_destination_empty() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("legacy");
+        let destination = root.path().join("extension");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        symlink("missing", source.join("symlink")).unwrap();
+        assert!(copy_legacy_state(&source, &destination).is_err());
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
     }
 
     #[test]

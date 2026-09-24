@@ -11,9 +11,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         completionHandler: @escaping (Error?) -> Void
     ) {
         RayfishLog.tunnel.info("Starting tunnel build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown", privacy: .public)")
+        var startingNode: Node?
         do {
             let directory = try stateDirectory()
             let node = Node(configDir: directory.path)
+            startingNode = node
             if let legacy = try LegacyDaemon.discover() {
                 RayfishLog.tunnel.info("Checking legacy daemon migration")
                 try legacy.migrateIfNeeded(to: directory) { source in
@@ -21,14 +23,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 }
             }
             try node.start()
-            let settings = try networkSettings(address: node.ipv6Address())
+            let settings = networkSettings(address: try node.ipv6Address())
             setTunnelNetworkSettings(settings) { [weak self] error in
-                guard error == nil else {
-                    RayfishLog.tunnel.error("Network settings failed: \(error!.localizedDescription, privacy: .public)")
+                if let error {
+                    node.stop()
+                    RayfishLog.tunnel.error("Network settings failed: \(error.localizedDescription, privacy: .public)")
                     completionHandler(error)
                     return
                 }
                 guard let self else {
+                    node.stop()
                     completionHandler(ProviderError.providerReleased)
                     return
                 }
@@ -39,11 +43,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
                 } catch {
+                    node.stop()
                     RayfishLog.tunnel.error("Tunnel activation failed: \(error.localizedDescription, privacy: .public)")
                     completionHandler(error)
                 }
             }
         } catch {
+            startingNode?.stop()
             RayfishLog.tunnel.error("Tunnel startup failed: \(error.localizedDescription, privacy: .public)")
             completionHandler(error)
         }
@@ -89,13 +95,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
 
     private func readPackets() {
         packetFlow.readPackets { [weak self] packets, _ in
-            guard let self else {
-                return
-            }
+            guard let self, let node = self.node else { return }
             do {
-                guard let node = node else {
-                    return
-                }
                 try node.receivePackets(packets: packets)
                 self.readPackets()
             } catch {
@@ -105,7 +106,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         }
     }
 
-    private func networkSettings(address: String) throws -> NEPacketTunnelNetworkSettings {
+    private func networkSettings(address: String) -> NEPacketTunnelNetworkSettings {
         // Rayfish has no single tunnel server; macOS still requires a numeric IP here.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         let ipv6 = NEIPv6Settings(addresses: [address], networkPrefixLengths: [128])
@@ -131,9 +132,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         guard let node else {
             throw ProviderError.notStarted
         }
+        var inviteCode: String?
         switch request.action {
         case .status:
-            return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
+            break
         case .create:
             try node.createNetwork(name: request.name, hostname: request.hostname)
         case .join:
@@ -145,8 +147,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
             guard let name = request.name, !name.isEmpty else {
                 throw ProviderError.missingNetworkName
             }
-            let code = try node.createInvite(network: name)
-            return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: code)
+            inviteCode = try node.createInvite(network: name)
         case .leave:
             guard let name = request.name, !name.isEmpty else {
                 throw ProviderError.missingNetworkName
@@ -157,18 +158,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 throw ProviderError.missingNetworkName
             }
             try node.setHostname(network: name, hostname: hostname)
-        case .acceptRequest:
+        case .acceptRequest, .denyRequest:
             guard let name = request.name, let id = request.id else {
                 throw ProviderError.missingNetworkName
             }
-            try node.acceptRequest(network: name, id: id)
-        case .denyRequest:
-            guard let name = request.name, let id = request.id else {
-                throw ProviderError.missingNetworkName
+            if request.action == .acceptRequest {
+                try node.acceptRequest(network: name, id: id)
+            } else {
+                try node.denyRequest(network: name, id: id)
             }
-            try node.denyRequest(network: name, id: id)
         }
-        return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: nil)
+        return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: inviteCode)
     }
 
     private func status(from status: NodeStatus) -> ProviderStatus {

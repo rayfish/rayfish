@@ -69,8 +69,6 @@ private enum Page: String, CaseIterable {
 private struct ContentView: View {
     @ObservedObject var controller: TunnelController
     @State private var page: Page = .networks
-    @State private var showCreate = false
-    @State private var showJoin = false
 
     private var connected: Bool { controller.isConnected }
 
@@ -120,7 +118,7 @@ private struct ContentView: View {
                 }
                 switch page {
                 case .networks:
-                    NetworksView(controller: controller, showCreate: $showCreate, showJoin: $showJoin)
+                    NetworksView(controller: controller)
                 case .devices:
                     DevicesView(controller: controller)
                 case .settings:
@@ -139,8 +137,6 @@ private struct ContentView: View {
         .tint(RayfishTheme.accent)
         .preferredColorScheme(.dark)
         .frame(minWidth: 820, minHeight: 560)
-        .sheet(isPresented: $showCreate) { CreateNetworkSheet(controller: controller) }
-        .sheet(isPresented: $showJoin) { JoinNetworkSheet(controller: controller) }
         .task {
             await controller.startup()
         }
@@ -197,8 +193,7 @@ private struct ContentView: View {
 
 private struct NetworksView: View {
     @ObservedObject var controller: TunnelController
-    @Binding var showCreate: Bool
-    @Binding var showJoin: Bool
+    @State private var networkAction: NetworkAction?
     @State private var inviteCode: String?
     @State private var leavingNetwork: ProviderNetwork?
     @State private var renamingNetwork: ProviderNetwork?
@@ -227,8 +222,8 @@ private struct NetworksView: View {
             HStack(spacing: 8) {
                 Text("Networks").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
                 Spacer()
-                Button("Join with a code") { showJoin = true }
-                Button("Create a network") { showCreate = true }
+                Button("Join with a code") { networkAction = .join }
+                Button("Create a network") { networkAction = .create }
                     .buttonStyle(RayfishButtonStyle(kind: .primary))
             }
             .disabled(controller.isLoading)
@@ -266,6 +261,7 @@ private struct NetworksView: View {
             }
         } message: { Text("This Mac will lose access to the network until it joins again.") }
         .sheet(item: $renamingNetwork) { network in RenameHostSheet(controller: controller, network: network) }
+        .sheet(item: $networkAction) { action in NetworkSheet(controller: controller, action: action) }
     }
 }
 
@@ -457,63 +453,50 @@ private struct RenameHostSheet: View {
     }
 }
 
-private struct CreateNetworkSheet: View {
-    @ObservedObject var controller: TunnelController
-    @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var hostname = ""
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Create a network").font(RayfishTheme.heading(18))
-            Text("Only people you invite can join.").foregroundColor(RayfishTheme.muted)
-            TextField("Network name (optional)", text: $name)
-            TextField("This Mac's name (optional)", text: $hostname)
-            if let error = controller.error { Text(error).foregroundColor(RayfishTheme.amber).font(RayfishTheme.text(13)) }
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button("Create") {
-                    Task {
-                        if controller.status == nil { await controller.connect() }
-                        guard controller.status != nil else { return }
-                        await controller.create(name: name.isEmpty ? nil : name, hostname: hostname.isEmpty ? nil : hostname)
-                        if controller.error == nil { dismiss() }
-                    }
-                }.buttonStyle(RayfishButtonStyle(kind: .primary)).disabled(controller.isLoading)
-            }
-        }.rayfishSheet().frame(width: 440)
-    }
+private enum NetworkAction: String, Identifiable {
+    case create = "Create", join = "Join"
+    var id: Self { self }
 }
 
-private struct JoinNetworkSheet: View {
+private struct NetworkSheet: View {
     @ObservedObject var controller: TunnelController
+    let action: NetworkAction
     @Environment(\.dismiss) private var dismiss
-    @State private var code = ""
+    @State private var input = ""
     @State private var hostname = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("Join a network").font(RayfishTheme.heading(18))
-            Text("Paste the invite code you received.").foregroundColor(RayfishTheme.muted)
-            TextEditor(text: $code)
-                .font(RayfishTheme.mono(12)).scrollContentBackground(.hidden)
-                .padding(8).frame(height: 100).background(RayfishTheme.deep)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(RayfishTheme.border))
+            Text("\(action.rawValue) a network").font(RayfishTheme.heading(18))
+            Text(action == .create ? "Only people you invite can join." : "Paste the invite code you received.")
+                .foregroundColor(RayfishTheme.muted)
+            if action == .create {
+                TextField("Network name (optional)", text: $input)
+            } else {
+                TextEditor(text: $input)
+                    .font(RayfishTheme.mono(12)).scrollContentBackground(.hidden)
+                    .padding(8).frame(height: 100).background(RayfishTheme.deep)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(RayfishTheme.border))
+            }
             TextField("This Mac's name (optional)", text: $hostname)
             if let error = controller.error { Text(error).foregroundColor(RayfishTheme.amber).font(RayfishTheme.text(13)) }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
-                Button("Join") {
+                Button(action.rawValue) {
                     Task {
                         if controller.status == nil { await controller.connect() }
                         guard controller.status != nil else { return }
-                        await controller.join(code: code, hostname: hostname.isEmpty ? nil : hostname)
+                        let requestedHostname = hostname.isEmpty ? nil : hostname
+                        switch action {
+                        case .create: await controller.create(name: input.isEmpty ? nil : input, hostname: requestedHostname)
+                        case .join: await controller.join(code: input, hostname: requestedHostname)
+                        }
                         if controller.error == nil { dismiss() }
                     }
                 }.buttonStyle(RayfishButtonStyle(kind: .primary))
-                    .disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || controller.isLoading)
+                    .disabled(controller.isLoading || (action == .join && input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
-        }.rayfishSheet().frame(width: 460)
+        }.rayfishSheet().frame(width: action == .create ? 440 : 460)
     }
 }

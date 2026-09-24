@@ -45,7 +45,7 @@ enum ShellCommandInstaller {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(fileName)
     }
 
-    private static func replacingCommand(in contents: String, executable: String) -> String {
+    static func replacingCommand(in contents: String, executable: String) -> String {
         let lines = contents.components(separatedBy: .newlines)
         var retained: [String] = []
         var index = 0
@@ -61,13 +61,14 @@ enum ShellCommandInstaller {
             index += 1
         }
 
-        let command = "alias ray=\(shellQuoted(executable))"
+        // Quote the executable when the alias runs, then quote that alias value.
+        let command = "alias ray=\(shellQuoted(shellQuoted(executable)))"
         return retained.joined(separator: "\n").trimmingCharacters(in: .newlines)
             + "\n\n\(marker)\n\(command)\n"
     }
 
     private static func shellQuoted(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'"))'"
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 }
 
