@@ -1,11 +1,18 @@
 # macOS releases
 
-The **macOS app release** GitHub Actions workflow builds separate Apple Silicon
-and Intel apps with Xcode 26.6. Each app contains the original Rust `ray` command
-and the packet tunnel system extension. Both use the repository's Cargo version.
+macOS releases support Apple Silicon (arm64). Users can choose either:
+
+- The signed, notarized DMG for Apple Silicon (arm64), with the native app and
+  packet tunnel system extension.
+- The standalone `ray-macos-aarch64` binary with the CLI and launchd daemon,
+  including `ray gui` and `ray set-operator`.
+
+Release and nightly workflows build both. The **macOS app release** workflow
+builds the DMG with Xcode 26.6. The app also bundles the Rust `ray` CLI, using the
+repository's Cargo version.
 The DMG uses Rayfish's logo, fonts, and colors, with a drag-to-Applications layout.
-Nightly releases include `Rayfish-nightly-arm64.dmg` and
-`Rayfish-nightly-x86_64.dmg`, rebuilt from each push to master.
+Nightly releases include `Rayfish-nightly-arm64.dmg` and `ray-macos-aarch64`,
+rebuilt from each push to master.
 
 Configure these repository secrets before running it:
 
@@ -42,8 +49,8 @@ publishing a release.
 
 The existing **Release** workflow calls it for version tags and manual releases.
 The tag must match Cargo's version (or be `nightly`) and point to the commit being
-built. Both architectures must pass signing checks and Apple notarization before
-their DMGs are attached to the existing release. Missing credentials or failed notarization
+built. The app must pass signing checks and Apple notarization before its DMG is
+attached to the existing release. Missing credentials or failed notarization
 fail the job; there is no unsigned fallback. Other platform release jobs remain
 independent.
 

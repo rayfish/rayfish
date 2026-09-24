@@ -15,7 +15,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   apply immediately; mDNS changes briefly reconnect the VPN.
 
 - **Production macOS app builds run in GitHub Actions.** Release and nightly builds
-  produce signed, notarized Apple Silicon and Intel disk images, with manual builds
+  produce signed, notarized Apple Silicon disk images, with manual builds
   available as workflow artifacts. The installer has a Retina-ready Rayfish
   design with drag-to-Applications installation.
 
@@ -50,6 +50,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence has already been evicted from the log ring.
 
 ### Changed
+
+- **macOS releases support Apple Silicon (arm64) only.** Both the native app DMG
+  and the standalone CLI with daemon support remain available. Intel macOS builds
+  are no longer published.
 
 - **The CLI bundled with the macOS app omits `ray gui` and `ray set-operator`.**
   Standalone CLI builds retain both commands, including on macOS.
