@@ -435,8 +435,10 @@ async fn probe_query(up: SocketAddr, query: &[u8]) -> bool {
 }
 
 /// Filter `candidates` down to the ones that actually answer, probing them
-/// concurrently so a set of dead entries costs one [`PROBE_TIMEOUT`], not one
-/// per entry. Order is preserved: callers treat the first as preferred.
+/// concurrently. A dead entry now costs two [`PROBE_TIMEOUT`]s (the root
+/// question times out, then the dotted fallback), but the whole set pays that
+/// once, not per entry. Order is preserved: callers treat the first as
+/// preferred.
 pub async fn live_upstreams(candidates: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
     let probes = candidates
         .iter()
