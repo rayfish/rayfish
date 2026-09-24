@@ -262,6 +262,8 @@ pub mod transfers;
 
 mod connect_service;
 pub(crate) use connect_service::ConnectService;
+mod management_service;
+pub(crate) use management_service::ManagementService;
 
 // Nodes seen on the local network over mDNS (`ray mdns scan`).
 mod lan_discovery;
@@ -712,6 +714,8 @@ pub struct Daemon {
     /// `ray connect` state + ALPN accept arm (see [`ConnectService`]). Shared with
     /// [`ProtocolRouter`], which runs the accept arm.
     connect: Arc<ConnectService>,
+    /// Delegated machine enrollment and direct management protocol.
+    management: Arc<ManagementService>,
     device_cert: Option<control::DeviceCert>,
     /// This node's contact id (`ray connect`): the public half of the rotatable
     /// contact key. The secret lives in config (read fresh by the publisher and

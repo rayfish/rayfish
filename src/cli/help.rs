@@ -43,13 +43,24 @@ const ROOT: Groups = &[
             "status",
             "hostname",
             "ephemeral",
+            "dns",
         ],
     ),
     (
         "Members & access",
         &["invite", "requests", "kick", "admin", "alias", "identityof"],
     ),
-    ("Devices & links", &["connect", "contact", "pair", "unpair"]),
+    (
+        "Devices & links",
+        &[
+            "connect",
+            "contact",
+            "pair",
+            "unpair",
+            "machines",
+            "controller",
+        ],
+    ),
     ("Files", &["send", "files"]),
     ("Policy", &["firewall", "exit-node", "apply"]),
     (
@@ -67,7 +78,7 @@ const ROOT: Groups = &[
     ),
     (
         "Diagnostics",
-        &["ping", "netcheck", "logs", "report", "mdns", "dns"],
+        &["ping", "netcheck", "logs", "report", "mdns"],
     ),
     (
         "Setup",

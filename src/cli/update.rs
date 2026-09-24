@@ -4,7 +4,7 @@
 //! lives in the library so the daemon's auto-updater can reuse it; this file
 //! adds spinners, changelog printing, root checks, and the service restart.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
