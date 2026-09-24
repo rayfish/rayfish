@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-24
+
 ### Added
 
 - **The macOS Devices page shows machines you control,** including their status
@@ -39,16 +41,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ray apply` reconciles their network membership from the live per-network
   diff, using endpoint identity when a machine has a network-specific hostname.
 
-- **Android: an opt-in periodic diagnostics report.** Off by default, under
-  Periodic diagnostics in You, and only available while crash reporting is on.
-  With it on, the app sends one diagnostics report every eight hours, but only
-  when the window has something in it: new warnings or errors from the core, or
-  an unusual number of network-callback rebinds. Quiet windows send nothing and
-  carry their counts into the next one. Reports go out only while Rayfish is
-  running, with a tunnel or in standby, and stop entirely when it is off. This
-  exists for the faults that only show up overnight, where by morning the
-  evidence has already been evicted from the log ring.
-
 ### Changed
 
 - **macOS Settings aligns the DNS and mDNS switches to the right of each row.**
@@ -68,45 +60,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Quitting the macOS app disconnects its VPN before exiting.** Closing only
   the main window leaves the menu bar app running.
+
 - **macOS records startup, connection changes, and failures in Console** under
   the `com.rayfish.app` subsystem.
 
 - **macOS matches the website and web dashboard's colors, fonts, and compact
   network cards, with the Rayfish logo for its app and menu-bar icons.**
-
-- **Android updates background file notifications when file state changes.**
-  Idle standby no longer checks for offers and transfers every four seconds.
-  Auto-accept, progress, save completion, and pending-save timeouts still work.
-
-- **LAN discovery uses a 30-second base interval and ignores unchanged
-  announcements.** This reduces background multicast traffic and repeated logs.
-  New LAN peers can take 30 seconds or more to appear, and LAN address lookups
-  wait longer for the next query. Update LAN peers together for consistent
-  expiry behavior with the slower announcements.
-
-- **Routine TUN packet logs require trace logging.** Normal debug diagnostics
-  retain connection and failure details without formatting a log for every packet.
-
-- **Tunnel MTU increased from 1280 to 1500 bytes on desktop and Android.**
-  Desktop devices that reject 1500 fall back to 1280. Peers exchange their
-  receive limits so larger packets get valid ICMP feedback instead of being
-  injected into a smaller TUN. Mesh fragmentation carries packets over smaller
-  QUIC paths.
-
-- **Mesh protocol 6 supports protocol 5 peers during rollout.** New peers use
-  fragmentation with each other and send only whole datagrams to protocol 5
-  peers. Coordinators advertise protocol 5 in signed network records so older
-  peers can still join. Paths that need fragmentation still require both peers
-  to run protocol 6.
-
-- **Linux: the mesh interface is now named `rayfish0` instead of `tun0`.** The
-  kernel's default name says nothing about which program owns the device, and
-  on a host running more than one tunnel it went to whoever started first. The
-  index still comes from the kernel, so a second device becomes `rayfish1`.
-  Firewall rules, monitoring or scripts that match on `tun0` by name need
-  updating; nothing inside Rayfish assumed the name. macOS keeps `utunN` and
-  FreeBSD keeps `tunN`, neither of which accepts an arbitrary name; Windows
-  already named its adapter `rayfish`.
 
 ### Fixed
 
@@ -210,6 +169,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   could put its stale route back into the forwarding table. The live connection
   now closes the replaced connection and remains current, including its
   network-handle and idle-capability state.
+
+## [0.4.2] - 2026-09-19
+
+### Added
+
+- **Android: an opt-in periodic diagnostics report.** Off by default, under
+  Periodic diagnostics in You, and only available while crash reporting is on.
+  With it on, the app sends one diagnostics report every eight hours, but only
+  when the window has something in it: new warnings or errors from the core, or
+  an unusual number of network-callback rebinds. Quiet windows send nothing and
+  carry their counts into the next one. Reports go out only while Rayfish is
+  running, with a tunnel or in standby, and stop entirely when it is off. This
+  exists for the faults that only show up overnight, where by morning the
+  evidence has already been evicted from the log ring.
+
+### Changed
+
+- **Android updates background file notifications when file state changes.**
+  Idle standby no longer checks for offers and transfers every four seconds.
+  Auto-accept, progress, save completion, and pending-save timeouts still work.
+
+- **LAN discovery uses a 30-second base interval and ignores unchanged
+  announcements.** This reduces background multicast traffic and repeated logs.
+  New LAN peers can take 30 seconds or more to appear, and LAN address lookups
+  wait longer for the next query. Update LAN peers together for consistent
+  expiry behavior with the slower announcements.
+
+- **Routine TUN packet logs require trace logging.** Normal debug diagnostics
+  retain connection and failure details without formatting a log for every packet.
+
+- **Tunnel MTU increased from 1280 to 1500 bytes on desktop and Android.**
+  Desktop devices that reject 1500 fall back to 1280. Peers exchange their
+  receive limits so larger packets get valid ICMP feedback instead of being
+  injected into a smaller TUN. Mesh fragmentation carries packets over smaller
+  QUIC paths.
+
+- **Mesh protocol 6 supports protocol 5 peers during rollout.** New peers use
+  fragmentation with each other and send only whole datagrams to protocol 5
+  peers. Coordinators advertise protocol 5 in signed network records so older
+  peers can still join. Paths that need fragmentation still require both peers
+  to run protocol 6.
+
+- **Linux: the mesh interface is now named `rayfish0` instead of `tun0`.** The
+  kernel's default name says nothing about which program owns the device, and
+  on a host running more than one tunnel it went to whoever started first. The
+  index still comes from the kernel, so a second device becomes `rayfish1`.
+  Firewall rules, monitoring or scripts that match on `tun0` by name need
+  updating; nothing inside Rayfish assumed the name. macOS keeps `utunN` and
+  FreeBSD keeps `tunN`, neither of which accepts an arbitrary name; Windows
+  already named its adapter `rayfish`.
+
+### Fixed
 
 - **Android retries file notifications after transient failures.** Background
   retries preserve the Downloads result and stop once reconciliation succeeds.
@@ -2331,7 +2342,9 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/rayfish/rayfish/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/rayfish/rayfish/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/rayfish/rayfish/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rayfish/rayfish/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rayfish/rayfish/compare/v0.2.1...v0.3.0
