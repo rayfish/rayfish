@@ -173,8 +173,4 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           gh release view "$RELEASE_TAG"
-          flags=()
-          if [[ "$RELEASE_TAG" == nightly ]]; then
-            flags+=(--clobber)
-          fi
-          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.sha256 "${flags[@]}"
+          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.sha256
