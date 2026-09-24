@@ -66,6 +66,15 @@ jobs:
             ${{ steps.notes.outputs.content }}
           prerelease: true
 
+  macos-app:
+    needs: roll-tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/macos-release.yml
+    with:
+      release_tag: nightly
+    secrets: inherit
+
   build:
     needs: roll-tag
     permissions:

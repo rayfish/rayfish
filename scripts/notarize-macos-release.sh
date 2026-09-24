@@ -42,7 +42,7 @@ xcrun stapler validate "$app"
 just macos-assess "$app"
 
 mkdir -p "$output/dist"
-dmg="$output/dist/Rayfish-$MACOS_RELEASE_VERSION-$MACOS_ARCH.dmg"
+dmg="$output/dist/Rayfish-${MACOS_DMG_LABEL:-$MACOS_RELEASE_VERSION}-$MACOS_ARCH.dmg"
 bash scripts/package-macos-dmg.sh "$app" "$dmg"
 codesign --sign 'Developer ID Application' --timestamp "$dmg"
 notarize "$dmg" dmg

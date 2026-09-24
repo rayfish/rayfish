@@ -15,8 +15,8 @@ fi
 version=$(cargo metadata --locked --no-deps --format-version 1 |
     jq -er '.packages[] | select(.name == "rayfish") | .version')
 if [[ -n "${RELEASE_TAG:-}" ]]; then
-    [[ "$RELEASE_TAG" == "v$version" ]] || {
-        echo 'Release tag must match the rayfish Cargo version.' >&2
+    [[ "$RELEASE_TAG" == nightly || "$RELEASE_TAG" == "v$version" ]] || {
+        echo 'Release tag must be nightly or match the rayfish Cargo version.' >&2
         exit 1
     }
     [[ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" == "$(git rev-parse HEAD)" ]] || {
@@ -51,3 +51,8 @@ just macos-validate "$app"
 "$app/Contents/MacOS/ray" --version
 "$app/Contents/MacOS/ray" status --help
 echo "MACOS_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+if [[ "${RELEASE_TAG:-}" == nightly ]]; then
+    echo 'MACOS_DMG_LABEL=nightly' >> "$GITHUB_ENV"
+else
+    echo "MACOS_DMG_LABEL=$version" >> "$GITHUB_ENV"
+fi
