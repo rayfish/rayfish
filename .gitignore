@@ -21,6 +21,10 @@ android/keystore.properties
 *.swo
 *~
 *.log
+xcuserdata/
+
+# Local macOS signing override
+/macos/Rayfish/RayfishSigning.entitlements
 
 # Local secrets — never commit
 .env

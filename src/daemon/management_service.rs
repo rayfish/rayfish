@@ -17,6 +17,13 @@ const MANAGEMENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGEMENT_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+impl Daemon {
+    /// Inventory for embedders, including machines outside the local networks.
+    pub async fn list_managed_machines(&self, probe: bool) -> IpcMessage {
+        self.management.list_machines(probe).await
+    }
+}
+
 fn now() -> UnixTimestampSecs {
     UnixTimestampSecs::from_secs(
         SystemTime::now()

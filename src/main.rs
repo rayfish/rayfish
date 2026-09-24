@@ -262,6 +262,7 @@ pub(crate) enum Command {
     /// Start a local browser GUI
     ///
     /// Covers the common workflows and every CLI command.
+    #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
     Gui {
         /// Localhost port to listen on (0 chooses a free port)
         #[arg(long, default_value_t = 0)]
@@ -517,6 +518,7 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Authorize a user to run ray without sudo (requires root)
+    #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
     SetOperator {
         /// Username or numeric UID to grant operator access
         #[arg(value_hint = clap::ValueHint::Username)]
@@ -1571,6 +1573,7 @@ async fn run() -> Result<()> {
         Command::Install { auto_update } => cmd_install(auto_update).await,
         Command::Restart => cmd_restart().await,
         Command::Completions { shell, install } => complete::cmd_completions(shell, install),
+        #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::Gui { port, no_open } => cmd_gui(port, no_open),
         Command::Invite {
             network,
@@ -1644,6 +1647,7 @@ async fn run() -> Result<()> {
         Command::Dns { action, json: _ } => cmd_dns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action, json } => cmd_config(action, json).await,
+        #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
         Command::Files { action, json: _ } => ipc_files(action).await,
@@ -1852,6 +1856,7 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
 /// `ray set-operator <user>`: authorize a local user to run mutating ray
 /// commands without sudo (Tailscale's `--operator` model). The daemon enforces
 /// that this call itself comes from root.
+#[cfg(not(all(target_os = "macos", feature = "macos-app")))]
 async fn cmd_set_operator(user: &str) -> Result<()> {
     // Windows writes the operator SID itself instead of asking the daemon. The
     // daemon has no Windows equivalent of the root check that authorizes
@@ -2031,10 +2036,6 @@ mod tests {
             "ray-linux-aarch64"
         );
         assert_eq!(
-            release_asset_name("macos", "x86_64").unwrap(),
-            "ray-macos-x86_64"
-        );
-        assert_eq!(
             release_asset_name("macos", "aarch64").unwrap(),
             "ray-macos-aarch64"
         );
@@ -2046,6 +2047,7 @@ mod tests {
 
     #[test]
     fn release_asset_name_rejects_unsupported_platforms() {
+        assert!(release_asset_name("macos", "x86_64").is_err());
         assert!(release_asset_name("windows", "aarch64").is_err());
         assert!(release_asset_name("linux", "riscv64").is_err());
     }

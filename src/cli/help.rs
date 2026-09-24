@@ -73,6 +73,7 @@ const ROOT: Groups = &[
             "restart",
             "install",
             "uninstall",
+            #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
             "set-operator",
         ],
     ),
@@ -82,7 +83,14 @@ const ROOT: Groups = &[
     ),
     (
         "Setup",
-        &["config", "update", "completions", "gui", "version"],
+        &[
+            "config",
+            "update",
+            "completions",
+            #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
+            "gui",
+            "version",
+        ],
     ),
 ];
 
@@ -172,6 +180,7 @@ fn group(cmd: Command, path: &[&str], groups: Groups) -> Command {
 /// appending `--json` to a command line it is about to run: since the flag is no
 /// longer global, appending it to a command that does not take one is a parse
 /// error rather than something harmlessly ignored.
+#[cfg(not(all(target_os = "macos", feature = "macos-app")))]
 pub(crate) fn supports_json(command: &str) -> bool {
     Cli::command()
         .find_subcommand(command)
@@ -225,6 +234,17 @@ mod tests {
     /// wrapped line breaks that column, so nothing may reach the width a
     /// terminal is narrowest at.
     const LIMIT: usize = 80;
+
+    #[test]
+    fn only_macos_app_builds_omit_browser_ui_and_operator_commands() {
+        let cmd = command();
+        for name in ["gui", "set-operator"] {
+            assert_eq!(
+                cmd.find_subcommand(name).is_none(),
+                cfg!(all(target_os = "macos", feature = "macos-app"))
+            );
+        }
+    }
 
     /// Resolve a page's path against the clap model.
     fn page<'a>(cmd: &'a Command, path: &[&str]) -> &'a Command {

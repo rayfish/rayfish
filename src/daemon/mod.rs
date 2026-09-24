@@ -93,6 +93,7 @@ use crate::transport;
 // where the packet interface is a `VpnService` fd supplied from Kotlin.
 #[cfg(not(target_os = "android"))]
 use crate::tun;
+use crate::tun::{TunRead, TunWrite};
 use ray_proto::SuggestedFirewall;
 use smol_str::SmolStr;
 
@@ -222,6 +223,8 @@ pub(crate) use mesh::*;
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
+#[cfg(unix)]
+pub use mesh::start_embedded_ipc;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
@@ -813,7 +816,7 @@ impl Daemon {
     /// stale session while the rebuilt endpoint (same node key) comes up and the
     /// device shows offline until the race clears.
     ///
-    /// Shutting the protocol router down first is what releases the blob store,
+    /// Shutting the protocol router down is what releases the blob store,
     /// and it is not optional for an embedder either: `Router::shutdown` is the
     /// only thing that drives `BlobsProtocol::shutdown` -> `Store::shutdown`,
     /// which is what drops the store's redb `Database` and with it the exclusive
@@ -821,11 +824,12 @@ impl Daemon {
     /// a second open does not fail, it waits: the next `build_headless` in the
     /// same process then blocks until whatever eventually drops the old store
     /// does, if anything does, which on mobile is how a disabled node never comes
-    /// back. The explicit `endpoint.close()` after it is the same idempotent
-    /// backstop the desktop tail keeps.
+    /// back. Close the endpoint concurrently so connection termination does not
+    /// wait for the store to flush. Both must finish before this call returns.
     ///
     /// After this the `Daemon` is spent; build a new one to come back online.
     pub async fn shutdown_and_close(&self) {
+        let started = Instant::now();
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
@@ -835,9 +839,15 @@ impl Daemon {
         // that rebuilds a daemon in the same process keeps the whole dead service
         // alive; see `DnsService::shutdown_background`.
         self.dns.shutdown_background();
-        let _ = self.router.shutdown().await;
-        self.transport.endpoint.close().await;
-        tracing::info!("shutdown: router stopped, blob store released, endpoint closed");
+        let (router_result, ()) =
+            tokio::join!(self.router.shutdown(), self.transport.endpoint.close(),);
+        if let Err(error) = router_result {
+            tracing::warn!(%error, "shutdown: protocol router failed");
+        }
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "shutdown: router stopped, blob store released, endpoint closed"
+        );
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
@@ -963,6 +973,20 @@ impl Daemon {
                 }
             });
         }
+    }
+
+    /// Start forwarding through an interface whose link, routes, and DNS are
+    /// already configured by the embedder (for example, NetworkExtension).
+    /// Unlike `activate`, this does not change the host network configuration.
+    /// Stop it with `detach_tun` before the embedder removes the interface.
+    pub async fn attach_external_tun<R: TunRead, W: TunWrite>(
+        self: &Arc<Self>,
+        reader: R,
+        writer: W,
+    ) {
+        self.attach_tun(reader, writer).await;
+        self.active.store(true, Ordering::SeqCst);
+        self.registry.poll_nudge.notify_waiters();
     }
 
     /// Part of the embedding API (used by `ray-mobile`'s `down`): stop the
@@ -3114,8 +3138,6 @@ mod headless_tests {
                 .expect("build_headless should not hang")
                 .expect("build_headless should succeed");
 
-        use std::sync::atomic::Ordering;
-
         // Helper: send one packet through the same `tun_tx` cell the peer-reader
         // and DNS-injection paths use, then wait for the given writer to see it.
         async fn send_pkt(daemon: &Arc<DaemonState>, pkt: &'static [u8]) {
@@ -3144,14 +3166,17 @@ mod headless_tests {
         let writer1 = FakeTunWriter::default();
         let sink1 = Arc::clone(&writer1.written);
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::new(()),
                 },
                 writer1,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            daemon.status(),
+            IpcMessage::StatusResponse { active: true, .. }
+        ));
 
         send_pkt(&daemon, b"packet-1").await;
         assert!(
@@ -3162,6 +3187,10 @@ mod headless_tests {
         // 2. Toggle: detach, then re-attach reader2 + writer2. This is the path
         //    that used to silently break before the fresh-channel-per-attach fix.
         daemon.detach_tun();
+        assert!(matches!(
+            daemon.status(),
+            IpcMessage::StatusResponse { active: false, .. }
+        ));
         let writer2 = FakeTunWriter {
             mtu: Some(1280),
             ..Default::default()
@@ -3169,14 +3198,13 @@ mod headless_tests {
         let sink2 = Arc::clone(&writer2.written);
         let alive2 = Arc::new(());
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::clone(&alive2),
                 },
                 writer2,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
 
         // A packet queued across the MTU change must not reach the smaller TUN.
         // The small packet acts as a barrier after the oversized packet.
@@ -3198,14 +3226,13 @@ mod headless_tests {
         let writer3 = FakeTunWriter::default();
         let sink3 = Arc::clone(&writer3.written);
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::new(()),
                 },
                 writer3,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
 
         send_pkt(&daemon, b"packet-3").await;
         assert_eq!(daemon.registry.peers.local_mtu(), 1500);
