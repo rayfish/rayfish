@@ -42,7 +42,16 @@ just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 - **Never add a bespoke IPC message for a single setting.** Add a variant to `GlobalKey`/`FirewallKey`/`NetworkKey` (`ray-proto/src/settings.rs`) plus its `apply`/`render` arms in `src/config/settings.rs` and a CLI arm. The enums are matched exhaustively, so a missing arm will not compile.
 - **Never declare `--json` on the root command.** It goes on each command that renders JSON, with `global = true`.
 - **Never let a non-daemon reader call `config::config_dir()`.** Use `config_dir_for_read` / `load_for_read`, which create nothing. An unprivileged `ray` that resolves a home-directory path invents an empty config and then reports it as the daemon's.
-- **Never change a wire struct without reading `.claude/rules/wire-protocol.md`.** Field order is the wire format there. Incompatible changes need the corresponding ALPN bump in the same commit.
+- **Never change a wire struct without reading the Wire protocol section below.** Field order is the wire format. Incompatible changes need the corresponding ALPN bump in the same commit.
+
+## Wire protocol
+
+- ALPN negotiation is the compatibility gate for `rayfish/{mesh,files,pair,connect}/<v>`; there is no in-band version handshake.
+- Network messages and `canonical_group_bytes` use msgpack arrays (`rmp_serde::to_vec`). Adding, removing, retyping, or reordering fields requires the corresponding ALPN bump in the same commit. `#[serde(default)]` only lets a new reader accept an older, shorter array; old readers reject longer arrays.
+- Never use `skip_serializing_if` on array-encoded wire structs: it shifts later fields. Reordering fields of the same type can silently swap their meaning.
+- Changing `Member` also requires a mesh ALPN bump. Its array-encoded roster travels over the shared, unversioned `iroh_blobs` ALPN.
+- Keep `identity::store_device_cert` and IPC on `to_vec_named`. Their stored certificates and local messages have no ALPN gate; named maps allow additive fields and safe `skip_serializing_if`.
+- Keep the compatibility tests in `membership.rs` passing: short-array defaults, long-array rejection, and same-type field swaps.
 
 ## Conventions
 

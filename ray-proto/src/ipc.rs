@@ -1604,7 +1604,7 @@ pub const LOG_CHUNK_BYTES: usize = MAX_FRAME_LEN / 4;
 /// other does not know; a named map is what makes that free, and it is why
 /// `skip_serializing_if` is still safe on the types below.
 ///
-/// The network wire made the opposite choice (see `.claude/rules/wire-protocol.md`): it is
+/// The network wire made the opposite choice (see the Wire protocol section in `AGENTS.md`): it is
 /// array-encoded, gated on an ALPN, and a `skip_serializing_if` there shifts
 /// every later field into the wrong slot. `HostSuggestions` crosses both
 /// boundaries and so carries no skips at all.
