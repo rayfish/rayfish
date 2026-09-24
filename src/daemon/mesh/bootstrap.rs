@@ -967,6 +967,7 @@ fn set_socket_permissions(path: &Path) {
 #[cfg(all(test, unix))]
 mod embedded_ipc_tests {
     use super::*;
+    use socket2::{Domain, SockAddr, Socket, Type};
     use std::ffi::OsString;
 
     #[tokio::test]
@@ -979,8 +980,11 @@ mod embedded_ipc_tests {
         drop(socket);
         assert!(!path.exists());
 
-        // Recover a socket left behind by a crashed process.
-        drop(UnixListener::bind(&path).unwrap());
+        // Leave a stale socket path without opening a listener that a concurrent
+        // subprocess could inherit between fork and exec.
+        let stale = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        stale.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        drop(stale);
         let socket = bind_ipc_socket(&path).await.unwrap();
         drop(socket);
         assert!(!path.exists());
