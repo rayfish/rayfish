@@ -425,25 +425,71 @@ impl Node {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(state) = state {
+        if let Some(state) = &state {
             state.detach_tun();
-            let _ = self
-                .runtime
-                .block_on(timeout(SHUTDOWN_TIMEOUT, state.shutdown_and_close()));
         }
         #[cfg(target_os = "macos")]
-        if let Some(mut task) = self
+        let ipc_task = self
             .ipc_task
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            self.runtime.block_on(async {
-                if timeout(SHUTDOWN_TIMEOUT, &mut task).await.is_err() {
-                    task.abort();
-                    let _ = task.await;
+            .take();
+        // Swift calls from an ordinary host thread. Construct timers only after
+        // entering the runtime, and let IPC drain alongside the mesh shutdown.
+        self.runtime.block_on(async {
+            let shutdown = async {
+                if let Some(state) = state
+                    && timeout(SHUTDOWN_TIMEOUT, state.shutdown_and_close())
+                        .await
+                        .is_err()
+                {
+                    tracing::warn!("Apple node shutdown exceeded its cleanup deadline");
                 }
+            };
+            #[cfg(target_os = "macos")]
+            {
+                let drain_ipc = async {
+                    if let Some(mut task) = ipc_task
+                        && timeout(SHUTDOWN_TIMEOUT, &mut task).await.is_err()
+                    {
+                        tracing::warn!("Apple IPC shutdown exceeded its cleanup deadline");
+                        task.abort();
+                        let _ = task.await;
+                    }
+                };
+                tokio::join!(shutdown, drain_ipc);
+            }
+            #[cfg(not(target_os = "macos"))]
+            shutdown.await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn stop_from_host_thread_releases_state_and_allows_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::new(directory.path().to_string_lossy().into_owned());
+        // Build without binding the installed app's CLI socket on macOS.
+        // The second build also checks that stop released the blob store lock.
+        for _ in 0..2 {
+            let state = node.runtime.block_on(async {
+                timeout(START_TIMEOUT, build_headless(false))
+                    .await
+                    .unwrap()
+                    .unwrap()
             });
+            *node.state.lock().unwrap() = Some(state);
+            let started = Instant::now();
+            node.stop();
+            eprintln!("host-thread stop took {:?}", started.elapsed());
+            assert!(matches!(node.state(), Err(AppleError::NotStarted)));
         }
+        node.stop();
     }
 }

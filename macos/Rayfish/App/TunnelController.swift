@@ -158,12 +158,16 @@ final class TunnelController: ObservableObject {
     }
 
     private func stopTunnel() async throws {
+        let started = DispatchTime.now().uptimeNanoseconds
         guard let manager = try await TunnelPreferences.load() else { return }
+        RayfishLog.app.info("Requesting VPN disconnect")
         manager.connection.stopVPNTunnel()
         for _ in 0..<100 {
             connectionStatus = manager.connection.status
             if connectionStatus == .disconnected || connectionStatus == .invalid {
                 status = nil
+                let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                RayfishLog.app.info("VPN disconnected in \(elapsedMs) ms")
                 return
             }
             try await Task.sleep(nanoseconds: 100_000_000)

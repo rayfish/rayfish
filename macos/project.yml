@@ -8,7 +8,7 @@ settings:
     DEVELOPMENT_TEAM: ""
     PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app
     MARKETING_VERSION: "0.4.2"
-    CURRENT_PROJECT_VERSION: "10"
+    CURRENT_PROJECT_VERSION: "11"
     RAYFISH_APP_PROFILE: Rayfish
     RAYFISH_TUNNEL_PROFILE: "Rayfish tunnel"
   configs:

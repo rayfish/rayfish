@@ -59,12 +59,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        let started = DispatchTime.now().uptimeNanoseconds
         RayfishLog.tunnel.info("Stopping tunnel, reason \(reason.rawValue)")
         messageListener?.invalidate()
         messageListener = nil
-        node?.stop()
-        node = nil
-        RayfishLog.tunnel.info("Tunnel stopped")
+        do {
+            let stoppingNode = node
+            node = nil
+            stoppingNode?.stop()
+        }
+        let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        RayfishLog.tunnel.info("Tunnel stopped in \(elapsedMs) ms")
         completionHandler()
     }
 

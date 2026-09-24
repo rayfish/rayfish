@@ -58,4 +58,6 @@ struct ProviderPeer: Codable, Equatable, Identifiable {
     var isOwnDevice: Bool
 
     var id: String { ipv6 }
+
+    func domain(in network: String) -> String { "\(hostname).\(network).ray" }
 }

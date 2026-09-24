@@ -812,7 +812,7 @@ impl Daemon {
     /// stale session while the rebuilt endpoint (same node key) comes up and the
     /// device shows offline until the race clears.
     ///
-    /// Shutting the protocol router down first is what releases the blob store,
+    /// Shutting the protocol router down is what releases the blob store,
     /// and it is not optional for an embedder either: `Router::shutdown` is the
     /// only thing that drives `BlobsProtocol::shutdown` -> `Store::shutdown`,
     /// which is what drops the store's redb `Database` and with it the exclusive
@@ -820,11 +820,12 @@ impl Daemon {
     /// a second open does not fail, it waits: the next `build_headless` in the
     /// same process then blocks until whatever eventually drops the old store
     /// does, if anything does, which on mobile is how a disabled node never comes
-    /// back. The explicit `endpoint.close()` after it is the same idempotent
-    /// backstop the desktop tail keeps.
+    /// back. Close the endpoint concurrently so connection termination does not
+    /// wait for the store to flush. Both must finish before this call returns.
     ///
     /// After this the `Daemon` is spent; build a new one to come back online.
     pub async fn shutdown_and_close(&self) {
+        let started = Instant::now();
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
@@ -834,9 +835,15 @@ impl Daemon {
         // that rebuilds a daemon in the same process keeps the whole dead service
         // alive; see `DnsService::shutdown_background`.
         self.dns.shutdown_background();
-        let _ = self.router.shutdown().await;
-        self.transport.endpoint.close().await;
-        tracing::info!("shutdown: router stopped, blob store released, endpoint closed");
+        let (router_result, ()) =
+            tokio::join!(self.router.shutdown(), self.transport.endpoint.close(),);
+        if let Err(error) = router_result {
+            tracing::warn!(%error, "shutdown: protocol router failed");
+        }
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "shutdown: router stopped, blob store released, endpoint closed"
+        );
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept

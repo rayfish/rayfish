@@ -95,17 +95,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     let result = serve_ipc(&daemon, token).await;
 
-    // Shut the protocol Router down, then close the iroh endpoint, before
-    // returning. `Router::shutdown` stops accepting, drains its handlers, and
-    // closes the endpoint itself; the explicit close is a harmless idempotent
-    // backstop. Dropping the endpoint without closing logs "Endpoint dropped
-    // without calling `Endpoint::close`. Aborting ungracefully." and can leave
-    // the process lingering until the service manager escalates to SIGKILL, which
-    // delays the relaunch on `ray restart`/`ray update` past the client's
-    // reachability probe. A clean close lets QUIC connections terminate and the
-    // process exit promptly so the new daemon comes up fast.
-    let _ = daemon.router.shutdown().await;
-    daemon.transport.endpoint.close().await;
+    // Close connections while protocol handlers flush their persistent state.
+    daemon.shutdown_and_close().await;
 
     result
 }
