@@ -4,50 +4,60 @@ import SwiftUI
 @main
 struct RayfishApp: App {
     @NSApplicationDelegateAdaptor(RayfishAppDelegate.self) private var appDelegate
-    @StateObject private var controller = TunnelController()
 
     init() { RayfishTheme.registerFonts() }
 
     var body: some Scene {
-        Window("Rayfish", id: "main") {
-            ContentView(controller: controller)
-                .environmentObject(appDelegate)
-                .onAppear { appDelegate.configure(controller: controller) }
+        Settings { EmptyView() }
+        .commands {
+            CommandGroup(replacing: .appSettings) {}
+            CommandGroup(replacing: .newItem) {
+                Button("Open Rayfish") { appDelegate.openMainWindow() }
+                    .keyboardShortcut("0", modifiers: .command)
+            }
         }
-        .defaultSize(width: 1000, height: 680)
     }
 }
 
 @MainActor
-final class RayfishAppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
-    var openMainWindow: (() -> Void)?
-    weak var controller: TunnelController?
+final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
+    private let controller = TunnelController()
+    private var mainWindow: RayfishWindow?
     private var statusMenu: RayfishMenu?
     private var isTerminating = false
 
-    func configure(controller: TunnelController) {
-        self.controller = controller
-        guard statusMenu == nil else { return }
+    func applicationDidFinishLaunching(_ notification: Notification) {
         statusMenu = RayfishMenu(controller: controller) { [weak self] in
-            self?.openMainWindow?()
+            self?.openMainWindow()
         }
+        openMainWindow()
+    }
+
+    func openMainWindow() {
+        if mainWindow == nil {
+            mainWindow = RayfishWindow(content: NSHostingView(rootView: ContentView(controller: controller)))
+        }
+        mainWindow?.show()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminating else { return .terminateLater }
-        guard let controller else { return .terminateNow }
         isTerminating = true
         Task {
             let stopped = await controller.prepareToQuit()
             isTerminating = false
-            if !stopped { openMainWindow?() }
+            if !stopped { openMainWindow() }
             sender.reply(toApplicationShouldTerminate: stopped)
         }
         return .terminateLater
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        openMainWindow?()
+        openMainWindow()
         return true
     }
 }
@@ -57,8 +67,6 @@ private enum Page: String, CaseIterable {
 }
 
 private struct ContentView: View {
-    @Environment(\.openWindow) private var openWindow
-    @EnvironmentObject private var appDelegate: RayfishAppDelegate
     @ObservedObject var controller: TunnelController
     @State private var page: Page = .networks
     @State private var showCreate = false
@@ -131,12 +139,6 @@ private struct ContentView: View {
         .tint(RayfishTheme.accent)
         .preferredColorScheme(.dark)
         .frame(minWidth: 820, minHeight: 560)
-        .onAppear {
-            appDelegate.openMainWindow = {
-                openWindow(id: "main")
-                NSApp.activate(ignoringOtherApps: true)
-            }
-        }
         .sheet(isPresented: $showCreate) { CreateNetworkSheet(controller: controller) }
         .sheet(isPresented: $showJoin) { JoinNetworkSheet(controller: controller) }
         .task {
