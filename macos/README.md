@@ -60,8 +60,9 @@ Rayfish into Applications and approve its network extension on first connection.
 Build logs, submission IDs, and notarization reports are saved in the diagnostics
 artifacts. A timeout stops publication; inspect that submission before retrying.
 
-PR CI builds the app without signing secrets. Real VPN connection and extension
-approval still need a Mac smoke test. Production builds use
+PR CI runs tests, linting, and the Apple bindings check without building the full
+app. Full app and DMG builds run for versioned releases or manual builds.
+Real VPN connection and extension approval still need a Mac smoke test. Production builds use
 `1000 + GITHUB_RUN_NUMBER` as their extension build number; Debug builds retain the
 version in `project.yml`.
 

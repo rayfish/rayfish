@@ -93,8 +93,8 @@ jobs:
           cargo -q clippy --workspace --all-targets --locked --features macos-app -- -D warnings
           cargo -q test -p rayfish --bin ray --locked --features macos-app cli::help::tests
 
-      - name: Install macOS build tools
-        run: brew install xcodegen just
+      - name: Install macOS test runner
+        run: brew install just
 
       - name: Test native app
         run: just macos-test macos-ipc-test macos-ui-test
@@ -110,16 +110,6 @@ jobs:
           sed -i '' 's/[[:space:]]*$//' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
           perl -0pi -e 's/\n+\z/\n/' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
           git diff --exit-code macos/Generated
-
-      - name: Build native app
-        run: |
-          xcodegen generate --spec macos/project.yml --project macos
-          xcodebuild \
-            -project macos/Rayfish.xcodeproj \
-            -scheme Rayfish \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            build
 
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
