@@ -21,6 +21,7 @@ android/keystore.properties
 *.swo
 *~
 *.log
+xcuserdata/
 
 # Local secrets — never commit
 .env

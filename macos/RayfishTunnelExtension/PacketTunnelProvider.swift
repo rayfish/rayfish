@@ -1,25 +1,32 @@
 import Darwin
 import Foundation
 import NetworkExtension
+import OSLog
 
 final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     private var node: Node?
+    private var messageListener: TunnelMessageListener?
 
     override func startTunnel(
         options: [String: NSObject]?,
         completionHandler: @escaping (Error?) -> Void
     ) {
+        RayfishLog.tunnel.info("Starting tunnel build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown", privacy: .public)")
         do {
-            let node = Node(configDir: try stateDirectory().path)
-            if let legacyStateDirectory = (protocolConfiguration as? NETunnelProviderProtocol)?
-                .providerConfiguration?["legacyStateDirectory"] as? String,
-               !legacyStateDirectory.isEmpty {
-                try node.migrateLegacyState(source: legacyStateDirectory)
+            let clientRequirement = try TunnelIPC.requirement(for: "com.rayfish.app")
+            let directory = try stateDirectory()
+            let node = Node(configDir: directory.path)
+            if let legacy = try LegacyDaemon.discover() {
+                RayfishLog.tunnel.info("Checking legacy daemon migration")
+                try legacy.migrateIfNeeded(to: directory) { source in
+                    try node.migrateLegacyState(source: source.path)
+                }
             }
             try node.start()
             let settings = try networkSettings(address: node.ipv6Address())
             setTunnelNetworkSettings(settings) { [weak self] error in
                 guard error == nil else {
+                    RayfishLog.tunnel.error("Network settings failed: \(error!.localizedDescription, privacy: .public)")
                     completionHandler(error)
                     return
                 }
@@ -30,29 +37,45 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 do {
                     try node.activate(flow: self)
                     self.node = node
+                    self.messageListener = TunnelMessageListener(
+                        listener: NSXPCListener(machServiceName: TunnelIPC.serviceName),
+                        clientRequirement: clientRequirement
+                    ) { [weak self] data, reply in
+                        guard let self else { reply(nil); return }
+                        self.handleAppMessage(data, completionHandler: reply)
+                    }
                     self.readPackets()
+                    RayfishLog.tunnel.info("Tunnel is ready; command listener started")
                     completionHandler(nil)
                 } catch {
+                    RayfishLog.tunnel.error("Tunnel activation failed: \(error.localizedDescription, privacy: .public)")
                     completionHandler(error)
                 }
             }
         } catch {
+            RayfishLog.tunnel.error("Tunnel startup failed: \(error.localizedDescription, privacy: .public)")
             completionHandler(error)
         }
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        RayfishLog.tunnel.info("Stopping tunnel, reason \(reason.rawValue)")
+        messageListener?.invalidate()
+        messageListener = nil
         node?.stop()
         node = nil
+        RayfishLog.tunnel.info("Tunnel stopped")
         completionHandler()
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
         do {
             let request = try JSONDecoder().decode(ProviderRequest.self, from: messageData)
+            RayfishLog.tunnel.debug("Handling \(request.action.rawValue, privacy: .public)")
             let response = try handle(request)
             completionHandler?(try JSONEncoder().encode(response))
         } catch {
+            RayfishLog.tunnel.error("Command failed: \(error.localizedDescription, privacy: .private)")
             let response = ProviderResponse(success: false, error: error.localizedDescription, status: nil, inviteCode: nil)
             completionHandler?(try? JSONEncoder().encode(response))
         }
@@ -75,13 +98,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 try node.receivePackets(packets: packets)
                 self.readPackets()
             } catch {
+                RayfishLog.tunnel.error("Packet processing failed: \(error.localizedDescription, privacy: .public)")
                 self.cancelTunnelWithError(error)
             }
         }
     }
 
     private func networkSettings(address: String) throws -> NEPacketTunnelNetworkSettings {
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "rayfish")
+        // Rayfish has no single tunnel server; macOS still requires a numeric IP here.
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         let ipv6 = NEIPv6Settings(addresses: [address], networkPrefixLengths: [128])
         ipv6.includedRoutes = [NEIPv6Route(destinationAddress: "200::", networkPrefixLength: 7)]
         settings.ipv6Settings = ipv6

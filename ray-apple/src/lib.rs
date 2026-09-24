@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rayfish::config;
+#[cfg(target_os = "macos")]
+use rayfish::daemon::start_embedded_ipc;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::invite;
 use rayfish::ipc::IpcMessage;
@@ -16,6 +18,8 @@ use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
 use tokio::runtime::Runtime;
+#[cfg(target_os = "macos")]
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 uniffi::setup_scaffolding!();
@@ -86,6 +90,8 @@ pub struct Node {
     runtime: Runtime,
     state: Mutex<Option<Arc<DaemonState>>>,
     #[cfg(target_os = "macos")]
+    ipc_task: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(target_os = "macos")]
     packet_tx: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
 }
 
@@ -115,6 +121,8 @@ impl Node {
             runtime,
             state: Mutex::new(None),
             #[cfg(target_os = "macos")]
+            ipc_task: Mutex::new(None),
+            #[cfg(target_os = "macos")]
             packet_tx: Mutex::new(None),
         })
     }
@@ -134,6 +142,17 @@ impl Node {
             .block_on(async { timeout(START_TIMEOUT, build_headless(true)).await })
             .map_err(|_| AppleError::Network("node start timed out".to_owned()))?
             .map_err(|e| AppleError::Network(e.to_string()))?;
+        #[cfg(target_os = "macos")]
+        {
+            let task = match self.runtime.block_on(start_embedded_ipc(&state)) {
+                Ok(task) => task,
+                Err(error) => {
+                    self.runtime.block_on(state.shutdown_and_close());
+                    return Err(AppleError::Network(error.to_string()));
+                }
+            };
+            *self.ipc_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        }
         let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
             *slot = Some(state);
@@ -355,8 +374,7 @@ impl Node {
             let reader = apple_tun::AppleTunReader::new(rx);
             let writer = apple_tun::AppleTunWriter::new(flow);
             self.runtime.block_on(async {
-                state.attach_tun(reader, writer).await;
-                state.activate(None).await;
+                state.attach_external_tun(reader, writer).await;
             });
             *packet_tx = Some(tx);
             Ok(())
@@ -412,6 +430,20 @@ impl Node {
             let _ = self
                 .runtime
                 .block_on(timeout(SHUTDOWN_TIMEOUT, state.shutdown_and_close()));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(mut task) = self
+            .ipc_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            self.runtime.block_on(async {
+                if timeout(SHUTDOWN_TIMEOUT, &mut task).await.is_err() {
+                    task.abort();
+                    let _ = task.await;
+                }
+            });
         }
     }
 }

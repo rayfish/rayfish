@@ -1,3 +1,8 @@
+import Foundation
 import NetworkExtension
 
-NEProvider.startSystemExtensionMode()
+autoreleasepool {
+    NEProvider.startSystemExtensionMode()
+}
+
+dispatchMain()

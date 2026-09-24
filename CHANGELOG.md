@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The macOS app bundles the original Rust `ray` CLI.** It uses the same
+  commands and output as the standalone binary and talks directly to the
+  running tunnel over Rayfish's normal local socket. Use the app to connect,
+  disconnect, and quit the NetworkExtension session.
+
+- **macOS has a compact native menu bar menu alongside its full window.** Connect or
+  disconnect, see networks, and copy device addresses without opening the dashboard.
+
+- **macOS imports an existing Rayfish service automatically on first launch.**
+  The app detects the service's state directory, stops and disables the old
+  service, and copies its identity and saved networks before connecting.
+  The original state is kept, and a failed import restores the service.
+
 - **Android: an opt-in periodic diagnostics report.** Off by default, under
   Periodic diagnostics in You, and only available while crash reporting is on.
   With it on, the app sends one diagnostics report every eight hours, but only
@@ -19,6 +32,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence has already been evicted from the log ring.
 
 ### Changed
+
+- **Quitting the macOS app disconnects its VPN before exiting.** Closing only
+  the main window leaves the menu bar app running.
+- **macOS records startup, connection changes, and failures in Console** under
+  the `com.rayfish.app` subsystem.
+
+- **macOS matches the website and web dashboard's colors, fonts, and compact
+  network cards, with the Rayfish logo for its app and menu-bar icons.**
 
 - **Android updates background file notifications when file state changes.**
   Idle standby no longer checks for offers and transfers every four seconds.
@@ -55,6 +76,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already named its adapter `rayfish`.
 
 ### Fixed
+
+- **macOS waits for a new VPN connection to start before reporting failure,**
+  avoiding a stale disconnect error immediately after clicking Connect.
+
+- **macOS updates an older running tunnel extension when the app starts,**
+  instead of showing missing networks or timeouts after replacing the app.
+
+- **macOS no longer flashes "connecting" during status refreshes.** Both views
+  show the VPN's connection state, and updates continue when the main window closes.
+
+- **The macOS UI and CLI can talk to the tunnel at the same time.**
+  Separate authenticated connections prevent intermittent "tunnel did not
+  respond" errors while the app is open.
+
+- **macOS keeps packet forwarding active after its VPN connects.** The app now
+  uses the interface and DNS settings supplied by macOS instead of trying to
+  configure a separate daemon interface and silently returning to standby.
+
+- **macOS tunnel startup uses a valid IP address in its network settings,**
+  fixing the "Invalid NETunnelNetworkSettings tunnelRemoteAddress" error.
+
+- **macOS shows when the network extension needs approval in System Settings,**
+  instead of displaying an import spinner while waiting for permission.
+
+- **macOS development builds use Apple Development signing and matching
+  provisioning profiles for local testing without release notarization.**
+
+- **macOS correctly registers and keeps its tunnel system extension running.**
+  The bundled extension's filename now matches its identifier, fixing
+  "Extension not found in App bundle" when connecting.
+  Its package type also identifies it as a system extension so macOS recognizes
+  the tunnel category.
+
+- **macOS opens its main window on launch and from the menu bar or Dock.**
+
+- **macOS builds use the app's current entitlements file and valid system-extension
+  signing entitlements.**
+  Release builds enable hardened runtime and omit debugging entitlements for
+  Developer ID notarization.
+
+- **macOS app and CLI use the tunnel identifier and shared storage group from
+  the provisioning profiles.**
 
 - **Network changes no longer leave control ping working while ordinary mesh
   traffic disappears.** A delayed handshake from a replaced peer connection
