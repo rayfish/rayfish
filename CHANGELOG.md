@@ -63,6 +63,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Magic DNS activates on hosts whose resolver ignores root-zone queries.**
+  Some consumer-router forwarders answer dotted names but stay silent for
+  `. NS` probes, which the takeover treated as a dead upstream and refused to
+  run, leaving `.ray` names unresolvable on the host. A silent root probe is
+  now followed by a plain `example.com A` question before the upstream is
+  given up on.
+
 - **Fresh installs enable Magic DNS by default.** The DNS toggle previously
   started off until it was enabled explicitly.
 
