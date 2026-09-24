@@ -66,14 +66,14 @@ mod system {
 
     pub(crate) struct FreeBsdLocalUnbound {
         key: String,
-        search: Arc<ArcSwap<Vec<SearchDomain>>>,
+        search: ArcSwap<Vec<SearchDomain>>,
     }
 
     impl FreeBsdLocalUnbound {
         pub(crate) fn new(tun_name: &str) -> Self {
             Self {
                 key: format!("{tun_name}.rayfish"),
-                search: Arc::new(ArcSwap::from_pointee(vec![SearchDomain::root()])),
+                search: ArcSwap::from_pointee(vec![SearchDomain::root()]),
             }
         }
 
@@ -99,7 +99,7 @@ mod system {
             Ok(())
         }
 
-        async fn ensure_local_unbound(&self) -> Result<()> {
+        async fn ensure_local_unbound() -> Result<()> {
             install_unbound_config()?;
 
             if !Self::command_succeeds(SERVICE, &["local_unbound", "enabled"]).await {
@@ -175,7 +175,7 @@ mod system {
     #[async_trait]
     impl DnsConfigurator for FreeBsdLocalUnbound {
         async fn apply(&self) -> Result<()> {
-            self.ensure_local_unbound().await?;
+            Self::ensure_local_unbound().await?;
             self.register().await?;
             tracing::info!(
                 backend = "local_unbound",
