@@ -23,6 +23,7 @@
 		D0BBAA0124DBD68D69E60D49 /* TunnelPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04F957D1BDEDFDAB48E32699 /* TunnelPreferences.swift */; };
 		D1DAD4DF0D9F1B71525FBF36 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = EA6E6748C8715BF45A6683B1 /* Assets.xcassets */; };
 		D1F80D5F9B82A6842D4C5959 /* RayfishTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BE21B08718D68C7706B9B6 /* RayfishTheme.swift */; };
+		BB912F7C6F2617EC678FD311 /* RayfishMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB912F7C6F2617EC678FD312 /* RayfishMenu.swift */; };
 		E58DD777F989195DE8D5FD0D /* TunnelIPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84AE5C6F0FAE105C0FC3BE66 /* TunnelIPC.swift */; };
 		FD38447B788E8D307F8A3732 /* TunnelController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4F80FB7E3C1BFC490855942 /* TunnelController.swift */; };
 /* End PBXBuildFile section */
@@ -71,6 +72,7 @@
 		DD2BE4D29C39C948C154194E /* RayfishTunnelExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = RayfishTunnelExtension.entitlements; sourceTree = "<group>"; };
 		EA6E6748C8715BF45A6683B1 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		F2BE21B08718D68C7706B9B6 /* RayfishTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RayfishTheme.swift; sourceTree = "<group>"; };
+		BB912F7C6F2617EC678FD312 /* RayfishMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RayfishMenu.swift; sourceTree = "<group>"; };
 		F551764865C525E7C133EBD7 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		FF7FD7099E4E9A5E24DF8FDE /* ray_appleFFI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ray_appleFFI.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -130,6 +132,7 @@
 			children = (
 				586C1EF82AFF3A4027DD6CCB /* RayfishApp.swift */,
 				F2BE21B08718D68C7706B9B6 /* RayfishTheme.swift */,
+				BB912F7C6F2617EC678FD312 /* RayfishMenu.swift */,
 				B83FD829A7C9832983D4E959 /* ShellCommandInstaller.swift */,
 				224C89EE4A7C4B10E79D1104 /* SystemExtensionInstaller.swift */,
 				B4F80FB7E3C1BFC490855942 /* TunnelController.swift */,
@@ -291,6 +294,7 @@
 				C500E290BEBBD70E1B6C2463 /* ProviderMessage.swift in Sources */,
 				89CA26F63629A9D20AB3769B /* RayfishApp.swift in Sources */,
 				D1F80D5F9B82A6842D4C5959 /* RayfishTheme.swift in Sources */,
+				BB912F7C6F2617EC678FD311 /* RayfishMenu.swift in Sources */,
 				7C13762AD4C45AE967288319 /* ShellCommandInstaller.swift in Sources */,
 				AD801FDCB5C9664B2E47FA8D /* SystemExtensionInstaller.swift in Sources */,
 				FD38447B788E8D307F8A3732 /* TunnelController.swift in Sources */,
@@ -358,7 +362,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 11;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -530,7 +534,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 11;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

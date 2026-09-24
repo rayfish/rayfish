@@ -38,8 +38,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **The macOS menu bar connection status is a toggle.** Click Connected to
-  disconnect or Disconnected to connect.
+- **The macOS menu bar has a connection switch.** The header shows Rayfish and
+  its current status, with an on/off switch to connect or disconnect.
+
+- **macOS copies peers' full domain names,** such as `ty2-hypr01.field.ray`,
+  from the menu bar and device context menus.
 
 - **Quitting the macOS app disconnects its VPN before exiting.** Closing only
   the main window leaves the menu bar app running.
@@ -84,6 +87,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already named its adapter `rayfish`.
 
 ### Fixed
+
+- **macOS disconnect no longer panics while stopping the Rust node.** Network
+  connections, protocol cleanup, and CLI shutdown run concurrently, and system
+  logs record how long disconnect takes.
+
+- **macOS displays IP addresses as plain text with copy actions,** avoiding
+  inverted glyphs in selectable address text on newer macOS versions.
 
 - **macOS waits for a new VPN connection to start before reporting failure,**
   avoiding a stale disconnect error immediately after clicking Connect.

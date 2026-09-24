@@ -12,15 +12,9 @@ struct RayfishApp: App {
         Window("Rayfish", id: "main") {
             ContentView(controller: controller)
                 .environmentObject(appDelegate)
-                .onAppear { appDelegate.controller = controller }
+                .onAppear { appDelegate.configure(controller: controller) }
         }
         .defaultSize(width: 1000, height: 680)
-
-        MenuBarExtra("Rayfish", image: "MenuBarIcon") {
-            RayfishMenu(controller: controller)
-                .onAppear { appDelegate.controller = controller }
-        }
-        .menuBarExtraStyle(.menu)
     }
 }
 
@@ -28,7 +22,16 @@ struct RayfishApp: App {
 final class RayfishAppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     var openMainWindow: (() -> Void)?
     weak var controller: TunnelController?
+    private var statusMenu: RayfishMenu?
     private var isTerminating = false
+
+    func configure(controller: TunnelController) {
+        self.controller = controller
+        guard statusMenu == nil else { return }
+        statusMenu = RayfishMenu(controller: controller) { [weak self] in
+            self?.openMainWindow?()
+        }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminating else { return .terminateLater }
@@ -46,77 +49,6 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate, ObservableObjec
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         openMainWindow?()
         return true
-    }
-}
-
-private struct RayfishMenu: View {
-    @Environment(\.openWindow) private var openWindow
-    @ObservedObject var controller: TunnelController
-
-    var body: some View {
-        Group {
-            Toggle(controller.connectionLabel.capitalized, isOn: Binding(
-                get: { controller.isConnected },
-                set: { connected in
-                    Task {
-                        if connected { await controller.connect() }
-                        else { await controller.disconnect() }
-                    }
-                }
-            ))
-            .disabled(controller.isLoading
-                      || controller.connectionStatus == .connecting
-                      || controller.connectionStatus == .reasserting
-                      || controller.connectionStatus == .disconnecting)
-
-            if let status = controller.status {
-                Button("Copy This Mac's IP Address") { copyAddress(status.ipv6) }
-                    .help(status.ipv6)
-                Divider()
-                Section("Networks") {
-                    if status.networks.isEmpty { Text("No networks yet") }
-                    ForEach(status.networks) { network in
-                        Menu("\(network.name) (\(network.peers.count) devices)") {
-                            Text("\(network.hostname).\(network.name).ray")
-                            Divider()
-                            ForEach(network.peers) { peer in
-                                Button {
-                                    copyAddress(peer.ipv6)
-                                } label: {
-                                    Label("\(peer.hostname) (\(peer.state))",
-                                          systemImage: peer.state == "idle" ? "circle" : "circle.fill")
-                                }.help("Copy \(peer.ipv6)")
-                            }
-                        }
-                    }
-                }
-            }
-            if let activity = controller.activity {
-                Divider()
-                Text(activity)
-            }
-            if let error = controller.error {
-                Divider()
-                Button("Connection Issue: Open Rayfish") { showWindow() }
-                    .help(error)
-            }
-            Divider()
-            Button("Open Rayfish") { showWindow() }
-                .keyboardShortcut("0", modifiers: .command)
-            Button("Disconnect and Quit") { NSApp.terminate(nil) }
-                .keyboardShortcut("q", modifiers: .command)
-        }
-        .task { await controller.startup() }
-    }
-
-    private func showWindow() {
-        openWindow(id: "main")
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func copyAddress(_ address: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(address, forType: .string)
     }
 }
 
@@ -140,7 +72,18 @@ private struct ContentView: View {
                 header
                 if let status = controller.status {
                     HStack(spacing: 18) {
-                        Text(status.ipv6).textSelection(.enabled)
+                        HStack(spacing: 6) {
+                            Text(status.ipv6)
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(status.ipv6, forType: .string)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Copy IP address")
+                            .accessibilityLabel("Copy this Mac's IP address")
+                        }
                         Text("\(status.networks.count) networks")
                         Text("\(status.networks.reduce(0) { $0 + $1.peers.count }) peers")
                     }
@@ -355,7 +298,8 @@ private struct NetworkCard: View {
             .padding(14)
             ForEach(network.peers) { peer in
                 Rectangle().fill(RayfishTheme.line).frame(height: 1)
-                PeerRow(peer: peer).padding(.horizontal, 14).padding(.vertical, 11)
+                PeerRow(peer: peer, domains: [peer.domain(in: network.name)])
+                    .padding(.horizontal, 14).padding(.vertical, 11)
             }
             if network.peers.isEmpty {
                 Rectangle().fill(RayfishTheme.line).frame(height: 1)
@@ -369,6 +313,7 @@ private struct NetworkCard: View {
 
 private struct PeerRow: View {
     let peer: ProviderPeer
+    let domains: [String]
     private var color: Color {
         peer.state == "direct" ? RayfishTheme.green : peer.state == "relay" ? RayfishTheme.amber : RayfishTheme.faint
     }
@@ -381,12 +326,20 @@ private struct PeerRow: View {
                     .padding(.horizontal, 5).padding(.vertical, 2)
                     .overlay(RoundedRectangle(cornerRadius: 4).stroke(RayfishTheme.border))
             }
-            Text(peer.ipv6).foregroundColor(RayfishTheme.muted).lineLimit(1).textSelection(.enabled)
+            Text(peer.ipv6).foregroundColor(RayfishTheme.muted).lineLimit(1)
             Spacer(minLength: 8)
             Text(peer.state).foregroundColor(color)
             if let latency = peer.latencyMs { Text("\(latency) ms").foregroundColor(RayfishTheme.faint) }
         }
         .font(RayfishTheme.mono(12))
+        .contextMenu {
+            ForEach(domains, id: \.self) { domain in
+                Button("Copy \(domain)") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(domain, forType: .string)
+                }
+            }
+        }
     }
 }
 
@@ -397,6 +350,11 @@ private struct DevicesView: View {
         return Dictionary(all.map { ($0.ipv6, $0) }, uniquingKeysWith: { first, _ in first })
             .values.sorted { $0.hostname < $1.hostname }
     }
+    private func domains(for peer: ProviderPeer) -> [String] {
+        (controller.status?.networks ?? []).compactMap { network in
+            network.peers.first { $0.ipv6 == peer.ipv6 }?.domain(in: network.name)
+        }.sorted()
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Devices").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
@@ -405,7 +363,7 @@ private struct DevicesView: View {
             } else {
                 VStack(spacing: 0) {
                     ForEach(peers) { peer in
-                        PeerRow(peer: peer).padding(14)
+                        PeerRow(peer: peer, domains: domains(for: peer)).padding(14)
                         Rectangle().fill(RayfishTheme.line).frame(height: 1)
                     }
                 }.rayfishCard()
