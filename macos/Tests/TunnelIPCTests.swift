@@ -19,6 +19,21 @@ struct TunnelIPCTests {
     @MainActor
     static func main() async throws {
         setbuf(stdout, nil)
+        let setting = ProviderRequest(action: .setSetting, setting: .dns, enabled: false)
+        let decodedSetting = try JSONDecoder().decode(ProviderRequest.self, from: JSONEncoder().encode(setting))
+        precondition(decodedSetting.setting == .dns && decodedSetting.enabled == false)
+        let machine = ProviderMachine(identity: "machine-id", hostname: "server", ipv6: "200::1", state: "offline", networks: [])
+        let inventory = ProviderResponse(success: true, error: nil, status: nil, inviteCode: nil, machines: [machine])
+        let decodedInventory = try JSONDecoder().decode(ProviderResponse.self, from: JSONEncoder().encode(inventory))
+        precondition(decodedInventory.status == nil && decodedInventory.machines == [machine])
+        let status = ProviderStatus(active: true, ipv6: "200::2", networks: [], pendingRequests: [],
+                                    contactId: "contact-id", connectionRequests: [
+                                        ProviderConnectionRequest(id: "request-id", hostname: "laptop", waitingSecs: 7)
+                                    ], dnsEnabled: false, mdnsEnabled: false, mdnsActive: true)
+        let decodedStatus = try JSONDecoder().decode(ProviderStatus.self, from: JSONEncoder().encode(status))
+        precondition(decodedStatus == status)
+        print("PASS: settings, peer requests, and independent machine inventory round-trip")
+
         let barrier = ReplyBarrier()
         async let first = TunnelIPC.send(Data("first".utf8), using: barrier.send)
         async let second = TunnelIPC.send(Data("second".utf8), using: barrier.send)

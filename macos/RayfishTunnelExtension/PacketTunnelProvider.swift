@@ -5,6 +5,7 @@ import OSLog
 
 final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     private var node: Node?
+    private var appliedDNS: Bool?
 
     override func startTunnel(
         options: [String: NSObject]?,
@@ -23,7 +24,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 }
             }
             try node.start()
-            let settings = networkSettings(address: try node.ipv6Address())
+            let status = try node.status()
+            let settings = networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled)
             setTunnelNetworkSettings(settings) { [weak self] error in
                 if let error {
                     node.stop()
@@ -39,6 +41,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 do {
                     try node.activate(flow: self)
                     self.node = node
+                    self.appliedDNS = status.dnsEnabled
                     self.readPackets()
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
@@ -61,6 +64,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         do {
             let stoppingNode = node
             node = nil
+            appliedDNS = nil
             stoppingNode?.stop()
         }
         let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
@@ -69,17 +73,34 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { completionHandler?(nil); return }
-            self.handleMessage(messageData, completionHandler: completionHandler)
+            await self.handleMessage(messageData, completionHandler: completionHandler)
         }
     }
 
-    private func handleMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+    @MainActor
+    private func handleMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) async {
         do {
             let request = try JSONDecoder().decode(ProviderRequest.self, from: messageData)
             RayfishLog.tunnel.debug("Handling \(request.action.rawValue, privacy: .public)")
-            let response = try handle(request)
+            guard let node else { throw ProviderError.notStarted }
+            let previousDNS = appliedDNS
+            let response = try await Task.detached {
+                try self.handle(request, node: node)
+            }.value
+            guard self.node === node else { throw ProviderError.notStarted }
+            if let status = response.status, appliedDNS != status.dnsEnabled {
+                do {
+                    try await setTunnelNetworkSettings(networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled))
+                    appliedDNS = status.dnsEnabled
+                } catch {
+                    if request.action == .setSetting, request.setting == .dns, let previousDNS {
+                        try node.setSetting(key: .dns, enabled: previousDNS)
+                    }
+                    throw error
+                }
+            }
             completionHandler?(try JSONEncoder().encode(response))
         } catch {
             RayfishLog.tunnel.error("Command failed: \(error.localizedDescription, privacy: .private)")
@@ -106,15 +127,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         }
     }
 
-    private func networkSettings(address: String) -> NEPacketTunnelNetworkSettings {
+    private func networkSettings(address: String, dnsEnabled: Bool) -> NEPacketTunnelNetworkSettings {
         // Rayfish has no single tunnel server; macOS still requires a numeric IP here.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         let ipv6 = NEIPv6Settings(addresses: [address], networkPrefixLengths: [128])
         ipv6.includedRoutes = [NEIPv6Route(destinationAddress: "200::", networkPrefixLength: 7)]
         settings.ipv6Settings = ipv6
-        let dns = NEDNSSettings(servers: ["200::53"])
-        dns.matchDomains = ["ray"]
-        settings.dnsSettings = dns
+        if dnsEnabled {
+            let dns = NEDNSSettings(servers: ["200::53"])
+            dns.matchDomains = ["ray"]
+            settings.dnsSettings = dns
+        }
         return settings
     }
 
@@ -128,14 +151,33 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         return path
     }
 
-    private func handle(_ request: ProviderRequest) throws -> ProviderResponse {
-        guard let node else {
-            throw ProviderError.notStarted
-        }
+    private func handle(_ request: ProviderRequest, node: Node) throws -> ProviderResponse {
         var inviteCode: String?
+        var message: String?
         switch request.action {
         case .status:
             break
+        case .machines:
+            let machines = try node.machines().map { machine in
+                ProviderMachine(identity: machine.identity, hostname: machine.hostname,
+                                ipv6: machine.ipv6, state: machine.state, networks: machine.networks)
+            }
+            return ProviderResponse(success: true, error: nil, status: nil, inviteCode: nil, machines: machines)
+        case .setSetting:
+            guard let setting = request.setting, let enabled = request.enabled else {
+                throw ProviderError.missingSetting
+            }
+            try node.setSetting(key: setting == .dns ? .dns : .mdns, enabled: enabled)
+        case .connectPeer:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
+            message = try node.connectPeer(contactId: id, hostname: request.hostname)
+        case .approveConnection, .rejectConnection:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
+            if request.action == .approveConnection {
+                try node.approveConnection(id: id)
+            } else {
+                try node.rejectConnection(id: id)
+            }
         case .create:
             try node.createNetwork(name: request.name, hostname: request.hostname)
         case .join:
@@ -168,7 +210,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 try node.denyRequest(network: name, id: id)
             }
         }
-        return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: inviteCode)
+        return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: inviteCode, message: message)
     }
 
     private func status(from status: NodeStatus) -> ProviderStatus {
@@ -199,7 +241,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                     hostname: request.hostname,
                     waitingSecs: request.waitingSecs
                 )
-            }
+            },
+            contactId: status.contactId,
+            connectionRequests: status.connectionRequests.map { request in
+                ProviderConnectionRequest(id: request.id, hostname: request.hostname, waitingSecs: request.waitingSecs)
+            },
+            dnsEnabled: status.dnsEnabled,
+            mdnsEnabled: status.mdnsEnabled,
+            mdnsActive: status.mdnsActive
         )
     }
 }
@@ -210,6 +259,8 @@ private enum ProviderError: LocalizedError {
     case missingInviteCode
     case missingNetworkName
     case missingAppGroup
+    case missingSetting
+    case missingPeer
 
     var errorDescription: String? {
         switch self {
@@ -223,6 +274,10 @@ private enum ProviderError: LocalizedError {
             "A network name is required"
         case .missingAppGroup:
             "Rayfish shared storage is unavailable"
+        case .missingSetting:
+            "A setting and its value are required"
+        case .missingPeer:
+            "A peer contact ID or request ID is required"
         }
     }
 }

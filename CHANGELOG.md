@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The macOS Devices page shows machines you control,** including their status
+  and networks, and supports direct peer connection requests and approvals.
+
+- **macOS Settings includes Magic DNS and mDNS discovery toggles.** DNS changes
+  apply immediately; mDNS changes briefly reconnect the VPN.
+
 - **Production macOS app builds run in GitHub Actions.** Release builds produce
   signed, notarized Apple Silicon and Intel disk images, with manual builds
   available as workflow artifacts. The installer has a Retina-ready Rayfish
@@ -44,6 +50,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence has already been evicted from the log ring.
 
 ### Changed
+
+- **The CLI bundled with the macOS app omits `ray gui` and `ray set-operator`.**
+  Standalone CLI builds retain both commands, including on macOS.
 
 - **The macOS menu bar has a connection switch.** The header shows Rayfish and
   its current status, with an on/off switch to connect or disconnect.

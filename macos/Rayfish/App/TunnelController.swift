@@ -10,8 +10,13 @@ final class TunnelController: ObservableObject {
     private var isRefreshing = false
     private var isQuitting = false
     private var pollingTask: Task<Void, Never>?
+    private var machinesTask: Task<Void, Never>?
+    private var lastMachinesRefresh = Date.distantPast
 
     @Published var status: ProviderStatus?
+    @Published private(set) var machines: [ProviderMachine] = []
+    @Published private(set) var machinesError: String?
+    @Published private(set) var isRefreshingMachines = false
     @Published var error: String? {
         didSet {
             if let error, error != oldValue { RayfishLog.app.error("\(error, privacy: .public)") }
@@ -37,7 +42,7 @@ final class TunnelController: ObservableObject {
         }
     }
 
-    deinit { pollingTask?.cancel() }
+    deinit { pollingTask?.cancel(); machinesTask?.cancel() }
 
     func startup() async {
         guard !didStart else { return }
@@ -72,11 +77,12 @@ final class TunnelController: ObservableObject {
             let manager = try await TunnelPreferences.load()
             guard !isLoading, !isQuitting else { return }
             connectionStatus = manager?.connection.status ?? .disconnected
-            guard isConnected else { status = nil; return }
+            guard isConnected else { status = nil; clearMachines(); return }
             let response = try await TunnelIPC.request(ProviderRequest(action: .status))
             guard !isLoading, !isQuitting else { return }
             status = response.status
             error = nil
+            if Date().timeIntervalSince(lastMachinesRefresh) >= 30 { refreshMachines() }
         } catch {
             if !isLoading, !isQuitting { self.error = error.localizedDescription }
         }
@@ -117,6 +123,7 @@ final class TunnelController: ObservableObject {
                 if isConnected {
                     let response = try await TunnelIPC.request(ProviderRequest(action: .status))
                     status = response.status
+                    refreshMachines()
                     UserDefaults.standard.set(true, forKey: Self.migrationCompletedKey)
                     return
                 }
@@ -158,6 +165,7 @@ final class TunnelController: ObservableObject {
     }
 
     private func stopTunnel() async throws {
+        clearMachines()
         let started = DispatchTime.now().uptimeNanoseconds
         guard let manager = try await TunnelPreferences.load() else { return }
         RayfishLog.app.info("Requesting VPN disconnect")
@@ -201,6 +209,60 @@ final class TunnelController: ObservableObject {
 
     func deny(request: ProviderJoinRequest) async {
         _ = await perform(ProviderRequest(action: .denyRequest, name: request.network, id: request.id))
+    }
+
+    func refreshMachines() {
+        guard isConnected, !isQuitting, machinesTask == nil else { return }
+        isRefreshingMachines = true
+        machinesTask = Task { [weak self] in
+            do {
+                let response = try await TunnelIPC.request(ProviderRequest(action: .machines))
+                guard !Task.isCancelled, let self, self.isConnected else { return }
+                guard let machines = response.machines else { throw TunnelIPCError.noResponse }
+                self.machines = machines.sorted { $0.hostname.localizedStandardCompare($1.hostname) == .orderedAscending }
+                self.machinesError = nil
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.machinesError = error.localizedDescription
+            }
+            self?.lastMachinesRefresh = Date()
+            self?.isRefreshingMachines = false
+            self?.machinesTask = nil
+        }
+    }
+
+    private func clearMachines() {
+        machinesTask?.cancel()
+        machinesTask = nil
+        machines = []
+        machinesError = nil
+        isRefreshingMachines = false
+        lastMachinesRefresh = .distantPast
+    }
+
+    func setSetting(_ setting: ProviderSetting, enabled: Bool) async {
+        guard await perform(ProviderRequest(action: .setSetting, setting: setting, enabled: enabled)) != nil else { return }
+        if setting == .mdns, status?.mdnsActive != enabled {
+            await reconnect()
+        }
+    }
+
+    func reconnect() async {
+        await disconnect()
+        guard connectionStatus == .disconnected || connectionStatus == .invalid else { return }
+        await connect()
+    }
+
+    func connectPeer(id: String, hostname: String?) async -> String? {
+        await perform(ProviderRequest(action: .connectPeer, hostname: hostname, id: id))?.message
+    }
+
+    func approveConnection(id: String) async {
+        _ = await perform(ProviderRequest(action: .approveConnection, id: id))
+    }
+
+    func rejectConnection(id: String) async {
+        _ = await perform(ProviderRequest(action: .rejectConnection, id: id))
     }
 
     private func perform(_ request: ProviderRequest) async -> ProviderResponse? {
