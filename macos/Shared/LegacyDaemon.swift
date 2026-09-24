@@ -137,10 +137,9 @@ struct LaunchdLegacyService: LegacyServiceControlling {
             // A loaded service can have a disabled override. Temporarily enable
             // it to bootstrap, then restore the original override.
             if state.disabled { _ = try checked(["enable", target]) }
-            defer {
-                if state.disabled { _ = try? checked(["disable", target]) }
-            }
-            _ = try checked(["bootstrap", "system", LegacyDaemon.plistURL.path])
+            let bootstrap = Result { try checked(["bootstrap", "system", LegacyDaemon.plistURL.path]) }
+            if state.disabled { _ = try checked(["disable", target]) }
+            _ = try bootstrap.get()
         }
     }
 

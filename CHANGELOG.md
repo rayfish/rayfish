@@ -41,7 +41,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The macOS menu bar has a connection switch.** The header shows Rayfish and
   its current status, with an on/off switch to connect or disconnect.
 
-- **macOS copies peers' full domain names,** such as `ty2-hypr01.field.ray`,
+- **macOS copies peers' full domain names,** such as `remote-device.testnet.ray`,
   from the menu bar and device context menus.
 
 - **Quitting the macOS app disconnects its VPN before exiting.** Closing only
@@ -87,6 +87,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already named its adapter `rayfish`.
 
 ### Fixed
+
+- **The macOS shell command works when the app's path contains spaces or
+  apostrophes.** Installing it again preserves the rest of the shell configuration.
+
+- **macOS migration reports failures to restore a disabled legacy service,**
+  instead of silently leaving its launchd override enabled.
+
+- **Failed macOS tunnel startup shuts down the Rust node,** releasing its
+  sockets and state files before another connection attempt.
 
 - **The macOS UI can reach the tunnel after extension upgrades** without relying
   on a separately registered command service. The app uses macOS provider messaging.

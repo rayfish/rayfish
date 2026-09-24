@@ -63,7 +63,7 @@ macos-ipc-test:
 # Test live menu updates and closing the dashboard without touching the VPN.
 macos-ui-test:
     mkdir -p target/macos-tests
-    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/RayfishMenu.swift macos/Rayfish/App/RayfishWindow.swift macos/Tests/AppUITests.swift -o target/macos-tests/app-ui-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/RayfishMenu.swift macos/Rayfish/App/RayfishWindow.swift macos/Rayfish/App/ShellCommandInstaller.swift macos/Tests/AppUITests.swift -o target/macos-tests/app-ui-tests
     target/macos-tests/app-ui-tests
 
 # Build a locally testable app with automatic Apple Development signing.

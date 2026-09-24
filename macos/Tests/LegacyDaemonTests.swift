@@ -39,7 +39,8 @@ private struct LegacyDaemonTests {
         try reportsRecoveryFailure()
         try stopsAndRestoresLaunchd()
         try stoppedInstallStaysStoppedOnRecovery()
-        print("10 macOS migration tests passed")
+        try reportsDisabledOverrideRecoveryFailure()
+        print("11 macOS migration tests passed")
     }
 
     static func withFixture(_ test: (URL, URL, URL) throws -> Void) throws {
@@ -234,5 +235,28 @@ private struct LegacyDaemonTests {
         try check(previous.disabled && !previous.loaded, "installed but stopped service must be detected")
         try check(!commands.contains(where: { $0.first == "bootstrap" || $0.first == "enable" }),
                   "a previously disabled service must not be started during recovery")
+    }
+
+    static func reportsDisabledOverrideRecoveryFailure() throws {
+        var disableCalls = 0
+        let service = LaunchdLegacyService { arguments in
+            switch arguments.first {
+            case "print":
+                return .init(status: 113, output: "Could not find service")
+            case "disable":
+                disableCalls += 1
+                if disableCalls == 2 {
+                    return .init(status: 1, output: "cannot restore disabled override")
+                }
+            default: break
+            }
+            return .init(status: 0, output: "")
+        }
+        do {
+            try service.restore(.init(loaded: true, disabled: true, processID: nil))
+            throw TestFailure.assertion("failure to restore the disabled override must propagate")
+        } catch LegacyMigrationError.service(let message) {
+            try check(message == "cannot restore disabled override", "report the failed launchctl command")
+        }
     }
 }
