@@ -18,8 +18,6 @@
     <string>Rayfish uses a network extension to connect this Mac to your private networks.</string>
     <key>NetworkExtension</key>
     <dict>
-        <key>NEMachServiceName</key>
-        <string>group.com.rayfish.app.tunnel</string>
         <key>NEProviderClasses</key>
         <dict>
             <key>com.apple.networkextension.packet-tunnel</key>

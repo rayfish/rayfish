@@ -89,7 +89,7 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
             items.append(entry)
         }
         items.append(separator("footer-start"))
-        items.append(item("Open Rayfish", action: #selector(showWindow), key: "0"))
+        items.append(item("Open Rayfish", action: #selector(showWindow), key: "o"))
         let quit = item("Disconnect and Quit", action: #selector(NSApplication.terminate(_:)), key: "q")
         quit.target = NSApp
         items.append(quit)

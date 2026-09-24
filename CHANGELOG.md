@@ -88,8 +88,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The macOS UI can reach the tunnel after extension upgrades** without relying
+  on a separately registered command service. The app uses macOS provider messaging.
+
 - **Opening the macOS dashboard brings it to the current desktop,** instead of
-  switching back to the desktop where it was last shown.
+  switching back to the desktop where it was last shown. Open Rayfish uses
+  Cmd+O in both the tray and app menus.
 
 - **The macOS tray updates while open,** including connection activity, errors,
   networks, and peer status. Closing the dashboard hides it to the tray without

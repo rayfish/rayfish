@@ -13,7 +13,7 @@ struct RayfishApp: App {
             CommandGroup(replacing: .appSettings) {}
             CommandGroup(replacing: .newItem) {
                 Button("Open Rayfish") { appDelegate.openMainWindow() }
-                    .keyboardShortcut("0", modifiers: .command)
+                    .keyboardShortcut("o", modifiers: .command)
             }
         }
     }

@@ -54,11 +54,10 @@ macos-test:
     xcrun swiftc macos/Shared/LegacyDaemon.swift macos/Tests/LegacyDaemonTests.swift -o target/macos-tests/migration-tests
     target/macos-tests/migration-tests
 
-# Exercise concurrent XPC clients, signature rejection, and request timeouts.
-macos-ipc-test identity="Apple Development":
+# Exercise concurrent provider messages, send failures, and request timeouts.
+macos-ipc-test:
     mkdir -p target/macos-tests
     xcrun swiftc -parse-as-library macos/Shared/TunnelIPC.swift macos/Shared/ProviderMessage.swift macos/Tests/TunnelIPCTests.swift -o target/macos-tests/tunnel-ipc-tests
-    codesign --force --sign "{{identity}}" --identifier com.rayfish.app target/macos-tests/tunnel-ipc-tests
     target/macos-tests/tunnel-ipc-tests
 
 # Test live menu updates and closing the dashboard without touching the VPN.

@@ -54,8 +54,7 @@ do {
     let capabilities = entitlements["com.apple.developer.networking.networkextension"] as? [String] ?? []
     try require(capabilities.contains("packet-tunnel-provider-systemextension"), "Missing signed packet tunnel system-extension entitlement")
     let groups = entitlements["com.apple.security.application-groups"] as? [String] ?? []
-    let service = network["NEMachServiceName"] as? String ?? ""
-    try require(groups.contains { service.hasPrefix($0 + ".") }, "Mach service must belong to a signed app group")
+    try require(groups.contains("group.com.rayfish.app"), "Missing shared state app group")
     for code in [app, bundle, app.appendingPathComponent("Contents/MacOS/ray")] {
         _ = try codesign(["--verify", "--strict", code.path])
         let signature = try codesign(["-dv", "--verbose=2", code.path], captureErrors: true)
@@ -64,8 +63,14 @@ do {
         try require(details.contains("(runtime)"), "Hardened runtime is disabled: \(code.path)")
         try require(details.contains("Timestamp="), "Missing secure signing timestamp: \(code.path)")
         let signedData = try codesign(["-d", "--entitlements", "-", "--xml", code.path])
+        if code == app { try require(!signedData.isEmpty, "Missing app entitlements") }
         if !signedData.isEmpty {
             let signedEntitlements = try PropertyListSerialization.propertyList(from: signedData, format: nil) as? [String: Any] ?? [:]
+            if code == app {
+                let team = signedEntitlements["com.apple.developer.team-identifier"] as? String ?? ""
+                try require(!team.isEmpty && signedEntitlements["com.apple.application-identifier"] as? String == "\(team).com.rayfish.app",
+                            "Missing application identity for NetworkExtension messaging")
+            }
             try require(signedEntitlements["com.apple.security.get-task-allow"] as? Bool != true, "Release includes debugging entitlement: \(code.path)")
         }
     }
