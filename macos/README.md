@@ -4,7 +4,8 @@ The **macOS app release** GitHub Actions workflow builds separate Apple Silicon
 and Intel apps with Xcode 26.6. Each app contains the original Rust `ray` command
 and the packet tunnel system extension. Both use the repository's Cargo version.
 The DMG uses Rayfish's logo, fonts, and colors, with a drag-to-Applications layout.
-Nightly releases do not run this workflow.
+Nightly releases include `Rayfish-nightly-arm64.dmg` and
+`Rayfish-nightly-x86_64.dmg`, rebuilt from each push to master.
 
 Configure these repository secrets before running it:
 
@@ -29,10 +30,20 @@ the notarized DMGs and checksums as workflow artifacts without publishing a
 release. A workflow must exist on the default branch before GitHub exposes its
 manual Run workflow button.
 
+Before merging a new app workflow, dispatch the existing **CI** workflow on the
+branch with `macos_dmg=true`:
+
+```sh
+gh workflow run ci.yml --ref feat/macos-native-app -f macos_dmg=true
+```
+
+This uses the same signing and notarization steps and uploads artifacts without
+publishing a release.
+
 The existing **Release** workflow calls it for version tags and manual releases.
-The tag must match Cargo's version and point to the commit being built. Both
-architectures must pass signing checks and Apple notarization before their DMGs
-are attached to the existing release. Missing credentials or failed notarization
+The tag must match Cargo's version (or be `nightly`) and point to the commit being
+built. Both architectures must pass signing checks and Apple notarization before
+their DMGs are attached to the existing release. Missing credentials or failed notarization
 fail the job; there is no unsigned fallback. Other platform release jobs remain
 independent.
 

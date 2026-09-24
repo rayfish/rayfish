@@ -14,8 +14,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **macOS Settings includes Magic DNS and mDNS discovery toggles.** DNS changes
   apply immediately; mDNS changes briefly reconnect the VPN.
 
-- **Production macOS app builds run in GitHub Actions.** Release builds produce
-  signed, notarized Apple Silicon and Intel disk images, with manual builds
+- **Production macOS app builds run in GitHub Actions.** Release and nightly builds
+  produce signed, notarized Apple Silicon and Intel disk images, with manual builds
   available as workflow artifacts. The installer has a Retina-ready Rayfish
   design with drag-to-Applications installation.
 

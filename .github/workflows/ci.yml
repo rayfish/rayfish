@@ -9,11 +9,25 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      macos_dmg:
+        description: Build signed and notarized macOS DMGs as artifacts
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-dmg:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_dmg
+    permissions:
+      contents: write
+    uses: ./.github/workflows/macos-release.yml
+    with:
+      release_tag: ''
+    secrets: inherit
+
   check:
     runs-on: ubuntu-22.04
     steps:
