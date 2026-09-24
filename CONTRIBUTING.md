@@ -46,16 +46,16 @@ For cross-compiling and remote deploys during development, see the `justfile`
 
 ## Code conventions
 
-`CLAUDE.md` documents the architecture, module layout, and key flows in depth —
-read it before making non-trivial changes. A few load-bearing rules:
+`AGENTS.md` maps the crates and records build commands and project conventions.
+Read the relevant module docs for design details. A few rules:
 
-- Never share an I/O resource (TUN, sockets, streams) behind a `Mutex` — split
+- Never share an I/O resource (TUN, sockets, streams) behind a `Mutex`; split
   into read/write halves. Prefer channels, atomics, or `RwLock`/`ArcSwap` over
   locks for shared state.
 - Use `tracing` for logging (spans on network lifecycle handlers and per-peer
   tasks). The daemon is fail-fast: panics are logged and the process aborts so
   the service manager restarts it.
-- Update the docs (`CLAUDE.md`, `README.md`, `CHANGELOG.md`) when you finish a
+- Update the docs (`AGENTS.md`, `README.md`, `CHANGELOG.md`) when you finish a
   feature or a significant change.
 
 ## Pull requests
