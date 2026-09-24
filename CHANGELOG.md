@@ -88,6 +88,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The macOS tray updates while open,** including connection activity, errors,
+  networks, and peer status. Closing the dashboard hides it to the tray without
+  quitting or disconnecting the VPN.
+
 - **macOS disconnect no longer panics while stopping the Rust node.** Network
   connections, protocol cleanup, and CLI shutdown run concurrently, and system
   logs record how long disconnect takes.

@@ -61,6 +61,12 @@ macos-ipc-test identity="Apple Development":
     codesign --force --sign "{{identity}}" --identifier com.rayfish.app target/macos-tests/tunnel-ipc-tests
     target/macos-tests/tunnel-ipc-tests
 
+# Test live menu updates and closing the dashboard without touching the VPN.
+macos-ui-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/RayfishMenu.swift macos/Rayfish/App/RayfishWindow.swift macos/Tests/AppUITests.swift -o target/macos-tests/app-ui-tests
+    target/macos-tests/app-ui-tests
+
 # Build a locally testable app with automatic Apple Development signing.
 macos-dev:
     env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration Debug -destination platform=macOS,arch=arm64 ARCHS=arm64 -derivedDataPath target/macos-development -allowProvisioningUpdates -allowProvisioningDeviceRegistration build

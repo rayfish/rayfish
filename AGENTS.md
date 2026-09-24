@@ -26,6 +26,7 @@ tests/e2e.sh <scenario> # shell, not cargo; see tests/e2e/README.md
 just macos-dev         # signed local Debug app; requires macOS and Xcode
 just macos-test        # legacy daemon detection and migration
 just macos-ipc-test    # signed XPC authentication, concurrency, and timeout tests
+just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 ```
 
 - For Rust changes, run `cargo fmt --all -- --check`, workspace Clippy with `--all-targets`, and tests for the affected crates before committing. Test the whole workspace when shared types or core behavior change.
