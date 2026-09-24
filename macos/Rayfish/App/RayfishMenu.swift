@@ -24,9 +24,7 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         // A custom menu view preserves the real switch; SwiftUI menu toggles become checkmarks.
-        let view = NSHostingView(rootView: RayfishConnectionSwitch(controller: controller) {
-            menu.cancelTracking()
-        })
+        let view = NSHostingView(rootView: RayfishConnectionSwitch(controller: controller))
         view.frame.size = view.fittingSize
         header.view = view
         header.identifier = .init("connection")
@@ -145,7 +143,6 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
 
 private struct RayfishConnectionSwitch: View {
     @ObservedObject var controller: TunnelController
-    let dismiss: () -> Void
 
     var body: some View {
         HStack {
@@ -158,7 +155,6 @@ private struct RayfishConnectionSwitch: View {
             Toggle("VPN connection", isOn: Binding(
                 get: { controller.isConnected },
                 set: { connected in
-                    dismiss()
                     Task {
                         if connected { await controller.connect() }
                         else { await controller.disconnect() }
