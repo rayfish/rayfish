@@ -50,7 +50,7 @@ targets:
         script: |
           set -euo pipefail
           cd "$SRCROOT/.."
-          cargo -q build --release --locked -p rayfish --bin ray
+          cargo -q build --release --locked -p rayfish --bin ray --features macos-app
           destination="$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray"
           install -m 755 target/release/ray "$destination"
           if [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then

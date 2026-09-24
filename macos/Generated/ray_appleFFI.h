@@ -291,6 +291,16 @@ void uniffi_ray_apple_fn_method_node_accept_request(void*_Nonnull ptr, RustBuffe
 void uniffi_ray_apple_fn_method_node_activate(void*_Nonnull ptr, uint64_t flow, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_APPROVE_CONNECTION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_APPROVE_CONNECTION
+void uniffi_ray_apple_fn_method_node_approve_connection(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CONNECT_PEER
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CONNECT_PEER
+RustBuffer uniffi_ray_apple_fn_method_node_connect_peer(void*_Nonnull ptr, RustBuffer contact_id, RustBuffer hostname, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_INVITE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_INVITE
 RustBuffer uniffi_ray_apple_fn_method_node_create_invite(void*_Nonnull ptr, RustBuffer network, RustCallStatus *_Nonnull out_status
@@ -326,6 +336,11 @@ void uniffi_ray_apple_fn_method_node_join_network(void*_Nonnull ptr, RustBuffer 
 void uniffi_ray_apple_fn_method_node_leave_network(void*_Nonnull ptr, RustBuffer network, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_MACHINES
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_MACHINES
+RustBuffer uniffi_ray_apple_fn_method_node_machines(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_MIGRATE_LEGACY_STATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_MIGRATE_LEGACY_STATE
 void uniffi_ray_apple_fn_method_node_migrate_legacy_state(void*_Nonnull ptr, RustBuffer source, RustCallStatus *_Nonnull out_status
@@ -336,9 +351,19 @@ void uniffi_ray_apple_fn_method_node_migrate_legacy_state(void*_Nonnull ptr, Rus
 void uniffi_ray_apple_fn_method_node_receive_packets(void*_Nonnull ptr, RustBuffer packets, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_CONNECTION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_CONNECTION
+void uniffi_ray_apple_fn_method_node_reject_connection(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
 void uniffi_ray_apple_fn_method_node_set_hostname(void*_Nonnull ptr, RustBuffer network, RustBuffer hostname, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_SETTING
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_SETTING
+void uniffi_ray_apple_fn_method_node_set_setting(void*_Nonnull ptr, RustBuffer key, int8_t enabled, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_START
@@ -653,6 +678,18 @@ uint16_t uniffi_ray_apple_checksum_method_node_activate(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_APPROVE_CONNECTION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_APPROVE_CONNECTION
+uint16_t uniffi_ray_apple_checksum_method_node_approve_connection(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_CONNECT_PEER
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_CONNECT_PEER
+uint16_t uniffi_ray_apple_checksum_method_node_connect_peer(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_CREATE_INVITE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_CREATE_INVITE
 uint16_t uniffi_ray_apple_checksum_method_node_create_invite(void
@@ -695,6 +732,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_leave_network(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_MACHINES
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_MACHINES
+uint16_t uniffi_ray_apple_checksum_method_node_machines(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_MIGRATE_LEGACY_STATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_MIGRATE_LEGACY_STATE
 uint16_t uniffi_ray_apple_checksum_method_node_migrate_legacy_state(void
@@ -707,9 +750,21 @@ uint16_t uniffi_ray_apple_checksum_method_node_receive_packets(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_CONNECTION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_CONNECTION
+uint16_t uniffi_ray_apple_checksum_method_node_reject_connection(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
 uint16_t uniffi_ray_apple_checksum_method_node_set_hostname(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_SETTING
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_SETTING
+uint16_t uniffi_ray_apple_checksum_method_node_set_setting(void
 
 );
 #endif

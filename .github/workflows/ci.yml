@@ -74,6 +74,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Check bundled macOS CLI
+        run: |
+          cargo -q clippy --workspace --all-targets --locked --features macos-app -- -D warnings
+          cargo -q test -p rayfish --bin ray --locked --features macos-app cli::help::tests
+
       - name: Install macOS build tools
         run: brew install xcodegen just
 

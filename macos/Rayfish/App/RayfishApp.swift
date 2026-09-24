@@ -343,6 +343,7 @@ private struct PeerRow: View {
 
 private struct DevicesView: View {
     @ObservedObject var controller: TunnelController
+    @State private var connectingPeer = false
     private var peers: [ProviderPeer] {
         let all = controller.status?.networks.flatMap { $0.peers } ?? []
         return Dictionary(all.map { ($0.ipv6, $0) }, uniquingKeysWith: { first, _ in first })
@@ -355,7 +356,67 @@ private struct DevicesView: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Devices").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+            HStack {
+                Text("Devices").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+                Spacer()
+                Button("Connect to a peer") { connectingPeer = true }
+                    .buttonStyle(RayfishButtonStyle(kind: .primary))
+                    .disabled(!controller.isConnected || controller.isLoading)
+            }
+            if let contactId = controller.status?.contactId {
+                HStack(spacing: 12) {
+                    Text("Your contact ID").foregroundColor(RayfishTheme.muted)
+                    Text(contactId).font(RayfishTheme.mono(11)).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(contactId, forType: .string)
+                    }.help("Share this ID so another peer can request a connection.")
+                }.padding(14).rayfishCard()
+            }
+            if let requests = controller.status?.connectionRequests, !requests.isEmpty {
+                Text("Connection requests").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+                VStack(spacing: 0) {
+                    ForEach(requests) { request in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(request.hostname ?? request.id)
+                                Text("\(request.id), waiting \(request.waitingSecs)s")
+                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                            }
+                            Spacer()
+                            Button("Deny", role: .destructive) { Task { await controller.rejectConnection(id: request.id) } }
+                            Button("Approve") { Task { await controller.approveConnection(id: request.id) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .primary))
+                        }.padding(14)
+                    }
+                }.rayfishCard().disabled(controller.isLoading)
+            }
+            HStack {
+                Text("Machines you control").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+                Spacer()
+                if controller.isRefreshingMachines { ProgressView().controlSize(.small) }
+                Button("Refresh") { controller.refreshMachines() }
+                    .disabled(!controller.isConnected || controller.isRefreshingMachines || controller.isLoading)
+            }
+            if let error = controller.machinesError {
+                Text(error).foregroundColor(RayfishTheme.amber).textSelection(.enabled)
+            }
+            if !controller.isConnected {
+                EmptyState(title: "Connect to see your machines.", description: "Enrolled machines are kept while disconnected.")
+            } else if controller.isRefreshingMachines && controller.machines.isEmpty {
+                EmptyState(title: "Checking your machines...", description: "Offline machines may take a few seconds to report.")
+            } else if controller.machines.isEmpty && controller.machinesError == nil {
+                EmptyState(title: "No enrolled machines.", description: "Use ray machines enroll to add a machine you control.")
+            } else if !controller.machines.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(controller.machines) { machine in
+                        MachineRow(machine: machine).padding(14)
+                        Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                    }
+                }.rayfishCard()
+            }
+            Text("Network peers").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
             if peers.isEmpty {
                 EmptyState(title: "No devices to show.", description: "Devices appear here once this Mac joins a network.")
             } else {
@@ -367,6 +428,80 @@ private struct DevicesView: View {
                 }.rayfishCard()
             }
         }
+        .sheet(isPresented: $connectingPeer) { ConnectPeerSheet(controller: controller) }
+    }
+}
+
+private struct MachineRow: View {
+    let machine: ProviderMachine
+    private var color: Color {
+        switch machine.state {
+        case "online": RayfishTheme.green
+        case "unauthorized": RayfishTheme.amber
+        default: RayfishTheme.faint
+        }
+    }
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(machine.hostname).foregroundColor(RayfishTheme.ink)
+                Text(machine.ipv6).font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                Text(machine.networks.isEmpty ? (machine.state == "online" ? "No networks" : "Networks unavailable") : machine.networks.joined(separator: ", "))
+                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
+            }
+            Spacer()
+            Text(machine.state).font(RayfishTheme.mono(12)).foregroundColor(color)
+        }
+        .contextMenu {
+            Button("Copy IP address") { copy(machine.ipv6) }
+            Button("Copy identity") { copy(machine.identity) }
+        }
+    }
+    private func copy(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+}
+
+private struct ConnectPeerSheet: View {
+    @ObservedObject var controller: TunnelController
+    @Environment(\.dismiss) private var dismiss
+    @State private var contactId = ""
+    @State private var hostname = ""
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Connect to a peer").font(RayfishTheme.heading(18))
+            Text("Paste their contact ID. They must approve the request before a private network is created.")
+                .foregroundColor(RayfishTheme.muted)
+            TextField("Contact ID or nearby peer ID", text: $contactId)
+                .font(RayfishTheme.mono(12))
+                .disabled(controller.isLoading || message != nil)
+            TextField("This Mac's name (optional)", text: $hostname)
+                .disabled(controller.isLoading || message != nil)
+            if let message { Text(message).foregroundColor(RayfishTheme.green) }
+            if let error = controller.error { Text(error).foregroundColor(RayfishTheme.amber) }
+            HStack {
+                if controller.isLoading { ProgressView().controlSize(.small) }
+                Spacer()
+                Button(message == nil ? "Cancel" : "Done") { dismiss() }
+                    .disabled(controller.isLoading)
+                if message == nil {
+                    Button("Send request") {
+                        Task {
+                            let name = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+                            message = await controller.connectPeer(
+                                id: contactId.trimmingCharacters(in: .whitespacesAndNewlines),
+                                hostname: name.isEmpty ? nil : name)
+                        }
+                    }.buttonStyle(RayfishButtonStyle(kind: .primary))
+                        .disabled(contactId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || controller.isLoading || !controller.isConnected)
+                }
+            }
+        }.rayfishSheet().frame(width: 480)
+            .interactiveDismissDisabled(controller.isLoading)
     }
 }
 
@@ -399,6 +534,29 @@ private struct SettingsView: View {
                 }
                 Text("The Rayfish system extension manages your connection.").foregroundColor(RayfishTheme.muted)
             }.padding(18).rayfishCard()
+            VStack(alignment: .leading, spacing: 14) {
+                Toggle("Magic DNS", isOn: Binding(
+                    get: { controller.status?.dnsEnabled ?? false },
+                    set: { enabled in Task { await controller.setSetting(.dns, enabled: enabled) } }
+                ))
+                Text("Resolve device names ending in .ray.").foregroundColor(RayfishTheme.muted)
+                Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                Toggle("mDNS discovery", isOn: Binding(
+                    get: { controller.status?.mdnsEnabled ?? false },
+                    set: { enabled in Task { await controller.setSetting(.mdns, enabled: enabled) } }
+                ))
+                Text("Discover peers on your local network. Changing this briefly reconnects the VPN.")
+                    .foregroundColor(RayfishTheme.muted)
+                if let status = controller.status, status.mdnsEnabled != status.mdnsActive {
+                    Button("Reconnect to apply mDNS") { Task { await controller.reconnect() } }
+                }
+                if controller.status == nil {
+                    Text("Connect to view and change DNS settings.").foregroundColor(RayfishTheme.faint)
+                }
+            }
+            .toggleStyle(.switch)
+            .disabled(controller.status == nil || controller.isLoading)
+            .padding(18).rayfishCard()
             VStack(alignment: .leading, spacing: 14) {
                 Text("Command line").font(RayfishTheme.heading(15))
                 Text("ray status").font(RayfishTheme.mono(13)).foregroundColor(RayfishTheme.rose)

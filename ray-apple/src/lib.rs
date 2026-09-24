@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rayfish::config;
+use rayfish::config::settings::GlobalKey;
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
 use rayfish::daemon::{DaemonState, build_headless};
@@ -54,6 +55,42 @@ pub struct NodeStatus {
     pub ipv6: String,
     pub networks: Vec<Network>,
     pub pending_requests: Vec<JoinRequest>,
+    pub contact_id: Option<String>,
+    pub connection_requests: Vec<ConnectionRequest>,
+    pub dns_enabled: bool,
+    pub mdns_enabled: bool,
+    pub mdns_active: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct ManagedMachine {
+    pub identity: String,
+    pub hostname: String,
+    pub ipv6: String,
+    pub state: String,
+    pub networks: Vec<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct ConnectionRequest {
+    pub id: String,
+    pub hostname: Option<String>,
+    pub waiting_secs: u64,
+}
+
+#[derive(uniffi::Enum)]
+pub enum GlobalSetting {
+    Dns,
+    Mdns,
+}
+
+impl From<GlobalSetting> for GlobalKey {
+    fn from(setting: GlobalSetting) -> Self {
+        match setting {
+            GlobalSetting::Dns => Self::Dns,
+            GlobalSetting::Mdns => Self::Mdns,
+        }
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -186,6 +223,8 @@ impl Node {
             endpoint_id,
             active,
             networks,
+            contact_id,
+            mdns_enabled: mdns_active,
             ..
         } = state.status()
         else {
@@ -209,8 +248,28 @@ impl Node {
                 _ => Vec::new(),
             })
             .collect();
+        let settings = config::load().map_err(|error| AppleError::Network(error.to_string()))?;
+        let connection_requests = match state.list_connections() {
+            IpcMessage::PendingRequests { requests } => requests
+                .into_iter()
+                .map(|request| ConnectionRequest {
+                    id: request.short_id,
+                    hostname: request.hostname,
+                    waiting_secs: request.waiting_secs,
+                })
+                .collect(),
+            response => {
+                expect_ok(response, "connection requests")?;
+                Vec::new()
+            }
+        };
         Ok(NodeStatus {
             active,
+            contact_id,
+            connection_requests,
+            dns_enabled: settings.dns_enabled,
+            mdns_enabled: settings.mdns_enabled,
+            mdns_active,
             ipv6: membership::derive_ipv6(&endpoint_id).to_string(),
             networks: networks
                 .into_iter()
@@ -243,6 +302,73 @@ impl Node {
                 .collect(),
             pending_requests,
         })
+    }
+
+    /// Probe enrolled machines separately so an offline machine cannot delay status.
+    pub fn machines(&self) -> Result<Vec<ManagedMachine>, AppleError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.list_managed_machines(true)) {
+            IpcMessage::ManagedMachinesResponse { machines } => Ok(machines
+                .into_iter()
+                .map(|machine| ManagedMachine {
+                    identity: machine.identity.to_string(),
+                    hostname: machine.hostname.to_string(),
+                    ipv6: membership::derive_ipv6(&machine.identity).to_string(),
+                    state: machine.state.as_str().to_owned(),
+                    networks: machine
+                        .networks
+                        .into_iter()
+                        .map(|name| name.to_string())
+                        .collect(),
+                })
+                .collect()),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "invalid machine inventory response".to_owned(),
+            )),
+        }
+    }
+
+    /// Persist an embedder-owned setting using the same keys as `ray config`.
+    /// NetworkExtension applies DNS; mDNS is rebuilt on the next connection.
+    pub fn set_setting(&self, key: GlobalSetting, enabled: bool) -> Result<(), AppleError> {
+        self.state()?;
+        config::update_settings(|settings| {
+            config::config_set(
+                settings,
+                key.into(),
+                if enabled { "on" } else { "off" },
+                false,
+            )
+        })
+        .map(|_| ())
+        .map_err(|error| AppleError::Network(error.to_string()))
+    }
+
+    pub fn connect_peer(
+        &self,
+        contact_id: String,
+        hostname: Option<String>,
+    ) -> Result<String, AppleError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.connect(&contact_id, hostname)) {
+            IpcMessage::Ok { message } => Ok(message),
+            IpcMessage::Joined { name, .. } => Ok(format!("Connected on {name}")),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network("invalid connect response".to_owned())),
+        }
+    }
+
+    pub fn approve_connection(&self, id: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        expect_ok(
+            self.runtime.block_on(state.approve_connection(&id)),
+            "connection approval",
+        )
+    }
+
+    pub fn reject_connection(&self, id: String) -> Result<(), AppleError> {
+        expect_ok(self.state()?.reject_connect(&id), "connection rejection")
     }
 
     pub fn create_network(
@@ -486,7 +612,7 @@ mod tests {
         let node = Node::new(directory.path().to_string_lossy().into_owned());
         // Build without binding the installed app's CLI socket on macOS.
         // The second build also checks that stop released the blob store lock.
-        for _ in 0..2 {
+        for iteration in 0..2 {
             let state = node.runtime.block_on(async {
                 timeout(START_TIMEOUT, build_headless(false))
                     .await
@@ -494,6 +620,53 @@ mod tests {
                     .unwrap()
             });
             *node.state.lock().unwrap() = Some(state);
+            if iteration == 0 {
+                let before = node.status().unwrap();
+                assert!(before.networks.is_empty());
+                assert!(before.connection_requests.is_empty());
+                assert!(before.contact_id.is_some());
+                node.set_setting(GlobalSetting::Dns, false).unwrap();
+                node.set_setting(GlobalSetting::Mdns, false).unwrap();
+                let after = node.status().unwrap();
+                assert!(!after.dns_enabled);
+                assert!(!after.mdns_enabled);
+                assert!(after.mdns_active, "mDNS stays active until reconnect");
+                assert!(matches!(
+                    node.connect_peer("invalid contact id".into(), None),
+                    Err(AppleError::Network(_))
+                ));
+                assert!(node.approve_connection("missing".into()).is_err());
+                assert!(node.reject_connection("missing".into()).is_err());
+
+                // A self-dial fails immediately, providing an offline inventory
+                // entry without relying on an external machine or a network.
+                let IpcMessage::StatusResponse { endpoint_id, .. } = node.state().unwrap().status()
+                else {
+                    panic!("expected node status");
+                };
+                config::update_settings(|settings| {
+                    settings.managed_machines.push(config::ManagedMachine {
+                        identity: endpoint_id,
+                        hostname: "managed-host".parse().unwrap(),
+                        enrolled_at: rayfish::ipc::UnixTimestampSecs::from_secs(1),
+                        last_seen: None,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+                let machines = node.machines().unwrap();
+                assert_eq!(machines.len(), 1);
+                assert_eq!(machines[0].hostname, "managed-host");
+                assert_eq!(machines[0].identity, endpoint_id.to_string());
+                assert_eq!(machines[0].ipv6, before.ipv6);
+                assert_eq!(machines[0].state, "offline");
+                assert!(machines[0].networks.is_empty());
+            } else {
+                let restarted = node.status().unwrap();
+                assert!(!restarted.dns_enabled);
+                assert!(!restarted.mdns_enabled);
+                assert!(!restarted.mdns_active);
+            }
             let started = Instant::now();
             node.stop();
             eprintln!("host-thread stop took {:?}", started.elapsed());

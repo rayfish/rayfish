@@ -39,6 +39,9 @@ required-features = ["desktop"]
 
 [features]
 default = ["desktop"]
+# The CLI bundled inside Rayfish.app uses the native UI and its user session.
+# Standalone macOS CLI builds keep the browser GUI and operator commands.
+macos-app = ["desktop"]
 # Desktop-only surface: the TUN-backed daemon binary, the embedded mesh SSH
 # server (russh/pty-process/uzers), interactive password prompts (rpassword),
 # and in-place self-update (self-replace). Off for the Android library build,

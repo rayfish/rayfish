@@ -284,7 +284,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/..\"\ncargo -q build --release --locked -p rayfish --bin ray\ndestination=\"$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray\"\ninstall -m 755 target/release/ray \"$destination\"\nif [ \"$CODE_SIGNING_ALLOWED\" != \"NO\" ]; then\n  codesign --force --options runtime --timestamp --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" \"$destination\"\nfi\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/..\"\ncargo -q build --release --locked -p rayfish --bin ray --features macos-app\ndestination=\"$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/MacOS/ray\"\ninstall -m 755 target/release/ray \"$destination\"\nif [ \"$CODE_SIGNING_ALLOWED\" != \"NO\" ]; then\n  codesign --force --options runtime --timestamp --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" \"$destination\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

@@ -573,7 +573,7 @@ pub(crate) async fn update_snapshot_and_publish(
 
 impl Daemon {
     /// `ray connect <contact-id>`: request a direct connection by contact id.
-    pub(crate) async fn connect(&self, contact_id: &str, hostname: Option<String>) -> IpcMessage {
+    pub async fn connect(&self, contact_id: &str, hostname: Option<String>) -> IpcMessage {
         self.connect.connect(contact_id, hostname).await
     }
 
