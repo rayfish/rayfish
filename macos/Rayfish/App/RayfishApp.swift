@@ -535,16 +535,26 @@ private struct SettingsView: View {
                 Text("The Rayfish system extension manages your connection.").foregroundColor(RayfishTheme.muted)
             }.padding(18).rayfishCard()
             VStack(alignment: .leading, spacing: 14) {
-                Toggle("Magic DNS", isOn: Binding(
-                    get: { controller.status?.dnsEnabled ?? false },
-                    set: { enabled in Task { await controller.setSetting(.dns, enabled: enabled) } }
-                ))
+                HStack {
+                    Text("Magic DNS")
+                    Spacer()
+                    Toggle("Magic DNS", isOn: Binding(
+                        get: { controller.status?.dnsEnabled ?? false },
+                        set: { enabled in Task { await controller.setSetting(.dns, enabled: enabled) } }
+                    ))
+                    .labelsHidden()
+                }
                 Text("Resolve device names ending in .ray.").foregroundColor(RayfishTheme.muted)
                 Rectangle().fill(RayfishTheme.line).frame(height: 1)
-                Toggle("mDNS discovery", isOn: Binding(
-                    get: { controller.status?.mdnsEnabled ?? false },
-                    set: { enabled in Task { await controller.setSetting(.mdns, enabled: enabled) } }
-                ))
+                HStack {
+                    Text("mDNS discovery")
+                    Spacer()
+                    Toggle("mDNS discovery", isOn: Binding(
+                        get: { controller.status?.mdnsEnabled ?? false },
+                        set: { enabled in Task { await controller.setSetting(.mdns, enabled: enabled) } }
+                    ))
+                    .labelsHidden()
+                }
                 Text("Discover peers on your local network. Changing this briefly reconnects the VPN.")
                     .foregroundColor(RayfishTheme.muted)
                 if let status = controller.status, status.mdnsEnabled != status.mdnsActive {

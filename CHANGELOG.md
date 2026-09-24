@@ -51,6 +51,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **macOS Settings aligns the DNS and mDNS switches to the right of each row.**
+
 - **macOS releases support Apple Silicon (arm64) only.** Both the native app DMG
   and the standalone CLI with daemon support remain available. Intel macOS builds
   are no longer published.
