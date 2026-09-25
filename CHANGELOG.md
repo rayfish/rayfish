@@ -23,6 +23,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The project README is now a short overview and install guide.** It links
+  directly to the macOS DMG, Windows installer, and full Rayfish documentation.
+
 - **Windows nightlies now contain only the CLI and daemon.** The Windows
   desktop installer and macOS DMG are produced for stable releases only.
 
