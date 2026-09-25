@@ -161,7 +161,7 @@ impl NetworkRegistry {
         };
         if removed {
             tracing::info!(network = %network, "coordinator kicked us and the signed record confirms removal; leaving network");
-            self.leave_network(network).await;
+            self.remove_kicked_network(network).await;
         }
     }
 
@@ -602,40 +602,55 @@ pub(crate) async fn remove_member_roster_only(
 }
 
 /// Republish the signed blob, broadcast a payload-free `MemberSync`, and send each
-/// `victim` a network-scoped `ControlMsg::KickedFromNetwork` so it confirms against
-/// the signed record and leaves this network. Call once after one or more
-/// [`remove_member_roster_only`] edits. Other members drop the victims when they
+/// removed member a network-scoped `ControlMsg::KickedFromNetwork` so it confirms
+/// against the signed record and leaves this network. Call once after one or more
+/// [`remove_member_roster_only`] edits. Other members drop removed peers when they
 /// reconverge from the freshly published record (`prune_departed_peers`).
 pub(crate) async fn finalize_removal(
     ctx: &MeshCtx,
     network: &str,
     state: &SharedNetworkState,
     dht_notify: &Option<Arc<tokio::sync::Notify>>,
-    victims: &[EndpointId],
+    removed_members: &[EndpointId],
 ) {
-    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
     let net_pubkey = state.read().unwrap().network_public_key;
-    broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
+    let mut removed_connections = Vec::new();
+
+    // Revoke local authorization before any publication or broadcast I/O. The
+    // roster has already been edited, so new hellos are rejected; removing the
+    // route here also stops data on an existing connection immediately.
     for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
         let resolved = ctx.device_user_map.resolve(&pid);
-        if victims.iter().any(|v| *v == pid || *v == resolved) {
-            // Authoritative, network-scoped kick: tell the victim in-band that it
-            // was removed from *this* network, so it can confirm against the signed
-            // record and leave just this one (a connection close code cannot name
-            // the network). Best-effort; a missed message falls back to the victim's
-            // reconverge.
-            if let Ok((mut send, _recv)) = conn.open_bi().await {
-                let _ =
-                    control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::KickedFromNetwork)
-                        .await;
-                let _ = send.finish();
-            }
-            // Drop this network's route to the victim. We do not close the
-            // connection: not closing keeps the kick message we just sent from
-            // racing a connection close, and the victim's message-triggered leave
-            // (or idle timeout) tears the link down. A link the victim still shares
-            // another network on stays up for those.
-            ctx.peers.remove_peer_from_network(&ip, network);
+        if removed_members
+            .iter()
+            .any(|removed| *removed == pid || *removed == resolved)
+        {
+            let close_after_notice =
+                revoke_peer_network(&ctx.peers, &ctx.pruned_peers, network, pid, ip).is_some();
+            removed_connections.push((conn, close_after_notice));
+        }
+    }
+
+    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
+    broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
+    for (conn, close_after_notice) in removed_connections {
+        // Authoritative, network-scoped kick: tell the removed member in-band so
+        // it can confirm against the signed record and leave just this network (a
+        // connection close code cannot name a network). Best-effort; a missed
+        // message falls back to reconvergence.
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::KickedFromNetwork)
+                .await;
+            let _ = send.finish();
+        }
+        // A connection shared by another network stays up for that network.
+        // Otherwise close the transport; the signed roster remains the removed
+        // member's reliable fallback if the best-effort notice loses this race.
+        if close_after_notice {
+            conn.close(
+                VarInt::from_u32(forward::KICK_CODE),
+                b"removed from network",
+            );
         }
     }
 }
@@ -680,7 +695,7 @@ pub(crate) fn spawn_stale_member_pruner(
                 .collect();
             // Identities alone: the address they are pruned at derives from each
             // one, so carrying it alongside would be two names for the same fact.
-            let victims: Vec<EndpointId> = {
+            let removed_members: Vec<EndpointId> = {
                 let s = state.read().unwrap();
                 s.members
                     .all()
@@ -697,14 +712,14 @@ pub(crate) fn spawn_stale_member_pruner(
                     .map(|m| m.identity)
                     .collect()
             };
-            if victims.is_empty() {
+            if removed_members.is_empty() {
                 continue;
             }
-            for id in &victims {
+            for id in &removed_members {
                 remove_member_roster_only(&ctx, &network, &state, *id, derive_ipv6(id)).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
-            finalize_removal(&ctx, &network, &state, &dht_notify, &victims).await;
+            finalize_removal(&ctx, &network, &state, &dht_notify, &removed_members).await;
         }
     })
 }

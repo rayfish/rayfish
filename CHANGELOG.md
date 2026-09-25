@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Windows has a desktop dashboard and tray app matching the macOS design.**
+  Closing its window leaves Rayfish in the notification area, where the VPN can
+  be connected, disconnected, reopened, or disconnected and quit.
+
+- **Windows and macOS can start Rayfish at login.** Enable it from Settings to
+  open the desktop app after signing in. The macOS app also connects the VPN.
+
 - **Managed machines restore missing controller inventory entries automatically.**
   New enrollments keep a signed receipt and announce themselves at startup and
   reconnect, with retries every five minutes. `ray machines confirm <endpoint-id>`
@@ -16,11 +23,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Windows nightlies now contain only the CLI and daemon.** The Windows
+  desktop installer and macOS DMG are produced for stable releases only.
+
 - **Machine management continues to support protocol v1.** Enrollment, status,
   and delegated network changes work with older peers. Signed receipts and
   inventory recovery require both endpoints to support v2.
 
 ### Fixed
+
+- **Kicks now revoke the removed device across the mesh.** Remaining peers drop
+  its network route and close its last shared connection, while the kicked device
+  removes the network from its local status and open desktop dashboard. A fresh
+  invite or approval can admit the same device again immediately.
 
 - **Commands that target network members accept their hostnames consistently.**
   Admin grants now accept names, and network-scoped commands do not resolve a

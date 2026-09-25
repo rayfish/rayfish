@@ -351,6 +351,10 @@ impl MeshCtx {
         network: &str,
     ) -> bool {
         let ipv6 = derive_ipv6(&peer_id);
+        // A fresh invite or approval can legitimately return a previously
+        // removed identity at once. Its successful authenticated registration
+        // supersedes the old one-shot reconnect suppression.
+        self.pruned_peers.remove(&(network.to_string(), peer_id));
         // Keep the roster route map current with every peer we connect to, so a
         // later idle teardown can re-dial it on demand (reconverge covers the
         // roster-wide sync + removals; this is the incremental add).
@@ -2115,6 +2119,52 @@ mod accept_handler_tests {
     }
 
     #[tokio::test]
+    async fn authorized_rejoin_clears_reconnect_suppression() {
+        let alpn = transport::mesh_alpn();
+        let local = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let remote = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let accept = {
+            let remote = remote.clone();
+            tokio::spawn(async move { remote.accept().await.unwrap().await.unwrap() })
+        };
+        let conn = local.connect(remote.addr(), &alpn).await.unwrap();
+        let remote_conn = accept.await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsStore::load(tmp.path()).await.unwrap();
+        let registry = sample_registry(
+            local.clone(),
+            IrohIdentityProvider::new(local.id()),
+            store.clone(),
+            local.id(),
+        );
+        let ctx = sample_mesh_ctx(IrohIdentityProvider::new(local.id()), store, registry);
+        let peer_id = conn.remote_id();
+        ctx.pruned_peers
+            .insert(("test-network".to_string(), peer_id));
+
+        ctx.register_peer_conn(&conn, peer_id, "test-network");
+
+        assert!(
+            !ctx.pruned_peers
+                .contains(&("test-network".to_string(), peer_id))
+        );
+        conn.close(VarInt::from_u32(0), b"test done");
+        remote_conn.close(VarInt::from_u32(0), b"test done");
+        local.close().await;
+        remote.close().await;
+    }
+
+    #[tokio::test]
     async fn reconnect_reuses_the_selected_connection_and_reports_success() {
         let alpn = transport::mesh_alpn();
         let local = Endpoint::builder(iroh::endpoint::presets::N0)
@@ -3030,6 +3080,30 @@ mod headless_tests {
                 if message == "ttl must be at least 3600 seconds (1 hour)"),
             "validation errors must not be mislabeled as save failures: {msg:?}"
         );
+    }
+
+    /// A signed roster is the authority for membership. When it no longer lists
+    /// this node, the network must disappear from saved state as well as the live
+    /// runtime, or the dashboard keeps showing it and startup tries to restore it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kicked_network_is_removed_from_saved_state() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
+        config::save_network(&config::empty_network_config("test-network")).unwrap();
+
+        daemon.registry.remove_kicked_network("test-network").await;
+
+        let saved = config::load().unwrap();
+        assert!(saved.networks.iter().all(|net| net.name != "test-network"));
+        daemon.shutdown_and_close().await;
     }
 
     /// A stopped node must be rebuildable in the same process, which is the
