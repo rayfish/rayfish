@@ -8,11 +8,15 @@
 //! only the work the data plane does, so a regression (or the gain from the
 //! zero-copy hand-off) is visible and stable run-to-run.
 //!
-//! Three groups:
+//! Five groups:
 //! - `handoff` — the packet ownership transfer that the zero-copy change
 //!   touched. `copy` reproduces the old allocate-and-copy (`Bytes::copy_from_slice`
 //!   on TX, `Vec::to_vec` on RX); `zerocopy` is the current pooled
 //!   `split_to(n).freeze()` (TX) and `Bytes` clone (RX). The delta is the saving.
+//! - `tun_ingress` compares the old kernel-to-scratch-to-pool shape with a
+//!   direct read into the owned packet allocation.
+//! - `apple_tun_ingress` compares the removed Swift-to-`Vec` channel path with
+//!   a direct read into the owned packet allocation.
 //! - `writer_resolve` — resolving the swappable TUN sender once per inbound
 //!   datagram: `load_full` (two atomic refcount ops) against the `arc_swap`
 //!   `Cache` the peer reader now uses.
@@ -36,8 +40,8 @@ use rayfish::firewall::{
 /// zero-copy path should be flat.
 const SIZES: &[usize] = &[64, 1280, rayfish::tun::TUN_MTU as usize];
 
-/// Pool chunk size mirrors `forward::TX_POOL_CHUNK` (64 KiB) so the amortized
-/// allocation behaviour matches production.
+/// Pool chunk size used by the old forwarding pool and the direct Android
+/// reader, so allocation stays amortized across packets.
 const POOL_CHUNK: usize = 64 * 1024;
 const MAX_DATAGRAM: usize = 1500;
 
@@ -106,6 +110,85 @@ fn bench_handoff(c: &mut Criterion) {
             b.iter(|| {
                 let cloned = black_box(dg).clone();
                 black_box(cloned)
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_tun_ingress(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tun_ingress");
+    for &size in SIZES {
+        let packet = ipv4_tcp_packet(size, 443);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("scratch_then_pool", size),
+            &packet,
+            |b, pkt| {
+                let mut scratch = vec![0u8; pkt.len()];
+                let mut pool = BytesMut::with_capacity(POOL_CHUNK);
+                b.iter(|| {
+                    scratch.copy_from_slice(black_box(pkt));
+                    if pool.capacity() < MAX_DATAGRAM {
+                        pool.reserve(POOL_CHUNK);
+                    }
+                    pool.extend_from_slice(black_box(&scratch));
+                    black_box(pool.split_to(pkt.len()).freeze())
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("direct_to_owned", size),
+            &packet,
+            |b, pkt| {
+                let mut pool = BytesMut::with_capacity(POOL_CHUNK);
+                b.iter(|| {
+                    if pool.capacity() < MAX_DATAGRAM {
+                        pool.reserve(POOL_CHUNK);
+                    }
+                    pool.extend_from_slice(black_box(pkt));
+                    black_box(pool.split_to(pkt.len()).freeze())
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_apple_tun_ingress(c: &mut Criterion) {
+    let mut group = c.benchmark_group("apple_tun_ingress");
+    for &size in SIZES {
+        let packet = ipv4_tcp_packet(size, 443);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("bridge_queue", size), &packet, |b, pkt| {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+            let mut pool = BytesMut::with_capacity(POOL_CHUNK);
+            b.iter(|| {
+                sender
+                    .try_send(black_box(pkt).to_vec())
+                    .expect("benchmark packet queue must have capacity");
+                let packet = receiver
+                    .try_recv()
+                    .expect("benchmark packet must be queued");
+                if pool.capacity() < MAX_DATAGRAM {
+                    pool.reserve(POOL_CHUNK);
+                }
+                pool.extend_from_slice(black_box(&packet));
+                black_box(pool.split_to(pkt.len()).freeze())
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("direct_fd", size), &packet, |b, pkt| {
+            let mut pool = BytesMut::with_capacity(POOL_CHUNK);
+            b.iter(|| {
+                if pool.capacity() < MAX_DATAGRAM {
+                    pool.reserve(POOL_CHUNK);
+                }
+                pool.extend_from_slice(black_box(pkt));
+                black_box(pool.split_to(pkt.len()).freeze())
             });
         });
     }
@@ -216,5 +299,12 @@ fn rule(
     }
 }
 
-criterion_group!(benches, bench_handoff, bench_writer_resolve, bench_firewall);
+criterion_group!(
+    benches,
+    bench_handoff,
+    bench_tun_ingress,
+    bench_apple_tun_ingress,
+    bench_writer_resolve,
+    bench_firewall
+);
 criterion_main!(benches);

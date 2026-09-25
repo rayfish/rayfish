@@ -3543,7 +3543,7 @@ mod headless_tests {
     }
 
     impl crate::tun::TunRead for FakeTunReader {
-        async fn read_into(&mut self, _buf: &mut bytes::BytesMut) -> anyhow::Result<usize> {
+        async fn read_packet(&mut self) -> anyhow::Result<bytes::Bytes> {
             std::future::pending::<()>().await;
             unreachable!("FakeTunReader never returns");
         }

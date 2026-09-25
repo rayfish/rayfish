@@ -251,21 +251,6 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureStr
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_PACKET_FLOW_METHOD0
-#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_PACKET_FLOW_METHOD0
-typedef void (*UniffiCallbackInterfacePacketFlowMethod0)(uint64_t, RustBuffer, void* _Nonnull,
-        RustCallStatus *_Nonnull uniffiCallStatus
-    );
-
-#endif
-#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PACKET_FLOW
-#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PACKET_FLOW
-typedef struct UniffiVTableCallbackInterfacePacketFlow {
-    UniffiCallbackInterfacePacketFlowMethod0 _Nonnull writePacket;
-    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
-} UniffiVTableCallbackInterfacePacketFlow;
-
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_CLONE_NODE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_CLONE_NODE
 void*_Nonnull uniffi_ray_apple_fn_clone_node(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -293,7 +278,7 @@ void uniffi_ray_apple_fn_method_node_accept_request(void*_Nonnull ptr, RustBuffe
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACTIVATE
-void uniffi_ray_apple_fn_method_node_activate(void*_Nonnull ptr, uint64_t flow, RustCallStatus *_Nonnull out_status
+void uniffi_ray_apple_fn_method_node_activate(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_APPROVE_CONNECTION
@@ -351,11 +336,6 @@ RustBuffer uniffi_ray_apple_fn_method_node_machines(void*_Nonnull ptr, RustCallS
 void uniffi_ray_apple_fn_method_node_migrate_legacy_state(void*_Nonnull ptr, RustBuffer source, RustCallStatus *_Nonnull out_status
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_RECEIVE_PACKETS
-#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_RECEIVE_PACKETS
-void uniffi_ray_apple_fn_method_node_receive_packets(void*_Nonnull ptr, RustBuffer packets, RustCallStatus *_Nonnull out_status
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_CONNECTION
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_CONNECTION
 void uniffi_ray_apple_fn_method_node_reject_connection(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
@@ -394,11 +374,6 @@ RustBuffer uniffi_ray_apple_fn_method_node_status(void*_Nonnull ptr, RustCallSta
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_STOP
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_STOP
 void uniffi_ray_apple_fn_method_node_stop(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_INIT_CALLBACK_VTABLE_PACKETFLOW
-#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_INIT_CALLBACK_VTABLE_PACKETFLOW
-void uniffi_ray_apple_fn_init_callback_vtable_packetflow(const UniffiVTableCallbackInterfacePacketFlow* _Nonnull vtable
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_RAY_APPLE_RUSTBUFFER_ALLOC
@@ -765,12 +740,6 @@ uint16_t uniffi_ray_apple_checksum_method_node_migrate_legacy_state(void
 
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_RECEIVE_PACKETS
-#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_RECEIVE_PACKETS
-uint16_t uniffi_ray_apple_checksum_method_node_receive_packets(void
-
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_CONNECTION
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_CONNECTION
 uint16_t uniffi_ray_apple_checksum_method_node_reject_connection(void
@@ -822,12 +791,6 @@ uint16_t uniffi_ray_apple_checksum_method_node_stop(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_CONSTRUCTOR_NODE_NEW
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_CONSTRUCTOR_NODE_NEW
 uint16_t uniffi_ray_apple_checksum_constructor_node_new(void
-
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_PACKETFLOW_WRITE_PACKET
-#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_PACKETFLOW_WRITE_PACKET
-uint16_t uniffi_ray_apple_checksum_method_packetflow_write_packet(void
 
 );
 #endif

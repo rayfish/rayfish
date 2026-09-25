@@ -1,9 +1,8 @@
-import Darwin
 import Foundation
 import NetworkExtension
 import OSLog
 
-final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
+final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var node: Node?
     private var appliedDNS: Bool?
 
@@ -42,10 +41,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                     return
                 }
                 do {
-                    try node.activate(flow: self)
+                    try node.activate()
                     self.node = node
                     self.appliedDNS = status.dnsEnabled
-                    self.readPackets()
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
                 } catch {
@@ -107,24 +105,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
             RayfishLog.tunnel.error("Command failed: \(error.localizedDescription, privacy: .private)")
             let response = ProviderResponse(success: false, error: error.localizedDescription, status: nil, inviteCode: nil)
             completionHandler?(try? JSONEncoder().encode(response))
-        }
-    }
-
-    func writePacket(packet: Data) {
-        let family = packet.first.map { $0 >> 4 } == 6 ? AF_INET6 : AF_INET
-        packetFlow.writePackets([packet], withProtocols: [NSNumber(value: family)])
-    }
-
-    private func readPackets() {
-        packetFlow.readPackets { [weak self] packets, _ in
-            guard let self, let node = self.node else { return }
-            do {
-                try node.receivePackets(packets: packets)
-                self.readPackets()
-            } catch {
-                RayfishLog.tunnel.error("Packet processing failed: \(error.localizedDescription, privacy: .public)")
-                self.cancelTunnelWithError(error)
-            }
         }
     }
 

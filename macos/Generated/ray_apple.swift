@@ -395,13 +395,7 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 
 
 // Public interface members begin here.
-// Magic number for the Rust proxy to call using the same mechanism as every other method,
-// to free the callback once it's dropped by Rust.
-private let IDX_CALLBACK_FREE: Int32 = 0
-// Callback return codes
-private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
-private let UNIFFI_CALLBACK_ERROR: Int32 = 1
-private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
+
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -500,24 +494,6 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterData: FfiConverterRustBuffer {
-    typealias SwiftType = Data
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
-        let len: Int32 = try readInt(&buf)
-        return Data(try readBytes(&buf, count: Int(len)))
-    }
-
-    public static func write(_ value: Data, into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        writeBytes(&buf, value)
-    }
-}
-
 
 
 
@@ -531,9 +507,9 @@ public protocol NodeProtocol: AnyObject, Sendable {
     func acceptRequest(network: String, id: String) throws
 
     /**
-     * Attach the system packet flow and start forwarding packets.
+     * Attach the system packet tunnel and start forwarding packets.
      */
-    func activate(flow: PacketFlow) throws
+    func activate() throws
 
     func approveConnection(id: String) throws
 
@@ -571,11 +547,6 @@ public protocol NodeProtocol: AnyObject, Sendable {
      * Copy legacy launchd state before starting the extension-owned node.
      */
     func migrateLegacyState(source: String) throws
-
-    /**
-     * Deliver packets read from `NEPacketTunnelFlow` to the mesh forwarder.
-     */
-    func receivePackets(packets: [Data]) throws
 
     func rejectConnection(id: String) throws
 
@@ -689,11 +660,10 @@ open func acceptRequest(network: String, id: String)throws   {try rustCallWithEr
 }
 
     /**
-     * Attach the system packet flow and start forwarding packets.
+     * Attach the system packet tunnel and start forwarding packets.
      */
-open func activate(flow: PacketFlow)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
-    uniffi_ray_apple_fn_method_node_activate(self.uniffiClonePointer(),
-        FfiConverterCallbackInterfacePacketFlow_lower(flow),$0
+open func activate()throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_activate(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -791,16 +761,6 @@ open func machines()throws  -> [ManagedMachine]  {
 open func migrateLegacyState(source: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_migrate_legacy_state(self.uniffiClonePointer(),
         FfiConverterString.lower(source),$0
-    )
-}
-}
-
-    /**
-     * Deliver packets read from `NEPacketTunnelFlow` to the mesh forwarder.
-     */
-open func receivePackets(packets: [Data])throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
-    uniffi_ray_apple_fn_method_node_receive_packets(self.uniffiClonePointer(),
-        FfiConverterSequenceData.lower(packets),$0
     )
 }
 }
@@ -1718,7 +1678,6 @@ public enum AppleError: Swift.Error {
     case UnsupportedPlatform
     case AlreadyActive
     case AlreadyStarted
-    case PacketQueueFull
     case Network(String
     )
 }
@@ -1741,8 +1700,7 @@ public struct FfiConverterTypeAppleError: FfiConverterRustBuffer {
         case 2: return .UnsupportedPlatform
         case 3: return .AlreadyActive
         case 4: return .AlreadyStarted
-        case 5: return .PacketQueueFull
-        case 6: return .Network(
+        case 5: return .Network(
             try FfiConverterString.read(from: &buf)
             )
 
@@ -1773,12 +1731,8 @@ public struct FfiConverterTypeAppleError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
 
 
-        case .PacketQueueFull:
-            writeInt(&buf, Int32(5))
-
-
         case let .Network(v1):
-            writeInt(&buf, Int32(6))
+            writeInt(&buf, Int32(5))
             FfiConverterString.write(v1, into: &buf)
 
         }
@@ -1962,125 +1916,6 @@ extension IncomingFileState: Equatable, Hashable {}
 
 
 
-
-
-
-public protocol PacketFlow: AnyObject, Sendable {
-
-    /**
-     * Write one packet received from a Rayfish peer into `NEPacketTunnelFlow`.
-     */
-    func writePacket(packet: Data)
-
-}
-
-
-// Put the implementation in a struct so we don't pollute the top-level namespace
-fileprivate struct UniffiCallbackInterfacePacketFlow {
-
-    // Create the VTable using a series of closures.
-    // Swift automatically converts these into C callback functions.
-    //
-    // This creates 1-element array, since this seems to be the only way to construct a const
-    // pointer that we can pass to the Rust code.
-    static let vtable: [UniffiVTableCallbackInterfacePacketFlow] = [UniffiVTableCallbackInterfacePacketFlow(
-        writePacket: { (
-            uniffiHandle: UInt64,
-            packet: RustBuffer,
-            uniffiOutReturn: UnsafeMutableRawPointer,
-            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
-        ) in
-            let makeCall = {
-                () throws -> () in
-                guard let uniffiObj = try? FfiConverterCallbackInterfacePacketFlow.handleMap.get(handle: uniffiHandle) else {
-                    throw UniffiInternalError.unexpectedStaleHandle
-                }
-                return uniffiObj.writePacket(
-                     packet: try FfiConverterData.lift(packet)
-                )
-            }
-
-
-            let writeReturn = { () }
-            uniffiTraitInterfaceCall(
-                callStatus: uniffiCallStatus,
-                makeCall: makeCall,
-                writeReturn: writeReturn
-            )
-        },
-        uniffiFree: { (uniffiHandle: UInt64) -> () in
-            let result = try? FfiConverterCallbackInterfacePacketFlow.handleMap.remove(handle: uniffiHandle)
-            if result == nil {
-                print("Uniffi callback interface PacketFlow: handle missing in uniffiFree")
-            }
-        }
-    )]
-}
-
-private func uniffiCallbackInitPacketFlow() {
-    uniffi_ray_apple_fn_init_callback_vtable_packetflow(UniffiCallbackInterfacePacketFlow.vtable)
-}
-
-// FfiConverter protocol for callback interfaces
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterCallbackInterfacePacketFlow {
-    fileprivate static let handleMap = UniffiHandleMap<PacketFlow>()
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-extension FfiConverterCallbackInterfacePacketFlow : FfiConverter {
-    typealias SwiftType = PacketFlow
-    typealias FfiType = UInt64
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public static func lift(_ handle: UInt64) throws -> SwiftType {
-        try handleMap.get(handle: handle)
-    }
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        let handle: UInt64 = try readInt(&buf)
-        return try lift(handle)
-    }
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public static func lower(_ v: SwiftType) -> UInt64 {
-        return handleMap.insert(obj: v)
-    }
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(v))
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterCallbackInterfacePacketFlow_lift(_ handle: UInt64) throws -> PacketFlow {
-    return try FfiConverterCallbackInterfacePacketFlow.lift(handle)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterCallbackInterfacePacketFlow_lower(_ v: PacketFlow) -> UInt64 {
-    return FfiConverterCallbackInterfacePacketFlow.lower(v)
-}
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2149,31 +1984,6 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
-    typealias SwiftType = [Data]
-
-    public static func write(_ value: [Data], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterData.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [Data]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterData.read(from: &buf))
         }
         return seq
     }
@@ -2375,7 +2185,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_method_node_accept_request() != 19133) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_apple_checksum_method_node_activate() != 47813) {
+    if (uniffi_ray_apple_checksum_method_node_activate() != 44063) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_approve_connection() != 5866) {
@@ -2411,9 +2221,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_method_node_migrate_legacy_state() != 46002) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_apple_checksum_method_node_receive_packets() != 53305) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_ray_apple_checksum_method_node_reject_connection() != 11655) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2441,11 +2248,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_constructor_node_new() != 28396) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_apple_checksum_method_packetflow_write_packet() != 46369) {
-        return InitializationResult.apiChecksumMismatch
-    }
 
-    uniffiCallbackInitPacketFlow()
     return InitializationResult.ok
 }()
 

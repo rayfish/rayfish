@@ -61,6 +61,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Admin grants now accept names, and network-scoped commands do not resolve a
   duplicate name from another network.
 
+### Performance
+
+- **macOS packet forwarding now uses the system tunnel directly.** Packets no
+  longer cross the Swift bridge or a Rust channel, and TUN reads no longer need
+  an intermediate copy.
+
 ## [0.5.0] - 2026-09-24
 
 ### Added
