@@ -1896,7 +1896,9 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
 mod tests {
     use super::*;
     use ipc::FirewallRuleView;
-    use rayfish::update::{normalize_version, release_asset_name, version_is_newer};
+    use rayfish::update::{
+        nightly_asset_name, normalize_version, release_asset_name, version_is_newer,
+    };
 
     #[test]
     fn pair_backup_accepts_the_1password_flag_spellings() {
@@ -2042,6 +2044,14 @@ mod tests {
         assert_eq!(
             release_asset_name("windows", "x86_64").unwrap(),
             "ray-windows-x86_64.msi"
+        );
+        assert_eq!(
+            nightly_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.exe"
+        );
+        assert_eq!(
+            nightly_asset_name("windows", "aarch64").unwrap(),
+            "ray-windows-aarch64.exe"
         );
     }
 
