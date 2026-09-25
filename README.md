@@ -39,8 +39,9 @@ security audit. Do not rely on it for critical systems yet.
 
 ### macOS
 
-[Download the signed and notarized DMG for Apple Silicon](https://github.com/rayfish/rayfish/releases/download/v0.5.0/Rayfish-0.5.0-arm64.dmg).
-Drag Rayfish into Applications, open it, then approve the network extension.
+[Download the signed and notarized macOS DMG](https://github.com/rayfish/rayfish/releases/latest).
+Apple Silicon and Intel builds are available. Drag Rayfish into Applications,
+open it, then approve the network extension.
 
 ### Windows
 

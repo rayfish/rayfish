@@ -29,9 +29,9 @@ const MAX_WARM_ENDPOINT_HINTS: usize = 64;
 
 fn network_key_from_selector(selector: &str) -> Option<EndpointId> {
     selector.parse().ok().or_else(|| {
-        crate::invite::decode_invite_code(selector)
+        crate::invite::decode_share_code(selector)
             .ok()
-            .map(|(network_key, _, _)| network_key)
+            .map(|code| code.network)
     })
 }
 
@@ -637,10 +637,6 @@ impl NetworkRegistry {
             .find_map(|handle| (handle.network_key == network_key).then(|| handle.key().clone()))
     }
 
-    /// A registered network's roster read key, if it has one.
-    ///
-    /// `None` means the network predates read keys and still publishes a
-    /// plaintext blob, so every code minted for it is a pre-read-key one.
     pub(crate) fn network_read_key(&self, network: &str) -> Option<ReadKey> {
         let handle = self.networks.get(network)?;
         let key = handle.state.read().ok()?.read_key.clone();
@@ -752,9 +748,6 @@ impl NetworkRegistry {
         // this is the one peer the co-coordinator key grant is pinned to.
         let pre_approved_peer = pre_approve.as_ref().map(|(id, _)| *id);
 
-        // Minted here and nowhere else on this path: the roster read key is what
-        // the shareable code carries, so it exists from the network's first
-        // moment rather than being added once someone is already looking.
         let read_key = ReadKey::generate();
         let mut net_state = self.build_initial_roster(
             &name,
@@ -778,6 +771,7 @@ impl NetworkRegistry {
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: Some(net_public_key),
+            read_key: Some(read_key.clone()),
             last_group_hash: Some(last_group_hash),
             last_group_hash_published: false,
             transport: None,
@@ -956,11 +950,13 @@ impl NetworkRegistry {
         else {
             return None;
         };
+        let commitment = self.network_read_key(network).map(|key| key.commitment());
         match dht::publish_network(
             &pkarr_client,
             net_secret_key,
             &blob_hash,
             &[self.transport.endpoint.id()],
+            commitment.as_ref(),
         )
         .await
         {
@@ -1055,10 +1051,11 @@ impl NetworkRegistry {
         if !snapshot_is_publishable(&self.transport.blob_store, &state, network, hash).await {
             return None;
         }
-        let (key, members, approved) = {
+        let (key, commitment, members, approved) = {
             let state = state.read().unwrap();
             (
                 state.network_secret_key.clone()?,
+                state.read_key.as_ref().map(ReadKey::commitment),
                 state.roster(),
                 state.approved_snapshot(),
             )
@@ -1072,7 +1069,8 @@ impl NetworkRegistry {
         seed_peers.push(self.transport.endpoint.id());
         seed_peers.sort_by_key(|id| id.to_string());
         seed_peers.dedup();
-        let packet = dht::encode_network_record(&key, &hash, &seed_peers).ok()?;
+        let packet =
+            dht::encode_network_record(&key, &hash, &seed_peers, commitment.as_ref()).ok()?;
         Some(CurrentSignedNetworkState {
             hash,
             packet: packet.as_bytes().to_vec(),

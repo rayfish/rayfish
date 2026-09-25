@@ -82,11 +82,6 @@ pub fn encode_network_record(
         format!("h,{blob_hash}"),
         format!("m,{}", crate::transport::MESH_RECORD_VERSION),
     ];
-    // `k,<blake3(read_key)>`: present iff the group blob is sealed. Two jobs, and
-    // both need it to be in the *signed* record rather than in the blob it
-    // describes. It tells a fetcher the bytes will need opening, before it has
-    // them; and because the network key signed it, a node handed a read key can
-    // check the key against it without trusting whoever handed it over.
     if let Some(commitment) = read_key_commitment {
         values.push(format!("k,{commitment}"));
     }
@@ -124,14 +119,10 @@ pub fn verify_network_record(bytes: &[u8], network_pubkey: EndpointId) -> Result
     Ok(packet)
 }
 
-/// What a signed network record says: the blob hash, the seed peers to fetch it
-/// from, and the read-key commitment when the blob is sealed.
 #[derive(Debug, Clone)]
 pub struct NetworkRecord {
     pub blob_hash: blake3::Hash,
     pub seed_peers: Vec<EndpointId>,
-    /// `blake3(read_key)`, present iff the blob is sealed. `None` means the
-    /// network predates read keys and publishes plaintext.
     pub read_key_commitment: Option<blake3::Hash>,
 }
 
@@ -161,9 +152,10 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<NetworkRecord> {
                     .parse::<EndpointId>()
                     .context("invalid peer endpoint ID")?,
             );
-        } else if let Some(k) = record.strip_prefix("k,") {
+        } else if let Some(commitment) = record.strip_prefix("k,") {
             read_key_commitment = Some(
-                k.parse::<blake3::Hash>()
+                commitment
+                    .parse::<blake3::Hash>()
                     .context("invalid read key commitment")?,
             );
         }
@@ -220,8 +212,9 @@ pub async fn publish_network(
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
+    read_key_commitment: Option<&blake3::Hash>,
 ) -> Result<Vec<u8>> {
-    let packet = encode_network_record(key, blob_hash, seed_peers)?;
+    let packet = encode_network_record(key, blob_hash, seed_peers, read_key_commitment)?;
     match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(&packet)).await {
         Ok(Ok(())) => Ok(packet.as_bytes().to_vec()),
         Ok(Err(e)) => Err(anyhow::anyhow!("failed to publish network record: {e:#}")),
@@ -329,7 +322,6 @@ mod tests {
         let decoded = decode_network_record(&packet).unwrap();
         assert_eq!(decoded.blob_hash, hash);
         assert_eq!(decoded.seed_peers, peers);
-        assert_eq!(decoded.read_key_commitment, None);
     }
 
     #[test]

@@ -60,6 +60,74 @@ fn member_admits(device_cert: Option<&control::DeviceCert>, members: &MemberList
     device_cert.is_some_and(|c| members.is_member(&c.user_identity))
 }
 
+/// Who is asking to read a network's roster, as
+/// [`state_permits_roster_read`] needs them. `device_cert` is already verified
+/// by the caller; `user_id` is the asker's resolved user identity, which may be
+/// the device key itself when nothing is paired.
+pub(crate) struct RosterReadRequest<'a> {
+    pub(crate) peer_id: EndpointId,
+    pub(crate) user_id: EndpointId,
+    pub(crate) invite_secret: Option<&'a [u8]>,
+    pub(crate) device_cert: Option<&'a control::DeviceCert>,
+}
+
+/// What the in-memory network state alone can decide about a roster read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RosterRead {
+    Allow,
+    Deny,
+    /// State says no, but the asker presented a secret that could still be a
+    /// single-use invite, which lives in the coordinator's on-disk ledger.
+    AskTheInviteLedger,
+}
+
+/// May this peer hold the key that opens this roster?
+///
+/// The same question admission answers, asked one message earlier because a
+/// joiner must read the roster before it can dial. Every `Allow` here has an
+/// admission branch behind it, with one deliberate omission: a *queued* request
+/// is not an allow. That is what makes a code, or a room id, worth nothing on
+/// its own — a join that is later denied never held a roster read.
+pub(crate) fn state_permits_roster_read(
+    s: &NetworkState,
+    req: &RosterReadRequest<'_>,
+    own_identity: EndpointId,
+) -> RosterRead {
+    // A device its primary unpaired is refused everywhere else; refuse it the
+    // roster too, before any of the allows below can rescue it.
+    if let Some(cert) = req.device_cert
+        && s.nullifiers.contains(&cert.device_key)
+    {
+        return RosterRead::Deny;
+    }
+    // Already in, or already approved by the operator: the roster is theirs.
+    if [req.peer_id, req.user_id]
+        .iter()
+        .any(|id| s.members.is_member(id) || s.approved.is_approved(id))
+    {
+        return RosterRead::Allow;
+    }
+    // A reusable key rides the signed blob, so it is checked in-state.
+    if let Some(secret) = req.invite_secret
+        && crate::membership::validate_reusable_key(&s.reusable_keys, secret, now_secs()).is_some()
+    {
+        return RosterRead::Allow;
+    }
+    // An open network admits anybody who asks, so withholding its roster from
+    // them would protect nothing.
+    if matches!(s.mode, GroupMode::Open) {
+        return RosterRead::Allow;
+    }
+    // One of our own paired devices, same as at admission.
+    if owner_admits(req.device_cert, own_identity) {
+        return RosterRead::Allow;
+    }
+    match req.invite_secret {
+        Some(_) => RosterRead::AskTheInviteLedger,
+        None => RosterRead::Deny,
+    }
+}
+
 /// Whether a signed record authored at `record_ts` may replace what we hold,
 /// given the timestamp of the last record applied (`floor`).
 ///
@@ -1208,9 +1276,15 @@ impl CoordinatorAcceptState {
                 let s = self.state.read().unwrap();
                 let key = s.network_secret_key.as_ref()?;
                 let hash = s.converged_hash?;
-                dht::encode_network_record(key, &hash, &[self.ctx.registry.transport.endpoint.id()])
-                    .ok()
-                    .map(|packet| packet.as_bytes().to_vec())
+                let commitment = s.read_key.as_ref().map(ReadKey::commitment);
+                dht::encode_network_record(
+                    key,
+                    &hash,
+                    &[self.ctx.registry.transport.endpoint.id()],
+                    commitment.as_ref(),
+                )
+                .ok()
+                .map(|packet| packet.as_bytes().to_vec())
             })
         } else {
             None
@@ -1782,7 +1856,9 @@ impl MemberAcceptState {
 
     /// The `k,` commitment in this network's current signed record, if any.
     async fn record_read_key_commitment(&self) -> Option<blake3::Hash> {
-        let client = dht::create_pkarr_client(&self.endpoint).ok()?;
+        let client =
+            dht::create_pkarr_client(&self.endpoint, &self.registry.transport.pkarr_relay_url)
+                .ok()?;
         let packet = dht::resolve_network_packet(&client, self.net_pubkey)
             .await
             .ok()?;
@@ -2184,6 +2260,29 @@ impl ProtocolRouter {
     }
 }
 
+pub(crate) async fn send_read_key_grant(
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    peer_id: EndpointId,
+    read_key: &ReadKey,
+) {
+    let Some((_, ip, conn)) = peers
+        .peers_for_network_with_conn(network_name)
+        .into_iter()
+        .find(|(id, _, _)| *id == peer_id)
+    else {
+        return;
+    };
+    let msg = ControlMsg::ReadKeyGrant {
+        network_pubkey: net_pubkey,
+        read_key: read_key.to_bytes(),
+    };
+    if let Err(e) = open_and_send(&conn, Some(net_pubkey), &msg).await {
+        tracing::warn!(peer_ip = %ip, error = %e, "failed to send read key grant");
+    }
+}
+
 #[cfg(test)]
 mod admission_rollback_tests {
     use super::*;
@@ -2397,11 +2496,14 @@ mod roster_read_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
+            unconfirmed_durable_hash: None,
             network_secret_key: None,
             read_key: None,
             network_public_key: eid(200),
             network_name: Some("team-alex".to_string()),
+            group_name: Some("team-alex".to_string()),
             mode,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),

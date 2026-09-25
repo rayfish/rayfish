@@ -36,9 +36,6 @@ pub const REPO_SLUG: &str = "rayfish/rayfish";
 /// (which runs on any Linux) and a glibc binary to the plain gnu asset. Getting
 /// this wrong would hand a musl-only host a glibc binary that can't start.
 pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
-    if os == "macos" && arch != "aarch64" {
-        anyhow::bail!("macOS releases require Apple Silicon (arm64)");
-    }
     if os == "windows" {
         if arch != "x86_64" {
             anyhow::bail!("no rayfish Windows MSI for architecture '{arch}'; build from source");

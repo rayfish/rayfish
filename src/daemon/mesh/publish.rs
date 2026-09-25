@@ -218,8 +218,18 @@ pub(crate) fn spawn_network_publisher(
                         seed_peers.sort_by_key(|id| id.to_string());
                         seed_peers.dedup();
 
-                        match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers)
-                            .await
+                        let commitment = state
+                            .read()
+                            .ok()
+                            .and_then(|s| s.read_key.as_ref().map(ReadKey::commitment));
+                        match dht::publish_network(
+                            &client,
+                            &net_secret_key,
+                            &hash,
+                            &seed_peers,
+                            commitment.as_ref(),
+                        )
+                        .await
                         {
                             Ok(_) => {
                                 if mark_group_hash_published(&network_name, hash) {
@@ -618,6 +628,7 @@ mod tests {
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,
+            read_key: None,
             network_public_key: SecretKey::generate().public(),
             network_name: Some("test".to_string()),
             group_name: Some("test".to_string()),

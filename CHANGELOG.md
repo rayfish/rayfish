@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Intel Macs can use the standalone CLI and daemon, self-update, install script,
+  and signed native app DMG again.
+
 - macOS notifies you about connection requests, network join requests, and incoming
   files. Click a notification to review it; files can be saved or declined in the app.
 - macOS Settings can enable mesh SSH and manage which network peers may sign in
@@ -1024,6 +1027,31 @@ change for any script that only checked the exit status.
   between attempts rather than being re-dialed on every change.
 
 ### Security
+
+- **A network's member list is no longer readable from its room id alone.** The
+  room id is a discovery address, not a credential, but until now anyone holding
+  one could look up the network and download the whole member list from it:
+  every member's identity and mesh address, hostnames, who the coordinators are,
+  which nodes offer an exit node, the suggested firewall rules, and the reusable
+  key metadata. That held even for a closed network that would never have
+  admitted the reader, which is what made a leaked invite a disclosure of the
+  roster rather than just a spent credential. The member list is now encrypted
+  under a per-network read key, so the room id still finds the network and no
+  longer opens it.
+
+  **The key is not in the codes you share.** Codes are unchanged in shape and
+  length, and a code by itself reads nothing. A joiner asks a coordinator for the
+  key while joining, and gets it only if it is already a member, has been
+  approved, holds an invite that is still good, or is knocking on an open
+  network. So an invite you hand out and then refuse with `ray requests deny`,
+  or one nobody ever uses, never opens the member list.
+
+  A network created before this version has no read key, and its list stays
+  readable until its coordinator restarts on this version, which is when the key
+  is created. Members pick it up automatically the next time they reconnect, or
+  ask for it themselves if they were offline when it was created. Anyone removed
+  from a network keeps the key they already had, so rotating it on `ray kick` is
+  still to come.
 
 - **Unprivileged report requests can no longer overwrite root-owned files.**
   Diagnostic bundles now use unpredictable, exclusively created paths and set

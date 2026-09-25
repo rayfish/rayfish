@@ -219,6 +219,7 @@ use report::*;
 // moved into `mesh/{join,background}.rs`; re-export them at the daemon level so
 // `mod.rs` and the other `mesh/` submodules (via `use super::super::*`) call them
 // by bare name, as before the split.
+pub use mesh::JoinSpec;
 pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
 pub use mesh::run_daemon;
@@ -479,9 +480,6 @@ pub(crate) struct NetworkState {
     /// and clears an older ambiguity.
     unconfirmed_durable_hash: Option<PendingSnapshotDurability>,
     network_secret_key: Option<SecretKey>,
-    /// The roster read key this network's blob is sealed under. Held by every
-    /// member, not just key-holders: it grants a read, never a write. `None` on
-    /// a network created before read keys existed, whose blob stays plaintext.
     read_key: Option<ReadKey>,
     network_public_key: EndpointId,
     /// Local config/runtime alias used to index this network on this device.
@@ -652,7 +650,7 @@ impl NetworkState {
         self.pending.retain(|identity, _| {
             !self.members.is_member(identity) && !self.approved.is_approved(identity)
         });
-        let bytes = canonical_group_bytes(
+        let plaintext = canonical_group_bytes(
             &self.members,
             &self.approved,
             &self.suggested_firewall,
@@ -660,17 +658,10 @@ impl NetworkState {
             &self.reusable_keys,
             &self.nullifiers,
         );
-        // Seal before hashing: the hash we publish is also the blob store's
-        // content address, so it has to cover the bytes a peer actually fetches
-        // (see `crate::groupkey`). Sealing is deterministic, so an unchanged
-        // roster still produces an unchanged hash and the publisher stays quiet.
         let bytes = match &self.read_key {
             Some(key) => match crate::groupkey::seal(key, &self.network_public_key, &plaintext) {
                 Ok(sealed) => sealed,
                 Err(e) => {
-                    // Effectively unreachable (the AEAD fails only on absurd
-                    // lengths), but the alternative is publishing a roster in
-                    // the clear, so keep the previous snapshot instead.
                     tracing::error!(error = %e, "could not seal group blob; keeping the previous snapshot");
                     return;
                 }
