@@ -310,9 +310,9 @@ mod tests {
     /// clock: spawning powershell.exe suspended, resuming it, and then the
     /// engine's own start. That last term is the one that moves. It is under a
     /// second on an idle machine and several on a loaded CI runner, which is
-    /// where a three-second budget used to lose the race and fail here on a
+    /// where shorter budgets lose the race and fail here on a
     /// missing pid file rather than on the descendant it means to test.
-    const PUBLISH_AND_KILL: Duration = Duration::from_secs(12);
+    const PUBLISH_AND_KILL: Duration = Duration::from_secs(30);
 
     #[tokio::test]
     async fn ddd_job_close_kills_descendants_and_releases_inherited_pipes() {
