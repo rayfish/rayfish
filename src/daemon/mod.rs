@@ -3031,6 +3031,30 @@ mod headless_tests {
         );
     }
 
+    /// A signed roster is the authority for membership. When it no longer lists
+    /// this node, the network must disappear from saved state as well as the live
+    /// runtime, or the dashboard keeps showing it and startup tries to restore it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kicked_network_is_removed_from_saved_state() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
+        config::save_network(&config::empty_network_config("test-network")).unwrap();
+
+        daemon.registry.remove_kicked_network("test-network").await;
+
+        let saved = config::load().unwrap();
+        assert!(saved.networks.iter().all(|net| net.name != "test-network"));
+        daemon.shutdown_and_close().await;
+    }
+
     /// A stopped node must be rebuildable in the same process, which is the
     /// mobile disable/enable cycle (`Node::stop` then `Node::start`, both in one
     /// app process).

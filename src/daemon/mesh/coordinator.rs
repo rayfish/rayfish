@@ -161,7 +161,7 @@ impl NetworkRegistry {
         };
         if removed {
             tracing::info!(network = %network, "coordinator kicked us and the signed record confirms removal; leaving network");
-            self.leave_network(network).await;
+            self.remove_kicked_network(network).await;
         }
     }
 

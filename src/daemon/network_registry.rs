@@ -577,10 +577,7 @@ impl NetworkRegistry {
             broadcast_control_msg(&self.peers, net_pubkey, name, &ControlMsg::LeaveNetwork).await;
         }
 
-        let was_active = self.teardown_network_runtime(name).await;
-        let removed_from_config = config::delete_network(name).unwrap_or(false);
-
-        if was_active || removed_from_config {
+        if self.remove_network_locally(name).await {
             tracing::info!(network = %name, "left network");
             IpcMessage::Ok {
                 message: format!("left network '{}'", name),
@@ -588,6 +585,27 @@ impl NetworkRegistry {
         } else {
             ipc_err(format!("network '{}' not found", name))
         }
+    }
+
+    /// Tear down and forget a network after its signed roster confirms that this
+    /// node was removed. Unlike [`Self::leave_network`], this does not announce a
+    /// departure to a coordinator that has already removed us.
+    pub(crate) async fn remove_kicked_network(&self, name: &str) {
+        if self.remove_network_locally(name).await {
+            tracing::info!(network = %name, "removed kicked network");
+        }
+    }
+
+    async fn remove_network_locally(&self, name: &str) -> bool {
+        let was_active = self.teardown_network_runtime(name).await;
+        let removed_from_config = match config::delete_network(name) {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(network = %name, %error, "failed to remove network from config");
+                false
+            }
+        };
+        was_active || removed_from_config
     }
 
     /// Look up an active network we coordinate, returning its public key and
