@@ -502,11 +502,14 @@ impl Node {
         match self.runtime.block_on(state.join_network(
             &network_key,
             None,
-            hostname,
-            invite,
-            coordinator,
-            false,
-            true,
+            rayfish::daemon::JoinOptions {
+                hostname,
+                invite,
+                coordinator,
+                auto_accept_firewall: false,
+                auto_accept_files: true,
+                roles: Vec::new(),
+            },
         )) {
             IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(AppleError::Network(message)),
@@ -519,10 +522,13 @@ impl Node {
     /// Mint a single-use invite that expires after seven days.
     pub fn create_invite(&self, network: String) -> Result<String, AppleError> {
         let state = self.state()?;
-        match self
-            .runtime
-            .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false))
-        {
+        match self.runtime.block_on(state.invite_create(
+            &network,
+            7 * 24 * 60 * 60,
+            None,
+            Vec::new(),
+            false,
+        )) {
             IpcMessage::InviteCreated { code, .. } => Ok(code),
             IpcMessage::Error { message } => Err(AppleError::Network(message)),
             _ => Err(AppleError::Network(
@@ -551,7 +557,8 @@ impl Node {
     pub fn accept_request(&self, network: String, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
         expect_ok(
-            self.runtime.block_on(state.accept_request(&network, &id)),
+            self.runtime
+                .block_on(state.accept_request(&network, &id, Vec::new())),
             "approval",
         )
     }

@@ -380,15 +380,19 @@ impl Daemon {
                 coordinator,
                 auto_accept_firewall,
                 auto_accept_files,
+                roles,
             } => {
                 self.join_network(
                     &network_key,
                     name.as_deref(),
-                    hostname,
-                    invite,
-                    coordinator,
-                    auto_accept_firewall,
-                    auto_accept_files,
+                    JoinOptions {
+                        hostname,
+                        invite,
+                        coordinator,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                        roles,
+                    },
                 )
                 .await
             }
@@ -611,10 +615,11 @@ impl Daemon {
                 network,
                 expires_secs,
                 hostname,
+                roles,
                 reusable,
             } => {
                 self.registry
-                    .invite_create(&network, expires_secs, hostname, reusable)
+                    .invite_create(&network, expires_secs, hostname, roles, reusable)
                     .await
             }
             IpcMessage::InviteList { network } => self.registry.invite_list(&network).await,
@@ -622,8 +627,8 @@ impl Daemon {
                 self.registry.invite_revoke(&network, &id).await
             }
             IpcMessage::Requests { network } => self.registry.list_requests(&network),
-            IpcMessage::AcceptRequest { network, id } => {
-                self.registry.accept_request(&network, &id).await
+            IpcMessage::AcceptRequest { network, id, roles } => {
+                self.registry.accept_request(&network, &id, roles).await
             }
             IpcMessage::DenyRequest { network, id } => self.registry.deny_request(&network, &id),
             IpcMessage::AdminAdd { network, identity } => {

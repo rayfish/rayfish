@@ -656,6 +656,7 @@ impl ManagementService {
                 network.as_ref(),
                 7 * 24 * 60 * 60,
                 Some(hostname.to_string()),
+                Vec::new(),
                 false,
             )
             .await
@@ -1070,11 +1071,14 @@ impl ManagementService {
                     .join_network(
                         &network_key.to_string(),
                         Some(network_name.as_ref()),
-                        Some(hostname.into()),
-                        Some(secret),
-                        Some(coordinator),
-                        auto_accept_firewall,
-                        auto_accept_files,
+                        JoinOptions {
+                            hostname: Some(hostname.into()),
+                            invite: Some(secret),
+                            coordinator: Some(coordinator),
+                            auto_accept_firewall,
+                            auto_accept_files,
+                            roles: Vec::new(),
+                        },
                     )
                     .await
                 {

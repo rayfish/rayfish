@@ -58,6 +58,7 @@
 //! Explicit rules always win (first-match). Established return traffic only
 //! bypasses the *default* action, never an explicit rule.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 #[cfg(test)]
 use std::net::{Ipv4Addr, Ipv6Addr};

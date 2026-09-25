@@ -1098,6 +1098,7 @@ impl CoordinatorAcceptState {
                 remote_id,
                 &final_hostname,
                 &device_cert,
+                &roles,
                 was_approved,
                 grant_direct,
             )
@@ -1224,6 +1225,7 @@ impl CoordinatorAcceptState {
         remote_id: EndpointId,
         final_hostname: &Option<String>,
         device_cert: &Option<control::DeviceCert>,
+        roles: &BTreeSet<String>,
         was_approved: bool,
         grant_direct: bool,
     ) -> AdmissionCommit {
@@ -1239,6 +1241,7 @@ impl CoordinatorAcceptState {
             last_seen: Some(crate::membership::now_secs()),
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: roles.clone(),
         };
         let (displaced_member, removed_approved, removed_pending) = {
             let mut s = self.state.write().unwrap();
@@ -2730,6 +2733,7 @@ mod pending_cap_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: BTreeSet::new(),
         });
         assert!(
             member_admits(Some(&cert), &members),

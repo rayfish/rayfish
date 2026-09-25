@@ -1865,6 +1865,7 @@ mod accept_handler_tests {
                     hostname: None,
                     device_cert: None,
                     requested_at: Instant::now(),
+                    requested_roles: BTreeSet::new(),
                 },
             );
         }
@@ -1873,6 +1874,7 @@ mod accept_handler_tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            roles: BTreeSet::new(),
         });
         state.members.add(seated(joined));
         state.refresh_snapshot();

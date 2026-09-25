@@ -25,7 +25,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use ray_proto::ipc::MachineHostname;
-use ray_proto::policy::SuggestedFirewall;
+use ray_proto::policy::{self, SuggestedFirewall};
 use serde::{Deserialize, Serialize};
 
 /// The full deploy spec: a `networks:` map of network name → its suggested
@@ -279,9 +279,7 @@ networks:
 /// and its members are covered by the reusable key that grants it.
 pub fn expected_hosts(firewall: &SuggestedFirewall) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
-    for firewall in spec.networks.values() {
-        set.extend(expected_hosts_for_network(firewall));
-    }
+    set.extend(expected_hosts_for_network(firewall));
     set.into_iter().collect()
 }
 
@@ -290,11 +288,11 @@ pub fn expected_hosts(firewall: &SuggestedFirewall) -> Vec<String> {
 pub fn expected_hosts_for_network(firewall: &SuggestedFirewall) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     for (subject, rules) in firewall {
-        if subject != "*" {
+        if is_host_key(subject) {
             set.insert(subject.clone());
         }
         for peer in rules.allows.keys().chain(rules.denies.keys()) {
-            if peer != "*" {
+            if is_host_key(peer) {
                 set.insert(peer.clone());
             }
         }

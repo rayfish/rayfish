@@ -1184,6 +1184,7 @@ mod grouping_tests {
             exit_node: false,
             exit_in_use: false,
             is_coordinator: false,
+            roles: Default::default(),
         }
     }
 
@@ -1287,6 +1288,7 @@ mod grouping_tests {
             exit_node: false,
             exit_in_use: false,
             is_coordinator: false,
+            roles: Default::default(),
         };
         let secondary = peer("sm-f966b", Some(laptop), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);
@@ -1436,6 +1438,7 @@ mod grouping_tests {
                 exit_node: false,
                 exit_in_use: false,
                 is_coordinator: false,
+                roles: Default::default(),
             })
             .collect();
         let mut n = net("laptop", peers);

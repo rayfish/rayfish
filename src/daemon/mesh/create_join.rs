@@ -646,6 +646,9 @@ impl NetworkRegistry {
         }
 
         let mut last_err = anyhow::anyhow!("no coordinators tried");
+        // Keep a final refusal so a later transient error does not hide it from
+        // the caller, which uses the error type to stop retrying.
+        let mut refused: Option<anyhow::Error> = None;
         let mut pending = false;
         for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
@@ -723,8 +726,8 @@ impl NetworkRegistry {
         if pending {
             return Ok(None);
         }
-        anyhow::bail!(
-            "no coordinator admitted the join (tried {}): {last_err:#}",
+        Err(refused.unwrap_or(last_err).context(format!(
+            "no coordinator admitted the join (tried {})",
             order.len()
         )))
     }
@@ -965,6 +968,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock,
             coordinator: None,
+            roles: BTreeSet::new(),
             mismatch: None,
         };
 
@@ -1704,6 +1708,7 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: BTreeSet::new(),
             });
             servers.push(tokio::spawn(async move {
                 let connection = timeout(Duration::from_secs(15), async {
@@ -1742,6 +1747,7 @@ mod tests {
             auto_accept_files: false,
             invite_lock: Arc::new(AsyncMutex::new(())),
             coordinator: None,
+            roles: BTreeSet::new(),
             mismatch: None,
         };
         let outcome = timeout(

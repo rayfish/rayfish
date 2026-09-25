@@ -23,8 +23,13 @@ impl Daemon {
         self.registry.list_requests(network)
     }
 
-    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
-        self.registry.accept_request(network, selector).await
+    pub async fn accept_request(
+        &self,
+        network: &str,
+        selector: &str,
+        roles: Vec<String>,
+    ) -> IpcMessage {
+        self.registry.accept_request(network, selector, roles).await
     }
 
     pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
@@ -314,10 +319,19 @@ impl NetworkRegistry {
         IpcMessage::PendingRequests { requests }
     }
 
-    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
+    pub async fn accept_request(
+        &self,
+        network: &str,
+        selector: &str,
+        roles: Vec<String>,
+    ) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
+        let granted = match crate::roles::normalize(&roles) {
+            Ok(roles) => roles,
+            Err(e) => return ipc_err(format!("{e:#}")),
+        };
         // Find and remove the pending request matching its hostname or id.
         let pending = {
             let Some(handle) = self.networks.get(network) else {
@@ -336,7 +350,19 @@ impl NetworkRegistry {
                     return ipc_err(format!("pending request '{selector}' is ambiguous"));
                 }
             };
-            found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
+            found.and_then(|id| {
+                let unmet: Vec<String> = s
+                    .pending
+                    .get(&id)?
+                    .requested_roles
+                    .difference(&granted)
+                    .cloned()
+                    .collect();
+                if !unmet.is_empty() {
+                    return None;
+                }
+                s.pending.remove(&id).map(|pj| (id, pj))
+            })
         };
         let Some((identity, pj)) = pending else {
             return ipc_err(format!("no pending request matching '{selector}'"));

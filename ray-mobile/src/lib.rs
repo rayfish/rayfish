@@ -1654,6 +1654,7 @@ mod network_state_tests {
             exit_node: false,
             exit_in_use: false,
             is_coordinator: false,
+            roles: Default::default(),
         }
     }
 
@@ -1663,6 +1664,7 @@ mod network_state_tests {
             role: NetworkRole::Member,
             my_ipv6: Ipv6Addr::LOCALHOST,
             my_hostname: Some("phone".to_string()),
+            my_roles: Default::default(),
             network_key: None,
             member_count: peers.len(),
             peers,

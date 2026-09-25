@@ -621,6 +621,10 @@ pub(crate) async fn ipc_apply(
     }
 
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
+    let mut role_counts: Vec<RoleCoverage> = Vec::new();
+    let mut net_reports: Vec<serde_json::Value> = Vec::new();
+    let mut changed = false;
+    let json = json_enabled();
     let mut removal_failures = false;
     let managed_machines = ipc_managed_machines_for_apply().await.unwrap_or_default();
 
@@ -923,6 +927,24 @@ async fn ipc_managed_machines_for_apply() -> Result<Vec<ipc::ManagedMachineInfo>
 }
 
 /// Joined hostnames on `network` (this node's hostname + every peer's hostname).
+fn role_holders(networks: &[ipc::NetworkStatus], network: &str, role: &str) -> usize {
+    let Some(net) = networks.iter().find(|n| n.name == network) else {
+        return 0;
+    };
+    let mine = usize::from(net.my_roles.iter().any(|r| r == role));
+    mine + net
+        .peers
+        .iter()
+        .filter(|p| p.roles.iter().any(|r| r == role))
+        .count()
+}
+
+struct RoleCoverage {
+    network: String,
+    role: String,
+    holders: usize,
+}
+
 pub(crate) fn joined_hostnames(networks: &[ipc::NetworkStatus], network: &str) -> Vec<String> {
     let Some(net) = networks.iter().find(|n| n.name == network) else {
         return Vec::new();
@@ -1265,6 +1287,7 @@ mod tests {
             exit_node: false,
             exit_in_use: false,
             is_coordinator: false,
+            roles: Default::default(),
         }
     }
 

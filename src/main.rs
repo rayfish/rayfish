@@ -1545,12 +1545,13 @@ async fn run() -> Result<()> {
             hostname,
             tor,
             auto_accept_firewall,
+            roles,
             no_auto_accept_files,
             delegate,
         } => match delegate {
             Some(machine) => {
-                if tor || name.is_some() {
-                    anyhow::bail!("--delegate does not support --tor or --name")
+                if tor || name.is_some() || !roles.is_empty() {
+                    anyhow::bail!("--delegate does not support --tor, --name, or --role")
                 }
                 let network = ipc::NetworkName::new(network_key);
                 let hostname = hostname.map(|value| value.parse()).transpose()?;
@@ -1567,10 +1568,13 @@ async fn run() -> Result<()> {
                 ipc_join(
                     &network_key,
                     name.as_deref(),
-                    hostname,
-                    tor,
-                    auto_accept_firewall,
-                    !no_auto_accept_files,
+                    JoinArgs {
+                        hostname,
+                        tor,
+                        auto_accept_firewall,
+                        auto_accept_files: !no_auto_accept_files,
+                        roles,
+                    },
                 )
                 .await
             }
