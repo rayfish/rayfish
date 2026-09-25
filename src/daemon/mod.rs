@@ -534,6 +534,88 @@ pub(crate) struct PendingJoin {
     pub(crate) requested_at: Instant,
 }
 
+/// Resolve an exact hostname or an unambiguous identity prefix from a small
+/// user-visible queue. Exact names win, which keeps a hostname made only of hex
+/// digits usable even when it also happens to prefix an identity.
+pub(crate) fn resolve_named_identity(
+    selector: &str,
+    candidates: impl IntoIterator<Item = (EndpointId, Option<String>)>,
+) -> Result<Option<EndpointId>, ()> {
+    let candidates: Vec<_> = candidates.into_iter().collect();
+    let names: Vec<EndpointId> = candidates
+        .iter()
+        .filter(|(_, hostname)| hostname.as_deref() == Some(selector))
+        .map(|(identity, _)| *identity)
+        .collect();
+    match names.as_slice() {
+        [identity] => return Ok(Some(*identity)),
+        [] => {}
+        _ => return Err(()),
+    }
+
+    let identities: Vec<EndpointId> = candidates
+        .iter()
+        .filter(|(identity, _)| {
+            identity.to_string().starts_with(selector)
+                || identity.fmt_short().to_string().starts_with(selector)
+        })
+        .map(|(identity, _)| *identity)
+        .collect();
+    match identities.as_slice() {
+        [] => Ok(None),
+        [identity] => Ok(Some(*identity)),
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod named_identity_tests {
+    use super::*;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut bytes = [0; 32];
+        bytes[0] = seed;
+        SecretKey::from(bytes).public()
+    }
+
+    #[test]
+    fn resolves_exact_name_or_unambiguous_identity_prefix() {
+        let alice = id(1);
+        let bob = id(2);
+        let candidates = || {
+            vec![
+                (alice, Some("alice".to_string())),
+                (bob, Some("bob".to_string())),
+            ]
+        };
+
+        assert_eq!(
+            resolve_named_identity("alice", candidates()),
+            Ok(Some(alice))
+        );
+        assert_eq!(
+            resolve_named_identity(&bob.fmt_short().to_string(), candidates()),
+            Ok(Some(bob))
+        );
+        assert_eq!(resolve_named_identity("missing", candidates()), Ok(None));
+        assert_eq!(resolve_named_identity("", candidates()), Err(()));
+    }
+
+    #[test]
+    fn rejects_duplicate_names() {
+        assert_eq!(
+            resolve_named_identity(
+                "same",
+                [
+                    (id(1), Some("same".to_string())),
+                    (id(2), Some("same".to_string()))
+                ],
+            ),
+            Err(())
+        );
+    }
+}
+
 impl NetworkState {
     /// Snapshot the current member roster as an owned `Vec` (the members map is
     /// the single source of truth; callers take a copy to release the lock).

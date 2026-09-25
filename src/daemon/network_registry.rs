@@ -181,6 +181,17 @@ pub(crate) struct MissingNetwork {
     pub coordinator_mode: Option<GroupMode>,
 }
 
+fn peer_selector_for_network<'a>(network: &str, selector: &'a str) -> Option<&'a str> {
+    match selector.strip_suffix(&format!(".{network}.{}", crate::DNS_DOMAIN)) {
+        Some(hostname) => Some(hostname),
+        None => match selector.strip_suffix(&format!(".{}", crate::DNS_DOMAIN)) {
+            Some(name) if !name.contains('.') => Some(name),
+            Some(_) => None,
+            None => Some(selector),
+        },
+    }
+}
+
 /// Decide which saved networks the supervisor should restore: everything in
 /// config that is neither live nor already being restored.
 ///
@@ -1082,6 +1093,28 @@ impl NetworkRegistry {
         None
     }
 
+    /// Resolve a peer selector against one network's roster. Network-scoped
+    /// commands use this so a repeated hostname on another network cannot pick
+    /// the wrong member. Accepts a hostname, qualified `.ray` name, mesh
+    /// address, short id, full device identity, or paired user identity.
+    pub(crate) fn resolve_peer_in_network(
+        &self,
+        network: &str,
+        selector: &str,
+    ) -> Option<EndpointId> {
+        let selector = peer_selector_for_network(network, selector)?;
+        let handle = self.networks.get(network)?;
+        if selector == "self" {
+            return Some(self.transport.endpoint.id());
+        }
+        handle
+            .state
+            .read()
+            .unwrap()
+            .members
+            .resolve_peer_selector(selector)
+    }
+
     /// Resolve `"self"` or a short / prefix endpoint id against every network's
     /// roster to a full endpoint id.
     pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
@@ -1296,6 +1329,17 @@ mod tests {
         );
         assert_eq!(network_key_from_selector(&invite), Some(network_key));
         assert_eq!(network_key_from_selector("field"), None);
+    }
+
+    #[test]
+    fn peer_selector_accepts_names_for_the_named_network_only() {
+        assert_eq!(peer_selector_for_network("box", "alice"), Some("alice"));
+        assert_eq!(peer_selector_for_network("box", "alice.ray"), Some("alice"));
+        assert_eq!(
+            peer_selector_for_network("box", "alice.box.ray"),
+            Some("alice")
+        );
+        assert_eq!(peer_selector_for_network("box", "alice.lab.ray"), None);
     }
 
     fn net(name: &str) -> config::NetworkConfig {

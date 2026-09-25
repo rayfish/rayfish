@@ -115,10 +115,7 @@ pub(crate) fn paired_devices() -> ArgValueCompleter {
     })
 }
 
-/// Peers waiting for admission, for `ray requests <net> accept|deny <id>`.
-///
-/// The id is a short id read off the listing directly above it on screen, which
-/// is exactly the kind of value nobody should be retyping by hand.
+/// Peers waiting for admission, for `ray requests <net> accept|deny <name>`.
 pub(crate) fn join_requests() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| {
         let Some(network) = scoped_network() else {
@@ -128,7 +125,7 @@ pub(crate) fn join_requests() -> ArgValueCompleter {
     })
 }
 
-/// Peers waiting for a direct link, for `ray connect approve <id>`.
+/// Peers waiting for a direct link, for `ray connect approve <name>`.
 pub(crate) fn connect_requests() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| waiting_peers(current, IpcMessage::Connections))
 }
@@ -142,10 +139,11 @@ fn waiting_peers(current: &OsStr, request: IpcMessage) -> Vec<CompletionCandidat
     })
     .unwrap_or_default();
     described(requests.into_iter().map(|req| {
+        let value = req.hostname.clone().unwrap_or_else(|| req.short_id.clone());
         let who = req.hostname.unwrap_or_else(|| "unnamed".to_string());
         (
-            req.short_id,
-            format!("{who}, waiting {}s", req.waiting_secs),
+            value,
+            format!("{who}, {}, waiting {}s", req.short_id, req.waiting_secs),
         )
     }))
     .into_iter()

@@ -515,10 +515,9 @@ impl NetworkRegistry {
             ));
         }
 
-        // Resolve the argument to a roster member. `resolve_peer_name` may hand
-        // back a transport id or a user identity; match either against the stored
-        // member key (which is the user identity for a paired peer).
-        let candidate = match self.resolve_peer_name(peer).await {
+        // Resolve within the named roster so the same hostname on another
+        // network cannot select the wrong member.
+        let candidate = match self.resolve_peer_in_network(network, peer) {
             Some(id) => id,
             None => {
                 return ipc_err(format!("could not resolve peer '{peer}'"));

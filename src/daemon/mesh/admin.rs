@@ -9,11 +9,9 @@ impl NetworkRegistry {
     /// suggest firewall rules). The key is shared (shared-key model), so this is
     /// a transfer of publish capability, not an attributable delegation. The
     /// grant is recorded locally for `ray admin list`.
-    pub(crate) async fn admin_add(&self, network: &str, identity_str: &str) -> IpcMessage {
-        let Some(identity) = self.resolve_short_id_any_network(identity_str) else {
-            return ipc_err(format!(
-                "could not resolve identity '{identity_str}' (use a short id of a joined member)"
-            ));
+    pub(crate) async fn admin_add(&self, network: &str, peer: &str) -> IpcMessage {
+        let Some(identity) = self.resolve_peer_in_network(network, peer) else {
+            return ipc_err(format!("could not resolve member '{peer}' on '{network}'"));
         };
         let (net_pubkey, net_secret_key) = match self.networks.get(network) {
             Some(h) => {

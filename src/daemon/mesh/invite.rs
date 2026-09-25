@@ -22,12 +22,12 @@ impl Daemon {
         self.registry.list_requests(network)
     }
 
-    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
-        self.registry.accept_request(network, id_prefix).await
+    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
+        self.registry.accept_request(network, selector).await
     }
 
-    pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
-        self.registry.deny_request(network, id_prefix)
+    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
+        self.registry.deny_request(network, selector)
     }
 }
 
@@ -289,28 +289,32 @@ impl NetworkRegistry {
         IpcMessage::PendingRequests { requests }
     }
 
-    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
-        // Find and remove the pending request matching the short id prefix.
+        // Find and remove the pending request matching its hostname or id.
         let pending = {
             let Some(handle) = self.networks.get(network) else {
                 return ipc_err(format!("network '{network}' not active"));
             };
             let mut s = handle.state.write().unwrap();
-            let found = s
-                .pending
-                .keys()
-                .find(|k| {
-                    k.fmt_short().to_string().starts_with(id_prefix)
-                        || k.to_string().starts_with(id_prefix)
-                })
-                .copied();
+            let found = resolve_named_identity(
+                selector,
+                s.pending
+                    .iter()
+                    .map(|(identity, request)| (*identity, request.hostname.clone())),
+            );
+            let found = match found {
+                Ok(found) => found,
+                Err(()) => {
+                    return ipc_err(format!("pending request '{selector}' is ambiguous"));
+                }
+            };
             found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
         };
         let Some((identity, pj)) = pending else {
-            return ipc_err(format!("no pending request matching '{id_prefix}'"));
+            return ipc_err(format!("no pending request matching '{selector}'"));
         };
 
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
@@ -346,7 +350,7 @@ impl NetworkRegistry {
         }
     }
 
-    pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
@@ -354,22 +358,21 @@ impl NetworkRegistry {
             return ipc_err(format!("network '{network}' not active"));
         };
         let mut s = handle.state.write().unwrap();
-        let found = s
-            .pending
-            .keys()
-            .find(|k| {
-                k.fmt_short().to_string().starts_with(id_prefix)
-                    || k.to_string().starts_with(id_prefix)
-            })
-            .copied();
+        let found = resolve_named_identity(
+            selector,
+            s.pending
+                .iter()
+                .map(|(identity, request)| (*identity, request.hostname.clone())),
+        );
         match found {
-            Some(id) => {
+            Ok(Some(id)) => {
                 s.pending.remove(&id);
                 IpcMessage::Ok {
                     message: format!("denied {}", id.fmt_short()),
                 }
             }
-            None => ipc_err(format!("no pending request matching '{id_prefix}'")),
+            Ok(None) => ipc_err(format!("no pending request matching '{selector}'")),
+            Err(()) => ipc_err(format!("pending request '{selector}' is ambiguous")),
         }
     }
 }
