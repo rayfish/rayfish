@@ -22,13 +22,16 @@
     <MediaTemplate EmbedCab="yes" />
     <Feature Id="ProductFeature" Title="Rayfish" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="FontLicenseComponents" />
     </Feature>
   </Product>
 
   <Fragment>
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="$(var.PlatformProgramFilesFolder)">
-        <Directory Id="INSTALLFOLDER" Name="Rayfish" />
+        <Directory Id="INSTALLFOLDER" Name="Rayfish">
+          <Directory Id="LICENSEFOLDER" Name="licenses" />
+        </Directory>
       </Directory>
       <Directory Id="ProgramMenuFolder" />
     </Directory>
@@ -70,6 +73,20 @@
                        Type="string" Value="$(var.ReleaseIdentity)" KeyPath="yes" />
         <RegistryValue Root="HKLM" Key="Software\Rayfish" Name="Channel"
                        Type="string" Value="$(var.ReleaseChannel)" />
+      </Component>
+    </ComponentGroup>
+    <ComponentGroup Id="FontLicenseComponents" Directory="LICENSEFOLDER">
+      <Component Id="ChakraPetchFontLicense" Guid="*">
+        <File Id="ChakraPetchOfl" Source="macos\Rayfish\Fonts\ChakraPetch-OFL.txt"
+              Name="ChakraPetch-OFL.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="IbmPlexMonoFontLicense" Guid="*">
+        <File Id="IbmPlexMonoOfl" Source="macos\Rayfish\Fonts\IBMPlexMono-OFL.txt"
+              Name="IBMPlexMono-OFL.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="PressStartFontLicense" Guid="*">
+        <File Id="PressStartOfl" Source="macos\Rayfish\Fonts\PressStart2P-OFL.txt"
+              Name="PressStart2P-OFL.txt" KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>

@@ -8,8 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Windows has a desktop dashboard and tray app.** Closing its window leaves
-  Rayfish running in the notification area, while Quit closes the app.
+- **Windows has a desktop dashboard and tray app matching the macOS design.**
+  Closing its window leaves Rayfish in the notification area, where the VPN can
+  be connected, disconnected, reopened, or disconnected and quit.
 
 ## [0.5.0] - 2026-09-24
 

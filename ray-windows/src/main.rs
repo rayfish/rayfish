@@ -18,8 +18,9 @@ mod windows_app {
     use std::io::{BufRead, BufReader};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::process::CommandExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    use std::thread;
 
     use anyhow::{Context, Result};
     use tao::dpi::LogicalSize;
@@ -27,9 +28,7 @@ mod windows_app {
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tao::window::{Icon as WindowIcon, Theme, Window, WindowBuilder};
     use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-    use tray_icon::{
-        Icon as TrayIconImage, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
-    };
+    use tray_icon::{Icon as TrayIconImage, TrayIconBuilder};
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
     use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CreateMutexW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -44,7 +43,11 @@ mod windows_app {
     #[derive(Debug)]
     enum UserEvent {
         Show,
+        ConnectionState(bool),
+        ToggleConnection,
+        ConnectionChanged { active: bool, error: Option<String> },
         Quit,
+        QuitFinished(Option<String>),
     }
 
     struct GuiServer {
@@ -131,54 +134,65 @@ mod windows_app {
             .with_window_icon(Some(window_icon))
             .build(&event_loop)
             .context("creating the Rayfish window")?;
+        let proxy = event_loop.create_proxy();
         let webview = WebViewBuilder::new()
             .with_url(url)
+            .with_ipc_handler(move |request| {
+                let active = match request.body().as_str() {
+                    "active" => Some(true),
+                    "standby" => Some(false),
+                    _ => None,
+                };
+                if let Some(active) = active {
+                    let _ = proxy.send_event(UserEvent::ConnectionState(active));
+                }
+            })
             .build(&window)
             .context("creating the Rayfish dashboard")?;
 
+        let state_id = MenuId::new("state");
+        let connection_id = MenuId::new("connection");
         let open_id = MenuId::new("open");
         let quit_id = MenuId::new("quit");
+        let state_item = MenuItem::with_id(state_id, "Rayfish: Checking...", false, None);
+        let connection_item = MenuItem::with_id(connection_id.clone(), "Connect", false, None);
         let open_item = MenuItem::with_id(open_id.clone(), "Open Rayfish", true, None);
         let separator = PredefinedMenuItem::separator();
-        let quit_item = MenuItem::with_id(quit_id.clone(), "Quit", true, None);
+        let footer_separator = PredefinedMenuItem::separator();
+        let quit_item = MenuItem::with_id(quit_id.clone(), "Disconnect and Quit", true, None);
         let tray_menu = Menu::new();
-        tray_menu.append_items(&[&open_item, &separator, &quit_item])?;
+        tray_menu.append_items(&[
+            &state_item,
+            &connection_item,
+            &separator,
+            &open_item,
+            &footer_separator,
+            &quit_item,
+        ])?;
 
         let tray_icon = TrayIconBuilder::new()
             .with_tooltip("Rayfish")
             .with_icon(load_tray_icon()?)
             .with_menu(Box::new(tray_menu))
-            .with_menu_on_left_click(false)
+            .with_menu_on_left_click(true)
             .build()
             .context("creating the Rayfish tray icon")?;
-
-        let proxy = event_loop.create_proxy();
-        TrayIconEvent::set_event_handler(Some(move |event| {
-            let should_show = matches!(
-                event,
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } | TrayIconEvent::DoubleClick {
-                    button: MouseButton::Left,
-                    ..
-                }
-            );
-            if should_show {
-                let _ = proxy.send_event(UserEvent::Show);
-            }
-        }));
 
         let proxy = event_loop.create_proxy();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if event.id == open_id {
                 let _ = proxy.send_event(UserEvent::Show);
+            } else if event.id == connection_id {
+                let _ = proxy.send_event(UserEvent::ToggleConnection);
             } else if event.id == quit_id {
                 let _ = proxy.send_event(UserEvent::Quit);
             }
         }));
 
+        let ray = ray_executable()?;
+        let command_proxy = event_loop.create_proxy();
+        let mut active = false;
+        let mut command_pending = false;
         event_loop.run(move |event, _, control_flow| {
             let _keep_alive = (&instance, &server, &webview, &tray_icon);
             *control_flow = ControlFlow::Wait;
@@ -189,7 +203,42 @@ mod windows_app {
                     ..
                 } if window_id == window.id() => window.set_visible(false),
                 Event::UserEvent(UserEvent::Show) => show_window(&window),
-                Event::UserEvent(UserEvent::Quit) => *control_flow = ControlFlow::Exit,
+                Event::UserEvent(UserEvent::ConnectionState(next)) if !command_pending => {
+                    active = next;
+                    update_connection_menu(&state_item, &connection_item, active, false);
+                }
+                Event::UserEvent(UserEvent::ToggleConnection) if !command_pending => {
+                    command_pending = true;
+                    update_connection_menu(&state_item, &connection_item, active, true);
+                    change_connection(ray.clone(), !active, command_proxy.clone());
+                }
+                Event::UserEvent(UserEvent::ConnectionChanged {
+                    active: next,
+                    error,
+                }) => {
+                    command_pending = false;
+                    if let Some(error) = error {
+                        show_error(&error);
+                    } else {
+                        active = next;
+                        let _ = webview.evaluate_script("refresh()");
+                    }
+                    update_connection_menu(&state_item, &connection_item, active, false);
+                }
+                Event::UserEvent(UserEvent::Quit) if !command_pending => {
+                    command_pending = true;
+                    update_connection_menu(&state_item, &connection_item, active, true);
+                    disconnect_and_quit(ray.clone(), command_proxy.clone());
+                }
+                Event::UserEvent(UserEvent::QuitFinished(error)) => {
+                    if let Some(error) = error {
+                        command_pending = false;
+                        update_connection_menu(&state_item, &connection_item, active, false);
+                        show_error(&error);
+                    } else {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
                 _ => {}
             }
         });
@@ -219,6 +268,64 @@ mod windows_app {
                 SetForegroundWindow(window);
             }
         }
+    }
+
+    fn update_connection_menu(
+        state_item: &MenuItem,
+        connection_item: &MenuItem,
+        active: bool,
+        pending: bool,
+    ) {
+        state_item.set_text(if pending {
+            "Rayfish: Updating..."
+        } else if active {
+            "Rayfish: Connected"
+        } else {
+            "Rayfish: Standby"
+        });
+        connection_item.set_text(if active { "Disconnect" } else { "Connect" });
+        connection_item.set_enabled(!pending);
+    }
+
+    fn change_connection(
+        ray: PathBuf,
+        active: bool,
+        proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+    ) {
+        thread::spawn(move || {
+            let error = set_connection(&ray, active)
+                .err()
+                .map(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::ConnectionChanged { active, error });
+        });
+    }
+
+    fn disconnect_and_quit(ray: PathBuf, proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
+        thread::spawn(move || {
+            let error = set_connection(&ray, false)
+                .err()
+                .map(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::QuitFinished(error));
+        });
+    }
+
+    fn set_connection(ray: &Path, active: bool) -> Result<()> {
+        let action = if active { "up" } else { "down" };
+        let output = Command::new(ray)
+            .arg(action)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .with_context(|| format!("running ray {action}"))?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            anyhow::bail!(
+                "Rayfish could not {}.{}{}",
+                if active { "connect" } else { "disconnect" },
+                if message.is_empty() { "" } else { "\n\n" },
+                message
+            );
+        }
+        Ok(())
     }
 
     fn icon_rgba() -> Result<(Vec<u8>, u32, u32)> {
