@@ -62,19 +62,20 @@ pub(crate) fn copy_legacy_state(source: &Path, destination: &Path) -> Result<()>
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     for entry in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
         let entry = entry.with_context(|| format!("reading entry in {}", source.display()))?;
+        let source_path = entry.path();
         let kind = entry
             .file_type()
-            .with_context(|| format!("reading type of {}", entry.path().display()))?;
+            .with_context(|| format!("reading type of {}", source_path.display()))?;
         let target = destination.join(entry.file_name());
         if kind.is_symlink() {
             bail!("legacy state contains a symbolic link")
         }
         if kind.is_dir() {
             fs::create_dir(&target).with_context(|| format!("creating {}", target.display()))?;
-            copy_directory(&entry.path(), &target)?;
+            copy_directory(&source_path, &target)?;
         } else if kind.is_file() {
-            fs::copy(entry.path(), &target)
-                .with_context(|| format!("copying {}", entry.path().display()))?;
+            fs::copy(&source_path, &target)
+                .with_context(|| format!("copying {}", source_path.display()))?;
         } else {
             bail!("legacy state contains an unsupported file type")
         }
