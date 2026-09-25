@@ -568,7 +568,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also stay bold), so `ray status`, tables and invite codes stay legible on
   light and dark terminals alike — without bold body text.
 
+- **A coordinator never picked up a peer that joined after a rule was
+  published.** Suggested rules name their peers by hostname, resolved against
+  the roster, and the docs promised a rule for a not-yet-joined peer would
+  appear once it joined. That held for members, which reconverge from the
+  published record, but not for the coordinator: it *is* that record's source,
+  so the poller's hash check short-circuited and it only ever re-resolved when
+  suggestions themselves were republished. It now re-resolves whenever its
+  roster changes, on both admission and removal.
+
+- **The invite command `ray apply` printed could not be pasted.** The
+  membership-gap tip rendered `ray invite <net> --hostname <h>`, which the parser
+  rejects: those flags belong to the `create` subcommand. It now prints
+  `ray invite <net> create --hostname <h>`.
+
+- **`ray apply --invite-missing` minted invites on the wrong network.** The
+  expected-host diff was computed over the whole spec but reported once per
+  network, so a host belonging to one network read as missing from every other
+  and its invite was minted there. Harmless when reading the output by eye, and
+  not when a provisioner consumes it. The diff is now scoped to the network it
+  is reported under.
+
 ### Security
+
+- **A role cannot be self-claimed.** Firewall rules keyed on a hostname rest on
+  a name the joiner picked whenever the invite did not bind one, so an unbound
+  join could take a name the spec had rules for. A role never comes from the
+  joiner: the coordinator reads it off the redeemed code, and `--role` on the
+  join side can only narrow that grant. Rules written against `role:` are free
+  of that hole.
 
 - **Android no longer sends your keys to Google's backup.** The app allowed
   Android Auto Backup with no exclusions, so the identity key, the device

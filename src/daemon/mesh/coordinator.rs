@@ -743,6 +743,7 @@ mod prune_tests {
             last_seen,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 
@@ -818,6 +819,7 @@ mod sender_authority_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 

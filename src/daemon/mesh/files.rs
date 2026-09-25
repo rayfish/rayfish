@@ -154,11 +154,10 @@ impl Daemon {
                             .join_network(
                                 &net_key,
                                 Some(&net_name),
-                                None,
-                                None,
-                                Some(endpoint_id),
-                                false,
-                                false,
+                                JoinOptions {
+                                    coordinator: Some(endpoint_id),
+                                    ..Default::default()
+                                },
                             )
                             .await
                         {

@@ -97,6 +97,7 @@ pub mod onepassword;
 pub mod peers;
 pub mod ratelimit;
 pub mod reject;
+pub mod roles;
 pub mod shutdown;
 #[cfg(feature = "desktop")]
 #[cfg(unix)]

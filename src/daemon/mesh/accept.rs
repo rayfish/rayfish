@@ -38,6 +38,38 @@ pub(crate) fn evict_oldest_pending(
     Some(oldest)
 }
 
+/// The parts of a gossiped [`ControlMsg::InviteShare`] a ledger entry is written
+/// from. One struct rather than four positional arguments, because two handlers
+/// (a coordinator's, and a member's for the co-coordinator case) build the same
+/// call.
+pub(crate) struct SharedInvite {
+    pub(crate) id: String,
+    /// The hex `blake3(secret)` as UTF-8 bytes, the form it travels in.
+    pub(crate) secret_hash: Vec<u8>,
+    pub(crate) expires: u64,
+    /// What the minter bound to the code, so redeeming it here grants the same
+    /// thing it would have there.
+    pub(crate) roles: BTreeSet<String>,
+}
+
+/// Write a coordinator-gossiped invite into `network`'s ledger. The caller holds
+/// the invite lock. A hash that is not UTF-8 is not one we minted, so it is
+/// dropped rather than stored.
+fn record_shared_invite(network: &str, shared: SharedInvite) {
+    let SharedInvite {
+        id,
+        secret_hash,
+        expires,
+        roles,
+    } = shared;
+    let Ok(hash) = String::from_utf8(secret_hash) else {
+        return;
+    };
+    if let Ok(mut store) = crate::invite::InviteStore::load(network) {
+        let _ = store.record_shared(id, hash, expires, roles);
+    }
+}
+
 /// A paired device is auto-admitted into a closed network only when its device
 /// cert is signed by this coordinator's own owner identity. The cert's
 /// signature is verified by the caller before this check.
@@ -268,9 +300,15 @@ impl CoordinatorAcceptState {
                 invite_secret,
                 hostname,
                 device_cert,
+                roles,
             } => {
-                self.handle_join_request(conn, send, peer_id, invite_secret, hostname, device_cert)
-                    .await
+                let attempt = JoinAttempt {
+                    invite_secret,
+                    hostname,
+                    device_cert,
+                    roles,
+                };
+                self.handle_join_request(conn, send, peer_id, attempt).await
             }
             // A known member re-announcing (reconnect or rename); an unknown peer
             // sending a bare MeshHello is an older client doing a no-invite join.
@@ -284,17 +322,33 @@ impl CoordinatorAcceptState {
                     self.handle_member_hello(conn, send, peer_id, hostname, device_cert)
                         .await
                 } else {
-                    self.handle_join_request(conn, send, peer_id, None, hostname, device_cert)
-                        .await
+                    let attempt = JoinAttempt {
+                        invite_secret: None,
+                        hostname,
+                        device_cert,
+                        // An older client predating roles asks for none, so it
+                        // takes whatever its credential carries.
+                        roles: BTreeSet::new(),
+                    };
+                    self.handle_join_request(conn, send, peer_id, attempt).await
                 }
             }
             ControlMsg::InviteShare {
                 id,
                 secret_hash,
                 expires,
+                roles,
             } => {
-                self.handle_invite_share(peer_id, id, secret_hash, expires)
-                    .await;
+                self.handle_invite_share(
+                    peer_id,
+                    SharedInvite {
+                        id,
+                        secret_hash,
+                        expires,
+                        roles,
+                    },
+                )
+                .await;
                 None
             }
             ControlMsg::InviteUsed { secret_hash } => {
@@ -324,10 +378,14 @@ impl CoordinatorAcceptState {
         conn: &Connection,
         send: iroh::endpoint::SendStream,
         remote_id: EndpointId,
-        invite_secret: Option<Vec<u8>>,
-        hostname: Option<String>,
-        device_cert: Option<control::DeviceCert>,
+        attempt: JoinAttempt,
     ) -> Option<Ipv6Addr> {
+        let JoinAttempt {
+            invite_secret,
+            hostname,
+            device_cert,
+            roles: requested_roles,
+        } = attempt;
         // Verify a device certificate if presented, and record the transport-key →
         // user-identity binding so paired devices resolve.
         if let Some(ref cert) = device_cert {
@@ -364,12 +422,58 @@ impl CoordinatorAcceptState {
                 .await;
         }
 
+        // Canonicalize what was asked for before any branch compares it. Our own
+        // joiner normalizes first, but `grant` compares by exact set difference,
+        // so an older or hand-rolled client asking for `Sentry` would be refused
+        // a role its key does grant. Placed after the reconnect short-circuit: a
+        // seated member's roles come from the roster, not from this field.
+        let requested_roles = match crate::roles::canonicalize(&requested_roles) {
+            Ok(roles) => roles,
+            Err(e) => {
+                tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "malformed role request");
+                self.deny_final(conn, send, format!("role request refused: {e}"))
+                    .await;
+                return None;
+            }
+        };
+
         // A peer pre-approved via `ray accept` is admitted directly.
         let is_approved = self.state.read().unwrap().approved.is_approved(&remote_id);
         if is_approved {
             // Live-approved name is joiner-chosen, not authoritative.
+            let approved_roles = self
+                .state
+                .read()
+                .unwrap()
+                .approved
+                .get(&remote_id)
+                .map(|e| e.roles.clone())
+                .unwrap_or_default();
+            // Same narrowing rule as the credential paths: the approval is the
+            // grant, `--role` may only ask for a subset of it, and asking
+            // outside it fails the join rather than seating the wrong policy.
+            let roles = match crate::roles::grant(&approved_roles, &requested_roles) {
+                Ok(roles) => roles,
+                Err(e) => {
+                    tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
+                    self.deny_final(conn, send, format!("role request refused: {e}"))
+                        .await;
+                    return None;
+                }
+            };
             return self
-                .admit_peer(conn, send, remote_id, hostname, device_cert, true, false)
+                .admit_peer(
+                    conn,
+                    send,
+                    AdmitRequest {
+                        remote_id,
+                        hostname,
+                        device_cert,
+                        roles,
+                        was_approved: true,
+                        authoritative: false,
+                    },
+                )
                 .await
                 .into_ip();
         }
@@ -377,18 +481,55 @@ impl CoordinatorAcceptState {
         // Unknown peer presenting an invite secret: verify and burn it.
         if let Some(secret) = invite_secret {
             return self
-                .redeem_invite_and_admit(conn, send, remote_id, hostname, device_cert, secret)
+                .redeem_invite_and_admit(
+                    conn,
+                    send,
+                    remote_id,
+                    RedeemAttempt {
+                        hostname,
+                        device_cert,
+                        requested_roles,
+                        secret,
+                    },
+                )
                 .await;
         }
 
         // Unknown peer, no invite: open networks auto-admit; closed networks queue
         // the request for live operator approval (`ray accept`).
         let mode = self.state.read().unwrap().mode;
+        // Neither admission path below reads a credential, so neither has a
+        // grant to narrow. `grant` against an empty permitted set is exactly the
+        // answer: fine for the usual empty request, an error for anything else.
+        // Seating the node quietly without the roles it asked for is the failure
+        // this module refuses to have (see `crate::roles::grant`) - it would
+        // report success and leave the firewall shut with nothing to point at.
+        let no_roles = crate::roles::grant(&BTreeSet::new(), &requested_roles);
         match mode {
-            GroupMode::Open => self
-                .admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
+            GroupMode::Open => {
+                if let Err(e) = no_roles {
+                    tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
+                    self.deny_final(conn, send, format!("role request refused: {e}"))
+                        .await;
+                    return None;
+                }
+                self.admit_peer(
+                    conn,
+                    send,
+                    AdmitRequest {
+                        remote_id,
+                        hostname,
+                        device_cert,
+                        // An open network admits on no credential at all, so
+                        // there is nothing to take a role from.
+                        roles: BTreeSet::new(),
+                        was_approved: false,
+                        authoritative: false,
+                    },
+                )
                 .await
-                .into_ip(),
+                .into_ip()
+            }
             GroupMode::Restricted => {
                 // A device cert signed by this coordinator's own owner identity is
                 // one of our own paired devices: admit directly (no approval step).
@@ -397,7 +538,20 @@ impl CoordinatorAcceptState {
                     || member_admits(device_cert.as_ref(), &self.state.read().unwrap().members);
                 if admits {
                     return self
-                        .admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
+                        .admit_peer(
+                            conn,
+                            send,
+                            AdmitRequest {
+                                remote_id,
+                                hostname,
+                                device_cert,
+                                // One of our own paired devices, admitted on its
+                                // cert rather than a role-bearing key.
+                                roles: BTreeSet::new(),
+                                was_approved: false,
+                                authoritative: false,
+                            },
+                        )
                         .await
                         .into_ip();
                 }
@@ -420,6 +574,7 @@ impl CoordinatorAcceptState {
                         PendingJoin {
                             hostname,
                             device_cert,
+                            requested_roles,
                             requested_at: Instant::now(),
                         },
                     );
@@ -622,15 +777,25 @@ impl CoordinatorAcceptState {
         };
 
         if changed {
-            let mut s = self.state.write().unwrap();
-            if let Some(m) = s.members.get_mut(&remote_id) {
-                m.hostname = Some(final_hostname.clone());
+            {
+                let mut s = self.state.write().unwrap();
+                if let Some(m) = s.members.get_mut(&remote_id) {
+                    m.hostname = Some(final_hostname.clone());
+                }
             }
-        }
-        if changed {
             commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
         }
         drop(commit_guard);
+        if changed {
+            // A rename moves this member in and out of every suggested rule that
+            // names a hostname, and changes which host a rule keyed on a `role:`
+            // it holds resolves to. Same reason as `admit_peer`: the coordinator
+            // is the published record's source, so its own poller short-circuits
+            // and nothing else re-resolves its installed rules.
+            self.ctx
+                .registry
+                .reapply_suggested_firewall(&self.network_name);
+        }
 
         // Re-assert this peer's DNS entry (idempotent).
         dns::remove_hostname_by_ip(
@@ -665,24 +830,13 @@ impl CoordinatorAcceptState {
     /// Handle an `InviteShare` gossiped by another coordinator: record its hash so
     /// this coordinator can redeem the cross-minted single-use invite too. Honored
     /// only from a coordinator peer in our verified roster.
-    async fn handle_invite_share(
-        &self,
-        peer_id: EndpointId,
-        id: String,
-        secret_hash: Vec<u8>,
-        expires: u64,
-    ) {
+    async fn handle_invite_share(&self, peer_id: EndpointId, shared: SharedInvite) {
         if !sender_is_coordinator(&self.state, peer_id) {
             tracing::warn!(peer = %peer_id.fmt_short(), "ignoring InviteShare from non-coordinator");
             return;
         }
-        let Ok(hash) = String::from_utf8(secret_hash) else {
-            return;
-        };
         let _guard = self.invite_lock.lock().await;
-        if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
-            let _ = store.record_shared(id, hash, expires);
-        }
+        record_shared_invite(&self.network_name, shared);
     }
 
     /// Handle an `InviteUsed` gossiped by another coordinator: burn the single-use
@@ -711,10 +865,14 @@ impl CoordinatorAcceptState {
         conn: &Connection,
         send: iroh::endpoint::SendStream,
         remote_id: EndpointId,
-        hostname: Option<String>,
-        device_cert: Option<control::DeviceCert>,
-        secret: Vec<u8>,
+        attempt: RedeemAttempt,
     ) -> Option<Ipv6Addr> {
+        let RedeemAttempt {
+            hostname,
+            device_cert,
+            requested_roles,
+            secret,
+        } = attempt;
         let redeemed = {
             let _guard = self.invite_lock.lock().await;
             match crate::invite::InviteStore::load(&self.network_name) {
@@ -723,22 +881,44 @@ impl CoordinatorAcceptState {
             }
         };
         match redeemed {
-            Ok(invite_hostname) => {
+            Ok(grant) => {
                 tracing::info!(peer = %remote_id.fmt_short(), "invite redeemed");
+                // The joiner may ask for a subset of what the invite grants;
+                // anything outside it fails the join rather than seating the
+                // peer with roles it did not ask for.
+                let roles = match crate::roles::grant(&grant.roles, &requested_roles) {
+                    Ok(roles) => roles,
+                    Err(e) => {
+                        tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
+                        self.deny_final(conn, send, format!("role request refused: {e}"))
+                            .await;
+                        // The secret was burned above; a refused role request is
+                        // a definite denial, so give it back to its holder.
+                        let _guard = self.invite_lock.lock().await;
+                        if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name)
+                        {
+                            let _ = store.restore(&secret);
+                        }
+                        return None;
+                    }
+                };
                 // A hostname bound to the invite is authoritative: it overrides
                 // the joiner's `--hostname` claim and is rejected on collision.
                 // A free-chosen name (no binding) keeps collision-rename.
-                let authoritative = invite_hostname.is_some();
-                let assigned = invite_hostname.or(hostname);
+                let authoritative = grant.hostname.is_some();
+                let assigned = grant.hostname.or(hostname);
                 let admitted = self
                     .admit_peer(
                         conn,
                         send,
-                        remote_id,
-                        assigned,
-                        device_cert,
-                        false,
-                        authoritative,
+                        AdmitRequest {
+                            remote_id,
+                            hostname: assigned,
+                            device_cert,
+                            roles,
+                            was_approved: false,
+                            authoritative,
+                        },
                     )
                     .await;
                 // Admission can still be denied (hostname/IP collision) after
@@ -774,22 +954,47 @@ impl CoordinatorAcceptState {
                 // Not a single-use invite, it may be a reusable key, which
                 // lives in the signed blob and is redeemable by any network-key
                 // holder (no burn). The blob is the verified source of truth.
-                let reusable_id = {
+                let redeemed_key = {
                     let s = self.state.read().unwrap();
                     crate::membership::validate_reusable_key(&s.reusable_keys, &secret, now_secs())
-                        .map(|k| k.id.clone())
+                        .map(|k| (k.id.clone(), k.roles.clone()))
                 };
-                if let Some(key_id) = reusable_id {
+                if let Some((key_id, permitted_roles)) = redeemed_key {
                     tracing::info!(
                         peer = %remote_id.fmt_short(),
                         key_id = %key_id,
                         "reusable key redeemed"
                     );
+                    // The path a provisioner takes: one key in a user-data blob
+                    // admits the whole group, and each node is seated with the
+                    // key's roles. The *name* is still joiner-chosen (a shared
+                    // key cannot bind a unique hostname), which is exactly why
+                    // policy keys on the role and not on the name.
+                    let roles = match crate::roles::grant(&permitted_roles, &requested_roles) {
+                        Ok(roles) => roles,
+                        Err(e) => {
+                            tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "role request refused");
+                            self.deny_final(conn, send, format!("role request refused: {e}"))
+                                .await;
+                            return None;
+                        }
+                    };
                     // Reusable joins are non-authoritative: joiner-chosen name,
                     // collision → suffix.
-                    self.admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
-                        .await
-                        .into_ip()
+                    self.admit_peer(
+                        conn,
+                        send,
+                        AdmitRequest {
+                            remote_id,
+                            hostname,
+                            device_cert,
+                            roles,
+                            was_approved: false,
+                            authoritative: false,
+                        },
+                    )
+                    .await
+                    .into_ip()
                 } else {
                     tracing::warn!(peer = %remote_id.fmt_short(), error = %single_use_err, "invite rejected");
                     self.deny(conn, send, format!("invite rejected: {single_use_err}"))
@@ -800,13 +1005,41 @@ impl CoordinatorAcceptState {
         }
     }
 
+    /// Refuse this attempt but invite another. For a condition on our side that
+    /// a later attempt may find gone: a direct grant we cannot reproduce yet, a
+    /// roster commit that did not land.
+    async fn deny(&self, conn: &Connection, send: iroh::endpoint::SendStream, reason: String) {
+        self.send_denial(conn, send, reason, true).await
+    }
+
+    /// Refuse the join for good. Nothing the joiner can do by asking again
+    /// changes the answer: it asked for a role that neither its credential nor
+    /// the operator's approval carries, or for one that is not a role name at
+    /// all. Say so, because a closed-network joiner retries on a backoff until
+    /// told to stop, and its CLI returned at "waiting for approval", so an
+    /// unmarked refusal loops silently forever.
+    async fn deny_final(
+        &self,
+        conn: &Connection,
+        send: iroh::endpoint::SendStream,
+        reason: String,
+    ) {
+        self.send_denial(conn, send, reason, false).await
+    }
+
     /// Reply on the joiner's stream that the join was refused, then wait for the
     /// joiner to close so the JoinDenied flushes before `conn` is dropped.
-    async fn deny(&self, conn: &Connection, mut send: iroh::endpoint::SendStream, reason: String) {
+    async fn send_denial(
+        &self,
+        conn: &Connection,
+        mut send: iroh::endpoint::SendStream,
+        reason: String,
+        retryable: bool,
+    ) {
         let _ = control::send_msg(
             &mut send,
             Some(self.net_pubkey()),
-            &ControlMsg::JoinDenied { reason },
+            &ControlMsg::JoinDenied { reason, retryable },
         )
         .await;
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
@@ -820,20 +1053,20 @@ impl CoordinatorAcceptState {
     /// the peer is retained in a generation whose directory sync is still
     /// ambiguous, or `Denied` for a definite rejection. A caller that burned a
     /// single-use credential restores it only for `Denied`.
-    #[allow(clippy::too_many_arguments)]
     async fn admit_peer(
         &self,
         conn: &Connection,
         mut send: iroh::endpoint::SendStream,
-        remote_id: EndpointId,
-        hostname: Option<String>,
-        device_cert: Option<control::DeviceCert>,
-        was_approved: bool,
-        // The hostname is coordinator-authoritative (came from an invite binding).
-        // Authoritative names are rejected on collision (no silent rename), so no
-        // peer can claim another's name to take its suggested firewall rules.
-        authoritative: bool,
+        req: AdmitRequest,
     ) -> AdmissionResult {
+        let AdmitRequest {
+            remote_id,
+            hostname,
+            device_cert,
+            roles,
+            was_approved,
+            authoritative,
+        } = req;
         let Admission {
             peer_ip,
             hostname: final_hostname,
@@ -865,6 +1098,7 @@ impl CoordinatorAcceptState {
                 remote_id,
                 &final_hostname,
                 &device_cert,
+                &roles,
                 was_approved,
                 grant_direct,
             )
@@ -911,9 +1145,22 @@ impl CoordinatorAcceptState {
                 identity: remote_id,
                 hostname: final_hostname.clone(),
                 device_cert: device_cert.clone(),
+                roles: roles.clone(),
             },
         )
         .await;
+
+        // A suggested rule names its peers by hostname or `role:`, and both
+        // resolve against the roster this admission just changed. Members pick
+        // that up when they reconverge from the published record; the
+        // coordinator never does, because it *is* the record's source and the
+        // poller's hash check (local == published) short-circuits. So a peer
+        // authored into a rule before it joined would never materialize here.
+        // Re-resolve now, which is also what makes a role cover a node that
+        // joins after the rule was published.
+        self.ctx
+            .registry
+            .reapply_suggested_firewall(&self.network_name);
 
         // A direct (`ray connect`) link is symmetric, so the pre-approved requester
         // is made a co-coordinator. Hand it the network key inside the Welcome it is
@@ -978,6 +1225,7 @@ impl CoordinatorAcceptState {
         remote_id: EndpointId,
         final_hostname: &Option<String>,
         device_cert: &Option<control::DeviceCert>,
+        roles: &BTreeSet<String>,
         was_approved: bool,
         grant_direct: bool,
     ) -> AdmissionCommit {
@@ -993,6 +1241,7 @@ impl CoordinatorAcceptState {
             last_seen: Some(crate::membership::now_secs()),
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: roles.clone(),
         };
         let (displaced_member, removed_approved, removed_pending) = {
             let mut s = self.state.write().unwrap();
@@ -1177,6 +1426,43 @@ impl AdmissionResult {
     }
 }
 
+/// What a joiner sent to get in: a `JoinRequest`, or the bare `MeshHello` an
+/// older client sends instead. Every field is the joiner's own say-so, and the
+/// coordinator decides what each is worth.
+struct JoinAttempt {
+    invite_secret: Option<Vec<u8>>,
+    hostname: Option<String>,
+    device_cert: Option<control::DeviceCert>,
+    /// Roles asked for. Granted only where the redeemed credential already
+    /// permits them, so this narrows a grant and can never widen one.
+    roles: BTreeSet<String>,
+}
+
+/// A join that presented a credential, on its way to being redeemed.
+struct RedeemAttempt {
+    hostname: Option<String>,
+    device_cert: Option<control::DeviceCert>,
+    requested_roles: BTreeSet<String>,
+    secret: Vec<u8>,
+}
+
+/// Everything the coordinator decided about a joiner, handed to `admit_peer` to
+/// seat. A struct rather than eight positional arguments: the two booleans sit
+/// next to each other and swapping them silently would grant the wrong thing.
+struct AdmitRequest {
+    remote_id: EndpointId,
+    hostname: Option<String>,
+    device_cert: Option<control::DeviceCert>,
+    /// Roles to seat the member with, taken from the redeemed credential or a
+    /// prior approval. Never anything the joiner asserted on its own.
+    roles: BTreeSet<String>,
+    was_approved: bool,
+    /// The hostname is coordinator-authoritative (came from an invite binding).
+    /// Authoritative names are rejected on collision (no silent rename), so no
+    /// peer can claim another's name to take its suggested firewall rules.
+    authoritative: bool,
+}
+
 /// What a coordinator settled for a joiner it is about to seat.
 struct Admission {
     /// Derived from the joiner's identity, not chosen here.
@@ -1237,7 +1523,10 @@ impl MemberAcceptState {
             // at the IP *this message* chose, writes its `.ray` name, and
             // registers its route. Same gate as `InviteShare`/`KickedFromNetwork`.
             ControlMsg::MemberApproved {
-                identity, hostname, ..
+                identity,
+                hostname,
+                roles,
+                ..
             } => {
                 if !sender_is_coordinator(&self.state, peer_id) {
                     tracing::warn!(peer = %peer_id.fmt_short(), "ignoring MemberApproved from non-coordinator");
@@ -1248,6 +1537,9 @@ impl MemberAcceptState {
                     hostname,
                     user_identity: None,
                     device_cert: None,
+                    // Gated on the sender being the coordinator just above, so
+                    // this is an assignment, not a peer's claim about itself.
+                    roles,
                 };
                 let mut s = self.state.write().unwrap();
                 s.approved.approve(entry);
@@ -1282,14 +1574,19 @@ impl MemberAcceptState {
                 id,
                 secret_hash,
                 expires,
+                roles,
             } => {
-                if sender_is_coordinator(&self.state, peer_id)
-                    && let Ok(hash) = String::from_utf8(secret_hash)
-                {
+                if sender_is_coordinator(&self.state, peer_id) {
                     let _guard = self.invite_lock.lock().await;
-                    if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
-                        let _ = store.record_shared(id, hash, expires);
-                    }
+                    record_shared_invite(
+                        &self.network_name,
+                        SharedInvite {
+                            id,
+                            secret_hash,
+                            expires,
+                            roles,
+                        },
+                    );
                 }
                 None
             }
@@ -1507,7 +1804,13 @@ impl MemberAcceptState {
         }
         let (snap_bytes, member_ip) = {
             let mut s = self.state.write().unwrap();
-            s.approved.remove(&peer_identity);
+            // The approval carries the roles the coordinator assigned; take them
+            // off it before it is consumed.
+            let approved_roles = s
+                .approved
+                .remove(&peer_identity)
+                .map(|e| e.roles)
+                .unwrap_or_default();
             let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
             // The address is derived from the identity that dialed, so there is
             // nothing left for a peer to claim and nothing to cross-check it
@@ -1522,6 +1825,7 @@ impl MemberAcceptState {
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: approved_roles,
             });
             s.refresh_snapshot();
             (
@@ -1570,6 +1874,12 @@ impl MemberAcceptState {
             Some(derive_ipv6(&peer_identity)),
         )
         .await;
+        // Seating a member changes what this network's suggested rules resolve
+        // to. See the same call in `admit_peer` for why the coordinator has to
+        // do this itself.
+        self.ctx
+            .registry
+            .reapply_suggested_firewall(&self.network_name);
         Some(member_ip)
     }
 
@@ -1983,6 +2293,7 @@ mod admission_rollback_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         }
     }
 
@@ -2095,6 +2406,7 @@ mod stranger_policy_tests {
                 invite_secret: None,
                 hostname: None,
                 device_cert: None,
+                roles: Default::default(),
             },
             ControlMsg::MeshHello {
                 identity: eid(1),
@@ -2118,6 +2430,7 @@ mod stranger_policy_tests {
                 identity: eid(1),
                 hostname: None,
                 device_cert: None,
+                roles: Default::default(),
             },
             ControlMsg::AdminGrant {
                 network_pubkey: eid(1),
@@ -2127,6 +2440,7 @@ mod stranger_policy_tests {
                 id: "ab".into(),
                 secret_hash: vec![],
                 expires: 0,
+                roles: Default::default(),
             },
             ControlMsg::InviteUsed {
                 secret_hash: vec![],
@@ -2170,6 +2484,7 @@ mod direct_grant_tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: Default::default(),
             });
         }
         Arc::new(RwLock::new(NetworkState {
@@ -2383,6 +2698,7 @@ mod pending_cap_tests {
         PendingJoin {
             hostname: None,
             device_cert: None,
+            requested_roles: BTreeSet::new(),
             requested_at: t,
         }
     }
@@ -2417,6 +2733,7 @@ mod pending_cap_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: BTreeSet::new(),
         });
         assert!(
             member_admits(Some(&cert), &members),

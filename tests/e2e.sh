@@ -9,6 +9,7 @@
 #   firewall      3-peer suggested-firewall + rule matrix (tests/e2e/firewall)
 #   closed-net    3-peer admission + lifecycle commands (tests/e2e/closed-net)
 #   apply         3-peer declarative `ray apply` deploy       (tests/e2e/apply)
+#   roles         3-peer coordinator-assigned roles           (tests/e2e/roles)
 #   dns           2-peer Magic DNS resolution + resolv.conf takeover (tests/e2e/dns)
 #   ssh           2-peer mesh SSH (`ray firewall ssh`) allow/deny matrix (tests/e2e/ssh)
 #   operator      2-peer unprivileged-client authority (`ray set-operator`) (tests/e2e/operator)
@@ -79,6 +80,9 @@ scenario_meta(){
                  LABELS=(srv-a srv-b srv-c) ;;
     apply)       DIR="$ROOT/tests/e2e/apply"
                  NAMES=(rayfish-apply-a rayfish-apply-b rayfish-apply-c)
+                 LABELS=(srv-a srv-b srv-c) ;;
+    roles)       DIR="$ROOT/tests/e2e/roles"
+                 NAMES=(rayfish-roles-a rayfish-roles-b rayfish-roles-c)
                  LABELS=(srv-a srv-b srv-c) ;;
     dns)         DIR="$ROOT/tests/e2e/dns"
                  NAMES=(rayfish-dns-a rayfish-dns-b)

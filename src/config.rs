@@ -435,6 +435,12 @@ pub struct PendingJoinEntry {
     /// The local display name to use once admitted, if the user gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Roles the join asked for (`ray join --role`). Kept so a restart resumes
+    /// the same request: coming back asking for nothing would let the node be
+    /// seated without the policy class it was provisioned for, and a firewall
+    /// rule keyed on that role would quietly never reach it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
 }
 
 /// A controller this machine has explicitly authorized to issue management
@@ -2813,6 +2819,7 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: Some("homelab".to_string()),
+                roles: vec!["sentry".to_string()],
             },
         )
         .unwrap();
@@ -2820,6 +2827,9 @@ name = "test"
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.pending_joins.len(), 1);
         assert_eq!(loaded.pending_joins[0].network_key, "abc123");
+        // The roles survive the round trip: a restart that resumed without them
+        // would ask for nothing and be seated without its policy class.
+        assert_eq!(loaded.pending_joins[0].roles, vec!["sentry".to_string()]);
 
         // Adding the same key again does not duplicate it.
         add_pending_join_in(
@@ -2827,6 +2837,7 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: None,
+                roles: Vec::new(),
             },
         )
         .unwrap();

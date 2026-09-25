@@ -21,6 +21,30 @@ const WARM_DIAL_CONCURRENCY: usize = 12;
 /// Borrowed bundle of the per-join inputs threaded through the dial + finalize
 /// phases of `join_network_inner`, so each phase takes one argument instead of a
 /// dozen. The references point at locals that live for the whole join.
+/// The knobs one join carries: who we say we are, what credential we present,
+/// and what we consent to once inside. Grouped so the call sites name each
+/// value rather than lining up seven positionals, several of them bare `bool`s
+/// that would swap silently.
+#[derive(Debug, Clone, Default)]
+pub struct JoinOptions {
+    /// Name to claim. Authoritative only if the credential binds one.
+    pub hostname: Option<String>,
+    /// Single-use invite secret or reusable key to present at admission.
+    pub invite: Option<Vec<u8>>,
+    /// Coordinator to dial first (the invite minter), when known.
+    pub coordinator: Option<EndpointId>,
+    /// Auto-install coordinator-suggested firewall rules on this network
+    /// (`--auto-accept-firewall`); persisted so it survives restarts.
+    pub auto_accept_firewall: bool,
+    /// Seed for per-network auto-accept of file offers from own devices
+    /// (`--auto-accept-files`); persisted, config wins on reconnect/restore.
+    pub auto_accept_files: bool,
+    /// Roles to ask for (`ray join --role sentry`). Narrows what the credential
+    /// grants and can never widen it, so an empty list (the usual case) takes
+    /// whatever the credential carries.
+    pub roles: Vec<String>,
+}
+
 struct JoinContext<'a> {
     display_name: &'a str,
     my_hostname: &'a str,
@@ -38,6 +62,10 @@ struct JoinContext<'a> {
     invite_lock: Arc<AsyncMutex<()>>,
     /// Pinned coordinator to dial first (the invite minter), if known.
     coordinator: Option<EndpointId>,
+    /// Roles this join asks for, forwarded in the `JoinRequest`. Canonical
+    /// already ([`crate::roles::normalize`]), so it meets the mint side's
+    /// spelling of the same names.
+    roles: BTreeSet<String>,
     /// Set on a restore whose network record advertises a mesh protocol version
     /// this build does not speak. Only [`VersionGate::Record`] can produce it,
     /// so it is always `None` on a fresh join.
@@ -279,56 +307,27 @@ impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// join an existing network by key (optionally with an invite/coordinator).
     /// Thin delegate to the network registry, which owns the join path.
-    #[allow(clippy::too_many_arguments)]
     pub async fn join_network(
         self: &Arc<Self>,
         network_key: &str,
         name: Option<&str>,
-        hostname: Option<String>,
-        invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
+        opts: JoinOptions,
     ) -> IpcMessage {
-        self.registry
-            .join_network(
-                network_key,
-                name,
-                hostname,
-                invite,
-                coordinator,
-                auto_accept_firewall,
-                auto_accept_files,
-            )
-            .await
+        self.registry.join_network(network_key, name, opts).await
     }
 }
 
 impl NetworkRegistry {
     /// Join an existing network by key (optionally with an invite/coordinator).
-    #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
+    #[tracing::instrument(skip(self, opts), fields(net = name.unwrap_or(network_key)))]
     pub async fn join_network(
         self: &Arc<Self>,
         network_key: &str,
         name: Option<&str>,
-        hostname: Option<String>,
-        invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
+        opts: JoinOptions,
     ) -> IpcMessage {
         match self
-            .join_network_inner(
-                network_key,
-                name,
-                hostname.clone(),
-                invite.clone(),
-                coordinator,
-                auto_accept_firewall,
-                auto_accept_files,
-                true,
-            )
+            .join_network_inner(network_key, name, opts.clone(), true)
             .await
         {
             Ok(TryJoin::Joined(resp)) => {
@@ -340,12 +339,14 @@ impl NetworkRegistry {
                 let _ = config::add_pending_join(config::PendingJoinEntry {
                     network_key: network_key.to_string(),
                     name: name.map(|s| s.to_string()),
+                    roles: opts.roles.clone(),
                 });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
                 let me = Arc::clone(self);
                 let nk = network_key.to_string();
                 let nm = name.map(|s| s.to_string());
+                let retry_opts = opts;
                 tokio::spawn(async move {
                     let mut backoff = BACKOFF_INITIAL;
                     loop {
@@ -355,16 +356,7 @@ impl NetworkRegistry {
                         }
                         backoff = (backoff * 2).min(BACKOFF_MAX);
                         match me
-                            .join_network_inner(
-                                &nk,
-                                nm.as_deref(),
-                                hostname.clone(),
-                                invite.clone(),
-                                coordinator,
-                                auto_accept_firewall,
-                                auto_accept_files,
-                                true,
-                            )
+                            .join_network_inner(&nk, nm.as_deref(), retry_opts.clone(), true)
                             .await
                         {
                             Ok(TryJoin::Joined(_)) => {
@@ -373,6 +365,19 @@ impl NetworkRegistry {
                                 return;
                             }
                             Ok(TryJoin::Pending) => continue,
+                            // A refusal the coordinator marked final: asking
+                            // again cannot change it, so stop and drop the
+                            // persisted request instead of looping forever on a
+                            // backoff that nothing ever surfaces.
+                            Err(e) if e.downcast_ref::<JoinRefused>().is_some() => {
+                                let _ = config::remove_pending_join(&nk);
+                                tracing::error!(
+                                    net = %nk,
+                                    error = %e,
+                                    "coordinator refused the join; giving up"
+                                );
+                                return;
+                            }
                             Err(e) => {
                                 tracing::warn!(net = %nk, error = %e, "join retry failed");
                             }
@@ -384,6 +389,15 @@ impl NetworkRegistry {
                         .to_string(),
                 }
             }
+            // Same answer as in the retry loop above, for the caller that never
+            // reaches it: the coordinator refused for good, so drop the persisted
+            // request instead of leaving it to be re-asked once per daemon
+            // restart (`connect`'s resume) with nothing ever surfacing it.
+            Err(e) if e.downcast_ref::<JoinRefused>().is_some() => {
+                let _ = config::remove_pending_join(network_key);
+                tracing::error!(net = %network_key, error = %e, "coordinator refused the join; giving up");
+                ipc_err(format!("{e:#}"))
+            }
             Err(e) => ipc_err(format!("{e:#}")),
         }
     }
@@ -393,20 +407,26 @@ impl NetworkRegistry {
         self: &Arc<Self>,
         network_key: &str,
         alias: Option<&str>,
-        hostname: Option<String>,
-        invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
-        // Auto-install coordinator-suggested firewall rules on this network
-        // (`--auto-accept-firewall`); persisted so it survives restarts.
-        auto_accept_firewall: bool,
-        // Seed for per-network auto-accept of file offers from own devices
-        // (`--auto-accept-files`); persisted, config wins on reconnect/restore.
-        auto_accept_files: bool,
+        opts: JoinOptions,
         // True for a fresh join (we send a JoinRequest first); false when
         // restoring a network we're already a member of (legacy handshake where
         // the coordinator speaks first).
         initial: bool,
     ) -> Result<TryJoin> {
+        let JoinOptions {
+            hostname,
+            invite,
+            coordinator,
+            auto_accept_firewall,
+            auto_accept_files,
+            roles,
+        } = opts;
+        // Canonicalize before asking. The mint side stores what
+        // `roles::normalize` produced, and the coordinator compares by exact set
+        // difference, so `--role Sentry` against a key minted `--role Sentry`
+        // would otherwise be refused a role the key does carry. A name that is
+        // not a role at all fails here, on the machine that typed it.
+        let roles = crate::roles::normalize(&roles).context("invalid --role")?;
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
         if let Some(a) = alias
@@ -505,6 +525,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock: Arc::clone(&invite_lock),
             coordinator,
+            roles,
             mismatch,
         };
 
@@ -625,6 +646,9 @@ impl NetworkRegistry {
         }
 
         let mut last_err = anyhow::anyhow!("no coordinators tried");
+        // Keep a final refusal so a later transient error does not hide it from
+        // the caller, which uses the error type to stop retrying.
+        let mut refused: Option<anyhow::Error> = None;
         let mut pending = false;
         for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
@@ -678,6 +702,19 @@ impl NetworkRegistry {
                     abort_join_tasks(&cancel, tasks);
                     pending = true;
                 }
+                // A refusal the coordinator marked final answers for that
+                // coordinator, not for the network. Most of what it rests on is
+                // shared (the signed roster, a reusable key inside it), but a
+                // single-use invite lives in a per-coordinator ledger fed by
+                // gossip, so one that has not arrived yet, or predates a field
+                // the minter added, makes this coordinator refuse a code the
+                // minter would honor. Keep the refusal and try the rest; it is
+                // returned only if nobody admits us.
+                Err(e) if e.downcast_ref::<JoinRefused>().is_some() => {
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator refused the join, trying next");
+                    abort_join_tasks(&cancel, tasks);
+                    refused.get_or_insert(e);
+                }
                 Err(e) => {
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
                     abort_join_tasks(&cancel, tasks);
@@ -689,10 +726,10 @@ impl NetworkRegistry {
         if pending {
             return Ok(None);
         }
-        anyhow::bail!(
-            "no coordinator admitted the join (tried {}): {last_err:#}",
+        Err(refused.unwrap_or(last_err).context(format!(
+            "no coordinator admitted the join (tried {})",
             order.len()
-        )
+        )))
     }
 
     /// Build an unconnected member state from a locally retained, previously
@@ -931,6 +968,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock,
             coordinator: None,
+            roles: BTreeSet::new(),
             mismatch: None,
         };
 
@@ -1003,6 +1041,7 @@ impl NetworkRegistry {
                 group_blob: data.clone(),
                 auto_accept_firewall: ctx.auto_accept_firewall,
                 auto_accept_files: ctx.auto_accept_files,
+                requested_roles: ctx.roles.clone(),
                 initial,
             },
             cancel.clone(),
@@ -1498,6 +1537,38 @@ impl NetworkRegistry {
 mod tests {
     use super::*;
 
+    /// The pending-join retry loop tells "ask again" from "the answer is no" by
+    /// downcasting, and every layer between the handshake and the loop has to
+    /// keep the error reachable. This once did not hold: `dial_fresh_join`
+    /// ended in a `bail!` that interpolated `{last_err:#}` into a fresh error,
+    /// which reads identically and flattens the chain, so the loop saw an
+    /// opaque string and reasked on a backoff forever.
+    #[test]
+    fn a_final_refusal_survives_the_context_layers() {
+        let refused: anyhow::Error = JoinRefused {
+            reason: "this key does not grant validator; it grants sentry".to_string(),
+        }
+        .into();
+        let wrapped = refused
+            .context("no coordinator admitted the join (tried 2)")
+            .context("join network");
+        assert!(wrapped.downcast_ref::<JoinRefused>().is_some());
+        // And the flattened rendering is unchanged, so nothing reads differently.
+        let msg = format!("{wrapped:#}");
+        assert!(msg.contains("no coordinator admitted the join"), "{msg}");
+        assert!(msg.contains("it grants sentry"), "{msg}");
+    }
+
+    /// The other half: a transient denial stays retryable, so a coordinator
+    /// hiccup does not tear down a join that would succeed a moment later.
+    #[test]
+    fn a_retryable_denial_is_not_a_final_refusal() {
+        let err =
+            anyhow::anyhow!("join denied: direct coordinator grant is temporarily unavailable")
+                .context("no coordinator admitted the join (tried 1)");
+        assert!(err.downcast_ref::<JoinRefused>().is_none());
+    }
+
     /// A restore of a network we already belong to must not be undone by the
     /// version gate. The roster blob is not ALPN-gated, so the network still
     /// registers from it; the mismatch is recorded and shown. Without this the
@@ -1637,6 +1708,7 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
+                roles: BTreeSet::new(),
             });
             servers.push(tokio::spawn(async move {
                 let connection = timeout(Duration::from_secs(15), async {
@@ -1675,6 +1747,7 @@ mod tests {
             auto_accept_files: false,
             invite_lock: Arc::new(AsyncMutex::new(())),
             coordinator: None,
+            roles: BTreeSet::new(),
             mismatch: None,
         };
         let outcome = timeout(
@@ -1704,6 +1777,7 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
+            roles: Default::default(),
         };
         let roster = vec![member(me), member(other)];
 
