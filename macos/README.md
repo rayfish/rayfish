@@ -1,18 +1,19 @@
 # macOS releases
 
-macOS releases support Apple Silicon (arm64). Users can choose either:
+macOS releases support Apple Silicon (arm64) and Intel (x86_64). Users can choose either:
 
-- The signed, notarized DMG for Apple Silicon (arm64), with the native app and
-  packet tunnel system extension.
-- The standalone `ray-macos-aarch64` binary with the CLI and launchd daemon,
-  including `ray gui` and `ray set-operator`.
+- The signed, notarized DMG for their architecture, with the native app and packet
+  tunnel system extension.
+- The standalone `ray-macos-aarch64` or `ray-macos-x86_64` binary with the CLI
+  and launchd daemon, including `ray gui` and `ray set-operator`.
 
 Versioned releases build both. DMGs can also be built manually; nightly releases
-build only the standalone binary for macOS. The **macOS app release** workflow
-builds the DMG with Xcode 26.6. The app also bundles the Rust `ray` CLI, using the
+build standalone binaries for both architectures. The **macOS app release** workflow
+builds each DMG with Xcode 26.6. The app also bundles the Rust `ray` CLI, using the
 repository's Cargo version.
 The DMG uses Rayfish's logo, fonts, and colors, with a drag-to-Applications layout.
-Nightly releases include `ray-macos-aarch64`, rebuilt from each push to master.
+Nightly releases include `ray-macos-aarch64` and `ray-macos-x86_64`, rebuilt from
+each push to master.
 
 Configure these repository secrets before running it:
 
@@ -49,8 +50,8 @@ publishing a release.
 
 The existing **Release** workflow calls it for version tags and manual releases.
 The tag must match Cargo's version and point to the commit being
-built. The app must pass signing checks and Apple notarization before its DMG is
-attached to the existing release. Missing credentials or failed notarization
+built. Both architectures must pass signing checks and Apple notarization before
+their DMGs are attached to the existing release. Missing credentials or failed notarization
 fail the job; there is no unsigned fallback. Other platform release jobs remain
 independent.
 
