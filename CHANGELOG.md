@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Intel Macs can use the standalone CLI and daemon, self-update, install script,
+  and signed native app DMG again.
+
 - macOS notifies you about connection requests, network join requests, and incoming
   files. Click a notification to review it; files can be saved or declined in the app.
 - macOS Settings can enable mesh SSH and manage which network peers may sign in
