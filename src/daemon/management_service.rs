@@ -7,6 +7,7 @@ use crate::management::{
 };
 use futures::future::join_all;
 use iroh::EndpointAddr;
+use iroh::endpoint::ConnectOptions;
 use ray_proto::ipc::{
     ControllerSelector, EnrollmentCredentialSelector, MachineHostname, ManagedMachineSelector,
     NetworkName, UnixTimestampSecs,
@@ -20,9 +21,11 @@ const MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGEMENT_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROLLER_HELLO_INTERVAL: Duration = Duration::from_secs(60);
+const CONTROLLER_HELLO_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CONTROLLER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(test)]
+mod compatibility_tests;
 #[cfg(test)]
 mod recovery_tests;
 
@@ -44,6 +47,20 @@ fn now() -> UnixTimestampSecs {
 
 fn enrollment_expiration(created_at: UnixTimestampSecs, expires_in: Duration) -> UnixTimestampSecs {
     created_at.saturating_add(expires_in)
+}
+
+/// Negotiate once, offering v1 for peers that have not upgraded. Recovery-only
+/// messages check the selected ALPN before sending any application data.
+async fn connect_management(
+    endpoint: &Endpoint,
+    address: EndpointAddr,
+) -> anyhow::Result<Connection> {
+    let options =
+        ConnectOptions::new().with_additional_alpns(vec![crate::management::LEGACY_ALPN.to_vec()]);
+    let connecting = endpoint
+        .connect_with_opts(address, crate::management::ALPN, options)
+        .await?;
+    Ok(connecting.await?)
 }
 
 fn record_enrollment(
@@ -405,9 +422,7 @@ impl ManagementService {
         };
         let connection = match tokio::time::timeout(
             MANAGEMENT_CONNECT_TIMEOUT,
-            self.transport
-                .endpoint
-                .connect(ticket.controller().clone(), crate::management::ALPN),
+            connect_management(&self.transport.endpoint, ticket.controller().clone()),
         )
         .await
         {
@@ -415,6 +430,7 @@ impl ManagementService {
             Ok(Err(error)) => return ipc_err(format!("failed to reach controller: {error}")),
             Err(_) => return ipc_err("timed out reaching controller"),
         };
+        let legacy = connection.alpn() == crate::management::LEGACY_ALPN;
         let (mut send, mut recv) = match connection.open_bi().await {
             Ok(streams) => streams,
             Err(error) => return ipc_err(format!("failed to open controller stream: {error}")),
@@ -435,46 +451,54 @@ impl ManagementService {
             control::recv_framed::<ManagementMsg>(&mut recv),
         )
         .await;
-        match response {
-            Err(_) => ipc_err("timed out waiting for controller enrollment response"),
-            Ok(Ok(ManagementMsg::Enrolled { receipt })) => {
+        let receipt = match response {
+            Err(_) => return ipc_err("timed out waiting for controller enrollment response"),
+            Ok(Ok(ManagementMsg::Enrolled)) if legacy => None,
+            Ok(Ok(ManagementMsg::EnrolledWithReceipt { receipt })) if !legacy => {
                 if !receipt.verify(controller, self.transport.endpoint.id()) {
                     return ipc_err("controller returned an invalid enrollment receipt");
                 }
-                let _guard = self.controller_gate.lock().await;
-                let saved = config::update_settings(|settings| {
-                    if let Some(grant) = settings
-                        .controllers
-                        .iter_mut()
-                        .find(|grant| grant.identity == controller)
-                    {
-                        grant.receipt = Some(receipt.clone());
-                    } else {
-                        settings.controllers.push(config::ControllerGrant {
-                            identity: controller,
-                            enrolled_at: receipt.enrolled_at,
-                            receipt: Some(receipt.clone()),
-                        });
-                    }
-                    Ok(())
+                Some(receipt)
+            }
+            Ok(Ok(ManagementMsg::EnrollmentRejected { message }))
+            | Ok(Ok(ManagementMsg::ProtocolError { message })) => return ipc_err(message),
+            Ok(Ok(other)) => return ipc_err(format!("unexpected enrollment response: {other:?}")),
+            Ok(Err(error)) => {
+                return ipc_err(format!("failed to read enrollment response: {error}"));
+            }
+        };
+        let _guard = self.controller_gate.lock().await;
+        let saved = config::update_settings(|settings| {
+            if let Some(grant) = settings
+                .controllers
+                .iter_mut()
+                .find(|grant| grant.identity == controller)
+            {
+                if receipt.is_some() {
+                    grant.receipt = receipt.clone();
+                }
+            } else {
+                settings.controllers.push(config::ControllerGrant {
+                    identity: controller,
+                    enrolled_at: receipt
+                        .as_ref()
+                        .map_or_else(now, |receipt| receipt.enrolled_at),
+                    receipt: receipt.clone(),
                 });
-                match saved {
-                    Ok(_) => {
-                        self.hello_notify.notify_one();
-                        IpcMessage::Ok {
-                            message: format!(
-                                "enrolled '{hostname}' with controller {}",
-                                controller.fmt_short()
-                            ),
-                        }
-                    }
-                    Err(error) => ipc_err(format!("failed to save controller grant: {error}")),
+            }
+            Ok(())
+        });
+        match saved {
+            Ok(_) => {
+                self.hello_notify.notify_one();
+                IpcMessage::Ok {
+                    message: format!(
+                        "enrolled '{hostname}' with controller {}",
+                        controller.fmt_short()
+                    ),
                 }
             }
-            Ok(Ok(ManagementMsg::EnrollmentRejected { message })) => ipc_err(message),
-            Ok(Ok(ManagementMsg::ProtocolError { message })) => ipc_err(message),
-            Ok(Ok(other)) => ipc_err(format!("unexpected enrollment response: {other:?}")),
-            Ok(Err(error)) => ipc_err(format!("failed to read enrollment response: {error}")),
+            Err(error) => ipc_err(format!("failed to save controller grant: {error}")),
         }
     }
 
@@ -815,13 +839,20 @@ impl ManagementService {
     ) -> Result<ManagementResult, String> {
         let connection = tokio::time::timeout(
             MANAGEMENT_CONNECT_TIMEOUT,
-            self.transport
-                .endpoint
-                .connect(EndpointAddr::from(target), crate::management::ALPN),
+            connect_management(&self.transport.endpoint, EndpointAddr::from(target)),
         )
         .await
         .map_err(|_| "timed out reaching managed machine".to_string())?
         .map_err(|error| format!("failed to reach managed machine: {error}"))?;
+        if connection.alpn() == crate::management::LEGACY_ALPN
+            && matches!(action, ManagementAction::ConfirmEnrollment { .. })
+        {
+            connection.close(0u32.into(), b"management v2 required");
+            return Err(
+                "inventory recovery requires management v2; upgrade the managed machine first"
+                    .to_string(),
+            );
+        }
         let (mut send, mut recv) = connection
             .open_bi()
             .await
@@ -861,6 +892,7 @@ impl ManagementService {
     /// Handles one inbound enrollment or authenticated management request.
     pub(crate) async fn accept_connection(&self, connection: Connection) {
         let remote = connection.remote_id();
+        let legacy = connection.alpn() == crate::management::LEGACY_ALPN;
         let Ok((mut send, mut recv)) = connection.accept_bi().await else {
             return;
         };
@@ -880,48 +912,55 @@ impl ManagementService {
                 return;
             }
         };
-        let reply = match message {
-            ManagementMsg::Enroll { secret, hostname } => {
-                match self.accept_enrollment(remote, &secret, &hostname) {
-                    Ok(receipt) => ManagementMsg::Enrolled { receipt },
-                    Err(message) => ManagementMsg::EnrollmentRejected { message },
+        let reply = if legacy && !message.supported_by_v1() {
+            ManagementMsg::ProtocolError {
+                message: "this operation requires management v2".to_string(),
+            }
+        } else {
+            match message {
+                ManagementMsg::Enroll { secret, hostname } => {
+                    match self.accept_enrollment(remote, &secret, &hostname) {
+                        Ok(_) if legacy => ManagementMsg::Enrolled,
+                        Ok(receipt) => ManagementMsg::EnrolledWithReceipt { receipt },
+                        Err(message) => ManagementMsg::EnrollmentRejected { message },
+                    }
                 }
-            }
-            ManagementMsg::ControllerHello { receipt, hostname } => {
-                match config::update_settings(|settings| {
-                    record_hello(
-                        settings,
-                        self.transport.endpoint.id(),
-                        remote,
-                        &receipt,
-                        &hostname,
-                        now(),
-                    )
-                }) {
-                    Ok(_) => ManagementMsg::HelloAccepted,
-                    Err(error) => ManagementMsg::HelloRejected {
-                        message: error.to_string(),
-                    },
+                ManagementMsg::ControllerHello { receipt, hostname } => {
+                    match config::update_settings(|settings| {
+                        record_hello(
+                            settings,
+                            self.transport.endpoint.id(),
+                            remote,
+                            &receipt,
+                            &hostname,
+                            now(),
+                        )
+                    }) {
+                        Ok(_) => ManagementMsg::HelloAccepted,
+                        Err(error) => ManagementMsg::HelloRejected {
+                            message: error.to_string(),
+                        },
+                    }
                 }
+                ManagementMsg::Request { request_id, action } => {
+                    let _guard = self.controller_gate.lock().await;
+                    let authorized = config::load().is_ok_and(|settings| {
+                        settings
+                            .controllers
+                            .iter()
+                            .any(|grant| grant.identity == remote)
+                    });
+                    let result = if authorized {
+                        self.apply_action(remote, action).await
+                    } else {
+                        ManagementResult::Unauthorized
+                    };
+                    ManagementMsg::Response { request_id, result }
+                }
+                _ => ManagementMsg::ProtocolError {
+                    message: "unexpected management message".to_string(),
+                },
             }
-            ManagementMsg::Request { request_id, action } => {
-                let _guard = self.controller_gate.lock().await;
-                let authorized = config::load().is_ok_and(|settings| {
-                    settings
-                        .controllers
-                        .iter()
-                        .any(|grant| grant.identity == remote)
-                });
-                let result = if authorized {
-                    self.apply_action(remote, action).await
-                } else {
-                    ManagementResult::Unauthorized
-                };
-                ManagementMsg::Response { request_id, result }
-            }
-            _ => ManagementMsg::ProtocolError {
-                message: "unexpected management message".to_string(),
-            },
         };
         if let Err(error) = control::send_framed(&mut send, &reply).await {
             tracing::warn!(peer = %remote.fmt_short(), %error, "failed to send management response");

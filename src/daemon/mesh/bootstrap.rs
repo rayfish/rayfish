@@ -112,7 +112,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 /// `ray send` / `ray connect`, otherwise the initial handshake fails with "peer
 /// doesn't support any known protocol" until the first create/join triggers
 /// `refresh_alpns()`.
-fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
+fn initial_alpns() -> Vec<Vec<u8>> {
     // Each mesh version carries every network, so this set is independent of
     // the saved networks.
     let mut alpns = transport::mesh_alpns();
@@ -122,6 +122,7 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
         PAIR_ALPN.to_vec(),
         transport::CONNECT_ALPN.to_vec(),
         crate::management::ALPN.to_vec(),
+        crate::management::LEGACY_ALPN.to_vec(),
     ]);
     alpns
 }
@@ -243,7 +244,7 @@ async fn build_daemon_inner(
         Some(id) => id,
         None => config::contact_secret(&mut app_config).public(),
     };
-    let alpns = initial_alpns(&app_config);
+    let alpns = initial_alpns();
     #[cfg(target_os = "android")]
     let relay_mode =
         transport::build_relay_mode(&app_config.relay)?.unwrap_or_else(|| iroh::RelayMode::Default);
@@ -674,6 +675,9 @@ async fn build_daemon_inner(
     // The Router owns the endpoint accept loop and dispatches by ALPN. It aborts on
     // drop, so the Daemon owns it for the process lifetime and shuts it down on exit.
     let router = protocol_router.build_router(transport.endpoint.clone());
+    // The router sorts its ALPN map. Restore our preference order so peers that
+    // offer both management versions negotiate v2 and receive recovery receipts.
+    transport.endpoint.set_alpns(initial_alpns());
     management.start_announcements(token.clone());
 
     // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it

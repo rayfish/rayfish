@@ -10,14 +10,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Managed machines restore missing controller inventory entries automatically.**
   New enrollments keep a signed receipt and announce themselves at startup and
-  reconnect, with periodic retries. `ray machines confirm <endpoint-id>` enables
-  recovery for an existing machine that already trusts this controller.
+  reconnect, with retries every five minutes. `ray machines confirm <endpoint-id>`
+  enables recovery for an existing machine that already trusts this controller.
   Explicitly forgotten machines stay forgotten until confirmed or enrolled again.
 
 ### Changed
 
-- **Machine management requires both endpoints to support protocol v2.** Upgrade
-  the controller and its managed machines together to use enrollment and management.
+- **Machine management continues to support protocol v1.** Enrollment, status,
+  and delegated network changes work with older peers. Signed receipts and
+  inventory recovery require both endpoints to support v2.
 
 ### Fixed
 
