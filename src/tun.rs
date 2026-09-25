@@ -16,7 +16,12 @@ use std::net::IpAddr;
 
 #[cfg(not(target_os = "android"))]
 use std::net::Ipv6Addr;
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+// Windows drives the interface through PowerShell (`windows_process`), not a
+// synchronous `Command`, so nothing here needs the blocking spawn. Linux does
+// every one of these through netlink and spawns nothing at all.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
@@ -60,28 +65,39 @@ pub trait TunRead: Send + 'static {
 
 /// Write side of a packet interface. Writes one IP packet to the device.
 pub trait TunWrite: Send + 'static {
+    /// Largest IP packet this interface can accept.
+    fn mtu(&self) -> u16 {
+        TUN_MTU
+    }
+
     fn write_packet(
         &mut self,
         packet: &[u8],
     ) -> impl core::future::Future<Output = anyhow::Result<()>> + Send;
 }
 
-/// MTU for the TUN device. IPv6 mandates a minimum link MTU of 1280 bytes
-/// (RFC 8200 §5); Linux refuses to enable IPv6 on a device with a smaller MTU,
-/// which silently breaks IPv6 address/route installation (the builder's IPv6
-/// assignment / `route_peer_range` fail with `EINVAL`). 1280 is also the value
-/// WireGuard and
-/// Tailscale use for their TUN interfaces for the same reason, and it still
-/// fits within QUIC datagram limits.
+/// Maximum IP packet size for the tunnel. Mesh fragmentation carries packets
+/// over smaller QUIC paths. Keep Android's VpnService MTU in sync with this.
+pub const TUN_MTU: u16 = 1500;
+/// IPv6's minimum link MTU, used when the device rejects the preferred MTU.
+pub const MIN_TUN_MTU: u16 = 1280;
+
 #[cfg(not(target_os = "android"))]
-const TUN_MTU: u16 = 1280;
+fn configure_mtu(mut set: impl FnMut(u16) -> std::io::Result<()>) -> Result<u16> {
+    match set(TUN_MTU) {
+        Ok(()) => Ok(TUN_MTU),
+        Err(error) => {
+            tracing::warn!(%error, mtu = MIN_TUN_MTU, "TUN rejected preferred MTU; trying fallback");
+            set(MIN_TUN_MTU).context("set fallback TUN MTU to 1280")?;
+            Ok(MIN_TUN_MTU)
+        }
+    }
+}
 
 /// Bytes exposed for a single `recv`. A TUN read yields at most one MTU-bounded
 /// packet (offload is off), plus a few bytes of slack for any platform
-/// packet-info header. `recv` needs an initialised `&mut [u8]`, so we zero-fill
-/// this many bytes at the tail of the caller's pool before each read; a hand-set
-/// jumbo MTU beyond this would be truncated, but such a packet exceeds the path
-/// MTU and could not traverse a QUIC datagram anyway.
+/// packet-info header. The reader allocates this much scratch space at creation;
+/// manually raising the interface MTU beyond the tunnel limit is unsupported.
 #[cfg(not(target_os = "android"))]
 const READ_RESERVE: usize = TUN_MTU as usize + 4;
 
@@ -100,6 +116,7 @@ pub struct TunReader {
 #[cfg(not(target_os = "android"))]
 pub struct TunWriter {
     dev: Arc<AsyncDevice>,
+    mtu: u16,
 }
 
 /// Creates a TUN device with this node's mesh address and shares it between
@@ -117,27 +134,115 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     // `.up()` did); `set_link_up` and the peer-range route helpers still run
     // later on activate. No IPv4 is assigned at all: the overlay is IPv6-only,
     // and `100.64.0.0/10` belongs to whatever else may be sharing the host.
-    let device = DeviceBuilder::new()
+    // Create at IPv6's minimum first so a rejected preferred MTU cannot prevent
+    // device creation. Upgrade separately: only MTU errors trigger fallback.
+    let builder = DeviceBuilder::new()
         .ipv6(v6, 128)
-        .mtu(TUN_MTU)
-        .enable(true)
-        .build_async()
-        .context("create tun-rs device")?;
+        .mtu(MIN_TUN_MTU)
+        .enable(true);
+    #[cfg(target_os = "linux")]
+    let builder = builder.name(LINUX_TUN_NAME);
+    #[cfg(target_os = "windows")]
+    let builder = builder
+        .mtu_v6(MIN_TUN_MTU)
+        .name(WINDOWS_TUN_NAME)
+        .description("Rayfish")
+        .wintun_file(wintun_library_path().to_string_lossy().into_owned());
+    let device = builder.build_async().context("create tun-rs device")?;
+    let mtu = configure_mtu(|mtu| {
+        device.set_mtu(mtu)?;
+        #[cfg(target_os = "windows")]
+        device.set_mtu_v6(mtu)?;
+        Ok(())
+    })?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
-    tracing::info!(ipv6 = %v6, tun = %tun_name, "TUN device created");
+    tracing::info!(ipv6 = %v6, tun = %tun_name, mtu, "TUN device created");
 
     // `recv`/`send` take `&self`, so both halves share one device via `Arc`
     // instead of splitting into independent read/write objects.
     let dev = Arc::new(device);
     Ok((
         TunReader {
-            dev: dev.clone(),
+            dev: Arc::clone(&dev),
             scratch: vec![0u8; READ_RESERVE].into_boxed_slice(),
         },
-        TunWriter { dev },
+        TunWriter { dev, mtu },
         tun_name,
     ))
+}
+
+/// Interface name pattern on Linux. The kernel's default `tun0` says nothing
+/// about who owns the device, and on a host with more than one tunnel it is
+/// whoever started first. `%d` is `TUNSETIFF`'s own placeholder: the kernel
+/// substitutes the lowest free index, so this comes out `rayfish0` and a second
+/// device gets `rayfish1` rather than `EBUSY`. `device.name()` reads the
+/// resolved name back off the fd, so the rest of the daemon sees the real one.
+///
+/// Linux only. macOS numbers its own `utunN` and will not take another name,
+/// and FreeBSD's `tun` cloner insists on a `tun` prefix.
+#[cfg(target_os = "linux")]
+const LINUX_TUN_NAME: &str = "rayfish%d";
+
+/// Wintun adapter name. Fixed rather than generated, so a restart reattaches to
+/// the adapter this daemon created instead of leaving a second one behind.
+#[cfg(target_os = "windows")]
+const WINDOWS_TUN_NAME: &str = "rayfish";
+
+#[cfg(target_os = "windows")]
+fn wintun_library_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("wintun.dll")))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("wintun.dll"))
+}
+
+/// The overlay range, routed into the Wintun adapter. IPv6 only: the mesh
+/// carries no IPv4, and `100.64.0.0/10` belongs to whatever else shares the
+/// host. `::` is the on-link next hop, matching the interface-scoped routes the
+/// other platforms install.
+#[cfg(target_os = "windows")]
+const WINDOWS_PEER_ROUTES: [(&str, &str); 1] = [("200::/7", "::")];
+
+#[cfg(target_os = "windows")]
+fn windows_link_args(tun_name: &str, up: bool) -> [String; 5] {
+    let state = if up { "enabled" } else { "disabled" };
+    [
+        "interface".to_owned(),
+        "set".to_owned(),
+        "interface".to_owned(),
+        format!("name={tun_name}"),
+        format!("admin={state}"),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn windows_interface_query_script(tun_name: &str) -> String {
+    let quoted = tun_name.replace('\'', "''");
+    format!(
+        "@(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty ifIndex)",
+        quoted
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_remove_route_script(prefix: &str, index: u32) -> String {
+    format!(
+        "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
+        prefix, index
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> String {
+    format!(
+        "{}; New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -PolicyStore ActiveStore -ErrorAction Stop",
+        windows_remove_route_script(prefix, index),
+        prefix,
+        index,
+        next_hop
+    )
 }
 
 /// Run `f` with a netlink handle and the interface index of `tun_name`.
@@ -244,6 +349,38 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
             status.success(),
             "route add {family} {net} failed with {status}"
         );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name).await?;
+    for &(prefix, _) in &WINDOWS_PEER_ROUTES {
+        windows_powershell(&windows_remove_route_script(prefix, index)).await?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
+pub async fn unroute_peer_range(_tun_name: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name).await?;
+    let mut installed = Vec::new();
+    for &(prefix, next_hop) in &WINDOWS_PEER_ROUTES {
+        let result =
+            windows_powershell(&windows_replace_route_script(prefix, index, next_hop)).await;
+        if let Err(error) = result {
+            for previous in installed {
+                let _ = windows_powershell(&windows_remove_route_script(previous, index)).await;
+            }
+            return Err(error);
+        }
+        installed.push(prefix);
     }
     Ok(())
 }
@@ -393,20 +530,20 @@ pub async fn route_self_loopback(_v6: Ipv6Addr) -> Result<()> {
 
 /// Bring the TUN interface administratively up (used when activating the VPN).
 #[cfg(not(target_os = "android"))]
-pub fn set_link_up(tun_name: &str) -> Result<()> {
-    set_link_state(tun_name, true)
+pub async fn set_link_up(tun_name: &str) -> Result<()> {
+    set_link_state(tun_name, true).await
 }
 
 /// Bring the TUN interface administratively down (standby). The underlying file
 /// descriptor stays open, so the device can be brought back up without
 /// recreating it.
 #[cfg(not(target_os = "android"))]
-pub fn set_link_down(tun_name: &str) -> Result<()> {
-    set_link_state(tun_name, false)
+pub async fn set_link_down(tun_name: &str) -> Result<()> {
+    set_link_state(tun_name, false).await
 }
 
 #[cfg(not(target_os = "android"))]
-fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
+async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     {
         let state = if up { "up" } else { "down" };
@@ -418,14 +555,64 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let state = if up { "up" } else { "down" };
-        let status = Command::new("ip")
-            .args(["link", "set", tun_name, state])
-            .status()
-            .context("run ip link set")?;
-        anyhow::ensure!(status.success(), "ip link set {state} failed with {status}");
+        // Netlink rather than `ip link set`, for the same reason the address and
+        // route helpers above use it: a shell-out puts iproute2 on the daemon's
+        // runtime PATH, and a service unit without it fails this one step while
+        // every netlink call around it succeeds. That leaves the link never
+        // brought up (or, on standby, never brought down) with the address and
+        // the `200::/7` route still in place, which reads as a working VPN that
+        // silently swallows every packet.
+        use rtnetlink::LinkUnspec;
+
+        with_tun_link(tun_name, async |handle, index| {
+            let msg = LinkUnspec::new_with_index(index);
+            let msg = if up { msg.up() } else { msg.down() };
+            handle
+                .link()
+                .set(msg.build())
+                .execute()
+                .await
+                .context("set TUN link state via netlink")
+        })
+        .await?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let args = windows_link_args(tun_name, up);
+        let output = crate::windows_process::WindowsProcessRunner::default()
+            .output("netsh.exe", args)
+            .await
+            .context("run netsh interface set interface")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "netsh interface {} failed: {}",
+            if up { "enabled" } else { "disabled" },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_powershell(script: &str) -> Result<String> {
+    crate::windows_process::WindowsProcessRunner::default()
+        .powershell(
+            &format!("$ErrorActionPreference='Stop'; {script}"),
+            "run Windows network PowerShell",
+        )
+        .await
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_interface_index(tun_name: &str) -> Result<u32> {
+    let output = windows_powershell(&windows_interface_query_script(tun_name)).await?;
+    anyhow::ensure!(
+        !output.is_empty() && !output.contains('\n'),
+        "Windows TUN adapter {tun_name:?} was not uniquely found"
+    );
+    output
+        .parse()
+        .with_context(|| format!("resolve Windows interface index for {tun_name:?}"))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -449,6 +636,10 @@ impl TunRead for TunReader {
 
 #[cfg(not(target_os = "android"))]
 impl TunWrite for TunWriter {
+    fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.dev.send(packet).await?;
         Ok(())
@@ -457,6 +648,48 @@ impl TunWrite for TunWriter {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn preferred_mtu_rejection_retries_at_ipv6_minimum() {
+        let mut attempts = Vec::new();
+        let mtu = super::configure_mtu(|mtu| {
+            attempts.push(mtu);
+            if mtu > 1280 {
+                Err(std::io::ErrorKind::InvalidInput.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(mtu, 1280);
+        assert_eq!(attempts, [1500, 1280]);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn mtu_setup_does_not_hide_a_failed_fallback() {
+        let mut attempts = Vec::new();
+        let result = super::configure_mtu(|mtu| {
+            attempts.push(mtu);
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, [1500, 1280]);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn supported_preferred_mtu_needs_no_retry() {
+        let mut attempts = Vec::new();
+        let mtu = super::configure_mtu(|mtu| {
+            attempts.push(mtu);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(mtu, 1500);
+        assert_eq!(attempts, [1500]);
+    }
+
     /// A narrowing tunnel must delete the family it stopped carrying.
     ///
     /// `carries` follows the gateway's claim, so it changes under a live tunnel:
@@ -520,5 +753,78 @@ mod tests {
         assert_eq!(adds(Dual).len(), 4);
         // An absent claim predates the field, so it is read as both families.
         assert_eq!(adds(Unknown).len(), 4);
+    }
+
+    /// The Wintun adapter is configured by generated PowerShell, so the
+    /// generators are what there is to pin without a Windows host: an
+    /// apostrophe in an adapter name must not end the quoted argument, and the
+    /// route script must scope itself to our interface index rather than
+    /// touching the machine's routing table at large.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_link_args_cover_up_down_and_name_boundary() {
+        let up = super::windows_link_args("Rayfish Tunnel", true);
+        assert_eq!(
+            up,
+            [
+                "interface",
+                "set",
+                "interface",
+                "name=Rayfish Tunnel",
+                "admin=enabled",
+            ]
+        );
+
+        let down = super::windows_link_args("O'Brien", false);
+        assert_eq!(down[3], "name=O'Brien");
+        assert_eq!(down[4], "admin=disabled");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_interface_query_quotes_powershell_boundaries() {
+        let script = super::windows_interface_query_script("O'Brien");
+        assert!(script.contains("Name -eq 'O''Brien'"));
+        assert!(script.contains("ExpandProperty ifIndex"));
+    }
+
+    /// The overlay is IPv6-only. A `100.64.0.0/10` entry here would put a route
+    /// for another VPN's range into our adapter.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_peer_routes_are_the_overlay_range_only() {
+        assert_eq!(super::WINDOWS_PEER_ROUTES, [("200::/7", "::")]);
+        assert_eq!(super::WINDOWS_TUN_NAME, "rayfish");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_route_scripts_are_scoped_and_idempotent() {
+        let remove = super::windows_remove_route_script("200::/7", 17);
+        assert!(remove.contains("Remove-NetRoute"));
+        assert!(remove.contains("-InterfaceIndex 17"));
+        assert!(remove.contains("-ErrorAction SilentlyContinue"));
+
+        // Replace is remove-then-add, so re-running it is a no-op rather than a
+        // duplicate route.
+        let replace = super::windows_replace_route_script("200::/7", 17, "::");
+        assert!(replace.starts_with(&remove));
+        assert!(replace.contains("New-NetRoute"));
+        assert!(replace.contains("-DestinationPrefix '200::/7'"));
+        assert!(replace.contains("-NextHop '::'"));
+        assert!(replace.contains("-PolicyStore ActiveStore"));
+    }
+
+    /// `tun-rs` loads Wintun by path, so the wrong name here is a runtime
+    /// failure with no compile-time signal.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn wintun_library_contract_ends_in_dll() {
+        assert_eq!(
+            super::wintun_library_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("wintun.dll")
+        );
     }
 }

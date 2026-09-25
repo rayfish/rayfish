@@ -20,6 +20,7 @@ pub(crate) async fn ipc_send_files(files: &[String], peer: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     use std::fs::File;
     use std::os::fd::AsFd;
@@ -75,6 +76,66 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         // Returned, not exited, for the same reason as the arm above.
         other => anyhow::bail!(unexpected_detail(&other)),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    const CHUNK: usize = 256 * 1024;
+    let path = std::path::absolute(file).with_context(|| format!("cannot resolve '{file}'"))?;
+    let opened = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("cannot read '{}'", path.display()))?;
+    let metadata = opened.metadata().await?;
+    if !metadata.is_file() {
+        anyhow::bail!("cannot send '{}': not a regular file", path.display());
+    }
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_owned());
+    let size = metadata.len();
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::SendFileBegin {
+            filename,
+            peer: peer.to_owned(),
+            size,
+        },
+    )
+    .await?;
+    let mut opened = opened;
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let read = opened.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::SendFileChunk {
+                data: buffer[..read].to_vec(),
+                done: false,
+            },
+        )
+        .await?;
+    }
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::SendFileChunk {
+            data: Vec::new(),
+            done: true,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
+        other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())
 }
@@ -164,7 +225,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             ipc::send(&mut stream, ipc::IpcMessage::ListFiles).await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
-                ipc::IpcMessage::FileList { files, outbox } => {
+                ipc::IpcMessage::FileList {
+                    files,
+                    outbox,
+                    transfers,
+                } => {
                     if json_enabled() {
                         let inbound: Vec<_> = files
                             .iter()
@@ -185,7 +250,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                             })
                             .collect();
                         print_json(&serde_json::json!({"pending": inbound, "queued": queued}));
-                    } else if files.is_empty() && outbox.is_empty() {
+                    } else if files.is_empty() && outbox.is_empty() && transfers.is_empty() {
                         println!("\n  {}\n", style::faint("no pending file transfers"));
                     } else {
                         if !files.is_empty() {
@@ -244,6 +309,50 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                             );
                             print!("{}", table(&["id", "to", "size", "file", ""], rows, 2));
                         }
+                        if !transfers.is_empty() {
+                            let rows = transfers
+                                .iter()
+                                .map(|t| {
+                                    let state = format!("{:?}", t.state).to_lowercase();
+                                    let action = if t.outgoing
+                                        && matches!(
+                                            t.state,
+                                            ipc::TransferFileState::Offered
+                                                | ipc::TransferFileState::Transferring
+                                        ) {
+                                        format!("ray files cancel-transfer {}", t.id)
+                                    } else {
+                                        String::new()
+                                    };
+                                    vec![
+                                        layout::Cell::new(
+                                            t.id.to_string(),
+                                            style::rose(&t.id.to_string()),
+                                        ),
+                                        layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
+                                        layout::Cell::right(
+                                            format!(
+                                                "{} / {}",
+                                                format_size(t.transferred),
+                                                format_size(t.size)
+                                            ),
+                                            style::faint(&format_size(t.size)),
+                                        ),
+                                        layout::Cell::new(
+                                            format!("{} ({state})", t.filename),
+                                            style::value(&t.filename),
+                                        ),
+                                        layout::Cell::new(action.clone(), style::faint(&action)),
+                                    ]
+                                })
+                                .collect();
+                            println!();
+                            println!("  {}", style::faint("transfers"));
+                            print!(
+                                "{}",
+                                table(&["id", "peer", "progress", "file", ""], rows, 2)
+                            );
+                        }
                         println!();
                     }
                 }
@@ -271,11 +380,33 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 other => fail_unexpected(&other),
             }
         }
+        Some(FilesAction::Reject { id }) => {
+            // No spinner, unlike `Accept`: nothing is fetched, the daemon just
+            // drops the entry and answers.
+            ipc::send(&mut stream, ipc::IpcMessage::RejectFile { id }).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("  {} {}", style::check(), style::value(&message));
+                }
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
+            }
+        }
         Some(FilesAction::Cancel { id }) => {
             ipc::send(&mut stream, ipc::IpcMessage::CancelSend { id }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
+                }
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
+            }
+        }
+        Some(FilesAction::CancelTransfer { id }) => {
+            ipc::send(&mut stream, ipc::IpcMessage::CancelTransfer { id }).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("  {} {}", style::check(), style::value(&message))
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),

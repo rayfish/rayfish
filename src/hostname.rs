@@ -45,6 +45,7 @@ pub fn system_hostname() -> Option<String> {
 
 /// Read the OS hostname. `None` when the call fails or the name is not UTF-8;
 /// Android answers `localhost` here, which [`mesh_form`] then refuses.
+#[cfg(unix)]
 fn raw_system_hostname() -> Option<String> {
     // HOST_NAME_MAX is 64 on Linux and 255 on macOS, so this cannot truncate.
     let mut buf = [0u8; 512];
@@ -55,6 +56,15 @@ fn raw_system_hostname() -> Option<String> {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+/// Windows has no `gethostname` outside Winsock (which would need the stack
+/// started), so this reads the same name from `COMPUTERNAME`. `hostname()`
+/// would be the DNS form; the NetBIOS name is closer to what the other
+/// platforms return, and [`mesh_form`] keeps only the first label anyway.
+#[cfg(windows)]
+fn raw_system_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty())
 }
 
 /// Fold an OS hostname into a mesh one, or `None` if nothing usable is left.

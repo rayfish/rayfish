@@ -7,6 +7,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import android.content.Intent
 import android.net.VpnService
 import androidx.compose.ui.platform.LocalContext
@@ -21,14 +22,15 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.R
 import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.ui.screens.*
 import xyz.rayfish.android.ui.theme.Rf
 
-enum class Tab(val label: String, val icon: ImageVector) {
-    NETWORKS("Networks", Icons.Filled.Hub),
-    HOME("Home", Icons.Filled.Home),
-    YOU("You", Icons.Filled.AccountCircle),
+enum class Tab(val labelRes: Int, val icon: ImageVector) {
+    NETWORKS(R.string.tab_networks, Icons.Filled.Hub),
+    HOME(R.string.tab_home, Icons.Filled.Home),
+    YOU(R.string.tab_you, Icons.Filled.AccountCircle),
 }
 
 @Composable
@@ -42,6 +44,25 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
     var detail by remember { mutableStateOf<NetworkDetail?>(null) }
     var status by remember { mutableStateOf<Status?>(null) }
     var starting by remember { mutableStateOf(true) }
+
+    // Null until the check completes, and everything below is composed only once
+    // it is true. That ordering is the whole point: every path out of this
+    // function starts the node, and the first start mints an identity, so a
+    // first-run restore has to be offered in front of all of it. Null rather
+    // than a default of false so an existing install never flashes the welcome
+    // screen while a file is stat'ed.
+    var hasIdentity by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(Unit) {
+        hasIdentity = withContext(Dispatchers.IO) {
+            // Treating a failure as "has one" keeps a reader that cannot answer
+            // from offering to overwrite a key that may well be there.
+            runCatching { NodeHolder.get(context).hasIdentity() }.getOrDefault(true)
+        }
+    }
+    if (hasIdentity != true) {
+        if (hasIdentity == false) WelcomeScreen(onDone = { hasIdentity = true })
+        return
+    }
 
     // Observe only: never start the node here. The 2s poll used to call
     // ensureStarted(), which resurrected the node moments after the user
@@ -91,7 +112,7 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                 )
             }
             readStatus()
-        } catch (t: Throwable) { snackbar.showSnackbar("Failed to start: ${t.message}") }
+        } catch (t: Throwable) { snackbar.showSnackbar(context.getString(R.string.error_failed_to_start, t.message.orEmpty())) }
         finally { starting = false }
     }
     LaunchedEffect(lifecycleOwner) {
@@ -113,11 +134,8 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                 NodeHolder.ensureStarted(context)
                 val action = withContext(Dispatchers.IO) { NodeHolder.get(context).handleLink(uri) }
                 refreshNow()
-                toast(when (action) {
-                    is uniffi.ray_mobile.LinkAction.Joined -> "Joined ${action.v1.name}"
-                    is uniffi.ray_mobile.LinkAction.Paired -> "Paired"
-                })
-            } catch (t: Throwable) { toast("Link failed: ${t.message}") }
+                toast(context.messageForLinkAction(action, R.string.toast_paired))
+            } catch (t: Throwable) { toast(context.getString(R.string.error_link_failed, t.message.orEmpty())) }
         }
     }
     LaunchedEffect(initialLinkUri) {
@@ -136,11 +154,12 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
             if (detail == null) {
                 NavigationBar(containerColor = Rf.Bg) {
                     Tab.entries.forEach { t ->
+                        val label = stringResource(t.labelRes)
                         NavigationBarItem(
                             selected = tab == t,
                             onClick = { tab = t },
-                            icon = { Icon(t.icon, contentDescription = t.label) },
-                            label = { Text(t.label) },
+                            icon = { Icon(t.icon, contentDescription = label) },
+                            label = { Text(label) },
                             colors = NavigationBarItemDefaults.colors(
                                 selectedIconColor = Rf.Rose400, selectedTextColor = Rf.Rose400,
                                 unselectedIconColor = Rf.Faint, unselectedTextColor = Rf.Faint,

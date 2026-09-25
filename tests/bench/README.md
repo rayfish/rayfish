@@ -29,12 +29,17 @@ here, which you can also invoke directly once `.servers` exists). Overrides:
 `KEEP_STATE=1` (skip the state wipe and re-use an existing network) for the run.
 Results are printed and saved to `results/<stamp>.md` (+ `.raw` TSV).
 
+Each run also performs a 100-packet-per-second latency profile and reports
+mean, p50, p95, p99, maximum, and loss for the direct and Rayfish paths. This
+is intentionally separate from the low-rate mean RTT: queueing bugs can leave
+the mean looking reasonable while causing large tail spikes. Set `PING_COUNT`
+and `PING_INTERVAL` to adjust it (defaults: `300`, `0.01` seconds).
+
 ## Caveats
 
 `s-1vcpu-1gb` has a single shared vCPU, so single-stream TCP is **CPU-bound**:
 rayfish's userspace TUN + iroh QUIC datagram encryption is the bottleneck, and
 absolute numbers are noisy run-to-run. Use a larger `SIZE` (e.g. `s-2vcpu-4gb`,
 or a CPU-optimized `c-2`) for steadier throughput; the *direct-vs-rayfish ratio*
-is the signal,
-not the absolute Mbit/s. rayfish also runs an MTU of 1280 (the IPv6 minimum, per
-WireGuard/Tailscale), which caps per-packet payload below the link's native MTU.
+is the signal, not the absolute Mbit/s. Rayfish uses a TUN MTU of 1500 bytes;
+packets larger than the QUIC datagram budget require mesh fragmentation.

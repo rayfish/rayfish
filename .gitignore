@@ -1,6 +1,7 @@
 /target
 /ray-proto/target
 /docs
+/.firecrawl
 .superpowers
 
 # Android build outputs / local config
@@ -20,6 +21,10 @@ android/keystore.properties
 *.swo
 *~
 *.log
+xcuserdata/
+
+# Local macOS signing override
+/macos/Rayfish/RayfishSigning.entitlements
 
 # Local secrets — never commit
 .env

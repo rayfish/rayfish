@@ -61,13 +61,16 @@ detect_asset() {
   case "$OS" in
     linux)  OS="linux" ;;
     darwin) OS="macos" ;;
-    *) die "unsupported OS: $OS (Windows support is planned)" ;;
+    *) die "unsupported OS: $OS (on Windows run install.ps1 instead)" ;;
   esac
   case "$arch" in
     x86_64|amd64)  arch="x86_64" ;;
     aarch64|arm64) arch="aarch64" ;;
     *) die "unsupported architecture: $arch" ;;
   esac
+  if [ "$OS" = "macos" ] && [ "$arch" != "aarch64" ]; then
+    die "macOS releases require Apple Silicon (arm64)"
+  fi
   ASSET="${BIN}-${OS}-${arch}"
 }
 

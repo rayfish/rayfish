@@ -4,7 +4,9 @@
 //! lives in the library so the daemon's auto-updater can reuse it; this file
 //! adds spinners, changelog printing, root checks, and the service restart.
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
@@ -15,14 +17,21 @@ use reqwest::Client;
 use crate::*;
 #[cfg(target_os = "linux")]
 use rayfish::init_system::InitSystem;
+use rayfish::update::download_and_swap;
+use rayfish::update::sha256_hex;
 use rayfish::update::{
-    GhRelease, REPO_SLUG, authed, download_and_swap, fetch_checksum, github_token,
-    normalize_version, release_asset_name, sha256_hex, version_is_newer,
+    GhRelease, REPO_SLUG, authed, fetch_checksum, github_token, nightly_asset_name,
+    normalize_version, release_asset_name, version_is_newer,
+};
+#[cfg(windows)]
+use rayfish::update::{
+    download_msi_to_temp, fetch_version_manifest, installed_msi_version, schedule_msi_update,
 };
 
 /// Whether a sibling temp file can be created in `dir` (i.e. it is writable by
 /// us). `self_replace` writes a temp next to the running binary then renames, so
 /// directory write permission is what decides if we need root.
+#[cfg(not(windows))]
 pub(crate) fn dir_writable(dir: &Path) -> bool {
     let probe = dir.join(".ray-update-probe");
     match std::fs::File::create(&probe) {
@@ -119,7 +128,8 @@ pub(crate) async fn print_pending_changelog(
 ///
 /// `--check` only reports current vs latest (no root, no install); `--force`
 /// reinstalls even when already current. `--list` prints the available releases
-/// and exits; `--version X` pins a specific release (downgrades allowed).
+/// and exits; `--version X` pins a specific release (downgrades allowed). Windows
+/// stable updates use the MSI; standalone Windows nightlies replace only `ray.exe`.
 pub(crate) async fn cmd_update(
     force: bool,
     check: bool,
@@ -129,7 +139,11 @@ pub(crate) async fn cmd_update(
 ) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     // Fail fast on unsupported platforms before any network I/O.
-    let asset = release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+    let asset = if nightly {
+        nightly_asset_name(std::env::consts::OS, std::env::consts::ARCH)?
+    } else {
+        release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?
+    };
 
     // reqwest is built with `rustls-no-provider`, so it relies on a process-level
     // default CryptoProvider. Install ring (already in the tree via iroh) before
@@ -150,6 +164,14 @@ pub(crate) async fn cmd_update(
     // no install.
     if list {
         return cmd_update_list(&client, &token, current).await;
+    }
+
+    #[cfg(windows)]
+    if nightly {
+        anyhow::ensure!(
+            installed_msi_version()?.is_none(),
+            "Windows desktop installations track stable releases only; use the published nightly executable separately"
+        );
     }
 
     // A pinned `--version` resolves to a `v`-prefixed tag (releases are tagged
@@ -213,6 +235,23 @@ pub(crate) async fn cmd_update(
     // checksum to the published one (two nightlies share a crate version, so
     // semver can't tell them apart); stable gates on semver. If we can't read
     // our own executable on the nightly path, proceed rather than assume current.
+    #[cfg(windows)]
+    let target_identity = if nightly {
+        None
+    } else {
+        Some(fetch_version_manifest(&client, &tag, &asset).await?)
+    };
+    #[cfg(windows)]
+    let up_to_date = if nightly {
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => sha256_hex(&bytes) == expected,
+            Err(_) => false,
+        }
+    } else {
+        let installed = installed_msi_version()?;
+        installed.as_deref() == target_identity.as_deref()
+    };
+    #[cfg(not(windows))]
     let up_to_date = if pinned_tag.is_some() {
         latest == current
     } else if nightly {
@@ -277,7 +316,28 @@ pub(crate) async fn cmd_update(
     )
     .await;
 
-    download_verify_and_install(&client, &bin_url, &expected, &asset, current, &remote_label).await
+    #[cfg(windows)]
+    let install_identity = target_identity.as_deref();
+    #[cfg(not(windows))]
+    let install_identity = Some(latest);
+    download_verify_and_install(
+        &client,
+        &bin_url,
+        &expected,
+        &asset,
+        current,
+        &remote_label,
+        install_identity,
+    )
+    .await
+}
+
+pub(crate) fn update_label(current: &str, remote_label: &str) -> String {
+    if remote_label.starts_with("nightly") {
+        format!("nightly ({})", env!("RAY_GIT_SHA"))
+    } else {
+        format!("v{current}")
+    }
 }
 
 /// `ray update --list`: enumerate published releases (newest first) and exit.
@@ -322,42 +382,99 @@ async fn download_verify_and_install(
     bin_url: &str,
     expected: &str,
     asset: &str,
-    current: &str,
+    _current: &str,
     remote_label: &str,
+    target_identity: Option<&str>,
 ) -> Result<()> {
-    // Replacing the installed binary (typically root-owned) and restarting the
-    // service both need root. Decide up front so we exit with a clean sudo hint
-    // before downloading.
-    let service_installed = service_unit_exists();
-    let exe = std::env::current_exe().context("failed to determine current executable path")?;
-    let needs_root =
-        service_installed || exe.parent().map(|dir| !dir_writable(dir)).unwrap_or(true);
-    if needs_root {
-        require_root()?;
+    #[cfg(windows)]
+    {
+        if target_identity.is_none() {
+            anyhow::ensure!(
+                installed_msi_version()?.is_none(),
+                "Windows desktop installations track stable releases only; use the published nightly executable separately"
+            );
+            let service_installed = service_unit_exists();
+            if service_installed {
+                anyhow::ensure!(
+                    rayfish::windows_identity::is_current_process_elevated_admin(),
+                    "updating an installed Windows service requires an elevated Administrator terminal; reopen PowerShell as Administrator and retry"
+                );
+            }
+            let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
+            let result = download_and_swap(client, bin_url, expected, asset).await;
+            spinner.finish_and_clear();
+            result?;
+            println!(
+                "updated rayfish {} to {remote_label}",
+                update_label(_current, remote_label)
+            );
+            if service_installed {
+                return restart_service_and_wait().await;
+            }
+            println!("run `ray up` to start the service with the new binary");
+            return Ok(());
+        }
+        anyhow::ensure!(
+            rayfish::windows_identity::is_current_process_elevated_admin(),
+            "Windows MSI update requires an elevated Administrator terminal; reopen PowerShell as Administrator and retry"
+        );
+        let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
+        let msi = download_msi_to_temp(client, bin_url, expected, asset).await;
+        spinner.finish_and_clear();
+        let msi = msi?;
+        let previous = installed_msi_version()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| _current.to_string());
+        schedule_msi_update(
+            &msi,
+            target_identity.context("missing Windows MSI release identity")?,
+            expected,
+        )?;
+        println!("scheduled detached Windows MSI update v{previous} → {remote_label}");
+        Ok(())
     }
 
-    // Download, verify against the (already-fetched) checksum, and atomically
-    // swap the running binary: the shared engine handles all three.
-    let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
-    let res = download_and_swap(client, bin_url, expected, asset).await;
-    spinner.finish_and_clear();
-    res?;
+    #[cfg(not(windows))]
+    {
+        let _ = target_identity;
+        // Replacing the installed binary (typically root-owned) and restarting the
+        // service both need root. Decide up front so we exit with a clean sudo hint
+        // before downloading.
+        let service_installed = service_unit_exists();
+        let exe = std::env::current_exe().context("failed to determine current executable path")?;
+        let needs_root =
+            service_installed || exe.parent().map(|dir| !dir_writable(dir)).unwrap_or(true);
+        if needs_root {
+            require_root()?;
+        }
 
-    println!("updated rayfish v{current} → {remote_label}");
+        // Download, verify against the (already-fetched) checksum, and atomically
+        // swap the running binary: the shared engine handles all three.
+        let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
+        let res = download_and_swap(client, bin_url, expected, asset).await;
+        spinner.finish_and_clear();
+        res?;
 
-    // If the service is installed, the daemon is still running the old binary.
-    // Go through the full install path: rewrite the unit (its exec path may have
-    // changed when `ray update` runs from a different location than the
-    // installed binary) and fully reload it via unload+load (launchctl) /
-    // daemon-reload+restart (systemd) so the service manager honors the
-    // rewritten unit. A bare `kickstart`/in-place restart would relaunch the
-    // stale cached unit, leaving the daemon on the old binary. `wait_for_daemon`
-    // then confirms the new daemon actually comes up.
-    if service_installed {
-        install_and_start_service(None).await
-    } else {
-        println!("run `sudo ray up` to start the service with the new binary");
-        Ok(())
+        println!(
+            "updated rayfish {} → {remote_label}",
+            update_label(_current, remote_label)
+        );
+
+        // If the service is installed, the daemon is still running the old binary.
+        // Go through the full install path: rewrite the unit (its exec path may have
+        // changed when `ray update` runs from a different location than the
+        // installed binary) and fully reload it via unload+load (launchctl) /
+        // daemon-reload+restart (systemd) so the service manager honors the
+        // rewritten unit. A bare `kickstart`/in-place restart would relaunch the
+        // stale cached unit, leaving the daemon on the old binary. `wait_for_daemon`
+        // then confirms the new daemon actually comes up.
+        if service_installed {
+            install_and_start_service(None).await
+        } else {
+            println!("run `sudo ray up` to start the service with the new binary");
+            Ok(())
+        }
     }
 }
 
@@ -425,6 +542,12 @@ pub(crate) fn print_daemon_log_tail() {
     }
 }
 
+/// Run a command, reporting a non-zero exit rather than failing on it.
+///
+/// Every caller is a service-manager invocation (`systemctl`, `launchctl`,
+/// `journalctl`), so there is nothing for it to do on Windows, where the SCM is
+/// driven through `windows_service` rather than a process.
+#[cfg(unix)]
 pub(crate) fn run_cmd(program: &str, args: &[&str]) {
     match Command::new(program).args(args).status() {
         Ok(status) if status.success() => {}
@@ -465,6 +588,17 @@ pub(crate) fn cmd_uninstall_service() -> Result<()> {
                 println!("Removed {} service.", init.label());
             }
             None => println!("Service not installed."),
+        }
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        if rayfish::windows_service::exists() {
+            rayfish::windows_service::remove()?;
+            println!("Removed Windows service.");
+        } else {
+            println!("Service not installed.");
         }
         return Ok(());
     }

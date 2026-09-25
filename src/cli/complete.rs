@@ -29,6 +29,8 @@ use std::ffi::OsStr;
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use clap::CommandFactory as _;
@@ -113,10 +115,7 @@ pub(crate) fn paired_devices() -> ArgValueCompleter {
     })
 }
 
-/// Peers waiting for admission, for `ray requests <net> accept|deny <id>`.
-///
-/// The id is a short id read off the listing directly above it on screen, which
-/// is exactly the kind of value nobody should be retyping by hand.
+/// Peers waiting for admission, for `ray requests <net> accept|deny <name>`.
 pub(crate) fn join_requests() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| {
         let Some(network) = scoped_network() else {
@@ -126,7 +125,7 @@ pub(crate) fn join_requests() -> ArgValueCompleter {
     })
 }
 
-/// Peers waiting for a direct link, for `ray connect approve <id>`.
+/// Peers waiting for a direct link, for `ray connect approve <name>`.
 pub(crate) fn connect_requests() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| waiting_peers(current, IpcMessage::Connections))
 }
@@ -140,10 +139,11 @@ fn waiting_peers(current: &OsStr, request: IpcMessage) -> Vec<CompletionCandidat
     })
     .unwrap_or_default();
     described(requests.into_iter().map(|req| {
+        let value = req.hostname.clone().unwrap_or_else(|| req.short_id.clone());
         let who = req.hostname.unwrap_or_else(|| "unnamed".to_string());
         (
-            req.short_id,
-            format!("{who}, waiting {}s", req.waiting_secs),
+            value,
+            format!("{who}, {}, waiting {}s", req.short_id, req.waiting_secs),
         )
     }))
     .into_iter()
@@ -191,7 +191,7 @@ pub(crate) fn invite_ids() -> ArgValueCompleter {
     })
 }
 
-/// Incoming transfers awaiting a decision, for `ray files accept <id>`.
+/// Incoming transfers awaiting a decision, for `ray files accept|reject <id>`.
 pub(crate) fn incoming_files() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| {
         let (files, _) = file_queues();
@@ -238,7 +238,7 @@ pub(crate) fn queued_sends() -> ArgValueCompleter {
 
 fn file_queues() -> (Vec<ipc::PendingFileInfo>, Vec<ipc::OutboxFileInfo>) {
     ask(IpcMessage::ListFiles, |reply| match reply {
-        IpcMessage::FileList { files, outbox } => Some((files, outbox)),
+        IpcMessage::FileList { files, outbox, .. } => Some((files, outbox)),
         _ => None,
     })
     .unwrap_or_default()
@@ -567,6 +567,19 @@ fn starts_with(candidate: &CompletionCandidate, current: &OsStr) -> bool {
 /// that its shell reads without being told to.
 const INSTALLABLE: [Shell; 3] = [Shell::Bash, Shell::Zsh, Shell::Fish];
 
+/// Whether this platform has directories every shell on the box already
+/// searches, which is what the system-wide install writes into.
+///
+/// Windows does not. The three shells above are found through a package layout
+/// (`/usr/share/...`) it has no counterpart to, and PowerShell, the shell that
+/// is actually there, loads completions from a profile script rather than a
+/// directory. Left unchecked, an elevated `ray up` re-rooted those POSIX paths
+/// on the system drive: it created `\usr\share\bash-completion\completions` and
+/// two more like it, wrote stubs no shell would ever read, and reported tab
+/// completion as installed. So install nothing there, and let the per-user path
+/// in [`user_path`] be the only target.
+const HAS_SYSTEM_DIRS: bool = cfg!(unix);
+
 /// Write the shell's side of this: a stub that calls back here.
 pub(crate) fn registration(shell: Shell, out: &mut dyn Write) -> Result<()> {
     let name = shell.to_string();
@@ -608,10 +621,8 @@ fi
 
 /// Where each shell looks for completions installed for every user on the box.
 ///
-/// All three are on the shells' default search path, which is the whole point:
-/// nothing to source, no rc file to edit, tab completion is just there after an
-/// install. On macOS that means the `/usr/local` copies of the same layout,
-/// which is what the system zsh has on its default `fpath`.
+/// bash and fish agree across distributions, so those two are named outright.
+/// zsh does not, and is asked instead: see [`zsh_system_dir`].
 fn system_path(shell: Shell) -> Option<PathBuf> {
     system_path_under(&destdir(), shell)
 }
@@ -619,22 +630,136 @@ fn system_path(shell: Shell) -> Option<PathBuf> {
 /// `system_path` with the root spelled out, so the tests can point the whole
 /// install at a temp directory without touching a process-wide env var.
 fn system_path_under(root: &Path, shell: Shell) -> Option<PathBuf> {
-    let relative = if cfg!(target_os = "macos") {
+    if !HAS_SYSTEM_DIRS {
+        return None;
+    }
+    if shell == Shell::Zsh {
+        return Some(under(root, &zsh_system_dir().join("_ray")));
+    }
+    let absolute = if cfg!(target_os = "macos") {
         match shell {
-            Shell::Bash => "usr/local/etc/bash_completion.d/ray",
-            Shell::Zsh => "usr/local/share/zsh/site-functions/_ray",
-            Shell::Fish => "usr/local/share/fish/vendor_completions.d/ray.fish",
+            Shell::Bash => "/usr/local/etc/bash_completion.d/ray",
+            Shell::Fish => "/usr/local/share/fish/vendor_completions.d/ray.fish",
             _ => return None,
         }
     } else {
         match shell {
-            Shell::Bash => "usr/share/bash-completion/completions/ray",
-            Shell::Zsh => "usr/share/zsh/site-functions/_ray",
-            Shell::Fish => "usr/share/fish/vendor_completions.d/ray.fish",
+            Shell::Bash => "/usr/share/bash-completion/completions/ray",
+            Shell::Fish => "/usr/share/fish/vendor_completions.d/ray.fish",
             _ => return None,
         }
     };
-    Some(root.join(relative))
+    Some(under(root, Path::new(absolute)))
+}
+
+/// Re-root an absolute path under a DESTDIR-style prefix.
+fn under(root: &Path, absolute: &Path) -> PathBuf {
+    root.join(absolute.strip_prefix("/").unwrap_or(absolute))
+}
+
+/// The directory names a zsh distribution uses for "completions from outside
+/// zsh go here".
+///
+/// zsh's own `functions/Completion/...` tree is on `fpath` too and is
+/// deliberately not in this list: a file written there lands inside zsh's own
+/// installation, where a package upgrade owns it.
+const ZSH_SITE_DIR_NAMES: [&str; 2] = ["site-functions", "vendor-completions"];
+
+/// Where to write `_ray` when zsh cannot be asked, which is what the previous
+/// hardcoded path was.
+const ZSH_FALLBACK_DIR: &str = match cfg!(target_os = "macos") {
+    true => "/usr/local/share/zsh/site-functions",
+    false => "/usr/share/zsh/site-functions",
+};
+
+/// Ask zsh where it actually looks, because the answer differs by distribution.
+///
+/// Debian and Ubuntu build zsh with its site directory at
+/// `/usr/local/share/zsh/site-functions` and hand packages
+/// `/usr/share/zsh/vendor-completions`. Plain `/usr/share/zsh/site-functions`,
+/// which Arch and Fedora do search, is on neither list there, so a file written
+/// to it is never autoloaded: tab does nothing, and no step of the install can
+/// tell, because writing the file succeeded. Guessing one path for every
+/// distribution is what made that failure possible, so guess nothing and read
+/// the real `fpath` off the zsh that is installed.
+///
+/// Falls back to [`ZSH_FALLBACK_DIR`] when there is no zsh to ask, which is the
+/// case where nothing we choose can be checked anyway.
+fn zsh_system_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        zsh_default_fpath()
+            .into_iter()
+            .find(|dir| is_zsh_site_dir(dir))
+            .unwrap_or_else(|| PathBuf::from(ZSH_FALLBACK_DIR))
+    })
+    .clone()
+}
+
+fn is_zsh_site_dir(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| ZSH_SITE_DIR_NAMES.contains(&name))
+}
+
+/// zsh's `fpath` before any rc file has touched it.
+///
+/// `-f` skips `.zshenv` and `.zshrc`, so this is the search path every zsh on
+/// the box starts with rather than one a single user has already extended.
+/// Empty when zsh is not installed, or is too broken to answer.
+fn zsh_default_fpath() -> Vec<PathBuf> {
+    static FPATH: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    FPATH
+        .get_or_init(|| {
+            let Ok(out) = Command::new("zsh")
+                .args(["-f", "-c", "print -rl -- $fpath"])
+                .output()
+            else {
+                return Vec::new();
+            };
+            if !out.status.success() {
+                return Vec::new();
+            }
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .clone()
+}
+
+/// Whether zsh searches the directory a stub was written to.
+///
+/// `None` when there is no zsh to ask, which is not the same answer as "no" and
+/// must not be reported as one.
+fn zsh_searches(dir: &Path) -> Option<bool> {
+    let fpath = zsh_default_fpath();
+    match fpath.is_empty() {
+        true => None,
+        false => Some(fpath.iter().any(|entry| entry == dir)),
+    }
+}
+
+/// `_ray` files left in the site directories this install is not using.
+///
+/// An install that predates [`zsh_system_dir`] put the file somewhere zsh never
+/// reads, and on Ubuntu that is exactly the box where completion has been
+/// quietly dead. `ray update` and `sudo ray up` both come through the install,
+/// so that is the moment to take the dead copy away.
+fn stale_zsh_paths(root: &Path) -> Vec<PathBuf> {
+    let chosen = zsh_system_dir();
+    [
+        "/usr/share/zsh/site-functions",
+        "/usr/share/zsh/vendor-completions",
+        "/usr/local/share/zsh/site-functions",
+    ]
+    .iter()
+    .map(Path::new)
+    .filter(|dir| *dir != chosen)
+    .map(|dir| under(root, &dir.join("_ray")))
+    .collect()
 }
 
 fn destdir() -> PathBuf {
@@ -668,8 +793,22 @@ fn user_path(shell: Shell) -> Option<PathBuf> {
     })
 }
 
+/// Whether this process may write the system-wide completion directories.
+///
+/// Only consulted where there are such directories, so the Windows arm is there
+/// to compile rather than to decide anything: [`HAS_SYSTEM_DIRS`] is false and
+/// short-circuits ahead of every call. It answers the same question `ray up`
+/// asks before touching the service, since an elevated Administrator is what
+/// corresponds to root on a platform with no euid.
 fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        rayfish::windows_identity::is_current_process_elevated_admin()
+    }
 }
 
 /// Write one stub, or leave the file alone when it already says this.
@@ -705,6 +844,10 @@ pub(crate) fn install_system() -> Vec<PathBuf> {
 }
 
 fn install_system_under(root: &Path) -> Vec<PathBuf> {
+    if !HAS_SYSTEM_DIRS {
+        return Vec::new();
+    }
+    remove_our_stubs(Shell::Zsh, &stale_zsh_paths(root));
     INSTALLABLE
         .iter()
         .filter_map(|&shell| {
@@ -714,17 +857,39 @@ fn install_system_under(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Unlink the given paths, but only where the file is one we wrote.
+///
+/// Content-checked rather than unlinked on sight: these are shared directories,
+/// and a `_ray` somebody else put there is not ours to delete.
+fn remove_our_stubs(shell: Shell, paths: &[PathBuf]) {
+    let mut ours = Vec::new();
+    if registration(shell, &mut ours).is_err() {
+        return;
+    }
+    for path in paths {
+        if std::fs::read(path).is_ok_and(|existing| existing == ours) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Remove the stubs `install_system` wrote. Best-effort, like the install.
 pub(crate) fn uninstall_system() {
     uninstall_system_under(&destdir());
 }
 
 fn uninstall_system_under(root: &Path) {
+    if !HAS_SYSTEM_DIRS {
+        return;
+    }
     for shell in INSTALLABLE {
         if let Some(path) = system_path_under(root, shell) {
             let _ = std::fs::remove_file(path);
         }
     }
+    // An uninstall on a box whose install predates `zsh_system_dir` still has
+    // to take that copy with it.
+    remove_our_stubs(Shell::Zsh, &stale_zsh_paths(root));
 }
 
 /// Install completions as part of installing the service.
@@ -734,7 +899,7 @@ fn uninstall_system_under(root: &Path) {
 /// a read-only `/usr` or a distro with no `bash-completion` must not turn a
 /// working service install into a failure.
 pub(crate) fn install_with_service() {
-    if !is_root() {
+    if !HAS_SYSTEM_DIRS || !is_root() {
         return;
     }
     let written = install_system();
@@ -753,8 +918,9 @@ pub(crate) fn cmd_completions(shell: Option<Shell>, install: bool) -> Result<()>
     }
 
     // Root and no shell named: every shell, system-wide, where they are found
-    // without anyone editing an rc file.
-    if is_root() && shell.is_none() {
+    // without anyone editing an rc file. Skipped where there is no such
+    // directory, so that this does not report an install it did not do.
+    if HAS_SYSTEM_DIRS && is_root() && shell.is_none() {
         let written = install_system();
         if written.is_empty() {
             println!("tab completion is already installed and up to date");
@@ -772,7 +938,7 @@ pub(crate) fn cmd_completions(shell: Option<Shell>, install: bool) -> Result<()>
 
     // A named shell under root still means system-wide: that is where root can
     // write, and where the file is found without configuration.
-    let path = match is_root() {
+    let path = match HAS_SYSTEM_DIRS && is_root() {
         true => system_path(shell),
         false => user_path(shell),
     };
@@ -785,14 +951,21 @@ pub(crate) fn cmd_completions(shell: Option<Shell>, install: bool) -> Result<()>
     write_stub(shell, &path)?;
     println!("wrote {}", path.display());
 
-    if !is_root() && shell == Shell::Zsh {
-        println!(
-            "zsh only reads completions on its fpath. If tab completion does not work, add this \
-             to ~/.zshrc:\n\n  fpath=({} $fpath)\n  autoload -Uz compinit && compinit\n",
-            path.parent().unwrap_or(&path).display()
-        );
+    // zsh reads completions off `fpath` and nowhere else, and no zsh ships an
+    // `fpath` entry under a user's home. Rather than leave that to be found by
+    // pressing tab and getting nothing, ask zsh directly and say so.
+    if shell == Shell::Zsh {
+        let dir = path.parent().unwrap_or(&path);
+        if zsh_searches(dir) == Some(false) {
+            println!(
+                "\nzsh does not search {}, so this file will not be picked up on its own.\n\
+                 Add to ~/.zshrc:\n\n  fpath=({} $fpath)\n  autoload -Uz compinit && compinit\n",
+                dir.display(),
+                dir.display()
+            );
+        }
     }
-    if !is_root() {
+    if HAS_SYSTEM_DIRS && !is_root() {
         println!("`sudo ray completions --install` installs for every shell and every user.");
     }
     println!(
@@ -876,7 +1049,7 @@ mod tests {
     /// is not something the model records.
     #[test]
     fn every_id_read_off_a_listing_has_a_completer() {
-        let expected: [(&[&str], &str); 9] = [
+        let expected: [(&[&str], &str); 10] = [
             (&["requests", "accept"], "id"),
             (&["requests", "deny"], "id"),
             (&["accept"], "id"),
@@ -884,6 +1057,7 @@ mod tests {
             (&["connect", "approve"], "id"),
             (&["invite", "revoke"], "id"),
             (&["files", "accept"], "id"),
+            (&["files", "reject"], "id"),
             (&["files", "cancel"], "id"),
             (&["firewall", "remove"], "index"),
         ];
@@ -907,6 +1081,105 @@ mod tests {
                 path.join(" ")
             );
         }
+    }
+
+    /// The guard on the system-wide install, from both sides: a platform with
+    /// those directories writes a stub for every shell, and one without writes
+    /// nothing at all. Windows is the second, and gets the whole assertion
+    /// rather than a skip, because the bug being kept out is silent. The POSIX
+    /// paths re-rooted cleanly there, so the install reported success while
+    /// leaving `\usr\share\bash-completion\completions\ray` on the system drive
+    /// for a shell that would never look.
+    #[test]
+    fn a_system_install_writes_only_where_a_shell_would_read_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let written = install_system_under(root.path());
+        assert_eq!(!written.is_empty(), HAS_SYSTEM_DIRS, "{written:?}");
+        for shell in INSTALLABLE {
+            assert_eq!(system_path(shell).is_some(), HAS_SYSTEM_DIRS, "{shell}");
+        }
+    }
+
+    /// zsh's own function tree is on `fpath` too, and is not somewhere to write.
+    #[test]
+    fn zsh_s_own_function_tree_is_not_a_place_to_install() {
+        assert!(!is_zsh_site_dir(Path::new(
+            "/usr/share/zsh/functions/Completion/Unix"
+        )));
+        assert!(!is_zsh_site_dir(Path::new(
+            "/usr/share/zsh/vendor-functions"
+        )));
+        assert!(is_zsh_site_dir(Path::new("/usr/share/zsh/site-functions")));
+        assert!(is_zsh_site_dir(Path::new(
+            "/usr/share/zsh/vendor-completions"
+        )));
+    }
+}
+
+/// What the system-wide install does once it has somewhere to install to, which
+/// is a POSIX package layout and nowhere else. Every path here is absolute in
+/// the way only a POSIX host reads as absolute: on Windows `Path::is_absolute`
+/// wants a drive letter or a UNC share, so `/usr/share/...` is a relative path
+/// and there is no equivalent for these three shells to rewrite it to. The
+/// platform side of it is asserted in
+/// [`tests::a_system_install_writes_only_where_a_shell_would_read_it`], which
+/// runs everywhere.
+#[cfg(all(test, unix))]
+mod system_install_tests {
+    use super::*;
+
+    /// The bug this detection exists for: on Debian and Ubuntu,
+    /// `/usr/share/zsh/site-functions` is on no zsh's `fpath`, so the stub that
+    /// was written there was never autoloaded and tab completion did nothing.
+    #[test]
+    fn the_zsh_directory_is_one_zsh_actually_searches() {
+        let dir = zsh_system_dir();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(is_zsh_site_dir(&dir), "{}", dir.display());
+
+        // Only assertable where there is a zsh to ask; CI images without one
+        // take the fallback, which is what the previous code always did.
+        if let Some(searched) = zsh_searches(&dir) {
+            assert!(searched, "zsh does not search {}", dir.display());
+        }
+    }
+
+    /// A stub left in the directory an older install chose is a file zsh never
+    /// reads, so installing has to take it away rather than add a second copy.
+    #[test]
+    fn installing_clears_a_stub_an_older_install_left_somewhere_zsh_ignores() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let stale = stale_zsh_paths(root.path());
+        assert!(!stale.is_empty());
+        for path in &stale {
+            assert_ne!(
+                Some(path),
+                system_path_under(root.path(), Shell::Zsh).as_ref()
+            );
+            write_stub(Shell::Zsh, path).expect("seed a stale stub");
+        }
+
+        install_system_under(root.path());
+        for path in &stale {
+            assert!(!path.exists(), "left behind: {}", path.display());
+        }
+        assert!(
+            system_path_under(root.path(), Shell::Zsh)
+                .expect("zsh path")
+                .is_file()
+        );
+    }
+
+    /// Shared directories: a `_ray` this install did not write is not ours.
+    #[test]
+    fn a_foreign_file_in_a_stale_directory_is_left_alone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let victim = stale_zsh_paths(root.path()).remove(0);
+        std::fs::create_dir_all(victim.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&victim, b"# somebody else's completion\n").expect("write");
+
+        install_system_under(root.path());
+        assert!(victim.is_file(), "deleted: {}", victim.display());
     }
 
     #[test]

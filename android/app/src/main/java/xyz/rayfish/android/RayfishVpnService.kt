@@ -23,8 +23,7 @@ import java.net.Inet4Address
 import java.net.Inet6Address
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -39,13 +38,22 @@ class RayfishVpnService : VpnService() {
     // Loopback DNS proxy forwarding non-.ray lookups through DnsResolver.rawQuery
     // (honors Private DNS / DoT). Null on API < 29 or if it failed to start.
     private var dnsProxy: DnsProxy? = null
-    // Polls for incoming own-device file offers and auto-accepts them, so files
+    // Observes incoming own-device file offers and auto-accepts them, so files
     // shared to this device land in Downloads even with the app UI closed.
-    private var autoAcceptPoller: ScheduledExecutorService? = null
+    private var fileStatusMonitor: FileStatusMonitor? = null
+    // Opt-in unattended diagnostics. Tied to this service rather than to the
+    // process because the service is alive exactly while the node is, tunnel or
+    // standby, and a report from a stopped node describes nothing.
+    private var diagnosticsJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        // Started unconditionally: the loop reads the pref on each tick, so a
+        // user who turns the feature on mid-session does not have to restart the
+        // service for it to take effect, and one who turns it off is not left
+        // with a loop that has to be torn down to stop reporting.
+        diagnosticsJob = PeriodicDiagnostics.start(applicationContext)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -397,7 +405,7 @@ class RayfishVpnService : VpnService() {
                 .setSession("Rayfish")
                 .addDnsServer(magicDns)
                 .addSearchDomain("ray")
-                .setMtu(1280)
+                .setMtu(1500) // Keep in sync with rayfish::tun::TUN_MTU.
                 // Our mesh address and the range it lives in (mirrors the desktop
                 // 200::/7 route). The blank check above guarantees we have one.
                 .addAddress(meshV6, 128)
@@ -505,7 +513,7 @@ class RayfishVpnService : VpnService() {
             NodeHolder.get(applicationContext).up(pfd.detachFd())
             Log.i(TAG, "Node.up succeeded")
             tunnelUp = true
-            startAutoAcceptPoller()
+            startFileStatusMonitor()
             rebindAfterBringUp()
         } catch (t: Throwable) {
             Log.e(TAG, "Node bring-up failed", t)
@@ -560,7 +568,7 @@ class RayfishVpnService : VpnService() {
      * cannot be assumed already up. ensureStarted is idempotent, so this is a
      * no-op in the common case where it is. Once that is done, the standby
      * notification replaces whatever startForegroundNotification() posted at the
-     * top of startTunnel(), and the poller starts so files keep landing. With
+     * top of startTunnel(), and the observer starts so files keep landing. With
      * "go fully offline" set there is nothing left to keep the service alive for.
      *
      * Honesty check on the go-fully-offline branch: with the VPN off and "go
@@ -594,7 +602,7 @@ class RayfishVpnService : VpnService() {
                 Log.e(TAG, "handleBringUpFailure: ensureStarted failed; mesh visibility and file transfer will not work until this recovers", t)
             }
             startForegroundNotification(standby = true)
-            startAutoAcceptPoller()
+            startFileStatusMonitor()
         } else {
             // With "go fully offline when disabled" set, "VPN off" must mean
             // fully offline. Without this, startTunnelBlocking's ensureStarted
@@ -609,11 +617,11 @@ class RayfishVpnService : VpnService() {
             Log.e(TAG, "$reason; tunnel not up and go fully offline set, stopping node and service (startId=$startId)")
             NodeHolder.stopNode(applicationContext)
             // Nothing is left to poll for: "go fully offline" means no control
-            // plane is meant to be up, so a poller left running here would just
+            // plane is meant to be up, so an observer left running here would just
             // be dead work spinning every 4s against a stopped node until
             // onDestroy's teardown eventually lands.
-            autoAcceptPoller?.shutdownNow()
-            autoAcceptPoller = null
+            fileStatusMonitor?.close()
+            fileStatusMonitor = null
             stopSelf(startId)
         }
     }
@@ -651,13 +659,13 @@ class RayfishVpnService : VpnService() {
 
     /**
      * The blocking half of standby bring-up: ensureStarted plus starting the
-     * poller. Runs on nodeExecutor, called both from enterStandby() above (the
+     * observer. Runs on nodeExecutor, called both from enterStandby() above (the
      * null-intent restart path and ACTION_STANDBY's own helper) and directly
      * from ACTION_STANDBY's executor task once that task has confirmed, on
      * nodeExecutor itself, that no tunnel is up.
      */
     private fun enterStandbyBlocking() {
-        // The control-plane bring-up failure below still needs the poller
+        // The control-plane bring-up failure below still needs the observer
         // started, so it's caught and logged here rather than aborting the
         // rest of this function.
         try {
@@ -667,10 +675,10 @@ class RayfishVpnService : VpnService() {
         } catch (t: Throwable) {
             Log.e(TAG, "standby bring-up failed", t)
         }
-        // autoAcceptPoller (like dnsProxy) is only read and written from
+        // fileStatusMonitor (like dnsProxy) is only read and written from
         // nodeExecutor's thread (startTunnelBlocking, stopTunnel), so this must
         // run here and not on the main thread.
-        startAutoAcceptPoller()
+        startFileStatusMonitor()
     }
 
     /**
@@ -716,18 +724,9 @@ class RayfishVpnService : VpnService() {
      * makes files keep working with the VPN off. Auto-accept is gated by the user's
      * opt-out toggle inside FileAutoAccept.run. Idempotent.
      */
-    private fun startAutoAcceptPoller() {
-        if (autoAcceptPoller != null) return
-        autoAcceptPoller = Executors.newSingleThreadScheduledExecutor().also { exec ->
-            exec.scheduleWithFixedDelay(
-                {
-                    runCatching { FileAutoAccept.run(applicationContext) }
-                    runCatching { TransferNotifier.poll(applicationContext) }
-                    runCatching { OfferNotifier.poll(applicationContext) }
-                },
-                4, 4, TimeUnit.SECONDS,
-            )
-        }
+    private fun startFileStatusMonitor() {
+        if (fileStatusMonitor?.isClosed == false) return
+        fileStatusMonitor = FileStatusMonitor.start(applicationContext)
     }
 
     // The IPv4 DNS servers of the underlying (non-VPN) network, deduplicated.
@@ -807,7 +806,7 @@ class RayfishVpnService : VpnService() {
                 // instance where the node was never started (e.g. the VPN slot
                 // was already taken when the app launched, so the service never
                 // ran startTunnelBlocking). Without this, downNode() below is a
-                // no-op, the poller starts polling a node that was never up, and
+                // no-op, the observer starts observing a node that was never up, and
                 // the notification we already posted ("Online, VPN off · files
                 // still work") is a lie. Idempotent, so this is a no-op if the
                 // node is already started.
@@ -818,7 +817,7 @@ class RayfishVpnService : VpnService() {
                 }
                 Log.i(TAG, "stopTunnel: Node.down (standby, control plane stays up)")
                 NodeHolder.downNode(applicationContext)
-                // Every standby path must start the poller by construction, not
+                // Every standby path must start the observer by construction, not
                 // rely on some earlier path in the same process having already
                 // started it. ACTION_STOP and onRevoke can both reach standby on
                 // a service instance where the node was never started (a fresh
@@ -826,7 +825,7 @@ class RayfishVpnService : VpnService() {
                 // case downNode() above is a no-op and nothing else here would
                 // start it. Idempotent, so this is a no-op when it is already
                 // running.
-                startAutoAcceptPoller()
+                startFileStatusMonitor()
             } else {
                 Log.i(TAG, "stopTunnel: NodeHolder.stopNode (offline)")
                 NodeHolder.stopNode(applicationContext)
@@ -851,7 +850,7 @@ class RayfishVpnService : VpnService() {
         // is nothing pointed at it. Torn down in both cases. Wrapped: this runs on
         // nodeExecutor via execute(), so an uncaught throwable here would reach the
         // default uncaught-exception handler and kill the process, skipping the
-        // dnsProxy = null reset and the poller shutdown below.
+        // dnsProxy = null reset and the observer shutdown below.
         try {
             dnsProxy?.stop()
         } catch (t: Throwable) {
@@ -859,11 +858,11 @@ class RayfishVpnService : VpnService() {
         }
         dnsProxy = null
 
-        // Keep the poller running in standby (files still work); shut it down on a
+        // Keep the observer running in standby (files still work); shut it down on a
         // full offline teardown.
         if (!standby) {
-            autoAcceptPoller?.shutdownNow()
-            autoAcceptPoller = null
+            fileStatusMonitor?.close()
+            fileStatusMonitor = null
         }
     }
 
@@ -885,10 +884,12 @@ class RayfishVpnService : VpnService() {
         // background.
         Log.i(TAG, "onDestroy: service being destroyed (tunnel fd present=${tunnel != null})")
         // Set now, not after the queued teardown below: TransferNotifier's "only
-        // notified if Rayfish stays running" caveat reads this to decide whether a
-        // poller is still alive, and once onDestroy has been called nothing here
+        // notified if Rayfish stays running" caveat reads this to decide whether an
+        // observer is still alive, and once onDestroy has been called nothing here
         // is going to observe a transfer completing any more.
         isRunning = false
+        diagnosticsJob?.cancel()
+        diagnosticsJob = null
         // Same reasoning for the tile's state: the service is going away, so the
         // tunnel is going with it. Set here rather than left to the queued
         // teardown below, which can sit behind a whole bring-up before it runs.
@@ -943,9 +944,9 @@ class RayfishVpnService : VpnService() {
         val nm = getSystemService(NotificationManager::class.java)
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Rayfish VPN",
+            getString(R.string.notif_channel_vpn),
             NotificationManager.IMPORTANCE_LOW,
-        ).apply { description = "Rayfish mesh tunnel status" }
+        ).apply { description = getString(R.string.notif_channel_vpn_desc) }
         nm.createNotificationChannel(channel)
 
         val openIntent = PendingIntent.getActivity(
@@ -956,8 +957,8 @@ class RayfishVpnService : VpnService() {
         )
 
         val builder = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Rayfish")
-            .setContentText(if (standby) "Online, VPN off · files still work" else "Mesh tunnel active")
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(if (standby) getString(R.string.notif_vpn_standby) else getString(R.string.notif_vpn_active))
             .setSmallIcon(R.drawable.ic_stat_vpn)
             .setOngoing(true)
             .setContentIntent(openIntent)
@@ -979,7 +980,7 @@ class RayfishVpnService : VpnService() {
             builder.addAction(
                 Notification.Action.Builder(
                     null as android.graphics.drawable.Icon?,
-                    "Disable",
+                    getString(R.string.action_disable),
                     disableIntent,
                 ).build(),
             )
@@ -1022,11 +1023,11 @@ class RayfishVpnService : VpnService() {
 
         // Whether an instance of this service is currently alive: set in onCreate,
         // cleared in onDestroy. Read by TransferNotifier to decide whether its
-        // "only notified if Rayfish stays running" caveat is actually true (a
-        // poller alive in the background, VPN on or standby, will observe and
+        // "only notified if Rayfish stays running" caveat is actually true (an
+        // observer alive in the background, VPN on or standby, will observe and
         // notify a transfer's completion regardless of whether the app UI is
-        // open). Not a substitute for tunnel/standby state: it says only that a
-        // poller is running, not what it is doing.
+        // open). Not a substitute for tunnel/standby state: it says only that an
+        // observer is running, not what it is doing.
         @Volatile
         var isRunning: Boolean = false
             private set

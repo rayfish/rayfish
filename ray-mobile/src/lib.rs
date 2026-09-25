@@ -11,8 +11,11 @@
 //! [`android_tun`], and everything else is a thin map from the core's
 //! `IpcMessage` results to the UniFFI records below.
 
+#[cfg(target_os = "android")]
 mod android_tun;
 mod diag;
+mod file_events;
+pub use file_events::{FileChangeListener, FileWatch};
 
 /// JNI bridge that hands the Android `JavaVM` + app `Context` to the two Rust
 /// dependencies that need them: `ndk-context` (so iroh-dns can read the system
@@ -61,10 +64,13 @@ mod android_jni {
 }
 
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(target_os = "android")]
 use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
 use rayfish::control;
@@ -76,6 +82,7 @@ use rayfish::hostname;
 use rayfish::identity;
 use rayfish::invite;
 use rayfish::ipc::{self, IpcMessage};
+use rayfish::keybackup;
 use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
@@ -113,6 +120,21 @@ pub enum RayError {
     /// unexpected protocol response.
     #[error("{0}")]
     Network(String),
+    /// A backup code would not decode, or the password was wrong. The two are
+    /// one case: the AEAD cannot tell them apart.
+    #[error("{0}")]
+    BadBackup(String),
+    /// [`Node::restore_identity`] found an identity already on the device and
+    /// was not told to replace it. Carries the existing public key so the UI can
+    /// name what it is about to overwrite. Not a failure on its own: the caller
+    /// is expected to confirm with the user and call again with
+    /// `replace_existing`.
+    #[error("device already has identity {0}")]
+    IdentityExists(String),
+    /// A restore was attempted while the node was running. The endpoint is bound
+    /// to the old key, so the identity cannot change under it; stop first.
+    #[error("stop the node before restoring an identity")]
+    NodeRunning,
 }
 
 impl RayError {
@@ -129,6 +151,18 @@ pub struct NetworkInfo {
     pub ipv6: String,
     /// True when the join was queued for coordinator approval (no IP yet).
     pub pending: bool,
+}
+
+/// An encrypted identity backup and the public key it restores to.
+#[derive(uniffi::Record)]
+pub struct IdentityBackup {
+    /// The base58 `enc1` blob. This is the secret: anyone holding it and the
+    /// password holds the identity, so it belongs in a password manager or
+    /// behind the file picker, never in a log or a share sheet preview.
+    pub code: String,
+    /// The identity the code restores to, for showing the user which one they
+    /// just wrote out.
+    pub public_key: String,
 }
 
 /// Three-state peer liveness, mirroring [`ipc::PeerState`]. `Idle` is not
@@ -163,6 +197,24 @@ pub struct PeerInfo {
     pub state: PeerConnState,
 }
 
+/// Whether the daemon has this network registered, for the UI's status dot.
+///
+/// A saved network the daemon has not registered yet still has to be listed.
+/// Dropping it makes every network vanish for the seconds a cold start spends
+/// restoring them, and makes a restore that never lands indistinguishable from a
+/// network the user never joined. `ray status` has always shown these (its
+/// `inactive_networks` block); this is the same thing for the phone.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetworkConnState {
+    /// Registered by the daemon: the rest of this snapshot is live.
+    Connected,
+    /// Saved, restore still in flight and not yet failed once.
+    Connecting,
+    /// Saved but carrying nothing: either a restore that has failed at least
+    /// once (see [`NetworkDetail::reason`]) or a deliberately stopped node.
+    NotConnected,
+}
+
 /// One network this node belongs to, with its peers.
 #[derive(uniffi::Record)]
 pub struct NetworkDetail {
@@ -171,6 +223,10 @@ pub struct NetworkDetail {
     pub hostname: String,
     pub is_coordinator: bool,
     pub peers: Vec<PeerInfo>,
+    pub state: NetworkConnState,
+    /// The daemon's one-line reason for the last failed restore, when `state` is
+    /// [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
+    pub reason: Option<String>,
 }
 
 /// Health/addresses/networks snapshot for the UI.
@@ -322,6 +378,73 @@ impl Node {
     }
 }
 
+/// One roster entry as the UI's [`PeerInfo`]. The mesh address is derived from
+/// the identity rather than taken from `PeerStatus::ipv6` so live and saved
+/// projections agree on it by construction.
+fn peer_info(p: &ipc::PeerStatus) -> PeerInfo {
+    PeerInfo {
+        ipv6: membership::derive_ipv6(&p.endpoint_id).to_string(),
+        node_id: p.endpoint_id.to_string(),
+        hostname: p.hostname.clone().unwrap_or_default(),
+        state: p.state.into(),
+    }
+}
+
+/// Project a saved network the daemon has not registered into a [`NetworkDetail`].
+///
+/// `reason` is the daemon's record of the last restore failure and is `None`
+/// until one has actually happened, which is exactly the distinction the UI
+/// needs: no failure yet means the restore is still in flight (`Connecting`),
+/// and a failure means it is stuck with something to say about why.
+///
+/// `fallback_ipv6` is this device's own mesh address, used for the name-only row
+/// a daemon predating the `saved` projection produces.
+fn inactive_network_detail(net: &ipc::InactiveNetwork, fallback_ipv6: &str) -> NetworkDetail {
+    let state = match net.reason {
+        None => NetworkConnState::Connecting,
+        Some(_) => NetworkConnState::NotConnected,
+    };
+    let Some(saved) = net.saved.as_ref() else {
+        return NetworkDetail {
+            name: net.name.clone(),
+            ipv6: fallback_ipv6.to_string(),
+            hostname: String::new(),
+            is_coordinator: false,
+            peers: Vec::new(),
+            state,
+            reason: net.reason.clone(),
+        };
+    };
+    NetworkDetail {
+        name: saved.name.clone(),
+        ipv6: saved.my_ipv6.to_string(),
+        hostname: saved.my_hostname.clone().unwrap_or_default(),
+        is_coordinator: saved.role.is_coordinator(),
+        peers: saved.peers.iter().map(peer_info).collect(),
+        state,
+        reason: net.reason.clone(),
+    }
+}
+
+/// Fold the daemon's unregistered networks in with the live ones and sort the
+/// result. One list rather than two so a network keeps its place in the UI when
+/// its restore lands, instead of jumping out of a "connecting" section.
+fn merge_networks(
+    mut live: Vec<NetworkDetail>,
+    inactive: &[ipc::InactiveNetwork],
+    fallback_ipv6: &str,
+) -> Vec<NetworkDetail> {
+    live.extend(
+        inactive
+            .iter()
+            .map(|n| inactive_network_detail(n, fallback_ipv6)),
+    );
+    // Stable alphabetical order so the list does not shuffle between status
+    // refreshes with the core's iteration order.
+    live.sort_by_key(|n| n.name.to_lowercase());
+    live
+}
+
 /// Build an offline status snapshot from the on-disk config, used when the node
 /// is stopped so the UI can still show the user's saved networks. Everything is
 /// reported offline: `running` is false and every peer's state is `Offline`. The
@@ -378,6 +501,10 @@ fn saved_networks_status() -> Status {
                 hostname: net.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: net.network_secret_key.is_some(),
                 peers,
+                // Stopped on purpose, so there is nothing in progress and no
+                // failure to explain.
+                state: NetworkConnState::NotConnected,
+                reason: None,
             }
         })
         .collect();
@@ -392,16 +519,18 @@ fn saved_networks_status() -> Status {
 #[uniffi::export]
 impl Node {
     /// `config_dir` is the app-private directory (Kotlin `Context.getFilesDir()`)
-    /// where identity + config live. It is exported to the core through
-    /// `RAYFISH_CONFIG_DIR`, which `config::config_dir()` honors on Android.
+    /// where identity + config live. It is published to the core through
+    /// `config::set_config_dir_override`, which `config::config_dir()` honors
+    /// ahead of `RAYFISH_CONFIG_DIR` on every platform.
     #[uniffi::constructor]
     pub fn new(config_dir: String) -> Arc<Self> {
         // Capture the core's tracing output for Android diagnostics. Idempotent;
         // safe to call once per process (Node is a process singleton).
         diag::install();
-        // SAFETY-ish: set before any core call reads config. Single-threaded at
-        // construction time.
-        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", &config_dir) };
+        // Set before any core call reads config. Not an environment write: that
+        // is undefined behaviour once the runtime's threads are up, and it also
+        // let one test redirect another's config reads mid-test.
+        config::set_config_dir_override(PathBuf::from(&config_dir));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -597,9 +726,11 @@ impl Node {
                 "invalid hostname '{name}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
             )));
         }
-        let mut cfg = config::load().map_err(RayError::network)?;
-        cfg.default_hostname = Some(name);
-        config::save_settings(&cfg).map_err(RayError::network)?;
+        config::update_settings(|cfg| {
+            cfg.default_hostname = Some(name);
+            Ok(())
+        })
+        .map_err(RayError::network)?;
         Ok(())
     }
 
@@ -741,6 +872,16 @@ impl Node {
         }
     }
 
+    /// Subscribe to file/transfer changes, including one initial reconciliation.
+    /// Close the returned handle when the platform observer stops.
+    pub fn watch_files(
+        &self,
+        listener: Box<dyn FileChangeListener>,
+    ) -> Result<Arc<FileWatch>, RayError> {
+        let changes = self.state()?.subscribe_file_changes();
+        Ok(FileWatch::start(&self.runtime, changes, listener))
+    }
+
     /// Incoming file offers waiting to be accepted or declined.
     pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
         let state = self.state()?;
@@ -792,6 +933,18 @@ impl Node {
     pub fn cancel_send(&self, id: u64) -> Result<(), RayError> {
         let state = self.state()?;
         match state.cancel_send(id) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!(
+                "unexpected cancel response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Cancel an outgoing transfer that has already been offered or started.
+    pub fn cancel_transfer(&self, id: u64) -> Result<(), RayError> {
+        let state = self.state()?;
+        match state.cancel_transfer(id) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
             other => Err(RayError::Network(format!(
@@ -1002,6 +1155,89 @@ impl Node {
         }
     }
 
+    /// Whether this device has an identity on disk yet.
+    ///
+    /// False only before anything has started the node, since the first start
+    /// mints one. That makes it the "has this person used the app" question, so
+    /// the platform can offer a restore on a fresh install and never show that
+    /// screen again, with no first-run flag of its own to keep in step.
+    ///
+    /// Reads a file. Does not need (and does not do) a [`Node::start`].
+    pub fn has_identity(&self) -> bool {
+        identity::load_existing()
+            .map(|k| k.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Encrypt this device's identity, pairing certificate, and saved networks
+    /// under `password` and return the backup code for a file or password manager.
+    /// Format and threat model are in
+    /// [`keybackup`]; the same code restores on desktop with
+    /// `ray pair restore <code>`.
+    ///
+    /// Does not need [`Node::start`]: the key is read off disk, and mints one if
+    /// the device has none yet, exactly as a start would.
+    pub fn backup_identity(&self, password: String) -> Result<IdentityBackup, RayError> {
+        let backup = keybackup::backup_current_identity(&password).map_err(RayError::network)?;
+        // The public key is fine to log; the code never is.
+        tracing::info!(id = %backup.public_key, "wrote identity backup");
+        Ok(IdentityBackup {
+            code: backup.code,
+            public_key: backup.public_key,
+        })
+    }
+
+    /// Replace this device's identity with the one in `code`.
+    ///
+    /// Refuses in two cases the caller is expected to handle rather than force:
+    /// [`RayError::NodeRunning`] if the node has not been stopped (the endpoint
+    /// is bound to the old key), and [`RayError::IdentityExists`] if a different
+    /// identity is already on the device and `replace_existing` is false. Call
+    /// again with the flag once the user has confirmed.
+    ///
+    /// A current backup restores the device cert and saved networks too. An old
+    /// key-only backup clears a cert tied to a different key. Restoring the same
+    /// identity can still recover missing metadata from a current backup.
+    ///
+    /// Returns the restored identity's public key. The caller must restart the
+    /// node afterwards for it to take effect.
+    pub fn restore_identity(
+        &self,
+        code: String,
+        password: String,
+        replace_existing: bool,
+    ) -> Result<String, RayError> {
+        if self.state.lock().unwrap().is_some() {
+            return Err(RayError::NodeRunning);
+        }
+
+        let backup = keybackup::decrypt_backup(&code, &password)
+            .map_err(|e| RayError::BadBackup(e.to_string()))?;
+        let restored = backup.secret_key.public().to_string();
+
+        // Deliberately not `load_or_create`: on a device with no identity yet
+        // that would mint one, and the restore would then have to ask the user
+        // for permission to overwrite a key it had just invented.
+        let existing = identity::load_existing().map_err(RayError::network)?;
+        let same_identity = existing
+            .as_ref()
+            .is_some_and(|key| key.public() == backup.secret_key.public());
+        if let Some(existing) = existing
+            && !replace_existing
+            && !same_identity
+        {
+            return Err(RayError::IdentityExists(existing.public().to_string()));
+        }
+
+        if !same_identity {
+            identity::store_secret_key(&backup.secret_key).map_err(RayError::network)?;
+        }
+        keybackup::restore_metadata(&backup, same_identity).map_err(RayError::network)?;
+
+        tracing::info!(id = %restored, "restored identity from backup");
+        Ok(restored)
+    }
+
     /// Point the Magic DNS resolver at the phone's DNS so non-`.ray` queries are
     /// forwarded instead of refused. On Android there is no `resolv.conf` to
     /// capture (the desktop path), so the platform passes upstreams here before
@@ -1032,52 +1268,71 @@ impl Node {
     /// reader/writer to the running daemon and mark the data plane active.
     /// Requires [`Node::start`] first.
     pub fn up(&self, tun_fd: i32) -> Result<(), RayError> {
-        // Kotlin calls `up(pfd.detachFd())`, so this descriptor is ours before
-        // the first line of the body runs: its `ParcelFileDescriptor` no longer
-        // owns anything and cannot close it for us. Take ownership here, ahead
-        // of anything fallible, so every early return below closes it.
-        //
-        // Leaking it on a failure path is not a mere fd leak: the fd is the only
-        // handle on the `VpnService` interface, so an unowned one keeps that
-        // interface established for the life of the process. Android tears the
-        // VPN down when the interface disappears (the framework's
-        // `interfaceRemoved` observer), so a stranded fd leaves the system
-        // showing a connected VPN while the app has fallen back to standby and
-        // reports the tunnel off, with no way to disconnect short of Settings.
-        // SAFETY: `tun_fd` came from Kotlin's `detachFd()`; nothing else owns or
-        // closes it, so wrapping it here closes it exactly once.
-        let tun = unsafe { OwnedFd::from_raw_fd(tun_fd) };
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = tun_fd;
+            Err(RayError::Network(
+                "VpnService data plane is only supported on Android".to_owned(),
+            ))
+        }
+        #[cfg(target_os = "android")]
+        {
+            // Kotlin calls `up(pfd.detachFd())`, so this descriptor is ours before
+            // the first line of the body runs: its `ParcelFileDescriptor` no longer
+            // owns anything and cannot close it for us. Take ownership here, ahead
+            // of anything fallible, so every early return below closes it.
+            //
+            // Leaking it on a failure path is not a mere fd leak: the fd is the only
+            // handle on the `VpnService` interface, so an unowned one keeps that
+            // interface established for the life of the process. Android tears the
+            // VPN down when the interface disappears (the framework's
+            // `interfaceRemoved` observer), so a stranded fd leaves the system
+            // showing a connected VPN while the app has fallen back to standby and
+            // reports the tunnel off, with no way to disconnect short of Settings.
+            // SAFETY: `tun_fd` came from Kotlin's `detachFd()`; nothing else owns or
+            // closes it, so wrapping it here closes it exactly once.
+            let tun = unsafe { OwnedFd::from_raw_fd(tun_fd) };
 
-        let state = self.state()?;
+            let state = self.state()?;
 
-        // `AndroidTunReader`/`AndroidTunWriter` wrap the fd in a `tokio` `AsyncFd`,
-        // which registers with the reactor and must be built inside the runtime
-        // context. `up` runs on a plain service thread, so enter the runtime for
-        // the duration of this call before constructing them.
-        let _guard = self.runtime.enter();
+            // `AndroidTunReader`/`AndroidTunWriter` wrap the fd in a `tokio` `AsyncFd`,
+            // which registers with the reactor and must be built inside the runtime
+            // context. `up` runs on a plain service thread, so enter the runtime for
+            // the duration of this call before constructing them.
+            let _guard = self.runtime.enter();
 
-        // The writer owns a single `dup` of the fd; the reader consumes the
-        // detached fd itself. Build the writer's dup first, while `tun` is still
-        // owned here, so a failure closes it. Two owned fds, each closed exactly
-        // once on drop (when `detach_tun`/`Drop` tears the tasks down).
-        let writer = AndroidTunWriter::new(tun.as_raw_fd()).map_err(RayError::network)?;
-        let reader = AndroidTunReader::new(tun).map_err(RayError::network)?;
+            // The writer owns a single `dup` of the fd; the reader consumes the
+            // detached fd itself. Build the writer's dup first, while `tun` is still
+            // owned here, so a failure closes it. Two owned fds, each closed exactly
+            // once on drop (when `detach_tun`/`Drop` tears the tasks down).
+            let writer = AndroidTunWriter::new(tun.as_raw_fd()).map_err(RayError::network)?;
+            let reader = AndroidTunReader::new(tun).map_err(RayError::network)?;
 
-        self.runtime.block_on(async {
-            state.attach_tun(reader, writer).await;
-            // Mark the data plane active (and configure Magic DNS) the same way
-            // `run_daemon` does after attaching the desktop TUN.
-            state.activate(None).await;
-        });
-        Ok(())
+            self.runtime.block_on(async {
+                state.attach_tun(reader, writer).await;
+                // Mark the data plane active (and configure Magic DNS) the same way
+                // `run_daemon` does after attaching the desktop TUN.
+                state.activate(None).await;
+            });
+            Ok(())
+        }
     }
 
     /// Tear the data plane down (stop the forward loop, close the fds) while
     /// keeping the control plane connected. Requires [`Node::start`] first.
     pub fn down(&self) -> Result<(), RayError> {
-        let state = self.state()?;
-        state.detach_tun();
-        Ok(())
+        #[cfg(not(target_os = "android"))]
+        {
+            Err(RayError::Network(
+                "VpnService data plane is only supported on Android".to_owned(),
+            ))
+        }
+        #[cfg(target_os = "android")]
+        {
+            let state = self.state()?;
+            state.detach_tun();
+            Ok(())
+        }
     }
 
     /// Fully tear down the control plane so the device goes offline: peers can
@@ -1130,14 +1385,6 @@ impl Node {
     /// Peers + addresses + running flag + per-network detail for the UI.
     /// Empty snapshot before [`Node::start`].
     pub fn status(&self) -> Status {
-        let empty = || Status {
-            running: false,
-            node_id: String::new(),
-            ipv6: String::new(),
-            peers: Vec::new(),
-            networks: Vec::new(),
-            pending_networks: Vec::new(),
-        };
         let Some(state) = self.state.lock().unwrap().as_ref().cloned() else {
             // Stopped (the user disabled the tunnel): the control plane is gone,
             // so there is no live snapshot. Read the saved networks off disk and
@@ -1151,25 +1398,20 @@ impl Node {
             active,
             networks,
             pending_networks,
+            inactive_networks,
             ..
         } = state.status()
         else {
-            return empty();
+            // Not the reply we asked for. Fall back to the saved networks rather
+            // than a blank snapshot: an empty list is indistinguishable from
+            // having joined none, which is the worst thing to show here.
+            return saved_networks_status();
         };
 
-        let mut detail = Vec::with_capacity(networks.len());
+        let mut detail = Vec::with_capacity(networks.len() + inactive_networks.len());
         let mut flat_peers = Vec::new();
         for n in &networks {
-            let peers: Vec<PeerInfo> = n
-                .peers
-                .iter()
-                .map(|p| PeerInfo {
-                    ipv6: rayfish::membership::derive_ipv6(&p.endpoint_id).to_string(),
-                    node_id: p.endpoint_id.to_string(),
-                    hostname: p.hostname.clone().unwrap_or_default(),
-                    state: p.state.into(),
-                })
-                .collect();
+            let peers: Vec<PeerInfo> = n.peers.iter().map(peer_info).collect();
             flat_peers.extend(peers.iter().map(|p| PeerInfo {
                 ipv6: p.ipv6.clone(),
                 node_id: p.node_id.clone(),
@@ -1182,14 +1424,16 @@ impl Node {
                 hostname: n.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: n.role.is_coordinator(),
                 peers,
+                state: NetworkConnState::Connected,
+                reason: None,
             });
         }
-        // Present networks in a stable alphabetical order so the UI list does
-        // not shuffle between status refreshes with the core's iteration order.
-        detail.sort_by_key(|n| n.name.to_lowercase());
         // The node's own mesh address derives from its identity, so it needs no
         // joined network to be known. It is what the tunnel binds.
         let ipv6 = rayfish::membership::derive_ipv6(&endpoint_id).to_string();
+        // `flat_peers` stays live-only on purpose: it is the set of peers we
+        // hold connection state for, and an unregistered network has none.
+        let detail = merge_networks(detail, &inactive_networks, &ipv6);
 
         Status {
             running: active,
@@ -1268,32 +1512,51 @@ impl Node {
     }
 }
 
+/// Process-wide lock serializing tests that construct a [`Node`], since
+/// `Node::new` points the process-wide config override at its argument and lib
+/// tests share one process across parallel threads. Without it a second
+/// `Node::new` redirects config reads out from under a test that is midway
+/// through writing and reading its own config dir, and the write lands in one
+/// directory while the read comes back empty from another.
+#[cfg(test)]
+static CONFIG_DIR_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod device_name_tests {
     use super::*;
 
     #[test]
     fn set_default_hostname_persists_and_rejects_invalid() {
-        // Isolated config dir; Node::new points RAYFISH_CONFIG_DIR at it.
+        // Serialize against the other test that builds a Node, so its config
+        // directory cannot bleed into the reads below.
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Isolated config dir; Node::new points the config override at it.
         let dir = std::env::temp_dir().join(format!("rayfish-dn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let node = Node::new(dir.to_string_lossy().to_string());
 
-        node.set_default_hostname("my-phone".into()).unwrap();
-        assert_eq!(node.default_hostname(), "my-phone");
-        assert_eq!(
-            rayfish::config::load().unwrap().default_hostname.as_deref(),
-            Some("my-phone")
-        );
+        #[cfg(not(windows))]
+        {
+            node.set_default_hostname("my-phone".into()).unwrap();
+            assert_eq!(node.default_hostname(), "my-phone");
+            assert_eq!(
+                rayfish::config::load().unwrap().default_hostname.as_deref(),
+                Some("my-phone")
+            );
 
-        // Invalid name is rejected and does not overwrite the stored value.
-        assert!(node.set_default_hostname("BAD NAME".into()).is_err());
-        assert_eq!(node.default_hostname(), "my-phone");
+            // Invalid name is rejected and does not overwrite the stored value.
+            assert!(node.set_default_hostname("BAD NAME".into()).is_err());
+            assert_eq!(node.default_hostname(), "my-phone");
+        }
+
+        assert!(node.up(-1).is_err());
+        assert!(node.down().is_err());
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "android"))]
 mod tun_fd_ownership_tests {
     use super::*;
     use std::os::fd::RawFd;
@@ -1344,6 +1607,10 @@ mod tun_fd_ownership_tests {
     /// connected VPN while the app believes the tunnel is off (issue #116).
     #[test]
     fn up_closes_the_detached_fd_when_the_node_is_not_started() {
+        // Held for the whole test: Node::new below moves the config override,
+        // which another test's config reads would otherwise pick up.
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = std::env::temp_dir().join(format!("rayfish-updfd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1357,5 +1624,159 @@ mod tun_fd_ownership_tests {
             "up() must close the fd it was handed when it fails, or the tunnel lingers"
         );
         unsafe { libc::close(observer) };
+    }
+}
+
+#[cfg(test)]
+mod network_state_tests {
+    use std::collections::BTreeMap;
+    use std::net::Ipv6Addr;
+
+    use rayfish::ipc::{InactiveNetwork, NetworkRole, NetworkStatus, PeerState, PeerStatus};
+
+    use super::*;
+
+    fn peer(hostname: &str) -> PeerStatus {
+        PeerStatus {
+            endpoint_id: iroh::SecretKey::generate().public(),
+            ipv6: Ipv6Addr::LOCALHOST,
+            hostname: Some(hostname.to_string()),
+            user_identity: None,
+            is_own_device: false,
+            incompatible: false,
+            connection: None,
+            // The daemon projects a saved network's roster with every peer
+            // offline: it is not registered, so there is no link to any of them.
+            state: PeerState::Offline,
+            exit_node: false,
+            exit_in_use: false,
+            is_coordinator: false,
+        }
+    }
+
+    fn saved(name: &str, peers: Vec<PeerStatus>) -> NetworkStatus {
+        NetworkStatus {
+            name: name.to_string(),
+            role: NetworkRole::Member,
+            my_ipv6: Ipv6Addr::LOCALHOST,
+            my_hostname: Some("phone".to_string()),
+            network_key: None,
+            member_count: peers.len(),
+            peers,
+            pending_suggestions: 0,
+            pending_requests: 0,
+            aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
+            my_exit_node: None,
+            exit_offering: false,
+            incompatible: None,
+        }
+    }
+
+    fn live(name: &str) -> NetworkDetail {
+        NetworkDetail {
+            name: name.to_string(),
+            ipv6: "200::1".to_string(),
+            hostname: "phone".to_string(),
+            is_coordinator: false,
+            peers: Vec::new(),
+            state: NetworkConnState::Connected,
+            reason: None,
+        }
+    }
+
+    /// A cold start has every saved network unregistered for the seconds its
+    /// restore takes. Nothing has failed yet, so the row reads as in progress —
+    /// not as an error, and above all not as absent.
+    #[test]
+    fn a_restore_that_has_not_failed_yet_reads_as_connecting() {
+        let net = InactiveNetwork {
+            name: "field".to_string(),
+            reason: None,
+            saved: Some(saved("field", vec![])),
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.state, NetworkConnState::Connecting);
+        assert_eq!(detail.reason, None);
+    }
+
+    /// Once an attempt has actually failed, the daemon has a one-line reason and
+    /// the row has to carry it: it is the only place the user can see why, short
+    /// of reading the log off the device.
+    #[test]
+    fn a_failed_restore_reads_as_not_connected_and_keeps_the_reason() {
+        let net = InactiveNetwork {
+            name: "dgrr-peer".to_string(),
+            reason: Some("could not fetch group blob from any peer".to_string()),
+            saved: Some(saved("dgrr-peer", vec![])),
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.state, NetworkConnState::NotConnected);
+        assert_eq!(
+            detail.reason.as_deref(),
+            Some("could not fetch group blob from any peer")
+        );
+    }
+
+    /// The saved projection is what makes the row worth opening: its roster,
+    /// hostname and address come from the daemon's config, so a network that is
+    /// still connecting shows its members rather than an empty card.
+    #[test]
+    fn an_unregistered_network_carries_its_saved_roster_offline() {
+        let net = InactiveNetwork {
+            name: "field".to_string(),
+            reason: None,
+            saved: Some(saved("field", vec![peer("laptop"), peer("desktop")])),
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.hostname, "phone");
+        assert_eq!(detail.ipv6, Ipv6Addr::LOCALHOST.to_string());
+        assert_eq!(detail.peers.len(), 2);
+        assert!(
+            detail
+                .peers
+                .iter()
+                .all(|p| p.state == PeerConnState::Offline),
+            "an unregistered network has no link to any of its peers"
+        );
+    }
+
+    /// A daemon predating the `saved` projection sends the name alone. The row
+    /// still has to appear, addressed with this device's own mesh address.
+    #[test]
+    fn a_network_without_a_saved_projection_degrades_to_a_name_only_row() {
+        let net = InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: Some("runs mesh protocol v2".to_string()),
+            saved: None,
+        };
+        let detail = inactive_network_detail(&net, "200::9");
+        assert_eq!(detail.name, "homelab");
+        assert_eq!(detail.ipv6, "200::9");
+        assert!(detail.peers.is_empty());
+        assert_eq!(detail.state, NetworkConnState::NotConnected);
+    }
+
+    /// Live and unregistered networks share one alphabetically sorted list, so a
+    /// network does not jump position when its restore lands.
+    #[test]
+    fn merged_networks_are_one_alphabetical_list() {
+        let inactive = [
+            InactiveNetwork {
+                name: "alpha".to_string(),
+                reason: None,
+                saved: Some(saved("alpha", vec![])),
+            },
+            InactiveNetwork {
+                name: "zulu".to_string(),
+                reason: None,
+                saved: Some(saved("zulu", vec![])),
+            },
+        ];
+        let merged = merge_networks(vec![live("Mike"), live("bravo")], &inactive, "200::9");
+        let names: Vec<&str> = merged.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "bravo", "Mike", "zulu"]);
+        assert_eq!(merged[1].state, NetworkConnState::Connected);
+        assert_eq!(merged[3].state, NetworkConnState::Connecting);
     }
 }

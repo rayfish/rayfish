@@ -13,7 +13,7 @@ use url::Url;
 
 const RECORD_NAME: &str = "_rayfish";
 const RECORD_VERSION: &str = "v1";
-const RECORD_TTL: u32 = 300;
+pub(crate) const RECORD_TTL: u32 = 300;
 const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
 
 /// Cap on a single record resolution. The relay is plain HTTPS and iroh's
@@ -21,29 +21,20 @@ const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
 /// stopped resolving the relay's own name) would otherwise leave `ray join`
 /// hanging with nothing on screen.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Bound publication too: snapshot commits wait behind an in-flight publish so
+/// an older record cannot land after a newer recovery pointer.
+const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Process-wide pkarr relay URL, set once at daemon startup from the
-/// `discovery-dns` config. The discovery server is a set-once constant for the
-/// daemon's lifetime, so a `OnceLock` avoids threading it through every
-/// `create_pkarr_client` caller.
-static PKARR_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Point the pkarr client at the configured `discovery-dns` server (first URL
-/// wins). No-op when unset, keeping the n0 default. Called once in build_daemon.
-pub fn set_discovery_override(o: &crate::config::ServerOverride) {
-    if let Ok(urls) = crate::config::discovery_urls(o)
-        && let Some(first) = urls.into_iter().next()
-    {
-        let _ = PKARR_OVERRIDE.set(first);
-    }
-}
-
-/// The pkarr relay URL in effect: the configured override, else the n0 default.
-pub fn effective_pkarr_url() -> String {
-    PKARR_OVERRIDE
-        .get()
-        .cloned()
-        .unwrap_or_else(|| PKARR_RELAY_URL.to_string())
+/// Resolve the pkarr relay URL for one daemon from its startup configuration.
+/// The URL is then carried in [`crate::daemon::foundation::Transport`], rather
+/// than in process-global state, so independently rebuilt embedders cannot
+/// borrow a prior daemon's discovery configuration.
+pub fn pkarr_relay_url(o: &crate::config::ServerOverride) -> Url {
+    crate::config::discovery_urls(o)
+        .ok()
+        .and_then(|urls| urls.into_iter().next())
+        .and_then(|url| url.parse().ok())
+        .unwrap_or_else(|| Url::parse(PKARR_RELAY_URL).expect("constant relay URL is valid"))
 }
 
 /// pkarr record name for a user's contact key (`ray connect`). Published under
@@ -55,14 +46,17 @@ const CONTACT_RECORD_NAME: &str = "_rayfish_contact";
 // Pkarr client
 // ---------------------------------------------------------------------------
 
-pub fn create_pkarr_client(ep: &Endpoint) -> Result<PkarrRelayClient> {
+pub fn create_pkarr_client(ep: &Endpoint, relay_url: &Url) -> Result<PkarrRelayClient> {
     let tls_config = ep.tls_config().clone();
     let dns_resolver: DnsResolver = ep
         .dns_resolver()
         .context("endpoint has no DNS resolver")?
         .clone();
-    let relay_url: Url = effective_pkarr_url().parse().expect("relay URL is valid");
-    Ok(PkarrRelayClient::new(relay_url, tls_config, dns_resolver))
+    Ok(PkarrRelayClient::new(
+        relay_url.clone(),
+        tls_config,
+        dns_resolver,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +66,8 @@ pub fn create_pkarr_client(ep: &Endpoint) -> Result<PkarrRelayClient> {
 /// Encodes a network record into a signed pkarr packet.
 ///
 /// The record contains the group blob hash, a list of seed peers, and the
-/// publishing coordinator's mesh protocol version (`m,<v>` =
-/// [`transport::MESH_PROTOCOL_VERSION`]). The version lets a joiner detect an
+/// publishing coordinator's oldest supported mesh protocol (`m,<v>` =
+/// [`transport::MESH_RECORD_VERSION`]). The version lets a joiner detect an
 /// incompatible mesh protocol *before* dialing (where the versioned ALPN would
 /// otherwise reject it opaquely), so it can surface a precise "run ray update"
 /// error. The record is network-key-signed, so the version can't be spoofed.
@@ -86,7 +80,7 @@ pub fn encode_network_record(
     let mut values = vec![
         RECORD_VERSION.to_string(),
         format!("h,{blob_hash}"),
-        format!("m,{}", crate::transport::MESH_PROTOCOL_VERSION),
+        format!("m,{}", crate::transport::MESH_RECORD_VERSION),
     ];
     // `k,<blake3(read_key)>`: present iff the group blob is sealed. Two jobs, and
     // both need it to be in the *signed* record rather than in the blob it
@@ -103,7 +97,7 @@ pub fn encode_network_record(
         .map_err(|e| anyhow::anyhow!("failed to build network record: {e}"))
 }
 
-/// Extracts the coordinator's advertised mesh protocol version (`m,<v>`) from a
+/// Extracts the coordinator's advertised compatibility version (`m,<v>`) from a
 /// network record, if present. Returns `None` for older records published before
 /// the version was added: callers treat that as "unknown, fall through to the
 /// ALPN gate" rather than blocking.
@@ -226,13 +220,16 @@ pub async fn publish_network(
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
-    read_key_commitment: Option<&blake3::Hash>,
-) -> Result<()> {
-    let packet = encode_network_record(key, blob_hash, seed_peers, read_key_commitment)?;
-    client
-        .publish(&packet)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to publish network record: {e:#}"))
+) -> Result<Vec<u8>> {
+    let packet = encode_network_record(key, blob_hash, seed_peers)?;
+    match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(&packet)).await {
+        Ok(Ok(())) => Ok(packet.as_bytes().to_vec()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("failed to publish network record: {e:#}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out publishing network record after {}s",
+            PUBLISH_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Resolves the raw signed network record packet. Use this when you need fields
@@ -301,11 +298,23 @@ mod tests {
     use iroh::SecretKey;
 
     #[test]
-    fn effective_url_defaults_when_unset() {
-        // The OnceLock is process-global; this binary never sets it, so the
-        // default holds. (We avoid asserting the set path here to keep tests
-        // order-independent.)
-        assert_eq!(effective_pkarr_url(), PKARR_RELAY_URL);
+    fn relay_url_defaults_when_unset() {
+        assert_eq!(
+            pkarr_relay_url(&crate::config::ServerOverride::default()).as_str(),
+            PKARR_RELAY_URL
+        );
+    }
+
+    #[test]
+    fn relay_url_is_selected_from_this_daemons_config() {
+        let override_config = crate::config::ServerOverride {
+            servers: vec!["https://pkarr.example.test/custom".to_string()],
+            replace: true,
+        };
+        assert_eq!(
+            pkarr_relay_url(&override_config).as_str(),
+            "https://pkarr.example.test/custom"
+        );
     }
 
     #[test]
@@ -342,7 +351,7 @@ mod tests {
         // standard hash/peers decode is unaffected by the added field.
         assert_eq!(
             mesh_version_from_record(&packet),
-            Some(crate::transport::MESH_PROTOCOL_VERSION)
+            Some(crate::transport::MESH_RECORD_VERSION)
         );
         assert_eq!(decode_network_record(&packet).unwrap().blob_hash, hash);
     }

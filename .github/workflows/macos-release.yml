@@ -1,0 +1,176 @@
+name: macOS app release
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Existing GitHub release to attach the verified DMGs to
+        required: true
+        type: string
+    secrets:
+      MACOS_CERTIFICATE_P12:
+        required: true
+      MACOS_CERTIFICATE_PASSWORD:
+        required: true
+      MACOS_APP_PROFILE:
+        required: true
+      MACOS_TUNNEL_PROFILE:
+        required: true
+      APPLE_API_PRIVATE_KEY:
+        required: true
+      APPLE_API_KEY_ID:
+        required: true
+      APPLE_API_ISSUER_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      CARGO_PROFILE_RELEASE_STRIP: none
+      MACOS_ARCH: arm64
+      APPLE_TEAM_ID: '3D9W8F63CL'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check signing credentials
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_APP_PROFILE: ${{ secrets.MACOS_APP_PROFILE }}
+          MACOS_TUNNEL_PROFILE: ${{ secrets.MACOS_TUNNEL_PROFILE }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD \
+            MACOS_APP_PROFILE MACOS_TUNNEL_PROFILE APPLE_API_PRIVATE_KEY \
+            APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing secret $name. See macos/README.md."
+              exit 1
+            fi
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-app-release-arm64
+          cache-on-failure: true
+
+      - name: Install build tools
+        run: brew install xcodegen just create-dmg
+
+      - name: Import signing certificate and profiles
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_APP_PROFILE: ${{ secrets.MACOS_APP_PROFILE }}
+          MACOS_TUNNEL_PROFILE: ${{ secrets.MACOS_TUNNEL_PROFILE }}
+        run: |
+          umask 077
+          keychain="$RUNNER_TEMP/rayfish-signing.keychain-db"
+          password=$(openssl rand -hex 32)
+          echo "::add-mask::$password"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          profiles="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          mkdir -p "$profiles"
+          for kind in APP TUNNEL; do
+            name="MACOS_${kind}_PROFILE"
+            printf '%s' "${!name}" | base64 --decode > "$RUNNER_TEMP/$kind.provisionprofile"
+            security cms -D -i "$RUNNER_TEMP/$kind.provisionprofile" > "$RUNNER_TEMP/$kind.plist"
+            uuid=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$RUNNER_TEMP/$kind.plist")
+            cp "$RUNNER_TEMP/$kind.provisionprofile" "$profiles/$uuid.provisionprofile"
+            echo "RAYFISH_${kind}_PROFILE=$uuid" >> "$GITHUB_ENV"
+          done
+
+      - name: Build and validate Release app
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: bash scripts/build-macos-release.sh
+
+      - name: Test migration and provider messaging
+        run: |
+          just macos-test
+          just macos-ipc-test
+
+      - name: Notarize and package
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: bash scripts/notarize-macos-release.sh
+
+      - name: Upload verified disk image
+        uses: actions/upload-artifact@v7
+        with:
+          name: rayfish-macos-arm64
+          path: |
+            target/macos-release/dist/*.dmg
+            target/macos-release/dist/*.sha256
+          if-no-files-found: error
+
+      - name: Upload build and notarization diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-diagnostics-arm64
+          path: |
+            target/macos-release/*.log
+            target/macos-release/notary-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/rayfish-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/signing.p12" "$RUNNER_TEMP/APP.provisionprofile" \
+            "$RUNNER_TEMP/TUNNEL.provisionprofile" "$RUNNER_TEMP/APP.plist" \
+            "$RUNNER_TEMP/TUNNEL.plist" "$RUNNER_TEMP/notary-key.p8"
+          if [[ -n "${RAYFISH_APP_PROFILE:-}" ]]; then
+            rm -f "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$RAYFISH_APP_PROFILE.provisionprofile"
+          fi
+          if [[ -n "${RAYFISH_TUNNEL_PROFILE:-}" ]]; then
+            rm -f "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$RAYFISH_TUNNEL_PROFILE.provisionprofile"
+          fi
+
+  publish:
+    if: inputs.release_tag != ''
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rayfish-macos-*
+          merge-multiple: true
+          path: dist
+      - name: Attach the disk image to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release view "$RELEASE_TAG"
+          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.sha256

@@ -27,31 +27,27 @@ impl NetworkRegistry {
                     None => return,
                 },
             };
-            self.clone().handle_disconnect(ev).await;
+            Arc::clone(&self).handle_disconnect(ev).await;
         }
     }
 
     async fn handle_disconnect(self: Arc<Self>, ev: forward::DisconnectEvent) {
-        // ABA guard: if the stored connection is newer than the one that died,
-        // the peer already re-dialed. Ignore the stale event rather than tearing
-        // down the live link (see DisconnectEvent::conn_stable_id).
-        if let Some(id) = ev.conn_stable_id
-            && !self.peers.conn_is_current(&ev.ipv6, id)
-        {
-            tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ipv6, "ignoring stale disconnect; peer already reconnected");
+        #[cfg(target_os = "android")]
+        if self.transport.is_suspended() {
+            // Android's idle suspension deliberately closes links. Keep the
+            // roster/route state intact so the next TUN packet can wake and
+            // lazy-dial without treating this as a real peer failure.
             return;
         }
-
-        // The networks this peer was reachable on, captured before removal.
-        let nets: Vec<SmolStr> = self
-            .peers
-            .identity_and_networks(&ev.ipv6)
-            .map(|(_, nets)| nets)
-            .unwrap_or_default();
+        // Compare and remove under one peer-table lock. A separate current-ID
+        // check and remove could delete a winner installed between the two.
+        let Some(nets) = self.peers.remove_connection(&ev.ipv6, ev.conn_stable_id) else {
+            tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ipv6, "ignoring stale disconnect; peer already reconnected");
+            return;
+        };
 
         // One connection carried every network, so the drop removes the peer
         // everywhere at once.
-        self.peers.remove(&ev.ipv6);
         tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ipv6, reason = ?ev.reason, "peer connection dropped");
 
         if ev.reason.prunes_member() {
@@ -94,12 +90,17 @@ impl NetworkRegistry {
             // above) is allowed to leave a peer disconnected. The idle timer will
             // close the healed link again if it stays quiet.
             if !reconnect_nets.is_empty() {
-                self.clone().spawn_reconnect(ev.endpoint_id, reconnect_nets);
+                Arc::clone(&self).spawn_reconnect(ev.endpoint_id, reconnect_nets);
             }
             return;
         }
 
-        // Transient drop: stamp `last_seen` on each network we coordinate so the
+        // A registered successor was preserved by remove_connection above. If
+        // Replaced removed the current route, the promised successor has not
+        // arrived. Retry it like a transient failure; dial_peer_once reuses a
+        // successor that registers during backoff instead of opening a duplicate.
+        //
+        // Lost route: stamp `last_seen` on each network we coordinate so the
         // ephemeral pruner ages the member from when it actually went offline
         // (not its admit time), then reconnect across every shared network,
         // skipping any we just pruned this peer from (one-shot via pruned_peers).
@@ -135,7 +136,13 @@ impl NetworkRegistry {
         // Resolve + fetch the current signed blob and leave only on a positive
         // confirmation that it no longer lists us; on any failure (can't
         // resolve/fetch) we stay, never leaving on uncertainty.
-        let removed = match resolve_signed(&self.transport.endpoint, net_pubkey).await {
+        let removed = match resolve_signed(
+            &self.transport.endpoint,
+            &self.transport.pkarr_relay_url,
+            net_pubkey,
+        )
+        .await
+        {
             // The timestamp is not consulted here: this only ever *confirms* a
             // kick before leaving, and an older record listing us is a reason to
             // stay, which is already the safe answer.
@@ -158,7 +165,7 @@ impl NetworkRegistry {
         };
         if removed {
             tracing::info!(network = %network, "coordinator kicked us and the signed record confirms removal; leaving network");
-            self.leave_network(network).await;
+            self.remove_kicked_network(network).await;
         }
     }
 
@@ -173,10 +180,14 @@ impl NetworkRegistry {
             if !h.role.is_coordinator() {
                 return;
             }
-            (h.state.clone(), h.network_key, h.dht_notify.clone())
+            (Arc::clone(&h.state), h.network_key, h.dht_notify.clone())
         };
         let member_id = self.device_user_map.resolve(&ev.endpoint_id);
+        let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
+        let commit_guard = snapshot_commit.lock().await;
         state.write().unwrap().members.remove(&member_id);
+        commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
+        drop(commit_guard);
         dns::remove_hostname_by_ip(
             &self.dns.hostname_table,
             &self.dns.reverse_table,
@@ -184,7 +195,6 @@ impl NetworkRegistry {
             ev.ipv6,
         )
         .await;
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         broadcast_member_sync(self, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after leave");
     }
@@ -213,9 +223,11 @@ impl NetworkRegistry {
             if !h.role.is_coordinator() {
                 return;
             }
-            (h.state.clone(), h.network_key, h.dht_notify.clone())
+            (Arc::clone(&h.state), h.network_key, h.dht_notify.clone())
         };
         let member_id = self.device_user_map.resolve(&peer_id);
+        let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
+        let commit_guard = snapshot_commit.lock().await;
         // Nothing to prune means nothing to announce. The tail of this function
         // is a signature, a DHT publish, and a `MemberSync` to every roster
         // member (each of which answers with a reconverge: a pkarr resolve plus a
@@ -227,6 +239,8 @@ impl NetworkRegistry {
             tracing::debug!(peer = %member_id.fmt_short(), network, "leave from a peer the roster does not list; ignoring");
             return;
         }
+        commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
+        drop(commit_guard);
         if let Some(ip) = leaver_ip {
             dns::remove_hostname_by_ip(
                 &self.dns.hostname_table,
@@ -236,7 +250,6 @@ impl NetworkRegistry {
             )
             .await;
         }
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         broadcast_member_sync(self, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after in-band leave");
     }
@@ -275,7 +288,7 @@ impl NetworkRegistry {
             drop(s);
             nets.push((
                 entry.key().clone(),
-                entry.value().state.clone(),
+                Arc::clone(&entry.value().state),
                 entry.value().dht_notify.clone(),
                 has_key,
             ));
@@ -289,12 +302,13 @@ impl NetworkRegistry {
 
         // Persist the nullifier seed so it survives a restart and is unioned into
         // every coordinated network's blob at seal time.
-        let mut cfg = config::load().unwrap_or_default();
         let hex = target.to_string();
-        if !cfg.revoked_devices.contains(&hex) {
-            cfg.revoked_devices.push(hex);
-        }
-        if let Err(e) = config::save_settings(&cfg) {
+        if let Err(e) = config::update_settings(|cfg| {
+            if !cfg.revoked_devices.contains(&hex) {
+                cfg.revoked_devices.push(hex);
+            }
+            Ok(())
+        }) {
             return Err(format!("failed to persist nullifier: {e}"));
         }
         self.device_user_map.remove(&target);
@@ -352,13 +366,21 @@ impl NetworkRegistry {
         let peer_ip = derive_ipv6(&peer_id);
         let my_identity = self.transport.identity.local_identity();
         let device_cert = self.current_device_cert();
-        let conn = match transport::connect_to_peer_with_alpn(
-            &self.transport.endpoint,
-            peer_id,
-            &transport::mesh_alpn(),
-        )
-        .await
+        // An accept or another network's dial may already have established the
+        // peer. Reuse that connection and send the remaining network hellos on it.
+        let connected = if let Some(conn) = self.peers.conn_for_ip(&peer_ip)
+            && conn.close_reason().is_none()
         {
+            Ok(conn)
+        } else {
+            transport::connect_to_peer_with_alpn(
+                &self.transport.endpoint,
+                peer_id,
+                &transport::mesh_alpn(),
+            )
+            .await
+        };
+        let conn = match connected {
             Ok(c) => c,
             Err(e) => {
                 // Flag an incompatible-version peer (ALPN gate) so `ray status`
@@ -399,18 +421,23 @@ impl NetworkRegistry {
                 .mesh_ctx()
                 .register_peer_conn(&conn, peer_id, &t.network);
         }
-        // A live connection now exists (either freshly stored, or already current
-        // when `conn_changed` is false), so the peer is reachable either way.
-        self.reachability.note_ok(peer_id);
-        if !conn_changed {
+        // Registration may have kept a different, globally preferred connection.
+        // Success means a live selected connection exists, not that this dial won.
+        let Some(selected) = self
+            .peers
+            .conn_for_ip(&peer_ip)
+            .filter(|c| c.close_reason().is_none())
+        else {
             return false;
+        };
+        self.reachability.note_ok(peer_id);
+        if conn_changed && selected.stable_id() == conn.stable_id() {
+            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
+            let router = Arc::clone(self.protocol_router());
+            let dconn = conn.clone();
+            tokio::spawn(router.drive_mesh_connection(dconn, true));
         }
-        tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
-        // Drive the new connection's control demux + announce handles.
-        let router = self.protocol_router().clone();
-        let dconn = conn.clone();
-        tokio::spawn(router.drive_mesh_connection(dconn, true));
-        announce_network_handles(&self.peers, &conn, peer_ip).await;
+        announce_network_handles(&self.peers, &selected, peer_ip).await;
         true
     }
 
@@ -440,7 +467,7 @@ impl NetworkRegistry {
             return;
         }
 
-        let this = self.clone();
+        let this = Arc::clone(&self);
         let token = self.shutdown_token.clone();
         use tracing::Instrument as _;
         let span = tracing::info_span!("reconnect", peer = %peer_id.fmt_short());
@@ -579,40 +606,55 @@ pub(crate) async fn remove_member_roster_only(
 }
 
 /// Republish the signed blob, broadcast a payload-free `MemberSync`, and send each
-/// `victim` a network-scoped `ControlMsg::KickedFromNetwork` so it confirms against
-/// the signed record and leaves this network. Call once after one or more
-/// [`remove_member_roster_only`] edits. Other members drop the victims when they
+/// removed member a network-scoped `ControlMsg::KickedFromNetwork` so it confirms
+/// against the signed record and leaves this network. Call once after one or more
+/// [`remove_member_roster_only`] edits. Other members drop removed peers when they
 /// reconverge from the freshly published record (`prune_departed_peers`).
 pub(crate) async fn finalize_removal(
     ctx: &MeshCtx,
     network: &str,
     state: &SharedNetworkState,
     dht_notify: &Option<Arc<tokio::sync::Notify>>,
-    victims: &[EndpointId],
+    removed_members: &[EndpointId],
 ) {
-    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
     let net_pubkey = state.read().unwrap().network_public_key;
-    broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
+    let mut removed_connections = Vec::new();
+
+    // Revoke local authorization before any publication or broadcast I/O. The
+    // roster has already been edited, so new hellos are rejected; removing the
+    // route here also stops data on an existing connection immediately.
     for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
         let resolved = ctx.device_user_map.resolve(&pid);
-        if victims.iter().any(|v| *v == pid || *v == resolved) {
-            // Authoritative, network-scoped kick: tell the victim in-band that it
-            // was removed from *this* network, so it can confirm against the signed
-            // record and leave just this one (a connection close code cannot name
-            // the network). Best-effort; a missed message falls back to the victim's
-            // reconverge.
-            if let Ok((mut send, _recv)) = conn.open_bi().await {
-                let _ =
-                    control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::KickedFromNetwork)
-                        .await;
-                let _ = send.finish();
-            }
-            // Drop this network's route to the victim. We do not close the
-            // connection: not closing keeps the kick message we just sent from
-            // racing a connection close, and the victim's message-triggered leave
-            // (or idle timeout) tears the link down. A link the victim still shares
-            // another network on stays up for those.
-            ctx.peers.remove_peer_from_network(&ip, network);
+        if removed_members
+            .iter()
+            .any(|removed| *removed == pid || *removed == resolved)
+        {
+            let close_after_notice =
+                revoke_peer_network(&ctx.peers, &ctx.pruned_peers, network, pid, ip).is_some();
+            removed_connections.push((conn, close_after_notice));
+        }
+    }
+
+    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
+    broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
+    for (conn, close_after_notice) in removed_connections {
+        // Authoritative, network-scoped kick: tell the removed member in-band so
+        // it can confirm against the signed record and leave just this network (a
+        // connection close code cannot name a network). Best-effort; a missed
+        // message falls back to reconvergence.
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::KickedFromNetwork)
+                .await;
+            let _ = send.finish();
+        }
+        // A connection shared by another network stays up for that network.
+        // Otherwise close the transport; the signed roster remains the removed
+        // member's reliable fallback if the best-effort notice loses this race.
+        if close_after_notice {
+            conn.close(
+                VarInt::from_u32(forward::KICK_CODE),
+                b"removed from network",
+            );
         }
     }
 }
@@ -657,7 +699,7 @@ pub(crate) fn spawn_stale_member_pruner(
                 .collect();
             // Identities alone: the address they are pruned at derives from each
             // one, so carrying it alongside would be two names for the same fact.
-            let victims: Vec<EndpointId> = {
+            let removed_members: Vec<EndpointId> = {
                 let s = state.read().unwrap();
                 s.members
                     .all()
@@ -674,14 +716,14 @@ pub(crate) fn spawn_stale_member_pruner(
                     .map(|m| m.identity)
                     .collect()
             };
-            if victims.is_empty() {
+            if removed_members.is_empty() {
                 continue;
             }
-            for id in &victims {
+            for id in &removed_members {
                 remove_member_roster_only(&ctx, &network, &state, *id, derive_ipv6(id)).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
-            finalize_removal(&ctx, &network, &state, &dht_notify, &victims).await;
+            finalize_removal(&ctx, &network, &state, &dht_notify, &removed_members).await;
         }
     })
 }
@@ -790,11 +832,14 @@ mod sender_authority_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
+            unconfirmed_durable_hash: None,
             network_secret_key: None,
             read_key: None,
             network_public_key: eid(200),
             network_name: Some("test-net".to_string()),
+            group_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),

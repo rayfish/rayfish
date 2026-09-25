@@ -18,7 +18,7 @@ use bytes::Bytes;
 
 use crate::firewall::PacketInfo;
 
-/// TUN MTU (RFC 8200 IPv6 minimum). Replies must fit.
+/// Keep error replies within IPv6's minimum MTU, even when the TUN is larger.
 const MTU: usize = 1280;
 
 const IPV4_HEADER_LEN: usize = 20;
@@ -68,10 +68,9 @@ pub fn build_reject(packet: &[u8], info: &PacketInfo) -> Option<Bytes> {
 
 /// Build an ICMP "packet too big" reply telling the source to lower its path MTU
 /// to `mtu` for this destination, or `None` when no reply should be sent. This is
-/// the PMTUD feedback the forwarder emits when a packet won't fit a single QUIC
-/// datagram on a peer's path (common under an exit-node full tunnel over a
-/// relayed peer): injected back into our own TUN, it makes the local kernel lower
-/// the flow's path MTU and resend a packet that fits, instead of a silent
+/// the PMTUD feedback the forwarder emits when a packet exceeds the tunnel's
+/// supported IP packet size: injected back into our own TUN, it makes the local
+/// kernel lower the flow's path MTU and resend a packet that fits, instead of a silent
 /// blackhole. Addressing mirrors [`build_reject`]: the reply appears to come back
 /// from the destination.
 ///

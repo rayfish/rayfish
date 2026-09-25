@@ -22,10 +22,12 @@ mod connect;
 mod exit_node;
 mod files;
 mod firewall;
+#[cfg(not(all(target_os = "macos", feature = "macos-app")))]
 mod gui;
 pub(crate) mod help;
 mod invite;
 mod logs;
+mod management;
 mod network;
 mod open;
 mod pair;
@@ -38,9 +40,11 @@ pub(crate) use connect::*;
 pub(crate) use exit_node::*;
 pub(crate) use files::*;
 pub(crate) use firewall::*;
+#[cfg(not(all(target_os = "macos", feature = "macos-app")))]
 pub(crate) use gui::*;
 pub(crate) use invite::*;
 pub(crate) use logs::*;
+pub(crate) use management::*;
 pub(crate) use network::*;
 pub(crate) use open::*;
 pub(crate) use pair::*;

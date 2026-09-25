@@ -1,18 +1,35 @@
 use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::fmt;
+#[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 use std::net::Ipv6Addr;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
-use iroh::EndpointId;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use iroh::{EndpointAddr, EndpointId};
+use iroh_tickets::{ParseError as TicketParseError, Ticket};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(unix)]
 use tokio::io::Interest;
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(windows)]
+use tokio::time::Instant;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
+#[cfg(windows)]
+use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, PSID};
 
 use crate::{
     Action, Direction, GroupMode, NetworkKey, NodeKey, Protocol, SuggestedFirewall, TransportMode,
@@ -58,9 +75,18 @@ pub enum IpcMessage {
     /// Coordinator-only: remove a member from a closed network. Prunes it from the
     /// roster + approved list, republishes the signed blob, and disconnects it
     /// mesh-wide. `peer` is a hostname / mesh IP / short id of a current member.
+    ///
+    /// Membership follows the user identity, so naming one device removes every
+    /// row that user holds. When that set is larger than one row, an unconfirmed
+    /// request is answered with [`IpcMessage::KickConfirm`] listing what would
+    /// go, and the CLI asks before sending the same request with `confirm` set.
+    /// Defaulted to `false` so a request from a CLI that predates the field is
+    /// held at the confirmation step rather than silently kicking a whole user.
     Kick {
         network: String,
         peer: String,
+        #[serde(default)]
+        confirm: bool,
     },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
@@ -207,6 +233,14 @@ pub enum IpcMessage {
         path: String,
         peer: String,
     },
+    /// Internal daemon request after a Windows in-band upload has been staged.
+    /// This frame is generated inside the daemon and must be rejected at the IPC
+    /// wire boundary; it is never a client-authorized file-transfer request.
+    SendFileStaged {
+        path: String,
+        filename: String,
+        peer: String,
+    },
     /// Send a file to a peer, passing the already-open file as an SCM_RIGHTS
     /// descriptor on the same connection (see [`send_with_fd`]). The client
     /// opens the file with its own privileges, so filesystem permissions and
@@ -216,15 +250,40 @@ pub enum IpcMessage {
         filename: String,
         peer: String,
     },
+    /// Windows named-pipe file transfer. The path never crosses IPC; the daemon
+    /// receives the bytes into a server-created temporary file.
+    SendFileBegin {
+        filename: String,
+        peer: String,
+        /// Initial metadata hint; stream completion is determined by the EOF
+        /// `SendFileChunk { done: true }` frame because the file may change.
+        size: u64,
+    },
+    /// A data chunk. The terminal frame has `done=true` and an empty payload;
+    /// declared metadata size is not used to decide stream completion.
+    SendFileChunk {
+        data: Vec<u8>,
+        done: bool,
+    },
     ListFiles,
     /// Cancel a queued outbound send (`ray files cancel <id>`). Only reaches
     /// sends still waiting in the outbox; a delivered offer is the peer's now.
     CancelSend {
         id: u64,
     },
+    /// Cancel an outgoing transfer that has already been offered or started.
+    CancelTransfer {
+        id: u64,
+    },
     AcceptFile {
         id: u64,
         output: Option<String>,
+    },
+    /// Decline a pending inbound offer (`ray files reject <id>`). Local only:
+    /// the entry leaves the queue and nothing is sent to the sender, so their
+    /// offer is left unpulled exactly as if it had been ignored.
+    RejectFile {
+        id: u64,
     },
     StartPairing,
     PairWithDevice {
@@ -234,6 +293,18 @@ pub enum IpcMessage {
     /// List this user's paired devices (enumerated from the network rosters).
     /// Reply: [`IpcMessage::PairedDevices`].
     ListPairedDevices,
+    /// Create an encrypted identity backup in the daemon-owned config tree.
+    /// This is a mutation because it releases the local identity to an
+    /// authorized caller, wrapped by the caller-supplied password.
+    BackupIdentity {
+        password: Option<String>,
+        onepassword: bool,
+    },
+    /// Restore an encrypted identity backup into the daemon-owned config tree.
+    RestoreIdentity {
+        backup: String,
+        password: Option<String>,
+    },
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
     /// Publishes a signed revocation record, drops the device locally, severs it
     /// from networks this node coordinates, and best-effort signals the device to
@@ -241,6 +312,52 @@ pub enum IpcMessage {
     Unpair {
         /// Device identifier: hostname, mesh IP, short id, or full endpoint id.
         device: String,
+    },
+    /// Creates a controller ticket for enrolling one or more machines.
+    MachineEnrollmentCreate {
+        expires_in: Duration,
+        reusable: bool,
+    },
+    /// Lists controller tickets and their current status.
+    MachineEnrollmentList,
+    /// Revokes a controller ticket.
+    MachineEnrollmentRevoke {
+        credential: EnrollmentCredentialSelector,
+    },
+    /// Enrolls this machine with the controller identified by `ticket`.
+    EnrollController {
+        ticket: EnrollmentTicket,
+    },
+    /// Lists controllers authorized to manage this machine.
+    ControllerList,
+    /// Revokes one controller, or all controllers when `identity` is absent.
+    ControllerRevoke {
+        identity: Option<ControllerSelector>,
+    },
+    /// Lists machines enrolled with this controller.
+    ManagedMachines {
+        probe: bool,
+    },
+    /// Removes one enrolled machine from this controller.
+    ManagedMachineForget {
+        machine: ManagedMachineSelector,
+    },
+    /// Confirms an existing remote controller grant and issues its recovery receipt.
+    ManagedMachineConfirm {
+        machine: EndpointId,
+    },
+    /// Asks an enrolled machine to join a network.
+    DelegatedJoin {
+        machine: ManagedMachineSelector,
+        network: NetworkName,
+        hostname: Option<MachineHostname>,
+        auto_accept_firewall: bool,
+        auto_accept_files: bool,
+    },
+    /// Asks an enrolled machine to leave a network.
+    DelegatedLeave {
+        machine: ManagedMachineSelector,
+        network: NetworkName,
     },
     /// Authorize a local user (by UID) to control the daemon without root, the
     /// way `tailscale up --operator` does. Root-only.
@@ -382,6 +499,15 @@ pub enum IpcMessage {
     Error {
         message: String,
     },
+    /// Answer to an unconfirmed [`IpcMessage::Kick`] that would remove more than
+    /// one roster row: every row the kick would take, for the CLI to print
+    /// before it asks. Nothing has been removed when this is sent.
+    KickConfirm {
+        network: String,
+        /// The row the caller's argument resolved to, for the prompt's wording.
+        display: String,
+        targets: Vec<KickTarget>,
+    },
     Created {
         name: String,
         network_key: EndpointId,
@@ -520,6 +646,9 @@ pub enum IpcMessage {
         /// that predate queued sends.
         #[serde(default)]
         outbox: Vec<OutboxFileInfo>,
+        /// In-flight and recently finished transfers.
+        #[serde(default)]
+        transfers: Vec<TransferFileInfo>,
     },
     PairingTicket {
         ticket: String,
@@ -530,6 +659,30 @@ pub enum IpcMessage {
     /// This user's paired devices (reply to `ListPairedDevices`).
     PairedDevices {
         devices: Vec<PairedDeviceInfo>,
+    },
+    /// Returns a newly created machine-enrollment ticket.
+    MachineEnrollmentCreated {
+        id: EnrollmentCredentialId,
+        ticket: EnrollmentTicket,
+        expires_at: UnixTimestampSecs,
+        reusable: bool,
+    },
+    /// Returns controller tickets and their current status.
+    MachineEnrollments {
+        enrollments: Vec<MachineEnrollmentInfo>,
+    },
+    /// Returns controllers authorized to manage this machine.
+    Controllers {
+        controllers: Vec<ControllerInfo>,
+    },
+    /// Returns machines enrolled with this controller.
+    ManagedMachinesResponse {
+        machines: Vec<ManagedMachineInfo>,
+    },
+    /// Encrypted identity backup returned by [`IpcMessage::BackupIdentity`].
+    IdentityBackup {
+        code: String,
+        public_key: String,
     },
     /// Nodes seen on the LAN over mDNS (reply to `ListLanPeers`).
     LanPeersList {
@@ -694,6 +847,458 @@ pub struct PairedDeviceInfo {
     pub networks: Vec<String>,
 }
 
+/// Status of one controller ticket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineEnrollmentInfo {
+    /// Short identifier used to select the credential.
+    pub id: EnrollmentCredentialId,
+    /// Expiration time in seconds since the Unix epoch.
+    pub expires_at: UnixTimestampSecs,
+    /// Whether the credential may enroll more than one machine.
+    pub reusable: bool,
+    /// Number of distinct machines enrolled with the credential.
+    pub uses: u64,
+    /// Current credential status.
+    pub status: MachineEnrollmentStatus,
+}
+
+/// Lifecycle state of a controller ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineEnrollmentStatus {
+    /// Valid and unused.
+    Pending,
+    /// Consumed by a machine and not reusable.
+    Used,
+    /// Past its expiration time.
+    Expired,
+    /// Explicitly revoked by the controller.
+    Revoked,
+}
+
+/// Controller authorized to manage the local machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerInfo {
+    /// Controller endpoint identity.
+    pub identity: EndpointId,
+    /// Enrollment time in seconds since the Unix epoch.
+    pub enrolled_at: UnixTimestampSecs,
+}
+
+/// Machine enrolled with the local controller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedMachineInfo {
+    /// Machine endpoint identity.
+    pub identity: EndpointId,
+    /// Stable hostname used by delegated commands.
+    pub hostname: MachineHostname,
+    /// Enrollment time in seconds since the Unix epoch.
+    pub enrolled_at: UnixTimestampSecs,
+    /// Last successful contact time in seconds since the Unix epoch.
+    pub last_seen: Option<UnixTimestampSecs>,
+    /// Result of the latest status probe.
+    pub state: ManagedMachineState,
+    /// Networks reported by the latest successful status probe.
+    #[serde(default)]
+    pub networks: Vec<NetworkName>,
+}
+
+/// Reachability and authorization state of an enrolled machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedMachineState {
+    /// The machine responded and authorized this controller.
+    Online,
+    /// The machine did not respond.
+    Offline,
+    /// The machine responded but no longer authorizes this controller.
+    Unauthorized,
+    /// The machine was not probed.
+    Unknown,
+}
+
+impl ManagedMachineState {
+    /// Returns the protocol name of this state.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Unauthorized => "unauthorized",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whole seconds since the Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnixTimestampSecs(u64);
+
+impl UnixTimestampSecs {
+    /// Creates a timestamp from whole seconds since the Unix epoch.
+    pub fn from_secs(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    /// Returns whole seconds since the Unix epoch.
+    pub fn as_secs(self) -> u64 {
+        self.0
+    }
+
+    /// Adds a duration, saturating at [`u64::MAX`].
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration.as_secs()))
+    }
+}
+
+impl fmt::Display for UnixTimestampSecs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Valid lowercase DNS label used to identify a managed machine.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct MachineHostname(String);
+
+impl MachineHostname {
+    /// Validates and creates a machine hostname.
+    pub fn new(value: String) -> Result<Self, InvalidMachineHostname> {
+        if value.is_empty()
+            || value.len() > 63
+            || value.starts_with('-')
+            || value.ends_with('-')
+            || !value.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            })
+        {
+            return Err(InvalidMachineHostname);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl AsRef<str> for MachineHostname {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<MachineHostname> for String {
+    fn from(hostname: MachineHostname) -> Self {
+        hostname.0
+    }
+}
+
+impl fmt::Display for MachineHostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for MachineHostname {
+    type Err = InvalidMachineHostname;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for MachineHostname {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Error returned when a machine hostname is not a lowercase DNS label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidMachineHostname;
+
+impl fmt::Display for InvalidMachineHostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("hostname must be a lowercase DNS label of at most 63 characters")
+    }
+}
+
+impl std::error::Error for InvalidMachineHostname {}
+
+/// Network name carried across the IPC and management protocols.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NetworkName(String);
+
+impl NetworkName {
+    /// Wraps a network name.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for NetworkName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<NetworkName> for String {
+    fn from(network: NetworkName) -> Self {
+        network.0
+    }
+}
+
+impl fmt::Display for NetworkName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for NetworkName {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Short identifier for a stored enrollment credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentCredentialId(String);
+
+impl EnrollmentCredentialId {
+    /// Wraps an enrollment credential identifier.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for EnrollmentCredentialId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnrollmentCredentialId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EnrollmentCredentialId {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Full or prefix selector for an enrollment credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentCredentialSelector(String);
+
+impl EnrollmentCredentialSelector {
+    /// Wraps an enrollment credential selector.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for EnrollmentCredentialSelector {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnrollmentCredentialSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EnrollmentCredentialSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Shareable capability for enrolling a machine with a controller.
+///
+/// The ticket contains current dialing information for the controller and a
+/// secret enrollment credential. Treat its string form as a secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnrollmentTicket {
+    controller: EndpointAddr,
+    secret: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+enum EnrollmentTicketWireFormat {
+    Variant1 {
+        controller: EndpointAddr,
+        secret: [u8; 32],
+    },
+}
+
+impl EnrollmentTicket {
+    /// Creates a ticket for `controller` using the supplied enrollment secret.
+    pub fn new(controller: EndpointAddr, secret: [u8; 32]) -> Self {
+        Self { controller, secret }
+    }
+
+    /// Returns the controller address carried by the ticket.
+    pub fn controller(&self) -> &EndpointAddr {
+        &self.controller
+    }
+
+    /// Returns the secret credential carried by the ticket.
+    pub fn secret(&self) -> &[u8; 32] {
+        &self.secret
+    }
+}
+
+impl Ticket for EnrollmentTicket {
+    const KIND: &'static str = "raymachine";
+
+    fn encode_bytes(&self) -> Vec<u8> {
+        let wire = EnrollmentTicketWireFormat::Variant1 {
+            controller: self.controller.clone(),
+            secret: self.secret,
+        };
+        postcard::to_stdvec(&wire)
+            .expect("enrollment ticket fields always have a valid postcard representation")
+    }
+
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, TicketParseError> {
+        let EnrollmentTicketWireFormat::Variant1 { controller, secret } =
+            postcard::from_bytes(bytes)?;
+        Ok(Self { controller, secret })
+    }
+}
+
+impl fmt::Debug for EnrollmentTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnrollmentTicket([redacted])")
+    }
+}
+
+impl fmt::Display for EnrollmentTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.encode_string())
+    }
+}
+
+impl FromStr for EnrollmentTicket {
+    type Err = TicketParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::decode_string(value.trim())
+    }
+}
+
+impl Serialize for EnrollmentTicket {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.encode_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for EnrollmentTicket {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Hostname, short identity, or full identity selecting a managed machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ManagedMachineSelector(String);
+
+impl ManagedMachineSelector {
+    /// Wraps a managed-machine selector.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for ManagedMachineSelector {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedMachineSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ManagedMachineSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// Full or prefix endpoint identity selecting a controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControllerSelector(String);
+
+impl ControllerSelector {
+    /// Wraps a controller selector.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for ControllerSelector {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ControllerSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ControllerSelector {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value.to_string()))
+    }
+}
+
+/// One roster row a pending kick would remove (reply to an unconfirmed
+/// [`IpcMessage::Kick`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KickTarget {
+    /// The row's hostname on this network, if the roster carries one.
+    pub hostname: Option<String>,
+    /// Short id form of the row's identity, for display.
+    pub short_id: String,
+    /// Whether this row is the user's own identity rather than one of the
+    /// devices paired to it.
+    pub primary: bool,
+}
+
 /// One rayfish node seen on the local network over mDNS. A sighting says only
 /// that the node exists and where it is; it carries no membership or trust.
 #[derive(Debug, Serialize, Deserialize)]
@@ -757,6 +1362,25 @@ pub struct PendingFileInfo {
     pub own_device: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TransferFileInfo {
+    pub id: u64,
+    pub outgoing: bool,
+    pub peer: String,
+    pub filename: String,
+    pub size: u64,
+    pub transferred: u64,
+    pub state: TransferFileState,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TransferFileState {
+    Offered,
+    Transferring,
+    Done,
+    Failed,
+}
+
 /// A mesh-protocol version mismatch on a network: what its signed record
 /// advertises against what this daemon speaks.
 ///
@@ -786,9 +1410,16 @@ pub struct InactiveNetwork {
     /// attempt has failed.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The network as the daemon's config last saved it, so `ray status` can
+    /// show the group, its roster and its join code while the restore retries
+    /// instead of a bare name with nothing under it. Every peer in it reads
+    /// offline: there is no registration yet, so there is no link to any of
+    /// them. `None` from a daemon predating this field.
+    #[serde(default)]
+    pub saved: Option<NetworkStatus>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub name: String,
     pub role: NetworkRole,
@@ -846,7 +1477,7 @@ pub enum NetworkRole {
     Direct,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub endpoint_id: EndpointId,
     pub ipv6: Ipv6Addr,
@@ -880,24 +1511,42 @@ pub struct PeerStatus {
     /// traffic from the others that merely offer.
     #[serde(default)]
     pub exit_in_use: bool,
+    /// True when this peer holds the network's secret key (`Member.is_coordinator`
+    /// in the signed roster): the node that admits members and signs the blob.
+    /// Shown as a marker in status, since "who approves a join" is otherwise only
+    /// visible on the coordinator's own header.
+    #[serde(default)]
+    pub is_coordinator: bool,
 }
 
 /// Three-state peer liveness for `ray status`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
 )]
 pub enum PeerState {
     /// A live mesh connection to the peer exists right now.
+    #[display("active")]
     Active,
     /// No live connection, but no failed reach either: presumed reachable (dialed
     /// lazily on demand). The optimistic default for a freshly booted node.
     #[default]
+    #[display("idle")]
     Idle,
     /// A recent reach attempt failed and wasn't cleared by a later success.
+    #[display("offline")]
     Offline,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub conn_type: ConnType,
     pub remote_addr: Option<String>,
@@ -909,11 +1558,24 @@ pub struct ConnectionInfo {
     pub lost_packets: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
+)]
 pub enum ConnType {
+    #[display("direct")]
     Direct,
+    #[display("relay")]
     Relay,
+    #[display("tor")]
     Tor,
+    #[display("unknown")]
     Unknown,
 }
 
@@ -946,7 +1608,7 @@ pub const LOG_CHUNK_BYTES: usize = MAX_FRAME_LEN / 4;
 /// other does not know; a named map is what makes that free, and it is why
 /// `skip_serializing_if` is still safe on the types below.
 ///
-/// The network wire made the opposite choice (see CLAUDE.md): it is
+/// The network wire made the opposite choice (see the Wire protocol section in `AGENTS.md`): it is
 /// array-encoded, gated on an ALPN, and a `skip_serializing_if` there shifts
 /// every later field into the wrong slot. `HostSuggestions` crosses both
 /// boundaries and so carries no skips at all.
@@ -1002,16 +1664,22 @@ impl<T: DeserializeOwned> Decoder for MsgpackCodec<T> {
     }
 }
 
+#[cfg(unix)]
 pub type IpcFramed = Framed<UnixStream, MsgpackCodec<IpcMessage>>;
+#[cfg(windows)]
+pub type IpcFramed = Framed<NamedPipeClient, MsgpackCodec<IpcMessage>>;
 
 pub fn socket_path() -> PathBuf {
-    if cfg!(target_os = "macos") {
+    if cfg!(windows) {
+        PathBuf::from(r"\\.\pipe\rayfish")
+    } else if cfg!(target_os = "macos") {
         PathBuf::from("/var/run/rayfish.sock")
     } else {
         PathBuf::from("/var/run/rayfish/rayfish.sock")
     }
 }
 
+#[cfg(unix)]
 pub async fn connect() -> Result<IpcFramed> {
     let path = socket_path();
     let stream = UnixStream::connect(&path)
@@ -1020,16 +1688,169 @@ pub async fn connect() -> Result<IpcFramed> {
     Ok(Framed::new(stream, MsgpackCodec::new()))
 }
 
-pub fn framed(stream: UnixStream) -> IpcFramed {
+#[cfg(windows)]
+pub async fn connect() -> Result<IpcFramed> {
+    const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + PIPE_CONNECT_TIMEOUT;
+    let stream = loop {
+        match ClientOptions::new().open(r"\\.\pipe\rayfish") {
+            Ok(stream) => break stream,
+            Err(error) => match classify_pipe_open_error(&error) {
+                PipeOpenError::Busy if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                PipeOpenError::Busy => {
+                    anyhow::bail!(
+                        "Rayfish service pipe remained busy for {PIPE_CONNECT_TIMEOUT:?}; retry later"
+                    )
+                }
+                PipeOpenError::NotFound => {
+                    return Err(error).context("daemon not running — start the Rayfish service");
+                }
+                PipeOpenError::Other(code) => {
+                    return Err(error).context(format!(
+                        "cannot connect to Rayfish service pipe (Windows error {code})"
+                    ));
+                }
+            },
+        }
+    };
+    verify_windows_server_is_local_system(&stream)?;
+    Ok(Framed::new(stream, MsgpackCodec::new()))
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum PipeOpenError {
+    Busy,
+    NotFound,
+    Other(i32),
+}
+
+#[cfg(windows)]
+fn classify_pipe_open_error(error: &std::io::Error) -> PipeOpenError {
+    match error.raw_os_error() {
+        Some(231) => PipeOpenError::Busy,       // ERROR_PIPE_BUSY
+        Some(2 | 3) => PipeOpenError::NotFound, // FILE/PATH_NOT_FOUND
+        Some(code) => PipeOpenError::Other(code),
+        None => PipeOpenError::Other(-1),
+    }
+}
+
+/// The SID of `NT AUTHORITY\SYSTEM`, the account the service runs as.
+#[cfg(windows)]
+const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+/// Refuse a pipe that some other account is squatting on.
+///
+/// Reaching `\\.\pipe\rayfish` proves nothing by itself. Any process may create
+/// a named pipe under any name not already taken, so if the service is not
+/// running, an unprivileged one can sit on that name and collect whatever the
+/// next `ray` command sends it. The client has to establish that the far end
+/// really is the service before it says anything to it.
+///
+/// This asks the kernel who owns the pipe object rather than asking the server
+/// process about itself. Owner is the right question anyway, but the reason it
+/// is asked this way is that the obvious version does not work: reading the
+/// server's token means `OpenProcess` against a LocalSystem service, which a
+/// standard user is not allowed to do. Every unprivileged `ray status` failed
+/// there, after opening the pipe perfectly well, and the daemon it had just
+/// connected to was reported as not running.
+///
+/// Reading the owner needs only `READ_CONTROL`, which the pipe's `GENERIC_READ`
+/// grant already carries, so this works from any account that can open the pipe
+/// at all. It is no weaker: the owner is stamped by the kernel at creation from
+/// the creator's token, and an unprivileged process cannot put `S-1-5-18` on an
+/// object it creates. An elevated administrator can, but one of those can
+/// replace the service outright, so it was never on the other side of this line.
+#[cfg(windows)]
+fn verify_windows_server_is_local_system(stream: &NamedPipeClient) -> Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let pipe = stream.as_raw_handle() as HANDLE;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    anyhow::ensure!(
+        status == ERROR_SUCCESS && !owner.is_null(),
+        "cannot read the owner of the Rayfish service pipe (Windows error {status})"
+    );
+    // `owner` points into `descriptor`, so it has to be read out before the free.
+    let sid = unsafe { sid_to_string(owner) };
+    unsafe { LocalFree(descriptor.cast()) };
+    let sid = sid?;
+    anyhow::ensure!(
+        sid == LOCAL_SYSTEM_SID,
+        "refusing IPC pipe owned by {sid} rather than LocalSystem"
+    );
+    Ok(())
+}
+
+/// Format a SID the way `ray` and the settings file spell one, `S-1-5-...`.
+///
+/// # Safety
+///
+/// `sid` must point at a valid SID that stays valid for the call.
+#[cfg(windows)]
+unsafe fn sid_to_string(sid: PSID) -> Result<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    let mut text = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { ConvertSidToStringSidW(sid, &mut text) } != 0 && !text.is_null(),
+        "cannot format the Rayfish service pipe owner SID"
+    );
+    let mut len = 0;
+    unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let owned = OsString::from_wide(unsafe { std::slice::from_raw_parts(text, len) })
+        .to_string_lossy()
+        .into_owned();
+    unsafe { LocalFree(text.cast()) };
+    Ok(owned)
+}
+
+pub fn framed<S>(stream: S) -> Framed<S, MsgpackCodec<IpcMessage>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     Framed::new(stream, MsgpackCodec::new())
 }
 
-pub async fn send(framed: &mut IpcFramed, msg: IpcMessage) -> Result<()> {
+pub async fn send<S>(
+    framed: &mut Framed<S, MsgpackCodec<IpcMessage>>,
+    msg: IpcMessage,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     use futures::SinkExt;
     framed.send(msg).await
 }
 
-pub async fn recv(framed: &mut IpcFramed) -> Result<IpcMessage> {
+pub async fn recv<S>(framed: &mut Framed<S, MsgpackCodec<IpcMessage>>) -> Result<IpcMessage>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     use futures::StreamExt;
     framed.next().await.context("connection closed")?
 }
@@ -1043,6 +1864,7 @@ pub const MAX_IPC_FDS: usize = 4;
 /// first byte as SCM_RIGHTS ancillary data. The receiver must read with
 /// [`recv_with_fds`]: a plain `read()` consumes the bytes but silently drops
 /// the descriptor.
+#[cfg(unix)]
 pub async fn send_with_fd(stream: &UnixStream, msg: &IpcMessage, fd: BorrowedFd<'_>) -> Result<()> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 
@@ -1079,6 +1901,7 @@ pub async fn send_with_fd(stream: &UnixStream, msg: &IpcMessage, fd: BorrowedFd<
 /// with it. The daemon reads every request through this (not through the
 /// framed codec) because ancillary data is only surfaced by `recvmsg` with a
 /// control buffer; any other read on the socket would drop the descriptors.
+#[cfg(unix)]
 pub async fn recv_with_fds(stream: &UnixStream) -> Result<(IpcMessage, Vec<OwnedFd>)> {
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
 
@@ -1154,6 +1977,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn in_band_file_frames_roundtrip() {
+        for request in [
+            IpcMessage::SendFileBegin {
+                filename: "a.txt".into(),
+                peer: "peer1".into(),
+                size: 5,
+            },
+            IpcMessage::SendFileChunk {
+                data: b"hello".to_vec(),
+                done: true,
+            },
+        ] {
+            let bytes = rmp_serde::to_vec_named(&request).unwrap();
+            let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+            assert!(matches!(
+                decoded,
+                IpcMessage::SendFileBegin { .. } | IpcMessage::SendFileChunk { .. }
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_open_errors_keep_busy_distinct_from_absence() {
+        assert_eq!(
+            classify_pipe_open_error(&std::io::Error::from_raw_os_error(231)),
+            PipeOpenError::Busy
+        );
+        assert_eq!(
+            classify_pipe_open_error(&std::io::Error::from_raw_os_error(2)),
+            PipeOpenError::NotFound
+        );
+        assert_eq!(
+            classify_pipe_open_error(&std::io::Error::from_raw_os_error(5)),
+            PipeOpenError::Other(5)
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_refuses_a_pipe_owned_by_anyone_but_local_system() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        // A pipe this test process owns stands in for a squatter's: the name is
+        // this test's own, not the daemon's, so nothing here can disturb a real
+        // service on the machine. Assumes the suite is not run as LocalSystem,
+        // which would make the process indistinguishable from the daemon and is
+        // not how anyone runs `cargo test`.
+        let name = r"\\.\pipe\rayfish-test-owner-is-not-local-system";
+        let _server = ServerOptions::new()
+            .create(name)
+            .expect("create a pipe under a name reserved for this test");
+        let client = ClientOptions::new().open(name).expect("open the test pipe");
+
+        let error = verify_windows_server_is_local_system(&client)
+            .expect_err("a pipe owned by an ordinary account must be refused");
+        assert!(
+            format!("{error:#}").contains("rather than LocalSystem"),
+            "refused for the wrong reason: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn send_file_fd_roundtrip() {
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -1186,6 +2073,7 @@ mod tests {
         assert_eq!(contents, "payload bytes");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn recv_with_fds_handles_plain_frames() {
         use futures::SinkExt;
@@ -1199,6 +2087,7 @@ mod tests {
         assert!(fds.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn send_file_fd_survives_multi_chunk_frames() {
         use std::os::fd::AsFd;
@@ -1461,6 +2350,71 @@ mod tests {
     }
 
     #[test]
+    fn managed_hostname_rejects_non_dns_labels() {
+        assert!("build-box".parse::<MachineHostname>().is_ok());
+        assert!("Build Box".parse::<MachineHostname>().is_err());
+        assert!("-build-box".parse::<MachineHostname>().is_err());
+        let encoded = rmp_serde::to_vec_named("Build Box").unwrap();
+        assert!(rmp_serde::from_slice::<MachineHostname>(&encoded).is_err());
+    }
+
+    #[test]
+    fn delegated_join_roundtrip_preserves_domain_types() {
+        let request = IpcMessage::DelegatedJoin {
+            machine: ManagedMachineSelector::new("build-box".to_string()),
+            network: NetworkName::new("infra".to_string()),
+            hostname: Some("build-box".parse().unwrap()),
+            auto_accept_firewall: true,
+            auto_accept_files: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&request).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::DelegatedJoin {
+                machine,
+                network,
+                hostname,
+                ..
+            } => {
+                assert_eq!(machine.as_ref(), "build-box");
+                assert_eq!(network.as_ref(), "infra");
+                assert_eq!(hostname.unwrap().as_ref(), "build-box");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrollment_ticket_debug_is_redacted() {
+        let controller = EndpointAddr::from(iroh::SecretKey::generate().public());
+        let ticket = EnrollmentTicket::new(controller, [7; 32]);
+        let debug = format!("{ticket:?}");
+        assert_eq!(debug, "EnrollmentTicket([redacted])");
+    }
+
+    #[test]
+    fn enrollment_ticket_string_and_ipc_roundtrip() {
+        let controller = EndpointAddr::from(iroh::SecretKey::generate().public());
+        let ticket = EnrollmentTicket::new(controller.clone(), [7; 32]);
+
+        let encoded = ticket.to_string();
+        assert!(encoded.starts_with("raymachine"));
+        let decoded: EnrollmentTicket = encoded.parse().unwrap();
+        assert_eq!(decoded.controller(), &controller);
+        assert_eq!(decoded.secret(), &[7; 32]);
+
+        let ipc_bytes = rmp_serde::to_vec_named(&ticket).unwrap();
+        let ipc_decoded: EnrollmentTicket = rmp_serde::from_slice(&ipc_bytes).unwrap();
+        assert_eq!(ipc_decoded, ticket);
+    }
+
+    #[test]
+    fn enrollment_ticket_rejects_another_ticket_kind() {
+        let error = "endpointaaaa".parse::<EnrollmentTicket>().unwrap_err();
+        assert!(error.to_string().contains("wrong prefix"));
+    }
+
+    #[test]
     fn test_invite_list_response_roundtrip() {
         let resp = IpcMessage::InviteListResponse {
             invites: vec![InviteInfo {
@@ -1620,6 +2574,7 @@ mod tests {
                     state: PeerState::Idle,
                     exit_node: false,
                     exit_in_use: false,
+                    is_coordinator: false,
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,

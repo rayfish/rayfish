@@ -486,7 +486,7 @@ step "8. the overlay survives the down/up cycle"
 # cycle used to leave the node with no mesh address at all: it still routed
 # 200::/7 into the TUN but owned nothing in it, and every peer silently got no
 # answer. With no second family to limp along on, that is now total.
-A_V6=$(on "$A" "ip -6 addr show dev tun0 scope global | awk '/inet6/{print \$2}' | cut -d/ -f1")
+A_V6=$(on "$A" "ip -o -6 addr show scope global | awk '\$2 ~ /^rayfish/ {print \$4}' | cut -d/ -f1")
 [[ -n "$A_V6" ]] \
   && pass "srv-a kept its overlay IPv6 address across 'ray down' + 'ray up' ($A_V6)" \
   || fail "srv-a lost its overlay IPv6 address on the down/up cycle (IPv4-only node)"

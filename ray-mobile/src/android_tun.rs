@@ -16,7 +16,7 @@ use bytes::{BufMut, BytesMut};
 use rayfish::tun::{TunRead, TunWrite};
 use tokio::io::unix::AsyncFd;
 
-/// One IP packet never exceeds the interface MTU (1280 on the desktop TUN); we
+/// One IP packet never exceeds the interface MTU (1500 bytes); we
 /// keep at least this much contiguous spare capacity before each read so a
 /// packet is never truncated.
 const READ_CHUNK: usize = 2048;

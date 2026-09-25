@@ -1,9 +1,10 @@
 //! Minimal, dependency-free ANSI styling for CLI output.
 //!
 //! Colors are applied only when stdout is a terminal and `NO_COLOR` is unset
-//! (honoring the https://no-color.org convention). `CLICOLOR_FORCE` overrides
+//! (honoring the <https://no-color.org> convention). `CLICOLOR_FORCE` overrides
 //! the TTY check so piped/captured output can still be colorized on request.
 
+use std::fmt;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +48,45 @@ fn paint(code: &str, s: &str) -> String {
     }
 }
 
+struct Styled<'a> {
+    code: &'static str,
+    value: &'a str,
+}
+
+impl fmt::Display for Styled<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if enabled() {
+            write!(f, "\x1b[{}m{}\x1b[0m", self.code, self.value)
+        } else {
+            f.write_str(self.value)
+        }
+    }
+}
+
+/// Returns a green terminal value that writes directly to a formatter.
+pub fn green_display(value: &str) -> impl fmt::Display + '_ {
+    Styled {
+        code: "38;5;42",
+        value,
+    }
+}
+
+/// Returns a faint terminal value that writes directly to a formatter.
+pub fn faint_display(value: &str) -> impl fmt::Display + '_ {
+    Styled {
+        code: "38;5;240",
+        value,
+    }
+}
+
+/// Returns a red terminal value that writes directly to a formatter.
+pub fn red_display(value: &str) -> impl fmt::Display + '_ {
+    Styled {
+        code: "38;5;203",
+        value,
+    }
+}
+
 // Palette: mirrors the rose/emerald/zinc identity used on the website mockup.
 /// Brand accent (the prompt, join codes). rose-400-ish.
 pub fn rose(s: &str) -> String {
@@ -54,7 +94,7 @@ pub fn rose(s: &str) -> String {
 }
 /// Success / live / online. emerald-400-ish.
 pub fn green(s: &str) -> String {
-    paint("38;5;42", s)
+    green_display(s).to_string()
 }
 /// Secondary labels (IPv4 / IPv6 / join). zinc-500-ish.
 pub fn label(s: &str) -> String {
@@ -62,19 +102,19 @@ pub fn label(s: &str) -> String {
 }
 /// Tertiary, easy-to-ignore text (comments, hints). zinc-600-ish.
 pub fn faint(s: &str) -> String {
-    paint("38;5;240", s)
+    faint_display(s).to_string()
 }
-/// Primary value text, bright and readable.
+/// Primary value text: theme-adaptive default foreground (not bold).
 pub fn value(s: &str) -> String {
-    paint("38;5;252", s)
+    paint("39", s)
 }
-/// Emphasis for names/headlines.
+/// Emphasis for names/headlines: bold default foreground.
 pub fn bold(s: &str) -> String {
-    paint("1;38;5;255", s)
+    paint("1", s)
 }
 /// Warning / loss. red-400-ish.
 pub fn red(s: &str) -> String {
-    paint("38;5;203", s)
+    red_display(s).to_string()
 }
 
 /// Whether colorized/styled output is active (TTY + not `NO_COLOR`). Exposed so

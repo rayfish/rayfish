@@ -110,7 +110,7 @@ class TunnelTileService : TileService() {
         val tile = qsTile ?: return
         tile.state = if (active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.subtitle = if (active) "Tunnel on" else "Tunnel off"
+            tile.subtitle = if (active) getString(R.string.tile_tunnel_on) else getString(R.string.tile_tunnel_off)
         }
         tile.updateTile()
     }

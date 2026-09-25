@@ -4,6 +4,7 @@
 //! peer-cleanup-adjacent helpers that drive reconvergence live here.
 
 use std::net::Ipv6Addr;
+use url::Url;
 
 use super::super::*;
 
@@ -116,9 +117,10 @@ pub(crate) fn apply_suggested_firewall(
 /// same reason, as the mesh path.
 pub(crate) async fn resolve_signed(
     endpoint: &Endpoint,
+    relay_url: &Url,
     net_pubkey: EndpointId,
 ) -> Option<(blake3::Hash, Vec<EndpointId>, u64)> {
-    let client = dht::create_pkarr_client(endpoint).ok()?;
+    let client = dht::create_pkarr_client(endpoint, relay_url).ok()?;
     let packet = dht::resolve_network_packet(&client, net_pubkey)
         .await
         .ok()?;
@@ -187,8 +189,19 @@ pub(crate) async fn fetch_verified_blob(
             );
             continue;
         }
-        match crate::membership::open_group_blob(&bytes, read_key, &net_pubkey) {
-            Ok(data) => return Some(data),
+        match crate::membership::decode_group_blob(&bytes) {
+            Ok(data) => {
+                if let Err(e) = retain_group_blob(blob_store, &bytes).await {
+                    tracing::warn!(
+                        network = %network_name,
+                        peer = %pid.fmt_short(),
+                        error = %e,
+                        "reconverge: failed to retain verified group blob"
+                    );
+                    return None;
+                }
+                return Some(data);
+            }
             Err(e) => {
                 // Two different failures land here and they want different
                 // advice, so tell them apart: sealed bytes we hold no key for is
@@ -215,26 +228,18 @@ pub(crate) async fn fetch_verified_blob(
     None
 }
 
-/// Ask this network's coordinators for its roster read key.
-///
-/// Sent to every connected coordinator rather than one, because "which
-/// coordinator is reachable" is not something a member that cannot even read the
-/// roster is well placed to answer. This is the already-a-member case, so it
-/// presents no invite: the receiver recognises us from its own roster.
-pub(crate) async fn request_read_key(
-    peers: &PeerTable,
-    net_pubkey: EndpointId,
-    network_name: &str,
-) {
-    let msg = ControlMsg::ReadKeyRequest {
-        invite_secret: None,
-        device_cert: None,
-    };
-    for (_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
-        if let Err(e) = open_and_send(&conn, Some(net_pubkey), &msg).await {
-            tracing::debug!(peer_ip = %ip, error = %e, "read key request failed");
-        }
-    }
+/// Compute a generation directly from the blob-bearing fields. `snapshot` is a
+/// publication cache and may lag mutations that have not reached
+/// `refresh_snapshot` yet, so it cannot safely guard an in-flight reconverge.
+fn current_group_hash(state: &NetworkState) -> blake3::Hash {
+    group_blob_hash(
+        &state.members,
+        &state.approved,
+        &state.suggested_firewall,
+        state.group_name.as_deref(),
+        &state.reusable_keys,
+        &state.nullifiers,
+    )
 }
 
 /// Reconverge the live network state from the signed pkarr record and apply it
@@ -264,12 +269,30 @@ pub(crate) async fn reconverge_and_apply(
         registry,
         ..
     } = ctx;
-    let floor = state.read().unwrap().last_record_timestamp;
-    let Some((signed, seeds, record_ts)) = resolve_signed(endpoint, net_pubkey).await else {
+    if !confirm_pending_snapshot_durability(state, blob_store, network_name).await {
+        tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
+        return;
+    }
+    let (floor, generation) = {
+        let s = state.read().unwrap();
+        (s.last_record_timestamp, current_group_hash(&s))
+    };
+    let Some((signed, seeds, record_ts)) =
+        resolve_signed(endpoint, &registry.transport.pkarr_relay_url, net_pubkey).await
+    else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
     };
+    if pending_authored_group_hash(state, network_name).is_some_and(|pending| pending != signed) {
+        tracing::debug!(network = %network_name, "reconverge: keeping a durably authored snapshot until its publication is confirmed");
+        return;
+    }
     if !state.read().unwrap().needs_reconverge(signed) {
+        // A prior apply may have reached live state while its config write failed.
+        // Retry the durable pointer even though no blob reconvergence is needed;
+        // the stored verified bytes make this safe and stale pointers stay
+        // unpublishable in the meantime.
+        persist_group_hash_if_needed(state, blob_store, network_name, signed, true).await;
         // Already converged on the signed hash. Even so, check whether we have
         // been nullified in the blob we already hold (e.g. we applied it while
         // still offline-blocked from ever receiving `ControlMsg::Unpaired`): if so,
@@ -283,7 +306,7 @@ pub(crate) async fn reconverge_and_apply(
             && self_is_nullified(cert, &roster, &nullifiers)
         {
             tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = registry.clone();
+            let registry = Arc::clone(registry);
             tokio::spawn(async move {
                 let _ = registry.unpair_self().await;
             });
@@ -342,7 +365,6 @@ pub(crate) async fn reconverge_and_apply(
         }
         return;
     };
-    state.write().unwrap().last_record_timestamp = Some(record_ts);
     // Self-unpair: if our own device cert is nullified in this (verified, signed)
     // blob and the blob is coordinated by our *own* primary, the primary has
     // revoked this device. Tear ourselves out (delete the cert + leave every
@@ -351,30 +373,56 @@ pub(crate) async fn reconverge_and_apply(
     // poller already fetches, so it needs no live mesh link. The
     // own-primary-coordinator gate stops a foreign network's coordinator from
     // forcing a global deauth by listing our key.
-    if let Some(cert) = device_cert
-        && self_is_nullified(cert, &data.members, &data.nullifiers)
-    {
-        tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            let _ = registry.unpair_self().await;
-        });
+    let self_nullified = device_cert
+        .as_ref()
+        .is_some_and(|cert| self_is_nullified(cert, &data.members, &data.nullifiers));
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
+    let commit_guard = commit.lock().await;
+    // A local author may have refreshed live state before its blob and recovery
+    // pointer became durable while this fetch was in flight. Re-check provenance
+    // under the same commit lock before an older signed record can replace it.
+    if state.read().unwrap().unconfirmed_durable_hash.is_some() {
+        tracing::debug!(network = %network_name, "reconverge: local snapshot durability became pending while fetching");
+        return;
+    }
+    if pending_authored_group_hash(state, network_name).is_some_and(|pending| pending != signed) {
+        tracing::debug!(network = %network_name, "reconverge: keeping a durably authored snapshot until its publication is confirmed");
         return;
     }
     // No tiebreak: an address is blake3 of the identity, so two coordinators
     // admitting concurrently cannot produce a roster with duplicate addresses.
+    // Revalidate and replace under one write guard so a mutation cannot land in
+    // the gap and then be overwritten by this fetched state.
     let roster = {
         let mut s = state.write().unwrap();
+        if current_group_hash(&s) != generation {
+            tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
+            return;
+        }
+        if self_nullified {
+            drop(s);
+            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+            let registry = Arc::clone(registry);
+            tokio::spawn(async move {
+                let _ = registry.unpair_self().await;
+            });
+            return;
+        }
         s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
+        s.group_name = data.name.clone();
+        s.reusable_keys = data.reusable_keys.clone();
         s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
         // What the network agreed on, which is not our re-encoding of it unless
         // the publisher writes the same bytes we would. See `converged_hash`.
         s.converged_hash = Some(signed);
+        s.last_record_timestamp = Some(record_ts);
         s.roster()
     };
+    persist_group_hash_locked(state, blob_store, network_name, signed, true).await;
+    drop(commit_guard);
     apply_roster_to_dns(
         &roster,
         network_name,
@@ -473,18 +521,35 @@ pub(crate) fn prune_departed_peers(
             continue;
         }
         tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
-        pruned_peers.insert((network_name.to_string(), peer_id));
         // One connection carries every shared network, so only close it when this
         // was the peer's last network with us; otherwise just drop this network's
-        // route and leave the peer reachable on the others (`remove_peer_from_network`
-        // returns the connection iff its network set emptied).
-        if let Some(conn) = peers.remove_peer_from_network(&derive_ipv6(&peer_id), network_name) {
+        // route and leave the peer reachable on the others.
+        if let Some(conn) = revoke_peer_network(
+            peers,
+            pruned_peers,
+            network_name,
+            peer_id,
+            derive_ipv6(&peer_id),
+        ) {
             conn.close(
                 VarInt::from_u32(forward::KICK_CODE),
                 b"removed from network",
             );
         }
     }
+}
+
+/// Revoke one peer's authorization on one network. Returns its transport only
+/// when no other authorized network still shares it, so the caller can close it.
+pub(crate) fn revoke_peer_network(
+    peers: &PeerTable,
+    pruned_peers: &Arc<DashSet<(String, EndpointId)>>,
+    network: &str,
+    peer_id: EndpointId,
+    peer_ip: Ipv6Addr,
+) -> Option<Connection> {
+    pruned_peers.insert((network.to_string(), peer_id));
+    peers.remove_peer_from_network(&peer_ip, network)
 }
 
 /// Register the connections we already hold for peers this roster lists but whose
@@ -570,7 +635,7 @@ pub(crate) async fn apply_roster_to_dns(
         .find(|m| m.identity == my_identity)
         .and_then(|m| m.hostname.clone());
 
-    if let Ok(Some(mut net)) = config::load_network(network_name) {
+    let _ = config::update_network(network_name, |net| {
         match net.pending_hostname.clone() {
             // A locally-requested rename is in flight. Until the blob confirms
             // it, keep showing/persisting the requested name and don't let a
@@ -591,13 +656,11 @@ pub(crate) async fn apply_roster_to_dns(
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);
-                    let _ = config::save_network(&net);
                 }
             }
             // Either the rename landed, or there was none: follow the blob and
             // clear any (now-confirmed) pending intent.
             pending => {
-                let mut dirty = false;
                 if let Some(p) = &pending {
                     tracing::info!(
                         network = %network_name,
@@ -606,20 +669,16 @@ pub(crate) async fn apply_roster_to_dns(
                         "rename confirmed by signed blob; clearing pending intent"
                     );
                     net.pending_hostname = None;
-                    dirty = true;
                 }
                 if let Some(mine) = blob_self.clone()
                     && net.my_hostname.as_deref() != Some(mine.as_str())
                 {
                     net.my_hostname = Some(mine);
-                    dirty = true;
-                }
-                if dirty {
-                    let _ = config::save_network(&net);
                 }
             }
         }
-    }
+        Ok(())
+    });
 
     dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
 }
@@ -650,7 +709,7 @@ pub(crate) fn spawn_group_poller(
         #[cfg(not(target_os = "android"))]
         let period = GROUP_POLL_INTERVAL;
         let mut tick = tokio::time::interval(period);
-        let nudge = registry.poll_nudge.clone();
+        let nudge = Arc::clone(&registry.poll_nudge);
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
@@ -676,6 +735,13 @@ pub(crate) fn spawn_group_poller(
                 }
             };
 
+            if pending_authored_group_hash(&state, &network_name)
+                .is_some_and(|pending| pending != remote_hash)
+            {
+                tracing::debug!(network = %network_name, "group poll: keeping a durably authored snapshot until its publication is confirmed");
+                continue;
+            }
+
             // Through the same method as the trigger-driven path, so the two
             // cannot answer "have we converged on this record" differently. They
             // did: this one open-coded the comparison against the snapshot hash,
@@ -684,13 +750,15 @@ pub(crate) fn spawn_group_poller(
             // so a member whose bytes differ from the publisher's refetched the
             // whole roster, re-materialized the suggested firewall and nudged the
             // exit reconcile once a minute, forever.
-            let current_hash = {
+            let (needs_reconverge, current_hash) = {
                 let s = state.read().unwrap();
-                if !s.needs_reconverge(remote_hash) {
-                    continue;
-                }
-                s.converged_hash
+                (s.needs_reconverge(remote_hash), s.converged_hash)
             };
+            if !needs_reconverge {
+                persist_group_hash_if_needed(&state, &blob_store, &network_name, remote_hash, true)
+                    .await;
+                continue;
+            }
 
             tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
 
@@ -722,6 +790,8 @@ pub(crate) enum ReconvergeOutcome {
     Applied,
     /// The blob could not be fetched from any peer or seed; nothing changed.
     Unfetched,
+    /// State changed while the blob was in flight, so its result was discarded.
+    Superseded,
     /// This node is no longer part of the network (kicked, or its own primary
     /// nullified this device). The caller should stop polling this network.
     Departed,
@@ -747,6 +817,17 @@ pub(crate) async fn fetch_and_apply_blob(
     remote_hash: blake3::Hash,
     seed_peers: &[EndpointId],
 ) -> ReconvergeOutcome {
+    if !confirm_pending_snapshot_durability(state, blob_store, network_name).await {
+        tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
+        return ReconvergeOutcome::Superseded;
+    }
+    if pending_authored_group_hash(state, network_name)
+        .is_some_and(|pending| pending != remote_hash)
+    {
+        tracing::debug!(network = %network_name, "reconverge: refusing to replace a pending authored snapshot with an older published record");
+        return ReconvergeOutcome::Superseded;
+    }
+    let generation = current_group_hash(&state.read().unwrap());
     // Fetch the verified blob from any connected peer *or* the record's seed
     // peers. Including the seeds is essential: a node that has been isolated
     // (e.g. an unpaired device the coordinator already severed) has no connected
@@ -781,54 +862,88 @@ pub(crate) async fn fetch_and_apply_blob(
     // nullifiers (`ray unpair`). Tear ourselves out even though we never
     // received `ControlMsg::Unpaired` (we were offline/severed). Rides the
     // signed blob, so it needs no live mesh link. See `self_is_nullified`.
-    if let Some(cert) = crate::identity::load_device_cert().ok().flatten()
-        && self_is_nullified(&cert, &data.members, &data.nullifiers)
-    {
-        tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            let _ = registry.unpair_self().await;
-        });
-        return ReconvergeOutcome::Departed;
-    }
+    let self_nullified = crate::identity::load_device_cert()
+        .ok()
+        .flatten()
+        .is_some_and(|cert| self_is_nullified(&cert, &data.members, &data.nullifiers));
 
-    // Reconcile: find removed peers
-    let old_members: Vec<EndpointId> = {
-        let s = state.read().unwrap();
-        s.members.all().iter().map(|m| m.identity).collect()
-    };
     let new_member_ids: std::collections::HashSet<EndpointId> =
         data.members.iter().map(|m| m.identity).collect();
-
-    for old_id in &old_members {
-        if !new_member_ids.contains(old_id) {
-            let s = state.read().unwrap();
-            if s.members.get(old_id).is_some() {
-                peers.remove(&derive_ipv6(old_id));
-                tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
-            }
-        }
-    }
-
     let my_id = endpoint.id();
-    if !new_member_ids.contains(&my_id) && !data.approved.iter().any(|a| a.identity == my_id) {
-        tracing::warn!("we have been removed from the network");
-        return ReconvergeOutcome::Departed;
-    }
+    let self_removed =
+        !new_member_ids.contains(&my_id) && !data.approved.iter().any(|a| a.identity == my_id);
 
-    // Update state and re-materialize suggested firewall rules from the freshly
-    // verified blob. Suggestions ride in the blob, so they are refreshed here.
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
+    let commit_guard = commit.lock().await;
+    // The live generation can become durable after the optimistic check above
+    // but before this lock is acquired. Once its pending pointer exists, an older
+    // signed record must not roll it back.
+    if state.read().unwrap().unconfirmed_durable_hash.is_some() {
+        tracing::debug!(network = %network_name, "reconverge: local snapshot durability became pending while fetching");
+        return ReconvergeOutcome::Superseded;
+    }
+    if pending_authored_group_hash(state, network_name)
+        .is_some_and(|pending| pending != remote_hash)
+    {
+        tracing::debug!(network = %network_name, "reconverge: refusing to replace a pending authored snapshot with an older published record");
+        return ReconvergeOutcome::Superseded;
+    }
+    // Revalidate and replace under one write guard so a mutation cannot land in
+    // the gap and then be overwritten by this fetched state.
     {
         let mut s = state.write().unwrap();
+        if current_group_hash(&s) != generation {
+            tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
+            return ReconvergeOutcome::Superseded;
+        }
+        if self_nullified {
+            drop(s);
+            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+            let registry = Arc::clone(registry);
+            tokio::spawn(async move {
+                let _ = registry.unpair_self().await;
+            });
+            return ReconvergeOutcome::Departed;
+        }
+        if self_removed {
+            drop(s);
+            tracing::warn!(network = %network_name, "we have been removed from the network");
+            // Run cleanup outside this network's poller. Teardown cancels and
+            // awaits every network task, including the task currently returning
+            // from this function.
+            let registry = Arc::clone(registry);
+            let network_name = network_name.to_owned();
+            tokio::spawn(async move {
+                registry.remove_kicked_network(&network_name).await;
+            });
+            return ReconvergeOutcome::Departed;
+        }
         s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
+        s.group_name = data.name.clone();
+        s.reusable_keys = data.reusable_keys.clone();
         s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
         // The hash the network agreed on, not our re-encoding of it. See
         // `converged_hash`.
         s.converged_hash = Some(remote_hash);
     }
+
+    // Revoke the removed peer's network route immediately. If this was the last
+    // network shared over the transport, close it as well. This is the security
+    // boundary: the kicked device does not have to receive or honor a message.
+    prune_departed_peers(
+        peers,
+        &registry.device_user_map,
+        &registry.pruned_peers,
+        state,
+        network_name,
+        my_id,
+    );
+
+    persist_group_hash_locked(state, blob_store, network_name, remote_hash, true).await;
+    drop(commit_guard);
     apply_suggested_firewall(fw, endpoint.id(), network_name, state);
 
     // Exit-node reconciliation. The fresh roster may have wiped our advertised
@@ -853,9 +968,11 @@ pub(crate) fn now_secs() -> u64 {
 }
 
 #[cfg(test)]
-mod self_nullified_tests {
+mod reconverge_tests {
     use super::*;
-    use iroh::SecretKey;
+    use iroh::{Endpoint, SecretKey};
+
+    const TEST_ALPN: &[u8] = b"rayfish/revoke-test";
 
     fn member(identity: EndpointId, is_coordinator: bool) -> Member {
         Member {
@@ -868,6 +985,60 @@ mod self_nullified_tests {
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
         }
+    }
+
+    fn state_with_members(members: Vec<Member>) -> SharedNetworkState {
+        Arc::new(RwLock::new(NetworkState {
+            members: MemberList::from_members(members),
+            approved: ApprovedList::new(),
+            snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
+            converged_hash: None,
+            unconfirmed_durable_hash: None,
+            network_secret_key: None,
+            network_public_key: SecretKey::generate().public(),
+            network_name: Some("test-network".to_string()),
+            group_name: Some("test-network".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+            last_record_timestamp: None,
+        }))
+    }
+
+    async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let server = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind server endpoint");
+        let client = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind client endpoint");
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("accept connection")
+            })
+        };
+        let client_conn = client
+            .connect(server.addr(), TEST_ALPN)
+            .await
+            .expect("connect client");
+        let server_conn = accept.await.expect("accept task");
+        (server, client, server_conn, client_conn)
     }
 
     #[test]
@@ -898,5 +1069,62 @@ mod self_nullified_tests {
             &roster,
             &std::collections::BTreeSet::new()
         ));
+    }
+
+    #[tokio::test]
+    async fn roster_removal_closes_the_last_shared_connection() {
+        let (server, client, conn, remote) = connected_pair().await;
+        let peer_id = conn.remote_id();
+        let peer_ip = derive_ipv6(&peer_id);
+        let peers = PeerTable::new();
+        peers.add(peer_ip, conn, peer_id, "test-network");
+        let pruned = Arc::new(DashSet::new());
+
+        prune_departed_peers(
+            &peers,
+            &peers::DeviceUserMap::new(),
+            &pruned,
+            &state_with_members(Vec::new()),
+            "test-network",
+            server.id(),
+        );
+
+        assert!(!peers.shares_network_v6(&peer_ip, "test-network"));
+        assert!(pruned.contains(&("test-network".to_string(), peer_id)));
+        tokio::time::timeout(Duration::from_secs(3), remote.closed())
+            .await
+            .expect("the revoked connection should close");
+        server.close().await;
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn roster_removal_keeps_a_connection_authorized_by_another_network() {
+        let (server, client, conn, remote) = connected_pair().await;
+        let peer_id = conn.remote_id();
+        let peer_ip = derive_ipv6(&peer_id);
+        let peers = PeerTable::new();
+        peers.add(peer_ip, conn.clone(), peer_id, "test-network");
+        peers.add(peer_ip, conn, peer_id, "other-network");
+
+        prune_departed_peers(
+            &peers,
+            &peers::DeviceUserMap::new(),
+            &Arc::new(DashSet::new()),
+            &state_with_members(Vec::new()),
+            "test-network",
+            server.id(),
+        );
+
+        assert!(!peers.shares_network_v6(&peer_ip, "test-network"));
+        assert!(peers.shares_network_v6(&peer_ip, "other-network"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), remote.closed())
+                .await
+                .is_err(),
+            "a connection still authorized on another network must remain open"
+        );
+        server.close().await;
+        client.close().await;
     }
 }

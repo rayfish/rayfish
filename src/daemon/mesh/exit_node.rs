@@ -238,36 +238,32 @@ impl NetworkRegistry {
         peer: &str,
         allow: bool,
     ) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
         // Resolve to a stored allow-entry: `*` stays literal, otherwise the peer's
         // **user identity** hex, so a paired multi-device peer matches on any of
         // its devices (same normalization the SSH allow-list uses).
         let entry = if peer == "*" {
             "*".to_string()
         } else {
-            match self.resolve_peer_flexible(peer).await {
+            match self.resolve_peer_in_network(network, peer) {
                 Some(id) => self.device_user_map.resolve(&id).to_string(),
                 None => return ipc_err(format!("could not resolve peer: {peer}")),
             }
         };
-        let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) else {
-            return ipc_err(format!("no such network: {network}"));
-        };
-        if allow {
-            if !net.exit_allow.iter().any(|p| p == &entry) {
-                net.exit_allow.push(entry.clone());
+        let net = match config::update_network(network, |net| {
+            if allow {
+                if !net.exit_allow.iter().any(|p| p == &entry) {
+                    net.exit_allow.push(entry.clone());
+                }
+            } else {
+                net.exit_allow.retain(|p| p != &entry);
             }
-        } else {
-            net.exit_allow.retain(|p| p != &entry);
-        }
+            Ok(())
+        }) {
+            Ok(Some(net)) => net,
+            Ok(None) => return ipc_err(format!("no such network: {network}")),
+            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
+        };
         let offering = !net.exit_allow.is_empty();
-        let net = net.clone();
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to persist network config: {e}"));
-        }
         // Not advertised from here: the roster flag must reflect a gateway that
         // actually forwards, so [`Self::sync_exit_offers`] publishes it only once
         // the reconcile has the kernel state in place (now if the daemon is up,
@@ -292,10 +288,6 @@ impl NetworkRegistry {
     /// over IPv4 alone would receive this node's traffic and have no uplink to
     /// masquerade it onto. Refusing here turns a silent black hole into a sentence.
     pub(crate) async fn exit_node_use(&self, network: &str, peer: Option<String>) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
         // Validate the selection against the live roster before persisting.
         // Set when the gateway is allowed on an absent IPv6 claim rather than a
         // positive one, so the reply can say so: a log line is not where someone
@@ -303,7 +295,7 @@ impl NetworkRegistry {
         let mut unverified = false;
         let selection = match &peer {
             Some(name) => {
-                let Some(id) = self.resolve_peer_flexible(name).await else {
+                let Some(id) = self.resolve_peer_in_network(network, name) else {
                     return ipc_err(format!("could not resolve peer: {name}"));
                 };
                 let member = self.roster_member(network, id);
@@ -329,13 +321,13 @@ impl NetworkRegistry {
             }
             None => None,
         };
-        let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) else {
-            return ipc_err(format!("no such network: {network}"));
-        };
-        net.exit_node_use = selection;
-        let net = net.clone();
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to persist network config: {e}"));
+        match config::update_network(network, |net| {
+            net.exit_node_use = selection;
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            Ok(None) => return ipc_err(format!("no such network: {network}")),
+            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
         }
         // "All traffic" would be a lie: the mesh carries no IPv4, so the tunnel
         // takes IPv6 and leaves the host's IPv4 egress where it already was. Say
@@ -822,37 +814,36 @@ impl NetworkRegistry {
         set: impl Fn(&mut Member) -> bool,
     ) {
         let user_id = self.device_user_map.resolve(&sender);
-        let changed = match self.networks.get(network) {
-            Some(h) => {
-                let mut s = h.state.write().unwrap();
-                if s.network_secret_key.is_none() {
-                    tracing::debug!(network = %network, "{what} received but we hold no network key; ignoring");
-                    return;
-                }
-                // The roster keys a member by its own identity, which for a paired
-                // multi-device peer is the user identity rather than the device id
-                // the datagram arrived under. Try both.
-                let Some(id) = [sender, user_id]
-                    .into_iter()
-                    .find(|id| s.members.get(id).is_some())
-                else {
-                    tracing::warn!(
-                        network = %network,
-                        sender = %sender.fmt_short(),
-                        "{what} from a peer the roster does not list; ignoring"
-                    );
-                    return;
-                };
-                let changed = match s.members.get_mut(&id) {
-                    Some(member) => set(member),
-                    None => false,
-                };
-                if changed {
-                    s.refresh_snapshot();
-                }
-                changed
-            }
+        let (state, dht_notify) = match self.networks.get(network) {
+            Some(h) => (Arc::clone(&h.state), h.dht_notify.clone()),
             None => return,
+        };
+        let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
+        let _commit_guard = snapshot_commit.lock().await;
+        let changed = {
+            let mut s = state.write().unwrap();
+            if s.network_secret_key.is_none() {
+                tracing::debug!(network = %network, "{what} received but we hold no network key; ignoring");
+                return;
+            }
+            // The roster keys a member by its own identity, which for a paired
+            // multi-device peer is the user identity rather than the device id
+            // the datagram arrived under. Try both.
+            let Some(id) = [sender, user_id]
+                .into_iter()
+                .find(|id| s.members.get(id).is_some())
+            else {
+                tracing::warn!(
+                    network = %network,
+                    sender = %sender.fmt_short(),
+                    "{what} from a peer the roster does not list; ignoring"
+                );
+                return;
+            };
+            match s.members.get_mut(&id) {
+                Some(member) => set(member),
+                None => false,
+            }
         };
         tracing::debug!(
             network = %network,
@@ -861,7 +852,7 @@ impl NetworkRegistry {
             "{what} recorded"
         );
         if changed {
-            self.store_and_publish_group(network).await;
+            commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
         }
     }
 }

@@ -2,9 +2,9 @@ name: Nightly
 
 # Rolling pre-release built from every push to master. Moves the `nightly` tag
 # to the new commit, recreates the `nightly` pre-release, and overwrites its
-# Linux + macOS binaries. Consumed by `ray update --nightly`, which compares the
-# published checksum against the running binary (not the version) to decide
-# whether to swap — so a shared `0.x.y` across nightlies is fine.
+# Linux, macOS, and Windows CLI assets plus Android app artifacts. Desktop
+# installers stay on the stable release workflow. `ray update --nightly`
+# compares binary checksums.
 on:
   push:
     branches:
@@ -27,7 +27,7 @@ jobs:
     outputs:
       sha: ${{ steps.meta.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history + tags so git-cliff can list commits since last stable.
           fetch-depth: 0
@@ -92,16 +92,11 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             name: ray-macos-aarch64
-          - target: x86_64-apple-darwin
-            # Cross-compiled on Apple Silicon (universal SDK); macos-13 Intel
-            # runners are being retired and leave the job queued indefinitely.
-            runner: macos-latest
-            name: ray-macos-x86_64
 
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -149,6 +144,90 @@ jobs:
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
 
+  windows:
+    needs: roll-tag
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-x86_64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Build CLI and daemon
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features desktop --bin ray
+
+      - name: Package for release
+        shell: pwsh
+        run: |
+          $asset = 'ray-windows-x86_64.exe'
+          Copy-Item target/x86_64-pc-windows-msvc/release/ray.exe $asset
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Out-File -FilePath "$asset.sha256" -Encoding ascii
+
+      - name: Upload Windows nightly assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          files: |
+            ray-windows-x86_64.exe
+            ray-windows-x86_64.exe.sha256
+
+  # Windows nightlies are CLI/daemon binaries only. The x86_64 desktop app and
+  # MSI are stable-release artifacts.
+  windows-arm64:
+    needs: roll-tag
+    runs-on: windows-11-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-aarch64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Build binary
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc
+
+      # `<digest>  <name>`, matching what sha256sum writes on the other legs;
+      # the updater reads the first whitespace-separated field.
+      - name: Package for release
+        shell: pwsh
+        run: |
+          $asset = 'ray-windows-aarch64.exe'
+          Copy-Item target/aarch64-pc-windows-msvc/release/ray.exe $asset
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Out-File -FilePath "$asset.sha256" -Encoding ascii
+
+      - name: Upload Windows ARM64 nightly assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          files: |
+            ray-windows-aarch64.exe
+            ray-windows-aarch64.exe.sha256
+
   android:
     needs: roll-tag
     # 24.04 (glibc 2.39): the prebuilt cargo-ndk from install-action is linked
@@ -159,7 +238,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -169,7 +248,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "android"
+          shared-key: "release-android"
           cache-on-failure: true
 
       - name: Set up JDK 17
@@ -183,6 +262,9 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also requests the retired `tools` package.
+          packages: platform-tools
 
       # The NDK is ~1GB; cache it so we download it once per version instead of
       # on every run. sdkmanager below is a no-op on a cache hit.
@@ -212,7 +294,9 @@ jobs:
           cargo run -p ray-mobile --bin uniffi-bindgen -- generate \
             --library target/debug/libray_mobile.so \
             --language kotlin \
-            --out-dir android/app/src/main/java
+            --out-dir android/app/src/main/java \
+            --no-format
+          sh scripts/format-generated-kotlin.sh
 
       - name: Build APK
         working-directory: android

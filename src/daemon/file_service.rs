@@ -10,6 +10,7 @@
 
 use super::transfers;
 use super::*;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use iroh_blobs::api::remote::GetProgressItem;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio_util::io::ReaderStream;
 
 /// Upper bound on one background offer dial. `Endpoint::connect` retries
@@ -68,10 +70,10 @@ impl FileService {
     ///
     /// Best-effort and detached: a failed reclaim wastes disk, it never fails
     /// the transfer that triggered it, so the error is logged and swallowed.
-    fn reclaim_blob(self: &Arc<Self>, tag: String) {
-        let svc = Arc::clone(self);
+    fn reclaim_blob(&self, tag: String) {
+        let store = self.transport.blob_store.clone();
         tokio::spawn(async move {
-            if let Err(e) = svc.transport.blob_store.tags().delete(&tag).await {
+            if let Err(e) = store.tags().delete(&tag).await {
                 tracing::warn!(%tag, error = %e, "could not drop blob tag");
             }
         });
@@ -162,6 +164,14 @@ pub(crate) fn evict_oldest_file(pending: &mut Vec<PendingFile>, cap: usize) -> O
         "pending file-offer queue full; evicted oldest offer"
     );
     Some(dropped.id)
+}
+
+/// Take the queued offer with `id` out of `pending`, if it is still there.
+/// Shared by accept and reject: both consume the entry, and neither may leave
+/// it behind for the other to act on a second time.
+pub(crate) fn take_pending(pending: &mut Vec<PendingFile>, id: u64) -> Option<PendingFile> {
+    let i = pending.iter().position(|f| f.id == id)?;
+    Some(pending.remove(i))
 }
 
 /// How long an open pairing session stays open.
@@ -269,8 +279,8 @@ impl FileService {
     /// `FILES_ALPN`: read a single `FileOffer` and queue it for `ray files`.
     /// Rejects offers whose claimed sender doesn't match the dialing identity.
     pub(crate) async fn accept_file_offer(self: &Arc<Self>, conn: Connection) {
-        let pending = self.pending_files.clone();
-        let counter = self.file_id_counter.clone();
+        let pending = Arc::clone(&self.pending_files);
+        let counter = Arc::clone(&self.file_id_counter);
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
             Ok((_send, mut recv)) => {
@@ -297,6 +307,7 @@ impl FileService {
                                     blob_hash,
                                 });
                             }
+                            self.transfers.changed();
                             // Evaluate own-device auto-accept directly: it accepts
                             // only offers from our own paired devices on an opted-in
                             // network, and no-ops otherwise, so the offer stays
@@ -396,17 +407,19 @@ impl FileService {
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
     ) -> IpcMessage {
+        #[cfg(windows)]
+        let _ = peer_cred;
         let pending_file = {
             let mut pending = self.pending_files.lock().unwrap();
-            let idx = pending.iter().position(|f| f.id == id);
-            match idx {
-                Some(i) => pending.remove(i),
+            match take_pending(&mut pending, id) {
+                Some(f) => f,
                 None => {
                     return ipc_err(format!("no pending file with id {id}"));
                 }
             }
         };
 
+        self.transfers.changed();
         let blob_hash = iroh_blobs::Hash::from_bytes(*pending_file.blob_hash.as_bytes());
 
         let conn = match transport::connect_to_peer_with_alpn(
@@ -432,7 +445,7 @@ impl FileService {
         // the entry stuck in `Transferring`: its `Drop` marks the transfer
         // failed unless `success()` disarms it first, which only happens once
         // the file is actually on disk.
-        let finish_guard = transfers::FinishGuard::new(self.transfers.clone(), transfer_id);
+        let finish_guard = transfers::FinishGuard::new(Arc::clone(&self.transfers), transfer_id);
 
         // Claim the blob before fetching it. `fetch` leaves what it downloads
         // untagged, so a GC triggered by some other transfer finishing mid-fetch
@@ -512,6 +525,7 @@ impl FileService {
         // duplication: every accepted file used to be kept twice, forever.
         self.reclaim_blob(recv_tag);
 
+        #[cfg(unix)]
         if let Some((uid, gid)) = peer_cred {
             use std::os::unix::ffi::OsStrExt;
             if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
@@ -593,6 +607,15 @@ impl FileService {
     /// itself can see; IPC clients use `send_file_fd`. Kept for in-process
     /// callers (ray-mobile), where daemon and app share one privilege domain.
     pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> IpcMessage {
+        self.send_file_named(path, None, peer).await
+    }
+
+    pub(crate) async fn send_file_named(
+        self: &Arc<Self>,
+        path: &str,
+        requested_filename: Option<&str>,
+        peer: &str,
+    ) -> IpcMessage {
         let file_path = Path::new(path);
         // Same guard the fd path applies: a FIFO or a character device would
         // stall or balloon the import.
@@ -601,9 +624,14 @@ impl FileService {
             Ok(_) => return ipc_err(format!("not a regular file: '{}'", file_path.display())),
             Err(e) => return ipc_err(format!("cannot read '{}': {e}", file_path.display())),
         };
-        let filename = file_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
+        let filename = requested_filename
+            .and_then(|name| Path::new(name).file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| {
+                file_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
             .unwrap_or_else(|| "file".to_string());
 
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
@@ -633,6 +661,7 @@ impl FileService {
     /// client opened the file with its own privileges, the daemon never
     /// resolves a path. This is what lets `ray send` reach TCC-protected
     /// folders on macOS and files the daemon can't read but the caller can.
+    #[cfg(unix)]
     pub(crate) async fn send_file_fd(
         self: &Arc<Self>,
         fd: OwnedFd,
@@ -884,6 +913,24 @@ impl FileService {
         }
     }
 
+    /// Cancel an outgoing transfer after its offer was delivered. A packet
+    /// already in flight may finish, but this transfer cannot be revived and
+    /// the local blob is released for GC.
+    pub(crate) fn cancel_transfer(&self, id: u64) -> IpcMessage {
+        match self.transfers.cancel(id) {
+            Some((hash, peer)) => {
+                self.reclaim_blob(blob_tags::send(
+                    &blake3::Hash::from_bytes(*hash.as_bytes()),
+                    &peer,
+                ));
+                IpcMessage::Ok {
+                    message: format!("canceled file transfer {id}"),
+                }
+            }
+            None => ipc_err(format!("no active outgoing transfer with id {id}")),
+        }
+    }
+
     /// Persist the outbox (atomic write via `config::write_file`). Filenames
     /// and peers are not secrets in the config-dir threat model, but keep the
     /// file root-only like the rest of the daemon state.
@@ -927,18 +974,41 @@ impl FileService {
                 size: e.size,
             })
             .collect();
-        IpcMessage::FileList { files, outbox }
+        let transfers = self
+            .transfers
+            .list()
+            .into_iter()
+            .map(|t| ipc::TransferFileInfo {
+                id: t.id,
+                outgoing: t.outgoing,
+                peer: t.peer,
+                filename: t.filename,
+                size: t.size,
+                transferred: t.transferred,
+                state: match t.state {
+                    transfers::TransferState::Offered => ipc::TransferFileState::Offered,
+                    transfers::TransferState::Transferring => ipc::TransferFileState::Transferring,
+                    transfers::TransferState::Done => ipc::TransferFileState::Done,
+                    transfers::TransferState::Failed => ipc::TransferFileState::Failed,
+                },
+            })
+            .collect();
+        IpcMessage::FileList {
+            files,
+            outbox,
+            transfers,
+        }
     }
 
     /// Decline a pending file offer: drop it from the queue without fetching the
     /// blob. In-memory only, mirroring how `accept_file` consumes the entry.
     pub(crate) fn reject_file(&self, id: u64) -> IpcMessage {
         let mut pending = self.pending_files.lock().unwrap();
-        match pending.iter().position(|f| f.id == id) {
-            Some(i) => {
-                pending.remove(i);
+        match take_pending(&mut pending, id) {
+            Some(f) => {
+                self.transfers.changed();
                 IpcMessage::Ok {
-                    message: format!("declined file {id}"),
+                    message: format!("declined {} from {}", f.filename, f.from.fmt_short()),
                 }
             }
             None => ipc_err(format!("no pending file with id {id}")),
@@ -994,7 +1064,7 @@ impl FileService {
     /// secret against the active pairing session and, on match, signs and returns
     /// a `DeviceCert` binding the new device key to our identity.
     pub(crate) async fn accept_pair_request(&self, conn: Connection) {
-        let pairing_secret = self.pairing_secret.clone();
+        let pairing_secret = Arc::clone(&self.pairing_secret);
         let secret_key = self.secret_key.clone();
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
@@ -1085,7 +1155,7 @@ impl FileService {
                                 // fresh cert; otherwise the device would reconnect-
                                 // loop. Spawned so the reseal/publish doesn't delay
                                 // the cert response the joiner is waiting on.
-                                let registry = self.registry.clone();
+                                let registry = Arc::clone(&self.registry);
                                 tokio::spawn(async move {
                                     registry.reauth_device(device_pubkey).await;
                                 });
@@ -1136,6 +1206,39 @@ mod tests {
     use super::*;
     use iroh_blobs::Hash;
     use std::time::Instant;
+
+    fn pending(id: u64) -> PendingFile {
+        PendingFile {
+            id,
+            from: SecretKey::from([id as u8; 32]).public(),
+            filename: format!("file{id}.bin"),
+            size: 1,
+            mime_type: "application/octet-stream".to_string(),
+            blob_hash: blake3::hash(b"payload"),
+        }
+    }
+
+    /// `ray files accept` and `ray files reject` both consume the offer, so a
+    /// second command on the same id must find nothing left to act on.
+    #[test]
+    fn taking_a_pending_offer_removes_only_that_one() {
+        let mut queue = vec![pending(1), pending(2), pending(3)];
+
+        let taken = take_pending(&mut queue, 2).expect("id 2 is queued");
+        assert_eq!(taken.id, 2);
+        assert_eq!(
+            queue.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the other offers stay queued, in order"
+        );
+
+        assert!(
+            take_pending(&mut queue, 2).is_none(),
+            "an id already taken is gone, not taken twice"
+        );
+        assert!(take_pending(&mut queue, 99).is_none());
+        assert_eq!(queue.len(), 2, "a miss leaves the queue untouched");
+    }
 
     /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`
     /// must survive a JSON round trip (the file is reloaded across daemon
