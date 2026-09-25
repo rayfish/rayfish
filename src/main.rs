@@ -3,14 +3,15 @@
 // client built on top.
 use rayfish::term::{layout, picker, progress, style};
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, keybackup,
-    logdir, membership, onepassword, shutdown, stats,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, invite, ipc, logdir, membership,
+    onepassword, shutdown, stats,
 };
 
 use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
 use clap::{FromArgMatches, Parser, Subcommand};
+use iroh::EndpointId;
 use ray_proto::settings::node_key_help;
 
 use membership::GroupMode;
@@ -77,8 +78,11 @@ fn json_requested(command: &Command) -> bool {
         | Command::Firewall { json, .. }
         | Command::ExitNode { json, .. }
         | Command::Mdns { json, .. }
+        | Command::Dns { json, .. }
         | Command::Files { json, .. }
         | Command::Pair { json, .. }
+        | Command::Machines { json, .. }
+        | Command::Controller { json, .. }
         | Command::Identityof { json, .. }
         | Command::Alias { json, .. }
         | Command::Config { json, .. } => *json,
@@ -110,7 +114,7 @@ pub(crate) enum Command {
     },
     /// Join an existing network using its room id or an invite code
     Join {
-        /// The network public key (room id) or a one-time invite code
+        /// Network public key, invite code, or local network name with --delegate
         network_key: String,
         /// Optional local alias for the network
         #[arg(long)]
@@ -132,6 +136,9 @@ pub(crate) enum Command {
         /// devices, identity-checked); pass this to require manual acceptance.
         #[arg(long)]
         no_auto_accept_files: bool,
+        /// Run the join on an enrolled machine instead of this one.
+        #[arg(long)]
+        delegate: Option<ipc::ManagedMachineSelector>,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -139,6 +146,9 @@ pub(crate) enum Command {
         /// Three-word network name
         #[arg(add = complete::networks())]
         name: String,
+        /// Run the leave on an enrolled machine instead of this one.
+        #[arg(long)]
+        delegate: Option<ipc::ManagedMachineSelector>,
     },
     /// Destroy a network (coordinator only)
     Nuke {
@@ -160,6 +170,9 @@ pub(crate) enum Command {
         /// Member to remove: hostname, mesh IP, or short id
         #[arg(add = complete::peers())]
         peer: String,
+        /// Skip the confirmation when the member holds more than one device
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Set or show a per-network ephemeral policy (coordinator only)
     ///
@@ -173,8 +186,11 @@ pub(crate) enum Command {
         #[arg(add = complete::ephemeral_args())]
         arg: String,
     },
-    /// Show status of all networks (active + saved)
-    #[command(visible_aliases = ["st", "ls"])]
+    /// Show status of all networks
+    ///
+    /// Covers the networks the daemon has registered and the saved ones it has
+    /// not brought up yet.
+    #[command(visible_aliases = ["s", "st", "ls"])]
     Status {
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
@@ -206,39 +222,9 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
-        /// Contact only the relay and discovery servers you name, nothing else
-        ///
-        /// Needs --relay and --pkarr, or just --pkarr with --tor, unless they are
-        /// already set to servers of your own. Turns mDNS and auto-update off,
-        /// since both reach past those servers. Sticky: it survives restarts
-        /// until `ray up --no-private`.
-        #[arg(long, conflicts_with = "no_private")]
-        private: bool,
-        /// Leave private mode, going back to the default servers
+        /// Enroll this machine with a controller after bringing the daemon up.
         #[arg(long)]
-        no_private: bool,
-        /// Reach peers over Tor only: no UDP socket, no relay, nothing published
-        ///
-        /// A peer's onion address is derived from its identity, so this needs no
-        /// discovery to be reachable. Requires a Tor daemon with ControlPort 9051.
-        /// Sticky, like --private; leave it with `ray up --no-tor`.
-        #[arg(long, conflicts_with = "no_tor")]
-        tor: bool,
-        /// Leave Tor mode, going back to direct connections
-        #[arg(long)]
-        no_tor: bool,
-        /// Relay servers to use instead of the defaults (comma-separated)
-        ///
-        /// Not accepted with --tor: onion routing needs no holepunching and no
-        /// fallback, so a relay there is a server that would never be contacted.
-        #[arg(long, value_name = "URL", conflicts_with = "tor")]
-        relay: Option<String>,
-        /// pkarr discovery server to use instead of the default
-        #[arg(long, value_name = "URL")]
-        pkarr: Option<String>,
-        /// Skip the confirmation when leaving private mode
-        #[arg(long, requires = "no_private")]
-        yes: bool,
+        controller: Option<ipc::EnrollmentTicket>,
     },
     /// Standby: take the data plane offline, staying connected to peers
     ///
@@ -277,6 +263,7 @@ pub(crate) enum Command {
     /// Start a local browser GUI
     ///
     /// Covers the common workflows and every CLI command.
+    #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
     Gui {
         /// Localhost port to listen on (0 chooses a free port)
         #[arg(long, default_value_t = 0)]
@@ -301,7 +288,7 @@ pub(crate) enum Command {
     /// Peers awaiting approval; admit or reject them
     ///
     /// Coordinator only, and closed networks only. With no action, lists who is
-    /// waiting; `accept <id>` admits one and `deny <id>` turns it away.
+    /// waiting; `accept <name>` admits one and `deny <name>` turns it away.
     Requests {
         /// Network name
         #[arg(add = complete::networks())]
@@ -312,23 +299,23 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// The old spelling of `ray requests <network> accept <id>`.
+    /// The old spelling of `ray requests <network> accept <name>`.
     #[command(hide = true)]
     Accept {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
-        /// Short id of the pending peer (from `ray requests`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
-    /// The old spelling of `ray requests <network> deny <id>`.
+    /// The old spelling of `ray requests <network> deny <name>`.
     #[command(hide = true)]
     Deny {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
-        /// Short id of the pending peer (from `ray requests`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
@@ -440,7 +427,7 @@ pub(crate) enum Command {
     /// Offer or use an internet gateway
     ///
     /// Offer this node as a gateway, or route this node's traffic through one.
-    #[command(name = "exit-node")]
+    #[command(name = "exit-node", visible_alias = "e")]
     ExitNode {
         #[command(subcommand)]
         action: ExitNodeAction,
@@ -451,8 +438,7 @@ pub(crate) enum Command {
     /// Reconcile trusted networks against a deploy spec file
     ///
     /// Creates missing trusted networks, publishes idempotent firewall
-    /// suggestions, and reports the membership gap (expected vs joined hosts).
-    /// Never joins.
+    /// suggestions, and reconciles enrolled machines by hostname.
     Apply {
         /// Path to a TOML spec file (see `ray apply --example`).
         #[arg(value_hint = clap::ValueHint::FilePath)]
@@ -507,6 +493,14 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// Enable or disable Magic DNS system integration
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// The old spelling of `ray config set auto-update on|off`.
     #[command(name = "auto-update", hide = true)]
     AutoUpdate {
@@ -525,6 +519,7 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Authorize a user to run ray without sudo (requires root)
+    #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
     SetOperator {
         /// Username or numeric UID to grant operator access
         #[arg(value_hint = clap::ValueHint::Username)]
@@ -565,6 +560,22 @@ pub(crate) enum Command {
         /// (see `ray pair list`)
         #[arg(add = complete::paired_devices())]
         device: String,
+    },
+    /// List and enroll machines controlled by this node
+    Machines {
+        #[command(subcommand)]
+        action: Option<MachinesAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Manage controllers authorized by this machine
+    Controller {
+        #[command(subcommand)]
+        action: Option<ControllerAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Handle a rayfish:// deep link (join or pair)
     ///
@@ -666,8 +677,8 @@ pub(crate) enum PairAction {
     List,
     /// Export an encrypted backup of the signing key
     Backup {
-        /// Store the backup in 1Password (via the `op` CLI) instead of printing it
-        #[arg(long = "1password", alias = "op")]
+        /// Store the backup in 1Password instead of printing it
+        #[arg(long = "1p", aliases = ["1password", "op"])]
         onepassword: bool,
         /// 1Password vault (defaults to your default vault)
         #[arg(long)]
@@ -678,10 +689,10 @@ pub(crate) enum PairAction {
     },
     /// Restore a signing key from an encrypted backup
     Restore {
-        /// The encrypted backup string (omit when using --1password)
+        /// The encrypted backup string (omit when using --1p)
         backup: Option<String>,
-        /// Read the backup from 1Password (via the `op` CLI)
-        #[arg(long = "1password", alias = "op")]
+        /// Read the backup from 1Password
+        #[arg(long = "1p", aliases = ["1password", "op"])]
         onepassword: bool,
         /// 1Password vault (defaults to your default vault)
         #[arg(long)]
@@ -693,10 +704,52 @@ pub(crate) enum PairAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum MachinesAction {
+    /// Mint a machine-enrollment ticket
+    Enroll {
+        /// Allow this ticket to enroll more than one machine
+        #[arg(long)]
+        reusable: bool,
+        /// How long the ticket remains valid, such as 30m or 7d
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// List enrollment tickets and their status
+    Enrollments,
+    /// Revoke an enrollment ticket
+    RevokeEnrollment {
+        credential: ipc::EnrollmentCredentialSelector,
+    },
+    /// Forget an enrolled machine from this controller
+    Forget {
+        machine: ipc::ManagedMachineSelector,
+    },
+    /// Confirm an existing machine for inventory recovery
+    Confirm {
+        /// Full endpoint ID of a machine that already trusts this controller
+        machine: EndpointId,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ControllerAction {
+    /// Enroll this machine using a controller ticket
+    Add { ticket: ipc::EnrollmentTicket },
+    /// List authorized controllers
+    List,
+    /// Revoke one controller, or all controllers with --all
+    Revoke {
+        identity: Option<ipc::ControllerSelector>,
+        #[arg(long, conflicts_with = "identity")]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum AdminAction {
     /// Grant the network key to a member
     Add {
-        /// Short id of the member to promote (from `ray status`)
+        /// Member hostname, mesh IP, short id, or full identity
         #[arg(add = complete::peers())]
         identity: String,
     },
@@ -737,13 +790,13 @@ pub(crate) enum RequestsAction {
     /// Admit a peer waiting for approval
     #[command(visible_alias = "ok")]
     Accept {
-        /// Short id of the pending peer (from `ray requests <network>`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
     /// Reject a peer waiting for approval
     Deny {
-        /// Short id of the pending peer (from `ray requests <network>`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
@@ -760,7 +813,7 @@ pub(crate) enum ConnectAction {
     /// reads the same here as it does under `ray requests`.
     #[command(visible_aliases = ["ok", "accept"])]
     Approve {
-        /// Short id of the requester (from `ray connect`)
+        /// Hostname or short id of the requester
         #[arg(add = complete::connect_requests())]
         id: String,
     },
@@ -825,6 +878,14 @@ pub(crate) enum MdnsAction {
     /// Seeing a node grants it nothing: linking up still needs `ray connect`
     /// and the other side's approval.
     Scan,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DnsAction {
+    /// Configure the system resolver for .ray names
+    On,
+    /// Remove Rayfish's system DNS configuration
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1098,10 +1159,26 @@ pub(crate) enum FilesAction {
         #[arg(long, short, value_hint = clap::ValueHint::DirPath)]
         output: Option<String>,
     },
+    /// Decline a pending file transfer
+    ///
+    /// Drops the offer from the queue without fetching it. The sender is not
+    /// told: their offer is simply never pulled.
+    Reject {
+        /// Transfer ID (from 'ray files')
+        #[arg(add = complete::incoming_files())]
+        id: u64,
+    },
     /// Cancel a queued send that hasn't reached its peer yet
     Cancel {
         /// Queued-send ID (from 'ray files')
         #[arg(add = complete::queued_sends())]
+        id: u64,
+    },
+    /// Cancel an outgoing transfer
+    ///
+    /// Cancels a transfer that has already been offered or started.
+    CancelTransfer {
+        /// Transfer ID (from 'ray files')
         id: u64,
     },
     /// Auto-accept offers from your own devices (on|off)
@@ -1416,7 +1493,13 @@ async fn run() -> Result<()> {
     let _log_guard = init_tracing(matches!(cli.command, Command::Daemon));
 
     match cli.command {
-        Command::Leave { name } => ipc_leave(&name).await,
+        Command::Leave { name, delegate } => match delegate {
+            Some(machine) => {
+                let network = ipc::NetworkName::new(name);
+                ipc_delegated_leave(&machine, &network).await
+            }
+            None => ipc_leave(&name).await,
+        },
         Command::Create {
             open,
             closed: _,
@@ -1438,19 +1521,37 @@ async fn run() -> Result<()> {
             tor,
             auto_accept_firewall,
             no_auto_accept_files,
-        } => {
-            ipc_join(
-                &network_key,
-                name.as_deref(),
-                hostname,
-                tor,
-                auto_accept_firewall,
-                !no_auto_accept_files,
-            )
-            .await
-        }
+            delegate,
+        } => match delegate {
+            Some(machine) => {
+                if tor || name.is_some() {
+                    anyhow::bail!("--delegate does not support --tor or --name")
+                }
+                let network = ipc::NetworkName::new(network_key);
+                let hostname = hostname.map(|value| value.parse()).transpose()?;
+                ipc_delegated_join(
+                    &machine,
+                    &network,
+                    hostname,
+                    auto_accept_firewall,
+                    !no_auto_accept_files,
+                )
+                .await
+            }
+            None => {
+                ipc_join(
+                    &network_key,
+                    name.as_deref(),
+                    hostname,
+                    tor,
+                    auto_accept_firewall,
+                    !no_auto_accept_files,
+                )
+                .await
+            }
+        },
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
-        Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
+        Command::Kick { network, peer, yes } => ipc_kick(&network, &peer, yes).await,
         Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
         Command::Status { json: _ } => ipc_status().await,
         Command::Report => ipc_report().await,
@@ -1469,26 +1570,8 @@ async fn run() -> Result<()> {
         }
         Command::Up {
             hostname,
-            private,
-            no_private,
-            tor,
-            no_tor,
-            relay,
-            pkarr,
-            yes,
-        } => {
-            cmd_up(UpOptions {
-                hostname,
-                private,
-                no_private,
-                tor,
-                no_tor,
-                relay,
-                pkarr,
-                yes,
-            })
-            .await
-        }
+            controller,
+        } => cmd_up(hostname, controller).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
@@ -1496,6 +1579,7 @@ async fn run() -> Result<()> {
         Command::Install { auto_update } => cmd_install(auto_update).await,
         Command::Restart => cmd_restart().await,
         Command::Completions { shell, install } => complete::cmd_completions(shell, install),
+        #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::Gui { port, no_open } => cmd_gui(port, no_open),
         Command::Invite {
             network,
@@ -1566,8 +1650,10 @@ async fn run() -> Result<()> {
             json,
         } => cmd_alias(&network, action, json).await,
         Command::Mdns { action, json: _ } => cmd_mdns(action).await,
+        Command::Dns { action, json: _ } => cmd_dns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action, json } => cmd_config(action, json).await,
+        #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
         Command::Files { action, json: _ } => ipc_files(action).await,
@@ -1577,6 +1663,8 @@ async fn run() -> Result<()> {
             json: _,
         } => cmd_pair(action, ticket).await,
         Command::Unpair { device } => ipc_unpair(&device).await,
+        Command::Machines { action, json: _ } => ipc_machines(action).await,
+        Command::Controller { action, json: _ } => ipc_controller(action).await,
         Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
             println!("ray {FULL_VERSION}");
@@ -1634,6 +1722,20 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
     };
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
+        value: state.to_string(),
+        replace: false,
+    })
+    .await
+}
+
+/// `ray dns on|off`: apply or remove Magic DNS without changing the data plane.
+async fn cmd_dns(action: DnsAction) -> Result<()> {
+    let state = match action {
+        DnsAction::On => "on",
+        DnsAction::Off => "off",
+    };
+    ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: ipc::NodeKey::Global(ipc::GlobalKey::Dns),
         value: state.to_string(),
         replace: false,
     })
@@ -1725,19 +1827,42 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     return user.parse::<u32>().ok();
     #[cfg(unix)]
     {
-        use std::ffi::CString;
+        use std::{ffi::CString, mem::zeroed, ptr::null_mut};
         let cname = CString::new(user).ok()?;
-        let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-        if !pw.is_null() {
-            return Some(unsafe { (*pw).pw_uid });
+        // getpwnam_r, not getpwnam, for the same reason rayfish_gid uses
+        // getgrnam_r: the legacy call's answer lives in a process-wide buffer
+        // that any other lookup is allowed to move or free mid-read, which
+        // corrupts the heap on musl when callers run concurrently.
+        let mut buf_len = 4096;
+        loop {
+            let mut buf = vec![0u8; buf_len];
+            let mut pwbuf: libc::passwd = unsafe { zeroed() };
+            let mut result: *mut libc::passwd = null_mut();
+            let rc = unsafe {
+                libc::getpwnam_r(
+                    cname.as_ptr(),
+                    &mut pwbuf,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE {
+                buf_len *= 2;
+                continue;
+            }
+            if rc == 0 && !result.is_null() {
+                return Some(unsafe { (*result).pw_uid });
+            }
+            return user.parse::<u32>().ok();
         }
-        user.parse::<u32>().ok()
     }
 }
 
 /// `ray set-operator <user>`: authorize a local user to run mutating ray
 /// commands without sudo (Tailscale's `--operator` model). The daemon enforces
 /// that this call itself comes from root.
+#[cfg(not(all(target_os = "macos", feature = "macos-app")))]
 async fn cmd_set_operator(user: &str) -> Result<()> {
     // Windows writes the operator SID itself instead of asking the daemon. The
     // daemon has no Windows equivalent of the root check that authorizes
@@ -1777,7 +1902,68 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
 mod tests {
     use super::*;
     use ipc::FirewallRuleView;
-    use rayfish::update::{normalize_version, release_asset_name, version_is_newer};
+    use rayfish::update::{
+        nightly_asset_name, normalize_version, release_asset_name, version_is_newer,
+    };
+
+    #[test]
+    fn pair_backup_accepts_the_1password_flag_spellings() {
+        for flag in ["--1p", "--1password", "--op"] {
+            let cli = Cli::try_parse_from(["ray", "pair", "backup", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Pair {
+                    action: Some(PairAction::Backup {
+                        onepassword: true,
+                        ..
+                    }),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn delegated_network_commands_parse_machine_and_network_types() {
+        let join =
+            Cli::try_parse_from(["ray", "join", "--delegate", "build-box", "infra"]).unwrap();
+        match join.command {
+            Command::Join {
+                network_key,
+                delegate: Some(machine),
+                ..
+            } => {
+                assert_eq!(network_key, "infra");
+                assert_eq!(machine.as_ref(), "build-box");
+            }
+            _ => panic!("wrong command"),
+        }
+
+        let leave =
+            Cli::try_parse_from(["ray", "leave", "--delegate", "build-box", "infra"]).unwrap();
+        assert!(matches!(
+            leave.command,
+            Command::Leave {
+                name,
+                delegate: Some(machine),
+            } if name == "infra" && machine.as_ref() == "build-box"
+        ));
+    }
+
+    #[test]
+    fn up_parses_controller_ticket() {
+        let controller = iroh::EndpointAddr::from(iroh::SecretKey::generate().public());
+        let expected = ipc::EnrollmentTicket::new(controller, [7; 32]);
+        let encoded = expected.to_string();
+        let cli = Cli::try_parse_from(["ray", "up", "--controller", encoded.as_str()]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Up {
+                controller: Some(ticket),
+                ..
+            } if ticket == expected
+        ));
+    }
 
     #[test]
     fn strip_deleted_suffix_sanitizes_replaced_binary_path() {
@@ -1858,10 +2044,6 @@ mod tests {
             "ray-linux-aarch64"
         );
         assert_eq!(
-            release_asset_name("macos", "x86_64").unwrap(),
-            "ray-macos-x86_64"
-        );
-        assert_eq!(
             release_asset_name("macos", "aarch64").unwrap(),
             "ray-macos-aarch64"
         );
@@ -1869,10 +2051,19 @@ mod tests {
             release_asset_name("windows", "x86_64").unwrap(),
             "ray-windows-x86_64.msi"
         );
+        assert_eq!(
+            nightly_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.exe"
+        );
+        assert_eq!(
+            nightly_asset_name("windows", "aarch64").unwrap(),
+            "ray-windows-aarch64.exe"
+        );
     }
 
     #[test]
     fn release_asset_name_rejects_unsupported_platforms() {
+        assert!(release_asset_name("macos", "x86_64").is_err());
         assert!(release_asset_name("windows", "aarch64").is_err());
         assert!(release_asset_name("linux", "riscv64").is_err());
     }
@@ -1882,6 +2073,16 @@ mod tests {
         assert_eq!(normalize_version("v0.1.0"), "0.1.0");
         assert_eq!(normalize_version("0.1.0"), "0.1.0");
         assert_eq!(normalize_version("v1.2.3-rc1"), "1.2.3-rc1");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn nightly_updates_show_both_commit_labels() {
+        assert_eq!(
+            update_label("0.4.2", "nightly (abcdef12)"),
+            format!("nightly ({})", env!("RAY_GIT_SHA"))
+        );
+        assert_eq!(update_label("0.4.2", "v0.4.3"), "v0.4.2");
     }
 
     #[test]

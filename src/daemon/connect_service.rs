@@ -117,32 +117,45 @@ impl ConnectService {
         if contact_pubkey == self.transport.contact_public {
             return Err("cannot connect to your own contact id".to_string());
         }
-        let pkarr = dht::create_pkarr_client(&self.transport.endpoint)
-            .map_err(|e| format!("failed to create pkarr client: {e}"))?;
+        let pkarr =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
+                .map_err(|e| format!("failed to create pkarr client: {e}"))?;
         dht::resolve_contact(&pkarr, contact_pubkey)
             .await
             .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
     }
 
-    /// Approve a pending `ray connect` request by contact-id prefix: mint a
+    /// Approve a pending `ray connect` request by hostname or contact-id prefix: mint a
     /// restricted 2-peer network with the requester pre-approved (idempotent if
     /// already linked; defers to the higher endpoint id on a simultaneous
     /// cross-connect). The initiator's connect-retry loop then joins it.
-    pub(crate) async fn approve_connection(&self, id_prefix: &str) -> IpcMessage {
-        let found = self
+    pub(crate) async fn approve_connection(&self, selector: &str) -> IpcMessage {
+        let identity = match resolve_named_identity(
+            selector,
+            self.pending_connects
+                .iter()
+                .map(|request| (request.from_contact_id, request.hostname.clone())),
+        ) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                return ipc_err(format!(
+                    "no pending connection request matching '{selector}'"
+                ));
+            }
+            Err(()) => {
+                return ipc_err(format!(
+                    "pending connection request '{selector}' is ambiguous"
+                ));
+            }
+        };
+        let Some(req) = self
             .pending_connects
             .iter()
-            .find(|p| {
-                p.from_contact_id
-                    .fmt_short()
-                    .to_string()
-                    .starts_with(id_prefix)
-                    || p.from_contact_id.to_string().starts_with(id_prefix)
-            })
-            .map(|p| p.value().clone());
-        let Some(req) = found else {
+            .find(|request| request.from_contact_id == identity)
+            .map(|request| request.value().clone())
+        else {
             return ipc_err(format!(
-                "no pending connection request matching '{id_prefix}'"
+                "pending connection request '{selector}' disappeared"
             ));
         };
         let peer = req.from_endpoint;
@@ -367,28 +380,36 @@ impl ConnectService {
         IpcMessage::PendingRequests { requests }
     }
 
-    /// Decline a pending connection request by contact-id prefix.
-    pub(crate) fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
-        let found = self
-            .pending_connects
-            .iter()
-            .find(|p| {
-                p.from_contact_id
-                    .fmt_short()
-                    .to_string()
-                    .starts_with(id_prefix)
-                    || p.from_contact_id.to_string().starts_with(id_prefix)
-            })
-            .map(|p| *p.key());
+    /// Decline a pending connection request by hostname or contact-id prefix.
+    pub(crate) fn reject_connect(&self, selector: &str) -> IpcMessage {
+        let found = resolve_named_identity(
+            selector,
+            self.pending_connects
+                .iter()
+                .map(|request| (request.from_contact_id, request.hostname.clone())),
+        );
         match found {
-            Some(peer) => {
+            Ok(Some(identity)) => {
+                let peer = self
+                    .pending_connects
+                    .iter()
+                    .find(|request| request.from_contact_id == identity)
+                    .map(|request| *request.key());
+                let Some(peer) = peer else {
+                    return ipc_err(format!(
+                        "pending connection request '{selector}' disappeared"
+                    ));
+                };
                 self.pending_connects.remove(&peer);
                 IpcMessage::Ok {
-                    message: format!("declined connection request '{id_prefix}'"),
+                    message: format!("declined connection request '{selector}'"),
                 }
             }
-            None => ipc_err(format!(
-                "no pending connection request matching '{id_prefix}'"
+            Ok(None) => ipc_err(format!(
+                "no pending connection request matching '{selector}'"
+            )),
+            Err(()) => ipc_err(format!(
+                "pending connection request '{selector}' is ambiguous"
             )),
         }
     }
@@ -407,7 +428,8 @@ impl ConnectService {
             return ipc_err("contact key rotation did not run".to_string());
         };
         if self.active.load(Ordering::SeqCst)
-            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
+            && let Ok(client) =
+                dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
         {
             let _ = dht::publish_contact(&client, &secret, self.transport.endpoint.id()).await;
         }
@@ -420,8 +442,8 @@ impl ConnectService {
     /// to the dialing identity, replies `Approved` if already accepted
     /// (idempotent), else queues it as `Pending` for `ray connect approve`.
     pub(crate) async fn accept_connect_request(&self, conn: Connection) {
-        let pending = self.pending_connects.clone();
-        let approved = self.approved_connects.clone();
+        let pending = Arc::clone(&self.pending_connects);
+        let approved = Arc::clone(&self.approved_connects);
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {

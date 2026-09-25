@@ -58,7 +58,9 @@
 //! Explicit rules always win (first-match). Established return traffic only
 //! bypasses the *default* action, never an explicit rule.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+#[cfg(test)]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,6 +73,12 @@ use ray_proto::SuggestedFirewall;
 use ray_proto::ipc::FirewallRuleView;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+
+mod packet;
+
+#[cfg(test)]
+pub(crate) use packet::{IPV6_AH, IPV6_FRAGMENT};
+pub use packet::{IPV6_EXTENSION_HEADERS, PacketInfo, parse_packet_info};
 
 // Direction / Protocol / Action live in `ray-proto` so the IPC layer carries them
 // typed (not stringified); re-exported here so the daemon keeps its original
@@ -298,14 +306,13 @@ impl SharedFirewall {
 
     /// First matching explicit rule's action, or `None` if no rule matches.
     fn match_rule(
-        &self,
+        config: &FirewallConfig,
         direction: Direction,
         protocol: u8,
         dst_port: u16,
         peer: &EndpointId,
         network: Option<&str>,
     ) -> Option<Action> {
-        let config = self.inner.load();
         for rule in &config.rules {
             if rule.direction != direction {
                 continue;
@@ -340,8 +347,7 @@ impl SharedFirewall {
     /// direction. Inbound ICMP is *not* special-cased here: it is allowed by a
     /// seeded, removable `allow in icmp` rule (see [`default_icmp_rule`]) that the
     /// rule scan matches first, so the user can delete it to deny ICMP.
-    fn default_for(&self, direction: Direction) -> Action {
-        let config = self.inner.load();
+    fn default_for(config: &FirewallConfig, direction: Direction) -> Action {
         match direction {
             Direction::Out => config.default_outbound,
             Direction::In => config.default_inbound,
@@ -358,8 +364,9 @@ impl SharedFirewall {
         dst_port: u16,
         peer: &EndpointId,
     ) -> Action {
-        self.match_rule(direction, protocol, dst_port, peer, None)
-            .unwrap_or_else(|| self.default_for(direction))
+        let config = self.inner.load();
+        Self::match_rule(&config, direction, protocol, dst_port, peer, None)
+            .unwrap_or_else(|| Self::default_for(&config, direction))
     }
 
     /// Whether "fail fast" REJECT mode is enabled (opt-in, default off). When on,
@@ -392,10 +399,16 @@ impl SharedFirewall {
         peer: &EndpointId,
         network: Option<&str>,
     ) -> Action {
+        // Hold one immutable firewall generation for this packet. A concurrent
+        // configuration update is allowed to affect the next packet, but never
+        // makes one packet evaluate its rules and default against different
+        // generations. This also keeps the forwarding hot path to one ArcSwap
+        // load instead of up to three.
+        let config = self.inner.load();
         // Global kill switch (`ray firewall off`): allow everything, skip rules,
         // defaults, and conntrack. The ingress anti-spoof check runs upstream in
         // `forward::evaluate_inbound`, so spoofed sources are still dropped.
-        if self.inner.load().disabled {
+        if config.disabled {
             return Action::Allow;
         }
         let proto = info.protocol;
@@ -413,7 +426,9 @@ impl SharedFirewall {
         };
 
         // 1. Explicit rules always win.
-        if let Some(action) = self.match_rule(direction, proto, info.dst_port, peer, network) {
+        if let Some(action) =
+            Self::match_rule(&config, direction, proto, info.dst_port, peer, network)
+        {
             if direction == Direction::Out && action.is_allow() {
                 self.track_outbound(&flow, info);
             }
@@ -422,7 +437,7 @@ impl SharedFirewall {
 
         match direction {
             Direction::Out => {
-                let default = self.default_for(Direction::Out);
+                let default = Self::default_for(&config, Direction::Out);
                 if default.is_allow() {
                     self.track_outbound(&flow, info);
                 }
@@ -446,7 +461,7 @@ impl SharedFirewall {
                     self.conntrack.insert(flow, Instant::now());
                     Action::Allow
                 } else {
-                    self.default_for(Direction::In)
+                    Self::default_for(&config, Direction::In)
                 }
             }
         }
@@ -556,260 +571,19 @@ fn protocol_matches(filter: Protocol, ip_proto: u8) -> bool {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct PacketInfo {
-    pub src_ip: IpAddr,
-    pub dst_ip: IpAddr,
-    pub protocol: u8,
-    pub src_port: u16,
-    pub dst_port: u16,
-    /// TCP flags byte (offset 13 of the TCP header). 0 for non-TCP. Used by the
-    /// stateful tracker to detect SYN/FIN/RST. Bits: FIN 0x01, SYN 0x02,
-    /// RST 0x04, ACK 0x10.
-    pub tcp_flags: u8,
-    /// ICMP/ICMPv6 type byte (offset 0 of the ICMP header). 0 for non-ICMP.
-    /// Lets conntrack distinguish an echo-request (new inbound) from an
-    /// echo-reply (return traffic): ICMP has no ports, so without the type a
-    /// request and a reply collapse to the same flow.
-    pub icmp_type: u8,
-    /// ICMP echo identifier (offset 4..6 of the ICMP header) for echo
-    /// request/reply, else 0. Keys the conntrack flow so unrelated ping sessions
-    /// (and spoofed replies for ids we never sent) don't share an entry.
-    pub icmp_id: u16,
-}
-
 /// ICMP (v4) and ICMPv6 protocol numbers.
 fn is_icmp(proto: u8) -> bool {
     proto == 1 || proto == 58
 }
 
-/// True for an ICMP echo-*request* (ICMPv4 type 8 / ICMPv6 type 128), the
-/// packet `ping` sends. Only an echo-request *we* initiate establishes a
-/// trackable flow.
+/// True when an ICMP echo request starts a flow we expect a reply for.
 fn is_icmp_echo_request(proto: u8, icmp_type: u8) -> bool {
     (proto == 1 && icmp_type == 8) || (proto == 58 && icmp_type == 128)
 }
 
-/// True for an ICMP echo-*reply* (ICMPv4 type 0 / ICMPv6 type 129), the answer
-/// to a ping. Only an echo-reply can be conntrack return traffic for an
-/// outbound echo-request.
+/// True when an ICMP echo reply can be treated as return traffic.
 fn is_icmp_echo_reply(proto: u8, icmp_type: u8) -> bool {
     (proto == 1 && icmp_type == 0) || (proto == 58 && icmp_type == 129)
-}
-
-pub fn parse_packet_info(packet: &[u8]) -> Option<PacketInfo> {
-    if packet.is_empty() {
-        return None;
-    }
-    match packet[0] >> 4 {
-        4 => parse_ipv4(packet),
-        6 => parse_ipv6(packet),
-        _ => None,
-    }
-}
-
-fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
-    if packet.len() < 20 {
-        return None;
-    }
-    let ihl = (packet[0] & 0x0F) as usize;
-    // A header shorter than 5 words can't hold the fields we're about to read,
-    // so the L4 offset derived from it would point back inside the IP header
-    // and the "ports" would be header bytes the sender controls. Reject rather
-    // than evaluate a packet whose ports and TCP flags are fiction. Every
-    // OS drops ihl < 5 on receive anyway, so nothing legitimate is lost.
-    if ihl < 5 {
-        return None;
-    }
-    let header_len = ihl * 4;
-    if packet.len() < header_len {
-        return None;
-    }
-    // A non-first fragment carries no L4 header, so the "ports" at `header_len`
-    // are payload bytes. The IPv6 twin of this is `ipv6_upper_layer`, and the
-    // reason is the same: a mis-keyed conntrack entry is a hole, not a misparse.
-    // Nothing on the mesh produces IPv4 any more (the TUN has no IPv4 address and
-    // inbound IPv4 dies at the anti-spoof check), so this guards a path rather
-    // than fixing a live bug.
-    let frag_offset = u16::from_be_bytes([packet[6], packet[7]]) & 0x1FFF;
-    if frag_offset != 0 {
-        return None;
-    }
-
-    let protocol = packet[9];
-    let src_ip = IpAddr::V4(Ipv4Addr::new(
-        packet[12], packet[13], packet[14], packet[15],
-    ));
-    let dst_ip = IpAddr::V4(Ipv4Addr::new(
-        packet[16], packet[17], packet[18], packet[19],
-    ));
-
-    let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
-    let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
-    let (icmp_type, icmp_id) = extract_icmp(protocol, packet, header_len);
-
-    Some(PacketInfo {
-        src_ip,
-        dst_ip,
-        protocol,
-        src_port,
-        dst_port,
-        tcp_flags,
-        icmp_type,
-        icmp_id,
-    })
-}
-
-/// IPv6 next-header values that are *extension* headers rather than the
-/// upper-layer protocol: hop-by-hop, routing, fragment, authentication,
-/// destination options, mobility, HIP and shim6.
-///
-/// Reading byte 6 as the protocol and the ports at a fixed offset 40 is wrong for
-/// every one of these, and not cosmetically: the conntrack `Flow` is keyed on
-/// `(proto, local_port, peer_port)`, so a fragmented TCP packet became
-/// `(44, 0, 0)`, a *wildcard* entry matching every fragmented packet from that
-/// peer whatever reassembled inside it. One outbound fragment (any UDP send past
-/// the 1280 MTU) then held a 30-second hole through which that peer could reach
-/// any local port, which is the inbound default-deny gone.
-///
-/// [`ipv6_upper_layer`] walks past them to the header that really is the protocol,
-/// except the fragment header, which it refuses outright: see its doc comment.
-/// The list stays public because it is what tells a caller which values are chain
-/// links rather than protocols, which the property tests generate against.
-pub const IPV6_EXTENSION_HEADERS: [u8; 8] = [0, 43, 44, 51, 60, 135, 139, 140];
-
-/// The subset of [`IPV6_EXTENSION_HEADERS`] whose first two octets are
-/// `(next_header, hdr_ext_len)`, the length in 8-octet units not counting the
-/// first 8. Authentication and Fragment are the two that are not: see
-/// [`ipv6_upper_layer`].
-const IPV6_TLV_EXT_HEADERS: [u8; 6] = [0, 43, 60, 135, 139, 140];
-
-/// Authentication Header (RFC 4302).
-const IPV6_AH: u8 = 51;
-/// Fragment header (RFC 8200 §4.5).
-const IPV6_FRAGMENT: u8 = 44;
-
-/// Walk an IPv6 extension-header chain to the upper-layer protocol, returning it
-/// and the offset it starts at.
-///
-/// `None` when the packet carries no upper-layer header this can read, which is
-/// the case that must stay refused rather than guessed at:
-///
-/// - **any fragment**, first or not. A non-first one has its L4 header in a
-///   different packet and cannot be classified at all. The first one can be, but
-///   classifying it only earns the right to forward a fragment whose siblings are
-///   refused: the peer holds an incomplete reassembly until it times out, and on
-///   the outbound side we would have put a datagram on the wire that can never
-///   complete while opening a conntrack entry for it. Refusing the whole datagram
-///   is what the mesh already promises (lower the application's datagram size, or
-///   let TCP handle it), so the promise is kept here rather than half-kept.
-/// - a truncated chain, or one longer than `MAX_HEADERS`. Eight is already more
-///   than RFC 8200 §4.1's recommended order allows; a chain longer than that is a
-///   crafted packet, not traffic.
-///
-/// ESP (50) and `No Next Header` (59) are *not* refused. Neither has ports to
-/// read, but both are protocol numbers rather than chain links, and the
-/// extractors give them `(proto, 0, 0)`: a per-protocol key, not the
-/// cross-protocol wildcard this exists to prevent.
-fn ipv6_upper_layer(packet: &[u8]) -> Option<(u8, usize)> {
-    const MAX_HEADERS: usize = 8;
-    let mut next = packet[6];
-    let mut off = 40;
-    for _ in 0..MAX_HEADERS {
-        let len = match next {
-            // Refused whatever the fragment offset says: see the doc comment.
-            // Reading the offset to let the first one through classified an
-            // otherwise-undeliverable packet, since every other fragment of the
-            // same datagram is refused either way.
-            IPV6_FRAGMENT => return None,
-            // The one header measured in 4-octet units, and minus 2 rather than
-            // plus 1 (RFC 4302 §2.2). Getting this wrong walks into the middle of
-            // the payload, so it is pinned by a test.
-            IPV6_AH => (usize::from(*packet.get(off + 1)?) + 2) * 4,
-            h if IPV6_TLV_EXT_HEADERS.contains(&h) => (usize::from(*packet.get(off + 1)?) + 1) * 8,
-            // An upper-layer protocol: the walk ends here.
-            h => return Some((h, off)),
-        };
-        next = *packet.get(off)?;
-        off = off.checked_add(len)?;
-        if off >= packet.len() {
-            return None;
-        }
-    }
-    None
-}
-
-fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
-    if packet.len() < 40 {
-        return None;
-    }
-    let (protocol, header_len) = ipv6_upper_layer(packet)?;
-    // A port-bearing protocol with no room for its ports would extract `(0, 0)`,
-    // which is the wildcard conntrack key the walk above exists to stop. Refuse
-    // instead, the same answer a non-first fragment gets.
-    if matches!(protocol, 6 | 17) && packet.len() < header_len + 4 {
-        return None;
-    }
-    let mut src_octets = [0u8; 16];
-    let mut dst_octets = [0u8; 16];
-    src_octets.copy_from_slice(&packet[8..24]);
-    dst_octets.copy_from_slice(&packet[24..40]);
-    let src_ip = IpAddr::V6(Ipv6Addr::from(src_octets));
-    let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_octets));
-
-    let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
-    let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
-    let (icmp_type, icmp_id) = extract_icmp(protocol, packet, header_len);
-
-    Some(PacketInfo {
-        src_ip,
-        dst_ip,
-        protocol,
-        src_port,
-        dst_port,
-        tcp_flags,
-        icmp_type,
-        icmp_id,
-    })
-}
-
-fn extract_ports(protocol: u8, packet: &[u8], header_len: usize) -> (u16, u16) {
-    if (protocol == 6 || protocol == 17) && packet.len() >= header_len + 4 {
-        (
-            u16::from_be_bytes([packet[header_len], packet[header_len + 1]]),
-            u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]),
-        )
-    } else {
-        (0, 0)
-    }
-}
-
-fn extract_tcp_flags(protocol: u8, packet: &[u8], header_len: usize) -> u8 {
-    if protocol == 6 && packet.len() >= header_len + 14 {
-        packet[header_len + 13]
-    } else {
-        0
-    }
-}
-
-/// Extract the ICMP/ICMPv6 (type, echo-identifier) from a packet. The type byte
-/// is the first byte of the ICMP header; the identifier (bytes 4..6) is only
-/// meaningful for echo request/reply, so it is 0 for every other ICMP type.
-/// Returns (0, 0) for non-ICMP packets.
-fn extract_icmp(protocol: u8, packet: &[u8], header_len: usize) -> (u8, u16) {
-    if !is_icmp(protocol) || packet.len() < header_len + 1 {
-        return (0, 0);
-    }
-    let icmp_type = packet[header_len];
-    let id = if (is_icmp_echo_request(protocol, icmp_type)
-        || is_icmp_echo_reply(protocol, icmp_type))
-        && packet.len() >= header_len + 6
-    {
-        u16::from_be_bytes([packet[header_len + 4], packet[header_len + 5]])
-    } else {
-        0
-    };
-    (icmp_type, id)
 }
 
 pub fn firewall_path() -> Result<PathBuf> {

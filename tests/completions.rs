@@ -49,13 +49,13 @@ fn a_bare_tab_offers_the_commands() {
 
 /// A command with visible aliases is listed under one of its names, not all of
 /// them: clap_complete gives every spelling the same id and shows the first
-/// after sorting, so `status` (aliases `st`, `ls`) appears as `ls`. Every name
-/// shown is a real command, and typing the canonical one still completes it,
-/// which is what the next test pins.
+/// after sorting, so `status` (aliases `s`, `st`, `ls`) appears as `ls`. Every
+/// name shown is a real command, and typing the canonical one still completes
+/// it, which is what the next test pins.
 #[test]
 fn an_aliased_command_is_listed_once() {
     let found: HashSet<String> = complete(&[""]).into_iter().collect();
-    let names = ["status", "st", "ls"];
+    let names = ["status", "s", "st", "ls"];
     let listed = names.iter().filter(|n| found.contains(**n)).count();
     assert_eq!(listed, 1, "expected exactly one of {names:?} in {found:?}");
 }

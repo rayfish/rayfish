@@ -35,16 +35,28 @@ pub enum DropReason {
     /// mode off, or the sender is not in the network's `exit_allow` list). Keeps
     /// a non-exit node from silently transiting a peer's internet traffic.
     ExitDenied,
-    /// Outbound packet larger than the peer path's single-datagram budget. The
-    /// forwarder emits an ICMP "packet too big" (PMTUD) back to the source before
-    /// dropping, so the sender lowers its path MTU and resends a packet that fits
-    /// rather than blackholing. Seen mostly under an exit-node full tunnel
-    /// carrying bulk traffic over a relayed peer.
+    /// Outbound packet exceeds the mesh's IP packet limit or cannot be framed.
     PacketTooBig,
+    /// An incomplete fragmented packet exceeded its fixed reassembly deadline.
+    ReassemblyTimeout,
+    /// A peer or the daemon exhausted its bounded fragment reassembly budget.
+    ReassemblyLimit,
+    /// Outbound packet dropped while its destination peer was being dialed on
+    /// demand. The small first-packet queue is full, so retaining this newest
+    /// packet would let a temporarily unreachable peer consume unbounded memory.
+    LazyDialBufferFull,
+    /// A packet needed an on-demand dial but the daemon was already attempting
+    /// the bounded maximum number of peer handshakes. The sender will retry;
+    /// dropping here prevents a large roster from creating unbounded work.
+    LazyDialConcurrency,
+    /// A local packet targeted Magic DNS while the bounded set of upstream
+    /// resolver tasks was full. Keeping this separate from generic send
+    /// backpressure makes resolver overload visible in diagnostics.
+    DnsConcurrency,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 8] = [
+    const ALL: [DropReason; 13] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -53,6 +65,11 @@ impl DropReason {
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
+        DropReason::ReassemblyTimeout,
+        DropReason::ReassemblyLimit,
+        DropReason::LazyDialBufferFull,
+        DropReason::LazyDialConcurrency,
+        DropReason::DnsConcurrency,
     ];
 }
 
@@ -160,7 +177,7 @@ impl ForwardMetrics {
     }
 
     pub fn spawn_logger(self: &Arc<Self>, token: CancellationToken) {
-        let stats = self.clone();
+        let stats = Arc::clone(self);
         tokio::spawn(async move {
             let start = Instant::now();
             let mut prev_rx = 0u64;
@@ -234,7 +251,7 @@ pub struct PeerMetrics {
 
 impl PeerMetrics {
     pub fn spawn_collector(self: &Arc<Self>, peers: PeerTable, token: CancellationToken) {
-        let metrics = self.clone();
+        let metrics = Arc::clone(self);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -361,7 +378,12 @@ mod tests {
                 | DropReason::Backpressure
                 | DropReason::Spoof
                 | DropReason::ExitDenied
-                | DropReason::PacketTooBig => 1,
+                | DropReason::ReassemblyTimeout
+                | DropReason::ReassemblyLimit
+                | DropReason::PacketTooBig
+                | DropReason::LazyDialBufferFull
+                | DropReason::LazyDialConcurrency
+                | DropReason::DnsConcurrency => 1,
             }
         });
         assert_eq!(counted, DropReason::ALL.len());

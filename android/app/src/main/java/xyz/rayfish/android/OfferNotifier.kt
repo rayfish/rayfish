@@ -52,7 +52,7 @@ object OfferNotifier {
     // action the user just took.
     private val acted = java.util.Collections.synchronizedSet(HashSet<ULong>())
 
-    @Volatile private var channelEnsured = false
+    @Volatile private var channelName: String? = null
     private var cancelledStaleOnStart = false
 
     /**
@@ -64,6 +64,10 @@ object OfferNotifier {
      * leave a notification on screen for an offer that is gone.
      */
     fun poll(context: Context) {
+        poll(context) { NodeHolder.get(context).listFileOffers() }
+    }
+
+    internal fun poll(context: Context, listOffers: () -> List<FileOffer>) {
         synchronized(this) {
             // The core's pending offers live in memory and do not survive a
             // process restart, so any offer notification still in the shade at
@@ -71,11 +75,11 @@ object OfferNotifier {
             // restart at 1, so its Save action could be pointed at a completely
             // different file. Clear them once, before posting anything of ours.
             if (!cancelledStaleOnStart) {
-                cancelledStaleOnStart = true
                 cancelStaleNotifications(context)
+                cancelledStaleOnStart = true
             }
 
-            val offers = runCatching { NodeHolder.get(context).listFileOffers() }.getOrNull() ?: return
+            val offers = listOffers()
             val autoAccepting = NodeHolder.isAutoAcceptOwnDevices(context)
             // The same filter HomeScreen applies to its rows: an own-device offer
             // is FileAutoAccept's to take (and TransferNotifier's to report) until
@@ -86,18 +90,18 @@ object OfferNotifier {
             }
             for (f in waiting) {
                 if (f.id in acted) continue
-                if (!posted.add(f.id)) continue
-                // Written back out if notify() throws, so a later poll retries
-                // rather than treating the offer as posted forever and silently
-                // muting it.
-                if (!runCatching { post(context, f) }.isSuccess) posted.remove(f.id)
+                if (f.id in posted) continue
+                // Commit only after posting; a failure must reach the monitor
+                // so it schedules a retry even without another core event.
+                post(context, f)
+                posted.add(f.id)
             }
             val live = waiting.mapTo(HashSet()) { it.id }
             // Accepted, rejected, or evicted from the core's queue: whatever it
             // said is no longer true, so it must not outlive the offer.
             val nm = context.getSystemService(NotificationManager::class.java)
             for (id in posted.filter { it !in live }) {
-                runCatching { nm.cancel(notifId(id)) }
+                nm.cancel(notifId(id))
                 posted.remove(id)
             }
             acted.removeAll { it !in live }
@@ -109,11 +113,9 @@ object OfferNotifier {
      * ever reach notifications left behind by a previous process. */
     private fun cancelStaleNotifications(context: Context) {
         val nm = context.getSystemService(NotificationManager::class.java)
-        runCatching {
-            for (sbn in nm.activeNotifications) {
-                if (sbn.id < NOTIF_BASE) continue
-                if (sbn.notification.channelId == CHANNEL_ID) nm.cancel(sbn.id)
-            }
+        for (sbn in nm.activeNotifications) {
+            if (sbn.id < NOTIF_BASE) continue
+            if (sbn.notification.channelId == CHANNEL_ID) nm.cancel(sbn.id)
         }
     }
 
@@ -139,6 +141,7 @@ object OfferNotifier {
      * suppressing it and let the next poll decide again. */
     fun clearActedOn(id: ULong) {
         synchronized(this) { acted.remove(id) }
+        FileStatusMonitor.request()
     }
 
     /**
@@ -163,7 +166,7 @@ object OfferNotifier {
 
     private fun post(context: Context, f: FileOffer) {
         ensureChannel(context)
-        val text = "${f.from} · ${formatSize(f.size)}"
+        val text = context.getString(R.string.notif_offer_text, f.from, formatSize(f.size))
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setContentTitle(f.filename)
             .setContentText(text)
@@ -185,13 +188,13 @@ object OfferNotifier {
             .setAutoCancel(true)
             .addAction(
                 action(
-                    context, f, ReceiveService.ACTION_ACCEPT, "Save",
+                    context, f, ReceiveService.ACTION_ACCEPT, context.getString(R.string.action_save),
                     android.R.drawable.stat_sys_download,
                 ),
             )
             .addAction(
                 action(
-                    context, f, ReceiveService.ACTION_REJECT, "Reject",
+                    context, f, ReceiveService.ACTION_REJECT, context.getString(R.string.action_reject),
                     android.R.drawable.ic_menu_close_clear_cancel,
                 ),
             )
@@ -233,17 +236,19 @@ object OfferNotifier {
         return Notification.Action.Builder(icon, label, pending).build()
     }
 
-    /** See [TransferNotifier.ensureChannel]: one definition per channel, created
-     * once per process, and the flag is set only after the platform actually has
-     * the channel or a notify() racing it would be dropped in silence. */
+    /** See [TransferNotifier.ensureChannel]: one definition per channel, rewritten
+     * only when the localized name changes, and the name is recorded only after
+     * the platform actually has the channel or a notify() racing it would be
+     * dropped in silence. */
     internal fun ensureChannel(context: Context) {
-        if (channelEnsured) return
+        val name = context.getString(R.string.notif_channel_offers)
+        if (channelName == name) return
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Incoming files",
+            name,
             NotificationManager.IMPORTANCE_DEFAULT,
-        ).apply { description = "Files other people have sent you over the mesh" }
+        ).apply { description = context.getString(R.string.notif_channel_offers_desc) }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        channelEnsured = true
+        channelName = name
     }
 }

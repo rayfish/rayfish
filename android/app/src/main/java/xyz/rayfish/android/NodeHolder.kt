@@ -2,10 +2,10 @@ package xyz.rayfish.android
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.LinkProperties
-import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.util.Log
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -14,6 +14,66 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Node
+
+/**
+ * A network callback received by [NodeHolder], counted before filtering.
+ *
+ * Which kind fires matters for battery, and the two halves are not comparable.
+ * [AVAILABLE] and [LOST] mean the default network really changed, and are rare.
+ * [LINK_PROPERTIES] and [CAPABILITIES] also fire on things the endpoint does not
+ * care about: a signal-strength update, a revised link-bandwidth estimate, a
+ * reordered DNS server list. On a cellular link those arrive continuously.
+ *
+ * Forwarded events request an endpoint refresh and wake the signed-record
+ * pollers. Comparing raw callback counts with dispatched notifications shows
+ * whether filtering and debouncing are keeping that work bounded.
+ */
+enum class NetworkEvent(val label: String) {
+    AVAILABLE("available"),
+    LOST("lost"),
+    LINK_PROPERTIES("link properties changed"),
+    CAPABILITIES("capabilities changed"),
+}
+
+/**
+ * One window of network-callback activity, as returned by
+ * [NodeHolder.takeNetworkChurn]. Counts are per window, not per process: reading
+ * them resets them.
+ */
+data class NetworkChurn(
+    /** Callbacks received, by kind. Every [NetworkEvent] is present, possibly 0. */
+    val perEvent: Map<NetworkEvent, Long>,
+    /**
+     * Callbacks that survived the debounce and became a real `networkChanged()`.
+     * Read against [callbacks] to measure filtering and debouncing. The field
+     * name is retained for telemetry compatibility; iroh may skip a rebind when
+     * its own interface comparison finds no change.
+     */
+    val rebinds: Long,
+    /** How long the window covers, in milliseconds. */
+    val windowMs: Long,
+) {
+    val callbacks: Long get() = perEvent.values.sum()
+
+    /** Nothing happened in this window, so there is nothing worth reporting. */
+    fun isQuiet(): Boolean = callbacks == 0L && rebinds == 0L
+
+    /**
+     * Merge two windows. [PeriodicDiagnostics] carries a window forward when it
+     * was not worth reporting on its own, so a slow drip still accumulates into
+     * a report instead of being discarded eight hours at a time.
+     */
+    operator fun plus(other: NetworkChurn): NetworkChurn = NetworkChurn(
+        perEvent = NetworkEvent.entries.associateWith { (perEvent[it] ?: 0) + (other.perEvent[it] ?: 0) },
+        rebinds = rebinds + other.rebinds,
+        windowMs = windowMs + other.windowMs,
+    )
+
+    /** Flat `network_<kind>` -> count map for a report's context block. */
+    fun asContext(): Map<String, Long> =
+        perEvent.mapKeys { (event, _) -> "network_" + event.name.lowercase() } +
+            mapOf("network_rebinds" to rebinds, "network_window_ms" to windowMs)
+}
 
 /**
  * Process-wide holder for the single [Node] FFI object. Both the VPN service and
@@ -55,6 +115,10 @@ object NodeHolder {
     // Crash reporting is opt-out: on unless the user turns it off in You. See
     // [xyz.rayfish.android.Telemetry], which reads this to gate Sentry init.
     private const val KEY_CRASH_REPORTING = "crash_reporting"
+    // Unattended diagnostics on a timer. Opt-in, and only ever consulted while
+    // crash reporting is on, since it reports through the same Sentry client.
+    // See [PeriodicDiagnostics].
+    private const val KEY_PERIODIC_DIAGNOSTICS = "periodic_diagnostics"
     private const val KEY_INSTALL_ID = "install_id"
     // Auto-accept incoming file offers from the user's own paired devices. Default
     // on: sharing to one of your own devices lands the file with no manual tap. The
@@ -138,6 +202,7 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_AUTO_ACCEPT_OWN, value).apply()
+        FileStatusMonitor.request()
     }
 
     fun isGoOfflineWhenDisabled(context: Context): Boolean =
@@ -159,6 +224,23 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_CRASH_REPORTING, value).apply()
+    }
+
+    /**
+     * Whether to send a diagnostics report on a timer without the user asking.
+     * Opt-in (default false), and gated on crash reporting: turning that off
+     * takes this with it, because the reports go through the same client.
+     */
+    fun isPeriodicDiagnosticsEnabled(context: Context): Boolean =
+        isCrashReportingEnabled(context) &&
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_PERIODIC_DIAGNOSTICS, false)
+
+    fun setPeriodicDiagnosticsEnabled(context: Context, value: Boolean) {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_PERIODIC_DIAGNOSTICS, value).apply()
     }
 
     /** Stable random id for this install, minted once and persisted. Tags every
@@ -241,7 +323,41 @@ object NodeHolder {
     private val netScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkCallbacks: List<NetworkChangeCallback> = emptyList()
+
+    /**
+     * Per-kind callback counts and the rebinds they produced, since the last
+     * [takeNetworkChurn]. Kept here rather than in the reporter because this is
+     * the only place that sees the events; the reporter only drains them.
+     *
+     * Plain counters, no log line per event: the whole point is the case where
+     * there are thousands of them in a window, and a log that large is both the
+     * cost being measured and useless to read.
+     */
+    private val eventCounts: Map<NetworkEvent, AtomicLong> =
+        NetworkEvent.entries.associateWith { AtomicLong() }
+
+    private val rebindCount = AtomicLong()
+
+    /** Start of the current counting window, `elapsedRealtime`. */
+    private val churnWindowStart = AtomicLong(android.os.SystemClock.elapsedRealtime())
+
+    /**
+     * Read the counters and start a fresh window. Not atomic across all five
+     * counters, so a callback landing mid-drain can be counted in either window.
+     * That is fine for what this measures: the question is whether a window holds
+     * tens of events or tens of thousands, and one event either side of the line
+     * does not change the answer.
+     */
+    fun takeNetworkChurn(): NetworkChurn {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val start = churnWindowStart.getAndSet(now)
+        return NetworkChurn(
+            perEvent = eventCounts.mapValues { (_, c) -> c.getAndSet(0) },
+            rebinds = rebindCount.getAndSet(0),
+            windowMs = (now - start).coerceAtLeast(0),
+        )
+    }
 
     /**
      * Forward default-network changes to the core. Android blocks netlink route
@@ -251,7 +367,8 @@ object NodeHolder {
      * timeouts, no relay, no mDNS announce, device invisible to the mesh).
      * Lives with the node's lifecycle, so it also covers standby, where the
      * control plane is the only thing running and nothing else would notice.
-     * networkChanged() is idempotent and cheap, so the callback stays dumb.
+     * Capability callbacks are filtered before debouncing: bandwidth estimates
+     * and signal strength do not warrant a refresh or a signed-record lookup.
      *
      * onAvailable/onLost alone are not enough, which is what made a phone that
      * had moved stay disconnected: the default Network object survives a Wi-Fi
@@ -261,32 +378,51 @@ object NodeHolder {
      * addresses under the endpoint have changed all the same.
      */
     private fun registerNetworkCallback(context: Context) {
-        if (networkCallback != null) return
+        if (networkCallbacks.isNotEmpty()) return
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
         if (cm == null) return
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = notifyCore("available", network)
-            override fun onLost(network: Network) = notifyCore("lost", network)
-            override fun onLinkPropertiesChanged(network: Network, props: LinkProperties) =
-                notifyCore("link properties changed", network)
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-                notifyCore("capabilities changed", network)
-            private fun notifyCore(event: String, network: Network) {
-                Log.i(TAG, "default network $event ($network); notifying core")
+        fun callback(source: String) = NetworkChangeCallback { event, network, changed ->
+            eventCounts[event]?.incrementAndGet()
+            if (changed) {
+                Log.i(TAG, "$source network ${event.label} ($network); notifying core")
                 scheduleNotify()
             }
         }
-        runCatching { cm.registerDefaultNetworkCallback(cb) }
-            .onSuccess { networkCallback = cb }
-            .onFailure { Log.w(TAG, "network callback registration failed", it) }
+        val default = callback("default")
+        val physical = callback("physical")
+        // A VPN's addresses/routes can stay fixed while its Wi-Fi or cellular
+        // underlay changes. Observe physical links too so filtering the VPN's
+        // capabilities cannot hide a DHCP renew, DNS change or handover. This
+        // is a passive listener, not a request to keep an extra radio online.
+        val physicalNetworks = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        val registered = mutableListOf<NetworkChangeCallback>()
+        runCatching {
+            cm.registerDefaultNetworkCallback(default)
+            registered += default
+            cm.registerNetworkCallback(physicalNetworks, physical)
+            registered += physical
+        }.onSuccess { networkCallbacks = registered.toList() }
+            .onFailure {
+                default.deactivate()
+                physical.deactivate()
+                registered.forEach { cb -> runCatching { cm.unregisterNetworkCallback(cb) } }
+                synchronized(notifyLock) {
+                    notifyJob?.cancel()
+                    notifyJob = null
+                }
+                Log.w(TAG, "network callback registration failed", it)
+            }
     }
 
     /**
      * Coalesce a burst of callbacks into one rebind. A single network switch
      * fires several of them within a few hundred milliseconds (available, then
      * capabilities, then link properties, often more than once as validation
-     * completes), and each networkChanged() is a full endpoint rebind and path
-     * re-probe. The last one in the burst is the one that sees the settled
+     * completes), and each networkChanged() requests an endpoint refresh and
+     * wakes signed-record polling. The last one sees the settled
      * addresses, so waiting for the burst to stop is both cheaper and more
      * accurate than acting on the first.
      *
@@ -310,20 +446,26 @@ object NodeHolder {
             notifyJob?.cancel()
             notifyJob = netScope.launch {
                 delay(NETWORK_DEBOUNCE_MS)
+                // Counted here, past the debounce, so this is rebinds actually
+                // dispatched rather than callbacks received. A cancelled job
+                // never reaches this line, which is the coalescing being
+                // measured.
+                rebindCount.incrementAndGet()
                 runCatching { node?.networkChanged() }
             }
         }
     }
 
     private fun unregisterNetworkCallback(context: Context) {
+        val callbacks = networkCallbacks
+        networkCallbacks = emptyList()
+        callbacks.forEach { it.deactivate() }
         synchronized(notifyLock) {
             notifyJob?.cancel()
             notifyJob = null
         }
-        val cb = networkCallback ?: return
-        networkCallback = null
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
-        runCatching { cm?.unregisterNetworkCallback(cb) }
+        callbacks.forEach { cb -> runCatching { cm?.unregisterNetworkCallback(cb) } }
     }
 
     /**
@@ -338,6 +480,7 @@ object NodeHolder {
      * to deadlock against.
      */
     fun stopNode(context: Context) {
+        FileStatusMonitor.stop()
         synchronized(this) {
             unregisterNetworkCallback(context)
             runCatching { node?.stop() }

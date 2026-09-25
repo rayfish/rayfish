@@ -48,7 +48,7 @@ class SendService : Service() {
             return START_NOT_STICKY
         }
         val peerId = intent.getStringExtra(EXTRA_PEER_ID)
-        val peerName = intent.getStringExtra(EXTRA_PEER_NAME) ?: "peer"
+        val peerName = intent.getStringExtra(EXTRA_PEER_NAME) ?: getString(R.string.fallback_peer)
         val uris = collectUris(intent)
         if (peerId.isNullOrBlank() || uris.isEmpty()) {
             stopSelf(startId)
@@ -128,13 +128,13 @@ class SendService : Service() {
         // A failed wake is not a send failure: the offer still goes out and parks
         // in the core's outbox until the peer reappears. Say that in the
         // notification instead of implying the transfer is on its way.
-        updateOngoingNotification(uris.size, peerName, "Waking $peerName…")
+        updateOngoingNotification(uris.size, peerName, getString(R.string.notif_waking, peerName))
         val awake = runCatching {
             NodeHolder.get(applicationContext).wakePeer(peerId)
         }.getOrDefault(false)
         updateOngoingNotification(
             uris.size, peerName,
-            if (awake) null else "$peerName is not answering, queued until it's back",
+            if (awake) null else getString(R.string.notif_peer_queued, peerName),
         )
 
         val maxIdBeforeBatch: Long?
@@ -264,10 +264,10 @@ class SendService : Service() {
 
     /** `status` overrides the default item-count line (used for the wake step). */
     private fun buildOngoing(count: Int, peerName: String, status: String?): Notification {
-        val label = if (count == 1) "1 item" else "$count items"
+        val label = resources.getQuantityString(R.plurals.share_item_count, count, count)
         return Notification.Builder(this, TransferNotifier.CHANNEL_ID)
-            .setContentTitle("Sending to $peerName")
-            .setContentText(status ?: "$label over Rayfish")
+            .setContentTitle(getString(R.string.notif_sending_to, peerName))
+            .setContentText(status ?: getString(R.string.notif_items_over_rayfish, label))
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(true)
             .build()
@@ -277,13 +277,12 @@ class SendService : Service() {
      * [TransferNotifier] once the peer has actually pulled the bytes. */
     private fun notifyFailure(peerName: String, failed: Int) {
         TransferNotifier.ensureChannel(this)
-        val text = if (failed == 1) "Could not send 1 item to $peerName"
-        else "Could not send $failed items to $peerName"
+        val text = resources.getQuantityString(R.plurals.notif_send_failed, failed, failed, peerName)
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = Notification.Builder(this, TransferNotifier.CHANNEL_ID)
-            .setContentTitle("Rayfish")
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setAutoCancel(true)

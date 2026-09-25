@@ -87,6 +87,12 @@ function Assert-Checksum {
         return
     }
     $sidecar = (Invoke-WebRequest -Uri "$Url.sha256" -UseBasicParsing).Content
+    # GitHub serves the sidecar as application/octet-stream, so PowerShell 7
+    # hands back a byte[] where 5.1 hands back a string. Splitting the byte[]
+    # would yield decimal byte values instead of the digest.
+    if ($sidecar -is [byte[]]) {
+        $sidecar = [Text.Encoding]::UTF8.GetString($sidecar)
+    }
     $expected = ($sidecar -split '\s+' | Where-Object { $_ })[0]
     if (-not $expected) { throw "no checksum published at $Url.sha256" }
     $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash

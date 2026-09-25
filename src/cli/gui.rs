@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::*;
 
 const GUI_HTML: &str = include_str!("gui.html");
+const GUI_LOGO: &[u8] =
+    include_bytes!("../../macos/Rayfish/Assets.xcassets/Logo.imageset/logo.png");
+const GUI_CHAKRA_REGULAR: &[u8] =
+    include_bytes!("../../macos/Rayfish/Fonts/ChakraPetch-Regular.ttf");
+const GUI_CHAKRA_SEMIBOLD: &[u8] =
+    include_bytes!("../../macos/Rayfish/Fonts/ChakraPetch-SemiBold.ttf");
+const GUI_MONO: &[u8] = include_bytes!("../../macos/Rayfish/Fonts/IBMPlexMono-Regular.ttf");
+const GUI_LOGO_FONT: &[u8] = include_bytes!("../../macos/Rayfish/Fonts/PressStart2P-Regular.ttf");
 const MAX_BODY: usize = 64 * 1024;
 const MAX_OUTPUT: usize = 256 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
@@ -39,6 +47,7 @@ pub(crate) fn cmd_gui(port: u16, no_open: bool) -> Result<()> {
     let exe = std::env::current_exe().context("finding current ray executable")?;
 
     println!("rayfish GUI listening on {url}");
+    std::io::stdout().flush()?;
     if !no_open && !open_url(&url) {
         println!("Open that URL in your browser.");
     }
@@ -70,6 +79,14 @@ fn gui_token() -> String {
 
 fn handle_client(mut stream: TcpStream, token: &str, exe: &std::path::Path) -> Result<()> {
     let req = read_http_request(&mut stream)?;
+    if req.method == "GET"
+        && let Some((content_type, body)) = gui_asset(&req.path)
+    {
+        if !query_has_token(&req.target, token) {
+            return respond_text(&mut stream, 403, "text/plain; charset=utf-8", "bad token");
+        }
+        return respond_bytes(&mut stream, 200, content_type, body);
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => {
             if !query_has_token(&req.target, token) {
@@ -94,6 +111,17 @@ fn handle_client(mut stream: TcpStream, token: &str, exe: &std::path::Path) -> R
             respond_text(&mut stream, 200, "application/json", &body)
         }
         _ => respond_text(&mut stream, 404, "text/plain; charset=utf-8", "not found"),
+    }
+}
+
+fn gui_asset(path: &str) -> Option<(&'static str, &'static [u8])> {
+    match path {
+        "/logo.png" => Some(("image/png", GUI_LOGO)),
+        "/fonts/chakra-regular.ttf" => Some(("font/ttf", GUI_CHAKRA_REGULAR)),
+        "/fonts/chakra-semibold.ttf" => Some(("font/ttf", GUI_CHAKRA_SEMIBOLD)),
+        "/fonts/mono.ttf" => Some(("font/ttf", GUI_MONO)),
+        "/fonts/logo.ttf" => Some(("font/ttf", GUI_LOGO_FONT)),
+        _ => None,
     }
 }
 
@@ -256,6 +284,15 @@ fn query_has_token(target: &str, token: &str) -> bool {
 }
 
 fn respond_text(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> Result<()> {
+    respond_bytes(stream, status, content_type, body.as_bytes())
+}
+
+fn respond_bytes(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
@@ -271,9 +308,10 @@ fn respond_text(stream: &mut TcpStream, status: u16, content_type: &str, body: &
          X-Content-Type-Options: nosniff\r\n\
          Connection: close\r\n\
          \r\n\
-         {body}",
+        ",
         body.len()
     )?;
+    stream.write_all(body)?;
     Ok(())
 }
 
@@ -314,5 +352,20 @@ mod tests {
         assert!(query_has_token("/?token=abc", "abc"));
         assert!(!query_has_token("/?token=abcd", "abc"));
         assert!(!query_has_token("/", "abc"));
+    }
+
+    #[test]
+    fn bundled_gui_assets_are_available() {
+        for path in [
+            "/logo.png",
+            "/fonts/chakra-regular.ttf",
+            "/fonts/chakra-semibold.ttf",
+            "/fonts/mono.ttf",
+            "/fonts/logo.ttf",
+        ] {
+            let (_, bytes) = gui_asset(path).expect("the GUI asset path is registered");
+            assert!(!bytes.is_empty());
+        }
+        assert!(gui_asset("/missing").is_none());
     }
 }

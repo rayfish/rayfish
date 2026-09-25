@@ -11,6 +11,7 @@
 #   apply         3-peer declarative `ray apply` deploy       (tests/e2e/apply)
 #   dns           2-peer Magic DNS resolution + resolv.conf takeover (tests/e2e/dns)
 #   ssh           2-peer mesh SSH (`ray firewall ssh`) allow/deny matrix (tests/e2e/ssh)
+#   operator      2-peer unprivileged-client authority (`ray set-operator`) (tests/e2e/operator)
 #   v4bridge      2-peer IPv4-only listener bridge over the mesh (tests/e2e/v4bridge)
 #   reliability   4-peer full-mesh packet-loss test (ping + iperf3 UDP) (tests/e2e/reliability)
 #   restore-offline 3-peer member-restore-with-coordinator-offline test (tests/e2e/restore-offline)
@@ -48,7 +49,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # variable would silently drop back to digitalocean halfway through.
 export E2E_BACKEND="${E2E_BACKEND:-digitalocean}"
 
-usage(){ sed -n '2,36p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+usage(){ sed -n '2,37p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
 # Scenarios the docker backend cannot run faithfully (see tests/e2e/README.md).
 DOCKER_UNSUPPORTED=(exit-node reliability bench)
@@ -85,6 +86,9 @@ scenario_meta(){
     ssh)         DIR="$ROOT/tests/e2e/ssh"
                  NAMES=(rayfish-ssh-a rayfish-ssh-b)
                  LABELS=(srv-a srv-b) ;;
+    operator)    DIR="$ROOT/tests/e2e/operator"
+                 NAMES=(rayfish-op-a rayfish-op-b)
+                 LABELS=(srv-a srv-b) ;;
     v4bridge)    DIR="$ROOT/tests/e2e/v4bridge"
                  NAMES=(rayfish-v4br-a rayfish-v4br-b)
                  LABELS=(srv-a srv-b) ;;
@@ -118,7 +122,7 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 # dispatcher per scenario (provision-if-needed + run, then teardown). Prints a
 # pass/fail summary and exits non-zero if any scenario failed.
 if [[ "$scenario" == all ]]; then
-  all_scenarios=(device-cert connect firewall closed-net apply dns ssh v4bridge reliability restore-offline unpair churn exit-node)
+  all_scenarios=(device-cert connect firewall closed-net apply dns ssh operator v4bridge reliability restore-offline unpair churn exit-node)
   passed=(); failed=(); skipped=()
   hint="check 'doctl compute droplet list'"
   [[ "$E2E_BACKEND" == "docker" ]] && hint="check 'docker ps -a'"

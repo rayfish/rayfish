@@ -1,15 +1,13 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::fs::Permissions;
-use std::net::Ipv4Addr;
-#[cfg(unix)]
+use std::net::{IpAddr, Ipv4Addr};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-#[cfg(not(windows))]
-use std::sync::atomic::{AtomicU64, Ordering};
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
 use std::sync::Mutex;
@@ -17,8 +15,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
+use ray_proto::ipc::{MachineHostname, UnixTimestampSecs};
 use serde::{Deserialize, Serialize};
 
+use crate::management::EnrollmentReceipt;
 use crate::membership::GroupMode;
 
 /// Per-network transport preference. Defined in `ray-proto` (shared with GUI
@@ -69,6 +69,11 @@ mod option_secret_key_hex {
         }
     }
 }
+
+mod write;
+
+pub use write::{restrict_perms, write_file};
+use write::{sync_file_and_parent, write_atomic};
 
 /// Info about a member in a saved network config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,34 +304,38 @@ pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
 
 /// Merge configured DNS upstreams with the system-captured ones. `replace`
 /// drops the captured set; otherwise custom upstreams are tried first, then the
-/// captured ones. Unset returns the captured set unchanged.
+/// captured ones. When present, Tailscale's Magic DNS resolver is preferred over
+/// every other upstream. Unset returns the captured set unchanged.
 ///
-/// IPv4 only, and deliberately so: the captured set this merges with comes from
-/// the OS DNS backends, every one of which reads an IPv4 nameserver. A configured
-/// IPv6 entry is not dropped so much as handled elsewhere, by
-/// [`crate::exit_node::tunnel_upstreams`], which is the one caller that has a
-/// path to reach it (an IPv6-only full tunnel, where the IPv4 ones are the
-/// unreachable half).
-pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
-    if o.servers.is_empty() {
-        return captured;
-    }
-    let custom: Vec<Ipv4Addr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
-    if o.replace {
-        // `dns_upstreams` takes any `IpAddr` since IPv6-only tunnels needed it, so
-        // an all-IPv6 `--replace` narrows to nothing here. Returning that empty
-        // list would leave both consumers with no server at all: the forwarder
-        // SERVFAILs every non-`.ray` name, and `control_plane_nameservers` falls
-        // back to iroh's own resolv.conf reader, which is the #111 circle. Keep
-        // the captured ones instead: the IPv6 entries are still honoured, by
-        // `exit_node::tunnel_upstreams`, which is the caller that can reach them.
-        if custom.is_empty() {
-            return captured;
-        }
-        custom
+/// Captured resolvers are IPv4 because that is what the desktop OS backends
+/// expose. Configured IPv6 addresses are retained so an overlay peer running a
+/// resolver can receive ordinary DNS queries over the mesh.
+pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<IpAddr> {
+    let upstreams = if o.servers.is_empty() {
+        captured.into_iter().map(IpAddr::V4).collect()
     } else {
-        custom.into_iter().chain(captured).collect()
+        let custom: Vec<IpAddr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
+        if o.replace {
+            custom
+        } else {
+            custom
+                .into_iter()
+                .chain(captured.into_iter().map(IpAddr::V4))
+                .collect()
+        }
+    };
+    prefer_tailscale_dns(upstreams)
+}
+
+/// Tailscale's Magic DNS resolver owns its split-DNS rules. Keep it first when
+/// present while Rayfish intercepts `.ray` queries and forwards other names.
+fn prefer_tailscale_dns(mut upstreams: Vec<IpAddr>) -> Vec<IpAddr> {
+    let tailscale = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100));
+    if let Some(index) = upstreams.iter().position(|ip| *ip == tailscale) {
+        let resolver = upstreams.remove(index);
+        upstreams.insert(0, resolver);
     }
+    upstreams
 }
 
 /// Whether `o` contributes anything to [`resolve_upstreams`], i.e. names at least
@@ -339,7 +348,7 @@ pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv
 /// instead of saving it. A bare `!servers.is_empty()` was exactly that bug once
 /// `dns_upstreams` started accepting IPv6.
 pub fn has_usable_upstream(o: &ServerOverride) -> bool {
-    o.servers.iter().any(|s| s.parse::<Ipv4Addr>().is_ok())
+    o.servers.iter().any(|s| s.parse::<IpAddr>().is_ok())
 }
 
 /// Parse a comma list of entries (trimmed, empties dropped).
@@ -428,6 +437,43 @@ pub struct PendingJoinEntry {
     pub name: Option<String>,
 }
 
+/// A controller this machine has explicitly authorized to issue management
+/// requests. Authority is bound to the controller's transport endpoint id,
+/// which iroh authenticates during the QUIC handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerGrant {
+    pub identity: EndpointId,
+    pub enrolled_at: UnixTimestampSecs,
+    /// Missing on enrollments made before management protocol v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<EnrollmentReceipt>,
+}
+
+/// A machine enrolled with this controller. `hostname` is the stable name used
+/// by delegated commands and by `ray apply` when matching a missing host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedMachine {
+    pub identity: EndpointId,
+    pub hostname: MachineHostname,
+    pub enrolled_at: UnixTimestampSecs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<UnixTimestampSecs>,
+}
+
+/// A controller-side enrollment credential. Only its hash is persisted.
+/// Reusable credentials may enroll multiple machines until revoked or expired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollmentCredential {
+    pub id: ray_proto::ipc::EnrollmentCredentialId,
+    pub secret_hash: blake3::Hash,
+    pub expires_at: UnixTimestampSecs,
+    pub reusable: bool,
+    #[serde(default)]
+    pub enrolled_machines: Vec<EndpointId>,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_true")]
@@ -484,6 +530,16 @@ pub struct AppConfig {
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
     #[serde(default)]
     pub dns_upstreams: ServerOverride,
+    /// Whether Rayfish configures the host resolver for Magic DNS.
+    #[serde(default = "default_true")]
+    pub dns_enabled: bool,
+    /// Recently successful peer transport paths.  These are only connection
+    /// hints: iroh still authenticates the endpoint identity in TLS and falls
+    /// back to its normal discovery services when a hint is stale.  Keeping
+    /// them lets a restart try a known LAN/direct path or relay immediately,
+    /// before a pkarr lookup completes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_hints: Vec<iroh::EndpointAddr>,
     /// Global toggle for the embedded mesh SSH server (`ray firewall ssh on`).
     /// When on, the daemon listens on each mesh IP's port 22 and admits peers
     /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
@@ -496,6 +552,13 @@ pub struct AppConfig {
     /// `crate::v4bridge`.
     #[serde(default = "default_true")]
     pub v4_bridge: bool,
+    /// macOS only: load a pf anchor that passes traffic on the mesh interface
+    /// (`ray config set pf-passthrough off`). On by default. Another VPN's kill
+    /// switch ends in a catch-all block and its allow-list names private ranges
+    /// the overlay is not in, so without this the mesh dies the moment that VPN
+    /// connects. See `crate::hostfw`.
+    #[serde(default = "default_true")]
+    pub pf_passthrough: bool,
     /// On-demand connection mode (battery-minimizing, Tailscale-style). When on,
     /// the node does not eagerly dial peers at startup: it restores memberships and
     /// the roster locally, dials a peer lazily on the first outgoing packet that
@@ -549,6 +612,18 @@ pub struct AppConfig {
     /// here when it re-pairs (re-auth). See `Daemon::unpair`/`reauth_device`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_devices: Vec<String>,
+    /// Remote controllers authorized by this machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controllers: Vec<ControllerGrant>,
+    /// Machines that enrolled with this node as their controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_machines: Vec<ManagedMachine>,
+    /// Prevent a signed hello from restoring an explicitly forgotten machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forgotten_machines: Vec<EndpointId>,
+    /// Pending and reusable machine-enrollment credentials minted here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrollment_credentials: Vec<EnrollmentCredential>,
 }
 
 impl Default for AppConfig {
@@ -563,8 +638,11 @@ impl Default for AppConfig {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            dns_enabled: true,
+            endpoint_hints: Vec::new(),
             ssh_enabled: false,
             v4_bridge: true,
+            pf_passthrough: true,
             on_demand: true,
             idle_timeout_secs: None,
             auto_update: false,
@@ -576,6 +654,10 @@ impl Default for AppConfig {
             pending_joins: Vec::new(),
             cert_generation: 0,
             revoked_devices: Vec::new(),
+            controllers: Vec::new(),
+            managed_machines: Vec::new(),
+            forgotten_machines: Vec::new(),
+            enrollment_credentials: Vec::new(),
         }
     }
 }
@@ -726,10 +808,16 @@ struct Settings {
     discovery_dns: ServerOverride,
     #[serde(default)]
     dns_upstreams: ServerOverride,
+    #[serde(default = "default_true")]
+    dns_enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
     ssh_enabled: bool,
     #[serde(default = "default_true")]
     v4_bridge: bool,
+    #[serde(default = "default_true")]
+    pf_passthrough: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -750,20 +838,49 @@ struct Settings {
     cert_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     revoked_devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    controllers: Vec<ControllerGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    managed_machines: Vec<ManagedMachine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    forgotten_machines: Vec<EndpointId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    enrollment_credentials: Vec<EnrollmentCredential>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
 #[cfg(target_os = "linux")]
 fn rayfish_gid() -> Option<u32> {
-    use std::ffi::CString;
+    use std::{ffi::CString, mem::zeroed, ptr::null_mut};
     let name = CString::new("rayfish").ok()?;
-    // SAFETY: getgrnam returns a pointer to a static struct; we copy gr_gid out
-    // immediately before any further libc call could overwrite it.
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    // getgrnam_r, never getgrnam: the legacy call returns a pointer into a
+    // process-wide buffer that any concurrent getgr*/getpw* call is allowed
+    // to move or free. Config saves run on many threads at once, and on musl
+    // that race corrupted the heap and took the daemon down with SIGSEGV.
+    // The reentrant variant copies into our own buffer, which is the whole
+    // reason it exists.
+    let mut buf_len = 4096;
+    loop {
+        let mut buf = vec![0u8; buf_len];
+        let mut grbuf: libc::group = unsafe { zeroed() };
+        let mut result: *mut libc::group = null_mut();
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                &mut grbuf,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        return Some(unsafe { (*result).gr_gid });
     }
 }
 
@@ -1067,129 +1184,6 @@ fn validate_net_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Serial number for temp file names, so two writers in this process never
-/// share one. See [`write_file`], which uses an unguessable nonce on Windows
-/// instead and so needs no counter.
-#[cfg(not(windows))]
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Re-establish the durability barrier for a file already in place: fsync the
-/// file, then the directory entry naming it. A [`write_file`] that failed
-/// ambiguously may have installed the bytes anyway, so a no-op retry still has
-/// to prove the result is on disk before anything is allowed to point at it.
-fn sync_file_and_parent(path: &Path) -> Result<()> {
-    let dir = path.parent().context("config path has no parent")?;
-    std::fs::File::open(path)
-        .with_context(|| format!("opening {} to sync", path.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing {}", path.display()))?;
-    sync_dir(dir)
-}
-
-/// Atomically and durably write `bytes` to `path`: write a sibling temp file,
-/// set its perms/owner, then rename over the target. The rename is atomic on
-/// POSIX, so a concurrent reader sees either the old file or the new one, never
-/// a torn one. `secret` selects 0600 root:root vs 0640 root:rayfish.
-///
-/// Returning `Ok` means the bytes are on disk and reachable under `path` after
-/// a power loss, not just in the page cache: the contents are fsynced before
-/// the rename and the directory entry after it, and a failure of either is an
-/// error rather than a shrug. Callers that persist a pointer to something else
-/// (the coordinator recovery hash) depend on that barrier being exact.
-///
-/// Public so every rayfish config writer (identity key, invite ledger, etc.)
-/// shares the same atomic + restrictive-perms guarantees under the config tree.
-pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
-    let dir = path.parent().context("config path has no parent")?;
-    ensure_dir(dir)?;
-    let fname = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config");
-    // The pid keeps two processes apart and the counter keeps two threads of
-    // this one apart. A temp path shared by two writers of the same file lets
-    // one rename a file the other has only half filled.
-    //
-    // Windows uses a random nonce instead: the stage file is created with
-    // `CREATE_NEW` and an explicit DACL, so an unpredictable name means nothing
-    // can be sitting on the path we are about to claim.
-    #[cfg(windows)]
-    let tmp = windows_config_stage_path(dir, fname);
-    #[cfg(not(windows))]
-    let tmp = {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        dir.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()))
-    };
-    let staged = stage_temp(&tmp, bytes, secret).and_then(|()| {
-        // Refuse to rename over something that is not a plain file we own: on
-        // Windows the target could have been swapped for a reparse point
-        // between the last write and this one.
-        #[cfg(all(windows, not(test)))]
-        validate_existing_windows_config_child(path)?;
-        std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
-    });
-    if staged.is_err() {
-        // Clean up on any failure so we don't litter: the temp path is ours
-        // alone, so nothing else can be waiting on it.
-        let _ = std::fs::remove_file(&tmp);
-        return staged;
-    }
-    sync_dir(dir)
-}
-
-/// Fill `tmp` with `bytes` and give it the target's perms/owner, leaving it
-/// ready to rename into place.
-fn stage_temp(tmp: &Path, bytes: &[u8], secret: bool) -> Result<()> {
-    {
-        use std::io::Write;
-        #[cfg(windows)]
-        let mut f = create_windows_config_stage(tmp)?;
-        #[cfg(not(windows))]
-        let mut f =
-            std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(bytes)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        // Discarding this used to report a write as saved while the bytes were
-        // still only in the page cache, so a crash could roll the file back to
-        // its previous contents with nothing having failed.
-        f.sync_all()
-            .with_context(|| format!("syncing {}", tmp.display()))?;
-    }
-    // Windows has no mode bits to set here. `create_windows_config_stage` gave
-    // the file an explicit SYSTEM + Administrators DACL with inheritance off at
-    // creation, which is stricter than either Unix mode, so `secret` has
-    // nothing left to select between.
-    #[cfg(windows)]
-    let _ = secret;
-    #[cfg(unix)]
-    {
-        let mode = if secret { 0o600 } else { 0o640 };
-        let _ = std::fs::set_permissions(tmp, Permissions::from_mode(mode));
-    }
-    #[cfg(target_os = "linux")]
-    set_owner(tmp, secret);
-    Ok(())
-}
-
-/// fsync a directory, so a rename into it survives a power loss. Without this
-/// the new file's contents are durable but the name is not, and the target can
-/// come back as the old file or as nothing at all.
-fn sync_dir(dir: &Path) -> Result<()> {
-    // Windows has no equivalent: a directory cannot be opened as a file for the
-    // flush, and there is no API that commits a rename the way fsync does. The
-    // stage file's own `sync_all` is the whole barrier available there.
-    #[cfg(windows)]
-    {
-        let _ = dir;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    std::fs::File::open(dir)
-        .with_context(|| format!("opening {} to sync", dir.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing {}", dir.display()))
-}
-
 #[cfg(windows)]
 fn windows_config_stage_path(dir: &Path, filename: &str) -> PathBuf {
     let nonce = hex::encode(rand::random::<[u8; 32]>());
@@ -1220,29 +1214,6 @@ fn validate_existing_windows_config_child(path: &Path) -> Result<()> {
         Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
     }
     Ok(())
-}
-
-fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
-    write_file(path, contents.as_bytes(), secret)
-}
-
-/// Apply restrictive perms/owner to an existing file under the config tree.
-/// For append-mode files (e.g. the audit log) that aren't rewritten via
-/// [`write_file`]. Best-effort.
-pub fn restrict_perms(path: &Path, secret: bool) {
-    #[cfg(all(windows, test))]
-    let _ = (path, secret);
-    #[cfg(all(windows, not(test)))]
-    if secret && let Err(error) = crate::windows_security::protect_file(path) {
-        tracing::error!(path = %path.display(), %error, "failed to protect Windows config file");
-    }
-    #[cfg(unix)]
-    {
-        let mode = if secret { 0o600 } else { 0o640 };
-        let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
-    }
-    #[cfg(target_os = "linux")]
-    set_owner(path, secret);
 }
 
 /// Linux-only: relocate a pre-`/etc` config tree into `/etc/rayfish` on first
@@ -1365,10 +1336,11 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         let s = std::fs::read_to_string(&settings_path).context("reading settings.toml")?;
         toml::from_str(&s).context("parsing settings.toml")?
     } else {
-        // Fresh install: mDNS discovery is on by default, everything else is the
-        // type-default.
+        // Fresh install: discovery and Magic DNS are on by default, everything
+        // else is the type-default.
         Settings {
             mdns_enabled: true,
+            dns_enabled: true,
             ..Default::default()
         }
     };
@@ -1407,8 +1379,11 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
+        dns_enabled: settings.dns_enabled,
+        endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         v4_bridge: settings.v4_bridge,
+        pf_passthrough: settings.pf_passthrough,
         on_demand: settings.on_demand,
         idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
@@ -1420,6 +1395,10 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         pending_joins: settings.pending_joins,
         cert_generation: settings.cert_generation,
         revoked_devices: settings.revoked_devices,
+        controllers: settings.controllers,
+        managed_machines: settings.managed_machines,
+        forgotten_machines: settings.forgotten_machines,
+        enrollment_credentials: settings.enrollment_credentials,
     })
 }
 
@@ -1476,8 +1455,11 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
+        dns_enabled: config.dns_enabled,
+        endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         v4_bridge: config.v4_bridge,
+        pf_passthrough: config.pf_passthrough,
         on_demand: config.on_demand,
         idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,
@@ -1488,6 +1470,10 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         pending_joins: config.pending_joins.clone(),
         cert_generation: config.cert_generation,
         revoked_devices: config.revoked_devices.clone(),
+        controllers: config.controllers.clone(),
+        managed_machines: config.managed_machines.clone(),
+        forgotten_machines: config.forgotten_machines.clone(),
+        enrollment_credentials: config.enrollment_credentials.clone(),
     };
     toml::to_string_pretty(&settings).context("serializing settings")
 }
@@ -1717,6 +1703,8 @@ pub(crate) static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 mod tests {
 
     use super::*;
+    use std::net::Ipv6Addr;
+
     use iroh::EndpointId;
 
     /// `ray-mobile` used to publish its config directory by writing
@@ -2263,6 +2251,78 @@ name = "test"
         assert_eq!(loaded.download_user, Some(1000));
     }
 
+    #[test]
+    fn management_state_roundtrips_with_typed_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let controller_key = SecretKey::generate();
+        let controller = controller_key.public();
+        let machine = test_id(32);
+        let enrolled_at = UnixTimestampSecs::from_secs(100);
+        let last_seen = UnixTimestampSecs::from_secs(200);
+        let cfg = AppConfig {
+            controllers: vec![ControllerGrant {
+                identity: controller,
+                enrolled_at,
+                receipt: Some(EnrollmentReceipt::issue(
+                    &controller_key,
+                    machine,
+                    enrolled_at,
+                )),
+            }],
+            managed_machines: vec![ManagedMachine {
+                identity: machine,
+                hostname: "build-box".parse().unwrap(),
+                enrolled_at,
+                last_seen: Some(last_seen),
+            }],
+            forgotten_machines: vec![test_id(33)],
+            enrollment_credentials: vec![EnrollmentCredential {
+                id: ray_proto::ipc::EnrollmentCredentialId::new("abc123".to_string()),
+                secret_hash: blake3::hash(b"fabricated enrollment secret"),
+                expires_at: UnixTimestampSecs::from_secs(300),
+                reusable: true,
+                enrolled_machines: vec![machine],
+                revoked: false,
+            }],
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.controllers, cfg.controllers);
+        assert_eq!(loaded.managed_machines, cfg.managed_machines);
+        assert_eq!(loaded.forgotten_machines, cfg.forgotten_machines);
+        assert_eq!(loaded.enrollment_credentials, cfg.enrollment_credentials);
+    }
+
+    #[test]
+    fn legacy_controller_grant_loads_without_a_receipt() {
+        let settings: Settings = toml::from_str(&format!(
+            "[[controllers]]\nidentity = '{}'\nenrolled_at = 100\n",
+            test_id(31)
+        ))
+        .unwrap();
+        assert!(settings.controllers[0].receipt.is_none());
+        assert!(settings.forgotten_machines.is_empty());
+    }
+
+    #[test]
+    fn settings_endpoint_hints_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let hint =
+            iroh::EndpointAddr::new(test_id(7)).with_ip_addr("203.0.113.7:41383".parse().unwrap());
+        let cfg = AppConfig {
+            endpoint_hints: vec![hint.clone()],
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.endpoint_hints, vec![hint]);
+    }
+
     /// The IPv6-only cutover deleted the `ipv6-only` setting, and the release
     /// notes promise a `settings.toml` still carrying it upgrades rather than
     /// failing to parse. Nothing in `Settings` names the key any more, so what
@@ -2287,6 +2347,13 @@ name = "test"
         let loaded = load_in(tmp.path()).unwrap();
         assert_eq!(loaded.download_dir, None);
         assert_eq!(loaded.download_user, None);
+    }
+
+    #[test]
+    fn fresh_install_enables_dns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_in(tmp.path()).unwrap();
+        assert!(loaded.dns_enabled);
     }
 
     #[test]
@@ -2404,7 +2471,7 @@ name = "test"
         // Unset: captured unchanged.
         assert_eq!(
             resolve_upstreams(&ServerOverride::default(), captured.clone()),
-            captured
+            vec![IpAddr::V4(captured[0])]
         );
 
         // Augment: custom first, then captured.
@@ -2414,7 +2481,7 @@ name = "test"
         };
         assert_eq!(
             resolve_upstreams(&aug, captured.clone()),
-            vec![one, captured[0]]
+            vec![IpAddr::V4(one), IpAddr::V4(captured[0])]
         );
 
         // Replace: custom only.
@@ -2422,31 +2489,47 @@ name = "test"
             servers: vec!["1.1.1.1".into()],
             replace: true,
         };
-        assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
+        assert_eq!(
+            resolve_upstreams(&rep, captured.clone()),
+            vec![IpAddr::V4(one)]
+        );
+
+        // Tailscale remains the preferred upstream even when the user added a
+        // different resolver, while Rayfish itself still intercepts `.ray`.
+        let tailscale = Ipv4Addr::new(100, 100, 100, 100);
+        assert_eq!(
+            resolve_upstreams(&aug, vec![captured[0], tailscale],),
+            vec![
+                IpAddr::V4(tailscale),
+                IpAddr::V4(one),
+                IpAddr::V4(captured[0])
+            ]
+        );
     }
 
-    /// `dns-upstreams` takes IPv6 since the IPv6-only tunnel needed it, so an
-    /// all-IPv6 `--replace` narrows to nothing here. Returning that empty list
-    /// would leave the forwarder with no server and hand `control_plane_nameservers`
-    /// an empty set, putting the endpoint back on iroh's resolv.conf reader (#111).
+    /// An IPv6 upstream can be a resolver on a mesh peer. `--replace` must leave
+    /// that address intact so it receives every non-`.ray` lookup.
     #[test]
-    fn replace_with_only_ipv6_keeps_the_captured_upstreams() {
+    fn replace_with_only_ipv6_uses_the_configured_peer() {
         let captured = vec![Ipv4Addr::new(192, 168, 1, 1)];
+        let peer: Ipv6Addr = "200::1234".parse().unwrap();
         let v6_only = ServerOverride {
-            servers: vec!["2606:4700:4700::1111".into()],
+            servers: vec![peer.to_string()],
             replace: true,
         };
-        assert_eq!(resolve_upstreams(&v6_only, captured.clone()), captured);
+        assert_eq!(
+            resolve_upstreams(&v6_only, captured.clone()),
+            vec![IpAddr::V6(peer)]
+        );
 
-        // One usable IPv4 entry and `replace` still means replace: the guard is
-        // for "nothing survived the narrowing", not "some entries were dropped".
+        // Both families retain their order under `--replace`.
         let mixed = ServerOverride {
-            servers: vec!["2606:4700:4700::1111".into(), "1.1.1.1".into()],
+            servers: vec![peer.to_string(), "1.1.1.1".into()],
             replace: true,
         };
         assert_eq!(
             resolve_upstreams(&mixed, captured),
-            vec![Ipv4Addr::new(1, 1, 1, 1)]
+            vec![IpAddr::V6(peer), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]
         );
     }
 
@@ -2462,8 +2545,8 @@ name = "test"
     fn only_a_usable_upstream_waives_the_takeover_guard() {
         let captured: Vec<Ipv4Addr> = Vec::new();
         for (servers, usable) in [
-            (vec!["2606:4700:4700::1111"], false),
-            (vec!["2606:4700:4700::1111", "2001:4860:4860::8888"], false),
+            (vec!["2606:4700:4700::1111"], true),
+            (vec!["2606:4700:4700::1111", "2001:4860:4860::8888"], true),
             (vec!["1.1.1.1"], true),
             (vec!["2606:4700:4700::1111", "1.1.1.1"], true),
             (vec!["not-an-address"], false),
@@ -2688,6 +2771,25 @@ name = "test"
                 .to_string()
                 .contains("network config update callbacks must not call network config APIs")
         );
+    }
+
+    /// A no-op update still re-syncs the file, and that must succeed. It runs on
+    /// every retry of an already-durable write, so a re-sync that always fails
+    /// leaves the caller retrying a write that has nothing left to do: the
+    /// coordinator republished its pkarr record every five seconds instead of
+    /// every two and a half minutes, for as long as the daemon ran. Windows is
+    /// the case this guards, where `FlushFileBuffers` rejects a read-only handle.
+    #[test]
+    fn a_no_op_network_update_re_syncs_rather_than_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+
+        let updated = update_network_in(dir, "homelab", |_| Ok(()))
+            .expect("a no-op update re-syncs the file rather than reporting a disk error")
+            .expect("the network exists");
+
+        assert_eq!(updated.name, "homelab");
     }
 
     #[test]

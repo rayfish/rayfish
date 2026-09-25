@@ -11,6 +11,10 @@
 //! the crate-level `transport` module that owns iroh endpoint setup.
 
 use super::*;
+use iroh::address_lookup::memory::MemoryLookup;
+#[cfg(target_os = "android")]
+use std::sync::atomic;
+use url::Url;
 
 // Fields are read starting in M2 (extracted services consume `Arc<Transport>`);
 // during M1 only the bundle is constructed, so silence the transitional warning.
@@ -35,6 +39,33 @@ pub(crate) struct Transport {
     pub(crate) contact_public: EndpointId,
     /// Nodes seen on the LAN over mDNS. Empty when mDNS is disabled.
     pub(crate) lan_peers: Arc<LanPeers>,
+    /// Bootstrap-only address hints from successful prior connections.  This is
+    /// registered with iroh's lookup chain, so a stale hint simply falls through
+    /// to normal discovery and can never impersonate its endpoint id.
+    pub(crate) warm_lookup: MemoryLookup,
+    /// The discovery relay selected for this daemon at startup. Keeping this
+    /// with the endpoint prevents a later embedded daemon from inheriting a
+    /// prior instance's process-global setting.
+    pub(crate) pkarr_relay_url: Url,
+    /// Android keeps the TUN/DNS plane alive while suspending mesh transport
+    /// after an idle period. The first packet resumes it before dialing.
+    #[cfg(target_os = "android")]
+    pub(crate) suspended: Arc<AtomicBool>,
+    #[cfg(target_os = "android")]
+    pub(crate) activity_seq: Arc<AtomicU64>,
+    #[cfg(target_os = "android")]
+    pub(crate) relay_configs: Arc<Vec<(RelayUrl, Arc<RelayConfig>)>>,
+}
+
+/// Startup-only values bundled to keep [`Transport::new`] focused on its core
+/// endpoint, identity, store, and metrics dependencies.
+pub(crate) struct TransportBootstrap {
+    pub(crate) contact_public: EndpointId,
+    pub(crate) lan_peers: Arc<LanPeers>,
+    pub(crate) warm_lookup: MemoryLookup,
+    pub(crate) pkarr_relay_url: Url,
+    #[cfg(target_os = "android")]
+    pub(crate) relay_configs: Vec<(RelayUrl, Arc<RelayConfig>)>,
 }
 
 impl Transport {
@@ -46,8 +77,7 @@ impl Transport {
         identity: IrohIdentityProvider,
         blob_store: FsStore,
         stats: Arc<ForwardMetrics>,
-        contact_public: EndpointId,
-        lan_peers: Arc<LanPeers>,
+        bootstrap: TransportBootstrap,
     ) -> Self {
         Self {
             endpoint: bound.endpoint,
@@ -55,8 +85,36 @@ impl Transport {
             identity,
             blob_store,
             stats,
-            contact_public,
-            lan_peers,
+            contact_public: bootstrap.contact_public,
+            lan_peers: bootstrap.lan_peers,
+            warm_lookup: bootstrap.warm_lookup,
+            pkarr_relay_url: bootstrap.pkarr_relay_url,
+            #[cfg(target_os = "android")]
+            suspended: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "android")]
+            activity_seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "android")]
+            relay_configs: Arc::new(bootstrap.relay_configs),
         }
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn is_suspended(&self) -> bool {
+        self.suspended.load(atomic::Ordering::Acquire)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn mark_suspended(&self) -> bool {
+        !self.suspended.swap(true, atomic::Ordering::AcqRel)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn mark_awake(&self) -> bool {
+        self.suspended.swap(false, atomic::Ordering::AcqRel)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn record_outgoing_activity(&self) {
+        self.activity_seq.fetch_add(1, atomic::Ordering::Relaxed);
     }
 }

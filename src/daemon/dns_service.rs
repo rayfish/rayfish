@@ -14,11 +14,21 @@
 //! `resolve` (reader side), on top of `configure` / `revert` (lifecycle).
 
 use super::*;
-use std::net::Ipv6Addr;
+#[cfg(target_os = "macos")]
+use std::net::IpAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 
 /// First and last backoff step for the OS-DNS configuration retry loop.
 const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
 const DNS_CONFIG_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// How often the forwarder re-checks which system resolvers actually answer.
+///
+/// Slower than the OS-DNS re-assert tick: a resolver going away is not urgent
+/// the way losing our own key is, since the first name to miss reveals it, and
+/// each pass costs one `. NS` probe per candidate.
+#[cfg(target_os = "macos")]
+const UPSTREAM_REFRESH_TICK: Duration = Duration::from_secs(15);
 
 pub(crate) struct DnsService {
     /// `.ray` forward lookup table (hostname → IP). Cloned into `MeshCtx` and the
@@ -32,7 +42,9 @@ pub(crate) struct DnsService {
     /// `reassert_os_config` can re-apply it. `Arc` (not `Box`) so a re-apply can
     /// clone it out and run without holding the lock across the await.
     configurator: Arc<Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>>,
-    /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
+    /// Cancellation token for the re-assert task that repairs the OS DNS
+    /// configuration after another program tramples it: `run_resolv_reassert`
+    /// on Linux (direct mode only), `run_sc_reassert` on macOS.
     reassert_token: Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Cancellation token for the retry loop spawned when the initial OS-DNS
     /// configuration fails (see [`DnsService::configure`]).
@@ -81,9 +93,18 @@ impl DnsService {
 
     /// Point system DNS at the in-daemon Magic DNS resolver: detect the OS DNS
     /// backend, merge any user-configured upstreams over the captured ones, and
-    /// (Linux direct-resolv.conf mode) spawn the inotify re-assert watcher.
+    /// spawn the re-assert watcher the platform's backend needs.
     /// Failures are non-fatal: pushed to `warnings` so `ray up` can surface them.
     pub(crate) async fn configure(self: &Arc<Self>, tun_name: &str, warnings: &mut Vec<String>) {
+        // Android's VpnService configures DNS and supplies the loopback proxy
+        // upstreams. Desktop backend detection is permanently unsupported there;
+        // retrying it only creates a timer and a misleading warning.
+        if cfg!(target_os = "android") {
+            return;
+        }
+        if !config::load().map(|c| c.dns_enabled).unwrap_or(true) {
+            return;
+        }
         // Configure system DNS to route .ray queries to our in-daemon resolver.
         dns_config::restore_stale_backups();
         if let Some(retry) = self.configure_retry.lock().unwrap().take() {
@@ -103,7 +124,8 @@ impl DnsService {
 
     /// Take ownership of a detected OS-DNS backend: seed the resolver's
     /// upstreams, keep the configurator for `revert`, install the current search
-    /// domains, and (Linux direct mode) start the inotify re-assert watcher.
+    /// domains, and start the re-assert watcher that repairs the configuration
+    /// if something else overwrites or deletes it.
     async fn adopt_configurator(
         self: &Arc<Self>,
         c: Box<dyn dns_config::DnsConfigurator>,
@@ -123,7 +145,8 @@ impl DnsService {
         // share with, and a live server behind us to decline *to*.
         let defer_off_mesh = c.shared_resolver().is_some() && !fallbacks.is_empty();
         tracing::info!(backend = c.name(), resolver_ip = %dns_config::resolver_addr(), upstreams = ?upstreams, defer_off_mesh, "Magic DNS active");
-        self.resolver.set_upstreams(upstreams);
+        self.resolver
+            .set_upstream_addrs(upstreams.into_iter().map(|ip| SocketAddr::from((ip, 53))));
         self.resolver.set_defer_off_mesh(defer_off_mesh);
         let c: Arc<dyn dns_config::DnsConfigurator> = Arc::from(c);
         *self.configurator.lock().unwrap() = Some(Arc::clone(&c));
@@ -164,6 +187,155 @@ impl DnsService {
                     me.recapture(why, tun_name, &watcher).await;
                 }
             });
+        }
+
+        // macOS: another VPN's DNS handling walks every service in the dynamic
+        // store, ours included. Mullvad writes its own resolver over
+        // `State:/Network/Service/rayfish/DNS` while it is connected and
+        // *removes* the key on disconnect instead of restoring what it found,
+        // so `.ray` stopped resolving the moment the other VPN went away and
+        // nothing brought it back before the next `ray up`. Poll the key and
+        // re-apply when it is gone.
+        #[cfg(target_os = "macos")]
+        {
+            let rt = CancellationToken::new();
+            // Cancel whatever the last adopt left running: `configure` can be
+            // called again without a `revert` in between (the retry loop
+            // succeeding is the usual way), and two watchers on one key would
+            // both answer the same removal.
+            if let Some(old) = self.reassert_token.lock().unwrap().replace(rt.clone()) {
+                old.cancel();
+            }
+            tokio::spawn(Arc::clone(self).run_sc_reassert(tun_name.to_string(), rt.clone()));
+            // Shares the re-assert token: both watch the same host DNS and both
+            // are meaningless once the data plane is down, so `revert` cancelling
+            // one has to cancel the other.
+            tokio::spawn(Arc::clone(self).run_upstream_refresh(rt));
+        }
+    }
+
+    /// Keep the forwarder pointed at system resolvers that actually answer.
+    ///
+    /// The upstream set is captured once, when the OS-DNS backend is detected,
+    /// and without this it stays that way for the life of the backend. Every way
+    /// the host's DNS can move afterwards breaks it: changing network leaves the
+    /// old router in the list, and another VPN connecting or disconnecting
+    /// swaps the resolvers wholesale. The damaging order is connecting that VPN
+    /// and *then* restarting, because the capture takes its resolvers and keeps
+    /// forwarding to them after it goes, so every non-`.ray` name dies with the
+    /// tunnel that is no longer there.
+    ///
+    /// Liveness is decided by probing, not by reading the configuration, because
+    /// the two disagree in exactly the case that matters. Under another VPN's
+    /// kill switch the captured resolver is still named by the system and still
+    /// route-reachable, and simply never answers. Probing also gets the ordering
+    /// right for free: a dead entry at the front of the list otherwise costs
+    /// every lookup a full timeout before the working one behind it is tried.
+    ///
+    /// A pass that finds nothing alive changes nothing. Replacing a set that is
+    /// merely unreachable this second with an empty one turns a slow forwarder
+    /// into a broken one, and the next pass costs 15 seconds.
+    #[cfg(target_os = "macos")]
+    async fn run_upstream_refresh(self: Arc<Self>, token: CancellationToken) {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(UPSTREAM_REFRESH_TICK) => {}
+            }
+
+            let live = dns_config::live_system_upstreams();
+            if live.is_empty() {
+                continue;
+            }
+            // Same merge the initial adopt does, so an operator's `dns-upstreams`
+            // keeps its precedence instead of being overwritten by the capture.
+            let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+            let desired = config::resolve_upstreams(&dns_override, live);
+
+            let mut answering = Vec::new();
+            for ip in desired {
+                if crate::dns::resolver::probe_upstream(SocketAddr::from((ip, 53u16))).await {
+                    answering.push(ip);
+                }
+            }
+            if answering.is_empty() {
+                continue;
+            }
+
+            let current: Vec<IpAddr> = self
+                .resolver
+                .upstreams()
+                .into_iter()
+                .map(|a| a.ip())
+                .collect();
+            if answering != current {
+                tracing::info!(
+                    ?current,
+                    upstreams = ?answering,
+                    "system resolvers changed; re-pointing the DNS forwarder"
+                );
+                self.resolver
+                    .set_upstream_addrs(answering.into_iter().map(|ip| SocketAddr::from((ip, 53))));
+            }
+        }
+    }
+
+    /// Re-install the macOS DNS configuration after another program deletes it.
+    ///
+    /// Mullvad's `talpid_dns` enumerates every service in the dynamic store when
+    /// it connects, ours included, writes its own resolver over each one, and on
+    /// disconnect *removes* them rather than putting back what it found. Our key
+    /// is a session key, so nothing reclaims it for us: `.ray` went quiet when
+    /// the other VPN was switched off, not while it was up, and stayed that way
+    /// until the next `ray up`.
+    ///
+    /// Only a key that is *gone* is repaired. One that somebody else is holding
+    /// is left to them: a VPN that owns DNS for the length of its tunnel
+    /// re-asserts on a notification of its own, so writing over it would be two
+    /// daemons overwriting each other for as long as it stays connected, which
+    /// is the fight `MERGE_COOLDOWN` avoids on Linux.
+    #[cfg(target_os = "macos")]
+    async fn run_sc_reassert(self: Arc<Self>, tun_name: String, token: CancellationToken) {
+        use dns_config::DnsKeyState;
+
+        // One line per takeover, not one per pass: another VPN holds DNS for as
+        // long as it is connected, and the key is read every few seconds.
+        let mut warned = false;
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(dns_config::SC_REASSERT_TICK) => {}
+            }
+            match dns_config::dns_key_state() {
+                DnsKeyState::Ours => warned = false,
+                DnsKeyState::Foreign => {
+                    if !warned {
+                        warned = true;
+                        tracing::warn!(
+                            "another program has taken the macOS DNS configuration for our \
+                             service; leaving it to them, so .ray names will not resolve \
+                             until they release it"
+                        );
+                    }
+                }
+                DnsKeyState::Gone => {
+                    tracing::warn!(
+                        "the macOS DNS configuration was removed under us; \
+                         re-asserting rayfish DNS"
+                    );
+                    warned = false;
+                    self.reassert_os_config(&tun_name).await;
+                    // `revert` cancels us on the way down, but it can have run
+                    // while the re-apply above was in flight: it took the
+                    // configurator with it, so its own `revert` removed the keys
+                    // before we wrote them back. Drop them rather than leave a
+                    // downed data plane's resolver in the store.
+                    if token.is_cancelled() {
+                        dns_config::remove_dns_config();
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -274,7 +446,13 @@ impl DnsService {
     /// just changed and the whole point is to act on it now.
     fn spawn_configure_retry(self: &Arc<Self>, tun_name: String, first_delay: Duration) {
         let token = CancellationToken::new();
-        *self.configure_retry.lock().unwrap() = Some(token.clone());
+        // Cancel whatever this replaces. `configure` and `revert` already cancel
+        // before they call in here, but `recapture` does not, and a token that is
+        // dropped from the cell without being cancelled leaves its loop running
+        // with nothing left that can ever stop it.
+        if let Some(previous) = self.configure_retry.lock().unwrap().replace(token.clone()) {
+            previous.cancel();
+        }
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let mut delay = first_delay;
@@ -308,21 +486,40 @@ impl DnsService {
     }
 
     /// Re-apply the current OS-DNS configuration in place (no re-detect, no
-    /// re-capture of upstreams). Called when the exit-node full-tunnel state flips
-    /// so the macOS configurator rewrites its match domains: catch-all (route all
-    /// DNS through Magic DNS, forwarded upstream via the tunnel) while an exit is
-    /// up, `.ray`-only split DNS otherwise. No-op if DNS was never configured.
+    /// re-capture of upstreams), then put the search domains back.
+    ///
+    /// Called when the exit-node full-tunnel state flips, so the macOS
+    /// configurator rewrites its match domains: catch-all (route all DNS through
+    /// Magic DNS, forwarded upstream via the tunnel) while an exit is up,
+    /// `.ray`-only split DNS otherwise. Also how [`run_sc_reassert`] repairs a
+    /// deleted configuration. No-op if DNS was never configured.
+    ///
+    /// The second half is not optional. `apply` writes the whole key from
+    /// scratch and the only search domain it knows is `.ray` itself; the
+    /// per-network ones that make a bare `box` resolve arrive separately, via
+    /// `set_search_domains`, and a re-apply that did not reinstall them would
+    /// drop every one until the next join or leave.
     ///
     /// macOS-only: it is the only platform whose exit-node client rewrites match
     /// domains, so elsewhere this is dead code and `-D warnings` says so.
+    ///
+    /// [`run_sc_reassert`]: DnsService::run_sc_reassert
     #[cfg(target_os = "macos")]
-    pub(crate) async fn reassert_os_config(&self) {
+    pub(crate) async fn reassert_os_config(&self, tun_name: &str) {
         // Clone the Arc out, not the guard, so the lock isn't held across await.
         let configurator = self.configurator.lock().unwrap().clone();
-        if let Some(configurator) = configurator
-            && let Err(e) = configurator.apply().await
+        let Some(configurator) = configurator else {
+            return;
+        };
+        if let Err(e) = configurator.apply().await {
+            tracing::warn!(error = %e, "failed to re-apply system DNS");
+            return;
+        }
+        let domains = self.search_domains.lock().unwrap().clone();
+        if !domains.is_empty()
+            && let Err(e) = configurator.set_search_domains(&domains, tun_name).await
         {
-            tracing::warn!(error = %e, "failed to re-apply system DNS after exit-node change");
+            tracing::warn!(error = %e, "failed to reinstall search domains after re-applying system DNS");
         }
     }
 
@@ -368,11 +565,81 @@ impl DnsService {
         dns_config::nm_quiet_remove().await;
         dns_config::clear_search_domains(tun_name).await;
     }
+
+    /// Stop the background tasks (`configure` retry, re-assert watcher) without
+    /// touching OS state. For a node going offline for good, where `revert`'s
+    /// undo work is either already done or about to be irrelevant, but the tasks
+    /// must not outlive the daemon that owns them.
+    ///
+    /// An embedder that rebuilds a daemon in the same process needs this: the
+    /// retry loop holds an `Arc<DnsService>` and runs on a runtime that survives
+    /// the node, so without a cancel here every stop/start cycle strands another
+    /// copy of this service, retrying forever against a platform that already
+    /// refused it. Observed on Android (where OS-DNS configuration always fails,
+    /// so the loop never exits on its own): three live loops after three
+    /// disable/enable cycles, between them filling most of the diagnostics log
+    /// ring with retry chatter.
+    pub(crate) fn shutdown_background(&self) {
+        if let Some(rt) = self.reassert_token.lock().unwrap().take() {
+            rt.cancel();
+        }
+        if let Some(retry) = self.configure_retry.lock().unwrap().take() {
+            retry.cancel();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service() -> Arc<DnsService> {
+        let table = dns::HostnameTable::default();
+        let reverse = dns::ReverseLookupTable::default();
+        let resolver = std::sync::Arc::new(crate::dns::resolver::Resolver::new(
+            Arc::clone(&table),
+            Arc::clone(&reverse),
+        ));
+        Arc::new(DnsService::new(
+            table,
+            reverse,
+            resolver,
+            Ipv6Addr::UNSPECIFIED,
+        ))
+    }
+
+    /// A second retry loop must cancel the first. `recapture` spawns without
+    /// cancelling, and a token merely dropped from the cell leaves its loop with
+    /// nothing that can ever stop it: on a platform that always refuses OS-DNS
+    /// configuration (Android) that loop then retries for the life of the
+    /// process.
+    #[tokio::test]
+    async fn spawning_a_retry_cancels_the_one_it_replaces() {
+        let dns = service();
+        dns.spawn_configure_retry("tun0".into(), Duration::from_secs(3600));
+        let first = dns.configure_retry.lock().unwrap().clone().unwrap();
+
+        dns.spawn_configure_retry("tun0".into(), Duration::from_secs(3600));
+        assert!(first.is_cancelled(), "the replaced loop was left running");
+
+        let second = dns.configure_retry.lock().unwrap().clone().unwrap();
+        assert!(!second.is_cancelled(), "the new loop must still be live");
+    }
+
+    /// A node going offline has to stop the retry loop even though `revert` was
+    /// never called. The loop holds an `Arc<DnsService>` on a runtime that
+    /// outlives the daemon, so on an embedder that rebuilds in-process an
+    /// uncancelled one strands the whole service.
+    #[tokio::test]
+    async fn shutdown_cancels_the_retry_loop() {
+        let dns = service();
+        dns.spawn_configure_retry("tun0".into(), Duration::from_secs(3600));
+        let token = dns.configure_retry.lock().unwrap().clone().unwrap();
+
+        dns.shutdown_background();
+        assert!(token.is_cancelled());
+        assert!(dns.configure_retry.lock().unwrap().is_none());
+    }
 
     /// Declining is only safe with somebody to decline *to*. Both halves of
     /// that come from the backend: another mesh sharing the file, and at least

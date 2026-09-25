@@ -53,3 +53,6 @@ jni = "0.22"
 # -- generate --library <path to cdylib> --language kotlin --out-dir <dir>`.
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

@@ -115,10 +115,7 @@ pub(crate) fn paired_devices() -> ArgValueCompleter {
     })
 }
 
-/// Peers waiting for admission, for `ray requests <net> accept|deny <id>`.
-///
-/// The id is a short id read off the listing directly above it on screen, which
-/// is exactly the kind of value nobody should be retyping by hand.
+/// Peers waiting for admission, for `ray requests <net> accept|deny <name>`.
 pub(crate) fn join_requests() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| {
         let Some(network) = scoped_network() else {
@@ -128,7 +125,7 @@ pub(crate) fn join_requests() -> ArgValueCompleter {
     })
 }
 
-/// Peers waiting for a direct link, for `ray connect approve <id>`.
+/// Peers waiting for a direct link, for `ray connect approve <name>`.
 pub(crate) fn connect_requests() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| waiting_peers(current, IpcMessage::Connections))
 }
@@ -142,10 +139,11 @@ fn waiting_peers(current: &OsStr, request: IpcMessage) -> Vec<CompletionCandidat
     })
     .unwrap_or_default();
     described(requests.into_iter().map(|req| {
+        let value = req.hostname.clone().unwrap_or_else(|| req.short_id.clone());
         let who = req.hostname.unwrap_or_else(|| "unnamed".to_string());
         (
-            req.short_id,
-            format!("{who}, waiting {}s", req.waiting_secs),
+            value,
+            format!("{who}, {}, waiting {}s", req.short_id, req.waiting_secs),
         )
     }))
     .into_iter()
@@ -193,7 +191,7 @@ pub(crate) fn invite_ids() -> ArgValueCompleter {
     })
 }
 
-/// Incoming transfers awaiting a decision, for `ray files accept <id>`.
+/// Incoming transfers awaiting a decision, for `ray files accept|reject <id>`.
 pub(crate) fn incoming_files() -> ArgValueCompleter {
     ArgValueCompleter::new(|current: &OsStr| {
         let (files, _) = file_queues();
@@ -240,7 +238,7 @@ pub(crate) fn queued_sends() -> ArgValueCompleter {
 
 fn file_queues() -> (Vec<ipc::PendingFileInfo>, Vec<ipc::OutboxFileInfo>) {
     ask(IpcMessage::ListFiles, |reply| match reply {
-        IpcMessage::FileList { files, outbox } => Some((files, outbox)),
+        IpcMessage::FileList { files, outbox, .. } => Some((files, outbox)),
         _ => None,
     })
     .unwrap_or_default()
@@ -1051,7 +1049,7 @@ mod tests {
     /// is not something the model records.
     #[test]
     fn every_id_read_off_a_listing_has_a_completer() {
-        let expected: [(&[&str], &str); 9] = [
+        let expected: [(&[&str], &str); 10] = [
             (&["requests", "accept"], "id"),
             (&["requests", "deny"], "id"),
             (&["accept"], "id"),
@@ -1059,6 +1057,7 @@ mod tests {
             (&["connect", "approve"], "id"),
             (&["invite", "revoke"], "id"),
             (&["files", "accept"], "id"),
+            (&["files", "reject"], "id"),
             (&["files", "cancel"], "id"),
             (&["firewall", "remove"], "index"),
         ];

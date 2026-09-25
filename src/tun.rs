@@ -19,8 +19,9 @@ use std::net::Ipv6Addr;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 // Windows drives the interface through PowerShell (`windows_process`), not a
-// synchronous `Command`, so nothing here needs the blocking spawn.
-#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
+// synchronous `Command`, so nothing here needs the blocking spawn. Linux does
+// every one of these through netlink and spawns nothing at all.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
@@ -64,28 +65,39 @@ pub trait TunRead: Send + 'static {
 
 /// Write side of a packet interface. Writes one IP packet to the device.
 pub trait TunWrite: Send + 'static {
+    /// Largest IP packet this interface can accept.
+    fn mtu(&self) -> u16 {
+        TUN_MTU
+    }
+
     fn write_packet(
         &mut self,
         packet: &[u8],
     ) -> impl core::future::Future<Output = anyhow::Result<()>> + Send;
 }
 
-/// MTU for the TUN device. IPv6 mandates a minimum link MTU of 1280 bytes
-/// (RFC 8200 §5); Linux refuses to enable IPv6 on a device with a smaller MTU,
-/// which silently breaks IPv6 address/route installation (the builder's IPv6
-/// assignment / `route_peer_range` fail with `EINVAL`). 1280 is also the value
-/// WireGuard and
-/// Tailscale use for their TUN interfaces for the same reason, and it still
-/// fits within QUIC datagram limits.
+/// Maximum IP packet size for the tunnel. Mesh fragmentation carries packets
+/// over smaller QUIC paths. Keep Android's VpnService MTU in sync with this.
+pub const TUN_MTU: u16 = 1500;
+/// IPv6's minimum link MTU, used when the device rejects the preferred MTU.
+pub const MIN_TUN_MTU: u16 = 1280;
+
 #[cfg(not(target_os = "android"))]
-const TUN_MTU: u16 = 1280;
+fn configure_mtu(mut set: impl FnMut(u16) -> std::io::Result<()>) -> Result<u16> {
+    match set(TUN_MTU) {
+        Ok(()) => Ok(TUN_MTU),
+        Err(error) => {
+            tracing::warn!(%error, mtu = MIN_TUN_MTU, "TUN rejected preferred MTU; trying fallback");
+            set(MIN_TUN_MTU).context("set fallback TUN MTU to 1280")?;
+            Ok(MIN_TUN_MTU)
+        }
+    }
+}
 
 /// Bytes exposed for a single `recv`. A TUN read yields at most one MTU-bounded
 /// packet (offload is off), plus a few bytes of slack for any platform
-/// packet-info header. `recv` needs an initialised `&mut [u8]`, so we zero-fill
-/// this many bytes at the tail of the caller's pool before each read; a hand-set
-/// jumbo MTU beyond this would be truncated, but such a packet exceeds the path
-/// MTU and could not traverse a QUIC datagram anyway.
+/// packet-info header. The reader allocates this much scratch space at creation;
+/// manually raising the interface MTU beyond the tunnel limit is unsupported.
 #[cfg(not(target_os = "android"))]
 const READ_RESERVE: usize = TUN_MTU as usize + 4;
 
@@ -104,6 +116,7 @@ pub struct TunReader {
 #[cfg(not(target_os = "android"))]
 pub struct TunWriter {
     dev: Arc<AsyncDevice>,
+    mtu: u16,
 }
 
 /// Creates a TUN device with this node's mesh address and shares it between
@@ -121,29 +134,55 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     // `.up()` did); `set_link_up` and the peer-range route helpers still run
     // later on activate. No IPv4 is assigned at all: the overlay is IPv6-only,
     // and `100.64.0.0/10` belongs to whatever else may be sharing the host.
-    let builder = DeviceBuilder::new().ipv6(v6, 128).mtu(TUN_MTU).enable(true);
+    // Create at IPv6's minimum first so a rejected preferred MTU cannot prevent
+    // device creation. Upgrade separately: only MTU errors trigger fallback.
+    let builder = DeviceBuilder::new()
+        .ipv6(v6, 128)
+        .mtu(MIN_TUN_MTU)
+        .enable(true);
+    #[cfg(target_os = "linux")]
+    let builder = builder.name(LINUX_TUN_NAME);
     #[cfg(target_os = "windows")]
     let builder = builder
+        .mtu_v6(MIN_TUN_MTU)
         .name(WINDOWS_TUN_NAME)
         .description("Rayfish")
         .wintun_file(wintun_library_path().to_string_lossy().into_owned());
     let device = builder.build_async().context("create tun-rs device")?;
+    let mtu = configure_mtu(|mtu| {
+        device.set_mtu(mtu)?;
+        #[cfg(target_os = "windows")]
+        device.set_mtu_v6(mtu)?;
+        Ok(())
+    })?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
-    tracing::info!(ipv6 = %v6, tun = %tun_name, "TUN device created");
+    tracing::info!(ipv6 = %v6, tun = %tun_name, mtu, "TUN device created");
 
     // `recv`/`send` take `&self`, so both halves share one device via `Arc`
     // instead of splitting into independent read/write objects.
     let dev = Arc::new(device);
     Ok((
         TunReader {
-            dev: dev.clone(),
+            dev: Arc::clone(&dev),
             scratch: vec![0u8; READ_RESERVE].into_boxed_slice(),
         },
-        TunWriter { dev },
+        TunWriter { dev, mtu },
         tun_name,
     ))
 }
+
+/// Interface name pattern on Linux. The kernel's default `tun0` says nothing
+/// about who owns the device, and on a host with more than one tunnel it is
+/// whoever started first. `%d` is `TUNSETIFF`'s own placeholder: the kernel
+/// substitutes the lowest free index, so this comes out `rayfish0` and a second
+/// device gets `rayfish1` rather than `EBUSY`. `device.name()` reads the
+/// resolved name back off the fd, so the rest of the daemon sees the real one.
+///
+/// Linux only. macOS numbers its own `utunN` and will not take another name,
+/// and FreeBSD's `tun` cloner insists on a `tun` prefix.
+#[cfg(target_os = "linux")]
+const LINUX_TUN_NAME: &str = "rayfish%d";
 
 /// Wintun adapter name. Fixed rather than generated, so a restart reattaches to
 /// the adapter this daemon created instead of leaving a second one behind.
@@ -516,12 +555,26 @@ async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let state = if up { "up" } else { "down" };
-        let status = Command::new("ip")
-            .args(["link", "set", tun_name, state])
-            .status()
-            .context("run ip link set")?;
-        anyhow::ensure!(status.success(), "ip link set {state} failed with {status}");
+        // Netlink rather than `ip link set`, for the same reason the address and
+        // route helpers above use it: a shell-out puts iproute2 on the daemon's
+        // runtime PATH, and a service unit without it fails this one step while
+        // every netlink call around it succeeds. That leaves the link never
+        // brought up (or, on standby, never brought down) with the address and
+        // the `200::/7` route still in place, which reads as a working VPN that
+        // silently swallows every packet.
+        use rtnetlink::LinkUnspec;
+
+        with_tun_link(tun_name, async |handle, index| {
+            let msg = LinkUnspec::new_with_index(index);
+            let msg = if up { msg.up() } else { msg.down() };
+            handle
+                .link()
+                .set(msg.build())
+                .execute()
+                .await
+                .context("set TUN link state via netlink")
+        })
+        .await?;
     }
     #[cfg(target_os = "windows")]
     {
@@ -583,6 +636,10 @@ impl TunRead for TunReader {
 
 #[cfg(not(target_os = "android"))]
 impl TunWrite for TunWriter {
+    fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.dev.send(packet).await?;
         Ok(())
@@ -591,6 +648,48 @@ impl TunWrite for TunWriter {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn preferred_mtu_rejection_retries_at_ipv6_minimum() {
+        let mut attempts = Vec::new();
+        let mtu = super::configure_mtu(|mtu| {
+            attempts.push(mtu);
+            if mtu > 1280 {
+                Err(std::io::ErrorKind::InvalidInput.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(mtu, 1280);
+        assert_eq!(attempts, [1500, 1280]);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn mtu_setup_does_not_hide_a_failed_fallback() {
+        let mut attempts = Vec::new();
+        let result = super::configure_mtu(|mtu| {
+            attempts.push(mtu);
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, [1500, 1280]);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn supported_preferred_mtu_needs_no_retry() {
+        let mut attempts = Vec::new();
+        let mtu = super::configure_mtu(|mtu| {
+            attempts.push(mtu);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(mtu, 1500);
+        assert_eq!(attempts, [1500]);
+    }
+
     /// A narrowing tunnel must delete the family it stopped carrying.
     ///
     /// `carries` follows the gateway's claim, so it changes under a live tunnel:

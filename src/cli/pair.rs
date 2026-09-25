@@ -20,7 +20,7 @@ pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>)
                 item,
             }),
             _,
-        ) => cmd_pair_backup(onepassword, vault.as_deref(), &item),
+        ) => cmd_pair_backup(onepassword, vault.as_deref(), &item).await,
         // `rayfish pair restore <backup>`
         (
             Some(PairAction::Restore {
@@ -30,7 +30,7 @@ pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>)
                 item,
             }),
             _,
-        ) => cmd_pair_restore(backup.as_deref(), onepassword, vault.as_deref(), &item),
+        ) => cmd_pair_restore(backup.as_deref(), onepassword, vault.as_deref(), &item).await,
     }
 }
 
@@ -156,7 +156,7 @@ pub(crate) async fn ipc_unpair(device: &str) -> Result<()> {
 /// Produce the encrypted `enc1…` backup blob for the local identity, prompting
 /// for (and confirming) a backup password. The blob format lives in
 /// [`keybackup`]; this only handles the terminal side of it.
-pub(crate) fn make_backup_blob() -> Result<keybackup::Backup> {
+pub(crate) fn backup_password() -> Result<String> {
     let password = rpassword::prompt_password("Enter backup password: ")?;
     if password.is_empty() {
         anyhow::bail!("password cannot be empty");
@@ -165,34 +165,52 @@ pub(crate) fn make_backup_blob() -> Result<keybackup::Backup> {
     if password != confirm {
         anyhow::bail!("passwords do not match");
     }
-    keybackup::backup_current_identity(&password)
+    Ok(password)
 }
 
-pub(crate) fn cmd_pair_backup(onepassword: bool, vault: Option<&str>, item: &str) -> Result<()> {
+pub(crate) async fn cmd_pair_backup(
+    onepassword: bool,
+    vault: Option<&str>,
+    item: &str,
+) -> Result<()> {
     // Fail fast if `op` is missing before prompting for a password.
     if onepassword {
         onepassword::op_available()?;
     }
 
-    let keybackup::Backup { code, public_key } = make_backup_blob()?;
+    let password = (!onepassword).then(backup_password).transpose()?;
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::BackupIdentity {
+            password,
+            onepassword,
+        },
+    )
+    .await?;
+    let (code, public_key) = match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::IdentityBackup { code, public_key } => (code, public_key),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
+    };
 
     if onepassword {
         onepassword::store(vault, item, &code, &public_key)?;
         println!("Stored encrypted backup in 1Password item \"{}\".", item);
         println!();
         println!("To restore on a new device:");
-        println!("  rayfish pair restore --1password");
+        println!("  ray pair restore --1p");
         return Ok(());
     }
 
     println!("Backup code: {}", code);
     println!();
     println!("Store this safely. To restore on a new device:");
-    println!("  rayfish pair restore {}", code);
+    println!("  ray pair restore {}", code);
     Ok(())
 }
 
-pub(crate) fn cmd_pair_restore(
+pub(crate) async fn cmd_pair_restore(
     backup: Option<&str>,
     onepassword: bool,
     vault: Option<&str>,
@@ -200,32 +218,32 @@ pub(crate) fn cmd_pair_restore(
 ) -> Result<()> {
     let backup = if onepassword {
         if backup.is_some() {
-            anyhow::bail!("provide either a backup code or --1password, not both");
+            anyhow::bail!("provide either a backup code or --1p, not both");
         }
         onepassword::op_available()?;
         onepassword::read(vault, item)?
     } else {
         backup
             .map(|b| b.to_string())
-            .context("provide a backup code, or use --1password to read it from 1Password")?
+            .context("provide a backup code, or use --1p to read it from 1Password")?
     };
 
-    let password = rpassword::prompt_password("Enter backup password: ")?;
-    let key = keybackup::decrypt(&backup, &password)?;
-
-    // Check if a key already exists
-    let existing = identity::load_or_create()?;
-    if existing.public() == key.public() {
-        println!("This device already has this identity.");
-        return Ok(());
+    let password = if onepassword {
+        None
+    } else {
+        Some(rpassword::prompt_password("Enter backup password: ")?)
+    };
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::RestoreIdentity { backup, password },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
-
-    // Writes into the shared config tree (Linux: /etc/rayfish, root-owned, so
-    // this command may need sudo there).
-    identity::store_secret_key(&key)?;
-
-    println!("Restored user identity: {}", key.public());
-    println!("Restart the daemon for changes to take effect.");
     Ok(())
 }
 

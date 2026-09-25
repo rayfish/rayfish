@@ -297,15 +297,10 @@ fn announce_posture(opts: &UpOptions, restarting: bool) {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-///
-/// The posture flags (`--private`, `--relay`, `--pkarr`) are settings writes,
-/// not part of `Up`: they go over `ConfigSet` first, and are read again when the
-/// endpoint next binds. See [`apply_posture`].
-pub(crate) async fn cmd_up(opts: UpOptions) -> Result<()> {
-    if opts.no_private {
-        confirm_leaving_private(opts.yes)?;
-    }
-
+pub(crate) async fn cmd_up(
+    hostname: Option<String>,
+    controller: Option<ipc::EnrollmentTicket>,
+) -> Result<()> {
     #[cfg(windows)]
     let mut operator_claim = WindowsOperatorClaim::begin()?;
     if let Ok(mut stream) = ipc::connect().await {
@@ -332,7 +327,10 @@ pub(crate) async fn cmd_up(opts: UpOptions) -> Result<()> {
                 // else leaves the claim to be rolled back on drop.
                 #[cfg(windows)]
                 operator_claim.commit();
-                println!("{message}")
+                println!("{message}");
+                if let Some(ticket) = controller {
+                    ipc_enroll_controller(&ticket).await?;
+                }
             }
             ipc::IpcMessage::Error { message } => fail_with("error", &message),
             other => fail_unexpected(&other),
@@ -352,16 +350,9 @@ pub(crate) async fn cmd_up(opts: UpOptions) -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service(opts.hostname.clone()).await?;
-
-    // The daemon is up and reachable now, so the posture can be written and made
-    // to take effect. Unlike the path above, this one already required root and
-    // just started the service itself, so bouncing it is neither a privilege
-    // problem nor a surprise: nothing was connected a moment ago.
-    if opts.touches_posture() {
-        apply_posture(&opts).await?;
-        announce_posture(&opts, true);
-        restart_service_and_wait().await?;
+    install_and_start_service(hostname).await?;
+    if let Some(ticket) = controller {
+        ipc_enroll_controller(&ticket).await?;
     }
     Ok(())
 }

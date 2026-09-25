@@ -242,6 +242,7 @@ impl Daemon {
                     connection,
                     exit_node: m.exit_node,
                     exit_in_use: is_my_exit(m),
+                    is_coordinator: m.is_coordinator,
                 }
             })
             .collect();
@@ -995,6 +996,7 @@ pub(crate) fn saved_network_status(
             state: PeerState::Offline,
             exit_node: false,
             exit_in_use: false,
+            is_coordinator: m.is_coordinator,
         })
         .collect();
     NetworkStatus {

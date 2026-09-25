@@ -387,3 +387,187 @@ table inet filter {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// macOS: surviving another VPN's default-deny pf ruleset.
+// ---------------------------------------------------------------------------
+
+/// The pf sub-anchor our pass rule is loaded into. Under Apple's wildcard
+/// (`anchor "com.apple/*"`), which the main ruleset calls *before* any anchor a
+/// VPN adds on connect, so a `quick` match here terminates evaluation before
+/// that VPN's catch-all block is ever reached.
+pub const TUN_ANCHOR: &str = "com.apple/rayfish_tun";
+
+/// The ruleset that keeps mesh traffic alive under another VPN's default-deny
+/// filter anchor.
+///
+/// `no state` is not cosmetic. `pfctl` applies `keep state` to a bare `pass` by
+/// default, and flushing an anchor removes its *rules* while leaving the states
+/// they created; a 1/sec ping refreshes such a state indefinitely, so teardown
+/// would appear to do nothing until the flow went idle. Stateless, the rule
+/// stops mattering the moment it is flushed.
+pub fn pf_pass_rules(tun: &str) -> String {
+    format!("pass quick on {tun} all no state\n")
+}
+
+/// Anchor names the main filter ruleset calls that are not Apple's own.
+///
+/// Off macOS nothing calls this or [`pf_anchor_blocks_all`]; both stay ungated so
+/// their tests run on every platform, which is the only place their parsing is
+/// checked at all.
+///
+/// `pfctl -s rules` prints one `anchor "<name>" ...` line per call, in
+/// evaluation order. Apple's is a wildcard we load into ourselves, so it is
+/// never foreign; anything else was inserted by a service that is now sharing
+/// the host with us.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pf_foreign_anchors(main_ruleset: &str) -> Vec<String> {
+    main_ruleset
+        .lines()
+        .map(str::trim)
+        // Only the filter call, never `scrub-anchor` / `nat-anchor` /
+        // `rdr-anchor`: those three cannot drop a packet.
+        .filter_map(|l| l.strip_prefix("anchor \""))
+        .filter_map(|rest| rest.split_once('"').map(|(name, _)| name))
+        .filter(|name| !name.starts_with("com.apple"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether an anchor's ruleset ends in a catch-all block, i.e. it default-denies
+/// anything its own passes did not claim.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pf_anchor_blocks_all(anchor_rules: &str) -> bool {
+    anchor_rules
+        .lines()
+        .map(str::trim)
+        // `on <iface>` narrows the rule to one interface, which the mesh is not
+        // on: that is somebody's interface policy, not a host-wide default-deny.
+        .any(|l| {
+            l.starts_with("block")
+                && l.contains("quick")
+                && l.ends_with(" all")
+                && !l.contains(" on ")
+        })
+}
+
+/// Load the passthrough anchor for `tun`, so mesh traffic survives another
+/// VPN's default-deny ruleset.
+///
+/// Deliberately does **not** enable pf. A Mac with pf off has nothing dropping
+/// mesh traffic, and turning it on would impose a firewall the operator never
+/// asked for; the anchor loaded while pf is off costs nothing and starts being
+/// evaluated the moment another VPN enables pf and inserts its own anchor.
+///
+/// For the same reason it does not force `/etc/pf.conf` in when the main ruleset
+/// does not reach [`TUN_ANCHOR`], the way the exit node's NAT anchor does: there,
+/// an unreferenced anchor means a gateway silently forwarding without
+/// masquerading, and here it means a rule nothing needed yet.
+#[cfg(target_os = "macos")]
+pub fn install_tun_passthrough(tun: &str) -> anyhow::Result<()> {
+    crate::exit_node::pf_load_anchor(TUN_ANCHOR, &pf_pass_rules(tun))
+}
+
+/// Flush the passthrough anchor. The anchor *node* survives (pfctl has no way to
+/// delete one; it goes on the next reboot), but an empty anchor matches nothing.
+#[cfg(target_os = "macos")]
+pub fn remove_tun_passthrough() {
+    if let Err(e) = crate::exit_node::pf_load_anchor(TUN_ANCHOR, "") {
+        tracing::debug!(error = %format!("{e:#}"), "could not flush the pf passthrough anchor");
+    }
+}
+
+/// The warning for an operator who has turned the passthrough off on a host
+/// where something is default-denying, so a dead mesh explains itself instead of
+/// looking like a rayfish fault.
+///
+/// Names the anchor rather than guessing at the product behind it: the ruleset
+/// is the evidence we actually have.
+#[cfg(target_os = "macos")]
+pub fn pf_block_warning() -> Option<String> {
+    let main = crate::exit_node::pfctl(&["-s", "rules"]).ok()?;
+    let name = pf_foreign_anchors(&main).into_iter().find(|a| {
+        crate::exit_node::pfctl(&["-a", a, "-s", "rules"]).is_ok_and(|r| pf_anchor_blocks_all(&r))
+    })?;
+    Some(format!(
+        "the `{name}` pf anchor ends in a catch-all block, and its allow-list covers the \
+         private ranges rather than the overlay's 200::/7, so mesh traffic is dropped \
+         before it reaches rayfish. `ray config set pf-passthrough on` loads a pass rule \
+         for the mesh interface ahead of it."
+    ))
+}
+
+#[cfg(test)]
+mod pf_tests {
+    use super::*;
+
+    /// `pfctl -s rules` with Mullvad connected, verbatim. Apple's anchor is
+    /// called first, which is the whole reason a pass rule of ours can win.
+    const MAIN_RULESET_CONNECTED: &str = "\
+scrub-anchor \"com.apple/*\" all fragment reassemble
+scrub-anchor \"mullvad\" all fragment reassemble
+anchor \"com.apple/*\" all
+anchor \"mullvad\" all
+";
+
+    /// The same host with the other VPN disconnected: it removes its anchor
+    /// calls from the main ruleset rather than leaving them empty.
+    const MAIN_RULESET_ALONE: &str = "\
+scrub-anchor \"com.apple/*\" all fragment reassemble
+anchor \"com.apple/*\" all
+";
+
+    /// The tail of that VPN's own anchor, which is what actually drops us.
+    const FOREIGN_ANCHOR: &str = "\
+pass quick on lo0 all flags any keep state
+pass out quick on utun10 inet proto udp from any to 10.64.0.1 port = 53 no state
+pass quick on utun10 all flags S/SA keep state
+block return out quick all
+block drop quick all
+";
+
+    #[test]
+    fn the_pass_rule_is_stateless() {
+        // A `keep state` rule (pfctl's default for a bare `pass`) outlives the
+        // anchor flush that is supposed to remove it, so teardown silently does
+        // nothing until the flow goes idle.
+        assert_eq!(pf_pass_rules("utun1"), "pass quick on utun1 all no state\n");
+    }
+
+    #[test]
+    fn apples_own_anchor_is_not_foreign() {
+        assert!(pf_foreign_anchors(MAIN_RULESET_ALONE).is_empty());
+    }
+
+    #[test]
+    fn a_vpn_that_inserts_an_anchor_is_foreign() {
+        assert_eq!(pf_foreign_anchors(MAIN_RULESET_CONNECTED), ["mullvad"]);
+    }
+
+    #[test]
+    fn a_catch_all_block_is_what_makes_an_anchor_dangerous() {
+        assert!(pf_anchor_blocks_all(FOREIGN_ANCHOR));
+    }
+
+    #[test]
+    fn an_anchor_that_only_passes_blocks_nothing() {
+        let benign = "pass quick on lo0 all flags any keep state\n";
+        assert!(!pf_anchor_blocks_all(benign));
+    }
+
+    /// A block scoped to one interface or protocol is somebody's policy, not a
+    /// default-deny, and must not be reported as the thing killing the mesh.
+    #[test]
+    fn a_scoped_block_is_not_a_catch_all() {
+        let scoped = "block return out quick proto udp from any to any port = 53\n";
+        assert!(!pf_anchor_blocks_all(scoped));
+    }
+
+    /// `block ... on <iface> all` is one interface's policy, not a host-wide
+    /// default-deny, and the mesh is not on that interface.
+    #[test]
+    fn a_block_scoped_to_an_interface_is_not_a_catch_all() {
+        let scoped = "block drop quick on utun10 all\n";
+        assert!(!pf_anchor_blocks_all(scoped));
+    }
+}

@@ -83,6 +83,10 @@ impl MeshConnection {
     /// exit that isn't daemon shutdown, stop the reader and, if this connection was
     /// ever a registered member, report the drop to the supervisor.
     pub(crate) async fn run(mut self) {
+        // Feed the warm-start cache from the authenticated connection.  A later
+        // restart can try its selected relay or direct path immediately instead
+        // of waiting for discovery to rediscover it.
+        self.ctx.registry.remember_connection_hints(&self.conn);
         // A connection to this peer now exists (either side dialed): let the
         // composition-root hook flush anything queued for it (send outbox).
         self.manager.notify_peer_connected(self.peer_id);
@@ -122,11 +126,16 @@ impl MeshConnection {
                 .unwrap_or(false);
             let sleep_for = (self.ctx.registry.on_demand
                 && !is_exit_peer
-                && self.ctx.peers.supports_idle_close(&self.peer_id))
-            .then(|| {
-                self.ctx
+                && self
+                    .ctx
                     .peers
-                    .idle_remaining(&self.peer_id, self.ctx.registry.idle_timeout)
+                    .supports_idle_close(&self.peer_id, &self.conn))
+            .then(|| {
+                self.ctx.peers.idle_remaining(
+                    &self.peer_id,
+                    &self.conn,
+                    self.ctx.registry.idle_timeout,
+                )
             })
             .flatten();
 
@@ -149,7 +158,11 @@ impl MeshConnection {
                     let still_idle = self
                         .ctx
                         .peers
-                        .idle_remaining(&self.peer_id, self.ctx.registry.idle_timeout)
+                        .idle_remaining(
+                            &self.peer_id,
+                            &self.conn,
+                            self.ctx.registry.idle_timeout,
+                        )
                         .is_some_and(|d| d.is_zero());
                     if !still_idle {
                         continue;
@@ -215,8 +228,16 @@ impl MeshConnection {
             }
             // Connection-level messages (not scoped to a network).
             match &frame.msg {
-                ControlMsg::NetworkHandles { entries, features } => {
-                    self.manager.apply_network_handles(self.peer_id, entries);
+                ControlMsg::NetworkHandles {
+                    entries,
+                    features,
+                    receive_mtu,
+                } => {
+                    self.manager
+                        .apply_network_handles(&self.conn, self.peer_id, entries);
+                    self.ctx
+                        .peers
+                        .note_receive_mtu(&self.peer_id, &self.conn, *receive_mtu);
                     // The handle announcement is the one control message both ends
                     // send right after connect, so it is where we learn the peer's
                     // idle-close capability (the MeshHello handshake is one-way). Gate
@@ -224,6 +245,7 @@ impl MeshConnection {
                     // advertise support is held open, never idle-closed.
                     self.ctx.peers.note_idle_support_by_id(
                         &self.peer_id,
+                        &self.conn,
                         features & crate::transport::FEATURE_IDLE_CLOSE != 0,
                     );
                     continue;
@@ -244,7 +266,7 @@ impl MeshConnection {
                     // every network is heavy, so spawn it off the demux loop rather
                     // than awaiting inline.
                     if is_unpaired_by(self.peer_id) {
-                        let registry = self.ctx.registry.clone();
+                        let registry = Arc::clone(&self.ctx.registry);
                         tokio::spawn(async move {
                             let _ = registry.unpair_self().await;
                         });
@@ -265,7 +287,7 @@ impl MeshConnection {
                     // a stranger is a no-op. Off the demux loop: republish + prune
                     // is heavy.
                     if self.ctx.registry.current_device_cert().is_none() {
-                        let registry = self.ctx.registry.clone();
+                        let registry = Arc::clone(&self.ctx.registry);
                         let requester = self.peer_id;
                         tokio::spawn(async move {
                             if let Err(reason) = registry.nullify_device(requester).await {
@@ -392,6 +414,11 @@ fn close_reason(e: &ConnectionError) -> forward::CloseReason {
         {
             forward::CloseReason::Idle
         }
+        ConnectionError::ApplicationClosed(ac)
+            if ac.error_code == VarInt::from_u32(forward::REPLACED_CONNECTION_CODE) =>
+        {
+            forward::CloseReason::Replaced
+        }
         _ => forward::CloseReason::Transient,
     }
 }
@@ -437,6 +464,10 @@ mod tests {
         assert!(matches!(
             close_reason(&app_close(forward::IDLE_CODE)),
             forward::CloseReason::Idle
+        ));
+        assert!(matches!(
+            close_reason(&app_close(forward::REPLACED_CONNECTION_CODE)),
+            forward::CloseReason::Replaced
         ));
         // An unrelated application code is a transient drop (reconnected).
         assert!(matches!(

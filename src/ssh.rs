@@ -8,8 +8,10 @@
 //! cryptographically identified by the QUIC mesh link, and the kernel TCP stack
 //! delivers the connection with the peer's mesh IP as the socket source (the
 //! ingress anti-spoof check in [`crate::forward`] guarantees that IP is really
-//! the peer's). We map that IP back to the peer identity via [`PeerTable`] and
+//! the peer's). We map that IP back to the peer identity via [`crate::peers::PeerTable`] and
 //! admit the session iff the peer is in a shared network's `ssh_allow` list.
+//! Grants are checked across verified memberships, not the network handles on
+//! the current connection. Reconnecting through another network cannot hide a grant.
 //!
 //! Authorization is the only gate; SSH auth itself is the `none` method (the
 //! identity is already proven). Which local accounts a peer may log in as comes
@@ -54,34 +56,54 @@
 //! on this box", so admitting it would hand every local user a root shell. On
 //! the host itself, use the host sshd (`ssh localhost`), which authenticates.
 
+mod authz;
+mod host_keys;
+mod login;
+mod permissions;
+mod session;
+mod session_env;
+
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Error;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
-use bytes::Bytes;
 use iroh::EndpointId;
 use pty_process::Size;
-use russh::keys::{Algorithm, PrivateKey};
+#[cfg(test)]
+use russh::keys::Algorithm;
+use russh::keys::PrivateKey;
 use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
+use russh::{Channel, ChannelId, MethodKind, MethodSet, Preferred, Sig, compression};
+#[cfg(test)]
 use smol_str::SmolStr;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::peers::{DeviceUserMap, PeerTable};
+use crate::daemon::NetworkRegistry;
+pub use authz::{SshAuthz, new_authz};
+use authz::{UserPolicy, auth_banner, resolve_user_policy};
+use host_keys::{load_host_key, sftp_subsystem_command};
+#[cfg(test)]
+use host_keys::{parse_hostkey_paths, parse_sftp_subsystem};
+use login::{LoginInfo, resolve_login};
+use permissions::{account_can, hand_over};
+use session::{Exit, SessionSpec, run_pipe_session, run_pty_session, signal_number};
+use session_env::env_accepted;
+#[cfg(test)]
+use session_env::tty_name;
 
 // The port a stock `ssh` client targets (`ssh user@host.ray`) and the internal
 // port the embedded server actually binds. Both live in `crate::forward` (the
@@ -98,144 +120,51 @@ pub(crate) use crate::forward::{SSH_LISTEN_PORT, SSH_PORT};
 /// while the person who typed the command is still watching.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-network SSH authorization snapshot: network name -> the network's SSH
-/// allow rules (peer + permitted login users). Held in an [`ArcSwap`] so
-/// `ray firewall ssh allow/deny` updates are picked up by a live listener
-/// without a restart.
-pub type SshAuthz = Arc<ArcSwap<HashMap<String, Vec<crate::config::SshRule>>>>;
+/// How long a connection has, from being accepted to completing authentication,
+/// before it is dropped. Keepalives only establish that the peer is responsive;
+/// without this deadline a peer could answer them forever without authenticating.
+/// Generous next to a handshake that is a few round trips over a mesh link.
+const LOGIN_GRACE: Duration = Duration::from_secs(60);
 
-/// Build an empty authorization snapshot.
-pub fn new_authz() -> SshAuthz {
-    Arc::new(ArcSwap::from_pointee(HashMap::new()))
-}
-
-/// The set of local unix accounts a peer may log in as, accumulated across the
-/// networks shared with it. `*` (any user, including root) wins over everything;
-/// an allow rule with no explicit users grants the non-root default; explicit
-/// usernames grant exactly those. The per-user check is by **uid** so a uid-0
-/// account under a non-`root` name can't slip past the non-root default.
-#[derive(Default, Debug, PartialEq)]
-struct UserPolicy {
-    /// Some rule matched this peer (it may open a session at all).
-    matched: bool,
-    /// A rule granted `*`: any user, including root.
-    any: bool,
-    /// A rule granted the default (no explicit users): any non-root user.
-    nonroot: bool,
-    /// Explicitly named users.
-    users: std::collections::HashSet<String>,
-}
-
-impl UserPolicy {
-    /// Fold one matching rule's `users` list into the policy.
-    fn add(&mut self, users: &[String]) {
-        self.matched = true;
-        if users.iter().any(|u| u == "*") {
-            self.any = true;
-        } else if users.is_empty() {
-            self.nonroot = true;
-        } else {
-            self.users.extend(users.iter().cloned());
-        }
+fn server_config(key: PrivateKey) -> Config {
+    Config {
+        keys: vec![key],
+        // Identity is proven by the mesh link; `auth_none` is the gate.
+        methods: MethodSet::from(&[MethodKind::None][..]),
+        // Quiet sessions stay open while the client answers SSH keepalives.
+        // This also refreshes the mesh firewall's idle TCP flow tracking.
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(15)),
+        // Russh sends three probes, then closes on the fourth tick: roughly
+        // 60 seconds since the last received SSH packet, even with output flowing.
+        keepalive_max: 3,
+        auth_rejection_time: Duration::from_secs(1),
+        // Offer "none" only. Russh's zlib is broken on the receive side: with
+        // `zlib@openssh.com` negotiated, the second SSH_MSG_CHANNEL_DATA the
+        // client sends fails to decompress and the connection dies with
+        // `SshEncoding: length invalid`. A stock OpenSSH client picks zlib
+        // whenever `Compression yes` is set in its config, so anyone with that
+        // setting gets a session that drops the moment they type a second
+        // command. Traffic on the mesh link is already small and latency-bound;
+        // compressing it buys nothing worth that.
+        preferred: Preferred {
+            compression: Cow::Borrowed(&[compression::NONE]),
+            ..Preferred::DEFAULT
+        },
+        ..Default::default()
     }
-
-    /// Whether the peer is authorized to open a session at all (before the
-    /// per-user check). No matching rule => reject every auth attempt.
-    fn authorized(&self) -> bool {
-        self.matched
-    }
-
-    /// Whether the requested login (`name`, resolved to `uid`) is permitted.
-    fn permits(&self, name: &str, uid: u32) -> bool {
-        self.any || self.users.contains(name) || (self.nonroot && uid != 0)
-    }
-
-    /// Which logins this policy grants, phrased for the SSH banner. `None` when
-    /// the policy allows every user, since there is nothing the client needs
-    /// warning about.
-    fn restriction(&self) -> Option<String> {
-        if self.any {
-            return None;
-        }
-        let mut named: Vec<&str> = self.users.iter().map(String::as_str).collect();
-        named.sort_unstable();
-        Some(match (self.nonroot, named.is_empty()) {
-            (true, true) => "any user except root".to_string(),
-            (true, false) => format!("any user except root, plus {}", named.join(", ")),
-            (false, false) => named.join(", "),
-            (false, true) => "no users".to_string(),
-        })
-    }
-}
-
-/// The banner shown before authentication, or `None` when this peer can log in
-/// unrestricted and there is nothing to explain.
-///
-/// Without it a rejection is invisible: mesh SSH offers only the `none` method,
-/// so a client that is refused silently falls through to whatever the *system*
-/// sshd offers and prompts for a password. Every mesh SSH authorization problem
-/// then presents as "why is it asking for a password", or worse as a network
-/// fault, with the real reason only in this node's log where the person
-/// connecting cannot see it. Say it on the wire instead.
-fn auth_banner(policy: &UserPolicy, peer: &EndpointId, networks: &[SmolStr]) -> Option<String> {
-    let net = networks
-        .iter()
-        .min()
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "<network>".to_string());
-    if !policy.authorized() {
-        return Some(format!(
-            "rayfish mesh SSH: peer {} is not authorized on this node.\r\n\
-             Authorize it here with: ray firewall ssh allow {net} {} [-u <users>]\r\n\
-             A password prompt after this line comes from the system sshd, not rayfish.\r\n",
-            peer.fmt_short(),
-            peer.fmt_short(),
-        ));
-    }
-    policy.restriction().map(|allowed| {
-        format!(
-            "rayfish mesh SSH: peer {} may log in as {allowed}.\r\n\
-             Widen it with: ray firewall ssh allow {net} {} -u '*'\r\n",
-            peer.fmt_short(),
-            peer.fmt_short(),
-        )
-    })
-}
-
-/// Accumulate the login policy for `user` (a peer's user identity) across the
-/// networks we currently share with it: every allow rule whose `peer` is `"*"`
-/// or this identity contributes its permitted users.
-fn resolve_user_policy(authz: &SshAuthz, user: &EndpointId, networks: &[SmolStr]) -> UserPolicy {
-    let map = authz.load();
-    let id = user.to_string();
-    let mut policy = UserPolicy::default();
-    for net in networks {
-        if let Some(rules) = map.get(net.as_str()) {
-            for rule in rules {
-                if rule.peer == "*" || rule.peer == id {
-                    policy.add(&rule.users);
-                }
-            }
-        }
-    }
-    policy
 }
 
 /// Handle to a running SSH server so the daemon can stop it on `ray down` /
 /// `ssh off`. Dropping or cancelling the token tears down every listener.
 pub struct SshServer {
-    peers: PeerTable,
-    device_user_map: DeviceUserMap,
+    registry: Arc<NetworkRegistry>,
     authz: SshAuthz,
 }
 
 impl SshServer {
-    pub fn new(peers: PeerTable, device_user_map: DeviceUserMap, authz: SshAuthz) -> Self {
-        Self {
-            peers,
-            device_user_map,
-            authz,
-        }
+    pub(crate) fn new(registry: Arc<NetworkRegistry>, authz: SshAuthz) -> Self {
+        Self { registry, authz }
     }
 
     /// Spawn a listener on each mesh address (at [`SSH_LISTEN_PORT`]). Runs until
@@ -251,15 +180,7 @@ impl SshServer {
                     return;
                 }
             };
-            let config = Arc::new(Config {
-                keys: vec![key],
-                // Identity is proven by the mesh link, so the `none` method is
-                // the only one offered; our `auth_none` is the authorization gate.
-                methods: MethodSet::from(&[MethodKind::None][..]),
-                inactivity_timeout: Some(Duration::from_secs(3600)),
-                auth_rejection_time: Duration::from_secs(1),
-                ..Default::default()
-            });
+            let config = Arc::new(server_config(key));
             for addr in addrs {
                 let listener = match crate::listener::bind_listener(addr, SSH_LISTEN_PORT) {
                     Ok(l) => l,
@@ -269,10 +190,9 @@ impl SshServer {
                     }
                 };
                 info!(%addr, port = SSH_LISTEN_PORT, "mesh SSH listening (reachable as :22)");
-                let peers = self.peers.clone();
-                let dum = self.device_user_map.clone();
-                let authz = self.authz.clone();
-                let config = config.clone();
+                let registry = Arc::clone(&self.registry);
+                let authz = Arc::clone(&self.authz);
+                let config = Arc::clone(&config);
                 let token = token.clone();
                 tokio::spawn(async move {
                     loop {
@@ -284,12 +204,11 @@ impl SshServer {
                                     Err(e) => { debug!(error = %e, "mesh SSH accept failed"); continue; }
                                 };
                                 disable_nagle(&stream);
-                                let config = config.clone();
-                                let peers = peers.clone();
-                                let dum = dum.clone();
-                                let authz = authz.clone();
+                                let config = Arc::clone(&config);
+                                let registry = Arc::clone(&registry);
+                                let authz = Arc::clone(&authz);
                                 tokio::spawn(async move {
-                                    handle_conn(stream, peer, config, peers, dum, authz).await;
+                                    handle_conn(stream, peer, config, registry, authz).await;
                                 });
                             }
                         }
@@ -323,11 +242,10 @@ fn disable_nagle(stream: &TcpStream) {
 
 /// Resolve the connecting peer, decide authorization, and run the SSH session.
 async fn handle_conn(
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: Arc<Config>,
-    peers: PeerTable,
-    device_user_map: DeviceUserMap,
+    registry: Arc<NetworkRegistry>,
     authz: SshAuthz,
 ) {
     // The mesh listener only ever binds our own overlay address, so a session
@@ -336,13 +254,18 @@ async fn handle_conn(
         debug!(peer = %peer.ip(), "mesh SSH: non-IPv6 source on the mesh listener, dropping");
         return;
     };
-    let Some((peer_id, networks)) = peers.identity_and_networks(&src) else {
+    let Some(peer_id) = registry.peers.identity_for_ip(&src) else {
         debug!(%src, "mesh SSH: connection from unknown mesh IP, dropping");
         return;
     };
-    let user_identity = device_user_map.resolve(&peer_id);
+    let user_identity = registry.device_user_map.resolve(&peer_id);
+    let networks = registry.authorization_networks(peer_id);
     let policy = resolve_user_policy(&authz, &user_identity, &networks);
-    debug!(%src, peer = %user_identity.fmt_short(), authorized = policy.authorized(), "mesh SSH connection");
+    // Logged before the handshake, and with the source port, so a session that
+    // stalls before it authenticates (and so logs nothing else) is still
+    // visible here and can be matched to a socket in `ss` output.
+    debug!(%src, port = peer.port(), peer = %user_identity.fmt_short(),
+        authorized = policy.authorized(), "mesh SSH connection");
     let banner = auth_banner(&policy, &user_identity, &networks);
     // The address the client believes it reached, not the internal listen port
     // the SSH NAT sent it to: this is what the session reports in
@@ -360,11 +283,64 @@ async fn handle_conn(
             server,
         },
     );
-    match russh::server::run_stream(config, stream, handler).await {
-        Ok(session) => {
-            let _ = session.await;
+    serve(config, stream, handler, LOGIN_GRACE).await;
+}
+
+/// Run the SSH protocol on an accepted connection, dropping it if the peer has
+/// not authenticated within `grace`.
+///
+/// The two halves of the handshake have to be bounded separately. russh reads
+/// the client's version string inside `run_stream`, before there is a session
+/// to speak of, so that half is bounded by dropping the future, which takes the
+/// socket with it. Everything after it runs in a task russh spawns and owns,
+/// and nothing here can cancel that task: what ends it is `shutdown(2)` on a
+/// duplicate of the socket, which fails its next read, so it drops the handler
+/// and with it the connection's channels, forwards and agent sockets.
+async fn serve(config: Arc<Config>, stream: TcpStream, handler: SshHandler, grace: Duration) {
+    let client = handler.origin.client;
+    let (src, port) = (client.ip(), client.port());
+    let peer = handler.user;
+    let authenticated = handler.auth_flag();
+    // A hangup handle. Never read from or written to: the session task owns the
+    // socket for I/O, this only ever shuts it down.
+    let hangup = match stream.as_fd().try_clone_to_owned().map(StdTcpStream::from) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(%src, port, error = %e,
+                "mesh SSH: cannot duplicate the connection socket; dropping");
+            return;
         }
-        Err(e) => debug!(error = %e, "mesh SSH session ended with error"),
+    };
+    let deadline = Instant::now() + grace;
+    let mut running =
+        match timeout_at(deadline, russh::server::run_stream(config, stream, handler)).await {
+            Ok(Ok(running)) => running,
+            Ok(Err(e)) => {
+                debug!(error = %e, "mesh SSH session ended with error");
+                return;
+            }
+            Err(_) => {
+                warn!(%src, port, peer = %peer.fmt_short(), secs = grace.as_secs(),
+                "mesh SSH: no version string within the login grace; dropping");
+                return;
+            }
+        };
+    match timeout_at(deadline, &mut running).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => debug!(error = %e, "mesh SSH session ended with error"),
+        // Authenticated in time. From here the session runs as long as the
+        // client remains responsive to SSH traffic or keepalives.
+        Err(_) if authenticated.load(Ordering::Relaxed) => {
+            if let Err(e) = running.await {
+                debug!(error = %e, "mesh SSH session ended with error");
+            }
+        }
+        Err(_) => {
+            warn!(%src, port, peer = %peer.fmt_short(), secs = grace.as_secs(),
+                "mesh SSH: no authentication within the login grace; dropping");
+            let _ = hangup.shutdown(Shutdown::Both);
+            let _ = running.await;
+        }
     }
 }
 
@@ -514,6 +490,9 @@ struct SshHandler {
     /// Where this connection came from, for the session environment and the
     /// login record.
     origin: Origin,
+    /// Set once a peer is admitted, so the login grace can tell a connection
+    /// that authenticated from one that is only holding the socket open.
+    authenticated: Arc<AtomicBool>,
 }
 
 impl Drop for SshHandler {
@@ -543,7 +522,14 @@ impl SshHandler {
             socket_forwards: HashMap::new(),
             token: CancellationToken::new(),
             origin,
+            authenticated: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flag [`Handler::auth_none`] sets once this peer is admitted. Taken
+    /// before the handler is handed to russh, which owns it from then on.
+    fn auth_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.authenticated)
     }
 
     /// The login this connection authenticated as, if any. Every forwarding
@@ -673,6 +659,7 @@ impl Handler for SshHandler {
         match resolve_login(user) {
             Ok(info) if self.policy.permits(user, info.uid) => {
                 self.login = Some(Arc::new(info));
+                self.authenticated.store(true, Ordering::Relaxed);
                 Ok(Auth::Accept)
             }
             Ok(info) => {
@@ -1260,70 +1247,6 @@ impl Handler for SshHandler {
     }
 }
 
-/// How a session's process ended. SSH reports the two cases differently, and a
-/// client that gets a status for a signalled process prints a wrong exit code.
-enum Exit {
-    Code(u32),
-    Signal(Sig),
-}
-
-impl Exit {
-    fn from_status(status: std::process::ExitStatus) -> Self {
-        use std::os::unix::process::ExitStatusExt;
-        match (status.code(), status.signal()) {
-            (Some(code), _) => Exit::Code(code as u32),
-            (None, Some(sig)) => Exit::Signal(signal_name(sig)),
-            (None, None) => Exit::Code(0),
-        }
-    }
-}
-
-/// The SSH name of a unix signal number. The protocol names a fixed set; the
-/// rest go over the wire as their number, which is what OpenSSH does too.
-fn signal_name(sig: i32) -> Sig {
-    match sig {
-        libc::SIGABRT => Sig::ABRT,
-        libc::SIGALRM => Sig::ALRM,
-        libc::SIGFPE => Sig::FPE,
-        libc::SIGHUP => Sig::HUP,
-        libc::SIGILL => Sig::ILL,
-        libc::SIGINT => Sig::INT,
-        libc::SIGKILL => Sig::KILL,
-        libc::SIGPIPE => Sig::PIPE,
-        libc::SIGQUIT => Sig::QUIT,
-        libc::SIGSEGV => Sig::SEGV,
-        libc::SIGTERM => Sig::TERM,
-        libc::SIGUSR1 => Sig::USR1,
-        other => Sig::Custom(other.to_string()),
-    }
-}
-
-/// The unix signal a client's `signal` request names, or `None` for a name this
-/// host has no signal for.
-fn signal_number(sig: &Sig) -> Option<i32> {
-    Some(match sig {
-        Sig::ABRT => libc::SIGABRT,
-        Sig::ALRM => libc::SIGALRM,
-        Sig::FPE => libc::SIGFPE,
-        Sig::HUP => libc::SIGHUP,
-        Sig::ILL => libc::SIGILL,
-        Sig::INT => libc::SIGINT,
-        Sig::KILL => libc::SIGKILL,
-        Sig::PIPE => libc::SIGPIPE,
-        Sig::QUIT => libc::SIGQUIT,
-        Sig::SEGV => libc::SIGSEGV,
-        Sig::TERM => libc::SIGTERM,
-        Sig::USR1 => libc::SIGUSR1,
-        Sig::Custom(name) => match name.as_str() {
-            "USR2" => libc::SIGUSR2,
-            "TSTP" => libc::SIGTSTP,
-            "CONT" => libc::SIGCONT,
-            "WINCH" => libc::SIGWINCH,
-            _ => return None,
-        },
-    })
-}
-
 /// Pump an SSH channel and a local socket against each other until either side
 /// closes, then end the channel. Every forwarded connection is this: the
 /// channel *is* the socket, whichever side asked for it.
@@ -1369,14 +1292,6 @@ fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf
     Ok((dir, listener, path))
 }
 
-/// Environment variables a client may set on a session (`ssh -o SendEnv=` /
-/// `SetEnv=`). Locale and terminal hints only, the same shape as the stock
-/// `AcceptEnv LANG LC_*`: anything else lets the peer steer the login shell
-/// (`LD_PRELOAD`, `PATH`, `BASH_ENV`) instead of just describing itself.
-fn env_accepted(name: &str) -> bool {
-    matches!(name, "LANG" | "TZ" | "COLORTERM" | "TERM") || name.starts_with("LC_")
-}
-
 /// Which local address an `ssh -R` listener binds. A reverse forward publishes
 /// the *peer's* service on this host, so a wildcard or external bind address is
 /// narrowed to loopback, exactly what a stock sshd does with its default
@@ -1393,548 +1308,6 @@ fn reverse_bind_addr(address: &str) -> IpAddr {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         }
     }
-}
-
-/// Whether `info`'s account has `want` (a unix permission triad: 4 read, 2
-/// write, 1 execute/search) on `path`.
-///
-/// Unix-socket forwarding is the one place where the daemon's root privilege
-/// would buy the peer something a shell wouldn't: the filesystem *is* the
-/// access control on a socket, and connecting as root ignores it. So the
-/// permission the login account has is checked here first. Like any check made
-/// before the open, it is not atomic against a path swapped underneath it; it
-/// stops the peer reaching sockets its account plainly cannot, not a local user
-/// racing their own directory.
-fn account_can(path: &Path, info: &LoginInfo, want: u32) -> bool {
-    if info.uid == 0 {
-        return true;
-    }
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    let mode = meta.permissions().mode();
-    let bits = if meta.uid() == info.uid {
-        (mode >> 6) & 7
-    } else if meta.gid() == info.gid || in_group(info, meta.gid()) {
-        (mode >> 3) & 7
-    } else {
-        mode & 7
-    };
-    bits & want == want
-}
-
-/// Whether the account is a member of `gid` through its supplementary groups.
-fn in_group(info: &LoginInfo, gid: u32) -> bool {
-    uzers::get_user_groups(&info.name, info.gid)
-        .map(|groups| groups.iter().any(|g| g.gid() == gid))
-        .unwrap_or(false)
-}
-
-/// Hand `path` to the login account with `mode`, so a socket this root daemon
-/// created is usable by (and only by) the user whose session it belongs to.
-fn hand_over(path: &Path, info: &LoginInfo, mode: u32) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting mode on {}", path.display()))?;
-    std::os::unix::fs::chown(path, Some(info.uid), Some(info.gid))
-        .with_context(|| format!("handing {} to {}", path.display(), info.name))?;
-    Ok(())
-}
-
-/// The resolved local account a session logs in as. Held in an [`Arc`] on the
-/// handler and cloned per channel, since every session on one connection logs
-/// in as the same account.
-struct LoginInfo {
-    uid: u32,
-    gid: u32,
-    home: PathBuf,
-    shell: PathBuf,
-    name: String,
-}
-
-/// Resolve the requested unix user via `getpwnam`.
-fn resolve_login(login_user: &str) -> Result<LoginInfo> {
-    use uzers::os::unix::UserExt;
-    let pw = uzers::get_user_by_name(login_user)
-        .with_context(|| format!("no such local user: {login_user}"))?;
-    Ok(LoginInfo {
-        uid: pw.uid(),
-        gid: pw.primary_group_id(),
-        home: pw.home_dir().to_path_buf(),
-        shell: pw.shell().to_path_buf(),
-        name: pw.name().to_string_lossy().to_string(),
-    })
-}
-
-/// The `login(1)` this host has, or `None` when the handoff cannot be used.
-///
-/// It needs root (it does the setuid itself) and an actual login binary, so a
-/// daemon running unprivileged, or a host without one (a minimal container),
-/// falls back to spawning the shell directly. `RAYFISH_SSH_NO_LOGIN` turns the
-/// handoff off, for a host whose `login` does something surprising.
-fn login_program() -> Option<PathBuf> {
-    if uzers::get_effective_uid() != 0 || std::env::var_os("RAYFISH_SSH_NO_LOGIN").is_some() {
-        return None;
-    }
-    ["/bin/login", "/usr/bin/login"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| {
-            std::fs::metadata(p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
-}
-
-/// The terminal a pty's child end will see, for `SSH_TTY`.
-fn tty_name(pts: &impl std::os::fd::AsRawFd) -> Option<String> {
-    let mut buf = [0 as libc::c_char; 128];
-    // SAFETY: `buf` is a live array of `buf.len()` chars; ttyname_r writes a
-    // NUL-terminated name into it or returns non-zero without touching it.
-    let rc = unsafe { libc::ttyname_r(pts.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
-    if rc != 0 {
-        return None;
-    }
-    // SAFETY: ttyname_r returned success, so `buf` holds a NUL-terminated name.
-    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-    name.to_str().ok().map(str::to_string)
-}
-
-/// Build a `pre_exec` closure that drops the root daemon's privileges to the
-/// target user **completely**: supplementary groups first (`initgroups`, so the
-/// child does NOT inherit root's groups like gid 0/wheel), then `setgid`, then
-/// `setuid`, in that order. It runs as root in the forked child just before
-/// `exec`. **Fails closed:** if any step errors, the closure returns an error so
-/// `exec` never happens and the shell never runs with leftover privileges.
-fn drop_privs(
-    uid: u32,
-    gid: u32,
-    name: &str,
-) -> Result<impl FnMut() -> std::io::Result<()> + Send + Sync + 'static> {
-    let cname = std::ffi::CString::new(name).context("user name contains NUL")?;
-    // Nothing to drop when the server already *is* the target account. The
-    // daemon runs as root in production, so uid 0 never takes this branch and
-    // the drop below is unchanged there; it is the unprivileged case (a
-    // hand-run daemon, or the tests) where these calls would fail with EPERM
-    // and fail the session closed even though the child gains nothing.
-    // SAFETY: geteuid/getegid take no arguments and cannot fail.
-    let already_dropped =
-        uid != 0 && unsafe { libc::geteuid() } == uid && unsafe { libc::getegid() } == gid;
-    Ok(move || {
-        if already_dropped {
-            return Ok(());
-        }
-        // SAFETY: only direct syscalls, in the child after fork, before exec.
-        unsafe {
-            #[cfg(target_os = "macos")]
-            let basegroup = gid as libc::c_int;
-            #[cfg(not(target_os = "macos"))]
-            let basegroup = gid as libc::gid_t;
-            if libc::initgroups(cname.as_ptr(), basegroup) != 0 {
-                return Err(Error::last_os_error());
-            }
-            if libc::setgid(gid as libc::gid_t) != 0 {
-                return Err(Error::last_os_error());
-            }
-            if libc::setuid(uid as libc::uid_t) != 0 {
-                return Err(Error::last_os_error());
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Apply the common login environment to a command builder.
-fn login_env<'a>(home: &Path, shell: &Path, name: &str) -> [(&'a str, std::ffi::OsString); 5] {
-    [
-        ("HOME", home.into()),
-        ("USER", name.into()),
-        ("LOGNAME", name.into()),
-        ("SHELL", shell.into()),
-        (
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-        ),
-    ]
-}
-
-/// What a session runs and who it runs as: everything the two session paths
-/// need beyond the channel itself.
-struct SessionSpec {
-    info: Arc<LoginInfo>,
-    /// The `exec` command, or `None` for a login shell.
-    command: Option<String>,
-    env: Vec<(String, String)>,
-    child_proc: ChildProc,
-    origin: Origin,
-}
-
-/// Allocate a PTY, spawn the login shell (or `exec` command) as the requested
-/// unix user, and pump bytes between the SSH channel and the PTY until the child
-/// exits. Returns the child's exit code.
-async fn run_pty_session(
-    channel: Channel<Msg>,
-    spec: SessionSpec,
-    pty_req: PtyReq,
-    mut resize_rx: mpsc::UnboundedReceiver<Size>,
-) -> Result<Exit> {
-    let SessionSpec {
-        info,
-        command,
-        env,
-        child_proc,
-        origin,
-    } = spec;
-    let (pty, pts) = pty_process::open().context("opening pty")?;
-    let _ = pty.resize(Size::new(pty_req.row, pty_req.col));
-    let tty = tty_name(&pts);
-    // Hold a terminal fd of our own for as long as the child runs. Reading the
-    // master end returns EIO the instant the *last* slave fd closes, and a
-    // child that closes and reopens its terminal while starting up (`login`
-    // does, between the PAM session and the shell) hits exactly that window:
-    // the read half would end there and the session would go silent with the
-    // shell still running behind it. Dropped below, once the child is gone, so
-    // the read half can finish.
-    let keep_open = pts.as_fd().try_clone_to_owned().ok();
-
-    // An interactive terminal with no command is a login, so hand it to
-    // `login(1)` when this host has one: it owns the things a session gets
-    // wrong when it is spawned directly. PAM (so a locked or expired account is
-    // refused, and logind gives the session an XDG_RUNTIME_DIR and its
-    // resource limits), the utmp/wtmp/lastlog records behind `who` and `last`,
-    // `/etc/nologin`, and the motd. It is also what does the setuid, so this
-    // branch keeps root and drops nothing itself.
-    //
-    // Not for root: `login` refuses a root session on a tty that is not in
-    // `/etc/securetty` (a pts never is), and it refuses it by hanging with no
-    // output rather than failing, which would leave `ssh root@host.ray` staring
-    // at nothing. Root keeps the direct path.
-    let handoff = (command.is_none() && info.uid != 0)
-        .then(login_program)
-        .flatten();
-    let mut cmd = match &handoff {
-        Some(login) => pty_process::Command::new(login)
-            // Keep the environment we curated (login sets HOME/USER/SHELL/PATH
-            // itself either way); record where the session came from; and log
-            // the user in without asking for a password we cannot check.
-            .arg("-p")
-            .arg("-h")
-            .arg(origin.client.ip().to_string())
-            .arg("-f")
-            .arg(&info.name),
-        None => match &command {
-            Some(c) => pty_process::Command::new(&info.shell).arg("-c").arg(c),
-            None => pty_process::Command::new(&info.shell).arg("-l"),
-        },
-    };
-    cmd = cmd
-        .env_clear()
-        .envs(login_env(&info.home, &info.shell, &info.name))
-        .env("TERM", &pty_req.term)
-        .envs(tty.map(|t| ("SSH_TTY".to_string(), t)))
-        .envs(env);
-    if handoff.is_none() {
-        // `login` chdirs itself, and copes with a home directory that is gone;
-        // spawning into a missing directory would just fail.
-        cmd = cmd.current_dir(&info.home);
-        let drop = drop_privs(info.uid, info.gid, &info.name)?;
-        // SAFETY: drops privileges (initgroups+setgid+setuid) before exec; we do NOT
-        // use `.uid()/.gid()` because std applies those *after* pre_exec, too late to
-        // also drop supplementary groups.
-        cmd = unsafe { cmd.pre_exec(drop) };
-    }
-    let mut child = cmd.spawn(pts).context("spawning login shell")?;
-    // Publish the pid so `signal` requests reach it, and clear it again below
-    // once it is reaped: a stale pid gets reused by an unrelated process.
-    child_proc
-        .pid
-        .store(child.id().unwrap_or(0), Ordering::Relaxed);
-
-    let stream = channel.into_stream();
-    let (mut chan_read, mut chan_write) = tokio::io::split(stream);
-    let (mut pty_read, mut pty_write) = pty.into_split();
-
-    // Client -> PTY, interleaved with window resizes (both touch the write half).
-    let c2p = tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            tokio::select! {
-                r = chan_read.read(&mut buf) => match r {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if pty_write.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                },
-                Some(size) = resize_rx.recv() => {
-                    let _ = pty_write.resize(size);
-                }
-            }
-        }
-    });
-
-    // PTY -> client. Ends when the child exits and the master side EOFs.
-    let p2c = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut pty_read, &mut chan_write).await;
-        let _ = chan_write.shutdown().await;
-    });
-
-    let status = child.wait().await.context("waiting on child")?;
-    child_proc.pid.store(0, Ordering::Relaxed);
-    // The child is gone, so let the terminal go: with no slave fd left the
-    // master reaches EIO and the reader below finishes instead of blocking.
-    drop(keep_open);
-    let _ = p2c.await;
-    c2p.abort();
-    Ok(Exit::from_status(status))
-}
-
-/// Run a command (or shell) with **pipes** instead of a PTY, for a non-`-t`
-/// `ssh host cmd`. stdout goes to the channel's data stream and stderr to the
-/// extended-data (code 1) stream, kept separate and untranslated, as a
-/// conventional sshd delivers them, so piped/binary output isn't corrupted.
-async fn run_pipe_session(
-    channel: Channel<Msg>,
-    handle: Handle,
-    channel_id: ChannelId,
-    spec: SessionSpec,
-) -> Result<Exit> {
-    let SessionSpec {
-        info,
-        command,
-        env,
-        child_proc,
-        ..
-    } = spec;
-    let drop = drop_privs(info.uid, info.gid, &info.name)?;
-
-    let mut cmd = tokio::process::Command::new(&info.shell);
-    match &command {
-        Some(c) => {
-            cmd.arg("-c").arg(c);
-        }
-        None => {
-            cmd.arg("-l");
-        }
-    }
-    cmd.current_dir(&info.home)
-        .env_clear()
-        .envs(login_env(&info.home, &info.shell, &info.name))
-        .envs(env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: drops privileges (initgroups+setgid+setuid) before exec.
-    unsafe {
-        cmd.pre_exec(drop);
-    }
-    let mut child = cmd.spawn().context("spawning command")?;
-    child_proc
-        .pid
-        .store(child.id().unwrap_or(0), Ordering::Relaxed);
-    let mut stdin = child.stdin.take().context("child stdin")?;
-    let mut stdout = child.stdout.take().context("child stdout")?;
-    let mut stderr = child.stderr.take().context("child stderr")?;
-
-    // Output goes out via `handle.data`/`extended_data` (the stream can't emit
-    // the separate stderr extended-data channel), so we only need the read half
-    // for client stdin. Dropping the write half here is safe: `tokio::io::split`
-    // keeps the underlying channel alive until *both* halves drop, and the
-    // close-on-drop lives on the read half, which `stdin_task` holds open.
-    let stream = channel.into_stream();
-    let (mut chan_read, _chan_write) = tokio::io::split(stream);
-
-    // client stdin -> child
-    let stdin_task = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut chan_read, &mut stdin).await;
-        // drop closes the child's stdin so commands reading to EOF finish.
-    });
-    // child stdout -> channel data
-    let h_out = handle.clone();
-    let out_task = tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if h_out
-                        .data(channel_id, Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    // child stderr -> channel extended data (code 1 = stderr)
-    let h_err = handle.clone();
-    let err_task = tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            match stderr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if h_err
-                        .extended_data(channel_id, 1, Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let status = child.wait().await.context("waiting on child")?;
-    child_proc.pid.store(0, Ordering::Relaxed);
-    let _ = out_task.await;
-    let _ = err_task.await;
-    stdin_task.abort();
-    Ok(Exit::from_status(status))
-}
-
-/// Load the SSH host key the embedded server presents.
-///
-/// Prefers the machine's real OpenSSH ed25519 host key so a stock client that
-/// already trusts the host keeps seeing the same fingerprint once the mesh SSH
-/// NAT takes over `:22` (no `known_hosts` mismatch). Falls back to a persisted
-/// generated key when no usable host key is found.
-fn load_host_key() -> Result<PrivateKey> {
-    if let Some((path, key)) = discover_host_ed25519_key() {
-        info!(path = %path.display(), "mesh SSH: reusing host ed25519 key");
-        return Ok(key);
-    }
-    let key = load_or_generate_host_key()?;
-    // Loud, because the consequence lands on whoever connects, not here. With no
-    // system sshd key to reuse (a container with no `/etc/ssh`, a host with no
-    // sshd, an encrypted key) we present a key of our own, so a client that has
-    // this host in `known_hosts` from a LAN or public-IP session sees a different
-    // key for the same name and OpenSSH reports it as a possible MITM. Print the
-    // fingerprint so the operator can compare and confirm the swap themselves.
-    warn!(
-        fingerprint = %key.public_key().fingerprint(Default::default()),
-        "mesh SSH: no reusable system sshd host key found; serving a generated one. \
-         Clients that already know this host by another address will see a host-key \
-         change for the mesh name"
-    );
-    Ok(key)
-}
-
-/// Run `sshd -T` and return the first configured ed25519 host key that loads
-/// unencrypted, together with its path. Best-effort: any failure (no `sshd`,
-/// dump error, no ed25519 key, unreadable or encrypted key) yields `None`, so
-/// the caller falls back to the generated key. The daemon is root, so it can
-/// read the `0600` host key files.
-fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
-    let dump = run_sshd_dump()?;
-    for path in parse_hostkey_paths(&dump) {
-        let Ok(pem) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        match PrivateKey::from_openssh(&pem) {
-            Ok(key) if !key.is_encrypted() && key.algorithm() == Algorithm::Ed25519 => {
-                return Some((path, key));
-            }
-            _ => continue,
-        }
-    }
-    None
-}
-
-/// Dump the effective sshd config (`sshd -T`). Tries `sshd` on `PATH` then the
-/// common absolute locations, since the daemon's `PATH` may not include
-/// `/usr/sbin`. Returns `None` if none run successfully.
-fn run_sshd_dump() -> Option<String> {
-    for bin in ["sshd", "/usr/sbin/sshd", "/usr/local/sbin/sshd"] {
-        match std::process::Command::new(bin)
-            .arg("-T")
-            .stderr(Stdio::null())
-            .output()
-        {
-            Ok(out) if out.status.success() => return String::from_utf8(out.stdout).ok(),
-            _ => continue,
-        }
-    }
-    None
-}
-
-/// Extract the `hostkey <path>` entries from `sshd -T` output, in order. `sshd`
-/// prints one lowercase directive per line; other directives are ignored.
-fn parse_hostkey_paths(dump: &str) -> Vec<PathBuf> {
-    dump.lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let directive = parts.next()?;
-            directive
-                .eq_ignore_ascii_case("hostkey")
-                .then(|| parts.next().map(PathBuf::from))
-                .flatten()
-        })
-        .collect()
-}
-
-/// Where the OpenSSH sftp-server binary lives, per distribution. Used when the
-/// host has no sshd to ask (a container, or a machine where mesh SSH *is* the
-/// SSH server); all of these are shell-safe as written.
-const SFTP_SERVER_PATHS: [&str; 5] = [
-    "/usr/lib/openssh/sftp-server",     // Debian, Ubuntu
-    "/usr/libexec/openssh/sftp-server", // Fedora, RHEL, SUSE
-    "/usr/libexec/sftp-server",         // macOS, BSD
-    "/usr/lib/ssh/sftp-server",         // Arch, Alpine
-    "/usr/lib/sftp-server",             // last resort
-];
-
-/// The shell command that serves the `sftp` subsystem, or `None` when this host
-/// has no sftp-server to run.
-///
-/// Prefers whatever the host's own sshd is configured to use, arguments and all
-/// (`sshd -T` prints `subsystem sftp <command>`), so a non-default location or
-/// an admin's logging flags are honoured. Falls back to the standard paths.
-fn sftp_subsystem_command() -> Option<String> {
-    if let Some(cmd) = run_sshd_dump().as_deref().and_then(parse_sftp_subsystem) {
-        return Some(cmd);
-    }
-    SFTP_SERVER_PATHS
-        .iter()
-        .find(|path| Path::new(path).is_file())
-        .map(|path| (*path).to_string())
-}
-
-/// Extract the `subsystem sftp <command>` entry from `sshd -T` output, keeping
-/// any arguments. Rejects a command that isn't an absolute path: sshd's
-/// `internal-sftp` is code inside sshd itself, not a binary we can spawn.
-fn parse_sftp_subsystem(dump: &str) -> Option<String> {
-    dump.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        if !parts.next()?.eq_ignore_ascii_case("subsystem") || parts.next()? != "sftp" {
-            return None;
-        }
-        let rest = parts.collect::<Vec<_>>();
-        let binary = Path::new(rest.first()?);
-        (binary.is_absolute() && binary.is_file()).then(|| rest.join(" "))
-    })
-}
-
-/// Load the persisted SSH host key, generating and persisting one on first use.
-/// Stored as OpenSSH PEM at `<config_dir>/ssh_host_key`, mode 0600.
-fn load_or_generate_host_key() -> Result<PrivateKey> {
-    use russh::keys::ssh_key::LineEnding;
-
-    let path = crate::config::config_dir()?.join("ssh_host_key");
-    if path.exists() {
-        let pem = std::fs::read_to_string(&path).context("reading ssh host key")?;
-        return PrivateKey::from_openssh(&pem).context("parsing ssh host key");
-    }
-    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
-        .context("generating ssh host key")?;
-    let pem = key
-        .to_openssh(LineEnding::LF)
-        .context("encoding ssh host key")?;
-    crate::config::write_file(&path, pem.as_bytes(), true)?;
-    Ok(key)
 }
 
 #[cfg(test)]
@@ -2156,7 +1529,7 @@ mod tests {
     /// client connection to it. The peer is authorized for any user, the same
     /// state a live mesh connection reaches before it opens a channel.
     async fn connect_to_test_server() -> client::Handle<AcceptAnyHost> {
-        connect_watching_openings(None, test_account()).await
+        connect_watching_openings(None, test_account(), LOGIN_GRACE).await
     }
 
     /// The same, plus the channels the server opens back to the client: what a
@@ -2167,7 +1540,7 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
-            connect_watching_openings(Some(tx), test_account()).await,
+            connect_watching_openings(Some(tx), test_account(), LOGIN_GRACE).await,
             rx,
         )
     }
@@ -2175,13 +1548,12 @@ mod tests {
     async fn connect_watching_openings(
         opened: Option<mpsc::UnboundedSender<Channel<ClientMsg>>>,
         login_as: String,
+        grace: Duration,
     ) -> client::Handle<AcceptAnyHost> {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
         let config = Arc::new(Config {
-            keys: vec![key],
-            methods: MethodSet::from(&[MethodKind::None][..]),
             auth_rejection_time: Duration::ZERO,
-            ..Default::default()
+            ..server_config(key)
         });
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2198,9 +1570,7 @@ mod tests {
                 server: SocketAddr::new(addr.ip(), SSH_PORT),
             };
             let handler = SshHandler::new(policy, id(1), None, origin);
-            if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
-                let _ = session.await;
-            }
+            serve(config, stream, handler, grace).await;
         });
 
         let mut handle = client::connect(
@@ -2219,6 +1589,174 @@ mod tests {
             "the `none` method is the mesh SSH auth gate"
         );
         handle
+    }
+
+    /// Serve one connection with a short login grace and hand back the client
+    /// socket, so a test can stall the handshake the way a black-holed mesh
+    /// path does and watch the server let go.
+    async fn connect_with_grace(grace: Duration) -> TcpStream {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
+        let config = Arc::new(Config {
+            auth_rejection_time: Duration::ZERO,
+            ..server_config(key)
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, client) = listener.accept().await.expect("accept");
+            let mut policy = UserPolicy::default();
+            policy.add(&["*".to_string()]);
+            let origin = Origin {
+                client,
+                server: SocketAddr::new(addr.ip(), SSH_PORT),
+            };
+            serve(
+                config,
+                stream,
+                SshHandler::new(policy, id(1), None, origin),
+                grace,
+            )
+            .await;
+        });
+        TcpStream::connect(addr).await.expect("client connect")
+    }
+
+    /// Read until the server hangs up, or fail. `read_to_end` returning at all
+    /// is the assertion: it means the socket is gone.
+    async fn wait_for_hangup(sock: &mut TcpStream) {
+        let mut sink = Vec::new();
+        timeout(Duration::from_secs(10), sock.read_to_end(&mut sink))
+            .await
+            .expect("the server held a stalled handshake open past the login grace")
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_session_outlives_the_login_grace() {
+        // The grace has to stop counting once a peer is admitted, or every
+        // session would be cut off partway through whatever it was doing.
+        let handle =
+            connect_watching_openings(None, test_account(), Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("open a session channel after the grace has passed");
+        channel.exec(true, "echo alive").await.expect("exec");
+        let (out, code) = drain(&mut channel).await;
+        assert!(out.contains("alive"), "output after the grace: {out}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn keepalives_preserve_idle_sessions_and_close_unresponsive_clients() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
+        let interval = Duration::from_millis(250);
+        let config = Arc::new(Config {
+            keepalive_interval: Some(interval),
+            auth_rejection_time: Duration::ZERO,
+            ..server_config(key)
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, client) = listener.accept().await.unwrap();
+            let mut policy = UserPolicy::default();
+            policy.add(&["*".to_string()]);
+            let origin = Origin {
+                client,
+                server: SocketAddr::new(addr.ip(), SSH_PORT),
+            };
+            serve(
+                config,
+                stream,
+                SshHandler::new(policy, id(1), None, origin),
+                LOGIN_GRACE,
+            )
+            .await;
+        });
+
+        // A transparent proxy can swallow replies without closing TCP. The
+        // client still receives probes and answers them, just as it would on
+        // a mesh path whose return traffic has stopped reaching the server.
+        let upstream = TcpStream::connect(addr).await.unwrap();
+        let (client_stream, proxy_stream) = tokio::io::duplex(65536);
+        let blackhole = Arc::new(AtomicBool::new(false));
+        let drop_replies = Arc::clone(&blackhole);
+        let proxy = tokio::spawn(async move {
+            let (mut client_read, mut client_write) = tokio::io::split(proxy_stream);
+            let (mut server_read, mut server_write) = upstream.into_split();
+            let forward_replies = async {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = client_read.read(&mut buf).await?;
+                    if n == 0 {
+                        return Ok::<_, std::io::Error>(());
+                    }
+                    if !drop_replies.load(Ordering::Relaxed) {
+                        server_write.write_all(&buf[..n]).await?;
+                    }
+                }
+            };
+            let _ = tokio::try_join!(
+                forward_replies,
+                tokio::io::copy(&mut server_read, &mut client_write)
+            );
+        });
+        let mut handle = client::connect_stream(
+            Arc::new(client::Config::default()),
+            client_stream,
+            AcceptAnyHost { opened: None },
+        )
+        .await
+        .unwrap();
+        assert!(
+            handle
+                .authenticate_none(test_account())
+                .await
+                .unwrap()
+                .success()
+        );
+
+        // More than two failure windows with no application traffic. Only
+        // automatic SSH replies keep this session alive.
+        tokio::time::sleep(interval * 9).await;
+        assert!(!server.is_finished(), "responsive idle client was dropped");
+        let mut channel = handle.channel_open_session().await.unwrap();
+        channel.exec(true, "echo alive").await.unwrap();
+        let (out, code) = drain(&mut channel).await;
+        assert!(out.contains("alive"));
+        assert_eq!(code, Some(0));
+
+        blackhole.store(true, Ordering::Relaxed);
+        timeout(interval * 6, server)
+            .await
+            .expect("unresponsive client survived the keepalive failure window")
+            .unwrap();
+        proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_sends_its_version_string_is_dropped() {
+        // Both halves of the handshake need their own bound, and this is the
+        // half russh runs before there is a session: without the grace it sits
+        // here indefinitely, holding the socket.
+        let mut sock = connect_with_grace(Duration::from_millis(200)).await;
+        wait_for_hangup(&mut sock).await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_authenticates_is_dropped() {
+        // The other half: the version exchange completes, so russh owns a
+        // session task, and then nothing else arrives. This is the shape of the
+        // real hang, where the mesh path stops carrying the flow mid-handshake.
+        let mut sock = connect_with_grace(Duration::from_millis(200)).await;
+        sock.write_all(b"SSH-2.0-stalls_here\r\n")
+            .await
+            .expect("write version string");
+        wait_for_hangup(&mut sock).await;
     }
 
     /// Drain one channel to its close, returning what the command wrote to
@@ -2593,7 +2131,7 @@ mod tests {
             0 => std::env::var("SUDO_USER").unwrap_or_else(|_| test_account()),
             _ => test_account(),
         };
-        let handle = connect_watching_openings(None, login_as).await;
+        let handle = connect_watching_openings(None, login_as, LOGIN_GRACE).await;
         let mut channel = handle
             .channel_open_session()
             .await
@@ -2631,6 +2169,90 @@ mod tests {
             }
         }
         assert!(ran, "the login shell never ran our command: {out:?}");
+    }
+
+    /// The server must offer "none" alone as its compression. Russh's zlib is
+    /// broken on the receive side: with `zlib@openssh.com` negotiated, the
+    /// second SSH_MSG_CHANNEL_DATA an OpenSSH client sends fails to decompress
+    /// and the connection dies with `SshEncoding: length invalid`. `Compression
+    /// yes` is common enough in people's ssh_config that this is the path they
+    /// hit first -- the session drops the moment they type a second command --
+    /// so the advertisement itself is what this pins. Russh's own client
+    /// interoperates with russh's zlib, so only the wire tells the truth here.
+    #[tokio::test]
+    async fn the_server_offers_no_compression() {
+        let mut sock = connect_with_grace(LOGIN_GRACE).await;
+        sock.write_all(b"SSH-2.0-rayfish-test\r\n")
+            .await
+            .expect("send our version string");
+
+        // Enough for the version line and the KEXINIT behind it, which is still
+        // in the clear this early.
+        let mut buf = vec![0u8; 8192];
+        let mut have = 0;
+        let kexinit = loop {
+            let n = timeout(Duration::from_secs(10), sock.read(&mut buf[have..]))
+                .await
+                .expect("the server never sent its KEXINIT")
+                .expect("read from the server");
+            assert!(n > 0, "the server hung up before its KEXINIT");
+            have += n;
+            if let Some(payload) = first_packet_payload(&buf[..have]) {
+                break payload.to_vec();
+            }
+        };
+
+        const SSH_MSG_KEXINIT: u8 = 20;
+        assert_eq!(
+            kexinit.first().copied(),
+            Some(SSH_MSG_KEXINIT),
+            "the server's first packet is its KEXINIT"
+        );
+        // msg type, then a 16-byte cookie, then the algorithm name-lists.
+        let lists = name_lists(&kexinit[17..]);
+        // kex, host key, cipher c2s, cipher s2c, mac c2s, mac s2c, then the two
+        // compression lists.
+        assert_eq!(
+            (
+                lists.get(6).map(String::as_str),
+                lists.get(7).map(String::as_str)
+            ),
+            (Some("none"), Some("none")),
+            "the server must not offer zlib: {lists:?}"
+        );
+    }
+
+    /// Split off the payload of the first complete binary packet in `bytes`,
+    /// skipping the version line ahead of it. `None` until all of it has
+    /// arrived. Unencrypted packets only, which is all this early in a session.
+    fn first_packet_payload(bytes: &[u8]) -> Option<&[u8]> {
+        let line_end = bytes.windows(2).position(|w| w == b"\r\n")? + 2;
+        let packet = bytes.get(line_end..)?;
+        let length = u32::from_be_bytes(packet.get(..4)?.try_into().ok()?) as usize;
+        let padding = *packet.get(4)? as usize;
+        let payload_len = length.checked_sub(padding + 1)?;
+        packet.get(5..5 + payload_len)
+    }
+
+    /// The `name-list` sequence of a KEXINIT body: each one a u32 length and
+    /// that many bytes of comma-separated names.
+    fn name_lists(mut bytes: &[u8]) -> Vec<String> {
+        let mut lists = Vec::new();
+        while bytes.len() >= 4 {
+            let (len_bytes, rest) = bytes.split_at(4);
+            let Ok(len) = u32::from_be_bytes(len_bytes.try_into().unwrap_or([0; 4])).try_into()
+            else {
+                break;
+            };
+            let len: usize = len;
+            if rest.len() < len {
+                break;
+            }
+            let (list, rest) = rest.split_at(len);
+            lists.push(String::from_utf8_lossy(list).into_owned());
+            bytes = rest;
+        }
+        lists
     }
 
     #[tokio::test]
