@@ -181,16 +181,20 @@ fn bench_apple_tun_ingress(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("direct_fd", size), &packet, |b, pkt| {
-            let mut pool = BytesMut::with_capacity(POOL_CHUNK);
-            b.iter(|| {
-                if pool.capacity() < MAX_DATAGRAM {
-                    pool.reserve(POOL_CHUNK);
-                }
-                pool.extend_from_slice(black_box(pkt));
-                black_box(pool.split_to(pkt.len()).freeze())
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("direct_buffer", size),
+            &packet,
+            |b, pkt| {
+                let mut pool = BytesMut::with_capacity(POOL_CHUNK);
+                b.iter(|| {
+                    if pool.capacity() < MAX_DATAGRAM {
+                        pool.reserve(POOL_CHUNK);
+                    }
+                    pool.extend_from_slice(black_box(pkt));
+                    black_box(pool.split_to(pkt.len()).freeze())
+                });
+            },
+        );
     }
     group.finish();
 }
