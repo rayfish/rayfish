@@ -4,8 +4,9 @@
 mod apple_tun;
 mod migration;
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::fmt::Display;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rayfish::config;
@@ -19,11 +20,13 @@ use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
 use tokio::runtime::{Builder, Runtime};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use tokio::sync::mpsc;
 
 #[cfg(target_os = "macos")]
 use apple_tun::{AppleTunReader, AppleTunWriter, PACKET_QUEUE_CAPACITY};
+#[cfg(any(target_os = "macos", test))]
+use arc_swap::ArcSwapOption;
 #[cfg(target_os = "macos")]
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -47,6 +50,12 @@ pub enum AppleError {
     PacketQueueFull,
     #[error("{0}")]
     Network(String),
+}
+
+impl AppleError {
+    fn network(error: impl Display) -> Self {
+        Self::Network(error.to_string())
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -133,17 +142,20 @@ pub struct Node {
     state: Mutex<Option<Arc<DaemonState>>>,
     #[cfg(target_os = "macos")]
     ipc_task: Mutex<Option<JoinHandle<()>>>,
+    /// Serializes tunnel attach and detach. Packet delivery never takes this lock.
     #[cfg(target_os = "macos")]
-    packet_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    packet_lifecycle: Mutex<()>,
+    /// Current Swift-to-Rust packet queue, read without locking in the hot path.
+    #[cfg(target_os = "macos")]
+    packet_tx: ArcSwapOption<mpsc::Sender<Vec<u8>>>,
 }
 
 impl Node {
     fn state(&self) -> Result<Arc<DaemonState>, AppleError> {
         self.state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .cloned()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
             .ok_or(AppleError::NotStarted)
     }
 }
@@ -165,13 +177,15 @@ impl Node {
             #[cfg(target_os = "macos")]
             ipc_task: Mutex::new(None),
             #[cfg(target_os = "macos")]
-            packet_tx: Mutex::new(None),
+            packet_lifecycle: Mutex::new(()),
+            #[cfg(target_os = "macos")]
+            packet_tx: ArcSwapOption::empty(),
         })
     }
 
     /// Start the control plane. This is safe to call more than once.
     pub fn start(&self) -> Result<(), AppleError> {
-        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_some() {
             return Ok(());
         }
@@ -179,17 +193,17 @@ impl Node {
             .runtime
             .block_on(async { timeout(START_TIMEOUT, build_headless(true)).await })
             .map_err(|_| AppleError::Network("node start timed out".to_owned()))?
-            .map_err(|e| AppleError::Network(e.to_string()))?;
+            .map_err(AppleError::network)?;
         #[cfg(target_os = "macos")]
         {
             let task = match self.runtime.block_on(start_embedded_ipc(&state)) {
                 Ok(task) => task,
                 Err(error) => {
                     self.runtime.block_on(state.shutdown_and_close());
-                    return Err(AppleError::Network(error.to_string()));
+                    return Err(AppleError::network(error));
                 }
             };
-            *self.ipc_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+            *self.ipc_task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
         }
         *slot = Some(state);
         Ok(())
@@ -197,12 +211,12 @@ impl Node {
 
     /// Copy legacy launchd state before starting the extension-owned node.
     pub fn migrate_legacy_state(&self, source: String) -> Result<(), AppleError> {
-        let slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_some() {
             return Err(AppleError::AlreadyStarted);
         }
-        migration::copy_legacy_state(PathBuf::from(source).as_path(), &self.config_dir)
-            .map_err(|error| AppleError::Network(error.to_string()))
+        migration::copy_legacy_state(Path::new(&source), &self.config_dir)
+            .map_err(AppleError::network)
     }
 
     /// The stable mesh address that the packet tunnel assigns to this device.
@@ -248,7 +262,7 @@ impl Node {
                 _ => Vec::new(),
             })
             .collect();
-        let settings = config::load().map_err(|error| AppleError::Network(error.to_string()))?;
+        let settings = config::load().map_err(AppleError::network)?;
         let connection_requests = match state.list_connections() {
             IpcMessage::PendingRequests { requests } => requests
                 .into_iter()
@@ -342,7 +356,7 @@ impl Node {
             )
         })
         .map(|_| ())
-        .map_err(|error| AppleError::Network(error.to_string()))
+        .map_err(AppleError::network)
     }
 
     pub fn connect_peer(
@@ -469,8 +483,11 @@ impl Node {
         #[cfg(target_os = "macos")]
         {
             let state = self.state()?;
-            let mut packet_tx = self.packet_tx.lock().unwrap_or_else(|e| e.into_inner());
-            if packet_tx.is_some() {
+            let _lifecycle = self
+                .packet_lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if self.packet_tx.load().is_some() {
                 return Err(AppleError::AlreadyActive);
             }
             let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
@@ -478,7 +495,7 @@ impl Node {
             let writer = AppleTunWriter::new(flow);
             self.runtime
                 .block_on(state.attach_external_tun(reader, writer));
-            *packet_tx = Some(tx);
+            self.packet_tx.store(Some(Arc::new(tx)));
             Ok(())
         }
     }
@@ -492,12 +509,8 @@ impl Node {
         }
         #[cfg(target_os = "macos")]
         {
-            let sender = self
-                .packet_tx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-                .ok_or(AppleError::NotStarted)?;
+            let sender = self.packet_tx.load();
+            let sender = sender.as_ref().ok_or(AppleError::NotStarted)?;
             for packet in packets {
                 sender
                     .try_send(packet)
@@ -510,25 +523,29 @@ impl Node {
     /// Detach the packet flow but leave mesh control connections alive.
     pub fn deactivate(&self) -> Result<(), AppleError> {
         let state = self.state()?;
+        #[cfg(target_os = "macos")]
+        let _lifecycle = self
+            .packet_lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         state.detach_tun();
         #[cfg(target_os = "macos")]
-        self.packet_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        self.packet_tx.store(None);
         Ok(())
     }
 
     /// Stop the mesh node and release all persistent-store locks.
     pub fn stop(&self) {
         // Keep startup waiting until the old node releases its store locks.
-        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = slot.take();
         #[cfg(target_os = "macos")]
-        self.packet_tx
+        let _lifecycle = self
+            .packet_lifecycle
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(target_os = "macos")]
+        self.packet_tx.store(None);
         if let Some(state) = &state {
             state.detach_tun();
         }
@@ -536,7 +553,7 @@ impl Node {
         let ipc_task = self
             .ipc_task
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .take();
         // Swift calls from an ordinary host thread. Construct timers only after
         // entering the runtime, and let IPC drain alongside the mesh shutdown.
@@ -604,6 +621,25 @@ mod tests {
             expect_ok(IpcMessage::Status, "leave"),
             Err(AppleError::Network(message)) if message == "node returned an invalid leave response"
         ));
+    }
+
+    #[test]
+    fn packet_sender_snapshot_tracks_lifecycle() {
+        let sender_slot: ArcSwapOption<mpsc::Sender<Vec<u8>>> = ArcSwapOption::empty();
+        assert!(sender_slot.load().is_none());
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender_slot.store(Some(Arc::new(sender)));
+        let snapshot = sender_slot.load();
+        snapshot
+            .as_ref()
+            .expect("active packet sender should be present")
+            .try_send(vec![1, 2, 3])
+            .expect("packet queue should have capacity");
+        assert_eq!(receiver.try_recv().unwrap(), [1, 2, 3]);
+
+        sender_slot.store(None);
+        assert!(sender_slot.load().is_none());
     }
 
     #[test]
