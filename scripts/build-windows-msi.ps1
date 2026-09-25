@@ -133,12 +133,16 @@ if ($outputDir -and -not (Test-Path -LiteralPath $outputDir)) {
 }
 
 try {
-    Write-Host "Building ray for $Target..."
+    Write-Host "Building Rayfish for $Target..."
     Push-Location $repoRoot
     try {
-        & cargo build --release --locked --target $Target --features desktop --bin ray
+        & cargo build --release --locked --target $Target --features desktop -p rayfish --bin ray
         if ($LASTEXITCODE -ne 0) {
-            throw "cargo build failed with exit code $LASTEXITCODE."
+            throw "cargo build for ray failed with exit code $LASTEXITCODE."
+        }
+        & cargo build --release --locked --target $Target -p ray-windows --bin rayfish-app
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build for rayfish-app failed with exit code $LASTEXITCODE."
         }
     }
     finally {
@@ -166,6 +170,7 @@ try {
 
     New-Item -ItemType Directory -Force -Path $msiBinDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $targetBinDir 'ray.exe') -Destination (Join-Path $msiBinDir 'ray.exe') -Force
+    Copy-Item -LiteralPath (Join-Path $targetBinDir 'rayfish-app.exe') -Destination (Join-Path $msiBinDir 'rayfish-app.exe') -Force
     Copy-Item -LiteralPath $dll.FullName -Destination $stagedDll -Force
 
     # The staged copy, before it goes into the package. Signing only the MSI
@@ -173,12 +178,13 @@ try {
     # dialog and service start after the install still says unknown publisher.
     # Wintun is already signed by its vendor and verified above; leave it alone.
     Invoke-Signing -Path (Join-Path $msiBinDir 'ray.exe')
+    Invoke-Signing -Path (Join-Path $msiBinDir 'rayfish-app.exe')
 
     Write-Host "Building MSI ProductVersion $Version ($Channel identity $ReleaseIdentity)..."
     Push-Location $repoRoot
     try {
         $wixArgs = @(
-            'wix', '-p', 'rayfish', '--no-build',
+            'wix', '-p', 'rayfish', '--no-build', '--nocapture',
             '--target', $Target,
             '--target-bin-dir', $msiBinDir,
             '--install-version', $Version,
