@@ -11,6 +11,7 @@ use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
 use clap::{FromArgMatches, Parser, Subcommand};
+use iroh::EndpointId;
 use ray_proto::settings::node_key_help;
 
 use membership::GroupMode;
@@ -722,6 +723,11 @@ pub(crate) enum MachinesAction {
     /// Forget an enrolled machine from this controller
     Forget {
         machine: ipc::ManagedMachineSelector,
+    },
+    /// Confirm an existing machine for inventory recovery
+    Confirm {
+        /// Full endpoint ID of a machine that already trusts this controller
+        machine: EndpointId,
     },
 }
 

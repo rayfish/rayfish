@@ -1776,7 +1776,10 @@ impl AcceptHandler {
 /// method handles its own errors (logs, closes the connection), so `accept`
 /// always reports `Ok`.
 #[derive(Clone)]
-struct MeshProtocol(Arc<ConnectionManager>);
+struct MeshProtocol {
+    connections: Arc<ConnectionManager>,
+    management: Arc<ManagementService>,
+}
 
 #[derive(Clone)]
 struct FilesProtocol(Arc<FileService>);
@@ -1815,7 +1818,10 @@ impl std::fmt::Debug for ConnectProtocol {
 
 impl iroh::protocol::ProtocolHandler for MeshProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        Arc::clone(&self.0).drive_mesh_connection(conn, false).await;
+        self.management.connection_established(conn.remote_id());
+        Arc::clone(&self.connections)
+            .drive_mesh_connection(conn, false)
+            .await;
         Ok(())
     }
 }
@@ -1929,9 +1935,19 @@ impl ProtocolRouter {
             .accept(
                 crate::management::ALPN,
                 ManagementProtocol(Arc::clone(&self.management)),
+            )
+            .accept(
+                crate::management::LEGACY_ALPN,
+                ManagementProtocol(Arc::clone(&self.management)),
             );
         for alpn in transport::mesh_alpns() {
-            builder = builder.accept(alpn, MeshProtocol(Arc::clone(&self.conn_mngr)));
+            builder = builder.accept(
+                alpn,
+                MeshProtocol {
+                    connections: Arc::clone(&self.conn_mngr),
+                    management: Arc::clone(&self.management),
+                },
+            );
         }
         builder.spawn()
     }
@@ -1945,6 +1961,7 @@ impl ProtocolRouter {
         conn: Connection,
         pre_registered: bool,
     ) {
+        self.management.connection_established(conn.remote_id());
         Arc::clone(&self.conn_mngr)
             .drive_mesh_connection(conn, pre_registered)
             .await;
