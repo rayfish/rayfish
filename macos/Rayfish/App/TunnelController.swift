@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import NetworkExtension
 import OSLog
+import ServiceManagement
 
 @MainActor
 final class TunnelController: ObservableObject {
@@ -24,6 +25,7 @@ final class TunnelController: ObservableObject {
     }
     @Published var isLoading = false
     @Published var activity: String?
+    @Published private(set) var launchAtLoginEnabled = false
     @Published private(set) var connectionStatus: NEVPNStatus = .disconnected {
         didSet {
             if connectionStatus != oldValue {
@@ -47,12 +49,13 @@ final class TunnelController: ObservableObject {
     func startup() async {
         guard !didStart else { return }
         didStart = true
+        refreshLaunchAtLogin()
         RayfishLog.app.info("Starting Rayfish build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown", privacy: .public)")
         do {
             let manager = try await TunnelPreferences.load()
             let needsImport = LegacyDaemon.isInstalled
                 && !UserDefaults.standard.bool(forKey: Self.migrationCompletedKey)
-            if needsImport || manager?.connection.status == .connected || manager?.connection.status == .connecting {
+            if needsImport || launchAtLoginEnabled || manager?.connection.status == .connected || manager?.connection.status == .connecting {
                 // Activation replaces an older extension before using its command service.
                 await connect()
             } else {
@@ -251,6 +254,30 @@ final class TunnelController: ObservableObject {
         await disconnect()
         guard connectionStatus == .disconnected || connectionStatus == .invalid else { return }
         await connect()
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+        do {
+            if enabled {
+                try service.register()
+            } else {
+                try service.unregister()
+            }
+            refreshLaunchAtLogin()
+            if enabled, service.status == .requiresApproval {
+                SMAppService.openSystemSettingsLoginItems()
+            }
+            error = nil
+        } catch {
+            refreshLaunchAtLogin()
+            self.error = "Could not update Start at login: \(error.localizedDescription)"
+        }
+    }
+
+    private func refreshLaunchAtLogin() {
+        let status = SMAppService.mainApp.status
+        launchAtLoginEnabled = status == .enabled || status == .requiresApproval
     }
 
     func connectPeer(id: String, hostname: String?) async -> String? {
