@@ -34,7 +34,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Kicks now revoke the removed device across the mesh.** Remaining peers drop
   its network route and close its last shared connection, while the kicked device
-  removes the network from its local status and open desktop dashboard.
+  removes the network from its local status and open desktop dashboard. A fresh
+  invite or approval can admit the same device again immediately.
 
 - **Commands that target network members accept their hostnames consistently.**
   Admin grants now accept names, and network-scoped commands do not resolve a
