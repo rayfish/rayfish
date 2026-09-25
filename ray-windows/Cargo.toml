@@ -1,0 +1,26 @@
+[package]
+name = "ray-windows"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[[bin]]
+name = "rayfish-app"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
+tray-icon = { version = "0.25.1", default-features = false, features = ["muda-common-controls-v6"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+wry = { version = "0.57", default-features = false }
+
+[build-dependencies]
+winresource = "0.1"
