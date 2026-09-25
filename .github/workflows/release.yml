@@ -105,6 +105,9 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             name: ray-macos-aarch64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            name: ray-macos-x86_64
 
     runs-on: ${{ matrix.runner }}
 
