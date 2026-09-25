@@ -244,7 +244,7 @@ impl NetworkRegistry {
         let entry = if peer == "*" {
             "*".to_string()
         } else {
-            match self.resolve_peer_flexible(peer).await {
+            match self.resolve_peer_in_network(network, peer) {
                 Some(id) => self.device_user_map.resolve(&id).to_string(),
                 None => return ipc_err(format!("could not resolve peer: {peer}")),
             }
@@ -295,7 +295,7 @@ impl NetworkRegistry {
         let mut unverified = false;
         let selection = match &peer {
             Some(name) => {
-                let Some(id) = self.resolve_peer_flexible(name).await else {
+                let Some(id) = self.resolve_peer_in_network(network, name) else {
                     return ipc_err(format!("could not resolve peer: {name}"));
                 };
                 let member = self.roster_member(network, id);
