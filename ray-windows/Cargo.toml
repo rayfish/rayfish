@@ -12,6 +12,7 @@ path = "src/main.rs"
 [target.'cfg(windows)'.dependencies]
 anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+serde_json = "1"
 tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
 tray-icon = { version = "0.25.1", default-features = false, features = ["muda-common-controls-v6"] }
 windows-sys = { version = "0.61.2", features = [

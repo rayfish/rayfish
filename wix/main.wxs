@@ -24,10 +24,19 @@
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentGroupRef Id="FontLicenseComponents" />
     </Feature>
+    <CustomAction Id="RemoveRayfishDesktopStartupTask" Directory="SystemFolder"
+                  ExeCommand="schtasks.exe /Delete /TN &quot;Rayfish Desktop App&quot; /F"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RemoveRayfishDesktopStartupTask" Before="RemoveFiles">
+        REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
+      </Custom>
+    </InstallExecuteSequence>
   </Product>
 
   <Fragment>
     <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="SystemFolder" />
       <Directory Id="$(var.PlatformProgramFilesFolder)">
         <Directory Id="INSTALLFOLDER" Name="Rayfish">
           <Directory Id="LICENSEFOLDER" Name="licenses" />

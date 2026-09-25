@@ -12,6 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Closing its window leaves Rayfish in the notification area, where the VPN can
   be connected, disconnected, reopened, or disconnected and quit.
 
+- **Windows and macOS can start Rayfish at login.** Enable it from Settings to
+  open the desktop app after signing in. The macOS app also connects the VPN.
+
 ## [0.5.0] - 2026-09-24
 
 ### Added

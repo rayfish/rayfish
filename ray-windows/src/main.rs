@@ -39,6 +39,13 @@ mod windows_app {
     const ICON_PNG: &[u8] =
         include_bytes!("../../macos/Rayfish/Assets.xcassets/AppIcon.appiconset/icon-64.png");
     const GUI_PREFIX: &str = "rayfish GUI listening on ";
+    const STARTUP_TASK_NAME: &str = "Rayfish Desktop App";
+
+    #[derive(Debug)]
+    enum LaunchAtLoginRequest {
+        Get,
+        Set(bool),
+    }
 
     #[derive(Debug)]
     enum UserEvent {
@@ -46,6 +53,7 @@ mod windows_app {
         ConnectionState(bool),
         ToggleConnection,
         ConnectionChanged { active: bool, error: Option<String> },
+        LaunchAtLogin(LaunchAtLoginRequest),
         Quit,
         QuitFinished(Option<String>),
     }
@@ -138,13 +146,18 @@ mod windows_app {
         let webview = WebViewBuilder::new()
             .with_url(url)
             .with_ipc_handler(move |request| {
-                let active = match request.body().as_str() {
-                    "active" => Some(true),
-                    "standby" => Some(false),
+                let event = match request.body().as_str() {
+                    "active" => Some(UserEvent::ConnectionState(true)),
+                    "standby" => Some(UserEvent::ConnectionState(false)),
+                    "startup:get" => Some(UserEvent::LaunchAtLogin(LaunchAtLoginRequest::Get)),
+                    "startup:on" => Some(UserEvent::LaunchAtLogin(LaunchAtLoginRequest::Set(true))),
+                    "startup:off" => {
+                        Some(UserEvent::LaunchAtLogin(LaunchAtLoginRequest::Set(false)))
+                    }
                     _ => None,
                 };
-                if let Some(active) = active {
-                    let _ = proxy.send_event(UserEvent::ConnectionState(active));
+                if let Some(event) = event {
+                    let _ = proxy.send_event(event);
                 }
             })
             .build(&window)
@@ -190,6 +203,7 @@ mod windows_app {
         }));
 
         let ray = ray_executable()?;
+        let app = std::env::current_exe().context("finding the Rayfish app executable")?;
         let command_proxy = event_loop.create_proxy();
         let mut active = false;
         let mut command_pending = false;
@@ -224,6 +238,19 @@ mod windows_app {
                         let _ = webview.evaluate_script("refresh()");
                     }
                     update_connection_menu(&state_item, &connection_item, active, false);
+                }
+                Event::UserEvent(UserEvent::LaunchAtLogin(request)) => {
+                    let error = match request {
+                        LaunchAtLoginRequest::Get => None,
+                        LaunchAtLoginRequest::Set(enabled) => set_launch_at_login(&app, enabled)
+                            .err()
+                            .map(|error| error.to_string()),
+                    };
+                    let enabled = launch_at_login_enabled();
+                    let error = serde_json::to_string(&error)
+                        .unwrap_or_else(|_| "\"Could not read the startup setting.\"".to_owned());
+                    let _ = webview
+                        .evaluate_script(&format!("setLaunchAtLoginState({enabled}, {error})"));
                 }
                 Event::UserEvent(UserEvent::Quit) if !command_pending => {
                     command_pending = true;
@@ -321,6 +348,55 @@ mod windows_app {
             anyhow::bail!(
                 "Rayfish could not {}.{}{}",
                 if active { "connect" } else { "disconnect" },
+                if message.is_empty() { "" } else { "\n\n" },
+                message
+            );
+        }
+        Ok(())
+    }
+
+    fn launch_at_login_enabled() -> bool {
+        Command::new("schtasks.exe")
+            .args(["/Query", "/TN", STARTUP_TASK_NAME])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn set_launch_at_login(app: &Path, enabled: bool) -> Result<()> {
+        let mut command = Command::new("schtasks.exe");
+        if enabled {
+            let task_command = format!("\"{}\"", app.display());
+            command.args([
+                "/Create",
+                "/TN",
+                STARTUP_TASK_NAME,
+                "/SC",
+                "ONLOGON",
+                "/TR",
+                &task_command,
+                "/RL",
+                "HIGHEST",
+                "/IT",
+                "/DELAY",
+                "0000:05",
+                "/F",
+            ]);
+        } else {
+            command.args(["/Delete", "/TN", STARTUP_TASK_NAME, "/F"]);
+        }
+        let output = command
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .context("updating the Rayfish startup task")?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            anyhow::bail!(
+                "Could not {} Start at login.{}{}",
+                if enabled { "enable" } else { "disable" },
                 if message.is_empty() { "" } else { "\n\n" },
                 message
             );
