@@ -14,6 +14,7 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [dependencies]
 rayfish = { path = "..", default-features = false }
 anyhow = "1"
+arc-swap = "1.9.1"
 bytes = "1"
 tempfile = "3"
 thiserror = "2"

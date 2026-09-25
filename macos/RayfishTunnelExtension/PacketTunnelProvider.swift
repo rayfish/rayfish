@@ -61,12 +61,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         let started = DispatchTime.now().uptimeNanoseconds
         RayfishLog.tunnel.info("Stopping tunnel, reason \(reason.rawValue)")
-        do {
-            let stoppingNode = node
-            node = nil
-            appliedDNS = nil
-            stoppingNode?.stop()
-        }
+        let stoppingNode = node
+        node = nil
+        appliedDNS = nil
+        stoppingNode?.stop()
         let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         RayfishLog.tunnel.info("Tunnel stopped in \(elapsedMs) ms")
         completionHandler()
@@ -171,13 +169,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         case .connectPeer:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             message = try node.connectPeer(contactId: id, hostname: request.hostname)
-        case .approveConnection, .rejectConnection:
+        case .approveConnection:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
-            if request.action == .approveConnection {
-                try node.approveConnection(id: id)
-            } else {
-                try node.rejectConnection(id: id)
-            }
+            try node.approveConnection(id: id)
+        case .rejectConnection:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
+            try node.rejectConnection(id: id)
         case .create:
             try node.createNetwork(name: request.name, hostname: request.hostname)
         case .join:
@@ -200,15 +197,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                 throw ProviderError.missingNetworkName
             }
             try node.setHostname(network: name, hostname: hostname)
-        case .acceptRequest, .denyRequest:
+        case .acceptRequest:
             guard let name = request.name, let id = request.id else {
                 throw ProviderError.missingNetworkName
             }
-            if request.action == .acceptRequest {
-                try node.acceptRequest(network: name, id: id)
-            } else {
-                try node.denyRequest(network: name, id: id)
+            try node.acceptRequest(network: name, id: id)
+        case .denyRequest:
+            guard let name = request.name, let id = request.id else {
+                throw ProviderError.missingNetworkName
             }
+            try node.denyRequest(network: name, id: id)
         }
         return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: inviteCode, message: message)
     }
