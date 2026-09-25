@@ -600,6 +600,7 @@ async fn build_daemon_inner(
     let management = Arc::new(ManagementService::new(
         Arc::clone(&transport),
         Arc::clone(&registry),
+        key.clone(),
     ));
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
@@ -673,6 +674,7 @@ async fn build_daemon_inner(
     // The Router owns the endpoint accept loop and dispatches by ALPN. It aborts on
     // drop, so the Daemon owns it for the process lifetime and shuts it down on exit.
     let router = protocol_router.build_router(transport.endpoint.clone());
+    management.start_announcements(token.clone());
 
     // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
     // stops the export); built here from the local handles so it can be a plain
