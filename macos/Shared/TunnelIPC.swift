@@ -21,7 +21,8 @@ enum TunnelIPC {
             }
             // NetworkExtension authenticates the containing app and routes messages to its provider.
             let data = try JSONEncoder().encode(request)
-            let timeout: TimeInterval = request.action == .connectPeer || request.action == .approveConnection ? 90 : 10
+            let timeout: TimeInterval = request.action == .acceptFile ? 300
+                : (request.action == .connectPeer || request.action == .approveConnection ? 90 : 10)
             let reply = try await send(data, timeout: timeout) { data, reply in
                 try session.sendProviderMessage(data, responseHandler: reply)
             }

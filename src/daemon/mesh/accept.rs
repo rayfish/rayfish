@@ -1251,6 +1251,7 @@ impl MemberAcceptState {
                 };
                 let mut s = self.state.write().unwrap();
                 s.approved.approve(entry);
+                s.pending.remove(&identity);
                 None
             }
             // Triggers only: the roster/firewall come exclusively from the

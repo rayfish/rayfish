@@ -281,6 +281,11 @@ void uniffi_ray_apple_fn_free_node(void*_Nonnull ptr, RustCallStatus *_Nonnull o
 void*_Nonnull uniffi_ray_apple_fn_constructor_node_new(RustBuffer config_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_FILE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_FILE
+void uniffi_ray_apple_fn_method_node_accept_file(void*_Nonnull ptr, uint64_t id, RustBuffer directory, uint32_t uid, uint32_t gid, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_REQUEST
 void uniffi_ray_apple_fn_method_node_accept_request(void*_Nonnull ptr, RustBuffer network, RustBuffer id, RustCallStatus *_Nonnull out_status
@@ -356,6 +361,11 @@ void uniffi_ray_apple_fn_method_node_receive_packets(void*_Nonnull ptr, RustBuff
 void uniffi_ray_apple_fn_method_node_reject_connection(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_FILE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_FILE
+void uniffi_ray_apple_fn_method_node_reject_file(void*_Nonnull ptr, uint64_t id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
 void uniffi_ray_apple_fn_method_node_set_hostname(void*_Nonnull ptr, RustBuffer network, RustBuffer hostname, RustCallStatus *_Nonnull out_status
@@ -366,9 +376,14 @@ void uniffi_ray_apple_fn_method_node_set_hostname(void*_Nonnull ptr, RustBuffer 
 void uniffi_ray_apple_fn_method_node_set_setting(void*_Nonnull ptr, RustBuffer key, int8_t enabled, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_SSH_RULE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_SSH_RULE
+void uniffi_ray_apple_fn_method_node_set_ssh_rule(void*_Nonnull ptr, RustBuffer network, RustBuffer peer, RustBuffer users, int8_t allow, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_START
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_START
-void uniffi_ray_apple_fn_method_node_start(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+void uniffi_ray_apple_fn_method_node_start(void*_Nonnull ptr, uint32_t owner_uid, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_STATUS
@@ -666,6 +681,12 @@ void ffi_ray_apple_rust_future_free_void(uint64_t handle
 void ffi_ray_apple_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_FILE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_FILE
+uint16_t uniffi_ray_apple_checksum_method_node_accept_file(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_REQUEST
 uint16_t uniffi_ray_apple_checksum_method_node_accept_request(void
@@ -756,6 +777,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_reject_connection(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_FILE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_FILE
+uint16_t uniffi_ray_apple_checksum_method_node_reject_file(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
 uint16_t uniffi_ray_apple_checksum_method_node_set_hostname(void
@@ -765,6 +792,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_set_hostname(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_SETTING
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_SETTING
 uint16_t uniffi_ray_apple_checksum_method_node_set_setting(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_SSH_RULE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_SSH_RULE
+uint16_t uniffi_ray_apple_checksum_method_node_set_ssh_rule(void
 
 );
 #endif

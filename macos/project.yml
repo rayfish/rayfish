@@ -43,6 +43,7 @@ targets:
         Release:
           PROVISIONING_PROFILE_SPECIFIER: "$(RAYFISH_APP_PROFILE)"
     dependencies:
+      - sdk: UserNotifications.framework
       - target: RayfishTunnelExtension
         embed: true
     postBuildScripts:

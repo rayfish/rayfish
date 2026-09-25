@@ -97,7 +97,7 @@ jobs:
         run: brew install just
 
       - name: Test native app
-        run: just macos-test macos-ipc-test macos-ui-test
+        run: just macos-test macos-ipc-test macos-ui-test macos-notification-test
 
       - name: Check Apple bindings
         run: |

@@ -597,8 +597,8 @@ impl NetworkRegistry {
 
     /// Fresh-join dial: try each coordinator in `coordinator_dial_order` (minter
     /// first) until one welcomes us. `Ok(None)` means a coordinator queued the
-    /// request (`JoinPending`) and we stop there; the caller retries with backoff
-    /// until `ray accept` admits us.
+    /// request (`JoinPending`). Continue to the other coordinators so any of them
+    /// can approve it; the caller retries with backoff until admitted.
     async fn dial_fresh_join(
         self: &Arc<Self>,
         ctx: &JoinContext<'_>,
@@ -625,6 +625,7 @@ impl NetworkRegistry {
         }
 
         let mut last_err = anyhow::anyhow!("no coordinators tried");
+        let mut pending = false;
         for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
             // Reconnect + cleanup are daemon-wide now (the connection supervisor),
@@ -632,15 +633,23 @@ impl NetworkRegistry {
             let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-            let conn = match transport::connect_to_peer_with_alpn(
-                &self.transport.endpoint,
-                *coordinator_id,
-                ctx.alpn,
+            let conn = match tokio::time::timeout(
+                DIAL_TIMEOUT,
+                transport::connect_to_peer_with_alpn(
+                    &self.transport.endpoint,
+                    *coordinator_id,
+                    ctx.alpn,
+                ),
             )
             .await
             {
-                Ok(c) => c,
-                Err(e) => {
+                Ok(Ok(c)) => c,
+                Err(_) => {
+                    abort_join_tasks(&cancel, tasks);
+                    last_err = anyhow::anyhow!("coordinator dial timed out");
+                    continue;
+                }
+                Ok(Err(e)) => {
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
                     abort_join_tasks(&cancel, tasks);
                     last_err = anyhow::anyhow!("coordinator offline: {e}");
@@ -666,10 +675,8 @@ impl NetworkRegistry {
                     }));
                 }
                 Ok(JoinResult::Pending) => {
-                    // This coordinator queued the request, don't try the next;
-                    // let the caller retry with backoff until accepted.
                     abort_join_tasks(&cancel, tasks);
-                    return Ok(None);
+                    pending = true;
                 }
                 Err(e) => {
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
@@ -679,6 +686,9 @@ impl NetworkRegistry {
             }
         }
 
+        if pending {
+            return Ok(None);
+        }
         anyhow::bail!(
             "no coordinator admitted the join (tried {}): {last_err:#}",
             order.len()
@@ -1576,6 +1586,109 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         SecretKey::from(bytes).public()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pending_join_reaches_both_coordinators() {
+        use iroh::RelayMode;
+        use iroh::endpoint::presets;
+        use std::ffi::OsString;
+        use tokio::time::timeout;
+
+        struct ConfigEnv(Option<OsString>);
+        impl Drop for ConfigEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                        None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                    }
+                }
+            }
+        }
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv(std::env::var_os("RAYFISH_CONFIG_DIR"));
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", directory.path()) };
+        let daemon = build_headless(false).await.unwrap();
+        let alpn = transport::mesh_alpn();
+        let mut members = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let endpoint = Endpoint::builder(presets::N0)
+                .alpns(vec![alpn.clone()])
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap();
+            daemon
+                .transport
+                .warm_lookup
+                .add_endpoint_info(endpoint.addr());
+            members.push(Member {
+                identity: endpoint.id(),
+                is_coordinator: true,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
+            servers.push(tokio::spawn(async move {
+                let connection = timeout(Duration::from_secs(15), async {
+                    endpoint.accept().await.unwrap().await.unwrap()
+                })
+                .await
+                .unwrap();
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                assert!(matches!(
+                    control::recv_msg(&mut recv).await.unwrap(),
+                    ControlMsg::JoinRequest { .. }
+                ));
+                control::send_msg(&mut send, Some(id(90)), &ControlMsg::JoinPending)
+                    .await
+                    .unwrap();
+                let _ = timeout(Duration::from_secs(5), connection.closed()).await;
+                endpoint.close().await;
+            }));
+        }
+        let data = crate::membership::GroupBlob {
+            members,
+            approved: Vec::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some("box".into()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        };
+        let context = JoinContext {
+            display_name: "box",
+            my_hostname: "studio",
+            alpn: &alpn,
+            net_pubkey: id(90),
+            group_hash: blake3::hash(b"test roster"),
+            invite: None,
+            auto_accept_firewall: false,
+            auto_accept_files: false,
+            invite_lock: Arc::new(AsyncMutex::new(())),
+            coordinator: None,
+            mismatch: None,
+        };
+        let outcome = timeout(
+            Duration::from_secs(15),
+            daemon.registry.dial_fresh_join(&context, &data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(outcome.is_none());
+        for server in servers {
+            server.await.unwrap();
+        }
+        daemon.shutdown_and_close().await;
     }
 
     #[test]

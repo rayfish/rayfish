@@ -1153,6 +1153,26 @@ impl NetworkRegistry {
         None
     }
 
+    /// Verified memberships for authorization, independent of transport handles.
+    #[cfg(feature = "desktop")]
+    pub(crate) fn authorization_networks(&self, peer: EndpointId) -> Vec<SmolStr> {
+        let user = self.device_user_map.resolve(&peer);
+        self.networks
+            .iter()
+            .filter_map(|entry| {
+                if self.pruned_peers.contains(&(entry.key().clone(), peer)) {
+                    return None;
+                }
+                let state = entry.state.read().unwrap();
+                if state.nullifiers.contains(&peer) {
+                    return None;
+                }
+                (state.members.is_member(&peer) || state.members.is_member(&user))
+                    .then(|| SmolStr::new(entry.key()))
+            })
+            .collect()
+    }
+
     /// Whether `identity` is a current member of at least one network that has
     /// file auto-accept enabled. Backs the own-device file auto-accept gate.
     pub(crate) fn member_on_autoaccept_network(&self, identity: EndpointId) -> bool {

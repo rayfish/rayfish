@@ -1070,11 +1070,8 @@ impl Daemon {
         drop(guard);
         self.rebuild_ssh_authz();
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
-        let server = crate::ssh::SshServer::new(
-            self.registry.peers.clone(),
-            self.registry.device_user_map.clone(),
-            Arc::clone(&self.ssh_authz),
-        );
+        let server =
+            crate::ssh::SshServer::new(Arc::clone(&self.registry), Arc::clone(&self.ssh_authz));
         // The overlay carries no IPv4, so there is one address to bind and it is
         // the derived mesh IPv6.
         let binds = vec![IpAddr::V6(my_v6)];

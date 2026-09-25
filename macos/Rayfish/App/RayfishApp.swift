@@ -27,6 +27,11 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        controller.notifications.install()
+        controller.notifications.onOpen = { [weak self] page in
+            self?.controller.page = page
+            self?.openMainWindow()
+        }
         statusMenu = RayfishMenu(controller: controller) { [weak self] in
             self?.openMainWindow()
         }
@@ -62,13 +67,8 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-private enum Page: String, CaseIterable {
-    case networks = "Networks", devices = "Devices", settings = "Settings"
-}
-
 private struct ContentView: View {
     @ObservedObject var controller: TunnelController
-    @State private var page: Page = .networks
 
     private var connected: Bool { controller.isConnected }
 
@@ -116,11 +116,13 @@ private struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(RayfishTheme.amber.opacity(0.25)))
                 }
-                switch page {
+                switch controller.page {
                 case .networks:
                     NetworksView(controller: controller)
                 case .devices:
                     DevicesView(controller: controller)
+                case .files:
+                    FilesView(controller: controller)
                 case .settings:
                     SettingsView(controller: controller)
                 }
@@ -169,18 +171,18 @@ private struct ContentView: View {
                 .disabled(controller.isLoading)
             }
             HStack(spacing: 22) {
-                ForEach(Page.allCases, id: \.self) { item in
-                    Button { page = item } label: {
+                ForEach(RayfishPage.allCases, id: \.self) { item in
+                    Button { controller.page = item } label: {
                         Text(item.rawValue)
                             .font(RayfishTheme.heading(14))
-                            .foregroundColor(page == item ? RayfishTheme.ink : RayfishTheme.faint)
+                            .foregroundColor(controller.page == item ? RayfishTheme.ink : RayfishTheme.faint)
                             .padding(.bottom, 10)
                             .overlay(alignment: .bottom) {
-                                Rectangle().fill(page == item ? RayfishTheme.accent : .clear).frame(height: 2)
+                                Rectangle().fill(controller.page == item ? RayfishTheme.accent : .clear).frame(height: 2)
                             }
                     }
                     .buttonStyle(.plain)
-                    .accessibilityAddTraits(page == item ? .isSelected : [])
+                    .accessibilityAddTraits(controller.page == item ? .isSelected : [])
                 }
                 Spacer()
                 Text("PRIVATE MESH").font(RayfishTheme.mono(10)).tracking(1.4)
@@ -525,6 +527,7 @@ private struct SettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Settings").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+            SSHSettingsView(controller: controller)
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     Text("VPN").font(RayfishTheme.heading(15))

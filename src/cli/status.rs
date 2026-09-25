@@ -107,6 +107,9 @@ pub(crate) fn infer_hint(message: &str) -> Option<String> {
     } else if m.contains("expired") || m.contains("invite") {
         Some("ask the coordinator for a fresh code: ray invite <net>".into())
     } else if m.contains("root") || m.contains("permission") || m.contains("operator") {
+        #[cfg(all(target_os = "macos", feature = "macos-app"))]
+        return Some("open the Rayfish app as this user and reconnect the VPN".into());
+        #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Some("run with sudo, or `sudo ray set-operator <you>` once".into())
     } else if m.contains("hostname") && m.contains("collision") {
         Some("pick another name: --hostname <name>".into())

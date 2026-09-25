@@ -15,7 +15,7 @@ use rayfish::config::settings::GlobalKey;
 use rayfish::daemon::start_embedded_ipc;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::invite;
-use rayfish::ipc::IpcMessage;
+use rayfish::ipc::{IpcMessage, TransferFileState};
 use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
@@ -66,6 +66,9 @@ pub struct NodeStatus {
     pub pending_requests: Vec<JoinRequest>,
     pub contact_id: Option<String>,
     pub connection_requests: Vec<ConnectionRequest>,
+    pub files: Vec<IncomingFile>,
+    pub ssh_enabled: bool,
+    pub ssh_rules: Vec<SshRule>,
     pub dns_enabled: bool,
     pub mdns_enabled: bool,
     pub mdns_active: bool,
@@ -88,9 +91,25 @@ pub struct ConnectionRequest {
 }
 
 #[derive(uniffi::Enum)]
+pub enum IncomingFileState {
+    Pending,
+    Received,
+}
+
+#[derive(uniffi::Record)]
+pub struct IncomingFile {
+    pub id: u64,
+    pub peer: String,
+    pub filename: String,
+    pub size: u64,
+    pub state: IncomingFileState,
+}
+
+#[derive(uniffi::Enum)]
 pub enum GlobalSetting {
     Dns,
     Mdns,
+    Ssh,
 }
 
 impl From<GlobalSetting> for GlobalKey {
@@ -98,6 +117,7 @@ impl From<GlobalSetting> for GlobalKey {
         match setting {
             GlobalSetting::Dns => Self::Dns,
             GlobalSetting::Mdns => Self::Mdns,
+            GlobalSetting::Ssh => Self::Ssh,
         }
     }
 }
@@ -113,11 +133,19 @@ pub struct Network {
 
 #[derive(uniffi::Record)]
 pub struct Peer {
+    pub identity: String,
     pub hostname: String,
     pub ipv6: String,
     pub state: String,
     pub latency_ms: Option<u32>,
     pub is_own_device: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct SshRule {
+    pub network: String,
+    pub peer: String,
+    pub users: Vec<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -184,8 +212,10 @@ impl Node {
     }
 
     /// Start the control plane. This is safe to call more than once.
-    pub fn start(&self) -> Result<(), AppleError> {
+    pub fn start(&self, owner_uid: u32) -> Result<(), AppleError> {
         let mut slot = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(not(target_os = "macos"))]
+        let _ = owner_uid;
         if slot.is_some() {
             return Ok(());
         }
@@ -196,7 +226,7 @@ impl Node {
             .map_err(AppleError::network)?;
         #[cfg(target_os = "macos")]
         {
-            let task = match self.runtime.block_on(start_embedded_ipc(&state)) {
+            let task = match self.runtime.block_on(start_embedded_ipc(&state, owner_uid)) {
                 Ok(task) => task,
                 Err(error) => {
                     self.runtime.block_on(state.shutdown_and_close());
@@ -281,6 +311,19 @@ impl Node {
             active,
             contact_id,
             connection_requests,
+            files: incoming_files(state.list_files())?,
+            ssh_enabled: settings.ssh_enabled,
+            ssh_rules: settings
+                .networks
+                .iter()
+                .flat_map(|network| {
+                    network.ssh_allow.iter().map(|rule| SshRule {
+                        network: network.name.clone(),
+                        peer: rule.peer.clone(),
+                        users: rule.users.clone(),
+                    })
+                })
+                .collect(),
             dns_enabled: settings.dns_enabled,
             mdns_enabled: settings.mdns_enabled,
             mdns_active,
@@ -296,6 +339,7 @@ impl Node {
                         .peers
                         .into_iter()
                         .map(|peer| Peer {
+                            identity: peer.endpoint_id.to_string(),
                             hostname: peer
                                 .hostname
                                 .unwrap_or_else(|| peer.endpoint_id.to_string()),
@@ -346,7 +390,15 @@ impl Node {
     /// Persist an embedder-owned setting using the same keys as `ray config`.
     /// NetworkExtension applies DNS; mDNS is rebuilt on the next connection.
     pub fn set_setting(&self, key: GlobalSetting, enabled: bool) -> Result<(), AppleError> {
-        self.state()?;
+        let state = self.state()?;
+        if matches!(key, GlobalSetting::Ssh) {
+            return self.runtime.block_on(async {
+                expect_ok(
+                    state.ssh_config_set(if enabled { "on" } else { "off" }),
+                    "SSH setting",
+                )
+            });
+        }
         config::update_settings(|settings| {
             config::config_set(
                 settings,
@@ -357,6 +409,22 @@ impl Node {
         })
         .map(|_| ())
         .map_err(AppleError::network)
+    }
+
+    pub fn set_ssh_rule(
+        &self,
+        network: String,
+        peer: String,
+        users: Vec<String>,
+        allow: bool,
+    ) -> Result<(), AppleError> {
+        expect_ok(
+            self.runtime.block_on(
+                self.state()?
+                    .firewall_ssh_allow(&network, &peer, users, allow),
+            ),
+            "SSH access",
+        )
     }
 
     pub fn connect_peer(
@@ -383,6 +451,26 @@ impl Node {
 
     pub fn reject_connection(&self, id: String) -> Result<(), AppleError> {
         expect_ok(self.state()?.reject_connect(&id), "connection rejection")
+    }
+
+    pub fn accept_file(
+        &self,
+        id: u64,
+        directory: String,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), AppleError> {
+        expect_ok(
+            self.runtime.block_on(
+                self.state()?
+                    .accept_file(id, Some(directory), Some((uid, gid))),
+            ),
+            "file acceptance",
+        )
+    }
+
+    pub fn reject_file(&self, id: u64) -> Result<(), AppleError> {
+        expect_ok(self.state()?.reject_file(id), "file rejection")
     }
 
     pub fn create_network(
@@ -586,6 +674,36 @@ impl Node {
     }
 }
 
+fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError> {
+    let IpcMessage::FileList {
+        files, transfers, ..
+    } = response
+    else {
+        return Err(AppleError::Network("invalid file list response".into()));
+    };
+    Ok(files
+        .into_iter()
+        .map(|file| IncomingFile {
+            id: file.id,
+            peer: file.from,
+            filename: file.filename,
+            size: file.size,
+            state: IncomingFileState::Pending,
+        })
+        .chain(transfers.into_iter().filter_map(|file| {
+            (!file.outgoing && matches!(file.state, TransferFileState::Done)).then_some(
+                IncomingFile {
+                    id: file.id,
+                    peer: file.peer,
+                    filename: file.filename,
+                    size: file.size,
+                    state: IncomingFileState::Received,
+                },
+            )
+        }))
+        .collect())
+}
+
 fn expect_ok(response: IpcMessage, operation: &str) -> Result<(), AppleError> {
     match response {
         IpcMessage::Ok { .. } => Ok(()),
@@ -643,6 +761,57 @@ mod tests {
     }
 
     #[test]
+    fn file_notifications_include_offers_and_successful_receives_only() {
+        use rayfish::ipc::{PendingFileInfo, TransferFileInfo};
+
+        let files = incoming_files(IpcMessage::FileList {
+            files: vec![PendingFileInfo {
+                id: 1,
+                from: "sender".into(),
+                filename: "offer.txt".into(),
+                size: 8,
+                mime_type: "text/plain".into(),
+                own_device: false,
+            }],
+            outbox: Vec::new(),
+            transfers: vec![
+                TransferFileInfo {
+                    id: 2,
+                    outgoing: false,
+                    peer: "sender".into(),
+                    filename: "received.txt".into(),
+                    size: 8,
+                    transferred: 8,
+                    state: TransferFileState::Done,
+                },
+                TransferFileInfo {
+                    id: 3,
+                    outgoing: true,
+                    peer: "receiver".into(),
+                    filename: "sent.txt".into(),
+                    size: 8,
+                    transferred: 8,
+                    state: TransferFileState::Done,
+                },
+                TransferFileInfo {
+                    id: 4,
+                    outgoing: false,
+                    peer: "sender".into(),
+                    filename: "failed.txt".into(),
+                    size: 8,
+                    transferred: 0,
+                    state: TransferFileState::Failed,
+                },
+            ],
+        })
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(matches!(files[0].state, IncomingFileState::Pending));
+        assert_eq!(files[1].filename, "received.txt");
+        assert!(matches!(files[1].state, IncomingFileState::Received));
+    }
+
+    #[test]
     fn stop_from_host_thread_releases_state_and_allows_restart() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::new(directory.path().to_string_lossy().into_owned());
@@ -663,6 +832,30 @@ mod tests {
                 assert!(before.contact_id.is_some());
                 node.set_setting(GlobalSetting::Dns, false).unwrap();
                 node.set_setting(GlobalSetting::Mdns, false).unwrap();
+                node.set_setting(GlobalSetting::Ssh, true).unwrap();
+                assert!(node.status().unwrap().ssh_enabled);
+                node.set_setting(GlobalSetting::Ssh, false).unwrap();
+                let mut network = config::NetworkConfig {
+                    name: "ssh-test".into(),
+                    ..Default::default()
+                };
+                network.ssh_allow.push(config::SshRule {
+                    peer: "departed-peer".into(),
+                    users: vec!["old-user".into()],
+                });
+                config::save_network(&network).unwrap();
+                node.set_ssh_rule(
+                    "ssh-test".into(),
+                    "departed-peer".into(),
+                    vec!["dario".into()],
+                    true,
+                )
+                .unwrap();
+                let rules = node.status().unwrap().ssh_rules;
+                assert_eq!(rules[0].users, ["dario"]);
+                node.set_ssh_rule("ssh-test".into(), "departed-peer".into(), Vec::new(), false)
+                    .unwrap();
+                assert!(node.status().unwrap().ssh_rules.is_empty());
                 let after = node.status().unwrap();
                 assert!(!after.dns_enabled);
                 assert!(!after.mdns_enabled);
@@ -720,12 +913,13 @@ mod tests {
             thread::scope(|scope| {
                 let start = || {
                     ready.wait();
-                    node.start().unwrap();
+                    node.start(1000).unwrap();
                     node.state().unwrap()
                 };
                 let first = scope.spawn(start);
                 let second = scope.spawn(start);
                 assert!(Arc::ptr_eq(&first.join().unwrap(), &second.join().unwrap()));
+                assert_eq!(config::load().unwrap().operator_uid, None);
             });
             node.stop();
         }

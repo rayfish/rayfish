@@ -691,16 +691,11 @@ impl PeerTable {
         });
     }
 
-    /// Resolve a peer by its mesh source IP to its transport identity
-    /// and the set of networks we currently share with it. Used by the embedded
-    /// mesh SSH server to authorize an incoming session: the peer is identified by
-    /// which mesh IP the TCP connection came from (the ingress anti-spoof check in
-    /// `forward.rs` guarantees that IP is the peer's own). Returns `None` if no
-    /// peer holds that address.
-    pub fn identity_and_networks(&self, ip: &Ipv6Addr) -> Option<(EndpointId, Vec<SmolStr>)> {
-        self.peers
-            .get(ip)
-            .map(|e| (e.endpoint_id, e.out_handles.keys().cloned().collect()))
+    /// Resolve an authenticated mesh source IP to its transport identity.
+    /// The ingress anti-spoof check guarantees that IP belongs to the peer.
+    /// Transport handles are not an authorization scope.
+    pub fn identity_for_ip(&self, ip: &Ipv6Addr) -> Option<EndpointId> {
+        self.peers.get(ip).map(|e| e.endpoint_id)
     }
 
     /// True if we currently share `network` with the peer at mesh IPv6 `ip`. The

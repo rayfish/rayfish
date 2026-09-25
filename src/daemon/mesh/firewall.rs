@@ -438,7 +438,7 @@ impl Daemon {
     /// is active. The key is served here, not by the generic `config_apply` path,
     /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
     /// on its own leaves the node advertising SSH with nothing listening.
-    pub(crate) fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+    pub fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
         // There is no Windows SSH server to start, so turning it on would write
         // `ssh_enabled = true` and open port 22 for a listener that never
         // arrives. Rejected before anything is persisted, so the config and the
@@ -619,27 +619,34 @@ impl Daemon {
     /// On allow, `users` is the set of local accounts the peer may log in as
     /// (empty = any non-root user; `"*"` = any incl. root) and **replaces** the
     /// peer's prior users. On deny, the peer's rule is dropped (`users` ignored).
-    pub(crate) async fn firewall_ssh_allow(
+    pub async fn firewall_ssh_allow(
         &self,
         network: &str,
         peer: &str,
         users: Vec<String>,
         allow: bool,
     ) -> IpcMessage {
-        let ssh_enabled = match config::load() {
-            Ok(c) => c.ssh_enabled,
+        let app_config = match config::load() {
+            Ok(c) => c,
             Err(e) => {
                 return ipc_err(format!("failed to load config: {e}"));
             }
         };
+        let ssh_enabled = app_config.ssh_enabled;
+        let existing_rule = app_config
+            .networks
+            .iter()
+            .any(|net| net.name == network && net.ssh_allow.iter().any(|rule| rule.peer == peer));
         // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
         // resolve to the peer's **user identity** hex. The roster lookup may
         // return a transport endpoint id (for a connected peer) which differs
         // from the user identity for a paired/multi-device peer; the SSH server
         // authorizes by user identity (`device_user_map.resolve`), so normalize
         // through the same map here. For an unmapped id this is a no-op.
-        let entry = if peer == "*" {
-            "*".to_string()
+        let entry = if peer == "*" || existing_rule {
+            // Stored identities must remain editable after a peer leaves, or
+            // while its network is inactive. New grants still require resolution.
+            peer.to_string()
         } else {
             match self.registry.resolve_peer_in_network(network, peer) {
                 Some(id) => self.registry.device_user_map.resolve(&id).to_string(),

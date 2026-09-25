@@ -66,6 +66,12 @@ macos-ui-test:
     xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/RayfishMenu.swift macos/Rayfish/App/RayfishWindow.swift macos/Rayfish/App/ShellCommandInstaller.swift macos/Tests/AppUITests.swift -o target/macos-tests/app-ui-tests
     target/macos-tests/app-ui-tests
 
+# Check notification deduplication and tunnel ownership without the installed VPN.
+macos-notification-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Shared/TunnelIPC.swift macos/Rayfish/App/RayfishNotifications.swift macos/Tests/NotificationTests.swift -o target/macos-tests/notification-tests
+    target/macos-tests/notification-tests
+
 # Build a locally testable app with automatic Apple Development signing.
 macos-dev:
     env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration Debug -destination platform=macOS,arch=arm64 ARCHS=arm64 -derivedDataPath target/macos-development -allowProvisioningUpdates -allowProvisioningDeviceRegistration build

@@ -526,6 +526,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  */
 public protocol NodeProtocol: AnyObject, Sendable {
 
+    func acceptFile(id: UInt64, directory: String, uid: UInt32, gid: UInt32) throws
+
     func acceptRequest(network: String, id: String) throws
 
     /**
@@ -577,6 +579,8 @@ public protocol NodeProtocol: AnyObject, Sendable {
 
     func rejectConnection(id: String) throws
 
+    func rejectFile(id: UInt64) throws
+
     func setHostname(network: String, hostname: String) throws
 
     /**
@@ -585,10 +589,12 @@ public protocol NodeProtocol: AnyObject, Sendable {
      */
     func setSetting(key: GlobalSetting, enabled: Bool) throws
 
+    func setSshRule(network: String, peer: String, users: [String], allow: Bool) throws
+
     /**
      * Start the control plane. This is safe to call more than once.
      */
-    func start() throws
+    func start(ownerUid: UInt32) throws
 
     /**
      * A UI-ready snapshot of the running node.
@@ -663,6 +669,16 @@ public convenience init(configDir: String) {
 
 
 
+
+open func acceptFile(id: UInt64, directory: String, uid: UInt32, gid: UInt32)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_accept_file(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(id),
+        FfiConverterString.lower(directory),
+        FfiConverterUInt32.lower(uid),
+        FfiConverterUInt32.lower(gid),$0
+    )
+}
+}
 
 open func acceptRequest(network: String, id: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_accept_request(self.uniffiClonePointer(),
@@ -796,6 +812,13 @@ open func rejectConnection(id: String)throws   {try rustCallWithError(FfiConvert
 }
 }
 
+open func rejectFile(id: UInt64)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_reject_file(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(id),$0
+    )
+}
+}
+
 open func setHostname(network: String, hostname: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_set_hostname(self.uniffiClonePointer(),
         FfiConverterString.lower(network),
@@ -816,11 +839,22 @@ open func setSetting(key: GlobalSetting, enabled: Bool)throws   {try rustCallWit
 }
 }
 
+open func setSshRule(network: String, peer: String, users: [String], allow: Bool)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_set_ssh_rule(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterString.lower(peer),
+        FfiConverterSequenceString.lower(users),
+        FfiConverterBool.lower(allow),$0
+    )
+}
+}
+
     /**
      * Start the control plane. This is safe to call more than once.
      */
-open func start()throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
-    uniffi_ray_apple_fn_method_node_start(self.uniffiClonePointer(),$0
+open func start(ownerUid: UInt32)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_start(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(ownerUid),$0
     )
 }
 }
@@ -975,6 +1009,100 @@ public func FfiConverterTypeConnectionRequest_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeConnectionRequest_lower(_ value: ConnectionRequest) -> RustBuffer {
     return FfiConverterTypeConnectionRequest.lower(value)
+}
+
+
+public struct IncomingFile {
+    public var id: UInt64
+    public var peer: String
+    public var filename: String
+    public var size: UInt64
+    public var state: IncomingFileState
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: UInt64, peer: String, filename: String, size: UInt64, state: IncomingFileState) {
+        self.id = id
+        self.peer = peer
+        self.filename = filename
+        self.size = size
+        self.state = state
+    }
+}
+
+#if compiler(>=6)
+extension IncomingFile: Sendable {}
+#endif
+
+
+extension IncomingFile: Equatable, Hashable {
+    public static func ==(lhs: IncomingFile, rhs: IncomingFile) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.peer != rhs.peer {
+            return false
+        }
+        if lhs.filename != rhs.filename {
+            return false
+        }
+        if lhs.size != rhs.size {
+            return false
+        }
+        if lhs.state != rhs.state {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(peer)
+        hasher.combine(filename)
+        hasher.combine(size)
+        hasher.combine(state)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIncomingFile: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IncomingFile {
+        return
+            try IncomingFile(
+                id: FfiConverterUInt64.read(from: &buf),
+                peer: FfiConverterString.read(from: &buf),
+                filename: FfiConverterString.read(from: &buf),
+                size: FfiConverterUInt64.read(from: &buf),
+                state: FfiConverterTypeIncomingFileState.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IncomingFile, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.peer, into: &buf)
+        FfiConverterString.write(value.filename, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+        FfiConverterTypeIncomingFileState.write(value.state, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIncomingFile_lift(_ buf: RustBuffer) throws -> IncomingFile {
+    return try FfiConverterTypeIncomingFile.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIncomingFile_lower(_ value: IncomingFile) -> RustBuffer {
+    return FfiConverterTypeIncomingFile.lower(value)
 }
 
 
@@ -1259,19 +1387,25 @@ public struct NodeStatus {
     public var pendingRequests: [JoinRequest]
     public var contactId: String?
     public var connectionRequests: [ConnectionRequest]
+    public var files: [IncomingFile]
+    public var sshEnabled: Bool
+    public var sshRules: [SshRule]
     public var dnsEnabled: Bool
     public var mdnsEnabled: Bool
     public var mdnsActive: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(active: Bool, ipv6: String, networks: [Network], pendingRequests: [JoinRequest], contactId: String?, connectionRequests: [ConnectionRequest], dnsEnabled: Bool, mdnsEnabled: Bool, mdnsActive: Bool) {
+    public init(active: Bool, ipv6: String, networks: [Network], pendingRequests: [JoinRequest], contactId: String?, connectionRequests: [ConnectionRequest], files: [IncomingFile], sshEnabled: Bool, sshRules: [SshRule], dnsEnabled: Bool, mdnsEnabled: Bool, mdnsActive: Bool) {
         self.active = active
         self.ipv6 = ipv6
         self.networks = networks
         self.pendingRequests = pendingRequests
         self.contactId = contactId
         self.connectionRequests = connectionRequests
+        self.files = files
+        self.sshEnabled = sshEnabled
+        self.sshRules = sshRules
         self.dnsEnabled = dnsEnabled
         self.mdnsEnabled = mdnsEnabled
         self.mdnsActive = mdnsActive
@@ -1303,6 +1437,15 @@ extension NodeStatus: Equatable, Hashable {
         if lhs.connectionRequests != rhs.connectionRequests {
             return false
         }
+        if lhs.files != rhs.files {
+            return false
+        }
+        if lhs.sshEnabled != rhs.sshEnabled {
+            return false
+        }
+        if lhs.sshRules != rhs.sshRules {
+            return false
+        }
         if lhs.dnsEnabled != rhs.dnsEnabled {
             return false
         }
@@ -1322,6 +1465,9 @@ extension NodeStatus: Equatable, Hashable {
         hasher.combine(pendingRequests)
         hasher.combine(contactId)
         hasher.combine(connectionRequests)
+        hasher.combine(files)
+        hasher.combine(sshEnabled)
+        hasher.combine(sshRules)
         hasher.combine(dnsEnabled)
         hasher.combine(mdnsEnabled)
         hasher.combine(mdnsActive)
@@ -1343,6 +1489,9 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
                 pendingRequests: FfiConverterSequenceTypeJoinRequest.read(from: &buf),
                 contactId: FfiConverterOptionString.read(from: &buf),
                 connectionRequests: FfiConverterSequenceTypeConnectionRequest.read(from: &buf),
+                files: FfiConverterSequenceTypeIncomingFile.read(from: &buf),
+                sshEnabled: FfiConverterBool.read(from: &buf),
+                sshRules: FfiConverterSequenceTypeSshRule.read(from: &buf),
                 dnsEnabled: FfiConverterBool.read(from: &buf),
                 mdnsEnabled: FfiConverterBool.read(from: &buf),
                 mdnsActive: FfiConverterBool.read(from: &buf)
@@ -1356,6 +1505,9 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
         FfiConverterSequenceTypeJoinRequest.write(value.pendingRequests, into: &buf)
         FfiConverterOptionString.write(value.contactId, into: &buf)
         FfiConverterSequenceTypeConnectionRequest.write(value.connectionRequests, into: &buf)
+        FfiConverterSequenceTypeIncomingFile.write(value.files, into: &buf)
+        FfiConverterBool.write(value.sshEnabled, into: &buf)
+        FfiConverterSequenceTypeSshRule.write(value.sshRules, into: &buf)
         FfiConverterBool.write(value.dnsEnabled, into: &buf)
         FfiConverterBool.write(value.mdnsEnabled, into: &buf)
         FfiConverterBool.write(value.mdnsActive, into: &buf)
@@ -1379,6 +1531,7 @@ public func FfiConverterTypeNodeStatus_lower(_ value: NodeStatus) -> RustBuffer 
 
 
 public struct Peer {
+    public var identity: String
     public var hostname: String
     public var ipv6: String
     public var state: String
@@ -1387,7 +1540,8 @@ public struct Peer {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hostname: String, ipv6: String, state: String, latencyMs: UInt32?, isOwnDevice: Bool) {
+    public init(identity: String, hostname: String, ipv6: String, state: String, latencyMs: UInt32?, isOwnDevice: Bool) {
+        self.identity = identity
         self.hostname = hostname
         self.ipv6 = ipv6
         self.state = state
@@ -1403,6 +1557,9 @@ extension Peer: Sendable {}
 
 extension Peer: Equatable, Hashable {
     public static func ==(lhs: Peer, rhs: Peer) -> Bool {
+        if lhs.identity != rhs.identity {
+            return false
+        }
         if lhs.hostname != rhs.hostname {
             return false
         }
@@ -1422,6 +1579,7 @@ extension Peer: Equatable, Hashable {
     }
 
     public func hash(into hasher: inout Hasher) {
+        hasher.combine(identity)
         hasher.combine(hostname)
         hasher.combine(ipv6)
         hasher.combine(state)
@@ -1439,6 +1597,7 @@ public struct FfiConverterTypePeer: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Peer {
         return
             try Peer(
+                identity: FfiConverterString.read(from: &buf),
                 hostname: FfiConverterString.read(from: &buf),
                 ipv6: FfiConverterString.read(from: &buf),
                 state: FfiConverterString.read(from: &buf),
@@ -1448,6 +1607,7 @@ public struct FfiConverterTypePeer: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: Peer, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.identity, into: &buf)
         FfiConverterString.write(value.hostname, into: &buf)
         FfiConverterString.write(value.ipv6, into: &buf)
         FfiConverterString.write(value.state, into: &buf)
@@ -1469,6 +1629,84 @@ public func FfiConverterTypePeer_lift(_ buf: RustBuffer) throws -> Peer {
 #endif
 public func FfiConverterTypePeer_lower(_ value: Peer) -> RustBuffer {
     return FfiConverterTypePeer.lower(value)
+}
+
+
+public struct SshRule {
+    public var network: String
+    public var peer: String
+    public var users: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(network: String, peer: String, users: [String]) {
+        self.network = network
+        self.peer = peer
+        self.users = users
+    }
+}
+
+#if compiler(>=6)
+extension SshRule: Sendable {}
+#endif
+
+
+extension SshRule: Equatable, Hashable {
+    public static func ==(lhs: SshRule, rhs: SshRule) -> Bool {
+        if lhs.network != rhs.network {
+            return false
+        }
+        if lhs.peer != rhs.peer {
+            return false
+        }
+        if lhs.users != rhs.users {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(network)
+        hasher.combine(peer)
+        hasher.combine(users)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSshRule: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SshRule {
+        return
+            try SshRule(
+                network: FfiConverterString.read(from: &buf),
+                peer: FfiConverterString.read(from: &buf),
+                users: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SshRule, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.network, into: &buf)
+        FfiConverterString.write(value.peer, into: &buf)
+        FfiConverterSequenceString.write(value.users, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSshRule_lift(_ buf: RustBuffer) throws -> SshRule {
+    return try FfiConverterTypeSshRule.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSshRule_lower(_ value: SshRule) -> RustBuffer {
+    return FfiConverterTypeSshRule.lower(value)
 }
 
 
@@ -1584,6 +1822,7 @@ public enum GlobalSetting {
 
     case dns
     case mdns
+    case ssh
 }
 
 
@@ -1605,6 +1844,8 @@ public struct FfiConverterTypeGlobalSetting: FfiConverterRustBuffer {
 
         case 2: return .mdns
 
+        case 3: return .ssh
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1619,6 +1860,10 @@ public struct FfiConverterTypeGlobalSetting: FfiConverterRustBuffer {
 
         case .mdns:
             writeInt(&buf, Int32(2))
+
+
+        case .ssh:
+            writeInt(&buf, Int32(3))
 
         }
     }
@@ -1641,6 +1886,76 @@ public func FfiConverterTypeGlobalSetting_lower(_ value: GlobalSetting) -> RustB
 
 
 extension GlobalSetting: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum IncomingFileState {
+
+    case pending
+    case received
+}
+
+
+#if compiler(>=6)
+extension IncomingFileState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIncomingFileState: FfiConverterRustBuffer {
+    typealias SwiftType = IncomingFileState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IncomingFileState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .pending
+
+        case 2: return .received
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: IncomingFileState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .pending:
+            writeInt(&buf, Int32(1))
+
+
+        case .received:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIncomingFileState_lift(_ buf: RustBuffer) throws -> IncomingFileState {
+    return try FfiConverterTypeIncomingFileState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIncomingFileState_lower(_ value: IncomingFileState) -> RustBuffer {
+    return FfiConverterTypeIncomingFileState.lower(value)
+}
+
+
+extension IncomingFileState: Equatable, Hashable {}
 
 
 
@@ -1892,6 +2207,31 @@ fileprivate struct FfiConverterSequenceTypeConnectionRequest: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeIncomingFile: FfiConverterRustBuffer {
+    typealias SwiftType = [IncomingFile]
+
+    public static func write(_ value: [IncomingFile], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeIncomingFile.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [IncomingFile] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [IncomingFile]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeIncomingFile.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeJoinRequest: FfiConverterRustBuffer {
     typealias SwiftType = [JoinRequest]
 
@@ -1989,6 +2329,31 @@ fileprivate struct FfiConverterSequenceTypePeer: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSshRule: FfiConverterRustBuffer {
+    typealias SwiftType = [SshRule]
+
+    public static func write(_ value: [SshRule], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSshRule.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SshRule] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SshRule]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSshRule.read(from: &buf))
+        }
+        return seq
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -2003,6 +2368,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_ray_apple_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_accept_file() != 37470) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_accept_request() != 19133) {
         return InitializationResult.apiChecksumMismatch
@@ -2049,13 +2417,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_method_node_reject_connection() != 11655) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ray_apple_checksum_method_node_reject_file() != 4388) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ray_apple_checksum_method_node_set_hostname() != 15380) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_set_setting() != 9671) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_apple_checksum_method_node_start() != 7498) {
+    if (uniffi_ray_apple_checksum_method_node_set_ssh_rule() != 65107) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_start() != 45061) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_status() != 21690) {

@@ -1,4 +1,5 @@
 import Combine
+import Darwin
 import Foundation
 import NetworkExtension
 import OSLog
@@ -13,8 +14,13 @@ final class TunnelController: ObservableObject {
     private var pollingTask: Task<Void, Never>?
     private var machinesTask: Task<Void, Never>?
     private var lastMachinesRefresh = Date.distantPast
+    let notifications = RayfishNotifications()
 
-    @Published var status: ProviderStatus?
+    @Published var page: RayfishPage = .networks
+
+    @Published var status: ProviderStatus? {
+        didSet { notifications.update(status) }
+    }
     @Published private(set) var machines: [ProviderMachine] = []
     @Published private(set) var machinesError: String?
     @Published private(set) var isRefreshingMachines = false
@@ -49,6 +55,7 @@ final class TunnelController: ObservableObject {
     func startup() async {
         guard !didStart else { return }
         didStart = true
+        Task { await notifications.requestAuthorization() }
         refreshLaunchAtLogin()
         RayfishLog.app.info("Starting Rayfish build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown", privacy: .public)")
         do {
@@ -105,6 +112,11 @@ final class TunnelController: ObservableObject {
             try await installer.install()
             guard !isQuitting else { return }
             activity = "Connecting..."
+            if let current = try await TunnelPreferences.load(),
+               current.connection.status == .connected || current.connection.status == .connecting,
+               TunnelOwner.uid(in: (current.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration) != getuid() {
+                try await stopTunnel()
+            }
             let manager = try await TunnelPreferences.configured()
             guard !isQuitting else { return }
             if manager.connection.status != .connected && manager.connection.status != .connecting {
@@ -290,6 +302,20 @@ final class TunnelController: ObservableObject {
 
     func rejectConnection(id: String) async {
         _ = await perform(ProviderRequest(action: .rejectConnection, id: id))
+    }
+
+    func acceptFile(_ file: ProviderFile, directory: URL) async {
+        _ = await perform(ProviderRequest(action: .acceptFile, fileId: file.transferId,
+                                         directory: directory.path, uid: getuid(), gid: getgid()))
+    }
+
+    func rejectFile(_ file: ProviderFile) async {
+        _ = await perform(ProviderRequest(action: .rejectFile, fileId: file.transferId))
+    }
+
+    func setSSHRule(_ rule: ProviderSSHRule, allow: Bool) async -> Bool {
+        await perform(ProviderRequest(action: .setSSHRule, name: rule.network, id: rule.peer,
+                                      enabled: allow, users: rule.users)) != nil
     }
 
     private func perform(_ request: ProviderRequest) async -> ProviderResponse? {

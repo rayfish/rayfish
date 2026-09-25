@@ -857,7 +857,7 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
 /// Bind before returning so startup failures reach the host. The task exits and
 /// removes its socket when `shutdown_and_close` cancels the node's token.
 #[cfg(unix)]
-pub async fn start_embedded_ipc(daemon: &Arc<Daemon>) -> Result<JoinHandle<()>> {
+pub async fn start_embedded_ipc(daemon: &Arc<Daemon>, owner_uid: u32) -> Result<JoinHandle<()>> {
     let socket = bind_ipc_socket(&ipc::socket_path()).await?;
     let daemon = Arc::clone(daemon);
     Ok(tokio::spawn(async move {
@@ -865,7 +865,7 @@ pub async fn start_embedded_ipc(daemon: &Arc<Daemon>) -> Result<JoinHandle<()>> 
             socket,
             &daemon,
             daemon.shutdown_token.clone(),
-            IpcHost::PacketTunnel,
+            IpcHost::PacketTunnel { owner_uid },
         )
         .await
         {
@@ -878,7 +878,32 @@ pub async fn start_embedded_ipc(daemon: &Arc<Daemon>) -> Result<JoinHandle<()>> 
 #[derive(Clone, Copy)]
 enum IpcHost {
     Daemon,
-    PacketTunnel,
+    PacketTunnel { owner_uid: u32 },
+}
+
+#[cfg(unix)]
+impl IpcHost {
+    fn check_authorized(self, req: &IpcMessage, peer: Option<&PeerIdentity>) -> Option<IpcMessage> {
+        let Self::PacketTunnel { owner_uid } = self else {
+            return Daemon::check_authorized(req, peer);
+        };
+        if Daemon::is_open_read(req) {
+            return None;
+        }
+        if matches!(req, IpcMessage::SetOperator { .. }) {
+            return Some(ipc_err(
+                "The Rayfish app manages access to its packet tunnel; no operator setting is needed",
+            ));
+        }
+        if peer.is_some_and(
+            |peer| matches!(peer, PeerIdentity::Unix { uid, .. } if *uid == 0 || *uid == owner_uid),
+        ) {
+            return None;
+        }
+        Some(ipc_err(
+            "permission denied: run ray as the macOS user who connected the Rayfish app",
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -976,6 +1001,35 @@ mod embedded_ipc_tests {
     use socket2::{Domain, SockAddr, Socket, Type};
     use std::ffi::OsString;
 
+    #[test]
+    fn packet_tunnel_uses_session_owner_not_daemon_operator() {
+        let host = IpcHost::PacketTunnel { owner_uid: 501 };
+        let owner = PeerIdentity::Unix { uid: 501, gid: 20 };
+        let other = PeerIdentity::Unix { uid: 502, gid: 20 };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        for request in [
+            IpcMessage::ApproveConnection { id: "30f07".into() },
+            IpcMessage::ConfigSet {
+                key: NodeKey::Global(GlobalKey::Ssh),
+                value: "on".into(),
+                replace: false,
+            },
+        ] {
+            assert!(host.check_authorized(&request, Some(&owner)).is_none());
+            assert!(host.check_authorized(&request, Some(&root)).is_none());
+            assert!(host.check_authorized(&request, Some(&other)).is_some());
+            assert!(host.check_authorized(&request, None).is_some());
+        }
+        assert!(
+            host.check_authorized(&IpcMessage::Status, Some(&other))
+                .is_none()
+        );
+        assert!(
+            host.check_authorized(&IpcMessage::SetOperator { uid: 502 }, Some(&root))
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn socket_ownership_and_cleanup() {
         let dir = tempfile::tempdir().unwrap();
@@ -1036,11 +1090,6 @@ mod embedded_ipc_tests {
         let dir = tempfile::tempdir().unwrap();
         let _env = ConfigEnv(std::env::var_os("RAYFISH_CONFIG_DIR"));
         unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", dir.path()) };
-        config::update_settings(|cfg| {
-            cfg.operator_uid = Some(unsafe { libc::geteuid() });
-            Ok(())
-        })
-        .unwrap();
         let daemon = tokio::time::timeout(Duration::from_secs(30), build_headless(true))
             .await
             .unwrap()
@@ -1053,7 +1102,9 @@ mod embedded_ipc_tests {
                 socket,
                 &server_daemon,
                 server_daemon.shutdown_token.clone(),
-                IpcHost::PacketTunnel,
+                IpcHost::PacketTunnel {
+                    owner_uid: unsafe { libc::geteuid() },
+                },
             )
             .await
         });
@@ -1074,6 +1125,27 @@ mod embedded_ipc_tests {
         for response in [first, second] {
             assert!(matches!(response, IpcMessage::StatusResponse { .. }));
         }
+        assert_eq!(config::load().unwrap().operator_uid, None);
+        let response = request(
+            &path,
+            IpcMessage::ConfigSet {
+                key: NodeKey::Global(GlobalKey::Ssh),
+                value: "off".into(),
+                replace: false,
+            },
+        )
+        .await;
+        assert!(matches!(response, IpcMessage::Ok { .. }));
+        let response = request(
+            &path,
+            IpcMessage::ApproveConnection {
+                id: "missing".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, IpcMessage::Error { message } if !message.contains("permission denied"))
+        );
         for message in [
             IpcMessage::Up { hostname: None },
             IpcMessage::Down,
@@ -1152,7 +1224,7 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>, host: IpcHo
     if let IpcMessage::Logs { since, follow } = &req {
         let (since, follow) = (*since, *follow);
         let mut framed = ipc::framed(stream);
-        if let Some(denied) = Daemon::check_authorized(&req, peer_cred.as_ref()) {
+        if let Some(denied) = host.check_authorized(&req, peer_cred.as_ref()) {
             let _ = ipc::send(&mut framed, denied).await;
             return Ok(());
         }
@@ -1168,16 +1240,22 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>, host: IpcHo
 
     // NetworkExtension owns the interface and its lifetime. Desktop lifecycle
     // handlers would change routes/DNS outside that session.
-    let resp = if matches!(host, IpcHost::PacketTunnel)
+    let resp = if let Some(denied) = host.check_authorized(&req, peer_cred.as_ref()) {
+        denied
+    } else if matches!(host, IpcHost::PacketTunnel { .. })
         && matches!(
             req,
             IpcMessage::Up { .. } | IpcMessage::Down | IpcMessage::Shutdown
-        ) {
-        Daemon::check_authorized(&req, peer_cred.as_ref()).unwrap_or_else(|| {
-            ipc_err("Use the Rayfish app to connect, disconnect, or quit this packet tunnel")
-        })
+        )
+    {
+        ipc_err("Use the Rayfish app to connect, disconnect, or quit this packet tunnel")
     } else {
-        daemon.handle_request(req, peer_cred, fds).await
+        match host {
+            IpcHost::Daemon => daemon.handle_request(req, peer_cred, fds).await,
+            IpcHost::PacketTunnel { .. } => {
+                daemon.handle_authorized_request(req, peer_cred, fds).await
+            }
+        }
     };
     let mut framed = ipc::framed(stream);
     ipc::send(&mut framed, resp).await?;

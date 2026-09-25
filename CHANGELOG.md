@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- macOS notifies you about connection requests, network join requests, and incoming
+  files. Click a notification to review it; files can be saved or declined in the app.
+- macOS Settings can enable mesh SSH and manage which network peers may sign in
+  and which local accounts they may use.
+
 - **Windows has a desktop dashboard and tray app matching the macOS design.**
   Closing its window leaves Rayfish in the notification area, where the VPN can
   be connected, disconnected, reopened, or disconnected and quit.
@@ -34,6 +39,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inventory recovery require both endpoints to support v2.
 
 ### Fixed
+
+- Mesh SSH honors a peer's grants across all verified shared networks, even when
+  its current connection was established through a different network.
+- The macOS app's bundled CLI authorizes the app's user without an operator
+  setting. Connection approvals and firewall changes work from that user's shell.
+  The standalone daemon keeps its operator access rules.
+- Pending network joins reach every available coordinator, so any coordinator
+  can approve them. Approval clears the request from the other coordinators.
 
 - **Mesh connections recover when a replacement connection fails to arrive.**
   Rayfish retries the missing link automatically, so SSH and other traffic do

@@ -23,7 +23,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                     try node.migrateLegacyState(source: source.path)
                 }
             }
-            try node.start()
+            guard let owner = TunnelOwner.uid(in: (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration) else {
+                throw ProviderError.missingOwner
+            }
+            try node.start(ownerUid: owner)
             let status = try node.status()
             let settings = networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled)
             setTunnelNetworkSettings(settings) { [weak self] error in
@@ -165,7 +168,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
             guard let setting = request.setting, let enabled = request.enabled else {
                 throw ProviderError.missingSetting
             }
-            try node.setSetting(key: setting == .dns ? .dns : .mdns, enabled: enabled)
+            let key: GlobalSetting
+            switch setting {
+            case .dns: key = .dns
+            case .mdns: key = .mdns
+            case .ssh: key = .ssh
+            }
+            try node.setSetting(key: key, enabled: enabled)
+        case .setSSHRule:
+            guard let network = request.name, let peer = request.id,
+                  let users = request.users, let allow = request.enabled else { throw ProviderError.missingSetting }
+            try node.setSshRule(network: network, peer: peer, users: users, allow: allow)
         case .connectPeer:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             message = try node.connectPeer(contactId: id, hostname: request.hostname)
@@ -175,6 +188,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
         case .rejectConnection:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             try node.rejectConnection(id: id)
+        case .acceptFile:
+            guard let id = request.fileId, let directory = request.directory, !directory.isEmpty,
+                  let uid = request.uid, let gid = request.gid,
+                  uid == TunnelOwner.uid(in: (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+            else { throw ProviderError.missingFile }
+            try node.acceptFile(id: id, directory: directory, uid: uid, gid: gid)
+        case .rejectFile:
+            guard let id = request.fileId else { throw ProviderError.missingFile }
+            try node.rejectFile(id: id)
         case .create:
             try node.createNetwork(name: request.name, hostname: request.hostname)
         case .join:
@@ -227,7 +249,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
                             ipv6: peer.ipv6,
                             state: peer.state,
                             latencyMs: peer.latencyMs,
-                            isOwnDevice: peer.isOwnDevice
+                            isOwnDevice: peer.isOwnDevice,
+                            identity: peer.identity
                         )
                     }
                 )
@@ -246,7 +269,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, PacketFlow {
             },
             dnsEnabled: status.dnsEnabled,
             mdnsEnabled: status.mdnsEnabled,
-            mdnsActive: status.mdnsActive
+            mdnsActive: status.mdnsActive,
+            files: status.files.map { file in
+                ProviderFile(transferId: file.id, peer: file.peer, filename: file.filename,
+                             size: file.size, state: file.state == .pending ? .pending : .received)
+            },
+            sshEnabled: status.sshEnabled,
+            sshRules: status.sshRules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) }
         )
     }
 }
@@ -259,6 +288,8 @@ private enum ProviderError: LocalizedError {
     case missingAppGroup
     case missingSetting
     case missingPeer
+    case missingOwner
+    case missingFile
 
     var errorDescription: String? {
         switch self {
@@ -276,6 +307,10 @@ private enum ProviderError: LocalizedError {
             "A setting and its value are required"
         case .missingPeer:
             "A peer contact ID or request ID is required"
+        case .missingOwner:
+            "Open the Rayfish app and reconnect to authorize your shell commands"
+        case .missingFile:
+            "A file and destination owned by the Rayfish user are required"
         }
     }
 }

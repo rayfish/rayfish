@@ -12,7 +12,7 @@ name = "ray_apple"
 crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
-rayfish = { path = "..", default-features = false }
+rayfish = { path = "..", default-features = false, features = ["desktop"] }
 anyhow = "1"
 arc-swap = "1.9.1"
 bytes = "1"

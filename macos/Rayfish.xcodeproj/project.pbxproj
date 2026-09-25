@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A10000000000000000000007 /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* UserNotifications.framework */; };
+		A10000000000000000000001 /* FilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* FilesView.swift */; };
+		A10000000000000000000003 /* RayfishNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* RayfishNotifications.swift */; };
+		A10000000000000000000005 /* SSHSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* SSHSettingsView.swift */; };
 		10CF514C0F2FBA56B5D6CE1B /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = F551764865C525E7C133EBD7 /* main.swift */; };
 		25FEF3ADDF7FAF7D8C10120E /* com.rayfish.app.tunnel.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 2D7FF352C42FF4506E6FB496 /* com.rayfish.app.tunnel.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		3F18BD7B209CAAE5E1FF4F58 /* Fonts in Resources */ = {isa = PBXBuildFile; fileRef = 84FC3CD94CC9D8002DA5C496 /* Fonts */; };
@@ -54,6 +58,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A10000000000000000000008 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
+		A10000000000000000000002 /* FilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesView.swift; sourceTree = "<group>"; };
+		A10000000000000000000004 /* RayfishNotifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RayfishNotifications.swift; sourceTree = "<group>"; };
+		A10000000000000000000006 /* SSHSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHSettingsView.swift; sourceTree = "<group>"; };
 		04F957D1BDEDFDAB48E32699 /* TunnelPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelPreferences.swift; sourceTree = "<group>"; };
 		224C89EE4A7C4B10E79D1104 /* SystemExtensionInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemExtensionInstaller.swift; sourceTree = "<group>"; };
 		26C97C969BAC3B6E6C4CAC12 /* LegacyDaemon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyDaemon.swift; sourceTree = "<group>"; };
@@ -78,6 +86,17 @@
 		F551764865C525E7C133EBD7 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		FF7FD7099E4E9A5E24DF8FDE /* ray_appleFFI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ray_appleFFI.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000009 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000007 /* UserNotifications.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		11E0AC53D66C8C095F76DC57 /* Shared */ = {
@@ -132,6 +151,9 @@
 		787A37291A10D53183D58F8A /* App */ = {
 			isa = PBXGroup;
 			children = (
+				A10000000000000000000002 /* FilesView.swift */,
+				A10000000000000000000004 /* RayfishNotifications.swift */,
+				A10000000000000000000006 /* SSHSettingsView.swift */,
 				586C1EF82AFF3A4027DD6CCB /* RayfishApp.swift */,
 				F2BE21B08718D68C7706B9B6 /* RayfishTheme.swift */,
 				BB912F7C6F2617EC678FD312 /* RayfishMenu.swift */,
@@ -148,6 +170,7 @@
 		E4870274DCC4E9944C9F835B = {
 			isa = PBXGroup;
 			children = (
+				A10000000000000000000008 /* UserNotifications.framework */,
 				84FC3CD94CC9D8002DA5C496 /* Fonts */,
 				787A37291A10D53183D58F8A /* App */,
 				231FBC38F3A12EC0C3980CB0 /* Generated */,
@@ -166,6 +189,7 @@
 			buildConfigurationList = CA1A41AE8DAEB04F9FBBCE07 /* Build configuration list for PBXNativeTarget "Rayfish" */;
 			buildPhases = (
 				D76FB9A2773706815890D604 /* Sources */,
+				A10000000000000000000009 /* Frameworks */,
 				F32F4FD569FADCA723AEDB17 /* Resources */,
 				30D24859D5817641FFF561F0 /* Embed System Extensions */,
 				4291C25C81A92889E7B6D181 /* Bundle the Rust ray command */,
@@ -293,6 +317,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000000000000000000001 /* FilesView.swift in Sources */,
+				A10000000000000000000003 /* RayfishNotifications.swift in Sources */,
+				A10000000000000000000005 /* SSHSettingsView.swift in Sources */,
 				A599B9CD1B8A1E701D5A0B0E /* LegacyDaemon.swift in Sources */,
 				C500E290BEBBD70E1B6C2463 /* ProviderMessage.swift in Sources */,
 				89CA26F63629A9D20AB3769B /* RayfishApp.swift in Sources */,

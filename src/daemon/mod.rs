@@ -644,6 +644,9 @@ impl NetworkState {
     }
 
     fn refresh_snapshot(&mut self) {
+        self.pending.retain(|identity, _| {
+            !self.members.is_member(identity) && !self.approved.is_approved(identity)
+        });
         let bytes = canonical_group_bytes(
             &self.members,
             &self.approved,
@@ -1073,6 +1076,10 @@ impl Daemon {
     ) {
         self.attach_tun(reader, writer).await;
         self.active.store(true, Ordering::SeqCst);
+        #[cfg(feature = "desktop")]
+        if config::load().is_ok_and(|settings| settings.ssh_enabled) {
+            self.start_ssh();
+        }
         self.registry.poll_nudge.notify_waiters();
     }
 
@@ -1085,6 +1092,8 @@ impl Daemon {
     /// child token and aborting the tasks drops the reader/writer, closing the
     /// underlying fds. Idempotent: a no-op if no interface is attached.
     pub fn detach_tun(&self) {
+        #[cfg(feature = "desktop")]
+        self.stop_ssh();
         self.active
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
@@ -1835,6 +1844,35 @@ mod accept_handler_tests {
         assert_eq!(blob.name.as_deref(), Some("signed-network-name"));
     }
 
+    #[test]
+    fn roster_refresh_clears_requests_approved_by_another_coordinator() {
+        let state = make_network_state();
+        let mut state = state.write().unwrap();
+        let approved = SecretKey::from_bytes(&[41; 32]).public();
+        let joined = SecretKey::from_bytes(&[42; 32]).public();
+        let waiting = SecretKey::from_bytes(&[43; 32]).public();
+        for identity in [approved, joined, waiting] {
+            state.pending.insert(
+                identity,
+                PendingJoin {
+                    hostname: None,
+                    device_cert: None,
+                    requested_at: Instant::now(),
+                },
+            );
+        }
+        state.approved.approve(ApprovedEntry {
+            identity: approved,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
+        state.members.add(seated(joined));
+        state.refresh_snapshot();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.contains_key(&waiting));
+    }
+
     /// Convergence is tracked as the hash we accepted, not the hash of our own
     /// re-encoding, and the two differ whenever the publisher writes bytes we
     /// would not.
@@ -2081,6 +2119,67 @@ mod accept_handler_tests {
             false,
             Duration::from_secs(config::DEFAULT_IDLE_TIMEOUT_SECS),
         ))
+    }
+
+    #[cfg(feature = "desktop")]
+    #[tokio::test]
+    async fn authorization_uses_identity_memberships_not_connection_handles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = sample_test_endpoint().await;
+        let registry = sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            FsStore::load(tmp.path()).await.unwrap(),
+            endpoint.id(),
+        );
+        let user = SecretKey::from_bytes(&[41; 32]).public();
+        let device = SecretKey::from_bytes(&[42; 32]).public();
+        let stranger = SecretKey::from_bytes(&[43; 32]).public();
+        registry.device_user_map.insert(device, user);
+        let box_state = make_network_state();
+        let field_state = make_network_state();
+        for (name, state) in [("box", &box_state), ("field", &field_state)] {
+            state.write().unwrap().members.add(seated(user));
+            registry.networks.insert(
+                name.into(),
+                NetworkHandle {
+                    name: name.into(),
+                    network_key: state.read().unwrap().network_public_key,
+                    role: NetworkRole::Coordinator,
+                    state: Arc::clone(state),
+                    dht_notify: None,
+                    cancel: CancellationToken::new(),
+                    tasks: Vec::new(),
+                    invite_lock: Arc::new(AsyncMutex::new(())),
+                    incompatible: None,
+                },
+            );
+        }
+        // No transport handles are needed to decide this identity's scope.
+        let networks = || {
+            let mut names = registry.authorization_networks(device);
+            names.sort();
+            names
+        };
+        assert_eq!(networks(), ["box", "field"]);
+        assert!(registry.authorization_networks(stranger).is_empty());
+
+        // An immediate prune overrides even a roster not yet republished.
+        registry.pruned_peers.insert(("box".into(), device));
+        assert_eq!(networks(), ["field"]);
+        registry.pruned_peers.remove(&("box".into(), device));
+
+        // A revoked device cannot inherit its still-authorized user's grant.
+        box_state.write().unwrap().nullifiers.insert(device);
+        assert_eq!(networks(), ["field"]);
+        box_state.write().unwrap().nullifiers.remove(&device);
+        assert_eq!(networks(), ["box", "field"]);
+
+        box_state.write().unwrap().members = MemberList::new();
+        assert_eq!(networks(), ["field"]);
+        registry.networks.remove("field");
+        assert!(networks().is_empty());
+        endpoint.close().await;
     }
 
     async fn sample_member_handler() -> AcceptHandler {

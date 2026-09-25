@@ -3,6 +3,34 @@
 use super::*;
 
 impl Daemon {
+    pub(crate) fn is_open_read(req: &IpcMessage) -> bool {
+        matches!(
+            req,
+            IpcMessage::Status
+                | IpcMessage::Report
+                | IpcMessage::Logs { .. }
+                | IpcMessage::FirewallShow
+                | IpcMessage::FirewallSuggestions { .. }
+                | IpcMessage::FirewallPending { .. }
+                | IpcMessage::FirewallSshShow
+                | IpcMessage::ExitNodeStatus { .. }
+                | IpcMessage::ListFiles
+                | IpcMessage::Connections
+                | IpcMessage::Requests { .. }
+                | IpcMessage::ContactId
+                | IpcMessage::Ping { .. }
+                | IpcMessage::Netcheck
+                | IpcMessage::AliasList { .. }
+                | IpcMessage::ListPairedDevices
+                | IpcMessage::MachineEnrollmentList
+                | IpcMessage::ControllerList
+                | IpcMessage::ManagedMachines { .. }
+                | IpcMessage::ListLanPeers
+                | IpcMessage::ConfigGet { .. }
+                | IpcMessage::NetConfigGet { .. }
+        )
+    }
+
     /// Tailscale-style access control. Read-only queries are open to any local
     /// user; mutating commands require the caller to be root or the configured
     /// operator UID; setting the operator itself is root-only. Returns `None`
@@ -16,33 +44,7 @@ impl Daemon {
         peer: Option<&PeerIdentity>,
     ) -> Option<IpcMessage> {
         // Reads are available to everyone.
-        if matches!(
-            req,
-            IpcMessage::Status
-                | IpcMessage::Report
-                | IpcMessage::Logs { .. }
-                | IpcMessage::FirewallShow
-                | IpcMessage::FirewallSuggestions { .. }
-                | IpcMessage::FirewallPending { .. }
-                | IpcMessage::FirewallSshShow
-                | IpcMessage::ExitNodeStatus { .. }
-                | IpcMessage::ListFiles
-                | IpcMessage::Connections
-                // The queue `ray requests <net> accept` reads its id out of,
-                // and the same shape as `Connections` right above it.
-                | IpcMessage::Requests { .. }
-                | IpcMessage::ContactId
-                | IpcMessage::Ping { .. }
-                | IpcMessage::Netcheck
-                | IpcMessage::AliasList { .. }
-                | IpcMessage::ListPairedDevices
-                | IpcMessage::MachineEnrollmentList
-                | IpcMessage::ControllerList
-                | IpcMessage::ManagedMachines { .. }
-                | IpcMessage::ListLanPeers
-                | IpcMessage::ConfigGet { .. }
-                | IpcMessage::NetConfigGet { .. }
-        ) {
+        if Self::is_open_read(req) {
             return None;
         }
 
@@ -350,6 +352,17 @@ impl Daemon {
         if let Some(denied) = Self::check_authorized(&req, peer.as_ref()) {
             return denied;
         }
+        self.handle_authorized_request(req, peer, fds).await
+    }
+
+    /// Dispatch only after the transport has checked its caller's authority.
+    /// Keep the real peer credentials for file ownership, even for app-owned IPC.
+    pub(crate) async fn handle_authorized_request(
+        self: &Arc<Self>,
+        req: IpcMessage,
+        peer: Option<PeerIdentity>,
+        fds: Vec<IpcOwnedFd>,
+    ) -> IpcMessage {
         let peer_cred = peer.as_ref().and_then(PeerIdentity::unix_cred);
         match req {
             IpcMessage::Create {
