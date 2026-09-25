@@ -8,15 +8,30 @@ on:
   # its own, without waiting for another push.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      macos_dmg:
+        description: Build signed and notarized macOS DMGs as artifacts
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-dmg:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_dmg
+    permissions:
+      contents: write
+    uses: ./.github/workflows/macos-release.yml
+    with:
+      release_tag: ''
+    secrets: inherit
+
   check:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -53,7 +68,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -73,6 +88,29 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Check bundled macOS CLI
+        run: |
+          cargo -q clippy --workspace --all-targets --locked --features macos-app -- -D warnings
+          cargo -q test -p rayfish --bin ray --locked --features macos-app cli::help::tests
+
+      - name: Install macOS test runner
+        run: brew install just
+
+      - name: Test native app
+        run: just macos-test macos-ipc-test macos-ui-test macos-notification-test
+
+      - name: Check Apple bindings
+        run: |
+          cargo build -p ray-apple --locked
+          cargo run -q -p ray-apple --bin uniffi-bindgen -- generate \
+            --library target/debug/libray_apple.dylib \
+            --language swift \
+            --out-dir macos/Generated \
+            --no-format
+          sed -i '' 's/[[:space:]]*$//' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
+          perl -0pi -e 's/\n+\z/\n/' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
+          git diff --exit-code macos/Generated
+
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
   # neither is compiled by the job above, so a PR could go green and break the
@@ -81,7 +119,7 @@ jobs:
   android:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -140,7 +178,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -192,7 +230,7 @@ jobs:
   windows-arm64:
     runs-on: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -214,7 +252,7 @@ jobs:
 
       # Unsigned, like the MSI below; signing happens in release.yml, on a tag.
       - name: Upload ray.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ray-windows-arm64
           path: target/aarch64-pc-windows-msvc/release/ray.exe
@@ -231,7 +269,7 @@ jobs:
     runs-on: windows-latest
     needs: windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -269,7 +307,7 @@ jobs:
       # forks, which cannot see the signing secrets. Signing happens in
       # release.yml, on a tag.
       - name: Upload MSI artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ray-windows-x86_64-msi
           path: ${{ runner.temp }}/ray-windows-x86_64.msi*

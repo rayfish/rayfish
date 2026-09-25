@@ -2,20 +2,39 @@
 
 use super::*;
 use crate::management::{
-    EnrollmentSecret, ManagementAction, ManagementMsg, ManagementRequestId, ManagementResult,
-    NetworkInvite,
+    EnrollmentReceipt, EnrollmentSecret, ManagementAction, ManagementMsg, ManagementRequestId,
+    ManagementResult, NetworkInvite,
 };
 use futures::future::join_all;
+use iroh::EndpointAddr;
+use iroh::endpoint::ConnectOptions;
 use ray_proto::ipc::{
     ControllerSelector, EnrollmentCredentialSelector, MachineHostname, ManagedMachineSelector,
     NetworkName, UnixTimestampSecs,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 const MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGEMENT_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGEMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROLLER_HELLO_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CONTROLLER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+mod compatibility_tests;
+#[cfg(test)]
+mod recovery_tests;
+
+impl Daemon {
+    /// Inventory for embedders, including machines outside the local networks.
+    pub async fn list_managed_machines(&self, probe: bool) -> IpcMessage {
+        self.management.list_machines(probe).await
+    }
+}
 
 fn now() -> UnixTimestampSecs {
     UnixTimestampSecs::from_secs(
@@ -28,6 +47,20 @@ fn now() -> UnixTimestampSecs {
 
 fn enrollment_expiration(created_at: UnixTimestampSecs, expires_in: Duration) -> UnixTimestampSecs {
     created_at.saturating_add(expires_in)
+}
+
+/// Negotiate once, offering v1 for peers that have not upgraded. Recovery-only
+/// messages check the selected ALPN before sending any application data.
+async fn connect_management(
+    endpoint: &Endpoint,
+    address: EndpointAddr,
+) -> anyhow::Result<Connection> {
+    let options =
+        ConnectOptions::new().with_additional_alpns(vec![crate::management::LEGACY_ALPN.to_vec()]);
+    let connecting = endpoint
+        .connect_with_opts(address, crate::management::ALPN, options)
+        .await?;
+    Ok(connecting.await?)
 }
 
 fn record_enrollment(
@@ -63,21 +96,87 @@ fn record_enrollment(
     if !credential.enrolled_machines.contains(&machine) {
         credential.enrolled_machines.push(machine);
     }
+    settings.forgotten_machines.retain(|id| *id != machine);
+    record_machine(settings, machine, hostname, enrolled_at, enrolled_at)
+}
+
+fn record_machine(
+    settings: &mut config::AppConfig,
+    machine: EndpointId,
+    hostname: &MachineHostname,
+    enrolled_at: UnixTimestampSecs,
+    seen_at: UnixTimestampSecs,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !settings
+            .managed_machines
+            .iter()
+            .any(|entry| entry.hostname == *hostname && entry.identity != machine),
+        "managed hostname '{hostname}' is already enrolled"
+    );
     if let Some(entry) = settings
         .managed_machines
         .iter_mut()
         .find(|entry| entry.identity == machine)
     {
         entry.hostname = hostname.clone();
-        entry.last_seen = Some(enrolled_at);
+        entry.last_seen = Some(seen_at);
     } else {
         settings.managed_machines.push(config::ManagedMachine {
             identity: machine,
             hostname: hostname.clone(),
             enrolled_at,
-            last_seen: Some(enrolled_at),
+            last_seen: Some(seen_at),
         });
     }
+    Ok(())
+}
+
+fn record_hello(
+    settings: &mut config::AppConfig,
+    controller: EndpointId,
+    remote: EndpointId,
+    receipt: &EnrollmentReceipt,
+    hostname: &MachineHostname,
+    seen_at: UnixTimestampSecs,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipt.verify(controller, remote),
+        "invalid enrollment receipt"
+    );
+    anyhow::ensure!(
+        !settings.forgotten_machines.contains(&remote),
+        "machine was explicitly forgotten; confirm or enroll it again"
+    );
+    record_machine(settings, remote, hostname, receipt.enrolled_at, seen_at)
+}
+
+fn forget_record(settings: &mut config::AppConfig, machine: EndpointId) {
+    settings
+        .managed_machines
+        .retain(|entry| entry.identity != machine);
+    if !settings.forgotten_machines.contains(&machine) {
+        settings.forgotten_machines.push(machine);
+    }
+}
+
+/// Confirmation can attach a receipt to an existing grant, never create a grant.
+fn confirm_controller_grant(
+    settings: &mut config::AppConfig,
+    controller: EndpointId,
+    machine: EndpointId,
+    receipt: EnrollmentReceipt,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipt.verify(controller, machine),
+        "invalid enrollment receipt"
+    );
+    let grant = settings
+        .controllers
+        .iter_mut()
+        .find(|grant| grant.identity == controller)
+        .ok_or_else(|| anyhow::anyhow!("controller is not authorized"))?;
+    grant.receipt = Some(receipt);
     Ok(())
 }
 
@@ -85,18 +184,148 @@ fn record_enrollment(
 pub(crate) struct ManagementService {
     transport: Arc<Transport>,
     registry: Arc<NetworkRegistry>,
+    secret_key: SecretKey,
     /// Serializes controller authorization changes with remote actions. Once a
     /// local revoke returns, no request from that controller is still running.
     controller_gate: AsyncMutex<()>,
+    hello_notify: Notify,
+    hello_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ManagementService {
     /// Creates the management service for the process-wide transport and registry.
-    pub(crate) fn new(transport: Arc<Transport>, registry: Arc<NetworkRegistry>) -> Self {
+    pub(crate) fn new(
+        transport: Arc<Transport>,
+        registry: Arc<NetworkRegistry>,
+        secret_key: SecretKey,
+    ) -> Self {
         Self {
             transport,
             registry,
+            secret_key,
             controller_gate: AsyncMutex::new(()),
+            hello_notify: Notify::new(),
+            hello_task: Mutex::new(None),
+        }
+    }
+
+    /// Start immediately, retry while offline, and repeat to recover a controller
+    /// that lost its inventory while the machine remained connected.
+    pub(crate) fn start_announcements(self: &Arc<Self>, token: CancellationToken) {
+        let service = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {},
+                _ = async {
+                    let mut interval = tokio::time::interval(CONTROLLER_HELLO_INTERVAL);
+                    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {},
+                            _ = service.hello_notify.notified() => {},
+                        }
+                        if let Err(error) = service.announce_controllers().await {
+                            tracing::debug!(%error, "controller announcement failed");
+                        }
+                    }
+                } => {},
+            }
+        });
+        *self.hello_task.lock().unwrap() = Some(task);
+    }
+
+    pub(crate) async fn stop_announcements(&self) {
+        let task = self.hello_task.lock().unwrap().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    /// A mesh reconnect is an opportunity to repair inventory immediately. The
+    /// timer also covers controllers that share no network with this machine.
+    pub(crate) fn connection_established(&self, peer: EndpointId) {
+        if config::load().is_ok_and(|settings| {
+            settings
+                .controllers
+                .iter()
+                .any(|grant| grant.identity == peer && grant.receipt.is_some())
+        }) {
+            self.hello_notify.notify_one();
+        }
+    }
+
+    async fn announce_controllers(&self) -> anyhow::Result<()> {
+        let settings = config::load()?;
+        if !settings
+            .controllers
+            .iter()
+            .any(|grant| grant.receipt.is_some())
+        {
+            return Ok(());
+        }
+        let hostname = self.local_hostname()?;
+        // Bound each exchange independently, so one offline controller cannot
+        // prevent the others from learning about this machine.
+        let machine = self.transport.endpoint.id();
+        let receipts = settings.controllers.into_iter().filter_map(|grant| {
+            grant
+                .receipt
+                .filter(|receipt| receipt.verify(grant.identity, machine))
+        });
+        join_all(receipts
+            .map(|receipt| {
+                let hostname = hostname.clone();
+                async move {
+                    let controller = receipt.controller;
+                    let outcome = tokio::time::timeout(
+                        CONTROLLER_HELLO_TIMEOUT, self.announce_controller(receipt, hostname)
+                    ).await;
+                    match outcome {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => tracing::debug!(peer = %controller.fmt_short(), %error, "controller hello failed"),
+                        Err(_) => tracing::debug!(peer = %controller.fmt_short(), "controller hello timed out"),
+                    }
+                }
+            })).await;
+        Ok(())
+    }
+
+    async fn announce_controller(
+        &self,
+        receipt: EnrollmentReceipt,
+        hostname: MachineHostname,
+    ) -> anyhow::Result<()> {
+        let controller = receipt.controller;
+        let connection = self
+            .transport
+            .endpoint
+            .connect(EndpointAddr::from(controller), crate::management::ALPN)
+            .await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        {
+            // Re-read under the revocation gate: a receipt captured before a
+            // local revoke must not be sent afterwards. Release before waiting
+            // for the reply so a slow controller does not block other hellos.
+            let _guard = self.controller_gate.lock().await;
+            let authorized = config::load()?.controllers.iter().any(|grant| {
+                grant.identity == controller && grant.receipt.as_ref() == Some(&receipt)
+            });
+            if !authorized {
+                return Ok(());
+            }
+            control::send_framed(
+                &mut send,
+                &ManagementMsg::ControllerHello { receipt, hostname },
+            )
+            .await?;
+        }
+        let reply = control::recv_framed::<ManagementMsg>(&mut recv).await?;
+        connection.close(0u32.into(), b"hello received");
+        match reply {
+            ManagementMsg::HelloAccepted => Ok(()),
+            ManagementMsg::HelloRejected { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected controller hello response"),
         }
     }
 
@@ -193,9 +422,7 @@ impl ManagementService {
         };
         let connection = match tokio::time::timeout(
             MANAGEMENT_CONNECT_TIMEOUT,
-            self.transport
-                .endpoint
-                .connect(ticket.controller().clone(), crate::management::ALPN),
+            connect_management(&self.transport.endpoint, ticket.controller().clone()),
         )
         .await
         {
@@ -203,6 +430,7 @@ impl ManagementService {
             Ok(Err(error)) => return ipc_err(format!("failed to reach controller: {error}")),
             Err(_) => return ipc_err("timed out reaching controller"),
         };
+        let legacy = connection.alpn() == crate::management::LEGACY_ALPN;
         let (mut send, mut recv) = match connection.open_bi().await {
             Ok(streams) => streams,
             Err(error) => return ipc_err(format!("failed to open controller stream: {error}")),
@@ -223,36 +451,54 @@ impl ManagementService {
             control::recv_framed::<ManagementMsg>(&mut recv),
         )
         .await;
-        match response {
-            Err(_) => ipc_err("timed out waiting for controller enrollment response"),
-            Ok(Ok(ManagementMsg::Enrolled)) => {
-                let saved = config::update_settings(|settings| {
-                    if !settings
-                        .controllers
-                        .iter()
-                        .any(|grant| grant.identity == controller)
-                    {
-                        settings.controllers.push(config::ControllerGrant {
-                            identity: controller,
-                            enrolled_at: now(),
-                        });
-                    }
-                    Ok(())
+        let receipt = match response {
+            Err(_) => return ipc_err("timed out waiting for controller enrollment response"),
+            Ok(Ok(ManagementMsg::Enrolled)) if legacy => None,
+            Ok(Ok(ManagementMsg::EnrolledWithReceipt { receipt })) if !legacy => {
+                if !receipt.verify(controller, self.transport.endpoint.id()) {
+                    return ipc_err("controller returned an invalid enrollment receipt");
+                }
+                Some(receipt)
+            }
+            Ok(Ok(ManagementMsg::EnrollmentRejected { message }))
+            | Ok(Ok(ManagementMsg::ProtocolError { message })) => return ipc_err(message),
+            Ok(Ok(other)) => return ipc_err(format!("unexpected enrollment response: {other:?}")),
+            Ok(Err(error)) => {
+                return ipc_err(format!("failed to read enrollment response: {error}"));
+            }
+        };
+        let _guard = self.controller_gate.lock().await;
+        let saved = config::update_settings(|settings| {
+            if let Some(grant) = settings
+                .controllers
+                .iter_mut()
+                .find(|grant| grant.identity == controller)
+            {
+                if receipt.is_some() {
+                    grant.receipt = receipt.clone();
+                }
+            } else {
+                settings.controllers.push(config::ControllerGrant {
+                    identity: controller,
+                    enrolled_at: receipt
+                        .as_ref()
+                        .map_or_else(now, |receipt| receipt.enrolled_at),
+                    receipt: receipt.clone(),
                 });
-                match saved {
-                    Ok(_) => IpcMessage::Ok {
-                        message: format!(
-                            "enrolled '{hostname}' with controller {}",
-                            controller.fmt_short()
-                        ),
-                    },
-                    Err(error) => ipc_err(format!("failed to save controller grant: {error}")),
+            }
+            Ok(())
+        });
+        match saved {
+            Ok(_) => {
+                self.hello_notify.notify_one();
+                IpcMessage::Ok {
+                    message: format!(
+                        "enrolled '{hostname}' with controller {}",
+                        controller.fmt_short()
+                    ),
                 }
             }
-            Ok(Ok(ManagementMsg::EnrollmentRejected { message })) => ipc_err(message),
-            Ok(Ok(ManagementMsg::ProtocolError { message })) => ipc_err(message),
-            Ok(Ok(other)) => ipc_err(format!("unexpected enrollment response: {other:?}")),
-            Ok(Err(error)) => ipc_err(format!("failed to read enrollment response: {error}")),
+            Err(error) => ipc_err(format!("failed to save controller grant: {error}")),
         }
     }
 
@@ -514,15 +760,53 @@ impl ManagementService {
             Err(error) => return ipc_err(error),
         };
         match config::update_settings(|settings| {
-            settings
-                .managed_machines
-                .retain(|entry| entry.identity != target.identity);
+            forget_record(settings, target.identity);
             Ok(())
         }) {
             Ok(_) => IpcMessage::Ok {
                 message: format!("forgot managed machine '{}'", target.hostname),
             },
             Err(error) => ipc_err(format!("failed to forget managed machine: {error}")),
+        }
+    }
+
+    /// Explicit operator confirmation for legacy grants, including machines whose
+    /// controller-side entry was lost. The target must already trust our identity.
+    pub(crate) async fn confirm_machine(&self, machine: EndpointId) -> IpcMessage {
+        if machine == self.transport.endpoint.id() {
+            return ipc_err("a machine cannot control itself");
+        }
+        let receipt = EnrollmentReceipt::issue(&self.secret_key, machine, now());
+        match self
+            .send_request(
+                machine,
+                ManagementAction::ConfirmEnrollment {
+                    receipt: receipt.clone(),
+                },
+            )
+            .await
+        {
+            Ok(ManagementResult::Status { hostname, .. }) => {
+                let saved = config::update_settings(|settings| {
+                    // A local confirmation is an explicit decision to restore a
+                    // forgotten entry, unlike an unsolicited hello.
+                    record_machine(settings, machine, &hostname, receipt.enrolled_at, now())?;
+                    settings.forgotten_machines.retain(|id| *id != machine);
+                    Ok(())
+                });
+                match saved {
+                    Ok(_) => IpcMessage::Ok {
+                        message: format!("confirmed '{hostname}'; inventory recovery enabled"),
+                    },
+                    Err(error) => ipc_err(format!("failed to save confirmed machine: {error}")),
+                }
+            }
+            Ok(ManagementResult::Unauthorized) => {
+                ipc_err("machine does not authorize this controller; enroll it with a ticket first")
+            }
+            Ok(ManagementResult::Error { message }) => ipc_err(message),
+            Ok(_) => ipc_err("unexpected confirmation response"),
+            Err(error) => ipc_err(error),
         }
     }
 
@@ -555,13 +839,20 @@ impl ManagementService {
     ) -> Result<ManagementResult, String> {
         let connection = tokio::time::timeout(
             MANAGEMENT_CONNECT_TIMEOUT,
-            self.transport
-                .endpoint
-                .connect(iroh::EndpointAddr::from(target), crate::management::ALPN),
+            connect_management(&self.transport.endpoint, EndpointAddr::from(target)),
         )
         .await
         .map_err(|_| "timed out reaching managed machine".to_string())?
         .map_err(|error| format!("failed to reach managed machine: {error}"))?;
+        if connection.alpn() == crate::management::LEGACY_ALPN
+            && matches!(action, ManagementAction::ConfirmEnrollment { .. })
+        {
+            connection.close(0u32.into(), b"management v2 required");
+            return Err(
+                "inventory recovery requires management v2; upgrade the managed machine first"
+                    .to_string(),
+            );
+        }
         let (mut send, mut recv) = connection
             .open_bi()
             .await
@@ -601,6 +892,7 @@ impl ManagementService {
     /// Handles one inbound enrollment or authenticated management request.
     pub(crate) async fn accept_connection(&self, connection: Connection) {
         let remote = connection.remote_id();
+        let legacy = connection.alpn() == crate::management::LEGACY_ALPN;
         let Ok((mut send, mut recv)) = connection.accept_bi().await else {
             return;
         };
@@ -620,31 +912,55 @@ impl ManagementService {
                 return;
             }
         };
-        let reply = match message {
-            ManagementMsg::Enroll { secret, hostname } => {
-                match self.accept_enrollment(remote, &secret, &hostname) {
-                    Ok(()) => ManagementMsg::Enrolled,
-                    Err(message) => ManagementMsg::EnrollmentRejected { message },
+        let reply = if legacy && !message.supported_by_v1() {
+            ManagementMsg::ProtocolError {
+                message: "this operation requires management v2".to_string(),
+            }
+        } else {
+            match message {
+                ManagementMsg::Enroll { secret, hostname } => {
+                    match self.accept_enrollment(remote, &secret, &hostname) {
+                        Ok(_) if legacy => ManagementMsg::Enrolled,
+                        Ok(receipt) => ManagementMsg::EnrolledWithReceipt { receipt },
+                        Err(message) => ManagementMsg::EnrollmentRejected { message },
+                    }
                 }
+                ManagementMsg::ControllerHello { receipt, hostname } => {
+                    match config::update_settings(|settings| {
+                        record_hello(
+                            settings,
+                            self.transport.endpoint.id(),
+                            remote,
+                            &receipt,
+                            &hostname,
+                            now(),
+                        )
+                    }) {
+                        Ok(_) => ManagementMsg::HelloAccepted,
+                        Err(error) => ManagementMsg::HelloRejected {
+                            message: error.to_string(),
+                        },
+                    }
+                }
+                ManagementMsg::Request { request_id, action } => {
+                    let _guard = self.controller_gate.lock().await;
+                    let authorized = config::load().is_ok_and(|settings| {
+                        settings
+                            .controllers
+                            .iter()
+                            .any(|grant| grant.identity == remote)
+                    });
+                    let result = if authorized {
+                        self.apply_action(remote, action).await
+                    } else {
+                        ManagementResult::Unauthorized
+                    };
+                    ManagementMsg::Response { request_id, result }
+                }
+                _ => ManagementMsg::ProtocolError {
+                    message: "unexpected management message".to_string(),
+                },
             }
-            ManagementMsg::Request { request_id, action } => {
-                let _guard = self.controller_gate.lock().await;
-                let authorized = config::load().is_ok_and(|settings| {
-                    settings
-                        .controllers
-                        .iter()
-                        .any(|grant| grant.identity == remote)
-                });
-                let result = if authorized {
-                    self.apply_action(action).await
-                } else {
-                    ManagementResult::Unauthorized
-                };
-                ManagementMsg::Response { request_id, result }
-            }
-            _ => ManagementMsg::ProtocolError {
-                message: "unexpected management message".to_string(),
-            },
         };
         if let Err(error) = control::send_framed(&mut send, &reply).await {
             tracing::warn!(peer = %remote.fmt_short(), %error, "failed to send management response");
@@ -660,18 +976,65 @@ impl ManagementService {
         machine: EndpointId,
         secret: &EnrollmentSecret,
         hostname: &MachineHostname,
-    ) -> Result<(), String> {
+    ) -> Result<EnrollmentReceipt, String> {
         let secret_hash = secret.hash();
         let enrolled_at = now();
         config::update_settings(|settings| {
             record_enrollment(settings, machine, secret_hash, hostname, enrolled_at)
         })
-        .map(|_| ())
+        .map(|settings| {
+            let machine = settings
+                .managed_machines
+                .iter()
+                .find(|entry| entry.identity == machine)
+                .expect("enrollment recorded the machine");
+            EnrollmentReceipt::issue(&self.secret_key, machine.identity, machine.enrolled_at)
+        })
         .map_err(|error| error.to_string())
     }
 
-    async fn apply_action(&self, action: ManagementAction) -> ManagementResult {
+    async fn apply_action(
+        &self,
+        controller: EndpointId,
+        action: ManagementAction,
+    ) -> ManagementResult {
         match action {
+            ManagementAction::ConfirmEnrollment { receipt } => {
+                // The caller holds controller_gate through this write and reply
+                // construction, so a concurrent revoke cannot recreate a grant.
+                let hostname = match self.local_hostname() {
+                    Ok(hostname) => hostname,
+                    Err(error) => {
+                        return ManagementResult::Error {
+                            message: error.to_string(),
+                        };
+                    }
+                };
+                match config::update_settings(|settings| {
+                    confirm_controller_grant(
+                        settings,
+                        controller,
+                        self.transport.endpoint.id(),
+                        receipt,
+                    )
+                }) {
+                    Ok(_) => {
+                        self.hello_notify.notify_one();
+                        ManagementResult::Status {
+                            hostname,
+                            networks: self
+                                .registry
+                                .networks
+                                .iter()
+                                .map(|entry| NetworkName::new(entry.key().clone()))
+                                .collect(),
+                        }
+                    }
+                    Err(error) => ManagementResult::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
             ManagementAction::Status => match self.local_hostname() {
                 Ok(hostname) => ManagementResult::Status {
                     hostname,
@@ -822,5 +1185,137 @@ mod tests {
             enrollment_expiration(created_at, Duration::ZERO),
             created_at
         );
+    }
+
+    #[test]
+    fn signed_hello_recovers_inventory_without_an_enrollment_secret() {
+        let key = SecretKey::generate();
+        let machine = endpoint(2);
+        let enrolled_at = UnixTimestampSecs::from_secs(100);
+        let receipt = EnrollmentReceipt::issue(&key, machine, enrolled_at);
+        let mut settings = config::AppConfig::default();
+        for hostname in ["build-box", "renamed-box"] {
+            record_hello(
+                &mut settings,
+                key.public(),
+                machine,
+                &receipt,
+                &hostname.parse().unwrap(),
+                UnixTimestampSecs::from_secs(200),
+            )
+            .unwrap();
+        }
+        assert_eq!(settings.managed_machines.len(), 1);
+        assert_eq!(
+            settings.managed_machines[0].hostname.as_ref(),
+            "renamed-box"
+        );
+        assert_eq!(settings.managed_machines[0].enrolled_at, enrolled_at);
+        assert!(settings.enrollment_credentials.is_empty());
+        assert!(
+            settings.controllers.is_empty(),
+            "inventory recovery grants no authority"
+        );
+    }
+
+    #[test]
+    fn stolen_receipt_and_hostname_collision_cannot_replace_inventory() {
+        let key = SecretKey::generate();
+        let machine = endpoint(2);
+        let other = endpoint(3);
+        let at = UnixTimestampSecs::from_secs(100);
+        let receipt = EnrollmentReceipt::issue(&key, machine, at);
+        let hostname = "build-box".parse().unwrap();
+        let mut settings = config::AppConfig::default();
+        assert!(record_hello(&mut settings, key.public(), other, &receipt, &hostname, at).is_err());
+        assert!(settings.managed_machines.is_empty());
+        record_hello(
+            &mut settings,
+            key.public(),
+            machine,
+            &receipt,
+            &hostname,
+            at,
+        )
+        .unwrap();
+        let other_receipt = EnrollmentReceipt::issue(&key, other, at);
+        assert!(
+            record_hello(
+                &mut settings,
+                key.public(),
+                other,
+                &other_receipt,
+                &hostname,
+                at
+            )
+            .is_err()
+        );
+        assert_eq!(settings.managed_machines.len(), 1);
+        assert_eq!(settings.managed_machines[0].identity, machine);
+    }
+
+    #[test]
+    fn forgotten_machine_stays_forgotten_until_explicit_reenrollment() {
+        let key = SecretKey::generate();
+        let machine = endpoint(2);
+        let at = UnixTimestampSecs::from_secs(100);
+        let hostname = "build-box".parse().unwrap();
+        let receipt = EnrollmentReceipt::issue(&key, machine, at);
+        let (mut settings, secret_hash) = settings_with_credential(false);
+        record_enrollment(&mut settings, machine, secret_hash, &hostname, at).unwrap();
+        forget_record(&mut settings, machine);
+        forget_record(&mut settings, machine);
+        assert_eq!(settings.forgotten_machines, [machine]);
+        let mut settings: config::AppConfig =
+            toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert!(
+            record_hello(
+                &mut settings,
+                key.public(),
+                machine,
+                &receipt,
+                &hostname,
+                at
+            )
+            .is_err()
+        );
+        assert!(settings.managed_machines.is_empty());
+        record_enrollment(&mut settings, machine, secret_hash, &hostname, at).unwrap();
+        assert!(settings.forgotten_machines.is_empty());
+        record_hello(
+            &mut settings,
+            key.public(),
+            machine,
+            &receipt,
+            &hostname,
+            at,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_confirmation_requires_an_existing_grant_and_cannot_undo_revocation() {
+        let key = SecretKey::generate();
+        let machine = endpoint(2);
+        let at = UnixTimestampSecs::from_secs(100);
+        let receipt = EnrollmentReceipt::issue(&key, machine, at);
+        let mut settings = config::AppConfig::default();
+        assert!(
+            confirm_controller_grant(&mut settings, key.public(), machine, receipt.clone())
+                .is_err()
+        );
+        settings.controllers.push(config::ControllerGrant {
+            identity: key.public(),
+            enrolled_at: at,
+            receipt: None,
+        });
+        assert!(
+            confirm_controller_grant(&mut settings, endpoint(3), machine, receipt.clone()).is_err()
+        );
+        confirm_controller_grant(&mut settings, key.public(), machine, receipt.clone()).unwrap();
+        assert_eq!(settings.controllers[0].receipt.as_ref(), Some(&receipt));
+        settings.controllers.clear();
+        assert!(confirm_controller_grant(&mut settings, key.public(), machine, receipt).is_err());
+        assert!(settings.controllers.is_empty());
     }
 }

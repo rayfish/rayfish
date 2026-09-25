@@ -36,6 +36,9 @@ pub const REPO_SLUG: &str = "rayfish/rayfish";
 /// (which runs on any Linux) and a glibc binary to the plain gnu asset. Getting
 /// this wrong would hand a musl-only host a glibc binary that can't start.
 pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
+    if os == "macos" && arch != "aarch64" {
+        anyhow::bail!("macOS releases require Apple Silicon (arm64)");
+    }
     if os == "windows" {
         if arch != "x86_64" {
             anyhow::bail!("no rayfish Windows MSI for architecture '{arch}'; build from source");
@@ -60,6 +63,22 @@ pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
         ""
     };
     Ok(format!("ray-{os}-{arch}{libc}"))
+}
+
+/// Map the host OS/arch to the rolling nightly asset. Windows nightlies are
+/// standalone CLI/daemon executables; the desktop app and MSI are stable-only.
+pub fn nightly_asset_name(os: &str, arch: &str) -> Result<String> {
+    if os == "windows" {
+        let arch = match arch {
+            "x86_64" => "x86_64",
+            "aarch64" => "aarch64",
+            other => anyhow::bail!(
+                "no rayfish Windows nightly for architecture '{other}'; build from source"
+            ),
+        };
+        return Ok(format!("ray-windows-{arch}.exe"));
+    }
+    release_asset_name(os, arch)
 }
 
 /// Parse a release version sidecar. Windows MSI assets use this because the
@@ -806,7 +825,6 @@ pub async fn run_msi_update_helper(
     result
 }
 
-#[cfg(not(windows))]
 /// Download the release asset, verify it against the (already-fetched)
 /// checksum, and atomically swap it in for the running binary. Stages the new
 /// binary in a temp file, marks it executable, then `self_replace`s (handles the
@@ -963,7 +981,16 @@ mod tests {
             release_asset_name("windows", "x86_64").unwrap(),
             "ray-windows-x86_64.msi"
         );
+        assert_eq!(
+            nightly_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.exe"
+        );
+        assert_eq!(
+            nightly_asset_name("windows", "aarch64").unwrap(),
+            "ray-windows-aarch64.exe"
+        );
         assert!(release_asset_name("windows", "aarch64").is_err());
+        assert!(nightly_asset_name("windows", "riscv64").is_err());
         assert_eq!(parse_version_manifest("0.2.17\n").unwrap(), "0.2.17");
         assert_eq!(
             parse_version_manifest("0.2.17-nightly.42+abc12345\n").unwrap(),

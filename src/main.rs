@@ -11,6 +11,7 @@ use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
 use clap::{FromArgMatches, Parser, Subcommand};
+use iroh::EndpointId;
 use ray_proto::settings::node_key_help;
 
 use membership::GroupMode;
@@ -262,6 +263,7 @@ pub(crate) enum Command {
     /// Start a local browser GUI
     ///
     /// Covers the common workflows and every CLI command.
+    #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
     Gui {
         /// Localhost port to listen on (0 chooses a free port)
         #[arg(long, default_value_t = 0)]
@@ -286,7 +288,7 @@ pub(crate) enum Command {
     /// Peers awaiting approval; admit or reject them
     ///
     /// Coordinator only, and closed networks only. With no action, lists who is
-    /// waiting; `accept <id>` admits one and `deny <id>` turns it away.
+    /// waiting; `accept <name>` admits one and `deny <name>` turns it away.
     Requests {
         /// Network name
         #[arg(add = complete::networks())]
@@ -297,23 +299,23 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// The old spelling of `ray requests <network> accept <id>`.
+    /// The old spelling of `ray requests <network> accept <name>`.
     #[command(hide = true)]
     Accept {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
-        /// Short id of the pending peer (from `ray requests`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
-    /// The old spelling of `ray requests <network> deny <id>`.
+    /// The old spelling of `ray requests <network> deny <name>`.
     #[command(hide = true)]
     Deny {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
-        /// Short id of the pending peer (from `ray requests`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
@@ -517,6 +519,7 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Authorize a user to run ray without sudo (requires root)
+    #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
     SetOperator {
         /// Username or numeric UID to grant operator access
         #[arg(value_hint = clap::ValueHint::Username)]
@@ -721,6 +724,11 @@ pub(crate) enum MachinesAction {
     Forget {
         machine: ipc::ManagedMachineSelector,
     },
+    /// Confirm an existing machine for inventory recovery
+    Confirm {
+        /// Full endpoint ID of a machine that already trusts this controller
+        machine: EndpointId,
+    },
 }
 
 #[derive(Subcommand)]
@@ -741,7 +749,7 @@ pub(crate) enum ControllerAction {
 pub(crate) enum AdminAction {
     /// Grant the network key to a member
     Add {
-        /// Short id of the member to promote (from `ray status`)
+        /// Member hostname, mesh IP, short id, or full identity
         #[arg(add = complete::peers())]
         identity: String,
     },
@@ -782,13 +790,13 @@ pub(crate) enum RequestsAction {
     /// Admit a peer waiting for approval
     #[command(visible_alias = "ok")]
     Accept {
-        /// Short id of the pending peer (from `ray requests <network>`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
     /// Reject a peer waiting for approval
     Deny {
-        /// Short id of the pending peer (from `ray requests <network>`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
@@ -805,7 +813,7 @@ pub(crate) enum ConnectAction {
     /// reads the same here as it does under `ray requests`.
     #[command(visible_aliases = ["ok", "accept"])]
     Approve {
-        /// Short id of the requester (from `ray connect`)
+        /// Hostname or short id of the requester
         #[arg(add = complete::connect_requests())]
         id: String,
     },
@@ -1571,6 +1579,7 @@ async fn run() -> Result<()> {
         Command::Install { auto_update } => cmd_install(auto_update).await,
         Command::Restart => cmd_restart().await,
         Command::Completions { shell, install } => complete::cmd_completions(shell, install),
+        #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::Gui { port, no_open } => cmd_gui(port, no_open),
         Command::Invite {
             network,
@@ -1644,6 +1653,7 @@ async fn run() -> Result<()> {
         Command::Dns { action, json: _ } => cmd_dns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action, json } => cmd_config(action, json).await,
+        #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
         Command::Files { action, json: _ } => ipc_files(action).await,
@@ -1852,6 +1862,7 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
 /// `ray set-operator <user>`: authorize a local user to run mutating ray
 /// commands without sudo (Tailscale's `--operator` model). The daemon enforces
 /// that this call itself comes from root.
+#[cfg(not(all(target_os = "macos", feature = "macos-app")))]
 async fn cmd_set_operator(user: &str) -> Result<()> {
     // Windows writes the operator SID itself instead of asking the daemon. The
     // daemon has no Windows equivalent of the root check that authorizes
@@ -1891,7 +1902,9 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
 mod tests {
     use super::*;
     use ipc::FirewallRuleView;
-    use rayfish::update::{normalize_version, release_asset_name, version_is_newer};
+    use rayfish::update::{
+        nightly_asset_name, normalize_version, release_asset_name, version_is_newer,
+    };
 
     #[test]
     fn pair_backup_accepts_the_1password_flag_spellings() {
@@ -2031,10 +2044,6 @@ mod tests {
             "ray-linux-aarch64"
         );
         assert_eq!(
-            release_asset_name("macos", "x86_64").unwrap(),
-            "ray-macos-x86_64"
-        );
-        assert_eq!(
             release_asset_name("macos", "aarch64").unwrap(),
             "ray-macos-aarch64"
         );
@@ -2042,10 +2051,19 @@ mod tests {
             release_asset_name("windows", "x86_64").unwrap(),
             "ray-windows-x86_64.msi"
         );
+        assert_eq!(
+            nightly_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.exe"
+        );
+        assert_eq!(
+            nightly_asset_name("windows", "aarch64").unwrap(),
+            "ray-windows-aarch64.exe"
+        );
     }
 
     #[test]
     fn release_asset_name_rejects_unsupported_platforms() {
+        assert!(release_asset_name("macos", "x86_64").is_err());
         assert!(release_asset_name("windows", "aarch64").is_err());
         assert!(release_asset_name("linux", "riscv64").is_err());
     }

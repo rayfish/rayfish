@@ -181,6 +181,17 @@ pub(crate) struct MissingNetwork {
     pub coordinator_mode: Option<GroupMode>,
 }
 
+fn peer_selector_for_network<'a>(network: &str, selector: &'a str) -> Option<&'a str> {
+    match selector.strip_suffix(&format!(".{network}.{}", crate::DNS_DOMAIN)) {
+        Some(hostname) => Some(hostname),
+        None => match selector.strip_suffix(&format!(".{}", crate::DNS_DOMAIN)) {
+            Some(name) if !name.contains('.') => Some(name),
+            Some(_) => None,
+            None => Some(selector),
+        },
+    }
+}
+
 /// Decide which saved networks the supervisor should restore: everything in
 /// config that is neither live nor already being restored.
 ///
@@ -566,10 +577,7 @@ impl NetworkRegistry {
             broadcast_control_msg(&self.peers, net_pubkey, name, &ControlMsg::LeaveNetwork).await;
         }
 
-        let was_active = self.teardown_network_runtime(name).await;
-        let removed_from_config = config::delete_network(name).unwrap_or(false);
-
-        if was_active || removed_from_config {
+        if self.remove_network_locally(name).await {
             tracing::info!(network = %name, "left network");
             IpcMessage::Ok {
                 message: format!("left network '{}'", name),
@@ -577,6 +585,27 @@ impl NetworkRegistry {
         } else {
             ipc_err(format!("network '{}' not found", name))
         }
+    }
+
+    /// Tear down and forget a network after its signed roster confirms that this
+    /// node was removed. Unlike [`Self::leave_network`], this does not announce a
+    /// departure to a coordinator that has already removed us.
+    pub(crate) async fn remove_kicked_network(&self, name: &str) {
+        if self.remove_network_locally(name).await {
+            tracing::info!(network = %name, "removed kicked network");
+        }
+    }
+
+    async fn remove_network_locally(&self, name: &str) -> bool {
+        let was_active = self.teardown_network_runtime(name).await;
+        let removed_from_config = match config::delete_network(name) {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(network = %name, %error, "failed to remove network from config");
+                false
+            }
+        };
+        was_active || removed_from_config
     }
 
     /// Look up an active network we coordinate, returning its public key and
@@ -1082,6 +1111,28 @@ impl NetworkRegistry {
         None
     }
 
+    /// Resolve a peer selector against one network's roster. Network-scoped
+    /// commands use this so a repeated hostname on another network cannot pick
+    /// the wrong member. Accepts a hostname, qualified `.ray` name, mesh
+    /// address, short id, full device identity, or paired user identity.
+    pub(crate) fn resolve_peer_in_network(
+        &self,
+        network: &str,
+        selector: &str,
+    ) -> Option<EndpointId> {
+        let selector = peer_selector_for_network(network, selector)?;
+        let handle = self.networks.get(network)?;
+        if selector == "self" {
+            return Some(self.transport.endpoint.id());
+        }
+        handle
+            .state
+            .read()
+            .unwrap()
+            .members
+            .resolve_peer_selector(selector)
+    }
+
     /// Resolve `"self"` or a short / prefix endpoint id against every network's
     /// roster to a full endpoint id.
     pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
@@ -1100,6 +1151,26 @@ impl NetworkRegistry {
             }
         }
         None
+    }
+
+    /// Verified memberships for authorization, independent of transport handles.
+    #[cfg(any(test, all(feature = "desktop", unix)))]
+    pub(crate) fn authorization_networks(&self, peer: EndpointId) -> Vec<SmolStr> {
+        let user = self.device_user_map.resolve(&peer);
+        self.networks
+            .iter()
+            .filter_map(|entry| {
+                if self.pruned_peers.contains(&(entry.key().clone(), peer)) {
+                    return None;
+                }
+                let state = entry.state.read().unwrap();
+                if state.nullifiers.contains(&peer) {
+                    return None;
+                }
+                (state.members.is_member(&peer) || state.members.is_member(&user))
+                    .then(|| SmolStr::new(entry.key()))
+            })
+            .collect()
     }
 
     /// Whether `identity` is a current member of at least one network that has
@@ -1296,6 +1367,17 @@ mod tests {
         );
         assert_eq!(network_key_from_selector(&invite), Some(network_key));
         assert_eq!(network_key_from_selector("field"), None);
+    }
+
+    #[test]
+    fn peer_selector_accepts_names_for_the_named_network_only() {
+        assert_eq!(peer_selector_for_network("box", "alice"), Some("alice"));
+        assert_eq!(peer_selector_for_network("box", "alice.ray"), Some("alice"));
+        assert_eq!(
+            peer_selector_for_network("box", "alice.box.ray"),
+            Some("alice")
+        );
+        assert_eq!(peer_selector_for_network("box", "alice.lab.ray"), None);
     }
 
     fn net(name: &str) -> config::NetworkConfig {

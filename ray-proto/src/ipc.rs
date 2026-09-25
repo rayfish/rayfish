@@ -342,6 +342,10 @@ pub enum IpcMessage {
     ManagedMachineForget {
         machine: ManagedMachineSelector,
     },
+    /// Confirms an existing remote controller grant and issues its recovery receipt.
+    ManagedMachineConfirm {
+        machine: EndpointId,
+    },
     /// Asks an enrolled machine to join a network.
     DelegatedJoin {
         machine: ManagedMachineSelector,
@@ -1517,16 +1521,28 @@ pub struct PeerStatus {
 
 /// Three-state peer liveness for `ray status`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
 )]
 pub enum PeerState {
     /// A live mesh connection to the peer exists right now.
+    #[display("active")]
     Active,
     /// No live connection, but no failed reach either: presumed reachable (dialed
     /// lazily on demand). The optimistic default for a freshly booted node.
     #[default]
+    #[display("idle")]
     Idle,
     /// A recent reach attempt failed and wasn't cleared by a later success.
+    #[display("offline")]
     Offline,
 }
 
@@ -1542,11 +1558,24 @@ pub struct ConnectionInfo {
     pub lost_packets: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
+)]
 pub enum ConnType {
+    #[display("direct")]
     Direct,
+    #[display("relay")]
     Relay,
+    #[display("tor")]
     Tor,
+    #[display("unknown")]
     Unknown,
 }
 
@@ -1579,7 +1608,7 @@ pub const LOG_CHUNK_BYTES: usize = MAX_FRAME_LEN / 4;
 /// other does not know; a named map is what makes that free, and it is why
 /// `skip_serializing_if` is still safe on the types below.
 ///
-/// The network wire made the opposite choice (see CLAUDE.md): it is
+/// The network wire made the opposite choice (see the Wire protocol section in `AGENTS.md`): it is
 /// array-encoded, gated on an ALPN, and a `skip_serializing_if` there shifts
 /// every later field into the wrong slot. `HostSuggestions` crosses both
 /// boundaries and so carries no skips at all.

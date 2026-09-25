@@ -93,6 +93,7 @@ use crate::transport;
 // where the packet interface is a `VpnService` fd supplied from Kotlin.
 #[cfg(not(target_os = "android"))]
 use crate::tun;
+use crate::tun::{TunRead, TunWrite};
 use ray_proto::SuggestedFirewall;
 use smol_str::SmolStr;
 
@@ -222,6 +223,8 @@ pub(crate) use mesh::*;
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
+#[cfg(unix)]
+pub use mesh::start_embedded_ipc;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
@@ -348,6 +351,10 @@ impl MeshCtx {
         network: &str,
     ) -> bool {
         let ipv6 = derive_ipv6(&peer_id);
+        // A fresh invite or approval can legitimately return a previously
+        // removed identity at once. Its successful authenticated registration
+        // supersedes the old one-shot reconnect suppression.
+        self.pruned_peers.remove(&(network.to_string(), peer_id));
         // Keep the roster route map current with every peer we connect to, so a
         // later idle teardown can re-dial it on demand (reconverge covers the
         // roster-wide sync + removals; this is the incremental add).
@@ -531,6 +538,88 @@ pub(crate) struct PendingJoin {
     pub(crate) requested_at: Instant,
 }
 
+/// Resolve an exact hostname or an unambiguous identity prefix from a small
+/// user-visible queue. Exact names win, which keeps a hostname made only of hex
+/// digits usable even when it also happens to prefix an identity.
+pub(crate) fn resolve_named_identity(
+    selector: &str,
+    candidates: impl IntoIterator<Item = (EndpointId, Option<String>)>,
+) -> Result<Option<EndpointId>, ()> {
+    let candidates: Vec<_> = candidates.into_iter().collect();
+    let names: Vec<EndpointId> = candidates
+        .iter()
+        .filter(|(_, hostname)| hostname.as_deref() == Some(selector))
+        .map(|(identity, _)| *identity)
+        .collect();
+    match names.as_slice() {
+        [identity] => return Ok(Some(*identity)),
+        [] => {}
+        _ => return Err(()),
+    }
+
+    let identities: Vec<EndpointId> = candidates
+        .iter()
+        .filter(|(identity, _)| {
+            identity.to_string().starts_with(selector)
+                || identity.fmt_short().to_string().starts_with(selector)
+        })
+        .map(|(identity, _)| *identity)
+        .collect();
+    match identities.as_slice() {
+        [] => Ok(None),
+        [identity] => Ok(Some(*identity)),
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod named_identity_tests {
+    use super::*;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut bytes = [0; 32];
+        bytes[0] = seed;
+        SecretKey::from(bytes).public()
+    }
+
+    #[test]
+    fn resolves_exact_name_or_unambiguous_identity_prefix() {
+        let alice = id(1);
+        let bob = id(2);
+        let candidates = || {
+            vec![
+                (alice, Some("alice".to_string())),
+                (bob, Some("bob".to_string())),
+            ]
+        };
+
+        assert_eq!(
+            resolve_named_identity("alice", candidates()),
+            Ok(Some(alice))
+        );
+        assert_eq!(
+            resolve_named_identity(&bob.fmt_short().to_string(), candidates()),
+            Ok(Some(bob))
+        );
+        assert_eq!(resolve_named_identity("missing", candidates()), Ok(None));
+        assert_eq!(resolve_named_identity("", candidates()), Err(()));
+    }
+
+    #[test]
+    fn rejects_duplicate_names() {
+        assert_eq!(
+            resolve_named_identity(
+                "same",
+                [
+                    (id(1), Some("same".to_string())),
+                    (id(2), Some("same".to_string()))
+                ],
+            ),
+            Err(())
+        );
+    }
+}
+
 impl NetworkState {
     /// Snapshot the current member roster as an owned `Vec` (the members map is
     /// the single source of truth; callers take a copy to release the lock).
@@ -555,6 +644,9 @@ impl NetworkState {
     }
 
     fn refresh_snapshot(&mut self) {
+        self.pending.retain(|identity, _| {
+            !self.members.is_member(identity) && !self.approved.is_approved(identity)
+        });
         let bytes = canonical_group_bytes(
             &self.members,
             &self.approved,
@@ -813,7 +905,7 @@ impl Daemon {
     /// stale session while the rebuilt endpoint (same node key) comes up and the
     /// device shows offline until the race clears.
     ///
-    /// Shutting the protocol router down first is what releases the blob store,
+    /// Shutting the protocol router down is what releases the blob store,
     /// and it is not optional for an embedder either: `Router::shutdown` is the
     /// only thing that drives `BlobsProtocol::shutdown` -> `Store::shutdown`,
     /// which is what drops the store's redb `Database` and with it the exclusive
@@ -821,23 +913,31 @@ impl Daemon {
     /// a second open does not fail, it waits: the next `build_headless` in the
     /// same process then blocks until whatever eventually drops the old store
     /// does, if anything does, which on mobile is how a disabled node never comes
-    /// back. The explicit `endpoint.close()` after it is the same idempotent
-    /// backstop the desktop tail keeps.
+    /// back. Close the endpoint concurrently so connection termination does not
+    /// wait for the store to flush. Both must finish before this call returns.
     ///
     /// After this the `Daemon` is spent; build a new one to come back online.
     pub async fn shutdown_and_close(&self) {
+        let started = Instant::now();
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
+        self.management.stop_announcements().await;
         // The DNS background tasks run on bare `tokio::spawn`s that observe their
         // own tokens, not `shutdown_token`, so cancelling the token above does not
         // reach them. They also hold an `Arc<DnsService>`, which on an embedder
         // that rebuilds a daemon in the same process keeps the whole dead service
         // alive; see `DnsService::shutdown_background`.
         self.dns.shutdown_background();
-        let _ = self.router.shutdown().await;
-        self.transport.endpoint.close().await;
-        tracing::info!("shutdown: router stopped, blob store released, endpoint closed");
+        let (router_result, ()) =
+            tokio::join!(self.router.shutdown(), self.transport.endpoint.close(),);
+        if let Err(error) = router_result {
+            tracing::warn!(%error, "shutdown: protocol router failed");
+        }
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "shutdown: router stopped, blob store released, endpoint closed"
+        );
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
@@ -965,6 +1065,24 @@ impl Daemon {
         }
     }
 
+    /// Start forwarding through an interface whose link, routes, and DNS are
+    /// already configured by the embedder (for example, NetworkExtension).
+    /// Unlike `activate`, this does not change the host network configuration.
+    /// Stop it with `detach_tun` before the embedder removes the interface.
+    pub async fn attach_external_tun<R: TunRead, W: TunWrite>(
+        self: &Arc<Self>,
+        reader: R,
+        writer: W,
+    ) {
+        self.attach_tun(reader, writer).await;
+        self.active.store(true, Ordering::SeqCst);
+        #[cfg(feature = "desktop")]
+        if config::load().is_ok_and(|settings| settings.ssh_enabled) {
+            self.start_ssh();
+        }
+        self.registry.poll_nudge.notify_waiters();
+    }
+
     /// Part of the embedding API (used by `ray-mobile`'s `down`): stop the
     /// packet-forwarding data plane started by [`attach_tun`] (the TUN writer and
     /// the `run_mesh` reader loop) WITHOUT tearing down the control plane. The
@@ -974,6 +1092,8 @@ impl Daemon {
     /// child token and aborting the tasks drops the reader/writer, closing the
     /// underlying fds. Idempotent: a no-op if no interface is attached.
     pub fn detach_tun(&self) {
+        #[cfg(feature = "desktop")]
+        self.stop_ssh();
         self.active
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
@@ -1724,6 +1844,35 @@ mod accept_handler_tests {
         assert_eq!(blob.name.as_deref(), Some("signed-network-name"));
     }
 
+    #[test]
+    fn roster_refresh_clears_requests_approved_by_another_coordinator() {
+        let state = make_network_state();
+        let mut state = state.write().unwrap();
+        let approved = SecretKey::from_bytes(&[41; 32]).public();
+        let joined = SecretKey::from_bytes(&[42; 32]).public();
+        let waiting = SecretKey::from_bytes(&[43; 32]).public();
+        for identity in [approved, joined, waiting] {
+            state.pending.insert(
+                identity,
+                PendingJoin {
+                    hostname: None,
+                    device_cert: None,
+                    requested_at: Instant::now(),
+                },
+            );
+        }
+        state.approved.approve(ApprovedEntry {
+            identity: approved,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
+        state.members.add(seated(joined));
+        state.refresh_snapshot();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.contains_key(&waiting));
+    }
+
     /// Convergence is tracked as the hash we accepted, not the hash of our own
     /// re-encoding, and the two differ whenever the publisher writes bytes we
     /// would not.
@@ -1972,6 +2121,67 @@ mod accept_handler_tests {
         ))
     }
 
+    #[cfg(feature = "desktop")]
+    #[tokio::test]
+    async fn authorization_uses_identity_memberships_not_connection_handles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = sample_test_endpoint().await;
+        let registry = sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            FsStore::load(tmp.path()).await.unwrap(),
+            endpoint.id(),
+        );
+        let user = SecretKey::from_bytes(&[41; 32]).public();
+        let device = SecretKey::from_bytes(&[42; 32]).public();
+        let stranger = SecretKey::from_bytes(&[43; 32]).public();
+        registry.device_user_map.insert(device, user);
+        let box_state = make_network_state();
+        let field_state = make_network_state();
+        for (name, state) in [("box", &box_state), ("field", &field_state)] {
+            state.write().unwrap().members.add(seated(user));
+            registry.networks.insert(
+                name.into(),
+                NetworkHandle {
+                    name: name.into(),
+                    network_key: state.read().unwrap().network_public_key,
+                    role: NetworkRole::Coordinator,
+                    state: Arc::clone(state),
+                    dht_notify: None,
+                    cancel: CancellationToken::new(),
+                    tasks: Vec::new(),
+                    invite_lock: Arc::new(AsyncMutex::new(())),
+                    incompatible: None,
+                },
+            );
+        }
+        // No transport handles are needed to decide this identity's scope.
+        let networks = || {
+            let mut names = registry.authorization_networks(device);
+            names.sort();
+            names
+        };
+        assert_eq!(networks(), ["box", "field"]);
+        assert!(registry.authorization_networks(stranger).is_empty());
+
+        // An immediate prune overrides even a roster not yet republished.
+        registry.pruned_peers.insert(("box".into(), device));
+        assert_eq!(networks(), ["field"]);
+        registry.pruned_peers.remove(&("box".into(), device));
+
+        // A revoked device cannot inherit its still-authorized user's grant.
+        box_state.write().unwrap().nullifiers.insert(device);
+        assert_eq!(networks(), ["field"]);
+        box_state.write().unwrap().nullifiers.remove(&device);
+        assert_eq!(networks(), ["box", "field"]);
+
+        box_state.write().unwrap().members = MemberList::new();
+        assert_eq!(networks(), ["field"]);
+        registry.networks.remove("field");
+        assert!(networks().is_empty());
+        endpoint.close().await;
+    }
+
     async fn sample_member_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
@@ -2005,6 +2215,240 @@ mod accept_handler_tests {
     /// (the handler is only inspected for its variant, never driven).
     async fn sample_test_endpoint() -> Endpoint {
         Endpoint::bind(iroh::endpoint::presets::N0).await.unwrap()
+    }
+
+    mod disconnect_recovery_tests {
+        use super::*;
+        use iroh::RelayMode;
+        use iroh::address_lookup::memory::MemoryLookup;
+        use iroh::endpoint::presets;
+        use tokio::time::timeout;
+
+        #[derive(Clone, Copy)]
+        enum Successor {
+            Missing,
+            BeforeDisconnect,
+            DuringBackoff,
+        }
+
+        async fn check_recovery(
+            reason: forward::CloseReason,
+            successor: Successor,
+            expect_dial: bool,
+        ) {
+            let alpn = transport::mesh_alpn();
+            let lookup = MemoryLookup::new();
+            let local = Endpoint::builder(presets::N0)
+                .alpns(vec![alpn.clone()])
+                .relay_mode(RelayMode::Disabled)
+                .address_lookup(lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            let remote = Endpoint::builder(presets::N0)
+                .alpns(vec![alpn.clone()])
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap();
+            lookup.add_endpoint_info(remote.addr());
+            let (conn, remote_conn) = timeout(Duration::from_secs(5), async {
+                tokio::join!(local.connect(remote.addr(), &alpn), async {
+                    remote.accept().await.unwrap().await.unwrap()
+                })
+            })
+            .await
+            .expect("initial loopback connection completes");
+            let conn = conn.unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let store = FsStore::load(tmp.path()).await.unwrap();
+            let registry = sample_registry(
+                local.clone(),
+                IrohIdentityProvider::new(local.id()),
+                store.clone(),
+                local.id(),
+            );
+            let peer_ip = derive_ipv6(&remote.id());
+            registry
+                .peers
+                .add(peer_ip, conn.clone(), remote.id(), "test-net");
+            let state = make_network_state();
+            state.write().unwrap().members.add(seated(remote.id()));
+            registry.networks.insert(
+                "test-net".to_string(),
+                NetworkHandle {
+                    name: "test-net".to_string(),
+                    network_key: state.read().unwrap().network_public_key,
+                    role: NetworkRole::Member,
+                    state: Arc::clone(&state),
+                    dht_notify: None,
+                    cancel: CancellationToken::new(),
+                    tasks: Vec::new(),
+                    invite_lock: Arc::new(AsyncMutex::new(())),
+                    incompatible: None,
+                },
+            );
+            let code = match reason {
+                forward::CloseReason::Replaced => forward::REPLACED_CONNECTION_CODE,
+                forward::CloseReason::Idle => forward::IDLE_CODE,
+                _ => 0,
+            };
+            remote_conn.close(VarInt::from_u32(code), b"disconnect recovery test");
+            timeout(Duration::from_secs(2), conn.closed())
+                .await
+                .unwrap();
+
+            // Keep both ends of the successor alive through the retry window.
+            let register_successor = async {
+                let (new_conn, peer_conn) = timeout(Duration::from_secs(5), async {
+                    tokio::join!(local.connect(remote.addr(), &alpn), async {
+                        remote.accept().await.unwrap().await.unwrap()
+                    })
+                })
+                .await
+                .expect("successor connects");
+                let new_conn = new_conn.unwrap();
+                registry
+                    .peers
+                    .add(peer_ip, new_conn.clone(), remote.id(), "test-net");
+                (new_conn, peer_conn)
+            };
+            tokio::pin!(register_successor);
+            let mut replacement = if matches!(successor, Successor::BeforeDisconnect) {
+                Some(register_successor.as_mut().await)
+            } else {
+                None
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let token = registry.shutdown_token.clone();
+            let supervisor =
+                tokio::spawn(Arc::clone(&registry).run_connection_supervisor(rx, token));
+            tx.send(forward::DisconnectEvent {
+                endpoint_id: remote.id(),
+                ipv6: peer_ip,
+                reason,
+                conn_stable_id: Some(conn.stable_id()),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            timeout(Duration::from_secs(2), supervisor)
+                .await
+                .unwrap()
+                .unwrap();
+
+            if replacement.is_none() {
+                assert!(
+                    registry.peers.conn_for_ip(&peer_ip).is_none(),
+                    "closed route is removed"
+                );
+            }
+            if matches!(successor, Successor::DuringBackoff) {
+                replacement = Some(register_successor.as_mut().await);
+            }
+            // With no packet traffic, only the supervisor can start this dial.
+            // Observe the incoming attempt without accepting it: the test does
+            // not need a second protocol router or a real TUN interface.
+            let incoming = timeout(Duration::from_secs(3), remote.accept()).await;
+            let attempted = matches!(&incoming, Ok(Some(_)));
+            if let Ok(Some(incoming)) = incoming {
+                incoming.refuse();
+            }
+            if let Some((new_conn, _)) = &replacement {
+                assert!(
+                    registry
+                        .peers
+                        .conn_is_current(&peer_ip, new_conn.stable_id())
+                );
+                assert!(new_conn.close_reason().is_none(), "successor stays live");
+            }
+            registry.shutdown_token.cancel();
+            local.close().await;
+            remote.close().await;
+            store.shutdown().await.unwrap();
+            assert_eq!(attempted, expect_dial, "recovery after {reason:?}");
+        }
+
+        #[tokio::test]
+        async fn replaced_without_a_successor_retries() {
+            check_recovery(forward::CloseReason::Replaced, Successor::Missing, true).await;
+        }
+
+        #[tokio::test]
+        async fn transient_disconnect_still_retries() {
+            check_recovery(forward::CloseReason::Transient, Successor::Missing, true).await;
+        }
+
+        #[tokio::test]
+        async fn stale_disconnect_preserves_ready_successor() {
+            check_recovery(
+                forward::CloseReason::Replaced,
+                Successor::BeforeDisconnect,
+                false,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn retry_reuses_successor_that_arrives_during_backoff() {
+            check_recovery(
+                forward::CloseReason::Replaced,
+                Successor::DuringBackoff,
+                false,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn deliberate_idle_disconnect_does_not_retry() {
+            check_recovery(forward::CloseReason::Idle, Successor::Missing, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_rejoin_clears_reconnect_suppression() {
+        let alpn = transport::mesh_alpn();
+        let local = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let remote = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let accept = {
+            let remote = remote.clone();
+            tokio::spawn(async move { remote.accept().await.unwrap().await.unwrap() })
+        };
+        let conn = local.connect(remote.addr(), &alpn).await.unwrap();
+        let remote_conn = accept.await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsStore::load(tmp.path()).await.unwrap();
+        let registry = sample_registry(
+            local.clone(),
+            IrohIdentityProvider::new(local.id()),
+            store.clone(),
+            local.id(),
+        );
+        let ctx = sample_mesh_ctx(IrohIdentityProvider::new(local.id()), store, registry);
+        let peer_id = conn.remote_id();
+        ctx.pruned_peers
+            .insert(("test-network".to_string(), peer_id));
+
+        ctx.register_peer_conn(&conn, peer_id, "test-network");
+
+        assert!(
+            !ctx.pruned_peers
+                .contains(&("test-network".to_string(), peer_id))
+        );
+        conn.close(VarInt::from_u32(0), b"test done");
+        remote_conn.close(VarInt::from_u32(0), b"test done");
+        local.close().await;
+        remote.close().await;
     }
 
     #[tokio::test]
@@ -2925,6 +3369,30 @@ mod headless_tests {
         );
     }
 
+    /// A signed roster is the authority for membership. When it no longer lists
+    /// this node, the network must disappear from saved state as well as the live
+    /// runtime, or the dashboard keeps showing it and startup tries to restore it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kicked_network_is_removed_from_saved_state() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
+        config::save_network(&config::empty_network_config("test-network")).unwrap();
+
+        daemon.registry.remove_kicked_network("test-network").await;
+
+        let saved = config::load().unwrap();
+        assert!(saved.networks.iter().all(|net| net.name != "test-network"));
+        daemon.shutdown_and_close().await;
+    }
+
     /// A stopped node must be rebuildable in the same process, which is the
     /// mobile disable/enable cycle (`Node::stop` then `Node::start`, both in one
     /// app process).
@@ -3114,8 +3582,6 @@ mod headless_tests {
                 .expect("build_headless should not hang")
                 .expect("build_headless should succeed");
 
-        use std::sync::atomic::Ordering;
-
         // Helper: send one packet through the same `tun_tx` cell the peer-reader
         // and DNS-injection paths use, then wait for the given writer to see it.
         async fn send_pkt(daemon: &Arc<DaemonState>, pkt: &'static [u8]) {
@@ -3144,14 +3610,17 @@ mod headless_tests {
         let writer1 = FakeTunWriter::default();
         let sink1 = Arc::clone(&writer1.written);
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::new(()),
                 },
                 writer1,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            daemon.status(),
+            IpcMessage::StatusResponse { active: true, .. }
+        ));
 
         send_pkt(&daemon, b"packet-1").await;
         assert!(
@@ -3162,6 +3631,10 @@ mod headless_tests {
         // 2. Toggle: detach, then re-attach reader2 + writer2. This is the path
         //    that used to silently break before the fresh-channel-per-attach fix.
         daemon.detach_tun();
+        assert!(matches!(
+            daemon.status(),
+            IpcMessage::StatusResponse { active: false, .. }
+        ));
         let writer2 = FakeTunWriter {
             mtu: Some(1280),
             ..Default::default()
@@ -3169,14 +3642,13 @@ mod headless_tests {
         let sink2 = Arc::clone(&writer2.written);
         let alive2 = Arc::new(());
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::clone(&alive2),
                 },
                 writer2,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
 
         // A packet queued across the MTU change must not reach the smaller TUN.
         // The small packet acts as a barrier after the oversized packet.
@@ -3198,14 +3670,13 @@ mod headless_tests {
         let writer3 = FakeTunWriter::default();
         let sink3 = Arc::clone(&writer3.written);
         daemon
-            .attach_tun(
+            .attach_external_tun(
                 FakeTunReader {
                     _alive: Arc::new(()),
                 },
                 writer3,
             )
             .await;
-        daemon.active.store(true, Ordering::SeqCst);
 
         send_pkt(&daemon, b"packet-3").await;
         assert_eq!(daemon.registry.peers.local_mtu(), 1500);

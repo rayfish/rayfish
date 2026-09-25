@@ -48,3 +48,5 @@ pub(crate) use select::*;
 pub use bootstrap::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use bootstrap::build_headless;
+#[cfg(unix)]
+pub use bootstrap::start_embedded_ipc;

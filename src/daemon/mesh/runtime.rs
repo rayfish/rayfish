@@ -515,10 +515,9 @@ impl NetworkRegistry {
             ));
         }
 
-        // Resolve the argument to a roster member. `resolve_peer_name` may hand
-        // back a transport id or a user identity; match either against the stored
-        // member key (which is the user identity for a paired peer).
-        let candidate = match self.resolve_peer_name(peer).await {
+        // Resolve within the named roster so the same hostname on another
+        // network cannot select the wrong member.
+        let candidate = match self.resolve_peer_in_network(network, peer) {
             Some(id) => id,
             None => {
                 return ipc_err(format!("could not resolve peer '{peer}'"));
@@ -530,8 +529,8 @@ impl NetworkRegistry {
         // It used to take the first: naming a paired secondary resolved to its
         // primary, and since the primary's row is normally seated earlier,
         // `ray kick <phone>` removed the *laptop* and left the phone in place.
-        // The victim's own row is matched too, so a device with no live pairing
-        // (a stale row from a reinstall) is still kickable by its own id.
+        // The removed member's own row is matched too, so a device with no live
+        // pairing (a stale row from a reinstall) is still kickable by its own id.
         let (targets, is_coord, display) = {
             let s = state.read().unwrap();
             match kick_targets(&s.members, candidate, candidate_user) {
@@ -582,23 +581,23 @@ impl NetworkRegistry {
 
         // The two calls the ephemeral pruner makes, which is what
         // `remove_member_roster_only`'s doc has always claimed the manual kick
-        // shared with it. It did not: this path closed the victim's connection
-        // with `KICK_CODE` instead, and a close code cannot name a network, so it
-        // is not a kick the victim can act on. `confirm_kick_and_leave` runs off
-        // the in-band, network-scoped `ControlMsg::KickedFromNetwork`, which only
-        // `finalize_removal` sends; without it the victim learned of its own
-        // removal from the group poll, whose `Departed` outcome does nothing but
-        // stop polling, leaving the network in `ray status` with a roster frozen
-        // at the kick. `finalize_removal` also deliberately leaves the connection
-        // open, so the message cannot lose a race with its own teardown.
+        // shared with it. It did not: this path closed the removed member's
+        // connection with `KICK_CODE` instead, and a close code cannot name a
+        // network, so it is not a kick the removed member can act on.
+        // `confirm_kick_and_leave` runs off the in-band, network-scoped
+        // `ControlMsg::KickedFromNetwork`, which only
+        // `finalize_removal` sends. The signed-record poll remains the fallback
+        // when that best-effort message is missed. `finalize_removal` revokes the
+        // local route before publishing and closes the transport after the notice
+        // when no other authorized network shares it.
         let ctx = self.mesh_ctx();
         for member_id in &targets {
             remove_member_roster_only(&ctx, network, &state, *member_id, derive_ipv6(member_id))
                 .await;
         }
         // One finalize for the whole set: it publishes the snapshot once and
-        // sends every victim its own `KickedFromNetwork`, so a person and their
-        // devices leave on the same record rather than on N republished ones.
+        // sends every removed member its own `KickedFromNetwork`, so a person and
+        // their devices leave on the same record rather than on N republished ones.
         finalize_removal(&ctx, network, &state, &dht_notify, &targets).await;
 
         for member_id in &targets {
@@ -1071,11 +1070,8 @@ impl Daemon {
         drop(guard);
         self.rebuild_ssh_authz();
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
-        let server = crate::ssh::SshServer::new(
-            self.registry.peers.clone(),
-            self.registry.device_user_map.clone(),
-            Arc::clone(&self.ssh_authz),
-        );
+        let server =
+            crate::ssh::SshServer::new(Arc::clone(&self.registry), Arc::clone(&self.ssh_authz));
         // The overlay carries no IPv4, so there is one address to bind and it is
         // the derived mesh IPv6.
         let binds = vec![IpAddr::V6(my_v6)];

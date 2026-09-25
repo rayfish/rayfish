@@ -8,8 +8,10 @@
 //! cryptographically identified by the QUIC mesh link, and the kernel TCP stack
 //! delivers the connection with the peer's mesh IP as the socket source (the
 //! ingress anti-spoof check in [`crate::forward`] guarantees that IP is really
-//! the peer's). We map that IP back to the peer identity via [`PeerTable`] and
+//! the peer's). We map that IP back to the peer identity via [`crate::peers::PeerTable`] and
 //! admit the session iff the peer is in a shared network's `ssh_allow` list.
+//! Grants are checked across verified memberships, not the network handles on
+//! the current connection. Reconnecting through another network cannot hide a grant.
 //!
 //! Authorization is the only gate; SSH auth itself is the `none` method (the
 //! identity is already proven). Which local accounts a peer may log in as comes
@@ -90,7 +92,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::peers::{DeviceUserMap, PeerTable};
+use crate::daemon::NetworkRegistry;
 pub use authz::{SshAuthz, new_authz};
 use authz::{UserPolicy, auth_banner, resolve_user_policy};
 use host_keys::{load_host_key, sftp_subsystem_command};
@@ -156,18 +158,13 @@ fn server_config(key: PrivateKey) -> Config {
 /// Handle to a running SSH server so the daemon can stop it on `ray down` /
 /// `ssh off`. Dropping or cancelling the token tears down every listener.
 pub struct SshServer {
-    peers: PeerTable,
-    device_user_map: DeviceUserMap,
+    registry: Arc<NetworkRegistry>,
     authz: SshAuthz,
 }
 
 impl SshServer {
-    pub fn new(peers: PeerTable, device_user_map: DeviceUserMap, authz: SshAuthz) -> Self {
-        Self {
-            peers,
-            device_user_map,
-            authz,
-        }
+    pub(crate) fn new(registry: Arc<NetworkRegistry>, authz: SshAuthz) -> Self {
+        Self { registry, authz }
     }
 
     /// Spawn a listener on each mesh address (at [`SSH_LISTEN_PORT`]). Runs until
@@ -193,8 +190,7 @@ impl SshServer {
                     }
                 };
                 info!(%addr, port = SSH_LISTEN_PORT, "mesh SSH listening (reachable as :22)");
-                let peers = self.peers.clone();
-                let dum = self.device_user_map.clone();
+                let registry = Arc::clone(&self.registry);
                 let authz = Arc::clone(&self.authz);
                 let config = Arc::clone(&config);
                 let token = token.clone();
@@ -209,11 +205,10 @@ impl SshServer {
                                 };
                                 disable_nagle(&stream);
                                 let config = Arc::clone(&config);
-                                let peers = peers.clone();
-                                let dum = dum.clone();
+                                let registry = Arc::clone(&registry);
                                 let authz = Arc::clone(&authz);
                                 tokio::spawn(async move {
-                                    handle_conn(stream, peer, config, peers, dum, authz).await;
+                                    handle_conn(stream, peer, config, registry, authz).await;
                                 });
                             }
                         }
@@ -247,11 +242,10 @@ fn disable_nagle(stream: &TcpStream) {
 
 /// Resolve the connecting peer, decide authorization, and run the SSH session.
 async fn handle_conn(
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: Arc<Config>,
-    peers: PeerTable,
-    device_user_map: DeviceUserMap,
+    registry: Arc<NetworkRegistry>,
     authz: SshAuthz,
 ) {
     // The mesh listener only ever binds our own overlay address, so a session
@@ -260,11 +254,12 @@ async fn handle_conn(
         debug!(peer = %peer.ip(), "mesh SSH: non-IPv6 source on the mesh listener, dropping");
         return;
     };
-    let Some((peer_id, networks)) = peers.identity_and_networks(&src) else {
+    let Some(peer_id) = registry.peers.identity_for_ip(&src) else {
         debug!(%src, "mesh SSH: connection from unknown mesh IP, dropping");
         return;
     };
-    let user_identity = device_user_map.resolve(&peer_id);
+    let user_identity = registry.device_user_map.resolve(&peer_id);
+    let networks = registry.authorization_networks(peer_id);
     let policy = resolve_user_policy(&authz, &user_identity, &networks);
     // Logged before the handshake, and with the source port, so a session that
     // stalls before it authenticates (and so logs nothing else) is still

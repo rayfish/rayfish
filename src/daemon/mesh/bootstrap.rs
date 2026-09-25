@@ -95,17 +95,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     let result = serve_ipc(&daemon, token).await;
 
-    // Shut the protocol Router down, then close the iroh endpoint, before
-    // returning. `Router::shutdown` stops accepting, drains its handlers, and
-    // closes the endpoint itself; the explicit close is a harmless idempotent
-    // backstop. Dropping the endpoint without closing logs "Endpoint dropped
-    // without calling `Endpoint::close`. Aborting ungracefully." and can leave
-    // the process lingering until the service manager escalates to SIGKILL, which
-    // delays the relaunch on `ray restart`/`ray update` past the client's
-    // reachability probe. A clean close lets QUIC connections terminate and the
-    // process exit promptly so the new daemon comes up fast.
-    let _ = daemon.router.shutdown().await;
-    daemon.transport.endpoint.close().await;
+    // Close connections while protocol handlers flush their persistent state.
+    daemon.shutdown_and_close().await;
 
     result
 }
@@ -121,7 +112,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 /// `ray send` / `ray connect`, otherwise the initial handshake fails with "peer
 /// doesn't support any known protocol" until the first create/join triggers
 /// `refresh_alpns()`.
-fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
+fn initial_alpns() -> Vec<Vec<u8>> {
     // Each mesh version carries every network, so this set is independent of
     // the saved networks.
     let mut alpns = transport::mesh_alpns();
@@ -131,6 +122,7 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
         PAIR_ALPN.to_vec(),
         transport::CONNECT_ALPN.to_vec(),
         crate::management::ALPN.to_vec(),
+        crate::management::LEGACY_ALPN.to_vec(),
     ]);
     alpns
 }
@@ -252,7 +244,7 @@ async fn build_daemon_inner(
         Some(id) => id,
         None => config::contact_secret(&mut app_config).public(),
     };
-    let alpns = initial_alpns(&app_config);
+    let alpns = initial_alpns();
     #[cfg(target_os = "android")]
     let relay_mode =
         transport::build_relay_mode(&app_config.relay)?.unwrap_or_else(|| iroh::RelayMode::Default);
@@ -609,6 +601,7 @@ async fn build_daemon_inner(
     let management = Arc::new(ManagementService::new(
         Arc::clone(&transport),
         Arc::clone(&registry),
+        key.clone(),
     ));
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
@@ -682,6 +675,10 @@ async fn build_daemon_inner(
     // The Router owns the endpoint accept loop and dispatches by ALPN. It aborts on
     // drop, so the Daemon owns it for the process lifetime and shuts it down on exit.
     let router = protocol_router.build_router(transport.endpoint.clone());
+    // The router sorts its ALPN map. Restore our preference order so peers that
+    // offer both management versions negotiate v2 and receive recovery receipts.
+    transport.endpoint.set_alpns(initial_alpns());
+    management.start_announcements(token.clone());
 
     // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
     // stops the export); built here from the local handles so it can be a plain
@@ -850,30 +847,129 @@ async fn spawn_metrics_server(
 /// handled on its own task so a slow client can't block the accept loop.
 #[cfg(unix)]
 async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()> {
-    let socket_path = ipc::socket_path();
-    if let Some(parent) = socket_path.parent() {
+    let socket = bind_ipc_socket(&ipc::socket_path()).await?;
+    let result = accept_ipc(socket, daemon, token, IpcHost::Daemon).await;
+    daemon.deactivate().await;
+    result
+}
+
+/// Serve the standard CLI protocol for an OS-owned packet tunnel.
+/// Bind before returning so startup failures reach the host. The task exits and
+/// removes its socket when `shutdown_and_close` cancels the node's token.
+#[cfg(unix)]
+pub async fn start_embedded_ipc(daemon: &Arc<Daemon>, owner_uid: u32) -> Result<JoinHandle<()>> {
+    let socket = bind_ipc_socket(&ipc::socket_path()).await?;
+    let daemon = Arc::clone(daemon);
+    Ok(tokio::spawn(async move {
+        if let Err(error) = accept_ipc(
+            socket,
+            &daemon,
+            daemon.shutdown_token.clone(),
+            IpcHost::PacketTunnel { owner_uid },
+        )
+        .await
+        {
+            tracing::warn!(%error, "packet tunnel IPC stopped");
+        }
+    }))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum IpcHost {
+    Daemon,
+    PacketTunnel { owner_uid: u32 },
+}
+
+#[cfg(unix)]
+impl IpcHost {
+    fn check_authorized(self, req: &IpcMessage, peer: Option<&PeerIdentity>) -> Option<IpcMessage> {
+        let Self::PacketTunnel { owner_uid } = self else {
+            return Daemon::check_authorized(req, peer);
+        };
+        if Daemon::is_open_read(req) {
+            return None;
+        }
+        if matches!(req, IpcMessage::SetOperator { .. }) {
+            return Some(ipc_err(
+                "The Rayfish app manages access to its packet tunnel; no operator setting is needed",
+            ));
+        }
+        if peer.is_some_and(
+            |peer| matches!(peer, PeerIdentity::Unix { uid, .. } if *uid == 0 || *uid == owner_uid),
+        ) {
+            return None;
+        }
+        Some(ipc_err(
+            "permission denied: run ray as the macOS user who connected the Rayfish app",
+        ))
+    }
+}
+
+#[cfg(unix)]
+struct IpcSocket {
+    listener: UnixListener,
+    path: PathBuf,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl Drop for IpcSocket {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.inode) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn bind_ipc_socket(path: &Path) -> Result<IpcSocket> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        anyhow::ensure!(metadata.file_type().is_socket(), "IPC path is not a socket");
+        match UnixStream::connect(path).await {
+            Ok(_) => anyhow::bail!("another Rayfish instance is already listening"),
+            Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path)?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
-    let listener = UnixListener::bind(&socket_path).context("failed to bind IPC socket")?;
-    set_socket_permissions(&socket_path);
-    tracing::info!(path = %socket_path.display(), "IPC socket listening");
+    let listener = UnixListener::bind(path).context("failed to bind IPC socket")?;
+    let inode = std::fs::symlink_metadata(path)?.ino();
+    set_socket_permissions(path);
+    tracing::info!(path = %path.display(), "IPC socket listening");
+    Ok(IpcSocket {
+        listener,
+        path: path.to_path_buf(),
+        inode,
+    })
+}
 
+#[cfg(unix)]
+async fn accept_ipc(
+    socket: IpcSocket,
+    daemon: &Arc<Daemon>,
+    token: CancellationToken,
+    host: IpcHost,
+) -> Result<()> {
     loop {
         tokio::select! {
             _ = token.cancelled() => {
-                tracing::info!("daemon shutting down");
-                daemon.deactivate().await;
-                let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
             }
-            result = listener.accept() => match result {
+            result = socket.listener.accept() => match result {
                 Ok((stream, _)) => {
                     let daemon = Arc::clone(daemon);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_ipc_client(stream, &daemon).await {
+                        if let Err(e) = handle_ipc_client(stream, &daemon, host).await {
                             tracing::debug!(error = %e, "IPC client error");
                         }
                     });
@@ -889,13 +985,185 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
 /// in `check_authorized` via `SO_PEERCRED` (root or the configured operator
 /// UID), Tailscale's model, so the file mode only has to permit the connect().
 #[cfg(unix)]
-fn set_socket_permissions(path: &std::path::Path) {
+fn set_socket_permissions(path: &Path) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
     if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
         unsafe { libc::chmod(c_path.as_ptr(), 0o666) };
         tracing::info!("IPC socket mode 0666 (per-request authorization via peer creds)");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod embedded_ipc_tests {
+    use super::*;
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::ffi::OsString;
+
+    #[test]
+    fn packet_tunnel_uses_session_owner_not_daemon_operator() {
+        let host = IpcHost::PacketTunnel { owner_uid: 501 };
+        let owner = PeerIdentity::Unix { uid: 501, gid: 20 };
+        let other = PeerIdentity::Unix { uid: 502, gid: 20 };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        for request in [
+            IpcMessage::ApproveConnection { id: "30f07".into() },
+            IpcMessage::ConfigSet {
+                key: NodeKey::Global(GlobalKey::Ssh),
+                value: "on".into(),
+                replace: false,
+            },
+        ] {
+            assert!(host.check_authorized(&request, Some(&owner)).is_none());
+            assert!(host.check_authorized(&request, Some(&root)).is_none());
+            assert!(host.check_authorized(&request, Some(&other)).is_some());
+            assert!(host.check_authorized(&request, None).is_some());
+        }
+        assert!(
+            host.check_authorized(&IpcMessage::Status, Some(&other))
+                .is_none()
+        );
+        assert!(
+            host.check_authorized(&IpcMessage::SetOperator { uid: 502 }, Some(&root))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_ownership_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ray.sock");
+        let socket = bind_ipc_socket(&path).await.unwrap();
+        assert!(bind_ipc_socket(&path).await.is_err());
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(socket);
+        assert!(!path.exists());
+
+        // Leave a stale socket path without opening a listener that a concurrent
+        // subprocess could inherit between fork and exec.
+        let stale = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        stale.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        drop(stale);
+        let socket = bind_ipc_socket(&path).await.unwrap();
+        drop(socket);
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"keep").unwrap();
+        assert!(bind_ipc_socket(&path).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn socket_cleanup_preserves_a_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ray.sock");
+        let socket = bind_ipc_socket(&path).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = bind_ipc_socket(&path).await.unwrap();
+        drop(socket);
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(replacement);
+        assert!(!path.exists());
+    }
+
+    struct ConfigEnv(Option<OsString>);
+
+    impl Drop for ConfigEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                    None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    // The shared test lock protects process-wide environment for the whole node lifetime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cli_reads_embedded_status_and_leaves_tunnel_lifecycle_to_host() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv(std::env::var_os("RAYFISH_CONFIG_DIR"));
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", dir.path()) };
+        let daemon = tokio::time::timeout(Duration::from_secs(30), build_headless(true))
+            .await
+            .unwrap()
+            .unwrap();
+        let path = dir.path().join("ray.sock");
+        let socket = bind_ipc_socket(&path).await.unwrap();
+        let server_daemon = Arc::clone(&daemon);
+        let task = tokio::spawn(async move {
+            accept_ipc(
+                socket,
+                &server_daemon,
+                server_daemon.shutdown_token.clone(),
+                IpcHost::PacketTunnel {
+                    owner_uid: unsafe { libc::geteuid() },
+                },
+            )
+            .await
+        });
+
+        async fn request(path: &Path, message: IpcMessage) -> IpcMessage {
+            let mut stream = ipc::framed(UnixStream::connect(path).await.unwrap());
+            ipc::send(&mut stream, message).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), ipc::recv(&mut stream))
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        let (first, second) = tokio::join!(
+            request(&path, IpcMessage::Status),
+            request(&path, IpcMessage::Status)
+        );
+        for response in [first, second] {
+            assert!(matches!(response, IpcMessage::StatusResponse { .. }));
+        }
+        assert_eq!(config::load().unwrap().operator_uid, None);
+        let response = request(
+            &path,
+            IpcMessage::ConfigSet {
+                key: NodeKey::Global(GlobalKey::Ssh),
+                value: "off".into(),
+                replace: false,
+            },
+        )
+        .await;
+        assert!(matches!(response, IpcMessage::Ok { .. }));
+        let response = request(
+            &path,
+            IpcMessage::ApproveConnection {
+                id: "missing".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, IpcMessage::Error { message } if !message.contains("permission denied"))
+        );
+        for message in [
+            IpcMessage::Up { hostname: None },
+            IpcMessage::Down,
+            IpcMessage::Shutdown,
+        ] {
+            let response = request(&path, message).await;
+            assert!(
+                matches!(response, IpcMessage::Error { message } if message.contains("Rayfish app"))
+            );
+            assert!(!daemon.shutdown_token.is_cancelled());
+        }
+        daemon.shutdown_and_close().await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
     }
 }
 
@@ -917,7 +1185,7 @@ fn truncate(s: &str) -> String {
 }
 
 #[cfg(unix)]
-async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<()> {
+async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>, host: IpcHost) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| PeerIdentity::Unix {
         uid: c.uid(),
         gid: c.gid(),
@@ -956,7 +1224,7 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
     if let IpcMessage::Logs { since, follow } = &req {
         let (since, follow) = (*since, *follow);
         let mut framed = ipc::framed(stream);
-        if let Some(denied) = Daemon::check_authorized(&req, peer_cred.as_ref()) {
+        if let Some(denied) = host.check_authorized(&req, peer_cred.as_ref()) {
             let _ = ipc::send(&mut framed, denied).await;
             return Ok(());
         }
@@ -970,7 +1238,25 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
         .await;
     }
 
-    let resp = daemon.handle_request(req, peer_cred, fds).await;
+    // NetworkExtension owns the interface and its lifetime. Desktop lifecycle
+    // handlers would change routes/DNS outside that session.
+    let resp = if let Some(denied) = host.check_authorized(&req, peer_cred.as_ref()) {
+        denied
+    } else if matches!(host, IpcHost::PacketTunnel { .. })
+        && matches!(
+            req,
+            IpcMessage::Up { .. } | IpcMessage::Down | IpcMessage::Shutdown
+        )
+    {
+        ipc_err("Use the Rayfish app to connect, disconnect, or quit this packet tunnel")
+    } else {
+        match host {
+            IpcHost::Daemon => daemon.handle_request(req, peer_cred, fds).await,
+            IpcHost::PacketTunnel { .. } => {
+                daemon.handle_authorized_request(req, peer_cred, fds).await
+            }
+        }
+    };
     let mut framed = ipc::framed(stream);
     ipc::send(&mut framed, resp).await?;
     Ok(())

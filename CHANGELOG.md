@@ -8,12 +8,226 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- macOS notifies you about connection requests, network join requests, and incoming
+  files. Click a notification to review it; files can be saved or declined in the app.
+- macOS Settings can enable mesh SSH and manage which network peers may sign in
+  and which local accounts they may use.
+
+- **Windows has a desktop dashboard and tray app matching the macOS design.**
+  Closing its window leaves Rayfish in the notification area, where the VPN can
+  be connected, disconnected, reopened, or disconnected and quit.
+
+- **Windows and macOS can start Rayfish at login.** Enable it from Settings to
+  open the desktop app after signing in. The macOS app also connects the VPN.
+
+- **Managed machines restore missing controller inventory entries automatically.**
+  New enrollments keep a signed receipt and announce themselves at startup and
+  reconnect, with retries every five minutes. `ray machines confirm <endpoint-id>`
+  enables recovery for an existing machine that already trusts this controller.
+  Explicitly forgotten machines stay forgotten until confirmed or enrolled again.
+
+### Changed
+
+- **The project README is now a short overview and install guide.** It links
+  directly to the macOS DMG, Windows installer, and full Rayfish documentation.
+
+- **Windows nightlies now contain only the CLI and daemon.** The Windows
+  desktop installer and macOS DMG are produced for stable releases only.
+
+- **Machine management continues to support protocol v1.** Enrollment, status,
+  and delegated network changes work with older peers. Signed receipts and
+  inventory recovery require both endpoints to support v2.
+
+### Fixed
+
+- Mesh SSH honors a peer's grants across all verified shared networks, even when
+  its current connection was established through a different network.
+- The macOS app's bundled CLI authorizes the app's user without an operator
+  setting. Connection approvals and firewall changes work from that user's shell.
+  The standalone daemon keeps its operator access rules.
+- Pending network joins reach every available coordinator, so any coordinator
+  can approve them. Approval clears the request from the other coordinators.
+
+- **Mesh connections recover when a replacement connection fails to arrive.**
+  Rayfish retries the missing link automatically, so SSH and other traffic do
+  not have to wait for another recovery trigger.
+
+- **Kicks now revoke the removed device across the mesh.** Remaining peers drop
+  its network route and close its last shared connection, while the kicked device
+  removes the network from its local status and open desktop dashboard. A fresh
+  invite or approval can admit the same device again immediately.
+
+- **Commands that target network members accept their hostnames consistently.**
+  Admin grants now accept names, and network-scoped commands do not resolve a
+  duplicate name from another network.
+
+## [0.5.0] - 2026-09-24
+
+### Added
+
+- **The macOS Devices page shows machines you control,** including their status
+  and networks, and supports direct peer connection requests and approvals.
+
+- **macOS Settings includes Magic DNS and mDNS discovery toggles.** DNS changes
+  apply immediately; mDNS changes briefly reconnect the VPN.
+
+- **Production macOS app builds run in GitHub Actions.** Versioned releases
+  produce signed, notarized Apple Silicon disk images, with manual builds
+  available as workflow artifacts. The installer has a Retina-ready Rayfish
+  design with drag-to-Applications installation.
+
+- **The macOS app bundles the original Rust `ray` CLI.** It uses the same
+  commands and output as the standalone binary and talks directly to the
+  running tunnel over Rayfish's normal local socket. Use the app to connect,
+  disconnect, and quit the NetworkExtension session.
+
+- **macOS has a compact native menu bar menu alongside its full window.** Connect or
+  disconnect, see networks, and copy device addresses without opening the dashboard.
+
+- **macOS imports an existing Rayfish service automatically on first launch.**
+  The app detects the service's state directory, stops and disables the old
+  service, and copies its identity and saved networks before connecting.
+  The original state is kept, and a failed import restores the service.
+
 - **Controllers can enroll and manage machines directly.** A machine runs
   `ray up --controller <ticket>` once, then its controller can inspect it and
   delegate network joins and leaves. Enrollment tickets may be one-time or
   reusable and can be revoked without affecting machines already enrolled.
   `ray apply` reconciles their network membership from the live per-network
   diff, using endpoint identity when a machine has a network-specific hostname.
+
+### Changed
+
+- **macOS Settings aligns the DNS and mDNS switches to the right of each row.**
+
+- **macOS releases support Apple Silicon (arm64) only.** Both the native app DMG
+  and the standalone CLI with daemon support remain available. Intel macOS builds
+  are no longer published.
+
+- **The CLI bundled with the macOS app omits `ray gui` and `ray set-operator`.**
+  Standalone CLI builds retain both commands, including on macOS.
+
+- **The macOS menu bar has a connection switch.** The header shows Rayfish and
+  its current status, with an on/off switch to connect or disconnect.
+
+- **macOS copies peers' full domain names,** such as `remote-device.testnet.ray`,
+  from the menu bar and device context menus.
+
+- **Quitting the macOS app disconnects its VPN before exiting.** Closing only
+  the main window leaves the menu bar app running.
+
+- **macOS records startup, connection changes, and failures in Console** under
+  the `com.rayfish.app` subsystem.
+
+- **macOS matches the website and web dashboard's colors, fonts, and compact
+  network cards, with the Rayfish logo for its app and menu-bar icons.**
+
+### Fixed
+
+- **The macOS tray stays open when toggling the VPN connection,** so connection
+  progress and updated status remain visible.
+
+- **The macOS shell command works when the app's path contains spaces or
+  apostrophes.** Installing it again preserves the rest of the shell configuration.
+
+- **macOS migration reports failures to restore a disabled legacy service,**
+  instead of silently leaving its launchd override enabled.
+
+- **Failed macOS tunnel startup shuts down the Rust node,** releasing its
+  sockets and state files before another connection attempt.
+
+- **The macOS UI can reach the tunnel after extension upgrades** without relying
+  on a separately registered command service. The app uses macOS provider messaging.
+
+- **Opening the macOS dashboard brings it to the current desktop,** instead of
+  switching back to the desktop where it was last shown. Open Rayfish uses
+  Cmd+O in both the tray and app menus.
+
+- **The macOS tray updates while open,** including connection activity, errors,
+  networks, and peer status. Closing the dashboard hides it to the tray without
+  quitting or disconnecting the VPN.
+
+- **macOS disconnect no longer panics while stopping the Rust node.** Network
+  connections, protocol cleanup, and CLI shutdown run concurrently, and system
+  logs record how long disconnect takes.
+
+- **macOS displays IP addresses as plain text with copy actions,** avoiding
+  inverted glyphs in selectable address text on newer macOS versions.
+
+- **macOS waits for a new VPN connection to start before reporting failure,**
+  avoiding a stale disconnect error immediately after clicking Connect.
+
+- **macOS updates an older running tunnel extension when the app starts,**
+  instead of showing missing networks or timeouts after replacing the app.
+
+- **macOS no longer flashes "connecting" during status refreshes.** Both views
+  show the VPN's connection state, and updates continue when the main window closes.
+
+- **The macOS UI and CLI can talk to the tunnel at the same time.**
+  Separate authenticated connections prevent intermittent "tunnel did not
+  respond" errors while the app is open.
+
+- **macOS keeps packet forwarding active after its VPN connects.** The app now
+  uses the interface and DNS settings supplied by macOS instead of trying to
+  configure a separate daemon interface and silently returning to standby.
+
+- **macOS tunnel startup uses a valid IP address in its network settings,**
+  fixing the "Invalid NETunnelNetworkSettings tunnelRemoteAddress" error.
+
+- **macOS shows when the network extension needs approval in System Settings,**
+  instead of displaying an import spinner while waiting for permission.
+
+- **macOS development builds use Apple Development signing and matching
+  provisioning profiles for local testing without release notarization.**
+
+- **macOS correctly registers and keeps its tunnel system extension running.**
+  The bundled extension's filename now matches its identifier, fixing
+  "Extension not found in App bundle" when connecting.
+  Its package type also identifies it as a system extension so macOS recognizes
+  the tunnel category.
+
+- **macOS opens its main window on launch and from the menu bar or Dock.**
+
+- **macOS builds use the app's current entitlements file and valid system-extension
+  signing entitlements.**
+  Release builds enable hardened runtime and omit debugging entitlements for
+  Developer ID notarization.
+
+- **macOS app and CLI use the tunnel identifier and shared storage group from
+  the provisioning profiles.**
+
+- **Magic DNS activates on hosts whose resolver ignores root-zone queries.**
+  Some consumer-router forwarders answer dotted names but stay silent for
+  `. NS` probes, which the takeover treated as a dead upstream and refused to
+  run, leaving `.ray` names unresolvable on the host. A silent root probe is
+  now followed by a plain `example.com A` question before the upstream is
+  given up on.
+
+- **Fresh installs enable Magic DNS by default.** The DNS toggle previously
+  started off until it was enabled explicitly.
+
+- **Delegated joins accept the public network key printed by `ray status`.**
+  A controller can now identify its active network by local name or public key.
+
+- **Mesh SSH sessions no longer drop on the second command when the client asks
+  for compression.** `Compression yes` in `ssh_config` selected a zlib path that
+  fails to decompress the second message a client sends, so a session opened,
+  printed the motd, ran one command, and then died with only "closed by remote
+  host" to show for it. The mesh SSH server offers no compression at all now.
+
+- **Linux config saves no longer crash the daemon on musl.** User and group
+  lookups now use caller-owned buffers, so concurrent saves cannot corrupt
+  process memory.
+
+- **Network changes no longer leave control ping working while ordinary mesh
+  traffic disappears.** A delayed handshake from a replaced peer connection
+  could put its stale route back into the forwarding table. The live connection
+  now closes the replaced connection and remains current, including its
+  network-handle and idle-capability state.
+
+## [0.4.2] - 2026-09-19
+
+### Added
 
 - **Android: an opt-in periodic diagnostics report.** Off by default, under
   Periodic diagnostics in You, and only available while crash reporting is on.
@@ -66,29 +280,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Magic DNS configures itself on FreeBSD.** Rayfish enables `local_unbound`
   and registers `.ray` as a private `resolvconf` domain instead of retrying an
   unsupported desktop backend every minute.
-
-- **Fresh installs enable Magic DNS by default.** The DNS toggle previously
-  started off until it was enabled explicitly.
-
-- **Delegated joins accept the public network key printed by `ray status`.**
-  A controller can now identify its active network by local name or public key.
-
-- **Mesh SSH sessions no longer drop on the second command when the client asks
-  for compression.** `Compression yes` in `ssh_config` selected a zlib path that
-  fails to decompress the second message a client sends, so a session opened,
-  printed the motd, ran one command, and then died with only "closed by remote
-  host" to show for it. The mesh SSH server offers no compression at all now.
-
-- **Linux config saves no longer crash the daemon on musl.** User and group
-  lookups now use caller-owned buffers, so concurrent saves cannot corrupt
-  process memory.
-
-- **Network changes no longer leave control ping working while ordinary mesh
-  traffic disappears.** A delayed handshake from a replaced peer connection
-  could put its stale route back into the forwarding table. The live connection
-  now closes the replaced connection and remains current, including its
-  network-handle and idle-capability state.
-
 - **Android retries file notifications after transient failures.** Background
   retries preserve the Downloads result and stop once reconciliation succeeds.
 
@@ -2209,7 +2400,9 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/rayfish/rayfish/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/rayfish/rayfish/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/rayfish/rayfish/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rayfish/rayfish/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rayfish/rayfish/compare/v0.2.1...v0.3.0

@@ -29,6 +29,62 @@ apk:
 # The sibling repos in this tree name this recipe `android`, so accept both.
 alias android := apk
 
+# Generate and open the native macOS app project. The app needs normal Xcode
+# signing configuration before its system extension can run on a local Mac.
+macos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname)" != "Darwin" ]; then
+        echo "just macos must run on macOS" >&2
+        exit 1
+    fi
+    if ! command -v xcodegen >/dev/null; then
+        if ! command -v brew >/dev/null; then
+            echo "XcodeGen is required. Install Homebrew, then run just macos again." >&2
+            exit 1
+        fi
+        brew install xcodegen
+    fi
+    xcodegen generate --spec macos/project.yml --project macos
+    open macos/Rayfish.xcodeproj
+
+# Test macOS legacy-service detection and migration without touching launchd.
+macos-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc macos/Shared/LegacyDaemon.swift macos/Tests/LegacyDaemonTests.swift -o target/macos-tests/migration-tests
+    target/macos-tests/migration-tests
+
+# Exercise concurrent provider messages, send failures, and request timeouts.
+macos-ipc-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/TunnelIPC.swift macos/Shared/ProviderMessage.swift macos/Tests/TunnelIPCTests.swift -o target/macos-tests/tunnel-ipc-tests
+    target/macos-tests/tunnel-ipc-tests
+
+# Test live menu updates and closing the dashboard without touching the VPN.
+macos-ui-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/RayfishMenu.swift macos/Rayfish/App/RayfishWindow.swift macos/Rayfish/App/ShellCommandInstaller.swift macos/Tests/AppUITests.swift -o target/macos-tests/app-ui-tests
+    target/macos-tests/app-ui-tests
+
+# Check notification deduplication and tunnel ownership without the installed VPN.
+macos-notification-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Shared/TunnelIPC.swift macos/Rayfish/App/RayfishNotifications.swift macos/Tests/NotificationTests.swift -o target/macos-tests/notification-tests
+    target/macos-tests/notification-tests
+
+# Build a locally testable app with automatic Apple Development signing.
+macos-dev:
+    env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration Debug -destination platform=macOS,arch=arm64 ARCHS=arm64 -derivedDataPath target/macos-development -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+
+# Check the actual signed release before installing it.
+macos-validate app="target/macos/Build/Products/Release/Rayfish.app":
+    xcrun swift macos/Tests/ValidateBundle.swift "{{app}}"
+
+# Require Apple notarization before handing over a release for installation.
+macos-assess app="target/macos/Build/Products/Release/Rayfish.app":
+    spctl --assess --type execute --verbose=2 "{{app}}"
+    codesign --verify --strict -R='notarized' "{{app}}/Contents/Library/SystemExtensions/com.rayfish.app.tunnel.systemextension"
+
 # Compile the Android core for both APK ABIs without an NDK on this machine:
 # cross builds it in a container (see cross/Dockerfile.android). Catches the
 # `#[cfg(target_os = "android")]` code that no desktop build ever sees. `just

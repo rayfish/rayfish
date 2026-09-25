@@ -1,6 +1,6 @@
 [package]
 name = "rayfish"
-version = "0.4.2"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
@@ -15,7 +15,7 @@ categories = ["network-programming", "command-line-utilities"]
 # The repo root is both the `rayfish` package (binary `ray`) and the workspace
 # root. `ray-proto` is a member crate holding the shared IPC wire protocol.
 [workspace]
-members = ["ray-proto", "ray-mobile"]
+members = ["ray-proto", "ray-mobile", "ray-apple", "ray-windows"]
 
 [workspace.metadata.release]
 publish = false
@@ -39,6 +39,9 @@ required-features = ["desktop"]
 
 [features]
 default = ["desktop"]
+# The CLI bundled inside Rayfish.app uses the native UI and its user session.
+# Standalone macOS CLI builds keep the browser GUI and operator commands.
+macos-app = ["desktop"]
 # Desktop-only surface: the TUN-backed daemon binary, the embedded mesh SSH
 # server (russh/pty-process/uzers), interactive password prompts (rpassword),
 # and in-place self-update (self-replace). Off for the Android library build,
@@ -61,7 +64,7 @@ otel = [
 ]
 
 [dependencies]
-ray-proto = { path = "ray-proto", version = "0.1.12" }
+ray-proto = { path = "ray-proto", version = "0.1.13" }
 anyhow = "1"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1"
@@ -222,7 +225,7 @@ iroh-mdns-address-lookup = { git = "https://github.com/rayfish/iroh-address-look
 #     the relay's TCP), used for the exit-node loop prevention: SO_MARK on Linux,
 #     IP_BOUND_IF interface pinning on macOS (upstream PR n0-computer/iroh#4406)
 #   - the batch datagram passthroughs on `Connection` (upstream PR
-#     n0-computer/iroh#4383, which needs the noq patch below)
+#     n0-computer/iroh#4383; the underlying noq APIs shipped in noq 1.3.0)
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
 iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
@@ -232,9 +235,3 @@ iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integr
 # Merged upstream (n0-computer/net-tools#182); drop this once a netwatch release
 # past 0.19.3 carries it.
 netwatch = { git = "https://github.com/n0-computer/net-tools", branch = "main" }
-# The batch datagram APIs the forwarder uses, `send_many_datagrams` and
-# `read_many_datagrams`. Merged upstream (n0-computer/noq#735); iroh re-exports
-# them on `Connection`. Drop these once a noq release past 1.2.0 carries them.
-noq = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-proto = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-udp = { git = "https://github.com/n0-computer/noq", branch = "main" }
