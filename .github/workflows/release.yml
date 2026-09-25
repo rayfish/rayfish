@@ -25,7 +25,7 @@ jobs:
     outputs:
       tag: ${{ steps.extract_version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history + tags so git-cliff can diff against the previous tag.
           fetch-depth: 0
@@ -109,7 +109,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -174,7 +174,7 @@ jobs:
       # that is what keeps the unsigned release building in the meantime.
       SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -218,7 +218,7 @@ jobs:
       - name: Upload unsigned MSI for signing
         id: unsigned
         if: env.SIGNPATH_API_TOKEN != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ray-windows-x86_64-msi-unsigned
           path: ${{ runner.temp }}/ray-windows-x86_64.msi
@@ -276,7 +276,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -322,7 +322,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

@@ -31,7 +31,7 @@ jobs:
   check:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -68,7 +68,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -119,7 +119,7 @@ jobs:
   android:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -178,7 +178,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -230,7 +230,7 @@ jobs:
   windows-arm64:
     runs-on: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -252,7 +252,7 @@ jobs:
 
       # Unsigned, like the MSI below; signing happens in release.yml, on a tag.
       - name: Upload ray.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ray-windows-arm64
           path: target/aarch64-pc-windows-msvc/release/ray.exe
@@ -269,7 +269,7 @@ jobs:
     runs-on: windows-latest
     needs: windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -307,7 +307,7 @@ jobs:
       # forks, which cannot see the signing secrets. Signing happens in
       # release.yml, on a tag.
       - name: Upload MSI artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ray-windows-x86_64-msi
           path: ${{ runner.temp }}/ray-windows-x86_64.msi*

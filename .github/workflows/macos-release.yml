@@ -38,7 +38,7 @@ jobs:
       MACOS_ARCH: arm64
       APPLE_TEAM_ID: '3D9W8F63CL'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -121,7 +121,7 @@ jobs:
         run: bash scripts/notarize-macos-release.sh
 
       - name: Upload verified disk image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rayfish-macos-arm64
           path: |
@@ -131,7 +131,7 @@ jobs:
 
       - name: Upload build and notarization diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-diagnostics-arm64
           path: |
@@ -161,7 +161,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: rayfish-macos-*
           merge-multiple: true
