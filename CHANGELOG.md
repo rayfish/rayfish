@@ -22,6 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Mesh connections recover when a replacement connection fails to arrive.**
+  Rayfish retries the missing link automatically, so SSH and other traffic do
+  not have to wait for another recovery trigger.
+
 - **Commands that target network members accept their hostnames consistently.**
   Admin grants now accept names, and network-scoped commands do not resolve a
   duplicate name from another network.
