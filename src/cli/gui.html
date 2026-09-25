@@ -5,8 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rayfish</title>
   <style>
-    /* Same families as rayfish.xyz; falls back to system stacks offline. */
-    @import url("https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Press+Start+2P&display=swap");
+    @font-face { font-family: "Chakra Petch"; src: url("/fonts/chakra-regular.ttf?token=__TOKEN__"); font-weight: 400; }
+    @font-face { font-family: "Chakra Petch"; src: url("/fonts/chakra-semibold.ttf?token=__TOKEN__"); font-weight: 600; }
+    @font-face { font-family: "IBM Plex Mono"; src: url("/fonts/mono.ttf?token=__TOKEN__"); font-weight: 400; }
+    @font-face { font-family: "Press Start 2P"; src: url("/fonts/logo.ttf?token=__TOKEN__"); font-weight: 400; }
     :root {
       color-scheme: dark;
       --bg: #18181b;          /* zinc-900 */
@@ -38,15 +40,16 @@
       line-height: 1.5;
     }
     ::selection { background: var(--rose-deep); color: #fff; }
-    button, input, select { font: inherit; letter-spacing: inherit; }
+    button, input, select, textarea { font: inherit; letter-spacing: inherit; }
     button {
       border: 1px solid var(--line-2);
-      border-radius: 8px;
+      border-radius: 7px;
       background: transparent;
       color: var(--body);
-      min-height: 36px;
-      padding: 0 14px;
+      min-height: 32px;
+      padding: 0 12px;
       cursor: pointer;
+      font-weight: 600;
     }
     button:hover { border-color: var(--faint); color: var(--ink); }
     button:focus-visible, input:focus-visible, select:focus-visible {
@@ -60,12 +63,12 @@
       font-weight: 600;
     }
     button.primary:hover { background: var(--rose-deep); border-color: var(--rose-deep); color: #fff; }
-    button.small { min-height: 28px; padding: 0 10px; font-size: 13px; border-radius: 6px; }
+    button.small { min-height: 32px; padding: 0 12px; font-size: 13px; }
     button.danger { color: var(--rose); border-color: rgba(244,63,94,.35); }
     button.danger:hover { border-color: var(--rose-strong); }
     button.on { color: var(--green); border-color: rgba(52,211,153,.4); }
     button.on:hover { color: var(--green); border-color: var(--green); }
-    input, select {
+    input, select, textarea {
       width: 100%;
       min-height: 38px;
       border: 1px solid var(--line-2);
@@ -74,28 +77,47 @@
       color: var(--ink);
       padding: 7px 11px;
     }
+    textarea { min-height: 100px; resize: vertical; font-family: var(--mono); }
     input::placeholder { color: var(--faint); }
     label { display: grid; gap: 5px; font-size: 13px; color: var(--muted); }
     label.check { display: flex; align-items: center; gap: 8px; color: var(--body); font-size: 14px; }
     label.check input { width: auto; min-height: auto; accent-color: var(--rose-strong); }
 
-    .wrap { max-width: 920px; margin: 0 auto; padding: 22px 18px 80px; }
+    .wrap { max-width: 976px; margin: 0 auto; padding: 28px 28px 64px; }
     header.top {
-      display: flex; align-items: center; gap: 14px;
-      padding: 4px 0 18px;
+      display: grid; gap: 20px;
     }
-    .logo { font-family: var(--logo); font-size: 15px; color: #e4e4e7; text-decoration: none; }
+    .brand-row { display: flex; align-items: center; gap: 14px; }
+    .brand-mark { width: 34px; height: 34px; object-fit: contain; }
+    .logo { font-family: var(--logo); font-size: 15px; color: var(--ink); text-decoration: none; }
     .logo .dot-i { color: var(--rose); }
     .live { display: inline-flex; align-items: center; gap: 6px; color: var(--faint); font-family: var(--mono); font-size: 11px; }
     .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
     .live.on { color: var(--green); }
     .live.on i { background: var(--green); box-shadow: 0 0 7px rgba(52,211,153,.8); }
     .top-actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .tabs {
+      display: flex; align-items: end; gap: 22px;
+      border-bottom: 1px solid var(--line);
+    }
+    button.tab {
+      min-height: auto; padding: 0 0 10px; border: 0; border-radius: 0;
+      color: var(--faint); font-size: 14px; font-weight: 600;
+      border-bottom: 2px solid transparent; margin-bottom: -1px;
+    }
+    button.tab:hover { color: var(--body); }
+    button.tab.active { color: var(--ink); border-bottom-color: var(--rose-strong); }
+    .mesh-label {
+      margin-left: auto; padding-bottom: 10px; color: var(--faint);
+      font: 10px var(--mono); letter-spacing: .14em;
+    }
+    .page { display: none; }
+    .page.active { display: block; }
 
     .statline {
       display: flex; flex-wrap: wrap; gap: 6px 18px;
       font-family: var(--mono); font-size: 12.5px; color: var(--muted);
-      padding: 10px 0 4px;
+      padding: 20px 0 0;
     }
     .statline .copyable { cursor: pointer; color: var(--body); }
     .statline .copyable:hover { color: var(--rose); }
@@ -111,6 +133,7 @@
       letter-spacing: .02em;
     }
     .sec-head .spacer { flex: 1; }
+    .spacer { flex: 1; }
 
     /* Needs attention */
     #attention .card { border-color: rgba(251,191,36,.25); }
@@ -137,6 +160,7 @@
       border-bottom: 1px solid var(--line);
     }
     .net-head strong { color: var(--ink); font-size: 16px; font-weight: 600; }
+    .net-title { display: flex; align-items: center; gap: 8px; }
     .role {
       font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
       border: 1px solid var(--line-2);
@@ -161,7 +185,7 @@
     .dot.direct { background: var(--green); box-shadow: 0 0 6px rgba(52,211,153,.6); }
     .dot.relay { background: var(--amber); }
     .dot.idle { background: transparent; border: 1px solid var(--faint); }
-    .peer-row .host { color: var(--ink); min-width: 120px; }
+    .peer-row .host { color: var(--ink); min-width: 110px; }
     .peer-row .tag {
       font-size: 9px; letter-spacing: .07em; text-transform: uppercase;
       border: 1px solid var(--line-2); border-radius: 4px; padding: 1px 5px; margin-left: 6px;
@@ -176,6 +200,44 @@
       padding: 26px 14px; text-align: center; color: var(--faint);
     }
     .empty .big { color: var(--muted); margin-bottom: 14px; }
+
+    .summary-card { display: flex; align-items: center; gap: 12px; padding: 14px; }
+    .summary-card .label { color: var(--muted); }
+    .summary-card .value {
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      color: var(--ink); font: 11px var(--mono);
+    }
+    .summary-card .spacer, .settings-card .spacer { flex: 1; }
+    .device-row {
+      display: flex; align-items: center; gap: 12px; padding: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .device-row:first-child { border-top: 0; }
+    .device-row .device-main { min-width: 0; flex: 1; }
+    .device-row .device-name { color: var(--ink); }
+    .device-row .device-detail { color: var(--muted); font: 11px var(--mono); overflow: hidden; text-overflow: ellipsis; }
+    .device-row .device-sub { color: var(--faint); font: 11px var(--mono); }
+    .device-row .device-state { font: 12px var(--mono); color: var(--faint); }
+    .device-row .device-state.online { color: var(--green); }
+    .device-row .device-state.unauthorized { color: var(--amber); }
+    .settings-card { padding: 18px; display: grid; gap: 14px; margin-bottom: 14px; }
+    .setting-row { display: flex; align-items: center; gap: 14px; }
+    .setting-title { color: var(--ink); font-weight: 600; }
+    .setting-description { color: var(--muted); }
+    .setting-divider { height: 1px; background: var(--line); }
+    [hidden] { display: none !important; }
+    button.switch {
+      position: relative; width: 38px; min-width: 38px; min-height: 22px; height: 22px;
+      padding: 0; border: 0; border-radius: 999px; background: var(--line-2);
+    }
+    button.switch::after {
+      content: ""; position: absolute; width: 18px; height: 18px; left: 2px; top: 2px;
+      border-radius: 50%; background: var(--ink); transition: transform .14s ease;
+    }
+    button.switch.on { background: var(--rose-strong); }
+    button.switch.on::after { transform: translateX(16px); }
+    button.switch:disabled { opacity: .45; cursor: default; }
+    .command-example { color: var(--rose); font: 13px var(--mono); }
 
     /* Advanced drawer */
     #advanced { display: none; }
@@ -257,7 +319,9 @@
     @media (max-width: 640px) {
       .peer-row .acts, .net-head .net-actions { margin-left: 0; width: 100%; }
       .top-actions { width: 100%; }
-      header.top { flex-wrap: wrap; }
+      .wrap { padding: 20px 16px 48px; }
+      .brand-row { flex-wrap: wrap; }
+      .mesh-label { display: none; }
     }
     @media (prefers-reduced-motion: reduce) {
       #toast { transition: none; }
@@ -267,65 +331,166 @@
 <body>
   <div class="wrap">
     <header class="top">
-      <span class="logo">rayf<span class="dot-i">i</span>sh</span>
-      <span id="liveDot" class="live"><i></i><span id="liveText">connecting</span></span>
-      <div class="top-actions">
-        <button id="powerBtn" class="small">…</button>
-        <button id="advancedBtn" class="small">Advanced</button>
+      <div class="brand-row">
+        <img class="brand-mark" src="/logo.png?token=__TOKEN__" alt="">
+        <span class="logo">rayf<span class="dot-i">i</span>sh</span>
+        <span id="liveDot" class="live"><i></i><span id="liveText">connecting</span></span>
+        <div class="top-actions">
+          <button id="powerBtn" class="small">...</button>
+        </div>
       </div>
+      <nav class="tabs" aria-label="Dashboard pages">
+        <button class="tab active" data-page="networks">Networks</button>
+        <button class="tab" data-page="devices">Devices</button>
+        <button class="tab" data-page="settings">Settings</button>
+        <span class="mesh-label">PRIVATE MESH</span>
+      </nav>
     </header>
 
     <div id="statusLine" class="statline"></div>
 
-    <section id="attention" hidden>
-      <div class="sec-head"><h2>Needs attention</h2></div>
-      <div class="card" id="attnList"></div>
-    </section>
+    <main id="pageNetworks" class="page active">
+      <section id="attention" hidden>
+        <div class="sec-head"><h2>Needs attention</h2></div>
+        <div class="card" id="attnList"></div>
+      </section>
 
-    <section>
-      <div class="sec-head">
-        <h2>Networks</h2>
-        <div class="spacer"></div>
-        <button id="joinBtn" class="small">Join with a code</button>
-        <button id="createBtn" class="small primary">Create a network</button>
-      </div>
-      <div id="networks"></div>
-    </section>
+      <section>
+        <div class="sec-head">
+          <h2>Networks</h2>
+          <div class="spacer"></div>
+          <button id="joinBtn" class="small">Join with a code</button>
+          <button id="createBtn" class="small primary">Create a network</button>
+        </div>
+        <div id="networks"></div>
+      </section>
+    </main>
 
-    <section id="advanced">
-      <div class="card console">
-        <div class="console-head">
-          <h3>Console</h3>
-          <button id="copyOutput" class="small">Copy</button>
-          <span id="lastStatus" class="badge">idle</span>
+    <main id="pageDevices" class="page">
+      <section>
+        <div class="sec-head">
+          <h2>Devices</h2>
+          <div class="spacer"></div>
+          <button id="connectPeerBtn" class="small primary">Connect to a peer</button>
         </div>
-        <div class="chips">
-          <button data-run="status">status</button>
-          <button data-run="netcheck">netcheck</button>
-          <button data-run="firewall show">firewall</button>
-          <button data-run="files">files</button>
-          <button data-run="pair list">devices</button>
-          <button data-run="connect">connections</button>
-          <button data-run="config">config</button>
-          <button data-run="update --check">update check</button>
-          <button data-run="report">report issue</button>
+        <div id="contactCard" class="card summary-card" hidden>
+          <span class="label">Your contact ID</span>
+          <span id="contactId" class="value"></span>
+          <span class="spacer"></span>
+          <button id="copyContact" class="small">Copy</button>
         </div>
-        <div class="cmdbar">
-          <input id="commandLine" list="cmdlist" placeholder="type a ray command, suggestions appear as you type" autocomplete="off">
-          <button id="runCommand" class="primary">Run</button>
+      </section>
+      <section id="connectionSection" hidden>
+        <div class="sec-head"><h2>Connection requests</h2></div>
+        <div id="connectionRequests" class="card"></div>
+      </section>
+      <section id="managedSection" hidden>
+        <div class="sec-head"><h2>Machines you control</h2><span class="spacer"></span><button id="refreshMachines" class="small">Refresh</button></div>
+        <div id="managedMachines" class="card"></div>
+      </section>
+      <section>
+        <div class="sec-head"><h2>Network peers</h2></div>
+        <div id="networkPeers"></div>
+      </section>
+    </main>
+
+    <main id="pageSettings" class="page">
+      <section>
+        <div class="sec-head"><h2>Settings</h2></div>
+        <div class="card settings-card">
+          <div class="setting-row">
+            <span class="setting-title">VPN</span>
+            <span class="spacer"></span>
+            <span id="vpnState" class="badge">checking</span>
+          </div>
+          <div id="vpnDescription" class="setting-description">Rayfish manages this connection through its Windows service.</div>
         </div>
-        <datalist id="cmdlist"></datalist>
-        <pre id="output"></pre>
-      </div>
-    </section>
+        <div id="launchAtLoginCard" class="card settings-card" hidden>
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Start at login</div>
+              <div class="setting-description">Open Rayfish after you sign in.</div>
+            </div>
+            <span class="spacer"></span>
+            <span id="launchAtLoginToggle"></span>
+          </div>
+        </div>
+        <div class="card settings-card">
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Magic DNS</div>
+              <div class="setting-description">Resolve device names ending in .ray.</div>
+            </div>
+            <span class="spacer"></span>
+            <span id="dnsToggle"></span>
+          </div>
+          <div class="setting-divider"></div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">mDNS discovery</div>
+              <div class="setting-description">Discover peers on your local network.</div>
+            </div>
+            <span class="spacer"></span>
+            <span id="mdnsToggle"></span>
+          </div>
+          <div class="setting-divider"></div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Automatic updates</div>
+              <div class="setting-description">Install signed Rayfish updates automatically.</div>
+            </div>
+            <span class="spacer"></span>
+            <span id="autoUpdateToggle"></span>
+          </div>
+        </div>
+        <div class="card settings-card">
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Command line</div>
+              <div class="command-example">ray status</div>
+              <div class="setting-description">Run Rayfish commands without leaving the app.</div>
+            </div>
+            <span class="spacer"></span>
+            <button id="advancedBtn" class="small">Open console</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="advanced">
+        <div class="card console">
+          <div class="console-head">
+            <h3>Console</h3>
+            <button id="copyOutput" class="small">Copy</button>
+            <span id="lastStatus" class="badge">idle</span>
+          </div>
+          <div class="chips">
+            <button data-run="status">status</button>
+            <button data-run="netcheck">netcheck</button>
+            <button data-run="firewall show">firewall</button>
+            <button data-run="files">files</button>
+            <button data-run="pair list">devices</button>
+            <button data-run="connect">connections</button>
+            <button data-run="config">config</button>
+            <button data-run="update --check">update check</button>
+            <button data-run="report">report issue</button>
+          </div>
+          <div class="cmdbar">
+            <input id="commandLine" list="cmdlist" placeholder="type a ray command, suggestions appear as you type" autocomplete="off">
+            <button id="runCommand" class="primary">Run</button>
+          </div>
+          <datalist id="cmdlist"></datalist>
+          <pre id="output"></pre>
+        </div>
+      </section>
+    </main>
   </div>
 
   <dialog id="createDlg">
     <h3>Create a network</h3>
     <form id="createForm" method="dialog">
+      <p class="dlg-note">Only people you invite can join.</p>
       <label>Network name <span>(optional, generated if empty)</span><input id="createName" autocomplete="off"></label>
-      <label>This machine's name in the network <span>(optional)</span><input id="createHost" autocomplete="off"></label>
-      <label class="check"><input id="createOpen" type="checkbox"> Open network (anyone with the room id can join)</label>
+      <label>This PC's name in the network <span>(optional)</span><input id="createHost" autocomplete="off"></label>
       <div class="dlg-actions">
         <button type="button" data-close>Cancel</button>
         <button class="primary" type="submit">Create</button>
@@ -336,8 +501,9 @@
   <dialog id="joinDlg">
     <h3>Join a network</h3>
     <form id="joinForm" method="dialog">
-      <label>Invite code or room id<input id="joinKey" required autocomplete="off"></label>
-      <label>This machine's name in the network <span>(optional)</span><input id="joinHost" autocomplete="off"></label>
+      <p class="dlg-note">Paste the invite code you received.</p>
+      <label>Invite code<textarea id="joinKey" required autocomplete="off"></textarea></label>
+      <label>This PC's name in the network <span>(optional)</span><input id="joinHost" autocomplete="off"></label>
       <div class="dlg-actions">
         <button type="button" data-close>Cancel</button>
         <button class="primary" type="submit">Join</button>
@@ -353,6 +519,31 @@
       <button type="button" data-close>Close</button>
       <button class="primary" id="inviteCopy" type="button">Copy code</button>
     </div>
+  </dialog>
+
+  <dialog id="connectDlg">
+    <h3>Connect to a peer</h3>
+    <form id="connectForm" method="dialog">
+      <p class="dlg-note">Paste their contact ID. They must approve the request before a private network is created.</p>
+      <label>Contact ID or nearby peer ID<input id="connectId" required autocomplete="off"></label>
+      <label>This PC's name <span>(optional)</span><input id="connectHost" autocomplete="off"></label>
+      <div class="dlg-actions">
+        <button type="button" data-close>Cancel</button>
+        <button class="primary" type="submit">Send request</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="renameDlg">
+    <h3>Rename this PC</h3>
+    <form id="renameForm" method="dialog">
+      <div id="renameDomain" class="dlg-note"></div>
+      <label>Hostname<input id="renameHost" required autocomplete="off"></label>
+      <div class="dlg-actions">
+        <button type="button" data-close>Cancel</button>
+        <button class="primary" type="submit">Save</button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast" role="status"></div>
@@ -480,16 +671,19 @@
     // ---- live state ----
     let statusBusy = false;
     let lastData = null;
-    let lastFw = null;
+    let lastConfig = null;
+    let launchAtLoginAvailable = false;
+    let launchAtLoginEnabled = false;
+    let launchAtLoginPending = false;
     async function refresh() {
       if (statusBusy || document.hidden) return;
       statusBusy = true;
       try {
-        const [res, fw] = await Promise.all([
+        const [res, config] = await Promise.all([
           call(["status"], true),
-          call(["firewall", "show"], true),
+          call(["config"], true),
         ]);
-        lastFw = fw && fw.success ? JSON.parse(fw.stdout) : null;
+        lastConfig = config && config.success ? JSON.parse(config.stdout) : null;
         if (res && res.success) {
           lastData = JSON.parse(res.stdout);
           render(lastData);
@@ -513,16 +707,9 @@
       const el = $("liveDot");
       el.className = "live" + (reachable ? " on" : "");
       $("liveText").textContent = reachable ? (active ? "connected" : "standby") : "daemon unreachable";
+      if (window.ipc) window.ipc.postMessage(reachable ? (active ? "active" : "standby") : "unreachable");
     }
 
-    // Index of the "share everything" rule for a network: inbound allow, all
-    // TCP ports, any peer. This is what the Share services toggle manages.
-    function shareRuleIndex(net) {
-      if (!lastFw || !Array.isArray(lastFw.rules)) return -1;
-      return lastFw.rules.findIndex(r =>
-        r.direction === "in" && r.action === "allow" && r.protocol === "tcp" &&
-        r.port === "*" && r.peer === "any" && r.network === net);
-    }
     function peerKind(p) {
       const type = p.connection && p.connection.conn_type;
       if (type && /direct/i.test(type)) return "direct";
@@ -534,28 +721,16 @@
 
       // power button
       const power = $("powerBtn");
-      power.textContent = data.active ? "Turn VPN off" : "Turn VPN on";
-      power.className = "small" + (data.active ? "" : " primary");
+      power.textContent = data.active ? "Disconnect" : "Connect";
+      power.className = "small" + (data.active ? " on" : " primary");
+      $("connectPeerBtn").disabled = !data.active;
 
-      // status line. The global traffic counter only tracks TUN-forwarded
-      // packets since the last daemon restart, so sum the live per-peer
-      // connection counters instead (one connection per peer device, so
-      // dedupe peers that appear in several networks).
-      let tx = 0, rx = 0;
-      const seen = new Set();
-      for (const n of nets) {
-        for (const p of (n.peers || [])) {
-          if (!p.connection || seen.has(p.endpoint_id)) continue;
-          seen.add(p.endpoint_id);
-          tx += p.connection.bytes_tx || 0;
-          rx += p.connection.bytes_rx || 0;
-        }
-      }
+      const peerCount = nets.reduce((count, network) => count + (network.peers || []).length, 0);
+      const myIp = nets.find(n => n.my_ipv6)?.my_ipv6 || "";
       $("statusLine").innerHTML =
-        `<span>daemon <b>${esc(data.daemon_version || "?")}</b></span>` +
-        `<span>&#8593; ${fmtBytes(tx)} · &#8595; ${fmtBytes(rx)}</span>` +
-        (data.mdns ? `<span>mDNS on</span>` : "") +
-        `<span class="copyable" data-copy="${esc(data.contact_id || "")}" title="Copy your contact id">contact ${esc((data.contact_id || "").slice(0, 12))}… (copy)</span>`;
+        (myIp ? `<span class="copyable" data-copy="${esc(myIp)}" title="Copy IP address">${esc(myIp)}</span>` : "") +
+        `<span>${nets.length} network${nets.length === 1 ? "" : "s"}</span>` +
+        `<span>${peerCount} peer${peerCount === 1 ? "" : "s"}</span>`;
 
       // networks
       $("networks").innerHTML = nets.length ? nets.map(n => {
@@ -565,39 +740,134 @@
           const kind = peerKind(p);
           const conn = p.connection;
           const connText = conn
-            ? `${kind}${conn.rtt_ms != null ? " · " + Math.round(conn.rtt_ms) + "ms" : ""}`
+            ? kind
             : "idle";
-          const tags = [p.is_own_device ? "yours" : "", p.exit_node ? "exit" : "", p.incompatible ? "outdated" : ""].filter(Boolean);
           return `<div class="peer-row">
             <span class="dot ${kind}"></span>
-            <span class="host">${esc(p.hostname || "?")}${tags.map(x => `<span class="tag">${x}</span>`).join("")}</span>
+            <span class="host">${esc(p.hostname || "?")}${p.is_own_device ? `<span class="tag">YOU</span>` : ""}</span>
             <span class="ip" data-copy="${esc(p.ipv6 || "")}" title="Copy IP">${esc(p.ipv6 || "")}</span>
+            <span class="spacer"></span>
             <span class="conn ${kind}">${esc(connText)}</span>
-            <span class="acts">
-              <button class="small" data-ping="${esc(p.hostname || p.ipv6 || "")}">ping</button>
-              ${isCoord && !p.is_own_device ? `<button class="small danger" data-kick="${esc(p.hostname || "")}" data-net="${esc(n.name)}">kick</button>` : ""}
-            </span>
+            ${conn && conn.rtt_ms != null ? `<span class="conn">${Math.round(conn.rtt_ms)} ms</span>` : ""}
           </div>`;
         }).join("");
         return `<div class="card net-card">
           <div class="net-head">
-            <strong>${esc(n.name)}</strong>
-            <span class="role ${isCoord ? "coordinator" : ""}">${esc(role)}</span>
-            <span class="self">you: ${esc(n.my_hostname || "?")} · <span class="copyable" data-copy="${esc(n.my_ipv6 || "")}" title="Copy IP">${esc(n.my_ipv6 || "")}</span> · ${n.member_count ?? "?"} members</span>
+            <div><div class="net-title"><strong>${esc(n.name)}</strong>
+              <span class="role ${isCoord ? "coordinator" : ""}">${esc(role.toUpperCase())}</span></div>
+              <div class="self"><span class="copyable" data-copy="${esc((n.my_hostname || "") + "." + n.name + ".ray")}" title="Copy domain">${esc(n.my_hostname || "?")}.${esc(n.name)}.ray</span></div>
+            </div>
             <span class="net-actions">
-              ${shareRuleIndex(n.name) >= 0
-                ? `<button class="small on" data-share="${esc(n.name)}" title="Peers can reach every TCP service on this machine. Click to stop sharing.">Sharing services</button>`
-                : `<button class="small" data-share="${esc(n.name)}" title="Let ${esc(n.name)} peers reach this machine's services (all TCP ports), e.g. at ${esc(n.my_hostname || "this-host")}.ray">Share services</button>`}
-              ${isCoord ? `<button class="small primary" data-invite="${esc(n.name)}">Invite</button>` : ""}
+              ${isCoord ? `<button class="small" data-invite="${esc(n.name)}">Invite</button>` : ""}
+              <button class="small" data-rename="${esc(n.name)}" data-host="${esc(n.my_hostname || "")}">Rename</button>
               <button class="small danger" data-leave="${esc(n.name)}">Leave</button>
             </span>
           </div>
-          ${peers || `<div class="peer-row"><span class="conn">no peers online</span></div>`}
+          ${peers || `<div class="peer-row"><span class="conn">Waiting for peers...</span></div>`}
         </div>`;
       }).join("") : `<div class="card"><div class="empty">
-          <div class="big">Not part of any network yet.</div>
-          <div>Create one and invite your devices, or paste an invite code someone sent you.</div>
+          <div class="big">No networks yet.</div>
+          <div>Create a private network or join one with an invite code.</div>
         </div></div>`;
+
+      renderDevices(data);
+      renderSettings(data);
+    }
+
+    function uniquePeers(data) {
+      const peers = new Map();
+      for (const network of (data.networks || [])) {
+        for (const peer of (network.peers || [])) {
+          const key = peer.ipv6 || peer.endpoint_id;
+          if (!peers.has(key)) peers.set(key, peer);
+        }
+      }
+      return [...peers.values()].sort((a, b) => String(a.hostname).localeCompare(String(b.hostname)));
+    }
+
+    function renderPeer(peer) {
+      const kind = peerKind(peer);
+      const conn = peer.connection;
+      return `<div class="peer-row">
+        <span class="dot ${kind}"></span>
+        <span class="host">${esc(peer.hostname || "?")}${peer.is_own_device ? `<span class="tag">YOU</span>` : ""}</span>
+        <span class="ip" data-copy="${esc(peer.ipv6 || "")}" title="Copy IP">${esc(peer.ipv6 || "")}</span>
+        <span class="spacer"></span>
+        <span class="conn ${kind}">${esc(conn ? kind : "idle")}</span>
+        ${conn && conn.rtt_ms != null ? `<span class="conn">${Math.round(conn.rtt_ms)} ms</span>` : ""}
+      </div>`;
+    }
+
+    function renderDevices(data) {
+      const contactId = data.contact_id || "";
+      $("contactCard").hidden = !contactId;
+      $("contactId").textContent = contactId;
+
+      const machines = Array.isArray(data.managed_machines) ? data.managed_machines : [];
+      $("managedSection").hidden = false;
+      $("managedMachines").innerHTML = machines.length ? machines.map(machine => {
+        const state = String(machine.state || "unknown").toLowerCase();
+        const networks = Array.isArray(machine.networks) && machine.networks.length
+          ? machine.networks.join(", ")
+          : (state === "online" ? "No networks" : "Networks unavailable");
+        return `<div class="device-row">
+          <span class="dot ${state === "online" ? "direct" : state === "unauthorized" ? "relay" : "idle"}"></span>
+          <div class="device-main">
+            <div class="device-name">${esc(machine.hostname || "Unknown machine")}</div>
+            <div class="device-detail" data-copy="${esc(machine.identity || "")}" title="Copy identity">${esc(machine.identity || "")}</div>
+            <div class="device-sub">${esc(networks)}</div>
+          </div>
+          <span class="device-state ${esc(state)}">${esc(state)}</span>
+        </div>`;
+      }).join("") : `<div class="empty"><div class="big">No enrolled machines.</div><div>Use ray machines enroll to add a machine you control.</div></div>`;
+
+      const peers = uniquePeers(data);
+      $("networkPeers").innerHTML = peers.length
+        ? `<div class="card">${peers.map(renderPeer).join("")}</div>`
+        : `<div class="card"><div class="empty"><div class="big">No devices to show.</div><div>Devices appear here once this PC joins a network.</div></div></div>`;
+    }
+
+    function settingToggle(enabled, args, label, disabled) {
+      return `<button type="button" class="switch${enabled ? " on" : ""}" aria-label="${esc(label)}" aria-pressed="${enabled}" ${disabled ? "disabled" : ""} data-act='${esc(JSON.stringify(args))}' data-ok="setting updated"></button>`;
+    }
+
+    function renderLaunchAtLogin() {
+      $("launchAtLoginCard").hidden = !launchAtLoginAvailable;
+      $("launchAtLoginToggle").innerHTML = `<button type="button" class="switch${launchAtLoginEnabled ? " on" : ""}" aria-label="Start at login" aria-pressed="${launchAtLoginEnabled}" ${launchAtLoginPending ? "disabled" : ""} data-startup="${launchAtLoginEnabled ? "off" : "on"}"></button>`;
+    }
+
+    function requestLaunchAtLogin() {
+      if (!window.ipc || launchAtLoginPending) return;
+      launchAtLoginPending = true;
+      renderLaunchAtLogin();
+      window.ipc.postMessage("startup:get");
+    }
+
+    function setLaunchAtLoginState(enabled, error) {
+      launchAtLoginAvailable = true;
+      launchAtLoginEnabled = !!enabled;
+      launchAtLoginPending = false;
+      renderLaunchAtLogin();
+      if (error) toast(error, true);
+    }
+
+    function configEnabled(key, fallback) {
+      const value = lastConfig && lastConfig[key];
+      return value == null ? !!fallback : value === true || String(value).toLowerCase() === "on";
+    }
+
+    function renderSettings(data) {
+      const active = !!data.active;
+      $("vpnState").textContent = active ? "connected" : "standby";
+      $("vpnState").className = "badge" + (active ? " good" : "");
+      $("vpnDescription").textContent = "The Rayfish Windows service manages your connection.";
+
+      const dns = configEnabled("dns", false);
+      const mdns = configEnabled("mdns", data.mdns);
+      const autoUpdate = configEnabled("auto-update", data.auto_update);
+      $("dnsToggle").innerHTML = settingToggle(dns, ["dns", dns ? "off" : "on"], "Magic DNS", !lastData);
+      $("mdnsToggle").innerHTML = settingToggle(mdns, ["mdns", mdns ? "off" : "on"], "mDNS discovery", !lastData);
+      $("autoUpdateToggle").innerHTML = settingToggle(autoUpdate, ["auto-update", autoUpdate ? "off" : "on"], "Automatic updates", !lastData);
     }
 
     // Fetch details for pending items and render them as actionable rows.
@@ -605,6 +875,7 @@
       const nets = Array.isArray(data.networks) ? data.networks : [];
       const pd = data.pending || {};
       const rows = [];
+      const connectionRows = [];
 
       for (const n of nets) {
         if (n.pending_requests > 0) {
@@ -634,9 +905,9 @@
         const res = await call(["connect"], true);
         if (res && res.success) {
           for (const r of JSON.parse(res.stdout)) {
-            rows.push(`<div class="attn-row">
+            connectionRows.push(`<div class="attn-row">
               <span class="what"><b>${esc(r.hostname || r.id)}</b> wants a direct connection
-                <span class="sub">waiting ${esc(String(r.waiting_secs))}s · id ${esc(r.id)}</span></span>
+                <span class="sub">${esc(r.id)}, waiting ${esc(String(r.waiting_secs))}s</span></span>
               <button class="small primary" data-act='${esc(JSON.stringify(["connect", "approve", r.id]))}' data-ok="connected">Approve</button>
             </div>`);
           }
@@ -658,11 +929,13 @@
 
       $("attention").hidden = rows.length === 0;
       $("attnList").innerHTML = rows.join("");
+      $("connectionSection").hidden = connectionRows.length === 0;
+      $("connectionRequests").innerHTML = connectionRows.join("");
     }
 
     // ---- invites ----
     async function mintInvite(net) {
-      toast("minting invite…");
+      toast("minting invite...");
       const res = await call(["invite", net], false);
       if (!res || !res.success) {
         toast((res && (res.stderr || res.stdout) || "invite failed").trim().split("\n")[0], true);
@@ -682,29 +955,24 @@
 
     // ---- wiring ----
     document.addEventListener("click", ev => {
-      const t = ev.target.closest("[data-copy],[data-ping],[data-kick],[data-leave],[data-invite],[data-share],[data-act],[data-run],[data-close]");
+      const t = ev.target.closest("[data-copy],[data-leave],[data-invite],[data-rename],[data-startup],[data-act],[data-run],[data-close]");
       if (!t) return;
       if (t.dataset.copy != null) {
         if (t.dataset.copy) copyText(t.dataset.copy).then(() => toast("copied"));
-      } else if (t.dataset.ping != null) {
-        run(["ping", t.dataset.ping, "-c", "3"]);
-      } else if (t.dataset.kick != null) {
-        if (confirm(`Remove ${t.dataset.kick} from ${t.dataset.net}? They lose access on every device.`))
-          act(["kick", t.dataset.net, t.dataset.kick], `kicked ${t.dataset.kick}`);
       } else if (t.dataset.leave != null) {
         if (confirm(`Leave ${t.dataset.leave} on this machine?`))
           act(["leave", t.dataset.leave], `left ${t.dataset.leave}`);
       } else if (t.dataset.invite != null) {
         mintInvite(t.dataset.invite);
-      } else if (t.dataset.share != null) {
-        const net = t.dataset.share;
-        const idx = shareRuleIndex(net);
-        if (idx >= 0) {
-          if (confirm(`Stop sharing this machine's services with ${net} peers?`))
-            act(["firewall", "remove", String(idx)], "sharing off");
-        } else if (confirm(`Let ${net} peers reach every TCP service on this machine?`)) {
-          act(["firewall", "add", "in", "allow", "-p", "tcp", "--network", net], "sharing on");
-        }
+      } else if (t.dataset.rename != null) {
+        renameNetwork = t.dataset.rename;
+        $("renameHost").value = t.dataset.host || "";
+        updateRenameDomain();
+        $("renameDlg").showModal();
+      } else if (t.dataset.startup != null) {
+        launchAtLoginPending = true;
+        renderLaunchAtLogin();
+        window.ipc.postMessage("startup:" + t.dataset.startup);
       } else if (t.dataset.act != null) {
         act(JSON.parse(t.dataset.act), t.dataset.ok);
       } else if (t.dataset.run != null) {
@@ -718,29 +986,57 @@
       if (!lastData) return;
       act([lastData.active ? "down" : "up"], lastData.active ? "VPN off (standby)" : "VPN on");
     };
+    function showPage(page) {
+      document.querySelectorAll(".page").forEach(el => el.classList.toggle("active", el.id === "page" + page[0].toUpperCase() + page.slice(1)));
+      document.querySelectorAll(".tab").forEach(el => el.classList.toggle("active", el.dataset.page === page));
+      if (page === "settings") requestLaunchAtLogin();
+    }
+    document.querySelectorAll(".tab").forEach(tab => {
+      tab.onclick = () => showPage(tab.dataset.page);
+    });
     $("advancedBtn").onclick = () => {
       const adv = $("advanced");
       adv.classList.toggle("open");
+      $("advancedBtn").textContent = adv.classList.contains("open") ? "Close console" : "Open console";
       if (adv.classList.contains("open")) adv.scrollIntoView({behavior: "smooth", block: "nearest"});
     };
     function openAdvanced() {
+      showPage("settings");
       $("advanced").classList.add("open");
+      $("advancedBtn").textContent = "Close console";
     }
     $("copyOutput").onclick = () => copyText(out.textContent).then(() => toast("output copied"));
 
     $("createBtn").onclick = () => $("createDlg").showModal();
     $("joinBtn").onclick = () => $("joinDlg").showModal();
+    $("connectPeerBtn").onclick = () => $("connectDlg").showModal();
+    $("copyContact").onclick = () => copyText($("contactId").textContent).then(() => toast("contact ID copied"));
+    $("refreshMachines").onclick = () => refresh();
     $("createForm").addEventListener("submit", () => {
       const args = ["create"];
       if ($("createName").value.trim()) args.push("--name", $("createName").value.trim());
       if ($("createHost").value.trim()) args.push("--hostname", $("createHost").value.trim());
-      if ($("createOpen").checked) args.push("--open");
-      run(args);
+      act(args, "network created");
     });
     $("joinForm").addEventListener("submit", () => {
       const args = ["join", $("joinKey").value.trim()];
       if ($("joinHost").value.trim()) args.push("--hostname", $("joinHost").value.trim());
-      run(args);
+      act(args, "network joined");
+    });
+    $("connectForm").addEventListener("submit", () => {
+      const args = ["connect", $("connectId").value.trim()];
+      if ($("connectHost").value.trim()) args.push("--hostname", $("connectHost").value.trim());
+      act(args, "request sent");
+    });
+
+    let renameNetwork = "";
+    function updateRenameDomain() {
+      $("renameDomain").textContent = `${$("renameHost").value.trim() || "hostname"}.${renameNetwork}.ray`;
+    }
+    $("renameHost").addEventListener("input", updateRenameDomain);
+    $("renameForm").addEventListener("submit", () => {
+      const hostname = $("renameHost").value.trim();
+      if (renameNetwork && hostname) act(["hostname", renameNetwork, hostname], "hostname updated");
     });
 
     $("cmdlist").innerHTML = templates.map(t => `<option>${esc(t)}</option>`).join("");

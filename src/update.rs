@@ -65,6 +65,22 @@ pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
     Ok(format!("ray-{os}-{arch}{libc}"))
 }
 
+/// Map the host OS/arch to the rolling nightly asset. Windows nightlies are
+/// standalone CLI/daemon executables; the desktop app and MSI are stable-only.
+pub fn nightly_asset_name(os: &str, arch: &str) -> Result<String> {
+    if os == "windows" {
+        let arch = match arch {
+            "x86_64" => "x86_64",
+            "aarch64" => "aarch64",
+            other => anyhow::bail!(
+                "no rayfish Windows nightly for architecture '{other}'; build from source"
+            ),
+        };
+        return Ok(format!("ray-windows-{arch}.exe"));
+    }
+    release_asset_name(os, arch)
+}
+
 /// Parse a release version sidecar. Windows MSI assets use this because the
 /// installer checksum cannot be compared with the installed `ray.exe` bytes.
 pub fn parse_version_manifest(text: &str) -> Result<String> {
@@ -809,7 +825,6 @@ pub async fn run_msi_update_helper(
     result
 }
 
-#[cfg(not(windows))]
 /// Download the release asset, verify it against the (already-fetched)
 /// checksum, and atomically swap it in for the running binary. Stages the new
 /// binary in a temp file, marks it executable, then `self_replace`s (handles the
@@ -966,7 +981,16 @@ mod tests {
             release_asset_name("windows", "x86_64").unwrap(),
             "ray-windows-x86_64.msi"
         );
+        assert_eq!(
+            nightly_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.exe"
+        );
+        assert_eq!(
+            nightly_asset_name("windows", "aarch64").unwrap(),
+            "ray-windows-aarch64.exe"
+        );
         assert!(release_asset_name("windows", "aarch64").is_err());
+        assert!(nightly_asset_name("windows", "riscv64").is_err());
         assert_eq!(parse_version_manifest("0.2.17\n").unwrap(), "0.2.17");
         assert_eq!(
             parse_version_manifest("0.2.17-nightly.42+abc12345\n").unwrap(),
