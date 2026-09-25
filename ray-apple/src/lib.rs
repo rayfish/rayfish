@@ -832,30 +832,33 @@ mod tests {
                 assert!(before.contact_id.is_some());
                 node.set_setting(GlobalSetting::Dns, false).unwrap();
                 node.set_setting(GlobalSetting::Mdns, false).unwrap();
-                node.set_setting(GlobalSetting::Ssh, true).unwrap();
-                assert!(node.status().unwrap().ssh_enabled);
-                node.set_setting(GlobalSetting::Ssh, false).unwrap();
-                let mut network = config::NetworkConfig {
-                    name: "ssh-test".into(),
-                    ..Default::default()
-                };
-                network.ssh_allow.push(config::SshRule {
-                    peer: "departed-peer".into(),
-                    users: vec!["old-user".into()],
-                });
-                config::save_network(&network).unwrap();
-                node.set_ssh_rule(
-                    "ssh-test".into(),
-                    "departed-peer".into(),
-                    vec!["dario".into()],
-                    true,
-                )
-                .unwrap();
-                let rules = node.status().unwrap().ssh_rules;
-                assert_eq!(rules[0].users, ["dario"]);
-                node.set_ssh_rule("ssh-test".into(), "departed-peer".into(), Vec::new(), false)
+                #[cfg(unix)]
+                {
+                    node.set_setting(GlobalSetting::Ssh, true).unwrap();
+                    assert!(node.status().unwrap().ssh_enabled);
+                    node.set_setting(GlobalSetting::Ssh, false).unwrap();
+                    let mut network = config::NetworkConfig {
+                        name: "ssh-test".into(),
+                        ..Default::default()
+                    };
+                    network.ssh_allow.push(config::SshRule {
+                        peer: "departed-peer".into(),
+                        users: vec!["old-user".into()],
+                    });
+                    config::save_network(&network).unwrap();
+                    node.set_ssh_rule(
+                        "ssh-test".into(),
+                        "departed-peer".into(),
+                        vec!["test-user".into()],
+                        true,
+                    )
                     .unwrap();
-                assert!(node.status().unwrap().ssh_rules.is_empty());
+                    let rules = node.status().unwrap().ssh_rules;
+                    assert_eq!(rules[0].users, ["test-user"]);
+                    node.set_ssh_rule("ssh-test".into(), "departed-peer".into(), Vec::new(), false)
+                        .unwrap();
+                    assert!(node.status().unwrap().ssh_rules.is_empty());
+                }
                 let after = node.status().unwrap();
                 assert!(!after.dns_enabled);
                 assert!(!after.mdns_enabled);
