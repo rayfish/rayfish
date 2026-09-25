@@ -18,6 +18,7 @@ use iroh::{EndpointId, SecretKey};
 use ray_proto::ipc::{MachineHostname, UnixTimestampSecs};
 use serde::{Deserialize, Serialize};
 
+use crate::management::EnrollmentReceipt;
 use crate::membership::GroupMode;
 
 /// Per-network transport preference. Defined in `ray-proto` (shared with GUI
@@ -443,6 +444,9 @@ pub struct PendingJoinEntry {
 pub struct ControllerGrant {
     pub identity: EndpointId,
     pub enrolled_at: UnixTimestampSecs,
+    /// Missing on enrollments made before management protocol v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<EnrollmentReceipt>,
 }
 
 /// A machine enrolled with this controller. `hostname` is the stable name used
@@ -587,6 +591,9 @@ pub struct AppConfig {
     /// Machines that enrolled with this node as their controller.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_machines: Vec<ManagedMachine>,
+    /// Prevent a signed hello from restoring an explicitly forgotten machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forgotten_machines: Vec<EndpointId>,
     /// Pending and reusable machine-enrollment credentials minted here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enrollment_credentials: Vec<EnrollmentCredential>,
@@ -620,6 +627,7 @@ impl Default for AppConfig {
             revoked_devices: Vec::new(),
             controllers: Vec::new(),
             managed_machines: Vec::new(),
+            forgotten_machines: Vec::new(),
             enrollment_credentials: Vec::new(),
         }
     }
@@ -784,6 +792,8 @@ struct Settings {
     controllers: Vec<ControllerGrant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     managed_machines: Vec<ManagedMachine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    forgotten_machines: Vec<EndpointId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     enrollment_credentials: Vec<EnrollmentCredential>,
 }
@@ -1335,6 +1345,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         revoked_devices: settings.revoked_devices,
         controllers: settings.controllers,
         managed_machines: settings.managed_machines,
+        forgotten_machines: settings.forgotten_machines,
         enrollment_credentials: settings.enrollment_credentials,
     })
 }
@@ -1407,6 +1418,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         revoked_devices: config.revoked_devices.clone(),
         controllers: config.controllers.clone(),
         managed_machines: config.managed_machines.clone(),
+        forgotten_machines: config.forgotten_machines.clone(),
         enrollment_credentials: config.enrollment_credentials.clone(),
     };
     toml::to_string_pretty(&settings).context("serializing settings")
@@ -2189,7 +2201,8 @@ name = "test"
     fn management_state_roundtrips_with_typed_values() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let controller = test_id(31);
+        let controller_key = SecretKey::generate();
+        let controller = controller_key.public();
         let machine = test_id(32);
         let enrolled_at = UnixTimestampSecs::from_secs(100);
         let last_seen = UnixTimestampSecs::from_secs(200);
@@ -2197,6 +2210,11 @@ name = "test"
             controllers: vec![ControllerGrant {
                 identity: controller,
                 enrolled_at,
+                receipt: Some(EnrollmentReceipt::issue(
+                    &controller_key,
+                    machine,
+                    enrolled_at,
+                )),
             }],
             managed_machines: vec![ManagedMachine {
                 identity: machine,
@@ -2204,6 +2222,7 @@ name = "test"
                 enrolled_at,
                 last_seen: Some(last_seen),
             }],
+            forgotten_machines: vec![test_id(33)],
             enrollment_credentials: vec![EnrollmentCredential {
                 id: ray_proto::ipc::EnrollmentCredentialId::new("abc123".to_string()),
                 secret_hash: blake3::hash(b"fabricated enrollment secret"),
@@ -2219,7 +2238,19 @@ name = "test"
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.controllers, cfg.controllers);
         assert_eq!(loaded.managed_machines, cfg.managed_machines);
+        assert_eq!(loaded.forgotten_machines, cfg.forgotten_machines);
         assert_eq!(loaded.enrollment_credentials, cfg.enrollment_credentials);
+    }
+
+    #[test]
+    fn legacy_controller_grant_loads_without_a_receipt() {
+        let settings: Settings = toml::from_str(&format!(
+            "[[controllers]]\nidentity = '{}'\nenrolled_at = 100\n",
+            test_id(31)
+        ))
+        .unwrap();
+        assert!(settings.controllers[0].receipt.is_none());
+        assert!(settings.forgotten_machines.is_empty());
     }
 
     #[test]
