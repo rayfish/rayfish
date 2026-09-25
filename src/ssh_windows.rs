@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 
-use crate::peers::{DeviceUserMap, PeerTable};
+use crate::daemon::NetworkRegistry;
 
 pub(crate) use crate::forward::SSH_LISTEN_PORT;
 
@@ -22,16 +22,14 @@ pub fn new_authz() -> SshAuthz {
 }
 
 pub struct SshServer {
-    _peers: PeerTable,
-    _device_user_map: DeviceUserMap,
+    _registry: Arc<NetworkRegistry>,
     _authz: SshAuthz,
 }
 
 impl SshServer {
-    pub fn new(peers: PeerTable, device_user_map: DeviceUserMap, authz: SshAuthz) -> Self {
+    pub(crate) fn new(registry: Arc<NetworkRegistry>, authz: SshAuthz) -> Self {
         Self {
-            _peers: peers,
-            _device_user_map: device_user_map,
+            _registry: registry,
             _authz: authz,
         }
     }

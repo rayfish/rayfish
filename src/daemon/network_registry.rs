@@ -1154,7 +1154,7 @@ impl NetworkRegistry {
     }
 
     /// Verified memberships for authorization, independent of transport handles.
-    #[cfg(feature = "desktop")]
+    #[cfg(any(test, all(feature = "desktop", unix)))]
     pub(crate) fn authorization_networks(&self, peer: EndpointId) -> Vec<SmolStr> {
         let user = self.device_user_map.resolve(&peer);
         self.networks
