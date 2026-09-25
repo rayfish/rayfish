@@ -9,6 +9,8 @@
 //! the machine. Explicitly forgotten identities remain blocked until enrollment
 //! or local confirmation clears the controller's durable removal record. Losing
 //! that record loses the distinction between a forgotten and a missing machine.
+//! Management v1 remains available for enrollment, status, joins, and leaves.
+//! Receipts and recovery require v2; a v1 enrollment stores no receipt.
 
 use std::fmt;
 
@@ -18,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 /// ALPN negotiated for direct controller-to-machine connections.
 pub const ALPN: &[u8] = b"rayfish/manage/2";
+pub const LEGACY_ALPN: &[u8] = b"rayfish/manage/1";
 const SECRET_LEN: usize = 32;
 
 /// Proof of a past enrollment, bound to the machine's authenticated endpoint.
@@ -222,7 +225,9 @@ pub enum ManagementMsg {
         secret: EnrollmentSecret,
         hostname: MachineHostname,
     },
-    Enrolled {
+    /// Original v1 reply. Keep this unit variant's encoding unchanged.
+    Enrolled,
+    EnrolledWithReceipt {
         receipt: EnrollmentReceipt,
     },
     ControllerHello {
@@ -249,6 +254,26 @@ pub enum ManagementMsg {
     },
 }
 
+impl ManagementMsg {
+    /// Gate new messages before processing anything received over the v1 ALPN.
+    pub(crate) fn supported_by_v1(&self) -> bool {
+        matches!(
+            self,
+            Self::Enroll { .. }
+                | Self::Enrolled
+                | Self::EnrollmentRejected { .. }
+                | Self::ProtocolError { .. }
+                | Self::Response { .. }
+                | Self::Request {
+                    action: ManagementAction::Status
+                        | ManagementAction::Join { .. }
+                        | ManagementAction::Leave { .. },
+                    ..
+                }
+        )
+    }
+}
+
 impl fmt::Debug for ManagementMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -257,7 +282,8 @@ impl fmt::Debug for ManagementMsg {
                 .field("secret", &"[redacted]")
                 .field("hostname", hostname)
                 .finish(),
-            Self::Enrolled { .. } => f.write_str("Enrolled"),
+            Self::Enrolled => f.write_str("Enrolled"),
+            Self::EnrolledWithReceipt { .. } => f.write_str("EnrolledWithReceipt"),
             Self::ControllerHello { hostname, .. } => f
                 .debug_struct("ControllerHello")
                 .field("hostname", hostname)
@@ -325,7 +351,7 @@ mod tests {
         let machine = SecretKey::generate().public();
         let receipt = EnrollmentReceipt::issue(&key, machine, UnixTimestampSecs::from_secs(100));
         for message in [
-            ManagementMsg::Enrolled {
+            ManagementMsg::EnrolledWithReceipt {
                 receipt: receipt.clone(),
             },
             ManagementMsg::ControllerHello {
@@ -336,7 +362,7 @@ mod tests {
             let bytes = rmp_serde::to_vec(&message).unwrap();
             let decoded: ManagementMsg = rmp_serde::from_slice(&bytes).unwrap();
             let restored = match decoded {
-                ManagementMsg::Enrolled { receipt }
+                ManagementMsg::EnrolledWithReceipt { receipt }
                 | ManagementMsg::ControllerHello { receipt, .. } => receipt,
                 _ => panic!("wrong message"),
             };

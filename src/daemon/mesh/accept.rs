@@ -1935,6 +1935,10 @@ impl ProtocolRouter {
             .accept(
                 crate::management::ALPN,
                 ManagementProtocol(Arc::clone(&self.management)),
+            )
+            .accept(
+                crate::management::LEGACY_ALPN,
+                ManagementProtocol(Arc::clone(&self.management)),
             );
         for alpn in transport::mesh_alpns() {
             builder = builder.accept(

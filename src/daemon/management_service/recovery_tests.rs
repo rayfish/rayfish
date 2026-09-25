@@ -8,13 +8,13 @@ use iroh::endpoint::presets;
 use std::ffi::OsString;
 use tempfile::TempDir;
 
-struct TestConfig {
+pub(super) struct TestConfig {
     _directory: TempDir,
     previous: Option<OsString>,
 }
 
 impl TestConfig {
-    fn new(peer: &Endpoint) -> Self {
+    pub(super) fn new(peer: &Endpoint) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
         // Callers hold CONFIG_ENV_LOCK for the full daemon lifetime.
@@ -45,7 +45,7 @@ impl Drop for TestConfig {
     }
 }
 
-async fn peer(key: &SecretKey) -> Endpoint {
+pub(super) async fn peer(key: &SecretKey) -> Endpoint {
     Endpoint::builder(presets::N0)
         .secret_key(key.clone())
         .alpns(vec![crate::management::ALPN.to_vec()])
@@ -116,7 +116,7 @@ async fn enrollment_receipt_recovers_lost_inventory_but_not_forgotten_inventory(
     else {
         panic!("expected enrollment ticket");
     };
-    let ManagementMsg::Enrolled { receipt } = exchange(
+    let ManagementMsg::EnrolledWithReceipt { receipt } = exchange(
         &remote,
         &daemon.transport.endpoint,
         ManagementMsg::Enroll {
@@ -320,7 +320,7 @@ async fn enrollment_persists_only_a_valid_receipt_and_announces_it() {
             assert_eq!(received.hash(), secret.hash());
             control::send_framed(
                 &mut send,
-                &ManagementMsg::Enrolled {
+                &ManagementMsg::EnrolledWithReceipt {
                     receipt: receipt.clone(),
                 },
             )
