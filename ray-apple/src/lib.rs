@@ -555,6 +555,8 @@ impl Node {
             if *active {
                 return Err(AppleError::AlreadyActive);
             }
+            // Swift calls this outside Tokio, but opening the async TUN needs its reactor.
+            let _runtime = self.runtime.enter();
             let (reader, writer) =
                 rayfish::tun::open_packet_tunnel().map_err(AppleError::network)?;
             self.runtime

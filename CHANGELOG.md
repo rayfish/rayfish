@@ -43,6 +43,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The macOS direct tunnel starts correctly when connecting from the app.
+
 - Mesh SSH honors a peer's grants across all verified shared networks, even when
   its current connection was established through a different network.
 - The macOS app's bundled CLI authorizes the app's user without an operator
