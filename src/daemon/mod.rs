@@ -2114,6 +2114,194 @@ mod accept_handler_tests {
         Endpoint::bind(iroh::endpoint::presets::N0).await.unwrap()
     }
 
+    mod disconnect_recovery_tests {
+        use super::*;
+        use iroh::RelayMode;
+        use iroh::address_lookup::memory::MemoryLookup;
+        use iroh::endpoint::presets;
+        use tokio::time::timeout;
+
+        #[derive(Clone, Copy)]
+        enum Successor {
+            Missing,
+            BeforeDisconnect,
+            DuringBackoff,
+        }
+
+        async fn check_recovery(
+            reason: forward::CloseReason,
+            successor: Successor,
+            expect_dial: bool,
+        ) {
+            let alpn = transport::mesh_alpn();
+            let lookup = MemoryLookup::new();
+            let local = Endpoint::builder(presets::N0)
+                .alpns(vec![alpn.clone()])
+                .relay_mode(RelayMode::Disabled)
+                .address_lookup(lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            let remote = Endpoint::builder(presets::N0)
+                .alpns(vec![alpn.clone()])
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap();
+            lookup.add_endpoint_info(remote.addr());
+            let (conn, remote_conn) = timeout(Duration::from_secs(5), async {
+                tokio::join!(local.connect(remote.addr(), &alpn), async {
+                    remote.accept().await.unwrap().await.unwrap()
+                })
+            })
+            .await
+            .expect("initial loopback connection completes");
+            let conn = conn.unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let store = FsStore::load(tmp.path()).await.unwrap();
+            let registry = sample_registry(
+                local.clone(),
+                IrohIdentityProvider::new(local.id()),
+                store.clone(),
+                local.id(),
+            );
+            let peer_ip = derive_ipv6(&remote.id());
+            registry
+                .peers
+                .add(peer_ip, conn.clone(), remote.id(), "test-net");
+            let state = make_network_state();
+            state.write().unwrap().members.add(seated(remote.id()));
+            registry.networks.insert(
+                "test-net".to_string(),
+                NetworkHandle {
+                    name: "test-net".to_string(),
+                    network_key: state.read().unwrap().network_public_key,
+                    role: NetworkRole::Member,
+                    state: Arc::clone(&state),
+                    dht_notify: None,
+                    cancel: CancellationToken::new(),
+                    tasks: Vec::new(),
+                    invite_lock: Arc::new(AsyncMutex::new(())),
+                    incompatible: None,
+                },
+            );
+            let code = match reason {
+                forward::CloseReason::Replaced => forward::REPLACED_CONNECTION_CODE,
+                forward::CloseReason::Idle => forward::IDLE_CODE,
+                _ => 0,
+            };
+            remote_conn.close(VarInt::from_u32(code), b"disconnect recovery test");
+            timeout(Duration::from_secs(2), conn.closed())
+                .await
+                .unwrap();
+
+            // Keep both ends of the successor alive through the retry window.
+            let register_successor = async {
+                let (new_conn, peer_conn) = timeout(Duration::from_secs(5), async {
+                    tokio::join!(local.connect(remote.addr(), &alpn), async {
+                        remote.accept().await.unwrap().await.unwrap()
+                    })
+                })
+                .await
+                .expect("successor connects");
+                let new_conn = new_conn.unwrap();
+                registry
+                    .peers
+                    .add(peer_ip, new_conn.clone(), remote.id(), "test-net");
+                (new_conn, peer_conn)
+            };
+            tokio::pin!(register_successor);
+            let mut replacement = if matches!(successor, Successor::BeforeDisconnect) {
+                Some(register_successor.as_mut().await)
+            } else {
+                None
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let token = registry.shutdown_token.clone();
+            let supervisor =
+                tokio::spawn(Arc::clone(&registry).run_connection_supervisor(rx, token));
+            tx.send(forward::DisconnectEvent {
+                endpoint_id: remote.id(),
+                ipv6: peer_ip,
+                reason,
+                conn_stable_id: Some(conn.stable_id()),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            timeout(Duration::from_secs(2), supervisor)
+                .await
+                .unwrap()
+                .unwrap();
+
+            if replacement.is_none() {
+                assert!(
+                    registry.peers.conn_for_ip(&peer_ip).is_none(),
+                    "closed route is removed"
+                );
+            }
+            if matches!(successor, Successor::DuringBackoff) {
+                replacement = Some(register_successor.as_mut().await);
+            }
+            // With no packet traffic, only the supervisor can start this dial.
+            // Observe the incoming attempt without accepting it: the test does
+            // not need a second protocol router or a real TUN interface.
+            let incoming = timeout(Duration::from_secs(3), remote.accept()).await;
+            let attempted = matches!(&incoming, Ok(Some(_)));
+            if let Ok(Some(incoming)) = incoming {
+                incoming.refuse();
+            }
+            if let Some((new_conn, _)) = &replacement {
+                assert!(
+                    registry
+                        .peers
+                        .conn_is_current(&peer_ip, new_conn.stable_id())
+                );
+                assert!(new_conn.close_reason().is_none(), "successor stays live");
+            }
+            registry.shutdown_token.cancel();
+            local.close().await;
+            remote.close().await;
+            store.shutdown().await.unwrap();
+            assert_eq!(attempted, expect_dial, "recovery after {reason:?}");
+        }
+
+        #[tokio::test]
+        async fn replaced_without_a_successor_retries() {
+            check_recovery(forward::CloseReason::Replaced, Successor::Missing, true).await;
+        }
+
+        #[tokio::test]
+        async fn transient_disconnect_still_retries() {
+            check_recovery(forward::CloseReason::Transient, Successor::Missing, true).await;
+        }
+
+        #[tokio::test]
+        async fn stale_disconnect_preserves_ready_successor() {
+            check_recovery(
+                forward::CloseReason::Replaced,
+                Successor::BeforeDisconnect,
+                false,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn retry_reuses_successor_that_arrives_during_backoff() {
+            check_recovery(
+                forward::CloseReason::Replaced,
+                Successor::DuringBackoff,
+                false,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn deliberate_idle_disconnect_does_not_retry() {
+            check_recovery(forward::CloseReason::Idle, Successor::Missing, false).await;
+        }
+    }
+
     #[tokio::test]
     async fn reconnect_reuses_the_selected_connection_and_reports_success() {
         let alpn = transport::mesh_alpn();
