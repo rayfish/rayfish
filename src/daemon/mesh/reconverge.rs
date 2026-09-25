@@ -848,7 +848,15 @@ pub(crate) async fn fetch_and_apply_blob(
         }
         if self_removed {
             drop(s);
-            tracing::warn!("we have been removed from the network");
+            tracing::warn!(network = %network_name, "we have been removed from the network");
+            // Run cleanup outside this network's poller. Teardown cancels and
+            // awaits every network task, including the task currently returning
+            // from this function.
+            let registry = Arc::clone(registry);
+            let network_name = network_name.to_owned();
+            tokio::spawn(async move {
+                registry.remove_kicked_network(&network_name).await;
+            });
             return ReconvergeOutcome::Departed;
         }
         let old_members = s.members.all().iter().map(|m| m.identity).collect();

@@ -585,11 +585,10 @@ impl NetworkRegistry {
         // with `KICK_CODE` instead, and a close code cannot name a network, so it
         // is not a kick the victim can act on. `confirm_kick_and_leave` runs off
         // the in-band, network-scoped `ControlMsg::KickedFromNetwork`, which only
-        // `finalize_removal` sends; without it the victim learned of its own
-        // removal from the group poll, whose `Departed` outcome does nothing but
-        // stop polling, leaving the network in `ray status` with a roster frozen
-        // at the kick. `finalize_removal` also deliberately leaves the connection
-        // open, so the message cannot lose a race with its own teardown.
+        // `finalize_removal` sends. The signed-record poll remains the fallback
+        // when that best-effort message is missed. `finalize_removal` also
+        // deliberately leaves the connection open, so the message cannot lose a
+        // race with its own teardown.
         let ctx = self.mesh_ctx();
         for member_id in &targets {
             remove_member_roster_only(&ctx, network, &state, *member_id, derive_ipv6(member_id))

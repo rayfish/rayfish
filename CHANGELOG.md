@@ -22,6 +22,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Kicked devices now remove the network from their local status.** This also
+  clears it from an open desktop dashboard without requiring an app restart.
+
 - **Commands that target network members accept their hostnames consistently.**
   Admin grants now accept names, and network-scoped commands do not resolve a
   duplicate name from another network.
