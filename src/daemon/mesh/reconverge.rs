@@ -203,24 +203,13 @@ pub(crate) async fn fetch_verified_blob(
                 return Some(data);
             }
             Err(e) => {
-                // Two different failures land here and they want different
-                // advice, so tell them apart: sealed bytes we hold no key for is
-                // a migration state that heals itself (the caller asks for the
-                // key), while anything else is a build/version split.
-                if crate::groupkey::is_sealed(&bytes) && read_key.is_none() {
-                    tracing::info!(
-                        network = %network_name,
-                        "the group blob is sealed and we hold no read key yet; asking a coordinator for it"
-                    );
-                } else {
-                    tracing::warn!(
-                        network = %network_name,
-                        peer = %pid.fmt_short(),
-                        error = %e,
-                        "reconverge: the signed group blob does not decode against this build; \
-                         the network's coordinator is on an incompatible version"
-                    );
-                }
+                tracing::warn!(
+                    network = %network_name,
+                    peer = %pid.fmt_short(),
+                    error = %e,
+                    "reconverge: the signed group blob does not decode against this build; \
+                     the network's coordinator is on an incompatible version"
+                );
                 return None;
             }
         }

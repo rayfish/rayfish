@@ -697,14 +697,6 @@ change for any script that only checked the exit status.
 
 ### Changed
 
-- **Nodes on this version and older ones cannot see each other.** The member
-  list changed shape, and it is served over a channel that has no version check
-  of its own, so an older node would fetch the new list and fail to read it on
-  every refresh. The mesh protocol version is bumped instead, which splits the
-  network where the split is visible: peers on different versions do not connect,
-  and `ray status` says so. The device pairing and `ray connect` protocols are
-  bumped for the same reason. Upgrade coordinators and members together.
-
 - **A join with no `--hostname` takes this machine's name.** `ray create` and
   `ray join` used to fall back to a random noun, so `ray status` on a fleet read
   as a list of animals nobody could match to a box. They now use the machine's

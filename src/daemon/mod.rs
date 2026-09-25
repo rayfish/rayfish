@@ -277,7 +277,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
 /// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-const PAIR_ALPN: &[u8] = b"rayfish/pair/3";
+const PAIR_ALPN: &[u8] = b"rayfish/pair/2";
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
@@ -1748,34 +1748,6 @@ async fn broadcast_control_msg(
         if let Err(e) = open_and_send(&conn, Some(net_pubkey), msg).await {
             tracing::warn!(peer_ip = %ip, error = %e, "failed to send control message");
         }
-    }
-}
-
-/// Send one peer this network's roster read key.
-///
-/// Used both by the coordinator's answer to a [`ControlMsg::ReadKeyRequest`] and
-/// by the push that follows minting a key for a network that predates them.
-/// Best-effort: a peer we cannot reach asks for itself later.
-pub(crate) async fn send_read_key_grant(
-    peers: &PeerTable,
-    net_pubkey: EndpointId,
-    network_name: &str,
-    peer_id: EndpointId,
-    read_key: &ReadKey,
-) {
-    let Some((_, ip, conn)) = peers
-        .peers_for_network_with_conn(network_name)
-        .into_iter()
-        .find(|(id, _, _)| *id == peer_id)
-    else {
-        return;
-    };
-    let msg = ControlMsg::ReadKeyGrant {
-        network_pubkey: net_pubkey,
-        read_key: read_key.to_bytes(),
-    };
-    if let Err(e) = open_and_send(&conn, Some(net_pubkey), &msg).await {
-        tracing::warn!(peer_ip = %ip, error = %e, "failed to send read key grant");
     }
 }
 

@@ -399,6 +399,7 @@ impl NetworkRegistry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn join_network_inner(
         self: &Arc<Self>,
         network_key: &str,
@@ -483,7 +484,7 @@ impl NetworkRegistry {
             .name
             .clone()
             .unwrap_or_else(|| network_key[..network_key.len().min(8)].to_string());
-        let display_name_owned = alias.clone().unwrap_or(blob_name);
+        let display_name_owned = alias.map(|a| a.to_string()).unwrap_or(blob_name);
         let display_name = display_name_owned.as_str();
 
         if self.networks.contains_key(display_name) {
