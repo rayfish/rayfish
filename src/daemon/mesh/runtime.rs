@@ -529,8 +529,8 @@ impl NetworkRegistry {
         // It used to take the first: naming a paired secondary resolved to its
         // primary, and since the primary's row is normally seated earlier,
         // `ray kick <phone>` removed the *laptop* and left the phone in place.
-        // The victim's own row is matched too, so a device with no live pairing
-        // (a stale row from a reinstall) is still kickable by its own id.
+        // The removed member's own row is matched too, so a device with no live
+        // pairing (a stale row from a reinstall) is still kickable by its own id.
         let (targets, is_coord, display) = {
             let s = state.read().unwrap();
             match kick_targets(&s.members, candidate, candidate_user) {
@@ -581,22 +581,23 @@ impl NetworkRegistry {
 
         // The two calls the ephemeral pruner makes, which is what
         // `remove_member_roster_only`'s doc has always claimed the manual kick
-        // shared with it. It did not: this path closed the victim's connection
-        // with `KICK_CODE` instead, and a close code cannot name a network, so it
-        // is not a kick the victim can act on. `confirm_kick_and_leave` runs off
-        // the in-band, network-scoped `ControlMsg::KickedFromNetwork`, which only
+        // shared with it. It did not: this path closed the removed member's
+        // connection with `KICK_CODE` instead, and a close code cannot name a
+        // network, so it is not a kick the removed member can act on.
+        // `confirm_kick_and_leave` runs off the in-band, network-scoped
+        // `ControlMsg::KickedFromNetwork`, which only
         // `finalize_removal` sends. The signed-record poll remains the fallback
-        // when that best-effort message is missed. `finalize_removal` also
-        // deliberately leaves the connection open, so the message cannot lose a
-        // race with its own teardown.
+        // when that best-effort message is missed. `finalize_removal` revokes the
+        // local route before publishing and closes the transport after the notice
+        // when no other authorized network shares it.
         let ctx = self.mesh_ctx();
         for member_id in &targets {
             remove_member_roster_only(&ctx, network, &state, *member_id, derive_ipv6(member_id))
                 .await;
         }
         // One finalize for the whole set: it publishes the snapshot once and
-        // sends every victim its own `KickedFromNetwork`, so a person and their
-        // devices leave on the same record rather than on N republished ones.
+        // sends every removed member its own `KickedFromNetwork`, so a person and
+        // their devices leave on the same record rather than on N republished ones.
         finalize_removal(&ctx, network, &state, &dht_notify, &targets).await;
 
         for member_id in &targets {

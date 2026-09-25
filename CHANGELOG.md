@@ -22,8 +22,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Kicked devices now remove the network from their local status.** This also
-  clears it from an open desktop dashboard without requiring an app restart.
+- **Kicks now revoke the removed device across the mesh.** Remaining peers drop
+  its network route and close its last shared connection, while the kicked device
+  removes the network from its local status and open desktop dashboard.
 
 - **Commands that target network members accept their hostnames consistently.**
   Admin grants now accept names, and network-scoped commands do not resolve a
