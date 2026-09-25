@@ -490,18 +490,35 @@ pub(crate) fn prune_departed_peers(
             continue;
         }
         tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
-        pruned_peers.insert((network_name.to_string(), peer_id));
         // One connection carries every shared network, so only close it when this
         // was the peer's last network with us; otherwise just drop this network's
-        // route and leave the peer reachable on the others (`remove_peer_from_network`
-        // returns the connection iff its network set emptied).
-        if let Some(conn) = peers.remove_peer_from_network(&derive_ipv6(&peer_id), network_name) {
+        // route and leave the peer reachable on the others.
+        if let Some(conn) = revoke_peer_network(
+            peers,
+            pruned_peers,
+            network_name,
+            peer_id,
+            derive_ipv6(&peer_id),
+        ) {
             conn.close(
                 VarInt::from_u32(forward::KICK_CODE),
                 b"removed from network",
             );
         }
     }
+}
+
+/// Revoke one peer's authorization on one network. Returns its transport only
+/// when no other authorized network still shares it, so the caller can close it.
+pub(crate) fn revoke_peer_network(
+    peers: &PeerTable,
+    pruned_peers: &Arc<DashSet<(String, EndpointId)>>,
+    network: &str,
+    peer_id: EndpointId,
+    peer_ip: Ipv6Addr,
+) -> Option<Connection> {
+    pruned_peers.insert((network.to_string(), peer_id));
+    peers.remove_peer_from_network(&peer_ip, network)
 }
 
 /// Register the connections we already hold for peers this roster lists but whose
@@ -831,7 +848,7 @@ pub(crate) async fn fetch_and_apply_blob(
     }
     // Revalidate and replace under one write guard so a mutation cannot land in
     // the gap and then be overwritten by this fetched state.
-    let old_members: Vec<EndpointId> = {
+    {
         let mut s = state.write().unwrap();
         if current_group_hash(&s) != generation {
             tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
@@ -859,7 +876,6 @@ pub(crate) async fn fetch_and_apply_blob(
             });
             return ReconvergeOutcome::Departed;
         }
-        let old_members = s.members.all().iter().map(|m| m.identity).collect();
         s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
@@ -870,18 +886,19 @@ pub(crate) async fn fetch_and_apply_blob(
         // The hash the network agreed on, not our re-encoding of it. See
         // `converged_hash`.
         s.converged_hash = Some(remote_hash);
-        old_members
-    };
-
-    // Reconcile: find removed peers after the state replacement. `old_members`
-    // was captured under the same guard, so each absent id was present in the
-    // generation we just replaced.
-    for old_id in &old_members {
-        if !new_member_ids.contains(old_id) {
-            peers.remove(&derive_ipv6(old_id));
-            tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
-        }
     }
+
+    // Revoke the removed peer's network route immediately. If this was the last
+    // network shared over the transport, close it as well. This is the security
+    // boundary: the kicked device does not have to receive or honor a message.
+    prune_departed_peers(
+        peers,
+        &registry.device_user_map,
+        &registry.pruned_peers,
+        state,
+        network_name,
+        my_id,
+    );
 
     persist_group_hash_locked(state, blob_store, network_name, remote_hash, true).await;
     drop(commit_guard);
@@ -909,9 +926,11 @@ pub(crate) fn now_secs() -> u64 {
 }
 
 #[cfg(test)]
-mod self_nullified_tests {
+mod reconverge_tests {
     use super::*;
-    use iroh::SecretKey;
+    use iroh::{Endpoint, SecretKey};
+
+    const TEST_ALPN: &[u8] = b"rayfish/revoke-test";
 
     fn member(identity: EndpointId, is_coordinator: bool) -> Member {
         Member {
@@ -924,6 +943,60 @@ mod self_nullified_tests {
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
         }
+    }
+
+    fn state_with_members(members: Vec<Member>) -> SharedNetworkState {
+        Arc::new(RwLock::new(NetworkState {
+            members: MemberList::from_members(members),
+            approved: ApprovedList::new(),
+            snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
+            converged_hash: None,
+            unconfirmed_durable_hash: None,
+            network_secret_key: None,
+            network_public_key: SecretKey::generate().public(),
+            network_name: Some("test-network".to_string()),
+            group_name: Some("test-network".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+            last_record_timestamp: None,
+        }))
+    }
+
+    async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let server = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind server endpoint");
+        let client = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind client endpoint");
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("accept connection")
+            })
+        };
+        let client_conn = client
+            .connect(server.addr(), TEST_ALPN)
+            .await
+            .expect("connect client");
+        let server_conn = accept.await.expect("accept task");
+        (server, client, server_conn, client_conn)
     }
 
     #[test]
@@ -954,5 +1027,62 @@ mod self_nullified_tests {
             &roster,
             &std::collections::BTreeSet::new()
         ));
+    }
+
+    #[tokio::test]
+    async fn roster_removal_closes_the_last_shared_connection() {
+        let (server, client, conn, remote) = connected_pair().await;
+        let peer_id = conn.remote_id();
+        let peer_ip = derive_ipv6(&peer_id);
+        let peers = PeerTable::new();
+        peers.add(peer_ip, conn, peer_id, "test-network");
+        let pruned = Arc::new(DashSet::new());
+
+        prune_departed_peers(
+            &peers,
+            &peers::DeviceUserMap::new(),
+            &pruned,
+            &state_with_members(Vec::new()),
+            "test-network",
+            server.id(),
+        );
+
+        assert!(!peers.shares_network_v6(&peer_ip, "test-network"));
+        assert!(pruned.contains(&("test-network".to_string(), peer_id)));
+        tokio::time::timeout(Duration::from_secs(3), remote.closed())
+            .await
+            .expect("the revoked connection should close");
+        server.close().await;
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn roster_removal_keeps_a_connection_authorized_by_another_network() {
+        let (server, client, conn, remote) = connected_pair().await;
+        let peer_id = conn.remote_id();
+        let peer_ip = derive_ipv6(&peer_id);
+        let peers = PeerTable::new();
+        peers.add(peer_ip, conn.clone(), peer_id, "test-network");
+        peers.add(peer_ip, conn, peer_id, "other-network");
+
+        prune_departed_peers(
+            &peers,
+            &peers::DeviceUserMap::new(),
+            &Arc::new(DashSet::new()),
+            &state_with_members(Vec::new()),
+            "test-network",
+            server.id(),
+        );
+
+        assert!(!peers.shares_network_v6(&peer_ip, "test-network"));
+        assert!(peers.shares_network_v6(&peer_ip, "other-network"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), remote.closed())
+                .await
+                .is_err(),
+            "a connection still authorized on another network must remain open"
+        );
+        server.close().await;
+        client.close().await;
     }
 }
