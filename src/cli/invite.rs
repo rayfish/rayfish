@@ -285,13 +285,11 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
                     &["id", "host", "waiting"]
                 };
                 println!();
-                print!("{}", table(headers, rows, 2));
-                let hint = if any_roles {
-                    format!("admit with: ray requests {network} accept <id> [--role <asked for>]")
-                } else {
-                    format!("admit with: ray requests {network} accept <id>")
-                };
-                println!("\n  {}", style::faint(&hint));
+                print!("{}", table(&["id", "host", "waiting"], rows, 2));
+                println!(
+                    "\n  {}",
+                    style::faint(&format!("admit with: ray requests {network} accept <name>"))
+                );
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),

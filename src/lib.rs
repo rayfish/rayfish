@@ -89,6 +89,7 @@ mod listen_events;
 #[cfg(feature = "desktop")]
 mod listener;
 pub mod logdir;
+pub mod management;
 pub mod membership;
 pub mod network_name;
 #[cfg(feature = "desktop")]

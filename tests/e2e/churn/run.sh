@@ -19,6 +19,9 @@
 #   - `ray down` / `ray up` flap: the data plane goes away and comes back while
 #     the control plane never drops, which is a different code path from a
 #     daemon restart and the one a laptop lid actually takes
+#   - the same flap on a host with no `ip` binary at all: the link state is the
+#     kernel's business (netlink), not a spawned process's, so a service PATH
+#     without iproute2 must still bring the tunnel up, down and back
 #   - a kick delivered while a member is offline. The kicked node must leave on
 #     the signed record; the offline node must reach the same roster on its own
 #     when it returns, having never seen the `MemberSync` that announced it
@@ -269,6 +272,79 @@ for r in $(seq 1 "$DOWN_ROUNDS"); do
     fail "round $r: srv-d does not answer after 'ray up'"
   fi
 done
+
+# ---------------------------------------------------------------------------
+step "4b. the same flap on a host with no 'ip' binary"
+# The data plane must not need iproute2 on the daemon's PATH: the link goes up
+# and down over netlink, like the address and the peer route beside it. While it
+# did not, a host whose service PATH had no `ip` failed that one step and
+# succeeded at every other, so the daemon activated onto a link it had never
+# brought up. The kernel then flushed the address and refused the connected
+# route, `ray ping` kept answering (that rides the control plane, not the TUN),
+# and every packet through the tunnel vanished. Standby had the mirror of it,
+# leaving the link up with `200::/7` still routed at nothing.
+TUN_D="$(on "$D" "ip -6 route 2>/dev/null | awk '/^200::\\/7 /{print \$3; exit}'" | tr -d '[:space:]')"
+IP_REAL="$(on "$D" 'readlink -f "$(command -v ip)" 2>/dev/null' | tr -d '[:space:]')"
+PROBE=/usr/local/lib/ip.e2e-probe
+if [[ -z "$TUN_D" || -z "$IP_REAL" ]]; then
+  fail "srv-d: no TUN device or no 'ip' to hide (tun='$TUN_D' ip='$IP_REAL')"
+else
+  # A copy under another name, so these checks can still read link state with
+  # the daemon's `ip` gone, and a restore on every exit path: a run that dies in
+  # the middle must not leave the host without iproute2.
+  restore_ip(){
+    on "$D" "test -e '$IP_REAL.e2e-hidden' && mv -f '$IP_REAL.e2e-hidden' '$IP_REAL'; rm -f '$PROBE'" \
+      >/dev/null 2>&1 || true
+  }
+  link_up(){ on "$D" "'$PROBE' -o link show '$TUN_D' 2>/dev/null | grep -qE '[<,]UP[,>]'"; }
+  trap restore_ip EXIT
+  on "$D" "install -D -m 0755 '$IP_REAL' '$PROBE' && mv '$IP_REAL' '$IP_REAL.e2e-hidden'" >/dev/null 2>&1
+  if on "$D" 'command -v ip' >/dev/null 2>&1; then
+    fail "srv-d still resolves 'ip', so the rest of this step would prove nothing"
+  else
+    pass "srv-d has no 'ip' binary to spawn"
+
+    on "$D" 'ray down' >/dev/null 2>&1 || true
+    if retry_until 30 '! link_up'; then
+      pass "'ray down' takes the link down with no 'ip' on the host"
+    else
+      fail "srv-d's $TUN_D is still up after 'ray down' (the state never reached the kernel)"
+    fi
+
+    on "$D" 'ray up' >/dev/null 2>&1 || true
+    if retry_until 30 'link_up'; then
+      pass "'ray up' brings the link back with no 'ip' on the host"
+    else
+      fail "srv-d's $TUN_D never came up after 'ray up'"
+    fi
+    if retry_until 30 "on '$D' \"'$PROBE' -6 route show 2>/dev/null | grep -q '^200::/7 '\""; then
+      pass "the 200::/7 route is back on srv-d"
+    else
+      fail "srv-d has no 200::/7 route after 'ray up' (peer traffic would take the default route)"
+    fi
+    if retry_until 60 "on '$B' 'ping -c 2 -W 3 $IP_D' >/dev/null 2>&1"; then
+      pass "srv-b reaches srv-d again over the tunnel"
+    else
+      fail "srv-d does not answer after an up/down cycle with no 'ip' on the host"
+    fi
+
+    # The warning this used to produce was the only trace of the whole failure,
+    # and it went to the journal where nobody was looking. Assert it is absent.
+    tunfail="$(on "$D" "journalctl -u rayfish --utc --since '${SINCE[$D]}' --no-pager 2>/dev/null | grep -c 'bring TUN interface'" | tr -d '[:space:]')"
+    if [[ ! "$tunfail" =~ ^[0-9]+$ ]]; then
+      fail "srv-d: could not read the journal, so the link-state check proves nothing"
+    elif [[ "$tunfail" == "0" ]]; then
+      pass "srv-d logged no TUN link-state failure"
+    else
+      fail "srv-d logged $tunfail TUN link-state failure(s) (the daemon is still spawning for it)"
+    fi
+  fi
+  restore_ip
+  trap - EXIT
+  on "$D" 'command -v ip' >/dev/null 2>&1 \
+    && pass "srv-d's 'ip' binary is back" \
+    || fail "srv-d was left without its 'ip' binary"
+fi
 
 # ---------------------------------------------------------------------------
 step "5. kick srv-d while srv-c is offline"

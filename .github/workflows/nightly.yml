@@ -2,8 +2,9 @@ name: Nightly
 
 # Rolling pre-release built from every push to master. Moves the `nightly` tag
 # to the new commit, recreates the `nightly` pre-release, and overwrites its
-# Linux, macOS, Android, and Windows assets. Consumed by `ray update --nightly`,
-# which compares checksums for binaries and the published version manifest for MSI.
+# Linux, macOS, and Windows CLI assets plus Android app artifacts. Desktop
+# installers stay on the stable release workflow. `ray update --nightly`
+# compares binary checksums.
 on:
   push:
     branches:
@@ -26,7 +27,7 @@ jobs:
     outputs:
       sha: ${{ steps.meta.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history + tags so git-cliff can list commits since last stable.
           fetch-depth: 0
@@ -91,16 +92,11 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             name: ray-macos-aarch64
-          - target: x86_64-apple-darwin
-            # Cross-compiled on Apple Silicon (universal SDK); macos-13 Intel
-            # runners are being retired and leave the job queued indefinitely.
-            runner: macos-latest
-            name: ray-macos-x86_64
 
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -154,7 +150,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -167,26 +163,16 @@ jobs:
           shared-key: "release-x86_64-pc-windows-msvc"
           cache-on-failure: true
 
-      - name: Install WiX 3
+      - name: Build CLI and daemon
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features desktop --bin ray
+
+      - name: Package for release
         shell: pwsh
         run: |
-          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
-            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
-          }
-          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
-            throw 'WiX candle.exe was not found after installation.'
-          }
-
-      - name: Install cargo-wix
-        run: cargo install cargo-wix --version 0.3.9 --locked
-
-      - name: Build Windows MSI
-        shell: pwsh
-        run: |
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $base = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
-          $identity = "${base}-nightly.$env:GITHUB_RUN_NUMBER+${{ needs.roll-tag.outputs.sha }}"
-          ./scripts/build-windows-msi.ps1 -Version $base -ReleaseIdentity $identity -Channel nightly -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+          $asset = 'ray-windows-x86_64.exe'
+          Copy-Item target/x86_64-pc-windows-msvc/release/ray.exe $asset
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Out-File -FilePath "$asset.sha256" -Encoding ascii
 
       - name: Upload Windows nightly assets
         uses: softprops/action-gh-release@v2
@@ -195,21 +181,18 @@ jobs:
         with:
           tag_name: nightly
           files: |
-            ${{ runner.temp }}/ray-windows-x86_64.msi
-            ${{ runner.temp }}/ray-windows-x86_64.msi.sha256
-            ${{ runner.temp }}/ray-windows-x86_64.msi.version
+            ray-windows-x86_64.exe
+            ray-windows-x86_64.exe.sha256
 
-  # The MSI is x86_64 only: build-windows-msi.ps1 validates that one target and
-  # pins the amd64 Wintun out of the archive it downloads. So ARM64 publishes
-  # the bare exe plus the checksum sidecar, the same shape as the Linux and
-  # macOS legs, rather than a second installer.
+  # Windows nightlies are CLI/daemon binaries only. The x86_64 desktop app and
+  # MSI are stable-release artifacts.
   windows-arm64:
     needs: roll-tag
     runs-on: windows-11-arm
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -255,7 +238,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -279,6 +262,9 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also requests the retired `tools` package.
+          packages: platform-tools
 
       # The NDK is ~1GB; cache it so we download it once per version instead of
       # on every run. sdkmanager below is a no-op on a cache hit.
@@ -308,7 +294,9 @@ jobs:
           cargo run -p ray-mobile --bin uniffi-bindgen -- generate \
             --library target/debug/libray_mobile.so \
             --language kotlin \
-            --out-dir android/app/src/main/java
+            --out-dir android/app/src/main/java \
+            --no-format
+          sh scripts/format-generated-kotlin.sh
 
       - name: Build APK
         working-directory: android

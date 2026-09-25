@@ -79,11 +79,13 @@ setting_keys! {
         Mdns = "mdns", "LAN peer discovery over mDNS (on|off)";
         Relay = "relay", "iroh relay servers (preset or URL, comma-separated)";
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
-        DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders (IP addresses, comma-separated)";
+        Dns = "dns", "Magic DNS system integration (on|off)";
+        DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders, including mesh peer IPv6 addresses (comma-separated)";
         AutoUpdate = "auto-update", "install new releases automatically (on|off)";
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";
         Ssh = "ssh", "embedded mesh SSH server (on|off)";
         V4Bridge = "v4-bridge", "reach this host's IPv4-only listeners over the mesh (on|off)";
+        PfPassthrough = "pf-passthrough", "macOS: keep the mesh alive under another VPN's firewall (on|off)";
         DownloadDir = "download-dir", "directory accepted files land in (absolute path, empty to clear)";
         DownloadUser = "download-user", "uid that owns accepted files (numeric, empty to clear)";
     }

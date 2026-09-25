@@ -670,7 +670,7 @@ mod tests {
         };
         let a = QTYPE::TYPE(simple_dns::TYPE::A);
         let declined = |name: &'static str, qtype| {
-            let (table, reverse) = (table.clone(), reverse.clone());
+            let (table, reverse) = (Arc::clone(&table), Arc::clone(&reverse));
             async move {
                 handle_query(&query(name, qtype), &table, &reverse)
                     .await

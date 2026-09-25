@@ -37,6 +37,7 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
     let reset = entries.is_empty() || entries == ["n0"];
     match key {
         GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
+        GlobalKey::Dns => cfg.dns_enabled = parse_bool(value, true)?,
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
@@ -46,6 +47,9 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         // Like `ssh`, only half the work: the live bridge has to start or stop
         // with it (see `Daemon::v4_bridge_config_set`).
         GlobalKey::V4Bridge => cfg.v4_bridge = parse_bool(value, true)?,
+        // Like `ssh` and `v4-bridge`, only half the work: the live pf anchor
+        // has to follow it (see `Daemon::pf_passthrough_config_set`).
+        GlobalKey::PfPassthrough => cfg.pf_passthrough = parse_bool(value, true)?,
         // Validated here, not in the CLI arm, so every caller is bound by it: a
         // relative download dir would resolve against the daemon's cwd, not the
         // user's.
@@ -86,10 +90,8 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
                 cfg.dns_upstreams = ServerOverride::default();
             } else {
                 // Either family. IPv4 entries are merged with the system-captured
-                // upstreams (`config::resolve_upstreams`); IPv6 ones are what an
-                // exit-node full tunnel forwards to, since that tunnel carries no
-                // IPv4 for a v4 resolver to be reached over
-                // (`exit_node::tunnel_upstreams`).
+                // upstreams; an IPv6 mesh address sends ordinary DNS to a resolver
+                // running on that peer.
                 for e in &entries {
                     e.parse::<IpAddr>()
                         .with_context(|| format!("invalid IP address: {e}"))?;
@@ -128,10 +130,12 @@ fn server_override(
 pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
+        GlobalKey::Dns => on_off(cfg.dns_enabled),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
         GlobalKey::V4Bridge => on_off(cfg.v4_bridge),
+        GlobalKey::PfPassthrough => on_off(cfg.pf_passthrough),
         // Empty renders as unset, matching the `net.ephemeral-ttl` convention.
         GlobalKey::DownloadDir => cfg.download_dir.clone().unwrap_or_default(),
         GlobalKey::DownloadUser => cfg.download_user.map(|u| u.to_string()).unwrap_or_default(),
@@ -352,6 +356,19 @@ mod tests {
     }
 
     #[test]
+    fn the_pf_passthrough_toggles_and_unsets_back_on() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.pf_passthrough, "on by default");
+        apply_global(&mut cfg, GlobalKey::PfPassthrough, "off", false).unwrap();
+        assert!(!cfg.pf_passthrough);
+        assert_eq!(render_global(&cfg, GlobalKey::PfPassthrough), "off");
+        // Unset is on: a host that never meets a default-deny ruleset loads an
+        // anchor nothing evaluates, which costs it nothing.
+        apply_global(&mut cfg, GlobalKey::PfPassthrough, "", false).unwrap();
+        assert!(cfg.pf_passthrough);
+    }
+
+    #[test]
     fn download_dir_must_be_absolute() {
         let mut cfg = AppConfig::default();
         let err =
@@ -405,6 +422,16 @@ mod tests {
         assert_eq!(cfg.relay.servers, vec!["rayfish".to_string()]);
         assert!(cfg.relay.replace);
         assert!(apply_global(&mut cfg, GlobalKey::Relay, "not a url", false).is_err());
+    }
+
+    #[test]
+    fn dns_toggle_defaults_on_and_round_trips() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::Dns, "off", false).unwrap();
+        assert!(!cfg.dns_enabled);
+        assert_eq!(render_global(&cfg, GlobalKey::Dns), "off");
+        apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
+        assert!(cfg.dns_enabled);
     }
 
     #[test]

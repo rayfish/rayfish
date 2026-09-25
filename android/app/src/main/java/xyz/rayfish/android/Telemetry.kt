@@ -8,7 +8,9 @@ import io.sentry.Attachment
 import io.sentry.Sentry
 import io.sentry.SentryLevel
 import io.sentry.android.core.SentryAndroid
+import io.sentry.android.core.SentryLogcatAdapter as Log
 import io.sentry.protocol.SentryId
+import java.util.concurrent.TimeUnit
 
 /**
  * Sentry crash reporting, gated by the user's opt-out toggle in the You screen.
@@ -107,54 +109,128 @@ object Telemetry {
     @Volatile
     private var lastFailureReportMs = 0L
 
+    /**
+     * This process's own logcat, newest [LOGCAT_LINES] lines of it.
+     *
+     * `--pid` of ourselves needs no permission: READ_LOGS only governs reading
+     * *other* apps' output, and every device since API 16 restricts an
+     * unprivileged reader to its own buffer anyway. A device that refuses
+     * outright (some OEM builds do) returns empty rather than throwing, so a
+     * report still goes out with the Rust log alone.
+     *
+     * Bounded and drained on a timeout: this runs on the same IO dispatcher as
+     * the rest of the send, and `logcat -d` on a busy buffer can outlive the
+     * user's patience.
+     */
+    private fun androidLog(): String = try {
+        val process = ProcessBuilder(
+            "logcat", "-d", "-t", LOGCAT_LINES.toString(), "--pid", android.os.Process.myPid().toString(),
+        ).redirectErrorStream(true).start()
+        val out = process.inputStream.bufferedReader().use { it.readText() }
+        if (!process.waitFor(LOGCAT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) process.destroy()
+        out
+    } catch (t: Throwable) {
+        Log.w(TAG, "could not capture logcat for diagnostics", t)
+        ""
+    }
+
+    private const val TAG = "RayfishTelemetry"
+
+    /** Enough to cover a bring-up attempt and the minutes around it. */
+    private const val LOGCAT_LINES = 2000
+
+    private const val LOGCAT_TIMEOUT_SECONDS = 5L
+
     /** Full log snapshot as a Sentry attachment. Returns the event id, or null
      * when Sentry is off / the send failed. Best-effort. */
-    fun sendDiagnostics(context: Context): String? {
+    fun sendDiagnostics(context: Context): String? =
+        capture(context, "rayfish diagnostics")
+
+    /**
+     * The unattended version, sent on [PeriodicDiagnostics]'s timer rather than
+     * by a user tapping Send diagnostics.
+     *
+     * Its own message, so the two never group together: a report the user sent is
+     * a complaint with a person behind it, and one the timer sent is a sample.
+     * Reading them in one issue would bury the first kind under the second.
+     */
+    fun sendPeriodicDiagnostics(context: Context, churn: NetworkChurn): String? =
+        capture(
+            context,
+            "rayfish periodic diagnostics",
+            tags = mapOf("periodic" to "true"),
+            extraContext = churn.asContext(),
+        )
+
+    /**
+     * Send one diagnostics report: the core's log ring, this process's logcat,
+     * and a health snapshot, under [message].
+     *
+     * Every report of a given message deliberately lands in one Sentry group. An
+     * earlier version set a per-send fingerprint (a millisecond stamp) to split
+     * each click into its own issue; it never actually split anything (488
+     * reports in a single group), and splitting was the wrong goal anyway.
+     * Diagnostics are a mailbox, not a defect: hundreds of one-event issues would
+     * bury the real crashes in the same queue. The tags below are what make a
+     * particular report findable (`issue:<id> install_id:<uuid>`), and the caller
+     * gets the event id back to quote.
+     *
+     * The scope is passed to the capture, never set up around it. Under
+     * `Sentry.withScope` (SDK 8.47.0) not one of these writes reached the event:
+     * 12 of 12 reports over a month carried no `install_id`, no `transport`, no
+     * `rayfish` context and no attachment, which is every field that makes a
+     * report worth having. They did not vanish either. They landed somewhere
+     * longer-lived and surfaced on an unrelated ANR captured 16 seconds after one
+     * of these calls, so the old shape both lost the data here and leaked a
+     * device id onto an event that had no business carrying one. This overload
+     * applies the callback to the event being sent and to nothing else.
+     */
+    private fun capture(
+        context: Context,
+        message: String,
+        tags: Map<String, String> = emptyMap(),
+        extraContext: Map<String, Long> = emptyMap(),
+    ): String? {
         if (!Sentry.isEnabled()) return null
         val node = NodeHolder.get(context)
         val logs = runCatching { node.logSnapshot() }.getOrDefault("")
         val health = runCatching { node.healthSnapshot() }.getOrNull()
-        // Every report deliberately lands in one Sentry group. An earlier version
-        // set a per-send fingerprint (a millisecond stamp) to split each click
-        // into its own issue; it never actually split anything (488 reports in a
-        // single group), and splitting was the wrong goal anyway. Diagnostics are
-        // a mailbox, not a defect: hundreds of one-event issues would bury the
-        // real crashes in the same queue. The tags below are what make a
-        // particular report findable (`issue:<id> install_id:<uuid>`), and the
-        // caller gets the event id back to quote.
-        //
-        // The scope is passed to the capture, never set up around it. Under
-        // `Sentry.withScope` (SDK 8.47.0) not one of these writes reached the
-        // event: 12 of 12 reports over a month carried no `install_id`, no
-        // `transport`, no `rayfish` context and no attachment, which is every
-        // field that makes a report worth having. They did not vanish either.
-        // They landed somewhere longer-lived and surfaced on an unrelated ANR
-        // captured 16 seconds after one of these calls, so the old shape both
-        // lost the data here and leaked a device id onto an event that had no
-        // business carrying one. This overload applies the callback to the
-        // event being sent and to nothing else.
-        val id = Sentry.captureMessage("rayfish diagnostics", SentryLevel.INFO) { scope ->
+        val id = Sentry.captureMessage(message, SentryLevel.INFO) { scope ->
             scope.setTag("install_id", NodeHolder.installId(context))
             scope.setTag("transport", transportType(context))
+            tags.forEach { (k, v) -> scope.setTag(k, v) }
             // An empty ring is a plausible drop on ingest, and an attachment that
             // may or may not exist is worse to read than one that never does.
             if (logs.isNotEmpty()) {
                 scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
             }
-            if (health != null) {
-                scope.setContexts("rayfish", mapOf(
-                    "running" to health.running,
-                    "networks" to health.networkCount.toLong(),
-                    "peers_online" to health.peersOnline.toLong(),
-                    "node_id" to health.nodeId,
-                    "warn_count" to health.warnCount.toLong(),
-                    "error_count" to health.errorCount.toLong(),
-                ))
+            // The core's ring buffer only ever holds the Rust side. Every decision
+            // about whether there is a tunnel at all is made in Kotlin
+            // (RayfishVpnService's bring-up and teardown, NodeHolder's start/stop
+            // and network callbacks), so a report sent because "it would not come
+            // back on" arrives with no trace of the attempt that failed: the Rust
+            // log shows a healthy node and nothing else. Ship our own logcat too.
+            val appLogs = androidLog()
+            if (appLogs.isNotEmpty()) {
+                scope.addAttachment(
+                    Attachment(appLogs.toByteArray(), "rayfish-android.txt", "text/plain")
+                )
             }
+            val rayfish = mutableMapOf<String, Any>()
+            if (health != null) {
+                rayfish["running"] = health.running
+                rayfish["networks"] = health.networkCount.toLong()
+                rayfish["peers_online"] = health.peersOnline.toLong()
+                rayfish["node_id"] = health.nodeId
+                rayfish["warn_count"] = health.warnCount.toLong()
+                rayfish["error_count"] = health.errorCount.toLong()
+            }
+            rayfish.putAll(extraContext)
+            if (rayfish.isNotEmpty()) scope.setContexts("rayfish", rayfish)
         }
-        // captureMessage only enqueues; block briefly so a user-initiated report
-        // is actually delivered before we tell them it was sent. Called off the
-        // main thread (Dispatchers.IO in YouScreen).
+        // captureMessage only enqueues; block briefly so a report is actually
+        // delivered before we tell the caller it was sent. Called off the main
+        // thread (Dispatchers.IO in YouScreen, the reporter thread otherwise).
         Sentry.flush(5000)
         // A refused capture answers EMPTY_ID instead of throwing, and the caller
         // turns null into "Diagnostics unavailable". Stringifying before the

@@ -192,6 +192,7 @@ pub(crate) async fn join_mesh_shared(
         match perform_join_handshake(
             &initial_conn,
             ep,
+            &registry.transport.pkarr_relay_url,
             network_name,
             &blob_store,
             &peers,
@@ -298,9 +299,9 @@ pub(crate) async fn join_mesh_shared(
     // debounced task. The notify is shared with the member accept handler below.
     let reconverge_notify = Arc::new(tokio::sync::Notify::new());
     spawn_reconverge_worker(
-        reconverge_notify.clone(),
+        Arc::clone(&reconverge_notify),
         token.clone(),
-        live_state.clone(),
+        Arc::clone(&live_state),
         network_name.to_string(),
         worker_ctx.clone(),
         ep.clone(),
@@ -319,13 +320,13 @@ pub(crate) async fn join_mesh_shared(
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: worker_ctx.clone(),
             network_name: network_name.to_string(),
-            state: live_state.clone(),
+            state: Arc::clone(&live_state),
             net_pubkey,
             my_identity,
             endpoint: ep.clone(),
-            registry: registry.clone(),
-            invite_lock: invite_lock.clone(),
-            reconverge_notify: reconverge_notify.clone(),
+            registry: Arc::clone(&registry),
+            invite_lock: Arc::clone(&invite_lock),
+            reconverge_notify: Arc::clone(&reconverge_notify),
         })),
     );
 
@@ -373,7 +374,7 @@ async fn register_dialed_peer(
 ) {
     let conn_changed = ctx.register_peer_conn(&conn, peer_id, network_name);
     if conn_changed {
-        let router = router.clone();
+        let router = Arc::clone(router);
         let dconn = conn.clone();
         tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
     }
@@ -562,6 +563,7 @@ async fn connect_to_roster_peers(
 async fn perform_join_handshake(
     initial_conn: &Connection,
     ep: &Endpoint,
+    relay_url: &url::Url,
     network_name: &str,
     blob_store: &FsStore,
     peers: &PeerTable,
@@ -696,7 +698,7 @@ async fn perform_join_handshake(
         // second resolve/fetch fails, retain the complete blob already verified
         // by `join_network_inner`; the config roster is a lossy display cache and
         // must never become publishable after a later promotion.
-        let (blob, record_ts) = match resolve_signed(ep, net_pubkey).await {
+        let (blob, record_ts) = match resolve_signed(ep, relay_url, net_pubkey).await {
             Some((signed, seeds, ts)) => {
                 match fetch_verified_blob(ep, blob_store, peers, signed, network_name, &seeds).await
                 {

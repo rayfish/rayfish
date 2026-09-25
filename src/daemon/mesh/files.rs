@@ -39,6 +39,10 @@ impl Daemon {
         self.files.cancel_send(id)
     }
 
+    pub fn cancel_transfer(&self, id: u64) -> IpcMessage {
+        self.files.cancel_transfer(id)
+    }
+
     /// Accept a queued file offer (delegates to [`FileService`]). Kept as a
     /// public Daemon method for the `ray-mobile` FFI.
     pub async fn accept_file(

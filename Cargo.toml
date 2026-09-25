@@ -1,6 +1,6 @@
 [package]
 name = "rayfish"
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
@@ -15,7 +15,7 @@ categories = ["network-programming", "command-line-utilities"]
 # The repo root is both the `rayfish` package (binary `ray`) and the workspace
 # root. `ray-proto` is a member crate holding the shared IPC wire protocol.
 [workspace]
-members = ["ray-proto", "ray-mobile"]
+members = ["ray-proto", "ray-mobile", "ray-apple", "ray-windows"]
 
 [workspace.metadata.release]
 publish = false
@@ -39,6 +39,9 @@ required-features = ["desktop"]
 
 [features]
 default = ["desktop"]
+# The CLI bundled inside Rayfish.app uses the native UI and its user session.
+# Standalone macOS CLI builds keep the browser GUI and operator commands.
+macos-app = ["desktop"]
 # Desktop-only surface: the TUN-backed daemon binary, the embedded mesh SSH
 # server (russh/pty-process/uzers), interactive password prompts (rpassword),
 # and in-place self-update (self-replace). Off for the Android library build,
@@ -61,7 +64,7 @@ otel = [
 ]
 
 [dependencies]
-ray-proto = { path = "ray-proto", version = "0.1.11" }
+ray-proto = { path = "ray-proto", version = "0.1.13" }
 anyhow = "1"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1"
@@ -84,7 +87,7 @@ iroh-tor-transport = { version = "0.1", optional = true }
 iroh-metrics = { version = "1", features = ["service", "metrics"] }
 iroh-dns = "1"
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
-iroh-mdns-address-lookup = "0.4"
+iroh-mdns-address-lookup = "0.5"
 humansize = "2"
 # `ray logs`: parses `--since 2h30m`, and renders the cutoff in the exact
 # fixed-width RFC3339 the log appender writes, so a line can be compared
@@ -212,18 +215,23 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [patch.crates-io]
-# iroh fork carrying two rayfish features on the `rayfish-integration` branch:
+# Background cadence and content-based discovery deduplication.
+# https://github.com/n0-computer/iroh-address-lookups/pull/15
+# Drop this patch when an upstream release includes it.
+iroh-mdns-address-lookup = { git = "https://github.com/rayfish/iroh-address-lookups", rev = "3c439994559d15fd6683695757ca72f70eccc060" }
+# iroh fork carrying three rayfish features on the `rayfish-integration` branch:
 #   - `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397)
 #   - `Builder::configure_socket`, a hook run on every socket iroh opens (UDP and
 #     the relay's TCP), used for the exit-node loop prevention: SO_MARK on Linux,
-#     IP_BOUND_IF interface pinning on macOS. Supersedes the socket_mark draft
-#     (PR #4406); not proposed upstream yet.
+#     IP_BOUND_IF interface pinning on macOS (upstream PR n0-computer/iroh#4406)
+#   - the batch datagram passthroughs on `Connection` (upstream PR
+#     n0-computer/iroh#4383; the underlying noq APIs shipped in noq 1.3.0)
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
 iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
-# netwatch fork exposing the `ConfigureSocket` hook that the iroh branch above
-# threads through (upstream has only the SO_MARK-only BindOptions from
-# n0-computer/net-tools#179, unreleased).
-netwatch = { git = "https://github.com/rayfish/net-tools", branch = "feat/configure-socket" }
+# netwatch's configure-socket hook, which the iroh branch above threads through.
+# Merged upstream (n0-computer/net-tools#182); drop this once a netwatch release
+# past 0.19.3 carries it.
+netwatch = { git = "https://github.com/n0-computer/net-tools", branch = "main" }

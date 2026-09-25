@@ -192,7 +192,7 @@ pub(crate) fn spawn_network_publisher(
             });
 
             if due {
-                let commit = state.read().unwrap().snapshot_commit.clone();
+                let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
                 let _commit = commit.lock().await;
                 let mut persistence_ready = true;
                 if let Some(hash) = group_hash_needing_persistence(&state, &network_name, false) {
@@ -444,7 +444,7 @@ pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash) -> bo
             false
         }
         Err(e) => {
-            tracing::warn!(network, error = %e, "failed to mark group hash as published");
+            tracing::warn!(network, error = %format!("{e:#}"), "failed to mark group hash as published");
             false
         }
     }
@@ -455,7 +455,7 @@ pub(crate) async fn confirm_pending_snapshot_durability(
     blob_store: &FsStore,
     network: &str,
 ) -> bool {
-    let commit = state.read().unwrap().snapshot_commit.clone();
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let _commit = commit.lock().await;
     // Re-read the complete marker under the generation lock. Carrying only H2's
     // provenance across this await could otherwise mark a newly authored H3 as
@@ -474,7 +474,7 @@ pub(crate) async fn persist_group_hash_if_needed(
     hash: blake3::Hash,
     published: bool,
 ) -> bool {
-    let commit = state.read().unwrap().snapshot_commit.clone();
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let _commit = commit.lock().await;
     let (current, pending) = {
         let state = state.read().unwrap();
@@ -566,14 +566,14 @@ pub(crate) async fn update_snapshot_and_publish(
     blob_store: &FsStore,
     dht_notify: &Option<Arc<tokio::sync::Notify>>,
 ) -> bool {
-    let commit = state.read().unwrap().snapshot_commit.clone();
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let _commit = commit.lock().await;
     commit_current_snapshot(state, blob_store, dht_notify).await
 }
 
 impl Daemon {
     /// `ray connect <contact-id>`: request a direct connection by contact id.
-    pub(crate) async fn connect(&self, contact_id: &str, hostname: Option<String>) -> IpcMessage {
+    pub async fn connect(&self, contact_id: &str, hostname: Option<String>) -> IpcMessage {
         self.connect.connect(contact_id, hostname).await
     }
 

@@ -8,32 +8,54 @@ on:
   # its own, without waiting for another push.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      macos_dmg:
+        description: Build signed and notarized macOS DMGs as artifacts
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-dmg:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_dmg
+    permissions:
+      contents: write
+    uses: ./.github/workflows/macos-release.yml
+    with:
+      release_tag: ''
+    secrets: inherit
+
   check:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
+      # `save-if` on master only. Every job here writes half a gigabyte or more
+      # of target dir, and a cache written on a pull request branch is readable
+      # from that branch alone: master never sees it. Those writes bought
+      # nothing and pushed the repo past the 10 GB per-repo cache budget, where
+      # GitHub evicts by last use and takes out the master caches these jobs
+      # actually restore from. Restoring is unaffected on pull requests.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-x86_64-unknown-linux-gnu"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      # `--workspace`: ray-proto and ray-mobile are members, and a root-package
-      # build never compiles their tests, so one of them had already gone stale.
-      - name: Check
-        run: cargo check --workspace --all-targets --locked
-
+      # Clippy runs rustc's own checks before its lints, so a separate
+      # `cargo check` pass only compiles the tree a second time under a
+      # different fingerprint. `--workspace`: ray-proto and ray-mobile are
+      # members, and a root-package build never compiles their tests, so one of
+      # them had already gone stale.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -46,7 +68,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,12 +80,36 @@ jobs:
         with:
           shared-key: "ci-aarch64-apple-darwin"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Check bundled macOS CLI
+        run: |
+          cargo -q clippy --workspace --all-targets --locked --features macos-app -- -D warnings
+          cargo -q test -p rayfish --bin ray --locked --features macos-app cli::help::tests
+
+      - name: Install macOS test runner
+        run: brew install just
+
+      - name: Test native app
+        run: just macos-test macos-ipc-test macos-ui-test macos-notification-test
+
+      - name: Check Apple bindings
+        run: |
+          cargo build -p ray-apple --locked
+          cargo run -q -p ray-apple --bin uniffi-bindgen -- generate \
+            --library target/debug/libray_apple.dylib \
+            --language swift \
+            --out-dir macos/Generated \
+            --no-format
+          sed -i '' 's/[[:space:]]*$//' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
+          perl -0pi -e 's/\n+\z/\n/' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
+          git diff --exit-code macos/Generated
 
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
@@ -73,7 +119,7 @@ jobs:
   android:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -85,6 +131,7 @@ jobs:
         with:
           shared-key: "ci-aarch64-linux-android"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@v2
@@ -97,19 +144,6 @@ jobs:
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           cargo ndk -t arm64-v8a check -p ray-mobile --locked
 
-      - name: Regenerate the UniFFI bindings
-        run: |
-          cargo build -p ray-mobile
-          cargo run -p ray-mobile --bin uniffi-bindgen -- generate \
-            --library target/debug/libray_mobile.so \
-            --language kotlin \
-            --out-dir android/app/src/main/java
-
-      # A stale committed copy means the app compiles here and not from a fresh
-      # checkout of the same commit, so it is a failure, not a fixup.
-      - name: Bindings are up to date
-        run: git diff --exit-code android/app/src/main/java/uniffi/ray_mobile/ray_mobile.kt
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -117,11 +151,26 @@ jobs:
           java-version: "17"
           cache: gradle
 
+      - name: Regenerate the UniFFI bindings
+        run: |
+          cargo build -p ray-mobile
+          cargo run -p ray-mobile --bin uniffi-bindgen -- generate \
+            --library target/debug/libray_mobile.so \
+            --language kotlin \
+            --out-dir android/app/src/main/java \
+            --no-format
+          sh scripts/format-generated-kotlin.sh
+
+      # A stale committed copy means the app compiles here and not from a fresh
+      # checkout of the same commit, so it is a failure, not a fixup.
+      - name: Bindings are up to date
+        run: git diff --exit-code android/app/src/main/java/uniffi/ray_mobile/ray_mobile.kt
+
       # `-x cargoNdkBuild` skips the native cross-build: the .so is not linked
       # into anything here, and the step above already compiled that code.
-      - name: Compile the app
+      - name: Compile and test the app
         working-directory: android
-        run: ./gradlew :app:compileDebugKotlin -x cargoNdkBuild
+        run: ./gradlew :app:compileDebugKotlin :app:testDebugUnitTest -x cargoNdkBuild
 
   # Same gap the macOS and Android jobs close, for the third platform whose code
   # no Linux build compiles: the TUN/route/DNS backends are per-OS `cfg`
@@ -129,7 +178,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -141,9 +190,7 @@ jobs:
         with:
           shared-key: "ci-x86_64-pc-windows-msvc"
           cache-on-failure: true
-
-      - name: Cross-target compile
-        run: cargo check --locked --target x86_64-pc-windows-msvc --features desktop --bin ray
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Host regression tests
         run: cargo test --workspace --locked
@@ -151,6 +198,10 @@ jobs:
       - name: Windows contract tests
         run: cargo test --test windows_contracts --locked
 
+      # Covers the `ray` bin too (`desktop` is a default feature), which is why
+      # there is no separate `--target x86_64-pc-windows-msvc` check step: the
+      # runner is already that triple, so naming it only built the whole
+      # dependency tree a second time into `target/x86_64-pc-windows-msvc`.
       - name: Clippy quality gate
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -179,7 +230,7 @@ jobs:
   windows-arm64:
     runs-on: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -191,6 +242,7 @@ jobs:
         with:
           shared-key: "ci-aarch64-pc-windows-msvc"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build ray.exe
         run: cargo build --locked --release --target aarch64-pc-windows-msvc --features desktop --bin ray
@@ -200,7 +252,7 @@ jobs:
 
       # Unsigned, like the MSI below; signing happens in release.yml, on a tag.
       - name: Upload ray.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ray-windows-arm64
           path: target/aarch64-pc-windows-msvc/release/ray.exe
@@ -217,7 +269,7 @@ jobs:
     runs-on: windows-latest
     needs: windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -229,6 +281,7 @@ jobs:
         with:
           shared-key: "ci-package-x86_64-pc-windows-msvc"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install WiX 3
         shell: pwsh
@@ -254,7 +307,7 @@ jobs:
       # forks, which cannot see the signing secrets. Signing happens in
       # release.yml, on a tag.
       - name: Upload MSI artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ray-windows-x86_64-msi
           path: ${{ runner.temp }}/ray-windows-x86_64.msi*

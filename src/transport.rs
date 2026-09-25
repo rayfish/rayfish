@@ -1,22 +1,26 @@
 //! iroh endpoint setup and peer connection management.
 //!
-//! Each network gets its own ALPN (`rayfish/net/<version>/<prefix>`) for isolation
-//! and mesh-protocol version gating (see `MESH_PROTOCOL_VERSION`).
-//! A single shared iroh [`Endpoint`] handles all networks, filtering by ALPN on accept.
+//! One iroh [`Endpoint`] handles all networks. Mesh ALPNs select the wire
+//! version; network selection happens inside each connection.
 
+use std::io::{self, ErrorKind};
+use std::iter;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result};
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
     dns::{DnsProtocol, DnsResolver},
     endpoint::Connection,
     endpoint::presets,
-    endpoint::{BindOpts, Builder, DirectAddrFilter, QuicTransportConfig},
+    endpoint::{BindOpts, Builder, DirectAddrFilter, QuicTransportConfig, SocketConfigurator},
 };
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::config::ServerOverride;
+use crate::exit_node::{LoopPrevention, is_transitable};
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
@@ -43,11 +47,9 @@ pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
 /// ephemeral port (see `create_endpoint_with_alpns`).
 pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 
-/// Mesh wire-protocol version, embedded in the single mesh ALPN. Bump this on any
-/// breaking change to the mesh control/forwarding protocol. Because iroh negotiates
-/// the ALPN during the QUIC handshake, two peers on different mesh versions share no
-/// common ALPN and simply cannot connect: the version gate is enforced by the
-/// transport, with no in-band handshake.
+/// Latest mesh wire-protocol version. The endpoint also accepts v5 so old peers
+/// can connect during the fragmentation rollout. Bump this on breaking changes;
+/// keep each supported older ALPN bound to its own wire behavior.
 ///
 /// Bumped to 2 for the single-connection-per-identity change: one mesh ALPN carries
 /// every shared network (network selection is now in-band, a `ControlFrame.net`
@@ -78,10 +80,25 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Compact gave that up. Bump for anything that changes a struct's shape, and
 /// for anything an old peer would *misinterpret* (removed or repurposed fields
 /// and variants, changed semantics of existing ones).
+///
+/// Version 6 adds fragmentation below IP so a 1280-byte IPv6 packet survives
+/// paths whose QUIC datagram budget is smaller. A v5 connection sends whole
+/// packets only; its reader cannot decode fragment framing.
 pub const MESH_PROTOCOL_VERSION: u32 = 6;
+/// Older mesh versions this build speaks, newest first. Add a version here only
+/// after its connection-scoped wire behavior is implemented and tested.
+pub const MESH_BACKWARDS_COMPAT: &[u32] = &[5];
+/// Keep the signed network record readable by v5 clients during the rollout.
+/// Once v5 support is removed, this can advance with the mesh ALPN.
+pub const MESH_RECORD_VERSION: u32 = if MESH_BACKWARDS_COMPAT.is_empty() {
+    MESH_PROTOCOL_VERSION
+} else {
+    MESH_BACKWARDS_COMPAT[MESH_BACKWARDS_COMPAT.len() - 1]
+};
+pub const MESH_V5_ALPN: &[u8] = b"rayfish/mesh/5";
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
-/// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:
+/// negotiated inside each mesh connection, so adding one needs no version bump:
 /// a peer acts on a bit only if the other side set it, and an absent `features`
 /// field decodes to `0` (a peer on a build that predates the bit). This is how
 /// idle-close coexists with v0.2.0 peers, which speak mesh v2 but do not
@@ -89,13 +106,19 @@ pub const MESH_PROTOCOL_VERSION: u32 = 6;
 /// idle-close a connection whose peer did not advertise `FEATURE_IDLE_CLOSE`.
 pub const FEATURE_IDLE_CLOSE: u64 = 1 << 0;
 
-/// The single mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,
-/// every mesh connection now negotiates this one ALPN regardless of network — a
-/// peer holds exactly one QUIC connection to us, carrying all networks we share.
+/// The preferred mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,
+/// a peer holds one QUIC connection carrying all networks we share.
 /// The accept loop dispatches every mesh connection to one connection handler,
 /// which routes each control message to the right network by its `ControlFrame.net`.
 pub fn mesh_alpn() -> Vec<u8> {
     format!("rayfish/mesh/{MESH_PROTOCOL_VERSION}").into_bytes()
+}
+
+pub fn mesh_alpns() -> Vec<Vec<u8>> {
+    iter::once(MESH_PROTOCOL_VERSION)
+        .chain(MESH_BACKWARDS_COMPAT.iter().copied())
+        .map(|version| format!("rayfish/mesh/{version}").into_bytes())
+        .collect()
 }
 
 /// Public resolvers appended to the endpoint's nameserver list so the daemon can
@@ -134,7 +157,13 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) 
     if system.is_none() && o.servers.is_empty() {
         return Vec::new();
     }
-    let mut out = crate::config::resolve_upstreams(o, system.unwrap_or_default());
+    let mut out: Vec<Ipv4Addr> = crate::config::resolve_upstreams(o, system.unwrap_or_default())
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
     if !o.replace {
         out.extend(PUBLIC_FALLBACK_DNS);
     }
@@ -154,7 +183,8 @@ pub async fn create_endpoint_with_alpns(
     relay: &ServerOverride,
     discovery: &ServerOverride,
     dns_upstreams: &ServerOverride,
-) -> Result<Endpoint> {
+    warm_hints: Vec<EndpointAddr>,
+) -> Result<(Endpoint, MemoryLookup)> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
     // it for the ephemeral fallback. Falling back to port 0 keeps the guarantee
@@ -166,17 +196,20 @@ pub async fn create_endpoint_with_alpns(
         control_plane_nameservers(dns_upstreams, crate::dns::config::system_nameservers());
     tracing::debug!(?nameservers, "control-plane DNS");
 
-    let ep = match bind_endpoint(
-        &secret_key,
-        &alpns,
+    // This lookup is intentionally additive to pkarr/mDNS, never a replacement.
+    // Hints came from paths that previously completed an identity-authenticated
+    // QUIC handshake; if an address has gone stale, iroh tries discovery as usual.
+    let warm_lookup = MemoryLookup::from_endpoint_info(warm_hints);
+    let bind = BindConfig {
+        secret_key: &secret_key,
+        alpns: &alpns,
         tor,
-        RAYFISH_LISTEN_PORT,
         relay,
         discovery,
-        &nameservers,
-    )
-    .await
-    {
+        nameservers: &nameservers,
+        warm_lookup: &warm_lookup,
+    };
+    let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
         Err(e) => {
             tracing::warn!(
@@ -184,7 +217,7 @@ pub async fn create_endpoint_with_alpns(
                 error = %e,
                 "fixed UDP port unavailable; falling back to an ephemeral port"
             );
-            bind_endpoint(&secret_key, &alpns, tor, 0, relay, discovery, &nameservers)
+            bind_endpoint(&bind, 0)
                 .await
                 .context("failed to bind iroh endpoint")?
         }
@@ -192,7 +225,21 @@ pub async fn create_endpoint_with_alpns(
 
     tracing::info!(id = %ep.id().fmt_short(), "iroh endpoint ready");
 
-    Ok(ep)
+    Ok((ep, warm_lookup))
+}
+
+/// Everything a bind attempt needs except the port. The port is the one value
+/// that differs between the fixed-port attempt and the ephemeral retry, so it
+/// stays a plain argument and the rest travels as one named group.
+#[derive(Clone, Copy)]
+struct BindConfig<'a> {
+    secret_key: &'a SecretKey,
+    alpns: &'a [Vec<u8>],
+    tor: bool,
+    relay: &'a ServerOverride,
+    discovery: &'a ServerOverride,
+    nameservers: &'a [Ipv4Addr],
+    warm_lookup: &'a MemoryLookup,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -206,15 +253,16 @@ pub async fn create_endpoint_with_alpns(
 /// published, and a peer on an IPv6-only network reachable through a relay only.
 /// The v6 bind is best-effort (`set_is_required(false)`), matching the preset,
 /// since a host with IPv6 disabled must still start.
-async fn bind_endpoint(
-    secret_key: &SecretKey,
-    alpns: &[Vec<u8>],
-    tor: bool,
-    port: u16,
-    relay: &ServerOverride,
-    discovery: &ServerOverride,
-    nameservers: &[Ipv4Addr],
-) -> Result<Endpoint> {
+async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
+    let BindConfig {
+        secret_key,
+        alpns,
+        tor,
+        relay,
+        discovery,
+        nameservers,
+        warm_lookup,
+    } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
@@ -280,13 +328,17 @@ async fn bind_endpoint(
     // (the underlay UDP sockets and the relay connection) off the default route that
     // `ray up` points into the TUN, instead of looping the transport back through the
     // tunnel it is carrying. See `exit_node::LoopPrevention`.
-    builder = builder.configure_socket(crate::exit_node::LoopPrevention);
+    builder = builder.configure_socket(LoopPrevention);
 
     // Override the N0 preset's relay / discovery defaults when configured.
     if let Some(mode) = build_relay_mode(relay)? {
         builder = builder.relay_mode(mode);
     }
     builder = apply_discovery(builder, discovery)?;
+    // `discovery-dns = replace` clears the preset lookup chain above, so add
+    // this after `apply_discovery`: warm hints must remain available regardless
+    // of whether the operator replaces the public discovery service.
+    builder = builder.address_lookup(warm_lookup.clone());
 
     #[cfg(feature = "tor")]
     if tor {
@@ -339,15 +391,91 @@ fn is_foreign_overlay_ip(ip: std::net::IpAddr) -> bool {
 /// Tailscale would otherwise publish its tailnet address in a public pkarr
 /// record: it names a network no rayfish peer can route to, and it leaks the
 /// fact (and address) of that tailnet to anyone who reads the record.
+///
+/// A *global* candidate whose family this host cannot currently route goes too. A
+/// co-resident VPN that takes one family down (Mullvad with IPv6 disabled removes
+/// the v6 default, and every v6 send then fails with `EHOSTUNREACH`) leaves the
+/// addresses of that family bound and discoverable, so without this we keep
+/// publishing them and peers keep dialling them: each dial opens a path we cannot
+/// answer on, it closes, and the pair churns for as long as the VPN is up.
 #[derive(Debug)]
 struct OverlayAddrFilter;
 
 impl DirectAddrFilter for OverlayAddrFilter {
-    fn keeps(&self, ip: std::net::IpAddr) -> bool {
-        !crate::membership::is_overlay_ip(ip)
-            && !matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
-            && !is_foreign_overlay_ip(ip)
+    fn keeps(&self, ip: IpAddr) -> bool {
+        keeps_addr(ip, family_can_egress)
     }
+}
+
+/// The filter's decision, with the routability probe passed in so it can be tested
+/// without depending on the host's routing table, and so it runs only when the
+/// answer can matter.
+fn keeps_addr(ip: IpAddr, can_egress: impl FnOnce(IpAddr) -> bool) -> bool {
+    if crate::membership::is_overlay_ip(ip)
+        || matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+        || is_foreign_overlay_ip(ip)
+    {
+        return false;
+    }
+    // Only a globally routable candidate is probed. A LAN-scope one (ULA,
+    // link-local, private v4) is a path to an on-link peer, and whether this host
+    // has a *global* route for the family says nothing about whether that path
+    // works. Probing anyway would drop a working LAN address on the common home
+    // network that has ULA addressing and no IPv6 from its ISP, trading the churn
+    // this fixes for a direct path lost. `is_transitable` is the same
+    // "public, globally routable unicast" question the exit node asks of a transit
+    // destination, asked here of our own candidate.
+    !is_transitable(ip) || can_egress(ip)
+}
+
+/// Destinations the probe below looks up. Both are documentation ranges (RFC 3849,
+/// RFC 5737): `connect` on a UDP socket only consults the routing table and sends
+/// nothing, and a range reserved for documentation could not reach a real host even
+/// if that ever stopped being true.
+const PROBE_DST_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+const PROBE_DST_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+
+/// Whether this host can currently route `ip`'s family off-link.
+///
+/// The question has to be asked per family rather than per address: `keeps` is
+/// handed local interface addresses *and* the reflexive addresses QAD discovered
+/// for us, and the latter are not bound here, so a bind-and-connect test would
+/// reject exactly the public candidates that matter.
+///
+/// The probe carries [`LoopPrevention`] because iroh's own sockets do. Without it
+/// the lookup consults a different routing table than the transport actually uses
+/// (on Linux the fwmark rule sends marked traffic to `main`), and the answer would
+/// describe a path no real socket takes.
+///
+/// Fails open: only an explicit "no route" verdict drops an address. Every other
+/// error keeps it, because a probe that cannot run is not evidence that the family
+/// is dead, and the cost of being wrong here is a node that publishes no addresses
+/// at all. `EADDRNOTAVAIL` is deliberately on the keep side: it means the kernel
+/// found no *source* address for the family, which is a host with no such address
+/// at all rather than one whose route was taken away, and that host has no global
+/// candidate of that family to filter in the first place.
+fn family_can_egress(ip: IpAddr) -> bool {
+    let (domain, dst) = match ip {
+        IpAddr::V4(_) => (Domain::IPV4, SocketAddr::from((PROBE_DST_V4, 9))),
+        IpAddr::V6(_) => (Domain::IPV6, SocketAddr::from((PROBE_DST_V6, 9))),
+    };
+    let Ok(sock) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) else {
+        return true;
+    };
+    let _ = LoopPrevention.configure(SockRef::from(&sock), domain);
+    match sock.connect(&dst.into()) {
+        Ok(()) => true,
+        Err(e) => !is_unroutable(&e),
+    }
+}
+
+/// Whether a `connect` error means the kernel has no route for the family, as
+/// opposed to anything else that can go wrong while probing.
+fn is_unroutable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable
+    )
 }
 
 /// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one stream
@@ -429,25 +557,29 @@ pub async fn connect_to_peer_with_alpn(
     alpn: &[u8],
 ) -> Result<Connection> {
     let addr: EndpointAddr = id.into();
-    let conn = match ep.connect(addr, alpn).await {
-        Ok(conn) => conn,
-        // An ALPN mismatch fails the QUIC/TLS handshake opaquely. Map that one
-        // case to an actionable hint (it's a heuristic: a peer that isn't
-        // running rayfish at all looks similar, hence "may be").
-        Err(e) if is_alpn_mismatch(&e.to_string()) => {
-            return Err(e).context(
-                "no shared protocol with peer — it may be running an incompatible \
-                 rayfish version (run `ray update`)",
-            );
+    let mut candidates = vec![alpn.to_vec()];
+    if alpn == mesh_alpn() {
+        candidates.extend(mesh_alpns().into_iter().skip(1));
+    }
+    let mut mismatch = None;
+    for candidate in candidates {
+        match ep.connect(addr.clone(), &candidate).await {
+            Ok(conn) => {
+                tracing::info!(
+                    peer = %conn.remote_id().fmt_short(),
+                    alpn = %String::from_utf8_lossy(&candidate),
+                    "connected to peer"
+                );
+                return Ok(conn);
+            }
+            Err(e) if is_alpn_mismatch(&e.to_string()) => mismatch = Some(e),
+            Err(e) => return Err(e).context("failed to connect to peer"),
         }
-        Err(e) => return Err(e).context("failed to connect to peer"),
-    };
-    tracing::info!(
-        peer = %conn.remote_id().fmt_short(),
-        alpn = %String::from_utf8_lossy(alpn),
-        "connected to peer"
-    );
-    Ok(conn)
+    }
+    let error = mismatch.expect("at least one ALPN candidate was tried");
+    Err(error).context(
+        "no shared protocol with peer; it may be running an incompatible rayfish version (run `ray update`)",
+    )
 }
 
 /// Heuristic: does a connect error look like an ALPN mismatch (no protocol the
@@ -463,10 +595,68 @@ pub(crate) fn is_alpn_mismatch(err: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A family this host cannot route is dropped whole, however ordinary the
+    /// address looks. This is the co-resident-VPN case: Mullvad with IPv6 off
+    /// leaves the v6 addresses bound and discoverable while every v6 send returns
+    /// `EHOSTUNREACH`, and publishing them makes peers dial a path we cannot
+    /// answer on.
+    #[test]
+    fn an_unroutable_family_drops_its_global_addresses() {
+        let v6: IpAddr = "2a02:6ea0:c318:2::e023".parse().unwrap();
+        let v4: IpAddr = "51.15.139.151".parse().unwrap();
+        assert!(keeps_addr(v6, |_| true));
+        assert!(!keeps_addr(v6, |_| false));
+        assert!(keeps_addr(v4, |_| true));
+        assert!(!keeps_addr(v4, |_| false));
+
+        // And a routable family does not rescue an overlay address: the two
+        // reasons to drop one are independent.
+        let overlay: IpAddr = "200::1".parse().unwrap();
+        assert!(!keeps_addr(overlay, |_| true));
+    }
+
+    /// The probe answers a question about reaching the internet, so it must not
+    /// be allowed to drop a LAN path. A home network with ULA addressing and no
+    /// IPv6 from its ISP is exactly this case, and dropping the ULA there would
+    /// cost a working direct path to an on-link peer.
+    #[test]
+    fn a_lan_scope_address_survives_an_unroutable_family() {
+        for lan in ["fd00:1234:5678::1", "192.168.1.104", "169.254.3.4"] {
+            let ip: IpAddr = lan.parse().unwrap();
+            assert!(
+                keeps_addr(ip, |_| false),
+                "{lan} is on-link, the global route says nothing about it"
+            );
+        }
+        // And the probe is not even consulted for those, so no syscall is made
+        // for a LAN candidate.
+        let ula: IpAddr = "fd00:1234:5678::1".parse().unwrap();
+        assert!(keeps_addr(ula, |_| panic!("probed a LAN-scope candidate")));
+    }
+
+    /// The probe fails open, so only an explicit "no route" verdict may drop an
+    /// address. A probe that cannot run says nothing about the family, and
+    /// treating it as a failure would publish no addresses at all.
+    #[test]
+    fn only_a_routing_failure_counts_as_unroutable() {
+        assert!(is_unroutable(&io::Error::from(
+            ErrorKind::NetworkUnreachable
+        )));
+        assert!(is_unroutable(&io::Error::from(ErrorKind::HostUnreachable)));
+        // Anything else is the probe failing, not the family being down.
+        assert!(!is_unroutable(&io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_unroutable(&io::Error::from(ErrorKind::AddrInUse)));
+        assert!(!is_unroutable(&io::Error::from(ErrorKind::Other)));
+    }
+
     #[test]
     fn overlay_addr_filter_keeps_only_non_overlay() {
         use std::net::IpAddr;
-        let keeps = |s: &str| OverlayAddrFilter.keeps(s.parse::<IpAddr>().unwrap());
+        // The routability half is covered above; this pins the overlay half, so
+        // the probe's answer is held at "routable" throughout.
+        let keeps = |s: &str| keeps_addr(s.parse::<IpAddr>().unwrap(), |_| true);
         // Real underlay / LAN addresses are kept.
         assert!(keeps("51.15.139.151"));
         assert!(keeps("192.168.1.104"));
@@ -581,6 +771,48 @@ mod tests {
         // The mesh ALPN is a single node-wide protocol id, no per-network suffix.
         let expected = format!("rayfish/mesh/{MESH_PROTOCOL_VERSION}");
         assert_eq!(mesh_alpn(), expected.as_bytes());
+        assert_eq!(mesh_alpns()[1], MESH_V5_ALPN);
+    }
+
+    #[tokio::test]
+    async fn mesh_dial_falls_back_to_v5() {
+        use iroh::endpoint::presets;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let lookup = MemoryLookup::new();
+        let newer = Endpoint::builder(presets::N0)
+            .alpns(mesh_alpns())
+            .address_lookup(lookup.clone())
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let older = Endpoint::builder(presets::N0)
+            .alpns(vec![MESH_V5_ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        lookup.add_endpoint_info(older.addr());
+        let preferred = mesh_alpn();
+        let dial = connect_to_peer_with_alpn(&newer, older.id(), &preferred);
+        let accept = async {
+            loop {
+                let incoming = older.accept().await.unwrap();
+                if let Ok(conn) = incoming.await {
+                    return conn;
+                }
+            }
+        };
+        let (dialed, accepted) =
+            timeout(Duration::from_secs(5), async { tokio::join!(dial, accept) })
+                .await
+                .unwrap();
+        assert_eq!(dialed.unwrap().alpn(), MESH_V5_ALPN);
+        assert_eq!(accepted.alpn(), MESH_V5_ALPN);
+        newer.close().await;
+        older.close().await;
     }
 
     #[test]

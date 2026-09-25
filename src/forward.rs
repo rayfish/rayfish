@@ -5,7 +5,10 @@
 //! - [`spawn_peer_reader`]: one per peer, reads incoming datagrams and forwards to TUN writer
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
-use std::collections::{HashMap, HashSet, VecDeque};
+mod fragment;
+mod lazy_dial;
+
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -15,7 +18,7 @@ use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -26,12 +29,23 @@ use crate::firewall::{self, Direction, SharedFirewall};
 use crate::membership::is_overlay_ip;
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
+use lazy_dial::{LazyDialBuffers, MAX_IN_FLIGHT as LAZY_DIAL_MAX_IN_FLIGHT};
+#[cfg(test)]
+use lazy_dial::{
+    MAX_PACKETS_PER_PEER as LAZY_DIAL_MAX_PACKETS_PER_PEER,
+    MAX_PACKETS_TOTAL as LAZY_DIAL_MAX_PACKETS_TOTAL,
+};
 
 /// Maximum datagram size accepted from a peer, including the [`TAG_LEN`]-byte
 /// network handle prefix. Anything larger is dropped before being parsed or
 /// written to the TUN device, bounding memory use under a flood of oversized
 /// datagrams from a malicious or buggy peer.
-const MAX_PEER_DATAGRAM: usize = 1500 + TAG_LEN;
+const MAX_PEER_DATAGRAM: usize = fragment::MAX_PACKET + TAG_LEN;
+
+/// Datagrams drained from a peer connection in one `read_many_datagrams` call.
+/// Sized for a burst at line rate without holding a large idle buffer: each slot
+/// is an empty `Bytes` between reads, so the cost when idle is the vector itself.
+const RECV_BATCH: usize = 32;
 
 /// Bytes of the per-datagram network handle tag: a big-endian `u16` prefixed to
 /// every mesh datagram. Since one connection now carries every network the two
@@ -64,6 +78,11 @@ pub(crate) fn untag_datagram(datagram: &[u8]) -> Option<(u16, &[u8])> {
 /// one is exhausted (the old chunk stays alive via the `Bytes` already handed to
 /// quinn and is freed as those datagrams are sent).
 const TX_POOL_CHUNK: usize = 64 * 1024;
+
+/// Magic DNS forwarding may await an upstream resolver.  Keep enough requests
+/// in flight for normal browser parallelism while bounding task and socket use
+/// when a local app floods the resolver address.
+const DNS_QUERIES_MAX_IN_FLIGHT: usize = 64;
 
 /// The port a stock `ssh` client targets (`ssh user@host.ray`). Defined here in
 /// the always-compiled forward core because the userspace SSH NAT below rewrites
@@ -201,7 +220,7 @@ pub(crate) fn evaluate_inbound(
     peer_ipv6: Ipv6Addr,
     network: &str,
 ) -> InboundDecision {
-    if packet.len() > MAX_PEER_DATAGRAM {
+    if packet.len() > fragment::MAX_PACKET {
         return InboundDecision::DropMalformed;
     }
     let Some(info) = firewall::parse_packet_info(packet) else {
@@ -321,6 +340,11 @@ pub const KICK_CODE: u32 = 0x14ced;
 /// an eager peer doesn't immediately re-dial the link we deliberately let go idle.
 pub const IDLE_CODE: u32 = 0x1d1e;
 
+/// Application close code sent when a peer has selected another live QUIC
+/// connection for this identity. The replacement is already in flight, so the
+/// receiver must not immediately create yet another competing connection.
+pub const REPLACED_CONNECTION_CODE: u32 = 0x2e91aced;
+
 /// How a peer's connection ended, from the perspective of the side that observed
 /// the close. Membership is decided solely by the network-key-signed roster, so a
 /// close code is a hint about intent, never authority over who is a member.
@@ -344,6 +368,9 @@ pub enum CloseReason {
     /// go (on-demand teardown). Never reconnect; the link comes back lazily on the
     /// next packet either side sends.
     Idle,
+    /// The peer selected another connection for this identity. Preserve an
+    /// already registered successor; otherwise retry in case its handshake fails.
+    Replaced,
 }
 
 impl CloseReason {
@@ -412,6 +439,18 @@ pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
     info.dst_port == 53 && info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6)
 }
 
+/// The inputs and shared handles for one TUN forwarding loop.
+pub(crate) struct MeshForwarder<R> {
+    pub tun: R,
+    pub peers: PeerTable,
+    pub firewall: SharedFirewall,
+    pub token: CancellationToken,
+    pub stats: Arc<ForwardMetrics>,
+    pub resolver: Arc<dns::resolver::Resolver>,
+    pub tun_tx: mpsc::Sender<Bytes>,
+    pub dialer: Option<Arc<NetworkRegistry>>,
+}
+
 /// Main TUN read loop. Reads outgoing packets from the TUN device and sends each
 /// to its peer over QUIC. When there is no live connection to the destination, an
 /// on-demand node buffers the packet and dials the peer (see below); with no dialer
@@ -424,109 +463,142 @@ pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
 /// that reports back on `done`. When a dial completes the loop flushes that peer's
 /// buffered packets over the now-live route (or drops them if the dial failed). The
 /// dial itself runs off-loop, so a slow handshake never blocks forwarding.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
-    mut tun: R,
-    peers: PeerTable,
-    firewall: SharedFirewall,
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-    resolver: Arc<dns::resolver::Resolver>,
-    tun_tx: mpsc::Sender<Bytes>,
-    dialer: Option<Arc<NetworkRegistry>>,
-) -> Result<()> {
-    let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
-    // On-demand lazy-dial state, owned by this loop (no shared/locked buffer).
-    let mut buffered: HashMap<EndpointId, VecDeque<Bytes>> = HashMap::new();
-    let mut in_flight: HashSet<EndpointId> = HashSet::new();
-    let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
-    // Client-side exit-node selection (cheap Arc-backed clone), consulted for
-    // internet-bound packets. Default (no selection) when there is no registry.
-    let exit_client = dialer
-        .as_ref()
-        .map(|r| r.exit_client.clone())
-        .unwrap_or_default();
-    loop {
-        // Ensure a full MTU of contiguous spare capacity before reading (a short
-        // buffer would truncate the packet). `reserve` reuses the current chunk
-        // until it's exhausted, then allocates a fresh one, so allocation is
-        // amortized across many packets instead of paid per packet.
-        if pool.capacity() < MAX_PEER_DATAGRAM {
-            pool.reserve(TX_POOL_CHUNK);
-        }
-        // Race the read against cancellation and dial-completion. The read arm
-        // returns only the byte count so no borrow of `pool` escapes the `select!`
-        // (it's reused right below); the completion arm flushes inline and loops.
-        let n = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            result = tun.read_into(&mut pool) => result?,
-            Some((peer, connected)) = done_rx.recv() => {
-                in_flight.remove(&peer);
-                let pkts = buffered.remove(&peer).unwrap_or_default();
-                flush_or_drop(&peers, &firewall, &stats, &tun_tx, &exit_client, connected, pkts)
-                    .await;
+impl<R: crate::tun::TunRead> MeshForwarder<R> {
+    pub(crate) async fn run(self) -> Result<()> {
+        let Self {
+            mut tun,
+            peers,
+            firewall,
+            token,
+            stats,
+            resolver,
+            tun_tx,
+            dialer,
+        } = self;
+        let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
+        // On-demand lazy-dial state, owned by this loop (no shared/locked buffer).
+        // `LazyDialBuffers` bounds retained bytes and packets both per peer and for
+        // the whole daemon, so an offline route cannot make the forwarding task grow
+        // without limit during a dial timeout.
+        let mut buffered = LazyDialBuffers::default();
+        let mut in_flight: HashSet<EndpointId> = HashSet::new();
+        let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
+        let dns_queries = Arc::new(Semaphore::new(DNS_QUERIES_MAX_IN_FLIGHT));
+        // Client-side exit-node selection (cheap Arc-backed clone), consulted for
+        // internet-bound packets. Default (no selection) when there is no registry.
+        let exit_client = dialer
+            .as_ref()
+            .map(|r| r.exit_client.clone())
+            .unwrap_or_default();
+        loop {
+            // Ensure a full MTU of contiguous spare capacity before reading (a short
+            // buffer would truncate the packet). `reserve` reuses the current chunk
+            // until it's exhausted, then allocates a fresh one, so allocation is
+            // amortized across many packets instead of paid per packet.
+            if pool.capacity() < MAX_PEER_DATAGRAM {
+                pool.reserve(TX_POOL_CHUNK);
+            }
+            // Race the read against cancellation and dial-completion. The read arm
+            // returns only the byte count so no borrow of `pool` escapes the `select!`
+            // (it's reused right below); the completion arm flushes inline and loops.
+            let n = tokio::select! {
+                _ = token.cancelled() => return Ok(()),
+                result = tun.read_into(&mut pool) => result?,
+                Some((peer, connected)) = done_rx.recv() => {
+                    in_flight.remove(&peer);
+                    let pkts = buffered.take(&peer);
+                    let ctx = SendCtx { firewall: &firewall, stats: &stats, tun_tx: &tun_tx };
+                    flush_or_drop(&peers, &ctx, &exit_client, connected, pkts).await;
+                    continue;
+                }
+            };
+            if n == 0 {
                 continue;
             }
-        };
-        if n == 0 {
-            continue;
-        }
-        // Zero-copy hand-off: slice the packet out of the pool as an owned
-        // `Bytes` sharing the chunk's allocation, no copy, no per-packet malloc.
-        let pkt = pool.split_to(n).freeze();
-        tracing::debug!(len = n, first_byte = pkt[0], "TUN read");
-        let Some(info) = firewall::parse_packet_info(&pkt) else {
-            // Not IP, truncated, or IPv6 carrying an extension header we refuse
-            // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
-            // logged: a UDP send past the TUN MTU arrives here as kernel-made
-            // fragments, and a silent drop reads as the link going quiet.
-            tracing::debug!(len = n, "outbound packet not classifiable, dropping");
-            stats.record_drop(DropReason::Malformed);
-            continue;
-        };
-        if is_magic_dns(&info) {
-            let resolver = resolver.clone();
-            let tun_tx = tun_tx.clone();
-            let pkt = pkt.clone();
-            tokio::spawn(async move {
-                resolver.handle_tun_query(&pkt, &info, &tun_tx).await;
-            });
-            continue; // do not fall through to peer routing
-        }
-        let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
-            // No live connection to this destination (direct or via the exit peer).
-            // Dial the destination member itself for overlay traffic, or the
-            // configured exit peer for internet-bound traffic. Only known roster
-            // members are dialable.
-            let target = dialer.as_ref().and_then(|reg| {
-                let dst = dial_dst(&exit_client, info.dst_ip)?;
-                reg.resolve_route(dst)
-            });
-            let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
-                tracing::debug!(dst = %info.dst_ip, "no peer for dst");
-                stats.record_drop(DropReason::NoPeer);
+            // Zero-copy hand-off: slice the packet out of the pool as an owned
+            // `Bytes` sharing the chunk's allocation, no copy, no per-packet malloc.
+            let pkt = pool.split_to(n).freeze();
+            tracing::trace!(len = n, first_byte = pkt[0], "TUN read");
+            let Some(info) = firewall::parse_packet_info(&pkt) else {
+                // Not IP, truncated, or IPv6 carrying an extension header we refuse
+                // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
+                // logged: a UDP send past the TUN MTU arrives here as kernel-made
+                // fragments, and a silent drop reads as the link going quiet.
+                tracing::debug!(len = n, "outbound packet not classifiable, dropping");
+                stats.record_drop(DropReason::Malformed);
                 continue;
             };
-
-            let peer = target.endpoint_id;
-            // Buffer so the first packets of the flow aren't lost once connected. A
-            // single dial per peer runs at a time (in_flight dedup) and is bounded by
-            // LAZY_DIAL_TIMEOUT; on completion `done` flushes the buffer (success) or
-            // drops it and records the drops (timeout/failure).
-            buffered.entry(peer).or_default().push_back(pkt);
-
-            if in_flight.insert(peer) {
-                let reg = reg.clone();
-                let done = done_tx.clone();
-                tokio::spawn(async move {
-                    let connected = reg.dial_target(&target).await;
-                    let _ = done.send((peer, connected)).await;
-                });
+            // Android keeps the TUN and DNS path alive while the iroh transport
+            // sleeps. Any packet is an explicit demand signal; wake before DNS
+            // handling or peer routing so the first mesh packet can be dialed.
+            #[cfg(target_os = "android")]
+            if let Some(reg) = dialer.as_ref() {
+                reg.transport.record_outgoing_activity();
+                reg.wake_transport().await;
             }
+            if is_magic_dns(&info) {
+                let Ok(permit) = Arc::clone(&dns_queries).try_acquire_owned() else {
+                    stats.record_drop(DropReason::DnsConcurrency);
+                    continue;
+                };
+                let resolver = Arc::clone(&resolver);
+                let tun_tx = tun_tx.clone();
+                let pkt = pkt.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    resolver.handle_tun_query(&pkt, &info, &tun_tx).await;
+                });
+                continue; // do not fall through to peer routing
+            }
+            let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
+                // No live connection to this destination (direct or via the exit peer).
+                // Dial the destination member itself for overlay traffic, or the
+                // configured exit peer for internet-bound traffic. Only known roster
+                // members are dialable.
+                let target = dialer.as_ref().and_then(|reg| {
+                    let dst = dial_dst(&exit_client, info.dst_ip)?;
+                    reg.resolve_route(dst)
+                });
+                let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
+                    tracing::debug!(dst = %info.dst_ip, "no peer for dst");
+                    stats.record_drop(DropReason::NoPeer);
+                    continue;
+                };
 
-            continue;
-        };
-        send_over_route(&firewall, &stats, &tun_tx, &route, &info, pkt).await;
+                let peer = target.endpoint_id;
+                if !in_flight.contains(&peer) && in_flight.len() >= LAZY_DIAL_MAX_IN_FLIGHT {
+                    stats.record_drop(DropReason::LazyDialConcurrency);
+                    continue;
+                }
+                // Buffer a bounded beginning of the flow so its first packets aren't
+                // lost once connected. A single dial per peer runs at a time
+                // (in_flight dedup) and is bounded by LAZY_DIAL_TIMEOUT; on completion
+                // `done` flushes the retained packets (success) or drops them
+                // (timeout/failure). Once either retention budget is full, drop newest
+                // rather than allowing an unreachable peer to accumulate unbounded
+                // memory.
+                if !buffered.push(peer, pkt) {
+                    stats.record_drop(DropReason::LazyDialBufferFull);
+                }
+
+                if in_flight.insert(peer) {
+                    let reg = Arc::clone(reg);
+                    let done = done_tx.clone();
+                    tokio::spawn(async move {
+                        let connected = reg.dial_target(&target).await;
+                        let _ = done.send((peer, connected)).await;
+                    });
+                }
+
+                continue;
+            };
+            let ctx = SendCtx {
+                firewall: &firewall,
+                stats: &stats,
+                tun_tx: &tun_tx,
+            };
+            send_over_route(&ctx, &route, &info, pkt).await;
+        }
     }
 }
 
@@ -566,53 +638,94 @@ fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Opti
 /// [`run_mesh`] when a dial completes.
 async fn flush_or_drop(
     peers: &PeerTable,
-    firewall: &SharedFirewall,
-    stats: &ForwardMetrics,
-    tun_tx: &mpsc::Sender<Bytes>,
+    ctx: &SendCtx<'_>,
     exit: &ExitClient,
     connected: bool,
     pkts: VecDeque<Bytes>,
 ) {
     if !connected {
         for _ in &pkts {
-            stats.record_drop(DropReason::NoPeer);
+            ctx.stats.record_drop(DropReason::NoPeer);
         }
         return;
     }
 
+    // The whole flush is one peer's backlog, so consecutive packets almost always
+    // share a route and go out in a single call. `staged` keeps the drop-newest
+    // budget honest across a run: the send buffer does not shrink until the batch
+    // is handed over, so each packet is measured against what the run already holds.
+    let mut batch: Vec<Bytes> = Vec::new();
+    let mut packets = Vec::new();
+    let mut batched: Option<PeerRoute> = None;
+    let mut staged = 0;
     for pkt in pkts {
         let Some(info) = firewall::parse_packet_info(&pkt) else {
-            stats.record_drop(DropReason::Malformed);
+            ctx.stats.record_drop(DropReason::Malformed);
             continue;
         };
 
         let Some(route) = resolve_send_route(peers, exit, info.dst_ip) else {
             // The connection vanished between dialing and flushing (a racing
             // teardown); the flow's retransmit will re-drive it.
-            stats.record_drop(DropReason::NoPeer);
+            ctx.stats.record_drop(DropReason::NoPeer);
             continue;
         };
 
-        send_over_route(firewall, stats, tun_tx, &route, &info, pkt).await;
+        // A route change ends the run: the batch belongs to one connection.
+        if batched.as_ref().is_some_and(|b| {
+            b.handle != route.handle || b.conn.stable_id() != route.conn.stable_id()
+        }) && let Some(prev) = batched.take()
+        {
+            send_batch(ctx, &prev, &batch, &packets);
+            batch.clear();
+            packets.clear();
+            staged = 0;
+        }
+
+        let packet_len = pkt.len();
+        if let Some(encoded) = prepare_datagrams(ctx, &route, &info, pkt, staged).await {
+            for tagged in encoded.datagrams() {
+                staged += tagged.len();
+                batch.push(tagged.clone());
+            }
+            packets.push((batch.len(), packet_len));
+            batched = Some(route);
+        }
+    }
+    if let Some(route) = batched {
+        send_batch(ctx, &route, &batch, &packets);
     }
 }
 
-/// Firewall-check an outbound packet already routed to `route`, then send it as a
-/// tagged QUIC datagram. Applies the same reject-inject, drop-newest backpressure,
-/// and SSH source-port NAT as the main loop. Shared by [`run_mesh`] and the
-/// on-demand flush of packets buffered while a peer connection was established.
-pub(crate) async fn send_over_route(
-    firewall: &SharedFirewall,
-    stats: &ForwardMetrics,
-    tun_tx: &mpsc::Sender<Bytes>,
+/// The three pieces of forwarding state every outbound send needs: the firewall
+/// that admits the packet, the counters it is recorded in, and the TUN writer a
+/// reject or PMTU reply is injected back into.
+pub(crate) struct SendCtx<'a> {
+    pub firewall: &'a SharedFirewall,
+    pub stats: &'a ForwardMetrics,
+    pub tun_tx: &'a mpsc::Sender<Bytes>,
+}
+
+/// Firewall-check an outbound packet routed to `route` and turn it into tagged
+/// datagrams to put on the wire, or `None` if it must not be sent (the reason is
+/// counted, and any reject or PMTU reply already injected). Applies the reject
+/// inject, drop-newest backpressure, and SSH source-port NAT.
+///
+/// `staged` is the number of bytes already prepared for this connection but not yet
+/// handed to it, so a caller building a batch keeps the same drop-newest budget as
+/// one sending packet by packet.
+async fn prepare_datagrams(
+    ctx: &SendCtx<'_>,
     route: &PeerRoute,
     info: &firewall::PacketInfo,
     pkt: Bytes,
-) {
+    staged: usize,
+) -> Option<fragment::Encoded> {
     let n = pkt.len();
     // Reachability is "we share a network", enforced by connection existence. The
     // per-host firewall is the fine-grained gate.
-    if firewall
+    if ctx
+        .firewall
         .evaluate_packet(
             Direction::Out,
             info,
@@ -622,51 +735,61 @@ pub(crate) async fn send_over_route(
         .is_deny()
     {
         tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
-        stats.record_drop(DropReason::Firewall);
+        ctx.stats.record_drop(DropReason::Firewall);
         // Fail fast (opt-in): inject a RST / ICMP-unreachable back into our own TUN
         // so the local app's socket fails immediately instead of hanging.
-        if firewall.reject_enabled()
+        if ctx.firewall.reject_enabled()
             && let Some(reply) = crate::reject::build_reject(&pkt, info)
         {
-            stats.record_reject();
-            let _ = tun_tx.send(reply).await;
+            ctx.stats.record_reject();
+            let _ = ctx.tun_tx.send(reply).await;
         }
-        return;
+        return None;
     }
-    // PMTUD: if the packet (plus its tag) is larger than a single datagram can
-    // carry on this peer's current path, tell the source to lower its path MTU
-    // (ICMP "packet too big") instead of dropping into a blackhole. Injecting the
-    // reply into our own TUN makes the local kernel shrink the flow and resend a
-    // packet that fits. Common under an exit-node full tunnel: bulk internet
-    // traffic over a relayed peer whose datagram budget is below the 1280 TUN MTU.
-    // Not gated on `reject_enabled`: this is required PMTU signaling, not an
-    // opt-in fail-fast reject.
-    if let Some(max) = route.conn.max_datagram_size()
-        && n + TAG_LEN > max
-    {
+    // The IP-facing limit stays valid for IPv6. A smaller QUIC path is
+    // handled below IP by mesh fragmentation, never by a sub-1280 ICMP PTB
+    // (IPv6 hosts must ignore those, leaving full-sized packets blackholed).
+    let receive_mtu = route.receive_mtu();
+    if n > usize::from(receive_mtu) {
+        if let Some(reply) = crate::reject::build_packet_too_big(&pkt, info, receive_mtu) {
+            let _ = ctx.tun_tx.send(reply).await;
+        }
+        ctx.stats.record_drop(DropReason::PacketTooBig);
+        return None;
+    }
+    let Some(max) = route.conn.max_datagram_size() else {
+        ctx.stats.record_drop(DropReason::SendFailure);
+        return None;
+    };
+    let legacy = route.conn.alpn() == crate::transport::MESH_V5_ALPN;
+    if legacy && n + TAG_LEN > max {
         let inner_mtu = max.saturating_sub(TAG_LEN) as u16;
-        tracing::debug!(dst = %info.dst_ip, len = n, max, inner_mtu, "packet too big for datagram; signalling PMTU");
         if let Some(reply) = crate::reject::build_packet_too_big(&pkt, info, inner_mtu) {
-            let _ = tun_tx.send(reply).await;
+            let _ = ctx.tun_tx.send(reply).await;
         }
-        stats.record_drop(DropReason::PacketTooBig);
-        return;
+        ctx.stats.record_drop(DropReason::PacketTooBig);
+        return None;
     }
+    let Some(wire_size) = fragment::wire_size(n, max) else {
+        ctx.stats.record_drop(DropReason::PacketTooBig);
+        return None;
+    };
     // Drop-newest at the application boundary: if the peer's QUIC datagram send
-    // buffer is too full to accept this packet (plus its tag) without evicting an
-    // already-queued (older) one, drop the *new* packet here instead of calling
-    // `send_datagram`, which would drop the *oldest* queued packet (see N6 in the
-    // datagram audit). This keeps the send path non-blocking while preferring
-    // drop-newest over drop-oldest.
-    if route.conn.datagram_send_buffer_space() < n + TAG_LEN {
+    // buffer is too full to accept this packet (including all fragment headers) without evicting an
+    // already-queued (older) one, drop the *new* packet here instead of handing it
+    // to noq, which would drop the *oldest* queued packet (see N6 in the datagram
+    // audit). This keeps the send path non-blocking while preferring drop-newest
+    // over drop-oldest.
+    if route.conn.datagram_send_buffer_space() < staged + wire_size {
         tracing::trace!(
             dst = %info.dst_ip,
             space = route.conn.datagram_send_buffer_space(),
+            staged,
             len = n,
             "datagram send buffer full; dropping newest",
         );
-        stats.record_drop(DropReason::Backpressure);
-        return;
+        ctx.stats.record_drop(DropReason::Backpressure);
+        return None;
     }
     // SSH NAT: rewrite our reply's source port (listen -> 22) so the peer sees it as
     // coming from `:22`. The cheap pre-check (TCP + source port == listen port)
@@ -685,19 +808,58 @@ pub(crate) async fn send_over_route(
     // network yet (the peer hasn't been announced) — drop rather than send an
     // undecodable datagram.
     if route.handle == 0 {
-        stats.record_drop(DropReason::NoPeer);
+        ctx.stats.record_drop(DropReason::NoPeer);
+        return None;
+    }
+    if legacy {
+        Some(fragment::Encoded::Whole(tag_datagram(route.handle, &pkt)))
+    } else {
+        fragment::encode(route.handle, &pkt, max)
+    }
+}
+
+/// Firewall-check an outbound packet already routed to `route`, then send it as a
+/// whole packet or fragments. Shared by [`run_mesh`] and the on-demand flush of packets
+/// buffered while a peer connection was established.
+pub(crate) async fn send_over_route(
+    ctx: &SendCtx<'_>,
+    route: &PeerRoute,
+    info: &firewall::PacketInfo,
+    pkt: Bytes,
+) {
+    let n = pkt.len();
+    let Some(encoded) = prepare_datagrams(ctx, route, info, pkt, 0).await else {
+        return;
+    };
+    let datagrams = encoded.datagrams();
+    send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]);
+}
+
+/// Hands a run of datagrams to noq. `packets` records the end index and original
+/// IP length of each packet, so fragmentation doesn't inflate traffic counters.
+/// A partially queued packet counts as one drop; its receiver expires the pieces.
+fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes], packets: &[(usize, usize)]) {
+    if batch.is_empty() {
         return;
     }
-    let tagged = tag_datagram(route.handle, &pkt);
-    match route.conn.send_datagram(tagged) {
-        Ok(()) => {
-            stats.record_tx(n);
-            // Outbound traffic keeps the connection off the idle reaper's list.
-            route.note_activity();
+    match route.conn.send_many_datagrams(batch) {
+        Ok(queued) => {
+            for &(end, len) in packets {
+                if end <= queued {
+                    ctx.stats.record_tx(len);
+                } else {
+                    ctx.stats.record_drop(DropReason::Backpressure);
+                }
+            }
+            if queued > 0 {
+                route.note_activity();
+            }
         }
         Err(e) => {
-            tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
-            stats.record_drop(DropReason::SendFailure);
+            tracing::debug!(peer = %route.endpoint_id.fmt_short(), error = %e, "batch datagram send failed");
+            for _ in packets {
+                ctx.stats.record_drop(DropReason::SendFailure);
+            }
         }
     }
 }
@@ -714,6 +876,7 @@ pub fn spawn_peer_reader(
     peers: PeerTable,
     ctx: ForwardCtx,
 ) -> JoinHandle<()> {
+    let legacy = conn.alpn() == crate::transport::MESH_V5_ALPN;
     let ForwardCtx {
         firewall,
         tun_tx,
@@ -740,14 +903,32 @@ pub fn spawn_peer_reader(
         // sender. The steady state (sender unchanged) is then refcount-free on the
         // hottest path we have, while a re-attach still redirects this reader.
         let mut tun_tx = arc_swap::cache::Cache::new(tun_tx);
+        // Reused across reads: `read_many_datagrams` drains what is buffered into
+        // this slice under a single lock hold, so a burst costs one wake and one
+        // lock instead of one of each per packet. Taking each entry out leaves an
+        // empty `Bytes` behind, so the batch holds no packet memory between reads.
+        let mut batch = vec![Bytes::new(); RECV_BATCH];
+        let mut reassembly = fragment::Reassembler::default();
         loop {
-            // Wait for the next datagram, exiting on cancellation or connection
-            // loss. Keeping the `select!` to "yield a datagram or return" leaves
-            // the actual forwarding below at loop-body depth.
-            let datagram = tokio::select! {
+            let deadline = reassembly.deadline();
+            // Wait for the next batch, exiting on cancellation or connection loss.
+            // Keeping the `select!` to "yield datagrams or return" leaves the
+            // actual forwarding below at loop-body depth.
+            let count = tokio::select! {
                 _ = token.cancelled() => return,
-                result = conn.read_datagram() => match result {
-                    Ok(d) => d,
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    for _ in 0..reassembly.expire(tokio::time::Instant::now()) {
+                        stats.record_drop(DropReason::ReassemblyTimeout);
+                    }
+                    continue;
+                }
+                result = conn.read_many_datagrams(&mut batch) => match result {
+                    Ok(n) => n,
                     Err(e) => {
                         // Connection closed. The owning `MeshConnection` observes
                         // the same close and reports the disconnect to the
@@ -757,87 +938,131 @@ pub fn spawn_peer_reader(
                     }
                 },
             };
-            if datagram.len() > MAX_PEER_DATAGRAM {
-                stats.record_drop(DropReason::Malformed);
-                continue;
-            }
-            // Strip the network handle tag and resolve which network it names.
-            let Some((handle, _)) = untag_datagram(&datagram) else {
-                stats.record_drop(DropReason::Malformed);
-                continue;
-            };
-            // Resolve the peer's mesh IPv6 + arrival network from the handle in one
-            // pass, which also enforces the in-band reachability wall: it returns
-            // `None` unless the handle maps to a network *we* currently share with
-            // this peer per our own roster. So the peer's handle table alone can't
-            // smuggle a datagram into a network we don't agree it belongs to.
-            let Some((peer_ipv6, network)) = peers.resolve_inbound_by_id(&peer_id, handle) else {
-                stats.record_drop(DropReason::Spoof);
-                continue;
-            };
-            // Owned, zero-copy view of the IP packet (drops the 2-byte tag).
-            let datagram = datagram.slice(TAG_LEN..);
-
-            let peer_user = device_user_map.resolve(&peer_id);
-            match evaluate_inbound(&datagram, &firewall, &exit, &peer_user, peer_ipv6, &network) {
-                InboundDecision::Accept => {
-                    stats.record_rx(datagram.len());
-                    // SSH NAT: a packet to our mesh `:22` is rewritten to the
-                    // SSH server's internal listen port before injection. The
-                    // anti-spoof + firewall checks above already ran on the
-                    // original `:22` packet. Cheap pre-check avoids a copy on
-                    // ordinary traffic.
-                    let datagram = match ssh_nat() {
-                        Some(_) => match firewall::parse_packet_info(&datagram) {
-                            Some(info) if info.protocol == 6 && info.dst_port == SSH_PORT => {
-                                let mut v = datagram.to_vec();
-                                rewrite_ssh_port(&mut v, &info, true);
-                                Bytes::from(v)
-                            }
-                            _ => datagram,
-                        },
-                        None => datagram,
-                    };
-                    // Resolve the live writer for each packet: the sender is
-                    // swapped on every TUN re-attach (VPN toggle). A send error
-                    // means the writer is currently down (standby between a
-                    // detach and the next attach); drop the packet and keep the
-                    // reader alive so it forwards again once a new TUN attaches.
-                    let _ = tun_tx.load().send(datagram).await;
+            for datagram in batch.iter_mut().take(count).map(std::mem::take) {
+                if datagram.len() > MAX_PEER_DATAGRAM {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
                 }
-                InboundDecision::DropFirewall(info) => {
-                    stats.record_drop(DropReason::Firewall);
-                    // Fail fast (opt-in): send a RST / ICMP-unreachable back over
-                    // this connection so the initiator on the other host fails
-                    // immediately. Its conntrack admits the reply (a RST matches
-                    // its outbound flow; the seeded `allow in icmp` rule admits an
-                    // ICMP error), so the initiator's app sees "connection refused".
-                    if firewall.reject_enabled()
-                        && let Some(reply) = crate::reject::build_reject(&datagram, &info)
-                    {
-                        stats.record_reject();
-                        let _ = conn.send_datagram(reply);
-                    }
+                if legacy && datagram.get(TAG_LEN) == Some(&0) {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
                 }
-                InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
-                InboundDecision::DropSpoof => {
+                // Strip the network handle tag and resolve which network it names.
+                let Some((handle, _)) = untag_datagram(&datagram) else {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
+                };
+                // Resolve the peer's mesh IPv6 + arrival network from the handle in one
+                // pass, which also enforces the in-band reachability wall: it returns
+                // `None` unless the handle maps to a network *we* currently share with
+                // this peer per our own roster. So the peer's handle table alone can't
+                // smuggle a datagram into a network we don't agree it belongs to.
+                let Some((peer_ipv6, network)) =
+                    peers.resolve_inbound_by_id(&peer_id, &conn, handle)
+                else {
                     stats.record_drop(DropReason::Spoof);
-                    tracing::debug!(
-                        peer = %peer_id.fmt_short(),
-                        "dropped inbound packet with spoofed source IP"
-                    );
-                }
-                InboundDecision::DropExit => {
-                    stats.record_drop(DropReason::ExitDenied);
-                    tracing::debug!(
-                        peer = %peer_id.fmt_short(),
-                        "dropped internet-bound packet: not an exit node for this sender"
-                    );
+                    continue;
+                };
+                // Reassemble only after validating membership, then run the same
+                // source-IP, firewall and SSH NAT checks as for whole packets.
+                let datagram = match reassembly.accept(datagram, tokio::time::Instant::now()) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => continue,
+                    Err(reason) => {
+                        stats.record_drop(reason);
+                        continue;
+                    }
+                };
+
+                let peer_user = device_user_map.resolve(&peer_id);
+                match evaluate_inbound(&datagram, &firewall, &exit, &peer_user, peer_ipv6, &network)
+                {
+                    InboundDecision::Accept => {
+                        // The TUN can be replaced with a smaller one while this
+                        // connection stays open. Guard in-flight packets too,
+                        // before peers have received the new MTU announcement.
+                        let mtu = peers.local_mtu();
+                        if datagram.len() > usize::from(mtu) {
+                            stats.record_drop(DropReason::PacketTooBig);
+                            if let Some(info) = firewall::parse_packet_info(&datagram)
+                                && let Some(reply) =
+                                    crate::reject::build_packet_too_big(&datagram, &info, mtu)
+                                && let Some(handle) = peers.out_handle(&peer_ipv6, &network)
+                            {
+                                send_peer_reply(&conn, handle, &reply);
+                            }
+                            continue;
+                        }
+                        stats.record_rx(datagram.len());
+                        // SSH NAT: a packet to our mesh `:22` is rewritten to the
+                        // SSH server's internal listen port before injection. The
+                        // anti-spoof + firewall checks above already ran on the
+                        // original `:22` packet. Cheap pre-check avoids a copy on
+                        // ordinary traffic.
+                        let datagram = match ssh_nat() {
+                            Some(_) => match firewall::parse_packet_info(&datagram) {
+                                Some(info) if info.protocol == 6 && info.dst_port == SSH_PORT => {
+                                    let mut v = datagram.to_vec();
+                                    rewrite_ssh_port(&mut v, &info, true);
+                                    Bytes::from(v)
+                                }
+                                _ => datagram,
+                            },
+                            None => datagram,
+                        };
+                        // Resolve the live writer for each packet: the sender is
+                        // swapped on every TUN re-attach (VPN toggle). A send error
+                        // means the writer is currently down (standby between a
+                        // detach and the next attach); drop the packet and keep the
+                        // reader alive so it forwards again once a new TUN attaches.
+                        let _ = tun_tx.load().send(datagram).await;
+                    }
+                    InboundDecision::DropFirewall(info) => {
+                        stats.record_drop(DropReason::Firewall);
+                        // Fail fast (opt-in): send a RST / ICMP-unreachable back over
+                        // this connection so the initiator on the other host fails
+                        // immediately. Its conntrack admits the reply (a RST matches
+                        // its outbound flow; the seeded `allow in icmp` rule admits an
+                        // ICMP error), so the initiator's app sees "connection refused".
+                        if firewall.reject_enabled()
+                            && let Some(reply) = crate::reject::build_reject(&datagram, &info)
+                        {
+                            stats.record_reject();
+                            if let Some(handle) = peers.out_handle(&peer_ipv6, &network) {
+                                send_peer_reply(&conn, handle, &reply);
+                            }
+                        }
+                    }
+                    InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
+                    InboundDecision::DropSpoof => {
+                        stats.record_drop(DropReason::Spoof);
+                        tracing::debug!(
+                            peer = %peer_id.fmt_short(),
+                            "dropped inbound packet with spoofed source IP"
+                        );
+                    }
+                    InboundDecision::DropExit => {
+                        stats.record_drop(DropReason::ExitDenied);
+                        tracing::debug!(
+                            peer = %peer_id.fmt_short(),
+                            "dropped internet-bound packet: not an exit node for this sender"
+                        );
+                    }
                 }
             }
         }
     };
     tokio::spawn(reader.instrument(span))
+}
+
+/// Feedback uses our handle namespace and the same framing as ordinary packets.
+/// Even a 1280-byte ICMP error may need fragmentation on a small QUIC path.
+fn send_peer_reply(conn: &Connection, handle: u16, reply: &[u8]) {
+    if let Some(max) = conn.max_datagram_size()
+        && let Some(encoded) = fragment::encode(handle, reply, max)
+    {
+        let _ = conn.send_many_datagrams(encoded.datagrams());
+    }
 }
 
 /// Spawns a task that consumes packets from `tun_rx` and writes them to the TUN
@@ -858,6 +1083,16 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
                 // never backs up while we keep the control plane connected.
                 continue;
             }
+            // A peer reader may have queued this just before a TUN reattach
+            // lowered the MTU. Never pass an oversized packet to the device.
+            if packet.len() > usize::from(tun.mtu()) {
+                tracing::debug!(
+                    len = packet.len(),
+                    mtu = tun.mtu(),
+                    "packet exceeds TUN MTU"
+                );
+                continue;
+            }
             if let Err(e) = tun.write_packet(&packet).await {
                 tracing::warn!(error = %e, "TUN write failed");
             }
@@ -870,7 +1105,344 @@ mod tests {
     use super::*;
     use crate::AsyncMutex;
     use crate::firewall::Action;
+    use iroh::SecretKey;
     use smol_str::SmolStr;
+
+    fn test_peer(seed: u8) -> EndpointId {
+        SecretKey::from([seed; 32]).public()
+    }
+
+    #[tokio::test]
+    async fn fragmented_tcp_crosses_small_quic_path_and_keeps_policy_checks() {
+        check_fragmented_tcp(1280).await;
+    }
+
+    #[tokio::test]
+    async fn full_tun_mtu_crosses_small_quic_path_and_keeps_policy_checks() {
+        check_fragmented_tcp(crate::tun::TUN_MTU as usize).await;
+    }
+
+    #[tokio::test]
+    async fn v5_connection_sends_only_whole_packets() {
+        use iroh::endpoint::{QuicTransportConfig, presets};
+        use iroh::{Endpoint, RelayMode};
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        async fn endpoint() -> Endpoint {
+            Endpoint::builder(presets::N0)
+                .alpns(vec![crate::transport::MESH_V5_ALPN.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .transport_config(
+                    QuicTransportConfig::builder()
+                        .initial_mtu(1200)
+                        .mtu_discovery_config(None)
+                        .build(),
+                )
+                .bind()
+                .await
+                .unwrap()
+        }
+        let a = endpoint().await;
+        let b = endpoint().await;
+        let (send, recv) = timeout(Duration::from_secs(5), async {
+            tokio::join!(a.connect(b.addr(), crate::transport::MESH_V5_ALPN), async {
+                b.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let send = send.unwrap();
+        assert!(send.max_datagram_size().unwrap() < 1282);
+        let a_ip = crate::membership::derive_ipv6(&a.id());
+        let b_ip = crate::membership::derive_ipv6(&b.id());
+        let peers = PeerTable::new();
+        peers.add(b_ip, send.clone(), b.id(), "test");
+        peers.note_receive_mtu(&b.id(), &send, crate::tun::TUN_MTU);
+        let route = peers.lookup_v6(&b_ip).unwrap();
+        let (feedback_tx, mut feedback_rx) = mpsc::channel(4);
+        let fw = inbound_fw(Action::Allow, vec![]);
+        let stats = ForwardMetrics::default();
+        let ctx = SendCtx {
+            firewall: &fw,
+            stats: &stats,
+            tun_tx: &feedback_tx,
+        };
+        let small = Bytes::from(make_tcp_packet_between(a_ip, b_ip, 22));
+        let info = firewall::parse_packet_info(&small).unwrap();
+        send_over_route(&ctx, &route, &info, small.clone()).await;
+        let wire = timeout(Duration::from_secs(5), recv.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire, tag_datagram(1, &small));
+
+        let mut large = small.to_vec();
+        large.resize(1280, 0);
+        large[4..6].copy_from_slice(&1240u16.to_be_bytes());
+        let info = firewall::parse_packet_info(&large).unwrap();
+        send_over_route(&ctx, &route, &info, Bytes::from(large)).await;
+        let reply = feedback_rx.try_recv().expect("v5 sends a local PTB");
+        assert_eq!(reply[40], 2);
+        assert_eq!(
+            &reply[44..48],
+            &((send.max_datagram_size().unwrap() - TAG_LEN) as u32).to_be_bytes()
+        );
+        a.close().await;
+        b.close().await;
+    }
+
+    /// Exercise the production sender, lazy-dial batch flush and receiver over
+    /// real QUIC, with discovery disabled so full IP packets need fragmentation
+    /// even on loopback.
+    async fn check_fragmented_tcp(packet_len: usize) {
+        use iroh::endpoint::{QuicTransportConfig, presets};
+        use iroh::{Endpoint, RelayMode};
+        use std::time::{Duration, Instant};
+        use tokio::time::timeout;
+
+        async fn endpoint() -> Endpoint {
+            Endpoint::builder(presets::N0)
+                .alpns(vec![crate::transport::mesh_alpn()])
+                .relay_mode(RelayMode::Disabled)
+                .transport_config(
+                    QuicTransportConfig::builder()
+                        .initial_mtu(1200)
+                        .mtu_discovery_config(None)
+                        .build(),
+                )
+                .bind()
+                .await
+                .unwrap()
+        }
+        let a = endpoint().await;
+        let b = endpoint().await;
+        let connect = async {
+            let alpn = crate::transport::mesh_alpn();
+            let (send, recv) = tokio::join!(a.connect(b.addr(), &alpn), async {
+                b.accept().await.unwrap().await.unwrap()
+            },);
+            (send.unwrap(), recv)
+        };
+        let (send, recv) = timeout(Duration::from_secs(5), connect).await.unwrap();
+        assert!(send.max_datagram_size().unwrap() < 1282);
+        let a_ip = crate::membership::derive_ipv6(&a.id());
+        let b_ip = crate::membership::derive_ipv6(&b.id());
+        let sender_peers = PeerTable::new();
+        sender_peers.add(b_ip, send.clone(), b.id(), "test");
+        sender_peers.note_receive_mtu(&b.id(), &send, crate::tun::TUN_MTU);
+        let receiver_peers = PeerTable::new();
+        receiver_peers.set_local_mtu(crate::tun::TUN_MTU);
+        receiver_peers.add(a_ip, recv.clone(), a.id(), "test");
+        receiver_peers.add_inbound_handle_by_id(&a.id(), &recv, 1, SmolStr::new("test"));
+
+        let (tun_tx, mut tun_rx) = mpsc::channel(16);
+        let (feedback_tx, mut feedback_rx) = mpsc::channel(16);
+        let stats = Arc::new(ForwardMetrics::default());
+        let send_stats = ForwardMetrics::default();
+        let firewall = inbound_fw(Action::Allow, vec![]);
+        let token = CancellationToken::new();
+        let reader = spawn_peer_reader(
+            recv,
+            a.id(),
+            receiver_peers.clone(),
+            ForwardCtx {
+                firewall: firewall.clone(),
+                tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(tun_tx)),
+                token: token.clone(),
+                stats: Arc::clone(&stats),
+                device_user_map: DeviceUserMap::new(),
+                exit: no_exit(),
+            },
+        );
+        let sender_fw = inbound_fw(Action::Allow, vec![]);
+        let ctx = SendCtx {
+            firewall: &sender_fw,
+            stats: &send_stats,
+            tun_tx: &feedback_tx,
+        };
+        let route = sender_peers.lookup_v6(&b_ip).unwrap();
+        let mut packet = make_tcp_packet_between(a_ip, b_ip, 22);
+        packet.resize(packet_len, 0x5a);
+        packet[4..6].copy_from_slice(&((packet_len - 40) as u16).to_be_bytes());
+        packet[52] = 0x50; // TCP data offset
+        packet[53] = 0x18; // PSH + ACK
+        let checksum = tcp_csum_v6(&packet);
+        packet[56..58].copy_from_slice(&checksum.to_be_bytes());
+        let packet = Bytes::from(packet);
+        let info = firewall::parse_packet_info(&packet).unwrap();
+        send_over_route(&ctx, &route, &info, packet.clone()).await;
+        assert_eq!(
+            timeout(Duration::from_secs(5), tun_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet
+        );
+        assert!(
+            feedback_rx.try_recv().is_err(),
+            "no sub-1280 PTB is injected"
+        );
+
+        // The on-demand backlog mixes small and fragmented packets in one send
+        // batch. Counters must still count IP packets, not individual fragments.
+        let small = Bytes::from(make_tcp_packet_between(a_ip, b_ip, 22));
+        flush_or_drop(
+            &sender_peers,
+            &ctx,
+            &ExitClient::default(),
+            true,
+            VecDeque::from([small.clone(), packet.clone(), small.clone()]),
+        )
+        .await;
+        for expected in [&small, &packet, &small] {
+            assert_eq!(
+                &timeout(Duration::from_secs(5), tun_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+        }
+        let sent = send_stats.snapshot(Instant::now());
+        let received = stats.snapshot(Instant::now());
+        assert_eq!(sent.packets_tx, 4);
+        assert_eq!(received.packets_rx, 4);
+        assert_eq!(sent.bytes_tx, (packet.len() * 2 + small.len() * 2) as u64);
+        assert_eq!(received.bytes_rx, sent.bytes_tx);
+
+        if packet_len > usize::from(crate::tun::MIN_TUN_MTU) {
+            // A smaller receive limit takes effect even on an already-cached
+            // route. Feedback reaches the local host without sending the packet.
+            sender_peers.note_receive_mtu(&b.id(), &send, crate::tun::MIN_TUN_MTU);
+            send_over_route(&ctx, &route, &info, packet.clone()).await;
+            let reply = feedback_rx
+                .try_recv()
+                .expect("local PTB for a smaller peer");
+            assert_eq!(reply[40], 2); // ICMPv6 Packet Too Big
+            assert_eq!(&reply[44..48], &1280u32.to_be_bytes());
+            assert!(tun_rx.try_recv().is_err());
+
+            // Simulate a TUN reattach while old 1500-byte packets are still in
+            // flight. The receiver must return a tagged, fragmented PTB rather
+            // than inject an oversized packet into the smaller TUN.
+            receiver_peers.set_local_mtu(crate::tun::MIN_TUN_MTU);
+            let encoded = fragment::encode(1, &packet, send.max_datagram_size().unwrap()).unwrap();
+            send.send_many_datagrams(encoded.datagrams()).unwrap();
+            let reply = timeout(Duration::from_secs(5), async {
+                let mut reassembly = fragment::Reassembler::default();
+                loop {
+                    let wire = send.read_datagram().await.unwrap();
+                    assert_eq!(untag_datagram(&wire).unwrap().0, 1);
+                    if let Some(reply) = reassembly
+                        .accept(wire, tokio::time::Instant::now())
+                        .unwrap()
+                    {
+                        break reply;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(reply[40], 2);
+            assert_eq!(&reply[44..48], &1280u32.to_be_bytes());
+            assert!(tun_rx.try_recv().is_err());
+
+            // The sender can still deliver a packet at the fallback MTU.
+            let mut smaller = packet[..1280].to_vec();
+            smaller[4..6].copy_from_slice(&1240u16.to_be_bytes());
+            smaller[56..58].fill(0);
+            let checksum = tcp_csum_v6(&smaller);
+            smaller[56..58].copy_from_slice(&checksum.to_be_bytes());
+            let smaller = Bytes::from(smaller);
+            let info = firewall::parse_packet_info(&smaller).unwrap();
+            send_over_route(&ctx, &route, &info, smaller.clone()).await;
+            assert_eq!(
+                timeout(Duration::from_secs(5), tun_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                smaller
+            );
+        }
+
+        // Reassembled packets still face source validation and the firewall.
+        let mut spoofed = packet.to_vec();
+        spoofed[8..24].copy_from_slice(&OTHER_V6.octets());
+        let spoofed = fragment::encode(1, &spoofed, send.max_datagram_size().unwrap()).unwrap();
+        send.send_many_datagrams(spoofed.datagrams()).unwrap();
+        firewall.update(firewall::FirewallConfig {
+            default_inbound: Action::Deny,
+            default_outbound: Action::Allow,
+            ..Default::default()
+        });
+        // Use a new source port to avoid the earlier flow's conntrack allowance.
+        let mut denied = packet.to_vec();
+        denied[40..42].copy_from_slice(&54321u16.to_be_bytes());
+        let denied = fragment::encode(1, &denied, send.max_datagram_size().unwrap()).unwrap();
+        send.send_many_datagrams(denied.datagrams()).unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = stats.snapshot(Instant::now());
+                let count = |name| snapshot.drops.iter().find(|(n, _)| n == name).unwrap().1;
+                if count("Spoof") >= 1 && count("Firewall") >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tun_rx.try_recv().is_err());
+
+        token.cancel();
+        reader.await.unwrap();
+        a.close().await;
+        b.close().await;
+    }
+
+    #[test]
+    fn lazy_dial_buffer_keeps_oldest_packets_and_releases_budget() {
+        let peer = test_peer(1);
+        let mut buffers = LazyDialBuffers::default();
+        assert!(buffers.push(peer, Bytes::from_static(b"first")));
+        assert!(buffers.push(peer, Bytes::from_static(b"second")));
+
+        let packets = buffers.take(&peer);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0], Bytes::from_static(b"first"));
+        assert_eq!(packets[1], Bytes::from_static(b"second"));
+        assert_eq!(buffers.packets, 0);
+        assert_eq!(buffers.bytes, 0);
+        assert!(buffers.by_peer.is_empty());
+    }
+
+    #[test]
+    fn lazy_dial_buffer_caps_each_peer_and_drops_newest() {
+        let peer = test_peer(2);
+        let mut buffers = LazyDialBuffers::default();
+        for n in 0..LAZY_DIAL_MAX_PACKETS_PER_PEER {
+            assert!(buffers.push(peer, Bytes::from(vec![n as u8])));
+        }
+        assert!(!buffers.push(peer, Bytes::from_static(b"newest")));
+
+        let packets = buffers.take(&peer);
+        assert_eq!(packets.len(), LAZY_DIAL_MAX_PACKETS_PER_PEER);
+        assert_eq!(packets.front().unwrap().as_ref(), &[0]);
+        assert_eq!(
+            packets.back().unwrap().as_ref(),
+            &[(LAZY_DIAL_MAX_PACKETS_PER_PEER - 1) as u8]
+        );
+    }
+
+    #[test]
+    fn lazy_dial_buffer_caps_total_retention_across_peers() {
+        let mut buffers = LazyDialBuffers::default();
+        for n in 0..LAZY_DIAL_MAX_PACKETS_TOTAL {
+            assert!(buffers.push(test_peer((n % 8) as u8 + 3), Bytes::from_static(b"x")));
+        }
+        assert!(!buffers.push(test_peer(42), Bytes::from_static(b"x")));
+    }
 
     #[test]
     fn only_a_deliberate_leave_prunes_the_member() {
@@ -900,7 +1472,7 @@ mod tests {
     async fn tun_writer_writes_when_active() {
         use std::sync::atomic::AtomicBool;
         let writer = FakeTunWriter::default();
-        let sink = writer.written.clone();
+        let sink = Arc::clone(&writer.written);
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         let active = std::sync::Arc::new(AtomicBool::new(true));
         let handle = spawn_tun_writer(writer, rx, active);
@@ -915,7 +1487,7 @@ mod tests {
     async fn tun_writer_drops_when_inactive() {
         use std::sync::atomic::AtomicBool;
         let writer = FakeTunWriter::default();
-        let sink = writer.written.clone();
+        let sink = Arc::clone(&writer.written);
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         let active = std::sync::Arc::new(AtomicBool::new(false));
         let handle = spawn_tun_writer(writer, rx, active);

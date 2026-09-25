@@ -102,7 +102,7 @@ impl ConnectionManager {
         };
         MeshConnection::new(
             conn,
-            self.clone(),
+            Arc::clone(&self),
             mesh.ctx.clone(),
             mesh.token.clone(),
             pre_registered,
@@ -117,6 +117,7 @@ impl ConnectionManager {
     /// derivation if it isn't registered yet).
     pub(crate) fn apply_network_handles(
         &self,
+        conn: &Connection,
         peer_id: EndpointId,
         entries: &[control::NetworkHandle],
     ) {
@@ -131,6 +132,6 @@ impl ConnectionManager {
                 table.push((e.handle, SmolStr::new(name)));
             }
         }
-        mesh.ctx.peers.set_inbound_handles(&ipv6, &table);
+        mesh.ctx.peers.set_inbound_handles(&ipv6, conn, &table);
     }
 }

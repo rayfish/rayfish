@@ -12,7 +12,7 @@ use crate::firewall::PacketInfo;
 
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
-/// TUN MTU (RFC 8200 IPv6 minimum). Replies must fit.
+/// Keep DNS replies within IPv6's minimum MTU, even when the TUN is larger.
 const MTU: usize = 1280;
 
 /// Builds a complete IP+UDP reply packet for a query, swapping src/dst and

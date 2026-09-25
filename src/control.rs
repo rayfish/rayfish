@@ -303,8 +303,8 @@ pub enum ControlMsg {
     /// which network. Sender-authoritative: each side assigns handles in its own
     /// namespace for the datagrams it sends, and the receiver caches this table to
     /// decode inbound datagrams. Full snapshot, idempotent (replace on receipt),
-    /// re-sent whenever the shared-network set changes. Not scoped to a single
-    /// network (its frame carries `net = None`).
+    /// re-sent whenever the shared-network set or local TUN MTU changes. Not
+    /// scoped to a single network (its frame carries `net = None`).
     NetworkHandles {
         entries: Vec<NetworkHandle>,
         /// The sender's capability bitmask (see [`transport::FEATURE_IDLE_CLOSE`]).
@@ -314,6 +314,9 @@ pub enum ControlMsg {
         /// so a peer on a build without this field decodes to `0` (no capabilities).
         #[serde(default)]
         features: u64,
+        /// Largest reassembled IP packet the sender's TUN can accept.
+        #[serde(default = "default_receive_mtu")]
+        receive_mtu: u16,
     },
     /// Primary to secondary: this device has been unpaired (`ray unpair`). Sent
     /// best-effort over a shared network's mesh connection. The receiver acts on
@@ -369,6 +372,10 @@ pub enum ControlMsg {
     NotSupported {
         msg_kind: String,
     },
+}
+
+fn default_receive_mtu() -> u16 {
+    crate::tun::MIN_TUN_MTU
 }
 
 /// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]
@@ -632,6 +639,22 @@ mod tests {
     }
 
     #[test]
+    fn network_handles_roundtrip_receive_mtu() {
+        for receive_mtu in [1280, 1500] {
+            let msg = ControlMsg::NetworkHandles {
+                entries: vec![NetworkHandle {
+                    network: test_id(2),
+                    handle: 1,
+                }],
+                features: crate::transport::FEATURE_IDLE_CLOSE,
+                receive_mtu,
+            };
+            let decoded = decode_msg(&encode_msg(None, &msg)).unwrap();
+            assert_eq!(decoded.msg, msg);
+        }
+    }
+
+    #[test]
     fn network_handles_missing_features_decodes_to_zero() {
         // A build that stops before the `features` field. `#[serde(default)]`
         // must decode that to `0` so we treat the peer as advertising no
@@ -652,8 +675,13 @@ mod tests {
         let body = rmp_serde::to_vec(&legacy).unwrap();
         let frame: ControlFrame = rmp_serde::from_slice(&body).unwrap();
         match frame.msg {
-            ControlMsg::NetworkHandles { features, entries } => {
+            ControlMsg::NetworkHandles {
+                features,
+                entries,
+                receive_mtu,
+            } => {
                 assert_eq!(features, 0);
+                assert_eq!(receive_mtu, crate::tun::MIN_TUN_MTU);
                 assert_eq!(entries.len(), 1);
             }
             other => panic!("wrong variant: {other:?}"),

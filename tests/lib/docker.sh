@@ -40,8 +40,7 @@ servers_backend(){
 
 # authorized_keys_file : collect the public keys ssh would offer as a default
 # identity into a temp file. `just scp` (justfile) runs bare `rsync`/`ssh` with
-# no -i, and closed-net/run.sh reassigns $KEY midway through its run, so the
-# nodes have to accept the default identity, not just $SSH_KEY.
+# no -i, so the nodes have to accept the default identity, not just $SSH_KEY.
 authorized_keys_file(){
   local out; out="$(mktemp)"
   local k

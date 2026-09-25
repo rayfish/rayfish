@@ -279,6 +279,43 @@ impl MemberList {
         None
     }
 
+    /// Resolve a user-facing peer selector within this roster. Hostnames are
+    /// matched exactly; addresses and identities use the literal rules above;
+    /// short identity prefixes must identify exactly one member.
+    pub fn resolve_peer_selector(&self, selector: &str) -> Option<EndpointId> {
+        let hostname_matches: Vec<EndpointId> = self
+            .members
+            .values()
+            .filter(|member| member.hostname.as_deref() == Some(selector))
+            .map(|member| member.identity)
+            .collect();
+        match hostname_matches.as_slice() {
+            [identity] => return Some(*identity),
+            [] => {}
+            _ => return None,
+        }
+
+        if let Some(identity) = self.resolve_peer_literal(selector) {
+            return Some(identity);
+        }
+
+        let prefix_matches: Vec<EndpointId> = self
+            .members
+            .values()
+            .filter(|member| {
+                member.identity.to_string().starts_with(selector)
+                    || member
+                        .user_identity
+                        .is_some_and(|identity| identity.to_string().starts_with(selector))
+            })
+            .map(|member| member.identity)
+            .collect();
+        match prefix_matches.as_slice() {
+            [identity] => Some(*identity),
+            _ => None,
+        }
+    }
+
     pub fn from_members(members: Vec<Member>) -> Self {
         let mut list = Self::new();
         for m in members {
@@ -954,6 +991,33 @@ mod tests {
         assert_eq!(list.resolve_peer_literal("100.64.0.1"), None);
         assert_eq!(list.resolve_peer_literal(&test_id(99).to_string()), None);
         assert_eq!(list.resolve_peer_literal("not-a-peer"), None);
+    }
+
+    #[test]
+    fn resolve_peer_selector_by_hostname_and_short_identity() {
+        let alice = test_id(11);
+        let bob = test_id(22);
+        let mut list = MemberList::new();
+        for (identity, hostname) in [(alice, "alice"), (bob, "bob")] {
+            list.add(Member {
+                identity,
+                is_coordinator: false,
+                hostname: Some(hostname.to_string()),
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
+        }
+
+        assert_eq!(list.resolve_peer_selector("alice"), Some(alice));
+        assert_eq!(
+            list.resolve_peer_selector(&alice.fmt_short().to_string()),
+            Some(alice)
+        );
+        assert_eq!(list.resolve_peer_selector("missing"), None);
+        assert_eq!(list.resolve_peer_selector(""), None);
     }
 
     #[test]

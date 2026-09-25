@@ -21,7 +21,7 @@ jobs:
   lint:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `local` is not POSIX but every shell that can be /bin/sh here implements
       # it, so lint against dash rather than the stricter `sh` dialect.
       - name: Shellcheck
@@ -36,7 +36,7 @@ jobs:
         os: [ubuntu-22.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install into an unprivileged dir
         run: |
@@ -72,10 +72,10 @@ jobs:
         include:
           - image: alpine:3.20            # musl
             deps: apk add --no-cache curl
-          - image: debian:11              # glibc 2.31, below the 2.35 build floor
+          - image: ubuntu:20.04           # glibc 2.31, below the 2.35 build floor
             deps: apt-get update -qq && apt-get install -y -qq curl ca-certificates
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install on ${{ matrix.image }}
         run: |
           docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }} sh -c '

@@ -23,19 +23,12 @@ impl Daemon {
         self.registry.list_requests(network)
     }
 
-    pub async fn accept_request(
-        &self,
-        network: &str,
-        id_prefix: &str,
-        roles: Vec<String>,
-    ) -> IpcMessage {
-        self.registry
-            .accept_request(network, id_prefix, roles)
-            .await
+    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
+        self.registry.accept_request(network, selector).await
     }
 
-    pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
-        self.registry.deny_request(network, id_prefix)
+    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
+        self.registry.deny_request(network, selector)
     }
 }
 
@@ -156,7 +149,7 @@ impl NetworkRegistry {
             Some(h) => {
                 let has_key = h.state.read().unwrap().network_secret_key.is_some();
                 (
-                    h.state.clone(),
+                    Arc::clone(&h.state),
                     h.dht_notify.clone(),
                     h.network_key,
                     has_key,
@@ -200,7 +193,7 @@ impl NetworkRegistry {
             };
             let s = handle.state.read().unwrap();
             (
-                handle.invite_lock.clone(),
+                Arc::clone(&handle.invite_lock),
                 s.network_secret_key.is_some(),
                 s.reusable_keys.clone(),
             )
@@ -259,9 +252,9 @@ impl NetworkRegistry {
             };
             let has_key = handle.state.read().unwrap().network_secret_key.is_some();
             (
-                handle.state.clone(),
+                Arc::clone(&handle.state),
                 handle.dht_notify.clone(),
-                handle.invite_lock.clone(),
+                Arc::clone(&handle.invite_lock),
                 has_key,
             )
         };
@@ -321,69 +314,32 @@ impl NetworkRegistry {
         IpcMessage::PendingRequests { requests }
     }
 
-    pub async fn accept_request(
-        &self,
-        network: &str,
-        id_prefix: &str,
-        roles: Vec<String>,
-    ) -> IpcMessage {
+    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
-        // A live approval has no credential to read roles off, so the operator
-        // supplies them: `ray accept <peer> --role sentry`.
-        let granted = match crate::roles::normalize(&roles) {
-            Ok(roles) => roles,
-            Err(e) => return ipc_err(format!("{e:#}")),
-        };
-        // Find the pending request matching the short id prefix, and take it only
-        // if this accept grants every role it asked for. The peer's `--role` is a
-        // request and this approval is the grant, so accepting without those roles
-        // leaves the peer refused for good: its next attempt takes the approved
-        // branch, `roles::grant` fails there, and the denial is final. Removing the
-        // entry first would delete the request the operator has to re-accept along
-        // with it, leaving no way back but a manual `ray join` on the peer itself,
-        // so refuse while the request is still queued and the peer still retrying.
-        let taken = {
+        // Find and remove the pending request matching its hostname or id.
+        let pending = {
             let Some(handle) = self.networks.get(network) else {
                 return ipc_err(format!("network '{network}' not active"));
             };
             let mut s = handle.state.write().unwrap();
-            let found = s
-                .pending
-                .keys()
-                .find(|k| {
-                    k.fmt_short().to_string().starts_with(id_prefix)
-                        || k.to_string().starts_with(id_prefix)
-                })
-                .copied();
-            match found {
-                Some(id) => {
-                    let unmet: Vec<String> = s
-                        .pending
-                        .get(&id)
-                        .map(|pj| pj.requested_roles.difference(&granted).cloned().collect())
-                        .unwrap_or_default();
-                    match unmet.as_slice() {
-                        [] => s.pending.remove(&id).map(|pj| (id, pj)),
-                        _ => {
-                            return ipc_err(format!(
-                                "{short} asked for {unmet}, which this accept does not grant; \
-                                 it would be refused for good. Accept it with `ray requests \
-                                 {network} accept {short} --role {flags}`, or turn it away with \
-                                 `ray requests {network} deny {short}`",
-                                short = id.fmt_short(),
-                                unmet = unmet.join(", "),
-                                flags = unmet.join(" --role "),
-                            ));
-                        }
-                    }
+            let found = resolve_named_identity(
+                selector,
+                s.pending
+                    .iter()
+                    .map(|(identity, request)| (*identity, request.hostname.clone())),
+            );
+            let found = match found {
+                Ok(found) => found,
+                Err(()) => {
+                    return ipc_err(format!("pending request '{selector}' is ambiguous"));
                 }
-                None => None,
-            }
+            };
+            found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
         };
-        let Some((identity, pj)) = taken else {
-            return ipc_err(format!("no pending request matching '{id_prefix}'"));
+        let Some((identity, pj)) = pending else {
+            return ipc_err(format!("no pending request matching '{selector}'"));
         };
 
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
@@ -421,7 +377,7 @@ impl NetworkRegistry {
         }
     }
 
-    pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
@@ -429,22 +385,21 @@ impl NetworkRegistry {
             return ipc_err(format!("network '{network}' not active"));
         };
         let mut s = handle.state.write().unwrap();
-        let found = s
-            .pending
-            .keys()
-            .find(|k| {
-                k.fmt_short().to_string().starts_with(id_prefix)
-                    || k.to_string().starts_with(id_prefix)
-            })
-            .copied();
+        let found = resolve_named_identity(
+            selector,
+            s.pending
+                .iter()
+                .map(|(identity, request)| (*identity, request.hostname.clone())),
+        );
         match found {
-            Some(id) => {
+            Ok(Some(id)) => {
                 s.pending.remove(&id);
                 IpcMessage::Ok {
                     message: format!("denied {}", id.fmt_short()),
                 }
             }
-            None => ipc_err(format!("no pending request matching '{id_prefix}'")),
+            Ok(None) => ipc_err(format!("no pending request matching '{selector}'")),
+            Err(()) => ipc_err(format!("pending request '{selector}' is ambiguous")),
         }
     }
 }

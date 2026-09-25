@@ -84,12 +84,6 @@ android {
         versionCode = rayVersionCode
         versionName = rayVersion
 
-        // App-name placeholders substituted into the manifest labels. The debug
-        // build type overrides these (see below) so the dev build installs as a
-        // separate app with a distinct name in the launcher and share sheet.
-        manifestPlaceholders["appName"] = "Rayfish"
-        manifestPlaceholders["shareLabel"] = "Share with Rayfish"
-
         // ray-mobile only builds these two ABIs for now (device + emulator).
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -130,8 +124,11 @@ android {
             // A build type can only suffix the applicationId (a full override
             // needs product flavors), so the dev package is xyz.rayfish.android.dev.
             applicationIdSuffix = ".dev"
-            manifestPlaceholders["appName"] = "Rayfish Dev"
-            manifestPlaceholders["shareLabel"] = "Share with Rayfish Dev"
+            // Launcher / share-sheet names come from src/debug/res (`app_name`,
+            // `share_with_rayfish`) so they stay distinct from the release
+            // install. `share_with_rayfish` is translated, so the overlay carries
+            // one file per locale: a locale-qualified string in main/ outranks an
+            // unqualified one in the debug overlay.
         }
         release {
             isMinifyEnabled = false
@@ -163,6 +160,10 @@ android {
         buildConfig = true
     }
 
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+
     // The JNA aar and the generated .so both land under jniLibs; keep them.
     packaging {
         jniLibs {
@@ -175,6 +176,9 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.16.1")
+
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")

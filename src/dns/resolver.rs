@@ -34,11 +34,23 @@ fn is_own_resolver(ip: IpAddr) -> bool {
 /// forwards back to us (as Tailscale does, since it only filters out its own
 /// service IPs) the two resolvers point at each other.
 ///
+/// Loopback counts for the same reason. Mullvad runs its resolver on a
+/// `127.0.0.0/8` address and makes it the host's only nameserver, so the capture
+/// finds it and we forward there; point Mullvad's own custom-DNS setting back at
+/// us, which is what makes `.ray` resolve while its tunnel is up, and the two
+/// forward to each other with the host's whole DNS in the cycle.
+///
 /// Rate-limited rather than dropped, unlike [`is_own_resolver`]: it is a real
 /// resolver that really answers, and on a host where the capture found nothing
-/// else, dropping it leaves the forwarder with nothing to ask at all.
+/// else, dropping it leaves the forwarder with nothing to ask at all. That is
+/// not hypothetical for the loopback case: with that VPN on its default DNS
+/// settings its resolver is the only upstream the capture can see, and it
+/// forwards into the tunnel perfectly well.
 fn is_loopable_upstream(ip: IpAddr) -> bool {
-    matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+    match ip {
+        IpAddr::V4(v4) => crate::membership::is_cgnat_range(v4) || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
 }
 
 pub struct Resolver {
@@ -367,6 +379,33 @@ async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::
     Ok(buf)
 }
 
+/// `. NS`: a caching resolver can answer from its knowledge of the root
+/// without touching the network, which keeps the probe cheap on healthy hosts.
+const ROOT_NS_QUERY: [u8; 17] = [
+    0x2b, 0x1d, // id (arbitrary, fixed: we only compare against the reply)
+    0x01, 0x00, // flags: standard query, recursion desired
+    0x00, 0x01, // qdcount 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
+    0x00, // qname: root
+    0x00, 0x02, // qtype NS
+    0x00, 0x01, // qclass IN
+];
+
+/// `example.com A`: a forwardable dotted question. Some consumer routers'
+/// forwarders go silent for root-zone queries while forwarding dotted names
+/// fine, so on those hosts the root probe alone reads a healthy resolver as
+/// dead — and the takeover then refuses to run, leaving the host without
+/// Magic DNS at all.
+const DOTTED_A_QUERY: [u8; 29] = [
+    0x5f, 0x3a, // id (arbitrary, fixed)
+    0x01, 0x00, // flags: standard query, recursion desired
+    0x00, 0x01, // qdcount 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
+    7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0x00, 0x00,
+    0x01, // qtype A
+    0x00, 0x01, // qclass IN
+];
+
 /// True if `up` answers a DNS query at all.
 ///
 /// Captured upstreams are only ever a *claim* about where DNS lives: on a box
@@ -374,19 +413,21 @@ async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::
 /// forwarding to it silently blackholes every non-`.ray` name (see #111). Any
 /// well-formed reply counts, including SERVFAIL: this asks "is something
 /// listening", not "is it a good resolver", and a dead upstream answers nothing.
+///
+/// Two questions are asked, because resolvers disagree on what they will
+/// answer. `. NS` settles it on every well-behaved resolver; if it draws
+/// silence, `example.com A` decides, since silence for the root zone does not
+/// mean silence for the names a forwarder will actually be asked to resolve.
 pub async fn probe_upstream(up: SocketAddr) -> bool {
-    // `. NS`, the cheapest question every resolver understands, and one that
-    // needs no upstream connectivity of its own to produce a reply.
-    let query = [
-        0x2b, 0x1d, // id (arbitrary, fixed: we only compare against the reply)
-        0x01, 0x00, // flags: standard query, recursion desired
-        0x00, 0x01, // qdcount 1
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
-        0x00, // qname: root
-        0x00, 0x02, // qtype NS
-        0x00, 0x01, // qclass IN
-    ];
-    match forward_once(&query, up, PROBE_TIMEOUT).await {
+    if probe_query(up, &ROOT_NS_QUERY).await {
+        return true;
+    }
+    probe_query(up, &DOTTED_A_QUERY).await
+}
+
+/// Send `query` to `up` and wait [`PROBE_TIMEOUT`] for a well-formed reply.
+async fn probe_query(up: SocketAddr, query: &[u8]) -> bool {
+    match forward_once(query, up, PROBE_TIMEOUT).await {
         // Match the transaction id so a stray datagram can't pass as an answer.
         Ok(resp) => resp.len() >= 12 && resp[..2] == query[..2],
         Err(_) => false,
@@ -394,8 +435,10 @@ pub async fn probe_upstream(up: SocketAddr) -> bool {
 }
 
 /// Filter `candidates` down to the ones that actually answer, probing them
-/// concurrently so a set of dead entries costs one [`PROBE_TIMEOUT`], not one
-/// per entry. Order is preserved: callers treat the first as preferred.
+/// concurrently. A dead entry now costs two [`PROBE_TIMEOUT`]s (the root
+/// question times out, then the dotted fallback), but the whole set pays that
+/// once, not per entry. Order is preserved: callers treat the first as
+/// preferred.
 pub async fn live_upstreams(candidates: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
     let probes = candidates
         .iter()
@@ -898,6 +941,52 @@ mod tests {
         assert!(servfail(&[0u8; 11]).is_none());
     }
 
+    /// The fallback question parses and asks what it claims: example.com, A,
+    /// IN. A hand-rolled query with a byte-count mistake would otherwise only
+    /// show up as a resolver that never answers it.
+    #[test]
+    fn dotted_probe_query_is_well_formed() {
+        let pkt = Packet::parse(&DOTTED_A_QUERY).expect("parse the example.com A probe");
+        assert_eq!(pkt.questions.len(), 1);
+        assert_eq!(pkt.questions[0].qname.to_string(), "example.com");
+        assert_eq!(&DOTTED_A_QUERY[25..27], &[0x00, 0x01]); // qtype A
+        assert_eq!(&DOTTED_A_QUERY[27..29], &[0x00, 0x01]); // qclass IN
+    }
+
+    /// A consumer-router resolver: answers every dotted question, goes silent
+    /// for root-zone ones. The root probe alone must not read it as dead —
+    /// that verdict used to make the takeover refuse to run and left the host
+    /// without Magic DNS.
+    #[tokio::test]
+    async fn probe_survives_resolvers_that_drop_root_zone_queries() {
+        let server = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+                let q = &buf[..n];
+                // A root question's qname is the single zero byte after the
+                // header. Stay silent for those, echo the rest as answers.
+                if q.len() >= 13 && q[12] == 0 {
+                    continue;
+                }
+                let mut resp = q.to_vec();
+                resp[2] |= 0x80; // QR: this is a response
+                let _ = server.send_to(&resp, peer).await;
+            }
+        });
+
+        assert!(
+            !probe_query(addr, &ROOT_NS_QUERY).await,
+            "the mock answers nothing for the root probe, by construction"
+        );
+        assert!(
+            probe_upstream(addr).await,
+            "the dotted fallback is what keeps this upstream alive"
+        );
+    }
+
     #[tokio::test]
     async fn upstream_dropped_when_equal_to_magic_ip() {
         let r = Resolver::new(
@@ -1028,5 +1117,22 @@ mod tests {
         assert_eq!(r.upstreams(), vec![SocketAddr::from((foreign, 53))]);
         assert!(is_loopable_upstream(IpAddr::V4(foreign)));
         assert!(!is_own_resolver(IpAddr::V4(foreign)));
+    }
+
+    /// A resolver on loopback is kept on the same terms. It is what another VPN
+    /// leaves as the host's only nameserver, so the capture has nothing else to
+    /// offer, and it forwards into that VPN's tunnel perfectly well. The cycle
+    /// it can form, when that VPN is pointed back at us, is the guard's job.
+    #[test]
+    fn a_loopback_resolver_is_rate_limited_rather_than_dropped() {
+        assert!(is_loopable_upstream(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_loopable_upstream(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 53
+        ))));
+        assert!(is_loopable_upstream(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!is_own_resolver(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+        // An ordinary upstream is neither, so the guard stays off its path.
+        assert!(!is_loopable_upstream(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 }
