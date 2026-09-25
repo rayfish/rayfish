@@ -536,6 +536,20 @@ private struct SettingsView: View {
             }.padding(18).rayfishCard()
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
+                    Text("Start at login")
+                    Spacer()
+                    Toggle("Start at login", isOn: Binding(
+                        get: { controller.launchAtLoginEnabled },
+                        set: { controller.setLaunchAtLogin($0) }
+                    ))
+                    .labelsHidden()
+                }
+                Text("Open Rayfish and connect after you sign in.").foregroundColor(RayfishTheme.muted)
+            }
+            .toggleStyle(.switch)
+            .padding(18).rayfishCard()
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
                     Text("Magic DNS")
                     Spacer()
                     Toggle("Magic DNS", isOn: Binding(

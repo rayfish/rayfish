@@ -5805,6 +5805,7 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "image",
+ "serde_json",
  "tao",
  "tray-icon",
  "windows-sys 0.61.2",

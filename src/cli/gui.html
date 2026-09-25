@@ -225,6 +225,7 @@
     .setting-title { color: var(--ink); font-weight: 600; }
     .setting-description { color: var(--muted); }
     .setting-divider { height: 1px; background: var(--line); }
+    [hidden] { display: none !important; }
     button.switch {
       position: relative; width: 38px; min-width: 38px; min-height: 22px; height: 22px;
       padding: 0; border: 0; border-radius: 999px; background: var(--line-2);
@@ -403,6 +404,16 @@
             <span id="vpnState" class="badge">checking</span>
           </div>
           <div id="vpnDescription" class="setting-description">Rayfish manages this connection through its Windows service.</div>
+        </div>
+        <div id="launchAtLoginCard" class="card settings-card" hidden>
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Start at login</div>
+              <div class="setting-description">Open Rayfish after you sign in.</div>
+            </div>
+            <span class="spacer"></span>
+            <span id="launchAtLoginToggle"></span>
+          </div>
         </div>
         <div class="card settings-card">
           <div class="setting-row">
@@ -661,6 +672,9 @@
     let statusBusy = false;
     let lastData = null;
     let lastConfig = null;
+    let launchAtLoginAvailable = false;
+    let launchAtLoginEnabled = false;
+    let launchAtLoginPending = false;
     async function refresh() {
       if (statusBusy || document.hidden) return;
       statusBusy = true;
@@ -817,6 +831,26 @@
       return `<button type="button" class="switch${enabled ? " on" : ""}" aria-label="${esc(label)}" aria-pressed="${enabled}" ${disabled ? "disabled" : ""} data-act='${esc(JSON.stringify(args))}' data-ok="setting updated"></button>`;
     }
 
+    function renderLaunchAtLogin() {
+      $("launchAtLoginCard").hidden = !launchAtLoginAvailable;
+      $("launchAtLoginToggle").innerHTML = `<button type="button" class="switch${launchAtLoginEnabled ? " on" : ""}" aria-label="Start at login" aria-pressed="${launchAtLoginEnabled}" ${launchAtLoginPending ? "disabled" : ""} data-startup="${launchAtLoginEnabled ? "off" : "on"}"></button>`;
+    }
+
+    function requestLaunchAtLogin() {
+      if (!window.ipc || launchAtLoginPending) return;
+      launchAtLoginPending = true;
+      renderLaunchAtLogin();
+      window.ipc.postMessage("startup:get");
+    }
+
+    function setLaunchAtLoginState(enabled, error) {
+      launchAtLoginAvailable = true;
+      launchAtLoginEnabled = !!enabled;
+      launchAtLoginPending = false;
+      renderLaunchAtLogin();
+      if (error) toast(error, true);
+    }
+
     function configEnabled(key, fallback) {
       const value = lastConfig && lastConfig[key];
       return value == null ? !!fallback : value === true || String(value).toLowerCase() === "on";
@@ -921,7 +955,7 @@
 
     // ---- wiring ----
     document.addEventListener("click", ev => {
-      const t = ev.target.closest("[data-copy],[data-leave],[data-invite],[data-rename],[data-act],[data-run],[data-close]");
+      const t = ev.target.closest("[data-copy],[data-leave],[data-invite],[data-rename],[data-startup],[data-act],[data-run],[data-close]");
       if (!t) return;
       if (t.dataset.copy != null) {
         if (t.dataset.copy) copyText(t.dataset.copy).then(() => toast("copied"));
@@ -935,6 +969,10 @@
         $("renameHost").value = t.dataset.host || "";
         updateRenameDomain();
         $("renameDlg").showModal();
+      } else if (t.dataset.startup != null) {
+        launchAtLoginPending = true;
+        renderLaunchAtLogin();
+        window.ipc.postMessage("startup:" + t.dataset.startup);
       } else if (t.dataset.act != null) {
         act(JSON.parse(t.dataset.act), t.dataset.ok);
       } else if (t.dataset.run != null) {
@@ -951,6 +989,7 @@
     function showPage(page) {
       document.querySelectorAll(".page").forEach(el => el.classList.toggle("active", el.id === "page" + page[0].toUpperCase() + page.slice(1)));
       document.querySelectorAll(".tab").forEach(el => el.classList.toggle("active", el.dataset.page === page));
+      if (page === "settings") requestLaunchAtLogin();
     }
     document.querySelectorAll(".tab").forEach(tab => {
       tab.onclick = () => showPage(tab.dataset.page);
