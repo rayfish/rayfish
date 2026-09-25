@@ -15,6 +15,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Windows and macOS can start Rayfish at login.** Enable it from Settings to
   open the desktop app after signing in. The macOS app also connects the VPN.
 
+### Changed
+
+- **Windows nightlies now contain only the CLI and daemon.** The Windows
+  desktop installer and macOS DMG are produced for stable releases only.
+
 ### Fixed
 
 - **Commands that target network members accept their hostnames consistently.**
