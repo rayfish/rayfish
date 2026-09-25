@@ -633,7 +633,7 @@ impl Daemon {
             }
         };
         // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
-        // resolve to the peer's **user identity** hex. `resolve_peer_name` may
+        // resolve to the peer's **user identity** hex. The roster lookup may
         // return a transport endpoint id (for a connected peer) which differs
         // from the user identity for a paired/multi-device peer; the SSH server
         // authorizes by user identity (`device_user_map.resolve`), so normalize
@@ -641,7 +641,7 @@ impl Daemon {
         let entry = if peer == "*" {
             "*".to_string()
         } else {
-            match self.resolve_peer_name(peer).await {
+            match self.registry.resolve_peer_in_network(network, peer) {
                 Some(id) => self.registry.device_user_map.resolve(&id).to_string(),
                 None => {
                     return ipc_err(format!("could not resolve peer: {peer}"));

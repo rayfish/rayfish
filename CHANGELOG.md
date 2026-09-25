@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Commands that target network members accept their hostnames consistently.**
+  Admin grants now accept names, and network-scoped commands do not resolve a
+  duplicate name from another network.
+
 ## [0.5.0] - 2026-09-24
 
 ### Added

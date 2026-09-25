@@ -287,7 +287,7 @@ pub(crate) enum Command {
     /// Peers awaiting approval; admit or reject them
     ///
     /// Coordinator only, and closed networks only. With no action, lists who is
-    /// waiting; `accept <id>` admits one and `deny <id>` turns it away.
+    /// waiting; `accept <name>` admits one and `deny <name>` turns it away.
     Requests {
         /// Network name
         #[arg(add = complete::networks())]
@@ -298,23 +298,23 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// The old spelling of `ray requests <network> accept <id>`.
+    /// The old spelling of `ray requests <network> accept <name>`.
     #[command(hide = true)]
     Accept {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
-        /// Short id of the pending peer (from `ray requests`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
-    /// The old spelling of `ray requests <network> deny <id>`.
+    /// The old spelling of `ray requests <network> deny <name>`.
     #[command(hide = true)]
     Deny {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
-        /// Short id of the pending peer (from `ray requests`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
@@ -743,7 +743,7 @@ pub(crate) enum ControllerAction {
 pub(crate) enum AdminAction {
     /// Grant the network key to a member
     Add {
-        /// Short id of the member to promote (from `ray status`)
+        /// Member hostname, mesh IP, short id, or full identity
         #[arg(add = complete::peers())]
         identity: String,
     },
@@ -784,13 +784,13 @@ pub(crate) enum RequestsAction {
     /// Admit a peer waiting for approval
     #[command(visible_alias = "ok")]
     Accept {
-        /// Short id of the pending peer (from `ray requests <network>`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
     /// Reject a peer waiting for approval
     Deny {
-        /// Short id of the pending peer (from `ray requests <network>`)
+        /// Hostname or short id of the pending peer
         #[arg(add = complete::join_requests())]
         id: String,
     },
@@ -807,7 +807,7 @@ pub(crate) enum ConnectAction {
     /// reads the same here as it does under `ray requests`.
     #[command(visible_aliases = ["ok", "accept"])]
     Approve {
-        /// Short id of the requester (from `ray connect`)
+        /// Hostname or short id of the requester
         #[arg(add = complete::connect_requests())]
         id: String,
     },

@@ -125,25 +125,37 @@ impl ConnectService {
             .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
     }
 
-    /// Approve a pending `ray connect` request by contact-id prefix: mint a
+    /// Approve a pending `ray connect` request by hostname or contact-id prefix: mint a
     /// restricted 2-peer network with the requester pre-approved (idempotent if
     /// already linked; defers to the higher endpoint id on a simultaneous
     /// cross-connect). The initiator's connect-retry loop then joins it.
-    pub(crate) async fn approve_connection(&self, id_prefix: &str) -> IpcMessage {
-        let found = self
+    pub(crate) async fn approve_connection(&self, selector: &str) -> IpcMessage {
+        let identity = match resolve_named_identity(
+            selector,
+            self.pending_connects
+                .iter()
+                .map(|request| (request.from_contact_id, request.hostname.clone())),
+        ) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                return ipc_err(format!(
+                    "no pending connection request matching '{selector}'"
+                ));
+            }
+            Err(()) => {
+                return ipc_err(format!(
+                    "pending connection request '{selector}' is ambiguous"
+                ));
+            }
+        };
+        let Some(req) = self
             .pending_connects
             .iter()
-            .find(|p| {
-                p.from_contact_id
-                    .fmt_short()
-                    .to_string()
-                    .starts_with(id_prefix)
-                    || p.from_contact_id.to_string().starts_with(id_prefix)
-            })
-            .map(|p| p.value().clone());
-        let Some(req) = found else {
+            .find(|request| request.from_contact_id == identity)
+            .map(|request| request.value().clone())
+        else {
             return ipc_err(format!(
-                "no pending connection request matching '{id_prefix}'"
+                "pending connection request '{selector}' disappeared"
             ));
         };
         let peer = req.from_endpoint;
@@ -368,28 +380,36 @@ impl ConnectService {
         IpcMessage::PendingRequests { requests }
     }
 
-    /// Decline a pending connection request by contact-id prefix.
-    pub(crate) fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
-        let found = self
-            .pending_connects
-            .iter()
-            .find(|p| {
-                p.from_contact_id
-                    .fmt_short()
-                    .to_string()
-                    .starts_with(id_prefix)
-                    || p.from_contact_id.to_string().starts_with(id_prefix)
-            })
-            .map(|p| *p.key());
+    /// Decline a pending connection request by hostname or contact-id prefix.
+    pub(crate) fn reject_connect(&self, selector: &str) -> IpcMessage {
+        let found = resolve_named_identity(
+            selector,
+            self.pending_connects
+                .iter()
+                .map(|request| (request.from_contact_id, request.hostname.clone())),
+        );
         match found {
-            Some(peer) => {
+            Ok(Some(identity)) => {
+                let peer = self
+                    .pending_connects
+                    .iter()
+                    .find(|request| request.from_contact_id == identity)
+                    .map(|request| *request.key());
+                let Some(peer) = peer else {
+                    return ipc_err(format!(
+                        "pending connection request '{selector}' disappeared"
+                    ));
+                };
                 self.pending_connects.remove(&peer);
                 IpcMessage::Ok {
-                    message: format!("declined connection request '{id_prefix}'"),
+                    message: format!("declined connection request '{selector}'"),
                 }
             }
-            None => ipc_err(format!(
-                "no pending connection request matching '{id_prefix}'"
+            Ok(None) => ipc_err(format!(
+                "no pending connection request matching '{selector}'"
+            )),
+            Err(()) => ipc_err(format!(
+                "pending connection request '{selector}' is ambiguous"
             )),
         }
     }
