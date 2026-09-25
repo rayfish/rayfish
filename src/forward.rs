@@ -368,8 +368,8 @@ pub enum CloseReason {
     /// go (on-demand teardown). Never reconnect; the link comes back lazily on the
     /// next packet either side sends.
     Idle,
-    /// The peer selected another live connection for this identity. Do not
-    /// reconnect: the selected connection's handshake will register its route.
+    /// The peer selected another connection for this identity. Preserve an
+    /// already registered successor; otherwise retry in case its handshake fails.
     Replaced,
 }
 

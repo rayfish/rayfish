@@ -35,6 +35,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Mesh connections recover when a replacement connection fails to arrive.**
+  Rayfish retries the missing link automatically, so SSH and other traffic do
+  not have to wait for another recovery trigger.
+
 - **Kicks now revoke the removed device across the mesh.** Remaining peers drop
   its network route and close its last shared connection, while the kicked device
   removes the network from its local status and open desktop dashboard. A fresh

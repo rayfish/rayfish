@@ -59,10 +59,7 @@ impl NetworkRegistry {
             return;
         }
 
-        if matches!(
-            ev.reason,
-            forward::CloseReason::Idle | forward::CloseReason::Replaced
-        ) {
+        if matches!(ev.reason, forward::CloseReason::Idle) {
             // The peer let an idle connection go (on-demand teardown). Never
             // reconnect on any node; the link comes back lazily on the next packet.
             return;
@@ -98,7 +95,12 @@ impl NetworkRegistry {
             return;
         }
 
-        // Transient drop: stamp `last_seen` on each network we coordinate so the
+        // A registered successor was preserved by remove_connection above. If
+        // Replaced removed the current route, the promised successor has not
+        // arrived. Retry it like a transient failure; dial_peer_once reuses a
+        // successor that registers during backoff instead of opening a duplicate.
+        //
+        // Lost route: stamp `last_seen` on each network we coordinate so the
         // ephemeral pruner ages the member from when it actually went offline
         // (not its admit time), then reconnect across every shared network,
         // skipping any we just pruned this peer from (one-shot via pruned_peers).
