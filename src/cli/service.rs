@@ -89,6 +89,7 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// site names its values and the posture flags can be validated as one thing.
 pub(crate) struct UpOptions {
     pub hostname: Option<String>,
+    pub controller: Option<ipc::EnrollmentTicket>,
     pub private: bool,
     pub no_private: bool,
     pub tor: bool,
@@ -297,10 +298,10 @@ fn announce_posture(opts: &UpOptions, restarting: bool) {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-pub(crate) async fn cmd_up(
-    hostname: Option<String>,
-    controller: Option<ipc::EnrollmentTicket>,
-) -> Result<()> {
+pub(crate) async fn cmd_up(opts: UpOptions) -> Result<()> {
+    if opts.no_private {
+        confirm_leaving_private(opts.yes)?;
+    }
     #[cfg(windows)]
     let mut operator_claim = WindowsOperatorClaim::begin()?;
     if let Ok(mut stream) = ipc::connect().await {
@@ -316,7 +317,7 @@ pub(crate) async fn cmd_up(
         ipc::send(
             &mut stream,
             ipc::IpcMessage::Up {
-                hostname: opts.hostname,
+                hostname: opts.hostname.clone(),
             },
         )
         .await?;
@@ -328,8 +329,8 @@ pub(crate) async fn cmd_up(
                 #[cfg(windows)]
                 operator_claim.commit();
                 println!("{message}");
-                if let Some(ticket) = controller {
-                    ipc_enroll_controller(&ticket).await?;
+                if let Some(ticket) = opts.controller.as_ref() {
+                    ipc_enroll_controller(ticket).await?;
                 }
             }
             ipc::IpcMessage::Error { message } => fail_with("error", &message),
@@ -350,9 +351,9 @@ pub(crate) async fn cmd_up(
         );
         std::process::exit(1);
     }
-    install_and_start_service(hostname).await?;
-    if let Some(ticket) = controller {
-        ipc_enroll_controller(&ticket).await?;
+    install_and_start_service(opts.hostname.clone()).await?;
+    if let Some(ticket) = opts.controller.as_ref() {
+        ipc_enroll_controller(ticket).await?;
     }
     Ok(())
 }
@@ -750,6 +751,7 @@ mod tests {
     fn opts() -> UpOptions {
         UpOptions {
             hostname: None,
+            controller: None,
             private: false,
             no_private: false,
             tor: false,

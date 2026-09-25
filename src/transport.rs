@@ -274,7 +274,7 @@ pub async fn create_endpoint_with_alpns(
     discovery: &ServerOverride,
     dns_upstreams: &ServerOverride,
     warm_hints: Vec<EndpointAddr>,
-) -> Result<(Endpoint, MemoryLookup)> {
+) -> Result<(BoundEndpoint, MemoryLookup)> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
     // it for the ephemeral fallback. Falling back to port 0 keeps the guarantee
@@ -301,14 +301,17 @@ pub async fn create_endpoint_with_alpns(
     let bind = BindConfig {
         secret_key: &secret_key,
         alpns: &alpns,
-        tor,
+        posture,
         relay,
         discovery,
         nameservers: &nameservers,
         warm_lookup: &warm_lookup,
     };
-    let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
-        Ok(ep) => ep,
+    let bound = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
+        Ok(bound) => bound,
+        Err(e) if posture.is_tor_only() => {
+            return Err(e).context("failed to bind iroh endpoint over Tor");
+        }
         Err(e) => {
             tracing::warn!(
                 port = RAYFISH_LISTEN_PORT,
@@ -321,13 +324,9 @@ pub async fn create_endpoint_with_alpns(
         }
     };
 
-    tracing::info!(
-        id = %bound.endpoint.id().fmt_short(),
-        ?posture,
-        "iroh endpoint ready"
-    );
+    tracing::info!(id = %bound.endpoint.id().fmt_short(), ?posture, "iroh endpoint ready");
 
-    Ok((ep, warm_lookup))
+    Ok((bound, warm_lookup))
 }
 
 /// Everything a bind attempt needs except the port. The port is the one value
@@ -337,7 +336,7 @@ pub async fn create_endpoint_with_alpns(
 struct BindConfig<'a> {
     secret_key: &'a SecretKey,
     alpns: &'a [Vec<u8>],
-    tor: bool,
+    posture: NodePosture,
     relay: &'a ServerOverride,
     discovery: &'a ServerOverride,
     nameservers: &'a [Ipv4Addr],
@@ -355,11 +354,11 @@ struct BindConfig<'a> {
 /// published, and a peer on an IPv6-only network reachable through a relay only.
 /// The v6 bind is best-effort (`set_is_required(false)`), matching the preset,
 /// since a host with IPv6 disabled must still start.
-async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
+async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<BoundEndpoint> {
     let BindConfig {
         secret_key,
         alpns,
-        tor,
+        posture,
         relay,
         discovery,
         nameservers,
@@ -459,11 +458,13 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         }
         builder = apply_discovery(builder, discovery)?;
     }
-    builder = apply_discovery(builder, discovery)?;
     // `discovery-dns = replace` clears the preset lookup chain above, so add
     // this after `apply_discovery`: warm hints must remain available regardless
     // of whether the operator replaces the public discovery service.
     builder = builder.address_lookup(warm_lookup.clone());
+
+    #[allow(unused_mut)]
+    let mut guard = TransportGuard::default();
 
     #[cfg(feature = "tor")]
     if posture.is_tor_only() {

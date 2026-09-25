@@ -194,6 +194,8 @@ impl Daemon {
             // match and forces the choice.
             NodeKey::Global(
                 k @ (GlobalKey::Mdns
+                | GlobalKey::Private
+                | GlobalKey::Tor
                 | GlobalKey::Relay
                 | GlobalKey::DiscoveryDns
                 | GlobalKey::DnsUpstreams

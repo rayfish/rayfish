@@ -178,17 +178,31 @@ const CONTACT_RECORD_NAME: &str = "_rayfish_contact";
 // Pkarr client
 // ---------------------------------------------------------------------------
 
-pub fn create_pkarr_client(ep: &Endpoint, relay_url: &Url) -> Result<PkarrRelayClient> {
+pub fn create_pkarr_client(ep: &Endpoint, relay_url: &Url) -> Result<PkarrClient> {
+    if posture().is_tor_only() {
+        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{TOR_SOCKS_PORT}"))
+            .context("building the Tor SOCKS proxy for pkarr")?;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .proxy(proxy)
+            .build()
+            .context("building the pkarr client for Tor")?;
+        return Ok(PkarrClient::Socks {
+            http,
+            relay_url: relay_url.clone(),
+        });
+    }
+
     let tls_config = ep.tls_config().clone();
     let dns_resolver: DnsResolver = ep
         .dns_resolver()
         .context("endpoint has no DNS resolver")?
         .clone();
-    Ok(PkarrRelayClient::new(
+    Ok(PkarrClient::Direct(PkarrRelayClient::new(
         relay_url.clone(),
         tls_config,
         dns_resolver,
-    ))
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +425,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a Tor daemon with SocksPort 9050"]
     async fn pkarr_over_tor_reaches_the_server() {
-        let relay_url: Url = effective_pkarr_url().parse().unwrap();
+        let relay_url = pkarr_relay_url(&crate::config::ServerOverride::default());
         let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{TOR_SOCKS_PORT}")).unwrap();
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder().proxy(proxy).build().unwrap();

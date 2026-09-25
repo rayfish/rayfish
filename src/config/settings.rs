@@ -36,9 +36,28 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
     let entries = super::parse_entries(value);
     let reset = entries.is_empty() || entries == ["n0"];
     match key {
-        GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
+        GlobalKey::Mdns => cfg.mdns_enabled = private_mode_forbids(cfg, value, key)?,
+        GlobalKey::Private => {
+            let on = parse_bool(value, false)?;
+            if on {
+                private_servers_or_bail(cfg, cfg.uses_tor())?;
+            }
+            cfg.private_mode = on;
+        }
+        GlobalKey::Tor => {
+            let on = parse_bool(value, false)?;
+            let still_tor = AppConfig {
+                tor: on,
+                ..cfg.clone()
+            }
+            .uses_tor();
+            if cfg.private_mode && !still_tor {
+                private_servers_or_bail(cfg, false)?;
+            }
+            cfg.tor = on;
+        }
         GlobalKey::Dns => cfg.dns_enabled = parse_bool(value, true)?,
-        GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
+        GlobalKey::AutoUpdate => cfg.auto_update = private_mode_forbids(cfg, value, key)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
         // caller must also seed/remove the `allow in tcp:22` passthrough and
@@ -215,6 +234,8 @@ fn server_override(
 pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
+        GlobalKey::Private => on_off(cfg.private_mode),
+        GlobalKey::Tor => on_off(cfg.tor),
         GlobalKey::Dns => on_off(cfg.dns_enabled),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),

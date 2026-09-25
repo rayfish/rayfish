@@ -1313,6 +1313,14 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
                 "disabled"
             }
         ),
+        GlobalKey::Private if cfg.private_mode => {
+            format!("Private mode on: mDNS and auto-update are off while it is. {restart}")
+        }
+        GlobalKey::Private => format!("Private mode off. {restart}"),
+        GlobalKey::Tor if cfg.tor => {
+            format!("Tor mode on: peers are reached over Tor only. {restart}")
+        }
+        GlobalKey::Tor => format!("Tor mode off. {restart}"),
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {

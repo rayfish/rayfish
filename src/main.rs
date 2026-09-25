@@ -222,6 +222,27 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Contact only the relay and discovery servers you name.
+        #[arg(long, conflicts_with = "no_private")]
+        private: bool,
+        /// Leave private mode.
+        #[arg(long)]
+        no_private: bool,
+        /// Reach peers over Tor only.
+        #[arg(long, conflicts_with = "no_tor")]
+        tor: bool,
+        /// Leave Tor mode.
+        #[arg(long)]
+        no_tor: bool,
+        /// Relay servers to use instead of the defaults.
+        #[arg(long, value_name = "URL", conflicts_with = "tor")]
+        relay: Option<String>,
+        /// pkarr discovery server to use instead of the default.
+        #[arg(long, value_name = "URL")]
+        pkarr: Option<String>,
+        /// Skip the confirmation when leaving private mode.
+        #[arg(long, requires = "no_private")]
+        yes: bool,
         /// Enroll this machine with a controller after bringing the daemon up.
         #[arg(long)]
         controller: Option<ipc::EnrollmentTicket>,
@@ -1570,8 +1591,28 @@ async fn run() -> Result<()> {
         }
         Command::Up {
             hostname,
+            private,
+            no_private,
+            tor,
+            no_tor,
+            relay,
+            pkarr,
+            yes,
             controller,
-        } => cmd_up(hostname, controller).await,
+        } => {
+            cmd_up(UpOptions {
+                hostname,
+                controller,
+                private,
+                no_private,
+                tor,
+                no_tor,
+                relay,
+                pkarr,
+                yes,
+            })
+            .await
+        }
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,

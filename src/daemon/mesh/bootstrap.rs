@@ -255,11 +255,12 @@ async fn build_daemon_inner(
         .into_iter()
         .filter_map(|url| relay_mode.relay_map().get(&url).map(|config| (url, config)))
         .collect();
-    let use_tor = app_config
-        .networks
-        .iter()
-        .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
-    let (ep, warm_lookup) = transport::create_endpoint_with_alpns(
+    let use_tor = app_config.uses_tor();
+    if app_config.private_mode {
+        private_mode_servers_ok(&app_config, use_tor)?;
+    }
+    let posture = transport::NodePosture::new(app_config.private_mode, use_tor);
+    let (bound, warm_lookup) = transport::create_endpoint_with_alpns(
         key.clone(),
         alpns,
         posture,
