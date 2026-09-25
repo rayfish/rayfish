@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Windows has a desktop dashboard and tray app.** Closing its window leaves
+  Rayfish running in the notification area, while Quit closes the app.
+
 ## [0.5.0] - 2026-09-24
 
 ### Added

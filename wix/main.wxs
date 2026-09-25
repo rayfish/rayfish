@@ -30,6 +30,7 @@
       <Directory Id="$(var.PlatformProgramFilesFolder)">
         <Directory Id="INSTALLFOLDER" Name="Rayfish" />
       </Directory>
+      <Directory Id="ProgramMenuFolder" />
     </Directory>
   </Fragment>
 
@@ -57,6 +58,12 @@
       </Component>
       <Component Id="WintunLibrary" Guid="*">
         <File Id="WintunDll" Source="$(var.CargoTargetBinDir)\wintun.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="RayfishAppExecutable" Guid="*">
+        <File Id="RayfishAppExe" Source="$(var.CargoTargetBinDir)\rayfish-app.exe" KeyPath="yes">
+          <Shortcut Id="RayfishStartMenuShortcut" Directory="ProgramMenuFolder"
+                    Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
       </Component>
       <Component Id="ReleaseIdentityRegistry" Guid="*" Win64="yes">
         <RegistryValue Root="HKLM" Key="Software\Rayfish" Name="ReleaseIdentity"

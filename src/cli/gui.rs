@@ -39,6 +39,7 @@ pub(crate) fn cmd_gui(port: u16, no_open: bool) -> Result<()> {
     let exe = std::env::current_exe().context("finding current ray executable")?;
 
     println!("rayfish GUI listening on {url}");
+    std::io::stdout().flush()?;
     if !no_open && !open_url(&url) {
         println!("Open that URL in your browser.");
     }
