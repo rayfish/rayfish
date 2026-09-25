@@ -15,10 +15,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Windows and macOS can start Rayfish at login.** Enable it from Settings to
   open the desktop app after signing in. The macOS app also connects the VPN.
 
+- **Managed machines restore missing controller inventory entries automatically.**
+  New enrollments keep a signed receipt and announce themselves at startup and
+  reconnect, with retries every five minutes. `ray machines confirm <endpoint-id>`
+  enables recovery for an existing machine that already trusts this controller.
+  Explicitly forgotten machines stay forgotten until confirmed or enrolled again.
+
 ### Changed
 
 - **Windows nightlies now contain only the CLI and daemon.** The Windows
   desktop installer and macOS DMG are produced for stable releases only.
+
+- **Machine management continues to support protocol v1.** Enrollment, status,
+  and delegated network changes work with older peers. Signed receipts and
+  inventory recovery require both endpoints to support v2.
 
 ### Fixed
 

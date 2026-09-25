@@ -553,6 +553,9 @@ impl Daemon {
                 self.management.revoke_controller(identity.as_ref()).await
             }
             IpcMessage::ManagedMachines { probe } => self.management.list_machines(probe).await,
+            IpcMessage::ManagedMachineConfirm { machine } => {
+                self.management.confirm_machine(machine).await
+            }
             IpcMessage::ManagedMachineForget { machine } => {
                 self.management.forget_machine(&machine)
             }
