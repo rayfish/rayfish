@@ -342,6 +342,10 @@ pub enum IpcMessage {
     ManagedMachineForget {
         machine: ManagedMachineSelector,
     },
+    /// Confirms an existing remote controller grant and issues its recovery receipt.
+    ManagedMachineConfirm {
+        machine: EndpointId,
+    },
     /// Asks an enrolled machine to join a network.
     DelegatedJoin {
         machine: ManagedMachineSelector,

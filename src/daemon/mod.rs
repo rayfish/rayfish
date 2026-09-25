@@ -915,6 +915,7 @@ impl Daemon {
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
+        self.management.stop_announcements().await;
         // The DNS background tasks run on bare `tokio::spawn`s that observe their
         // own tokens, not `shutdown_token`, so cancelling the token above does not
         // reach them. They also hold an `Arc<DnsService>`, which on an embedder

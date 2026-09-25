@@ -21,6 +21,9 @@ pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
         Some(MachinesAction::Forget { machine }) => {
             ipc::IpcMessage::ManagedMachineForget { machine }
         }
+        Some(MachinesAction::Confirm { machine }) => {
+            ipc::IpcMessage::ManagedMachineConfirm { machine }
+        }
     };
     let response = ipc_request(request).await?;
     match response {
