@@ -1056,26 +1056,32 @@ impl ManagementService {
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
-                let (network_key, coordinator, secret) =
-                    match crate::invite::decode_invite_code(invite.expose()) {
-                        Ok(decoded) => decoded,
-                        Err(error) => {
-                            return ManagementResult::Error {
-                                message: error.to_string(),
-                            };
-                        }
+                let share = match crate::invite::decode_share_code(invite.expose()) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        return ManagementResult::Error {
+                            message: error.to_string(),
+                        };
+                    }
+                };
+                let (Some(coordinator), Some(secret)) = (share.coordinator, share.invite_secret)
+                else {
+                    return ManagementResult::Error {
+                        message: "managed join requires an invite code".to_string(),
                     };
+                };
                 match self
                     .registry
-                    .join_network(
-                        &network_key.to_string(),
-                        Some(network_name.as_ref()),
-                        Some(hostname.into()),
-                        Some(secret),
-                        Some(coordinator),
+                    .join_network(JoinSpec {
+                        network_key: share.network.to_string(),
+                        name: Some(network_name.into()),
+                        hostname: Some(hostname.into()),
+                        invite: Some(secret),
+                        coordinator: Some(coordinator),
+                        read_key: None,
                         auto_accept_firewall,
                         auto_accept_files,
-                    )
+                    })
                     .await
                 {
                     IpcMessage::Joined { name, .. } => ManagementResult::Applied {

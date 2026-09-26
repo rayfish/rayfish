@@ -53,11 +53,11 @@ fn verify_direct_admission(
         (Some(_), Some(bytes)) => {
             let packet = dht::verify_network_record(&bytes, net_pubkey)
                 .context("verify direct-network admission record")?;
-            let (hash, seeds) = dht::decode_network_record(&packet)
+            let record = dht::decode_network_record(&packet)
                 .context("decode direct-network admission record")?;
             Some(DirectAdmissionRecord {
-                hash,
-                seeds,
+                hash: record.blob_hash,
+                seeds: record.seed_peers,
                 timestamp: packet.timestamp().as_micros(),
                 published: direct_record_published,
             })
@@ -109,6 +109,7 @@ pub(crate) struct JoinParams {
     /// fallback and seeds every signed field; the lossy config projection must
     /// never become live state that a later promotion could publish.
     pub(crate) group_blob: crate::membership::GroupBlob,
+    pub(crate) read_key: Option<ReadKey>,
     /// Consent: auto-install suggested rules without a manual review queue.
     pub(crate) auto_accept_firewall: bool,
     /// Seed for per-network auto-accept of file offers from own devices
@@ -156,6 +157,7 @@ pub(crate) async fn join_mesh_shared(
         device_cert,
         invite_secret,
         group_blob,
+        read_key,
         auto_accept_firewall,
         auto_accept_files,
         initial,
@@ -177,6 +179,7 @@ pub(crate) async fn join_mesh_shared(
             &my_hostname,
             &device_cert,
             &group_blob,
+            read_key.as_ref(),
         )
         .await?
         {
@@ -210,6 +213,8 @@ pub(crate) async fn join_mesh_shared(
             record.hash,
             network_name,
             &record.seeds,
+            net_pubkey,
+            read_key.as_ref(),
         )
         .await
         .context("fetch admitted direct-network roster")?;
@@ -248,6 +253,7 @@ pub(crate) async fn join_mesh_shared(
         auto_accept_firewall,
         auto_accept_files,
         initial,
+        read_key.as_ref(),
     )?;
 
     let remote_id = initial_conn.remote_id();
@@ -263,6 +269,7 @@ pub(crate) async fn join_mesh_shared(
         nullifiers,
         &blob_store,
         direct_key.as_ref(),
+        read_key,
         record_ts,
         exact_group_hash,
     )
@@ -369,6 +376,7 @@ fn persist_join_config(
     auto_accept_firewall: bool,
     auto_accept_files: bool,
     initial: bool,
+    read_key: Option<&ReadKey>,
 ) -> Result<()> {
     let persisted_hostname = members
         .iter()
@@ -388,6 +396,7 @@ fn persist_join_config(
         approved: approved_entries.clone(),
         network_secret_key: None,
         network_public_key: Some(net_pubkey),
+        read_key: read_key.cloned(),
         auto_accept_firewall,
         auto_accept_files,
         ..Default::default()
@@ -407,6 +416,9 @@ fn persist_join_config(
             net.network_secret_key = None;
         }
         net.network_public_key = Some(net_pubkey);
+        if let Some(read_key) = read_key {
+            net.read_key = Some(read_key.clone());
+        }
         if initial {
             net.auto_accept_firewall = auto_accept_firewall;
             net.auto_accept_files |= auto_accept_files;
@@ -443,6 +455,7 @@ async fn build_member_state(
     // state with the network key so `finalize_join` registers us as a coordinator
     // (starts a publisher, admits future peers). `None` for a plain member.
     direct_key: Option<&SecretKey>,
+    read_key: Option<ReadKey>,
     // Replay floor seeded from the record this roster came out of, if any.
     record_ts: Option<u64>,
     // Exact hash of the complete signed generation adopted by a direct joiner.
@@ -457,6 +470,7 @@ async fn build_member_state(
         converged_hash: None,
         unconfirmed_durable_hash: None,
         network_secret_key: direct_key.cloned(),
+        read_key,
         network_public_key: net_pubkey,
         network_name: Some(network_name.to_string()),
         group_name,
@@ -547,6 +561,7 @@ async fn perform_join_handshake(
     my_hostname: &Option<String>,
     device_cert: &Option<control::DeviceCert>,
     fallback_blob: &crate::membership::GroupBlob,
+    read_key: Option<&ReadKey>,
 ) -> Result<HandshakeOutcome> {
     if initial {
         let (mut send, mut recv) = initial_conn
@@ -666,7 +681,17 @@ async fn perform_join_handshake(
         // must never become publishable after a later promotion.
         let (blob, record_ts) = match resolve_signed(ep, relay_url, net_pubkey).await {
             Some((signed, seeds, ts)) => {
-                match fetch_verified_blob(ep, blob_store, peers, signed, network_name, &seeds).await
+                match fetch_verified_blob(
+                    ep,
+                    blob_store,
+                    peers,
+                    signed,
+                    network_name,
+                    &seeds,
+                    net_pubkey,
+                    read_key,
+                )
+                .await
                 {
                     Some(data) => (data, Some(ts)),
                     None => (fallback_blob.clone(), None),
@@ -784,7 +809,7 @@ mod persist_config_tests {
     fn direct_grant_is_bound_to_its_signed_exact_hash() {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"exact admitted group");
-        let packet = dht::encode_network_record(&key, &hash, &[id(3)])
+        let packet = dht::encode_network_record(&key, &hash, &[id(3)], None)
             .unwrap()
             .as_bytes()
             .to_vec();
@@ -839,6 +864,7 @@ mod persist_config_tests {
             approved: vec![],
             network_secret_key: Some(admin_key.clone()),
             network_public_key: Some(net_pubkey),
+            read_key: None,
             last_group_hash: Some(cached_hash),
             last_group_hash_published: true,
             transport: None,
@@ -867,6 +893,7 @@ mod persist_config_tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
 
@@ -906,6 +933,7 @@ mod persist_config_tests {
             false,
             false,
             true,
+            None,
         )
         .unwrap();
         let after_fresh_join = config::load_network("homelab").unwrap().unwrap();
@@ -920,6 +948,97 @@ mod persist_config_tests {
         assert!(
             after_fresh_join.network_secret_key.is_none(),
             "a fresh member join must clear a stale coordinator key"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_preserves_the_roster_read_key() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let read_key = ReadKey::from_bytes([9u8; 32]);
+        config::save_network(&NetworkConfig {
+            name: "homelab".to_string(),
+            network_public_key: Some(net_pubkey),
+            read_key: Some(read_key.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        persist_join_config(
+            "homelab",
+            &[member(2, false)],
+            &[],
+            me,
+            net_pubkey,
+            &Some("umbrel".to_string()),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config::load_network("homelab").unwrap().unwrap().read_key,
+            Some(read_key)
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_fresh_join_adopts_the_key_it_was_granted() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let stale = ReadKey::from_bytes([1u8; 32]);
+        let fresh = ReadKey::from_bytes([2u8; 32]);
+        config::save_network(&NetworkConfig {
+            name: "homelab".to_string(),
+            network_public_key: Some(net_pubkey),
+            read_key: Some(stale),
+            ..Default::default()
+        })
+        .unwrap();
+
+        persist_join_config(
+            "homelab",
+            &[member(2, false)],
+            &[],
+            me,
+            net_pubkey,
+            &None,
+            false,
+            false,
+            true,
+            Some(&fresh),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config::load_network("homelab").unwrap().unwrap().read_key,
+            Some(fresh)
         );
 
         unsafe {
@@ -949,6 +1068,7 @@ mod persist_config_tests {
             false,
             false,
             false,
+            None,
         );
 
         assert!(result.is_err());

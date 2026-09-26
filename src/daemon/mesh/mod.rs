@@ -34,6 +34,9 @@ mod select;
 // `pub(crate) use mesh::*`).
 pub(crate) use accept::*;
 pub(crate) use coordinator::*;
+// The join input bundle: `pub` because it is part of the embedding API that
+// `ray-mobile` builds a join from.
+pub use create_join::JoinSpec;
 // Device-side unpair wipe + cert-refresh helpers, reached by both control readers.
 pub(crate) use files::{is_unpaired_by, resolve_download_target, store_refreshed_cert};
 pub(crate) use join::*;

@@ -125,8 +125,8 @@ pub(crate) async fn resolve_signed(
         .await
         .ok()?;
     let ts = packet.timestamp().as_micros();
-    let (hash, seeds) = dht::decode_network_record(&packet).ok()?;
-    Some((hash, seeds, ts))
+    let decoded = dht::decode_network_record(&packet).ok()?;
+    Some((decoded.blob_hash, decoded.seed_peers, ts))
 }
 
 /// Fetch the group blob for `signed` from any connected peer or seed, and verify
@@ -144,6 +144,7 @@ pub(crate) async fn resolve_signed(
 /// coordinator when it is a version split, and it repeats every group poll, so
 /// the decode error itself goes in the log rather than being swallowed with the
 /// dial failures.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_verified_blob(
     endpoint: &Endpoint,
     blob_store: &FsStore,
@@ -151,6 +152,8 @@ pub(crate) async fn fetch_verified_blob(
     signed: blake3::Hash,
     network_name: &str,
     seeds: &[EndpointId],
+    net_pubkey: EndpointId,
+    read_key: Option<&ReadKey>,
 ) -> Option<crate::membership::GroupBlob> {
     let blob_hash = iroh_blobs::Hash::from_bytes(*signed.as_bytes());
     let mut peer_ids: Vec<EndpointId> = peers
@@ -186,7 +189,7 @@ pub(crate) async fn fetch_verified_blob(
             );
             continue;
         }
-        match crate::membership::decode_group_blob(&bytes) {
+        match crate::membership::open_group_blob(&bytes, read_key, &net_pubkey) {
             Ok(data) => {
                 if let Err(e) = retain_group_blob(blob_store, &bytes).await {
                     tracing::warn!(
@@ -212,6 +215,28 @@ pub(crate) async fn fetch_verified_blob(
         }
     }
     None
+}
+
+/// Ask this network's coordinators for its roster read key.
+///
+/// Sent to every connected coordinator rather than one, because "which
+/// coordinator is reachable" is not something a member that cannot even read the
+/// roster is well placed to answer. This is the already-a-member case, so it
+/// presents no invite: the receiver recognises us from its own roster.
+pub(crate) async fn request_read_key(
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+) {
+    let msg = ControlMsg::ReadKeyRequest {
+        invite_secret: None,
+        device_cert: None,
+    };
+    for (_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
+        if let Err(e) = open_and_send(&conn, Some(net_pubkey), &msg).await {
+            tracing::debug!(peer_ip = %ip, error = %e, "read key request failed");
+        }
+    }
 }
 
 /// Compute a generation directly from the blob-bearing fields. `snapshot` is a
@@ -328,10 +353,23 @@ pub(crate) async fn reconverge_and_apply(
         );
         return;
     }
-    let Some(data) =
-        fetch_verified_blob(endpoint, blob_store, peers, signed, network_name, &seeds).await
+    let read_key = state.read().ok().and_then(|state| state.read_key.clone());
+    let Some(data) = fetch_verified_blob(
+        endpoint,
+        blob_store,
+        peers,
+        signed,
+        network_name,
+        &seeds,
+        net_pubkey,
+        read_key.as_ref(),
+    )
+    .await
     else {
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
+        if read_key.is_none() {
+            request_read_key(peers, net_pubkey, network_name).await;
+        }
         return;
     };
     // Self-unpair: if our own device cert is nullified in this (verified, signed)
@@ -696,13 +734,15 @@ pub(crate) fn spawn_group_poller(
             // no-op when the flag already matches.
             registry.sync_exit_offers().await;
 
-            let (remote_hash, seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
+            let record = match dht::resolve_network(&client, net_pubkey).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::debug!(error = %e, "group poll failed");
                     continue;
                 }
             };
+            let remote_hash = record.blob_hash;
+            let seed_peers = record.seed_peers;
 
             if pending_authored_group_hash(&state, &network_name)
                 .is_some_and(|pending| pending != remote_hash)
@@ -802,6 +842,10 @@ pub(crate) async fn fetch_and_apply_blob(
     // (e.g. an unpaired device the coordinator already severed) has no connected
     // peers, so a connected-only fetch could never discover its own
     // removal/nullification.
+    let (net_pubkey, read_key) = {
+        let state = state.read().unwrap();
+        (state.network_public_key, state.read_key.clone())
+    };
     let Some(data) = fetch_verified_blob(
         endpoint,
         blob_store,
@@ -809,10 +853,15 @@ pub(crate) async fn fetch_and_apply_blob(
         remote_hash,
         network_name,
         seed_peers,
+        net_pubkey,
+        read_key.as_ref(),
     )
     .await
     else {
         tracing::warn!("could not fetch updated group blob from any peer");
+        if read_key.is_none() {
+            request_read_key(peers, net_pubkey, network_name).await;
+        }
         return ReconvergeOutcome::Unfetched;
     };
 
@@ -954,6 +1003,7 @@ mod reconverge_tests {
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,
+            read_key: None,
             network_public_key: SecretKey::generate().public(),
             network_name: Some("test-network".to_string()),
             group_name: Some("test-network".to_string()),

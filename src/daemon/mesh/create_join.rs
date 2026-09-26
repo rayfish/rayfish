@@ -18,6 +18,26 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// unbounded NAT-punch / relay storm.
 const WARM_DIAL_CONCURRENCY: usize = 12;
 
+#[derive(Debug, Clone, Default)]
+pub struct JoinSpec {
+    /// The network public key (room id), always bare. An invite code is split at
+    /// the CLI / mobile boundary, so nothing inward ever sees it whole: the key
+    /// is parsed as an `EndpointId`, sliced for a fallback display name, and
+    /// compared by string equality for pending-join dedupe.
+    pub network_key: String,
+    pub name: Option<String>,
+    pub hostname: Option<String>,
+    pub invite: Option<Vec<u8>>,
+    pub coordinator: Option<EndpointId>,
+    /// Roster read key we already hold. Only a restore sets this, out of
+    /// `NetworkConfig`: no share code carries a key, so a fresh join arrives
+    /// with `None` and asks a coordinator for one (`acquire_read_key`) before it
+    /// can read the roster.
+    pub read_key: Option<ReadKey>,
+    pub auto_accept_firewall: bool,
+    pub auto_accept_files: bool,
+}
+
 /// Borrowed bundle of the per-join inputs threaded through the dial + finalize
 /// phases of `join_network_inner`, so each phase takes one argument instead of a
 /// dozen. The references point at locals that live for the whole join.
@@ -38,6 +58,9 @@ struct JoinContext<'a> {
     invite_lock: Arc<AsyncMutex<()>>,
     /// Pinned coordinator to dial first (the invite minter), if known.
     coordinator: Option<EndpointId>,
+    /// The read key this network's blob is sealed under: granted by a
+    /// coordinator during this join, or (on a restore) read from config.
+    read_key: Option<ReadKey>,
     /// Set on a restore whose network record advertises a mesh protocol version
     /// this build does not speak. Only [`VersionGate::Record`] can produce it,
     /// so it is always `None` on a fresh join.
@@ -60,13 +83,19 @@ enum VersionGate {
 
 /// A network's verified roster blob plus what its signed record said about the
 /// mesh protocol version.
-struct ResolvedNetwork {
-    blob: crate::membership::GroupBlob,
-    /// Exact content hash committed by the verified network record.
-    hash: blake3::Hash,
-    /// `Some` when the record advertises a version this build does not speak and
-    /// the caller asked to record that rather than refuse.
-    mismatch: Option<MeshVersionMismatch>,
+enum ResolvedNetwork {
+    Resolved {
+        blob: Box<crate::membership::GroupBlob>,
+        /// Exact content hash committed by the verified network record.
+        hash: blake3::Hash,
+        /// `Some` when the record advertises a version this build does not speak
+        /// and the caller asked to record that rather than refuse.
+        mismatch: Option<MeshVersionMismatch>,
+        /// The key used to open the blob, acquired from a coordinator when the
+        /// caller did not already hold it.
+        read_key: Option<ReadKey>,
+    },
+    NeedsApproval,
 }
 
 /// Where coordinator restore learned the complete blob hash it is allowed to
@@ -172,7 +201,14 @@ fn apply_finalized_join_config(
     Ok(())
 }
 
-/// Whether the mesh version a network's record advertises is one this build can speak.
+/// How long to wait for a coordinator to answer a pre-admission read-key
+/// request. Short on purpose: an unentitled asker is answered with silence, so
+/// this is also how long a refusal takes, and it is paid once per candidate
+/// coordinator before the join can proceed.
+const READ_KEY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether the mesh version a network's record advertises is one this build can
+/// speak.
 ///
 /// An absent version means a record published before the field existed: not a
 /// refusal, just unknown, so the ALPN gate decides for those.
@@ -279,73 +315,47 @@ impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// join an existing network by key (optionally with an invite/coordinator).
     /// Thin delegate to the network registry, which owns the join path.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn join_network(
-        self: &Arc<Self>,
-        network_key: &str,
-        name: Option<&str>,
-        hostname: Option<String>,
-        invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
-    ) -> IpcMessage {
-        self.registry
-            .join_network(
-                network_key,
-                name,
-                hostname,
-                invite,
-                coordinator,
-                auto_accept_firewall,
-                auto_accept_files,
-            )
-            .await
+    pub async fn join_network(self: &Arc<Self>, spec: JoinSpec) -> IpcMessage {
+        self.registry.join_network(spec).await
     }
 }
 
 impl NetworkRegistry {
     /// Join an existing network by key (optionally with an invite/coordinator).
-    #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
-    pub async fn join_network(
-        self: &Arc<Self>,
-        network_key: &str,
-        name: Option<&str>,
-        hostname: Option<String>,
-        invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
-    ) -> IpcMessage {
+    #[tracing::instrument(skip(self, spec), fields(net = spec.name.as_deref().unwrap_or(&spec.network_key)))]
+    pub async fn join_network(self: &Arc<Self>, spec: JoinSpec) -> IpcMessage {
+        let network_key = spec.network_key.clone();
+        let name = spec.name.clone();
         match self
             .join_network_inner(
-                network_key,
-                name,
-                hostname.clone(),
-                invite.clone(),
-                coordinator,
-                auto_accept_firewall,
-                auto_accept_files,
+                &network_key,
+                name.as_deref(),
+                spec.hostname.clone(),
+                spec.invite.clone(),
+                spec.coordinator,
+                spec.read_key.clone(),
+                spec.auto_accept_firewall,
+                spec.auto_accept_files,
                 true,
             )
             .await
         {
             Ok(TryJoin::Joined(resp)) => {
-                let _ = config::remove_pending_join(network_key);
+                let _ = config::remove_pending_join(&network_key);
                 *resp
             }
             Ok(TryJoin::Pending) => {
                 // Persist so the retry resumes after a restart.
                 let _ = config::add_pending_join(config::PendingJoinEntry {
-                    network_key: network_key.to_string(),
-                    name: name.map(|s| s.to_string()),
+                    network_key: spec.network_key.clone(),
+                    name: spec.name.clone(),
                 });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
                 let me = Arc::clone(self);
-                let nk = network_key.to_string();
-                let nm = name.map(|s| s.to_string());
+                let nk = network_key;
+                let nm = name;
+                let retry_spec = spec;
                 tokio::spawn(async move {
                     let mut backoff = BACKOFF_INITIAL;
                     loop {
@@ -358,11 +368,12 @@ impl NetworkRegistry {
                             .join_network_inner(
                                 &nk,
                                 nm.as_deref(),
-                                hostname.clone(),
-                                invite.clone(),
-                                coordinator,
-                                auto_accept_firewall,
-                                auto_accept_files,
+                                retry_spec.hostname.clone(),
+                                retry_spec.invite.clone(),
+                                retry_spec.coordinator,
+                                retry_spec.read_key.clone(),
+                                retry_spec.auto_accept_firewall,
+                                retry_spec.auto_accept_files,
                                 true,
                             )
                             .await
@@ -396,6 +407,7 @@ impl NetworkRegistry {
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
+        read_key: Option<ReadKey>,
         // Auto-install coordinator-suggested firewall rules on this network
         // (`--auto-accept-firewall`); persisted so it survives restarts.
         auto_accept_firewall: bool,
@@ -407,6 +419,16 @@ impl NetworkRegistry {
         // the coordinator speaks first).
         initial: bool,
     ) -> Result<TryJoin> {
+        let resolve_spec = JoinSpec {
+            network_key: network_key.to_string(),
+            name: alias.map(str::to_string),
+            hostname: hostname.clone(),
+            invite: invite.clone(),
+            coordinator,
+            read_key,
+            auto_accept_firewall,
+            auto_accept_files,
+        };
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
         if let Some(a) = alias
@@ -424,11 +446,18 @@ impl NetworkRegistry {
         } else {
             VersionGate::Record
         };
-        let ResolvedNetwork {
+        let resolved = self
+            .resolve_and_fetch_blob(net_pubkey, gate, &resolve_spec)
+            .await?;
+        let ResolvedNetwork::Resolved {
             blob: data,
             hash: group_hash,
             mismatch,
-        } = self.resolve_and_fetch_blob(net_pubkey, gate).await?;
+            read_key,
+        } = resolved
+        else {
+            return Ok(TryJoin::Pending);
+        };
 
         // If our own primary has nullified this device in the signed blob
         // (`ray unpair`), tear ourselves out instead of trying (and failing) to
@@ -505,6 +534,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock: Arc::clone(&invite_lock),
             coordinator,
+            read_key,
             mismatch,
         };
 
@@ -538,6 +568,7 @@ impl NetworkRegistry {
         &self,
         net_pubkey: EndpointId,
         gate: VersionGate,
+        spec: &JoinSpec,
     ) -> Result<ResolvedNetwork> {
         let pkarr_client =
             dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
@@ -556,21 +587,61 @@ impl NetworkRegistry {
             gate,
         )?;
 
-        let (expected_hash, peer_ids) =
-            dht::decode_network_record(&record).context("invalid network record")?;
-        if peer_ids.is_empty() {
+        let decoded = dht::decode_network_record(&record).context("invalid network record")?;
+        if decoded.seed_peers.is_empty() {
             anyhow::bail!("no peers found in network record");
         }
+        // The blob is sealed and we hold no key. Fetching would be pointless
+        // (every seed peer serves the same bytes we cannot open), so ask for the
+        // key first. `commitment` is in the network-key-signed record, which is
+        // what makes a granted key checkable without a roster we cannot read.
+        let mut read_key = spec.read_key.clone();
+        if let Some(commitment) = decoded.read_key_commitment
+            && read_key.is_none()
+        {
+            // An invite names its minter, which is a coordinator by construction
+            // and need not be in the record's (necessarily stale) seed list, so
+            // it is asked first.
+            let mut candidates = decoded.seed_peers.clone();
+            if let Some(coord) = spec.coordinator
+                && !candidates.contains(&coord)
+            {
+                candidates.insert(0, coord);
+            }
+            read_key = self
+                .acquire_read_key(net_pubkey, &candidates, spec.invite.as_deref(), &commitment)
+                .await;
+            if read_key.is_none() {
+                // Refused. On a closed network with no invite that is the
+                // expected answer and not a failure: the request still has to
+                // reach the operator, so queue it and report Pending. The retry
+                // that follows approval is granted the key, because approval is
+                // one of the things `may_read_roster` accepts.
+                if self.queue_join_request(net_pubkey, &candidates).await {
+                    return Ok(ResolvedNetwork::NeedsApproval);
+                }
+                anyhow::bail!(
+                    "this network's roster is encrypted and no coordinator would hand over \
+                     the key or queue a join request; join with an invite code, or check \
+                     that a coordinator is online"
+                );
+            }
+        }
+        let expected_hash = decoded.blob_hash;
         let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
         let mut last_err = None;
-        for peer_id in &peer_ids {
-            match self.try_fetch_group_blob(*peer_id, blob_hash).await {
+        for peer_id in &decoded.seed_peers {
+            match self
+                .try_fetch_group_blob(*peer_id, blob_hash, net_pubkey, read_key.as_ref())
+                .await
+            {
                 Ok(blob) => {
-                    return Ok(ResolvedNetwork {
-                        blob,
+                    return Ok(ResolvedNetwork::Resolved {
+                        blob: Box::new(blob),
                         hash: expected_hash,
                         mismatch,
+                        read_key,
                     });
                 }
                 Err(e) => {
@@ -592,6 +663,157 @@ impl NetworkRegistry {
                 peer.fmt_short()
             ),
             None => anyhow::bail!("could not fetch group blob from any peer"),
+        }
+    }
+
+    /// Put a join request in front of the operator on a network whose roster we
+    /// cannot read.
+    ///
+    /// The normal join sends its `JoinRequest` after the blob is open, because
+    /// the roster is what picks the coordinator to dial and settles the
+    /// hostname. Neither is available here, so this dials the record's seed
+    /// peers instead and sends the machine's own name undeduplicated: the
+    /// coordinator resolves collisions authoritatively at admission anyway, and
+    /// this name exists mostly so `ray requests` shows the operator who is
+    /// asking. Returns whether some coordinator queued us.
+    ///
+    /// Only ever reached with no invite and no prior approval, so `JoinPending`
+    /// is the only success this can see. An invite or an approval would have
+    /// been granted the read key, and an open network grants it to anybody.
+    async fn queue_join_request(&self, net_pubkey: EndpointId, seed_peers: &[EndpointId]) -> bool {
+        let alpn = transport::mesh_alpn();
+        let hostname = crate::hostname::default_hostname(
+            config::load().ok().and_then(|c| c.default_hostname),
+            &[],
+        );
+        let request = ControlMsg::JoinRequest {
+            invite_secret: None,
+            hostname: Some(hostname),
+            device_cert: self.current_device_cert(),
+        };
+        for peer_id in seed_peers {
+            if *peer_id == self.transport.identity.local_identity() {
+                continue;
+            }
+            let queued = async {
+                let conn =
+                    transport::connect_to_peer_with_alpn(&self.transport.endpoint, *peer_id, &alpn)
+                        .await
+                        .ok()?;
+                let (mut send, mut recv) = conn.open_bi().await.ok()?;
+                control::send_msg(&mut send, Some(net_pubkey), &request)
+                    .await
+                    .ok()?;
+                match tokio::time::timeout(READ_KEY_TIMEOUT, control::recv_msg(&mut recv)).await {
+                    Ok(Ok(ControlMsg::JoinPending)) => Some(()),
+                    _ => None,
+                }
+            }
+            .await;
+            if queued.is_some() {
+                tracing::info!(
+                    coordinator = %peer_id.fmt_short(),
+                    "join queued for approval; the roster stays sealed until then",
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Ask this network's peers for the roster read key, before being admitted.
+    ///
+    /// A joiner has to open the roster before it can dial: the roster is what
+    /// names the coordinators, and it is what settles whether the hostname this
+    /// machine wants is already taken. No code carries the key, so this is where
+    /// a fresh join gets one.
+    ///
+    /// Every candidate comes out of the signed record's seed peer list, which
+    /// always contains at least one coordinator (only a network-key holder
+    /// publishes, and each publisher puts itself in the list), so a coordinator
+    /// is reachable here whenever the record is fresh. Non-coordinators simply
+    /// do not answer.
+    ///
+    /// A grant is adopted only if it matches the record's `k,` commitment, so a
+    /// peer that answers with the wrong key (or a hostile one that answers at
+    /// all) cannot make us decrypt garbage or accept a roster it authored. That
+    /// check is what stands in for the public half a symmetric key does not
+    /// have.
+    async fn acquire_read_key(
+        &self,
+        net_pubkey: EndpointId,
+        seed_peers: &[EndpointId],
+        invite: Option<&[u8]>,
+        commitment: &blake3::Hash,
+    ) -> Option<ReadKey> {
+        let alpn = transport::mesh_alpn();
+        let request = ControlMsg::ReadKeyRequest {
+            invite_secret: invite.map(|s| s.to_vec()),
+            device_cert: self.current_device_cert(),
+        };
+        for peer_id in seed_peers {
+            if *peer_id == self.transport.identity.local_identity() {
+                continue;
+            }
+            match self
+                .ask_peer_for_read_key(*peer_id, net_pubkey, &alpn, &request, commitment)
+                .await
+            {
+                Ok(Some(key)) => {
+                    tracing::info!(peer = %peer_id.fmt_short(), "received this network's roster read key");
+                    return Some(key);
+                }
+                // Answered with silence, or is not a coordinator: try the next.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(peer = %peer_id.fmt_short(), error = %e, "read key request failed");
+                }
+            }
+        }
+        None
+    }
+
+    /// One peer's turn in [`Self::acquire_read_key`]. `Ok(None)` means the peer
+    /// declined (or is not a coordinator, or timed out), which is not an error:
+    /// a refusal is deliberately indistinguishable from silence.
+    async fn ask_peer_for_read_key(
+        &self,
+        peer_id: EndpointId,
+        net_pubkey: EndpointId,
+        alpn: &[u8],
+        request: &ControlMsg,
+        commitment: &blake3::Hash,
+    ) -> Result<Option<ReadKey>> {
+        let conn = transport::connect_to_peer_with_alpn(&self.transport.endpoint, peer_id, alpn)
+            .await
+            .context("connect")?;
+        let (mut send, mut recv) = conn.open_bi().await.context("open stream")?;
+        control::send_msg(&mut send, Some(net_pubkey), request)
+            .await
+            .context("send read key request")?;
+
+        let reply = match tokio::time::timeout(READ_KEY_TIMEOUT, control::recv_msg(&mut recv)).await
+        {
+            Ok(Ok(msg)) => msg,
+            // Declined (the coordinator closes without answering) or too slow.
+            Ok(Err(_)) | Err(_) => return Ok(None),
+        };
+        match reply {
+            ControlMsg::ReadKeyGrant {
+                network_pubkey,
+                read_key,
+            } if network_pubkey == net_pubkey => {
+                let key = ReadKey::from_bytes(read_key);
+                if &key.commitment() != commitment {
+                    tracing::warn!(
+                        peer = %peer_id.fmt_short(),
+                        "read key does not match the signed record's commitment; ignoring",
+                    );
+                    return Ok(None);
+                }
+                Ok(Some(key))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -711,6 +933,7 @@ impl NetworkRegistry {
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,
+            read_key: ctx.read_key.clone(),
             network_public_key: ctx.net_pubkey,
             network_name: Some(ctx.display_name.to_string()),
             group_name: data.name.clone(),
@@ -882,7 +1105,8 @@ impl NetworkRegistry {
         let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await else {
             return Ok(false);
         };
-        let Ok(data) = verify_group_blob(&bytes, &group_hash) else {
+        let Ok(data) = verify_group_blob(&bytes, &group_hash, saved.read_key.as_ref(), &net_pubkey)
+        else {
             tracing::warn!(network = %name, %group_hash, "discarding invalid cached group blob during warm resume");
             return Ok(false);
         };
@@ -931,6 +1155,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock,
             coordinator: None,
+            read_key: saved.read_key.clone(),
             mismatch: None,
         };
 
@@ -1001,6 +1226,7 @@ impl NetworkRegistry {
                 device_cert: self.current_device_cert(),
                 invite_secret,
                 group_blob: data.clone(),
+                read_key: ctx.read_key.clone(),
                 auto_accept_firewall: ctx.auto_accept_firewall,
                 auto_accept_files: ctx.auto_accept_files,
                 initial,
@@ -1221,6 +1447,7 @@ impl NetworkRegistry {
     pub(crate) async fn restore_roster_from_blob(
         &self,
         net_pubkey: EndpointId,
+        read_key: Option<&ReadKey>,
         cached_hash: Option<blake3::Hash>,
         cached_is_published: bool,
         persisted_peers: &[EndpointId],
@@ -1247,8 +1474,9 @@ impl NetworkRegistry {
         let resolution_error = resolved
             .is_none()
             .then(|| "signed network record was unavailable".to_string());
+        let published = resolved.map(|record| (record.blob_hash, record.seed_peers));
         let target =
-            select_restore_target(resolved, cached_hash, cached_is_published, persisted_peers)
+            select_restore_target(published, cached_hash, cached_is_published, persisted_peers)
                 .with_context(|| {
                     resolution_error
                         .clone()
@@ -1280,7 +1508,7 @@ impl NetworkRegistry {
         // Local blob store first: snapshots are permanently retained when they
         // are authored or fetched, so the normal restart has no network trip.
         if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
-            && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
+            && let Ok(data) = verify_group_blob(&bytes, &expected_hash, read_key, &net_pubkey)
         {
             retain_group_blob(&self.transport.blob_store, &bytes).await?;
             return Ok(RestoredGroupBlob {
@@ -1317,7 +1545,7 @@ impl NetworkRegistry {
                 continue;
             }
             if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
-                && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
+                && let Ok(data) = verify_group_blob(&bytes, &expected_hash, read_key, &net_pubkey)
             {
                 retain_group_blob(&self.transport.blob_store, &bytes).await?;
                 return Ok(RestoredGroupBlob {
@@ -1334,6 +1562,8 @@ impl NetworkRegistry {
         &self,
         peer_id: EndpointId,
         blob_hash: iroh_blobs::Hash,
+        net_pubkey: EndpointId,
+        read_key: Option<&ReadKey>,
     ) -> Result<crate::membership::GroupBlob> {
         let conn = transport::connect_to_peer_with_alpn(
             &self.transport.endpoint,
@@ -1354,7 +1584,7 @@ impl NetworkRegistry {
             .get_bytes(blob_hash)
             .await
             .map_err(|e| anyhow::anyhow!("blob read failed: {e}"))?;
-        let blob = crate::membership::decode_group_blob(&bytes)?;
+        let blob = crate::membership::open_group_blob(&bytes, read_key, &net_pubkey)?;
         retain_group_blob(&self.transport.blob_store, &bytes).await?;
         Ok(blob)
     }
@@ -1675,6 +1905,7 @@ mod tests {
             auto_accept_files: false,
             invite_lock: Arc::new(AsyncMutex::new(())),
             coordinator: None,
+            read_key: None,
             mismatch: None,
         };
         let outcome = timeout(
