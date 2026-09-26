@@ -587,10 +587,7 @@ fn host_interfaces() -> HostInterfaces {
     match out {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            HostInterfaces {
-                addrs: parse_host_addresses(&text),
-                on_link: parse_on_link_prefixes(&text),
-            }
+            parse_host_interfaces(&text)
         }
         _ => HostInterfaces::default(),
     }
@@ -599,15 +596,14 @@ fn host_interfaces() -> HostInterfaces {
 /// One read of the host's interface list: what the gateway must refuse as a
 /// transit destination, in both of the forms it takes.
 #[derive(Default)]
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", test))]
 pub struct HostInterfaces {
     pub addrs: HashSet<IpAddr>,
     pub on_link: Vec<Ipv6Prefix>,
 }
 
-/// Pull the directly-attached IPv6 prefixes out of the same output
-/// [`parse_host_addresses`] reads, in either platform's spelling: Linux's
-/// `inet6 2001:db8::1/64` and the BSDs' `inet6 2001:db8::1 prefixlen 64`.
+/// Read interface addresses and directly-attached IPv6 prefixes from Linux's
+/// `ip -o addr` or BSD's `ifconfig -a` output in one pass.
 ///
 /// Only global unicast (`2000::/3`) is kept, and only `32 <= len < 128`. Everything
 /// narrower than /128 is already covered by `self_addrs`, and everything the other
@@ -617,14 +613,23 @@ pub struct HostInterfaces {
 /// transit to most of the internet and break the exit node outright, so the
 /// failure mode of this parser is bounded on the side that keeps traffic flowing.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", test))]
-pub(crate) fn parse_on_link_prefixes(out: &str) -> Vec<Ipv6Prefix> {
-    let mut found: Vec<Ipv6Prefix> = Vec::new();
+pub(crate) fn parse_host_interfaces(out: &str) -> HostInterfaces {
     let toks: Vec<&str> = out.split_whitespace().collect();
+    let mut interfaces = HostInterfaces::default();
     for (i, tok) in toks.iter().enumerate() {
-        if *tok != "inet6" {
+        if *tok != "inet" && *tok != "inet6" {
             continue;
         }
         let Some(raw) = toks.get(i + 1) else { break };
+
+        let addr = raw.split(['/', '%']).next().unwrap_or(raw);
+        if let Ok(addr) = addr.parse::<IpAddr>() {
+            interfaces.addrs.insert(addr);
+        }
+        if *tok != "inet6" {
+            continue;
+        }
+
         let addr_part = raw.split('%').next().unwrap_or(raw);
         let (addr_str, inline_len) = match addr_part.split_once('/') {
             Some((a, l)) => (a, l.parse::<u8>().ok()),
@@ -643,36 +648,11 @@ pub(crate) fn parse_on_link_prefixes(out: &str) -> Vec<Ipv6Prefix> {
             continue;
         }
         let prefix = Ipv6Prefix { addr, len };
-        if !found.contains(&prefix) {
-            found.push(prefix);
+        if !interfaces.on_link.contains(&prefix) {
+            interfaces.on_link.push(prefix);
         }
     }
-    found
-}
-
-/// Pull the addresses out of `ip -o addr show` or `ifconfig -a` output: any token
-/// following an `inet`/`inet6` keyword, with the Linux `/prefix` and BSD `%zone`
-/// suffixes stripped.
-// Same platforms as its only caller: Android has neither `ip` nor `ifconfig`,
-// and Windows reads its addresses through PowerShell, so nothing else produces
-// output for it to parse. `test` joins them because the parser is pure string
-// handling and its test is worth running everywhere, the same way
-// [`parse_on_link_prefixes`] is gated.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", test))]
-fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
-    let mut addrs = HashSet::new();
-    let mut tokens = out.split_whitespace().peekable();
-    while let Some(tok) = tokens.next() {
-        if tok != "inet" && tok != "inet6" {
-            continue;
-        }
-        let Some(raw) = tokens.peek() else { break };
-        let addr = raw.split(['/', '%']).next().unwrap_or(raw);
-        if let Ok(ip) = addr.parse::<IpAddr>() {
-            addrs.insert(ip);
-        }
-    }
-    addrs
+    interfaces
 }
 
 /// Whether this host has an IPv6 default route, i.e. an exit node it offers can
@@ -1320,7 +1300,7 @@ mod tests {
                      2: eth0    inet6 fe80::1/64 scope link \\       valid_lft forever\n\
                      3: tun0    inet6 200::5/7 scope global \\       valid_lft forever\n";
         assert_eq!(
-            parse_on_link_prefixes(linux),
+            parse_host_interfaces(linux).on_link,
             vec![Ipv6Prefix {
                 addr: "2001:db8:1:2::5".parse().unwrap(),
                 len: 64
@@ -1336,7 +1316,7 @@ mod tests {
                    lo0: flags=8049 mtu 16384\n\
                    \tinet6 ::1 prefixlen 128\n";
         assert_eq!(
-            parse_on_link_prefixes(bsd),
+            parse_host_interfaces(bsd).on_link,
             vec![Ipv6Prefix {
                 addr: "2001:db8:99::7".parse().unwrap(),
                 len: 64
@@ -1351,10 +1331,12 @@ mod tests {
     fn an_implausibly_short_prefix_is_not_treated_as_on_link() {
         let absurd = "eth0 inet6 2000::1/3 scope global\n\
                       eth0 inet6 2001:db8::1/31 scope global\n";
-        assert!(parse_on_link_prefixes(absurd).is_empty());
+        assert!(parse_host_interfaces(absurd).on_link.is_empty());
         // /32 is the documented lower bound and is kept.
         assert_eq!(
-            parse_on_link_prefixes("eth0 inet6 2001:db8::1/32 x").len(),
+            parse_host_interfaces("eth0 inet6 2001:db8::1/32 x")
+                .on_link
+                .len(),
             1
         );
     }
@@ -1363,9 +1345,9 @@ mod tests {
     #[test]
     fn an_on_link_prefix_contains_its_neighbours_and_nothing_else() {
         let server = ExitServer::new();
-        server.set_on_link(parse_on_link_prefixes(
-            "eth0 inet6 2001:db8:1:2::5/64 scope global",
-        ));
+        server.set_on_link(
+            parse_host_interfaces("eth0 inet6 2001:db8:1:2::5/64 scope global").on_link,
+        );
         // The gateway's neighbours: reachable from the gateway, not "the internet".
         for neighbour in ["2001:db8:1:2::1", "2001:db8:1:2::dead:beef"] {
             assert!(
@@ -1429,7 +1411,7 @@ mod tests {
 2: eth0    inet 51.15.20.7/24 brd 51.15.20.255 scope global eth0\\       valid_lft forever preferred_lft forever
 2: eth0    inet6 2001:bc8:710:d1::1/64 scope global \\       valid_lft forever preferred_lft forever
 2: eth0    inet6 fe80::1c:2ff:fe33:4455/64 scope link \\       valid_lft forever preferred_lft forever";
-        let addrs = parse_host_addresses(linux);
+        let addrs = parse_host_interfaces(linux).addrs;
         assert!(addrs.contains(&"51.15.20.7".parse().unwrap()));
         assert!(addrs.contains(&"2001:bc8:710:d1::1".parse().unwrap()));
         assert!(addrs.contains(&"127.0.0.1".parse().unwrap()));
@@ -1440,7 +1422,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 \tinet 192.168.1.5 netmask 0xffffff00 broadcast 192.168.1.255
 \tinet6 fe80::8aa:bbcc:ddee:ff00%en0 prefixlen 64 secured scopeid 0xb
 \tinet6 2a01:cb00:11:2200:1:2:3:4 prefixlen 64 autoconf secured";
-        let addrs = parse_host_addresses(mac);
+        let addrs = parse_host_interfaces(mac).addrs;
         assert!(addrs.contains(&"192.168.1.5".parse().unwrap()));
         assert!(addrs.contains(&"2a01:cb00:11:2200:1:2:3:4".parse().unwrap()));
         assert!(addrs.contains(&"fe80::8aa:bbcc:ddee:ff00".parse().unwrap()));

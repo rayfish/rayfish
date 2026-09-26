@@ -288,17 +288,17 @@ impl InviteStore {
 
     /// Revoke an unused invite by id (exact match, or unambiguous prefix).
     pub fn revoke(&mut self, id: &str) -> Result<()> {
-        let matches: Vec<usize> = self
-            .invites
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| i.id == id || i.id.starts_with(id))
-            .map(|(idx, _)| idx)
-            .collect();
-        let idx = match matches.as_slice() {
-            [] => bail!("no invite matching '{id}'"),
-            [idx] => *idx,
-            _ => bail!("ambiguous invite id '{id}'"),
+        let mut matching_idx = None;
+        for (idx, invite) in self.invites.iter().enumerate() {
+            if invite.id == id || invite.id.starts_with(id) {
+                if matching_idx.is_some() {
+                    bail!("ambiguous invite id '{id}'");
+                }
+                matching_idx = Some(idx);
+            }
+        }
+        let Some(idx) = matching_idx else {
+            bail!("no invite matching '{id}'");
         };
         if matches!(self.invites[idx].status, InviteStatus::Redeemed { .. }) {
             bail!("cannot revoke an already-used invite");

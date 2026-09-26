@@ -1862,10 +1862,10 @@ mod tests {
         let exit = no_exit();
         exit.server
             .reload([("test-net", vec![peer.to_string()].as_slice())]);
-        exit.server
-            .set_on_link(crate::exit_node::parse_on_link_prefixes(
-                "eth0 inet6 2001:db8:1:2::5/64 scope global",
-            ));
+        exit.server.set_on_link(
+            crate::exit_node::parse_host_interfaces("eth0 inet6 2001:db8:1:2::5/64 scope global")
+                .on_link,
+        );
         let lan_neighbour: std::net::Ipv6Addr = "2001:db8:1:2::1".parse().unwrap();
         assert!(
             matches!(

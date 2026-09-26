@@ -494,15 +494,17 @@ impl ReusableKey {
 /// `revoked` flag. A revoked key stays in the blob (so the revocation is part of
 /// the signed content and propagates) but admits no one.
 pub fn revoke_reusable(keys: &mut BTreeMap<String, ReusableKey>, id: &str) -> Result<()> {
-    let matches: Vec<String> = keys
-        .iter()
-        .filter(|(_, k)| k.id == id || k.id.starts_with(id))
-        .map(|(hash, _)| hash.clone())
-        .collect();
-    let hash = match matches.as_slice() {
-        [] => bail!("no reusable key matching '{id}'"),
-        [h] => h.clone(),
-        _ => bail!("ambiguous reusable key id '{id}'"),
+    let mut matching_hash = None;
+    for (hash, key) in keys.iter() {
+        if key.id == id || key.id.starts_with(id) {
+            if matching_hash.is_some() {
+                bail!("ambiguous reusable key id '{id}'");
+            }
+            matching_hash = Some(hash.clone());
+        }
+    }
+    let Some(hash) = matching_hash else {
+        bail!("no reusable key matching '{id}'");
     };
     keys.get_mut(&hash)
         .expect("hash came from this map")

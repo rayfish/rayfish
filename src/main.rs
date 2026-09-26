@@ -55,6 +55,38 @@ fn json_enabled() -> bool {
     JSON_FLAG.load(atomic::Ordering::Relaxed)
 }
 
+/// Render pending requests in JSON or the shared connection table.
+fn print_pending_requests(requests: &[ipc::PendingRequestInfo], empty_message: &str, footer: &str) {
+    if json_enabled() {
+        print_json(&serde_json::json!(
+            requests
+                .iter()
+                .map(|r| serde_json::json!({
+                    "id": r.short_id, "hostname": r.hostname, "waiting_secs": r.waiting_secs,
+                }))
+                .collect::<Vec<_>>()
+        ));
+    } else if requests.is_empty() {
+        println!("\n  {}\n", style::faint(empty_message));
+    } else {
+        let rows = requests
+            .iter()
+            .map(|r| {
+                let host = r.hostname.clone().unwrap_or_else(|| "—".to_string());
+                let wait = format!("{}s", r.waiting_secs);
+                vec![
+                    layout::Cell::new(r.short_id.clone(), style::rose(&r.short_id)),
+                    layout::Cell::new(host.clone(), style::value(&host)),
+                    layout::Cell::right(wait.clone(), style::faint(&wait)),
+                ]
+            })
+            .collect();
+        println!();
+        print!("{}", table(&["id", "host", "waiting"], rows, 2));
+        println!("\n  {}", style::faint(footer));
+    }
+}
+
 /// Whether the parsed command carried `--json`.
 ///
 /// `--json` used to be a `global = true` flag on `Cli`, which meant every one of
