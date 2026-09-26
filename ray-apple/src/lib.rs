@@ -1,7 +1,5 @@
 //! Swift bindings for the Rayfish core running in an Apple packet tunnel.
 
-#[cfg(any(target_os = "macos", test))]
-mod apple_tun;
 mod migration;
 
 use std::fmt::Display;
@@ -20,13 +18,6 @@ use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
 use tokio::runtime::{Builder, Runtime};
-#[cfg(any(target_os = "macos", test))]
-use tokio::sync::mpsc;
-
-#[cfg(target_os = "macos")]
-use apple_tun::{AppleTunReader, AppleTunWriter, PACKET_QUEUE_CAPACITY};
-#[cfg(any(target_os = "macos", test))]
-use arc_swap::ArcSwapOption;
 #[cfg(target_os = "macos")]
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -46,8 +37,6 @@ pub enum AppleError {
     AlreadyActive,
     #[error("state migration must run before the node starts")]
     AlreadyStarted,
-    #[error("packet queue is full")]
-    PacketQueueFull,
     #[error("{0}")]
     Network(String),
 }
@@ -156,12 +145,6 @@ pub struct JoinRequest {
     pub waiting_secs: u64,
 }
 
-#[uniffi::export(callback_interface)]
-pub trait PacketFlow: Send + Sync {
-    /// Write one packet received from a Rayfish peer into `NEPacketTunnelFlow`.
-    fn write_packet(&self, packet: Vec<u8>);
-}
-
 /// One Rayfish node hosted by a packet tunnel provider.
 #[derive(uniffi::Object)]
 pub struct Node {
@@ -170,12 +153,9 @@ pub struct Node {
     state: Mutex<Option<Arc<DaemonState>>>,
     #[cfg(target_os = "macos")]
     ipc_task: Mutex<Option<JoinHandle<()>>>,
-    /// Serializes tunnel attach and detach. Packet delivery never takes this lock.
+    /// Serializes tunnel attach and detach.
     #[cfg(target_os = "macos")]
-    packet_lifecycle: Mutex<()>,
-    /// Current Swift-to-Rust packet queue, read without locking in the hot path.
-    #[cfg(target_os = "macos")]
-    packet_tx: ArcSwapOption<mpsc::Sender<Vec<u8>>>,
+    tunnel_active: Mutex<bool>,
 }
 
 impl Node {
@@ -205,9 +185,7 @@ impl Node {
             #[cfg(target_os = "macos")]
             ipc_task: Mutex::new(None),
             #[cfg(target_os = "macos")]
-            packet_lifecycle: Mutex::new(()),
-            #[cfg(target_os = "macos")]
-            packet_tx: ArcSwapOption::empty(),
+            tunnel_active: Mutex::new(false),
         })
     }
 
@@ -561,49 +539,29 @@ impl Node {
         expect_ok(state.deny_request(&network, &id), "denial")
     }
 
-    /// Attach the system packet flow and start forwarding packets.
-    pub fn activate(&self, flow: Box<dyn PacketFlow>) -> Result<(), AppleError> {
+    /// Attach the system packet tunnel and start forwarding packets.
+    pub fn activate(&self) -> Result<(), AppleError> {
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = flow;
             Err(AppleError::UnsupportedPlatform)
         }
         #[cfg(target_os = "macos")]
         {
             let state = self.state()?;
-            let _lifecycle = self
-                .packet_lifecycle
+            let mut active = self
+                .tunnel_active
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if self.packet_tx.load().is_some() {
+            if *active {
                 return Err(AppleError::AlreadyActive);
             }
-            let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
-            let reader = AppleTunReader::new(rx);
-            let writer = AppleTunWriter::new(flow);
+            // Swift calls this outside Tokio, but opening the async TUN needs its reactor.
+            let _runtime = self.runtime.enter();
+            let (reader, writer) =
+                rayfish::tun::open_packet_tunnel().map_err(AppleError::network)?;
             self.runtime
                 .block_on(state.attach_external_tun(reader, writer));
-            self.packet_tx.store(Some(Arc::new(tx)));
-            Ok(())
-        }
-    }
-
-    /// Deliver packets read from `NEPacketTunnelFlow` to the mesh forwarder.
-    pub fn receive_packets(&self, packets: Vec<Vec<u8>>) -> Result<(), AppleError> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = packets;
-            Err(AppleError::UnsupportedPlatform)
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let sender = self.packet_tx.load();
-            let sender = sender.as_ref().ok_or(AppleError::NotStarted)?;
-            for packet in packets {
-                sender
-                    .try_send(packet)
-                    .map_err(|_| AppleError::PacketQueueFull)?;
-            }
+            *active = true;
             Ok(())
         }
     }
@@ -612,13 +570,15 @@ impl Node {
     pub fn deactivate(&self) -> Result<(), AppleError> {
         let state = self.state()?;
         #[cfg(target_os = "macos")]
-        let _lifecycle = self
-            .packet_lifecycle
+        let mut active = self
+            .tunnel_active
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         state.detach_tun();
         #[cfg(target_os = "macos")]
-        self.packet_tx.store(None);
+        {
+            *active = false;
+        }
         Ok(())
     }
 
@@ -628,14 +588,16 @@ impl Node {
         let mut slot = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = slot.take();
         #[cfg(target_os = "macos")]
-        let _lifecycle = self
-            .packet_lifecycle
+        let mut active = self
+            .tunnel_active
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        #[cfg(target_os = "macos")]
-        self.packet_tx.store(None);
         if let Some(state) = &state {
             state.detach_tun();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            *active = false;
         }
         #[cfg(target_os = "macos")]
         let ipc_task = self
@@ -739,25 +701,6 @@ mod tests {
             expect_ok(IpcMessage::Status, "leave"),
             Err(AppleError::Network(message)) if message == "node returned an invalid leave response"
         ));
-    }
-
-    #[test]
-    fn packet_sender_snapshot_tracks_lifecycle() {
-        let sender_slot: ArcSwapOption<mpsc::Sender<Vec<u8>>> = ArcSwapOption::empty();
-        assert!(sender_slot.load().is_none());
-
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender_slot.store(Some(Arc::new(sender)));
-        let snapshot = sender_slot.load();
-        snapshot
-            .as_ref()
-            .expect("active packet sender should be present")
-            .try_send(vec![1, 2, 3])
-            .expect("packet queue should have capacity");
-        assert_eq!(receiver.try_recv().unwrap(), [1, 2, 3]);
-
-        sender_slot.store(None);
-        assert!(sender_slot.load().is_none());
     }
 
     #[test]

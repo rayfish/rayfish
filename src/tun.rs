@@ -11,11 +11,17 @@
 use crate::membership::ExitFamilies;
 #[cfg(target_os = "linux")]
 use std::future::Future;
+#[cfg(target_os = "macos")]
+use std::io::Error as IoError;
+#[cfg(target_os = "macos")]
+use std::mem::{size_of, zeroed};
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
 
 #[cfg(not(target_os = "android"))]
 use std::net::Ipv6Addr;
+#[cfg(target_os = "macos")]
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 // Windows drives the interface through PowerShell (`windows_process`), not a
@@ -26,41 +32,43 @@ use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 
-// `Result` is the CGNAT preflight's too, which Android has its own version of;
-// `Context` is only used by the desktop setup below.
 #[cfg(not(target_os = "android"))]
 use anyhow::Context;
+#[cfg(not(target_os = "android"))]
 use anyhow::Result;
+#[cfg(not(target_os = "android"))]
+use anyhow::anyhow;
 // The desktop TUN device (the `tun-rs` crate) only exists off Android, where the
 // packet interface is a `VpnService` fd instead.
 #[cfg(not(target_os = "android"))]
+use futures::StreamExt;
+#[cfg(target_os = "macos")]
+use libc::{
+    AF_SYSTEM, CTLIOCGINFO, F_DUPFD_CLOEXEC, c_char, ctl_info, fcntl, getpeername, ioctl, sockaddr,
+    sockaddr_ctl, socklen_t,
+};
+#[cfg(not(target_os = "android"))]
+use tun_rs::async_framed::{BytesCodec, DeviceFramedRead};
+#[cfg(not(target_os = "android"))]
 use tun_rs::{AsyncDevice, DeviceBuilder};
 
-/// Read side of a packet interface. Fills the spare capacity of `buf` with one
-/// IP packet and returns the number of bytes read. Abstracts the concrete TUN
-/// device so the forwarding loop can run over any packet source: the desktop
-/// TUN, an Android `VpnService` fd, an iOS `NEPacketTunnelFlow`, or an in-memory
-/// fake in tests. Reading into caller-owned spare capacity keeps the forward
-/// loop's zero-copy `split_to(n).freeze()` hand-off.
+/// Read side of a packet interface. Returns one owned IP packet. Abstracts the
+/// concrete TUN device so the forwarding loop can run over any packet source:
+/// the desktop TUN, an Android `VpnService` fd, or an in-memory fake in tests.
+/// The packet's allocation passes directly to the forwarding loop and transport.
 ///
-/// Contract: `Ok(0)` means "no packet this time, retry", the forwarding loop
-/// treats it as a spurious wakeup and loops again. End-of-stream (e.g. an
-/// Android `VpnService` fd whose descriptor is revoked/closed) MUST surface as
-/// `Err`, never as a perpetual `Ok(0)`, or `run_mesh` would busy-spin at 100%
-/// CPU. The desktop TUN never returns 0, so this only binds future impls.
+/// Contract: an empty packet means "no packet this time, retry". End-of-stream
+/// must surface as `Err`, never as a stream of empty packets, or `run_mesh`
+/// would busy-spin.
 ///
-/// **`read_into` MUST be cancel-safe.** `run_mesh` races it in a `select!` against
+/// **`read_packet` MUST be cancel-safe.** `run_mesh` races it in a `select!` against
 /// dial-completion and shutdown, so the future can be dropped before it resolves.
-/// A dropped read MUST leave `buf` byte-for-byte as it was on entry: never append
-/// (or grow-then-not-truncate) before the `.await`, or a cancelled read leaves
-/// stray bytes in the pool that offset every later `split_to`, silently corrupting
-/// every subsequent packet. Read into owned scratch (or uninitialised spare
-/// capacity via `advance_mut`) and commit to `buf` only after the read returns.
+/// A dropped read must leave the reader ready for the next call. Readers should
+/// keep their receive allocation internally until a complete packet is ready.
 pub trait TunRead: Send + 'static {
-    fn read_into(
+    fn read_packet(
         &mut self,
-        buf: &mut bytes::BytesMut,
-    ) -> impl core::future::Future<Output = anyhow::Result<usize>> + Send;
+    ) -> impl core::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send;
 }
 
 /// Write side of a packet interface. Writes one IP packet to the device.
@@ -94,22 +102,12 @@ fn configure_mtu(mut set: impl FnMut(u16) -> std::io::Result<()>) -> Result<u16>
     }
 }
 
-/// Bytes exposed for a single `recv`. A TUN read yields at most one MTU-bounded
-/// packet (offload is off), plus a few bytes of slack for any platform
-/// packet-info header. The reader allocates this much scratch space at creation;
-/// manually raising the interface MTU beyond the tunnel limit is unsupported.
-#[cfg(not(target_os = "android"))]
-const READ_RESERVE: usize = TUN_MTU as usize + 4;
-
 /// Read half of the TUN device. Owned by [`forward::run_mesh`]. Holds a clone of
-/// the shared [`AsyncDevice`]; `recv` takes `&self`, so the reader and writer
-/// share one device without a lock.
+/// the shared [`AsyncDevice`] through a framed reader that receives directly
+/// into a `BytesMut` allocation.
 #[cfg(not(target_os = "android"))]
 pub struct TunReader {
-    dev: Arc<AsyncDevice>,
-    /// Owned landing buffer for one packet. `read_into` reads here first, then
-    /// copies into the caller's pool, which keeps it cancel-safe (see `read_into`).
-    scratch: Box<[u8]>,
+    framed: DeviceFramedRead<BytesCodec, Arc<AsyncDevice>>,
 }
 
 /// Write half of the TUN device. Owned by [`forward::spawn_tun_writer`].
@@ -159,17 +157,83 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
     tracing::info!(ipv6 = %v6, tun = %tun_name, mtu, "TUN device created");
 
-    // `recv`/`send` take `&self`, so both halves share one device via `Arc`
-    // instead of splitting into independent read/write objects.
+    let (reader, writer) = split_device(device, mtu);
+    Ok((reader, writer, tun_name))
+}
+
+#[cfg(not(target_os = "android"))]
+fn split_device(device: AsyncDevice, mtu: u16) -> (TunReader, TunWriter) {
     let dev = Arc::new(device);
-    Ok((
-        TunReader {
-            dev: Arc::clone(&dev),
-            scratch: vec![0u8; READ_RESERVE].into_boxed_slice(),
-        },
-        TunWriter { dev, mtu },
-        tun_name,
-    ))
+    let framed = DeviceFramedRead::new(Arc::clone(&dev), BytesCodec::new());
+    (TunReader { framed }, TunWriter { dev, mtu })
+}
+
+/// Opens the utun interface owned by `NEPacketTunnelProvider` without routing
+/// packets through Swift. The provider keeps its descriptor; Rayfish owns a
+/// duplicate that is closed when the attached data plane stops.
+#[cfg(target_os = "macos")]
+pub fn open_packet_tunnel() -> Result<(TunReader, TunWriter)> {
+    let fd = packet_tunnel_fd()?;
+    let raw_fd = fd.into_raw_fd();
+    // SAFETY: `raw_fd` is an owned duplicate of the provider's open utun fd.
+    let device = unsafe { AsyncDevice::from_fd(raw_fd) }.context("open packet tunnel utun fd")?;
+    Ok(split_device(device, TUN_MTU))
+}
+
+#[cfg(target_os = "macos")]
+fn packet_tunnel_fd() -> Result<OwnedFd> {
+    const MAX_FD: RawFd = 1024;
+    const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
+
+    // Both C structs are plain integer arrays and are valid when zeroed.
+    let mut info: ctl_info = unsafe { zeroed() };
+    for (destination, source) in info
+        .ctl_name
+        .iter_mut()
+        .zip(UTUN_CONTROL_NAME.iter().copied())
+    {
+        *destination = source as c_char;
+    }
+
+    for fd in 0..=MAX_FD {
+        // `getpeername` initializes the address and updates its length on success.
+        let mut address: sockaddr_ctl = unsafe { zeroed() };
+        let mut address_len = size_of::<sockaddr_ctl>() as socklen_t;
+        // SAFETY: both pointers refer to writable values of the advertised size.
+        let result = unsafe {
+            getpeername(
+                fd,
+                (&mut address as *mut sockaddr_ctl).cast::<sockaddr>(),
+                &mut address_len,
+            )
+        };
+        if result != 0
+            || (address_len as usize) < size_of::<sockaddr_ctl>()
+            || i32::from(address.sc_family) != AF_SYSTEM
+        {
+            continue;
+        }
+
+        if info.ctl_id == 0 {
+            // SAFETY: `info` is writable and has the layout required by CTLIOCGINFO.
+            if unsafe { ioctl(fd, CTLIOCGINFO, &mut info) } != 0 {
+                continue;
+            }
+        }
+        if address.sc_id != info.ctl_id {
+            continue;
+        }
+
+        // SAFETY: `fd` was accepted by `getpeername`; fcntl returns a new owned fd.
+        let duplicate = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(IoError::last_os_error()).context("duplicate packet tunnel utun fd");
+        }
+        // SAFETY: `duplicate` is a fresh descriptor returned by fcntl.
+        return Ok(unsafe { OwnedFd::from_raw_fd(duplicate) });
+    }
+
+    Err(anyhow!("packet tunnel utun fd was not found"))
 }
 
 /// Interface name pattern on Linux. The kernel's default `tun0` says nothing
@@ -617,20 +681,13 @@ async fn windows_interface_index(tun_name: &str) -> Result<u32> {
 
 #[cfg(not(target_os = "android"))]
 impl TunRead for TunReader {
-    /// Reads one packet from the TUN device, appending it to `buf`.
-    ///
-    /// **Cancel-safety matters here:** `run_mesh` races this future in a `select!`
-    /// against dial-completion and shutdown, so it can be dropped mid-`recv`. We
-    /// therefore read into an owned `scratch` buffer and only append to the caller's
-    /// pool *after* `recv` returns. Growing `buf` before the await (and truncating
-    /// after) would leave stray bytes in the pool whenever a read is cancelled,
-    /// permanently offsetting every subsequent `split_to`, so every packet parses as
-    /// garbage and the whole data plane wedges. The one extra copy is a single
-    /// sub-MTU `memcpy`; correctness beats the zero-copy read.
-    async fn read_into(&mut self, buf: &mut bytes::BytesMut) -> anyhow::Result<usize> {
-        let n = self.dev.recv(&mut self.scratch[..]).await?;
-        buf.extend_from_slice(&self.scratch[..n]);
-        Ok(n)
+    async fn read_packet(&mut self) -> anyhow::Result<bytes::Bytes> {
+        self.framed
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("TUN device closed"))?
+            .map(bytes::BytesMut::freeze)
+            .map_err(Into::into)
     }
 }
 

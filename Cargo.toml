@@ -178,7 +178,7 @@ harness = false
 # dependency that can't cross-compile there. The desktop TUN code in `src/tun.rs`
 # is likewise `#[cfg(not(target_os = "android"))]`.
 [target.'cfg(not(target_os = "android"))'.dependencies]
-tun-rs = { version = "2", features = ["async"] }
+tun-rs = { version = "2", features = ["async", "async_framed"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21.0"

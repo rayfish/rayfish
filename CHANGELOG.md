@@ -43,6 +43,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The macOS direct tunnel starts correctly when connecting from the app.
+
 - Mesh SSH honors a peer's grants across all verified shared networks, even when
   its current connection was established through a different network.
 - The macOS app's bundled CLI authorizes the app's user without an operator
@@ -63,6 +65,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Commands that target network members accept their hostnames consistently.**
   Admin grants now accept names, and network-scoped commands do not resolve a
   duplicate name from another network.
+
+### Performance
+
+- **macOS packet forwarding now uses the system tunnel directly.** Packets no
+  longer cross the Swift bridge or a Rust channel, and TUN reads no longer need
+  an intermediate copy.
 
 ## [0.5.0] - 2026-09-24
 

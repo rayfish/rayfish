@@ -12,7 +12,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use anyhow::{Result, bail};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use rayfish::tun::{TunRead, TunWrite};
 use tokio::io::unix::AsyncFd;
 
@@ -20,6 +20,7 @@ use tokio::io::unix::AsyncFd;
 /// keep at least this much contiguous spare capacity before each read so a
 /// packet is never truncated.
 const READ_CHUNK: usize = 2048;
+const RECEIVE_POOL_CHUNK: usize = 64 * 1024;
 
 /// Mark an already-owned fd non-blocking (required by `AsyncFd`), in place.
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
@@ -52,6 +53,7 @@ fn dup_nonblocking(fd: RawFd) -> io::Result<OwnedFd> {
 /// Read half of the Android `VpnService` fd.
 pub struct AndroidTunReader {
     fd: AsyncFd<OwnedFd>,
+    buffer: BytesMut,
 }
 
 impl AndroidTunReader {
@@ -64,20 +66,21 @@ impl AndroidTunReader {
         set_nonblocking(fd.as_raw_fd())?;
         Ok(Self {
             fd: AsyncFd::new(fd)?,
+            buffer: BytesMut::with_capacity(RECEIVE_POOL_CHUNK),
         })
     }
 }
 
 impl TunRead for AndroidTunReader {
-    async fn read_into(&mut self, buf: &mut BytesMut) -> Result<usize> {
-        if buf.capacity() - buf.len() < READ_CHUNK {
-            buf.reserve(READ_CHUNK);
+    async fn read_packet(&mut self) -> Result<Bytes> {
+        if self.buffer.capacity() - self.buffer.len() < READ_CHUNK {
+            self.buffer.reserve(RECEIVE_POOL_CHUNK);
         }
         loop {
             let mut guard = self.fd.readable_mut().await?;
             let out = guard.try_io(|inner| {
                 let raw = inner.get_ref().as_raw_fd();
-                let spare = buf.spare_capacity_mut();
+                let spare = self.buffer.spare_capacity_mut();
                 // SAFETY: read writes at most `spare.len()` bytes into the
                 // uninitialised spare capacity; we advance the length only by
                 // the returned count below.
@@ -98,8 +101,8 @@ impl TunRead for AndroidTunReader {
                 Ok(Ok(0)) => bail!("android tun fd reached EOF (revoked or closed)"),
                 Ok(Ok(n)) => {
                     // SAFETY: the kernel initialised exactly `n` spare bytes.
-                    unsafe { buf.advance_mut(n) };
-                    return Ok(n);
+                    unsafe { self.buffer.advance_mut(n) };
+                    return Ok(self.buffer.split_to(n).freeze());
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 // Spurious readiness (would-block): re-arm and wait again.

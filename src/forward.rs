@@ -72,13 +72,6 @@ pub(crate) fn untag_datagram(datagram: &[u8]) -> Option<(u16, &[u8])> {
     Some((handle, &datagram[TAG_LEN..]))
 }
 
-/// Size of the TUN read pool. One allocation is amortized across the ~50
-/// datagrams that fit in a chunk: each packet is sliced off with a zero-copy
-/// `split_to(n).freeze()`, and a fresh chunk is only allocated once the current
-/// one is exhausted (the old chunk stays alive via the `Bytes` already handed to
-/// quinn and is freed as those datagrams are sent).
-const TX_POOL_CHUNK: usize = 64 * 1024;
-
 /// Magic DNS forwarding may await an upstream resolver.  Keep enough requests
 /// in flight for normal browser parallelism while bounding task and socket use
 /// when a local app floods the resolver address.
@@ -475,7 +468,6 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             tun_tx,
             dialer,
         } = self;
-        let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
         // On-demand lazy-dial state, owned by this loop (no shared/locked buffer).
         // `LazyDialBuffers` bounds retained bytes and packets both per peer and for
         // the whole daemon, so an offline route cannot make the forwarding task grow
@@ -491,19 +483,9 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             .map(|r| r.exit_client.clone())
             .unwrap_or_default();
         loop {
-            // Ensure a full MTU of contiguous spare capacity before reading (a short
-            // buffer would truncate the packet). `reserve` reuses the current chunk
-            // until it's exhausted, then allocates a fresh one, so allocation is
-            // amortized across many packets instead of paid per packet.
-            if pool.capacity() < MAX_PEER_DATAGRAM {
-                pool.reserve(TX_POOL_CHUNK);
-            }
-            // Race the read against cancellation and dial-completion. The read arm
-            // returns only the byte count so no borrow of `pool` escapes the `select!`
-            // (it's reused right below); the completion arm flushes inline and loops.
-            let n = tokio::select! {
+            let pkt = tokio::select! {
                 _ = token.cancelled() => return Ok(()),
-                result = tun.read_into(&mut pool) => result?,
+                result = tun.read_packet() => result?,
                 Some((peer, connected)) = done_rx.recv() => {
                     in_flight.remove(&peer);
                     let pkts = buffered.take(&peer);
@@ -512,12 +494,10 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     continue;
                 }
             };
+            let n = pkt.len();
             if n == 0 {
                 continue;
             }
-            // Zero-copy hand-off: slice the packet out of the pool as an owned
-            // `Bytes` sharing the chunk's allocation, no copy, no per-packet malloc.
-            let pkt = pool.split_to(n).freeze();
             tracing::trace!(len = n, first_byte = pkt[0], "TUN read");
             let Some(info) = firewall::parse_packet_info(&pkt) else {
                 // Not IP, truncated, or IPv6 carrying an extension header we refuse

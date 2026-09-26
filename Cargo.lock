@@ -5753,8 +5753,6 @@ name = "ray-apple"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
- "bytes",
  "rayfish",
  "tempfile",
  "thiserror 2.0.20",
@@ -7810,6 +7808,8 @@ dependencies = [
  "byteorder",
  "bytes",
  "encoding_rs",
+ "futures",
+ "futures-core",
  "getifaddrs",
  "ipnet",
  "libc",

@@ -17,16 +17,19 @@ a second run prints `change: [...]` deltas vs the stored baseline.
 
 ## Groups (`benches/forward.rs`)
 
-- **`handoff`** — the packet ownership transfer the zero-copy change touched,
-  TX (TUN→peer) and RX (peer→TUN), old copy path vs current zero-copy, at 64 B
-  and 1280 B (TUN MTU):
-  - `tx_copy` = old `Bytes::copy_from_slice` (allocate + copy) ·
-    `tx_zerocopy` = pooled `BytesMut::split_to(n).freeze()`
-  - `rx_copy` = old `datagram.to_vec()` · `rx_zerocopy` = `Bytes` clone (refcount)
-- **`firewall`** — `parse_packet_info` + `evaluate_packet`, the unavoidable
-  per-packet work run once per direction. A regression guard
-  (`parse_only`, `parse_eval_out_allow`, `parse_eval_in_whitelist`).
+- **`handoff`** compares the old allocation-and-copy packet handoff with the
+  current `Bytes` paths for TX and RX.
+- **`tun_ingress`** compares the old scratch-buffer copy plus pool copy with
+  extending the owned packet buffer directly.
+- **`apple_tun_ingress`** compares the Swift bridge queue, `Vec` allocation and
+  pool copy with the direct owned-buffer path.
+- **`writer_resolve`** compares resolving the swappable TUN sender on each
+  packet with the reader's cached lookup.
+- **`firewall`** measures packet parsing and evaluation for the default allow
+  path and a small inbound whitelist.
 
-The `*_copy` variants reproduce the pre-optimization code so the delta to the
-`*_zerocopy` variant is exactly the saving; they are bench-only fixtures, not
-live code paths.
+Ingress cases use 64, 1280 and 1500 byte packets. They measure buffer copies,
+allocation and queue overhead in memory. They do not call an OS TUN or utun
+device, so they estimate the per-packet CPU saved in those paths, not end-to-end
+packet latency. The old and new variants are benchmark fixtures, not live code
+paths.
