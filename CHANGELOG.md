@@ -288,6 +288,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Magic DNS configures itself on FreeBSD.** Rayfish enables `local_unbound`
+  and registers `.ray` as a private `resolvconf` domain instead of retrying an
+  unsupported desktop backend every minute.
 - **Android retries file notifications after transient failures.** Background
   retries preserve the Downloads result and stop once reconciliation succeeds.
 
