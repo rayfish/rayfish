@@ -9,8 +9,10 @@ use dashmap::DashSet;
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, VarInt};
 use smol_str::SmolStr;
+use tokio::time::timeout;
 
 use crate::audit::AuditLog;
+use crate::control::{self, ControlMsg};
 use crate::membership;
 
 mod device_user_map;
@@ -32,6 +34,39 @@ static ACTIVITY_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// Milliseconds since [`ACTIVITY_EPOCH`]. Wraps far past any process lifetime.
 fn now_ms() -> u64 {
     ACTIVITY_EPOCH.elapsed().as_millis() as u64
+}
+
+const REPLACED_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn close_replaced_after_ack(conn: Connection, reason: &'static [u8]) {
+    let result = timeout(REPLACED_CLOSE_TIMEOUT, async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        control::send_msg(&mut send, None, &ControlMsg::Close).await?;
+        anyhow::ensure!(
+            matches!(control::recv_msg(&mut recv).await?, ControlMsg::CloseAck),
+            "peer did not acknowledge mesh close"
+        );
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        tracing::debug!(peer = %conn.remote_id().fmt_short(), "mesh close acknowledgement unavailable; closing after timeout or error");
+    }
+    conn.close(
+        VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
+        reason,
+    );
+}
+
+fn schedule_replaced_close(conn: Connection, reason: &'static [u8]) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(close_replaced_after_ack(conn, reason));
+    } else {
+        conn.close(
+            VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
+            reason,
+        );
+    }
 }
 
 /// A `DashMap` using ahash instead of the default SipHash. Used for the
@@ -223,17 +258,11 @@ impl PeerEntry {
         if self.active.conn.close_reason().is_none()
             && self.active.selection_id <= connection_selection_id(conn)
         {
-            conn.close(
-                VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
-                b"noncanonical",
-            );
+            schedule_replaced_close(conn.clone(), b"noncanonical");
             return false;
         }
         let old = std::mem::replace(&mut self.active, ActiveConnection::new(conn.clone()));
-        old.conn.close(
-            VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
-            b"replaced",
-        );
+        schedule_replaced_close(old.conn, b"replaced");
         true
     }
 
@@ -1060,6 +1089,29 @@ mod tests {
             .expect("client connect");
         let conn_server = accept.await.expect("accept task");
         (conn_server, conn_client)
+    }
+
+    #[tokio::test]
+    async fn replaced_connection_waits_for_close_ack() {
+        let (_server, _client, sender, receiver) = connected_pair().await;
+        let closing = tokio::spawn(close_replaced_after_ack(sender.clone(), b"replaced"));
+        let (mut reply, mut request) = timeout(Duration::from_secs(5), receiver.accept_bi())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            control::recv_msg(&mut request).await.unwrap(),
+            ControlMsg::Close
+        ));
+        assert!(sender.close_reason().is_none());
+        control::send_msg(&mut reply, None, &ControlMsg::CloseAck)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(sender.close_reason().is_some());
     }
 
     #[tokio::test]

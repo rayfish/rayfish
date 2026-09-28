@@ -54,6 +54,7 @@ pub(crate) async fn drain_pending_rename(
     network_name: &str,
     my_identity: EndpointId,
     device_cert: &Option<control::DeviceCert>,
+    registry: &NetworkRegistry,
 ) {
     // `apply_roster_to_dns` already cleared the intent if the blob confirmed it,
     // so a value here means it's genuinely still outstanding.
@@ -84,7 +85,21 @@ pub(crate) async fn drain_pending_rename(
     }
 
     for m in coordinators {
-        match transport::connect_to_peer_with_alpn(endpoint, m.identity, alpn).await {
+        let dial_lock = registry.mesh_dial_lock(m.identity);
+        let Ok(_dial_guard) = dial_lock.try_lock() else {
+            continue;
+        };
+        let peer_ip = derive_ipv6(&m.identity);
+        let connected = if let Some(conn) = registry
+            .peers
+            .conn_for_ip(&peer_ip)
+            .filter(|conn| conn.close_reason().is_none())
+        {
+            Ok(conn)
+        } else {
+            transport::connect_to_peer_with_alpn(endpoint, m.identity, alpn).await
+        };
+        match connected {
             Ok(conn) => {
                 if let Ok((mut send, _recv)) = conn.open_bi().await {
                     let _ = control::send_msg(

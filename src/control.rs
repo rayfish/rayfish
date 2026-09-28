@@ -337,6 +337,11 @@ pub enum ControlMsg {
     NotSupported {
         msg_kind: String,
     },
+    /// Connection-level request to retire this physical mesh connection after
+    /// outstanding control work has been handled. The reply uses the same
+    /// bidirectional stream, so the sender can wait before closing QUIC.
+    Close,
+    CloseAck,
 }
 
 fn default_receive_mtu() -> u16 {

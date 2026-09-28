@@ -182,7 +182,7 @@ impl MeshConnection {
                 }
                 r = self.conn.accept_bi() => r,
             };
-            let (send, mut recv) = match accepted {
+            let (mut send, mut recv) = match accepted {
                 Ok(pair) => pair,
                 // Connection closed. Tear down the reader and report the drop.
                 Err(e) => {
@@ -228,6 +228,11 @@ impl MeshConnection {
             }
             // Connection-level messages (not scoped to a network).
             match &frame.msg {
+                ControlMsg::Close if frame.net.is_none() => {
+                    let _ = control::send_msg(&mut send, None, &ControlMsg::CloseAck).await;
+                    continue;
+                }
+                ControlMsg::CloseAck => continue,
                 ControlMsg::NetworkHandles {
                     entries,
                     features,

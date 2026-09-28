@@ -377,6 +377,13 @@ pub(crate) async fn announce_network_handles(
     conn: &Connection,
     peer_ip: Ipv6Addr,
 ) {
+    // A simultaneous inbound and outbound handshake may have selected a
+    // different physical connection while this caller was registering its
+    // network. Announce on the selected link, which is where data will flow.
+    let selected = peers
+        .conn_for_ip(&peer_ip)
+        .filter(|candidate| candidate.close_reason().is_none())
+        .unwrap_or_else(|| conn.clone());
     let entries: Vec<control::NetworkHandle> = peers
         .outbound_handles(&peer_ip)
         .into_iter()
@@ -395,7 +402,7 @@ pub(crate) async fn announce_network_handles(
         return;
     }
     let _ = open_and_send(
-        conn,
+        &selected,
         None,
         &ControlMsg::NetworkHandles {
             entries,

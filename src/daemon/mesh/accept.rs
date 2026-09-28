@@ -13,6 +13,23 @@ use crate::daemon;
 
 use super::super::*;
 
+/// A peer table update can close this connection when another shared-network
+/// connection already won selection. Wait until the Welcome stream has been
+/// acknowledged before allowing that update to happen.
+async fn send_welcome(
+    send: &mut iroh::endpoint::SendStream,
+    network_key: EndpointId,
+    welcome: &ControlMsg,
+) -> Result<()> {
+    control::send_msg(send, Some(network_key), welcome).await?;
+    match tokio::time::timeout(Duration::from_secs(10), send.stopped()).await {
+        Ok(Ok(None)) => Ok(()),
+        Ok(Ok(Some(code))) => anyhow::bail!("peer stopped welcome stream: {code}"),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => anyhow::bail!("timed out waiting for welcome delivery"),
+    }
+}
+
 /// Upper bound on a closed network's in-memory pending-join queue. Keyed by peer
 /// identity, so repeat requests from one peer don't grow it; this caps a flood
 /// across *distinct* identities (an attacker would need a fresh key per slot).
@@ -134,6 +151,8 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         | ControlMsg::CertRefresh { .. }
         | ControlMsg::RequestUnpair
         | ControlMsg::NotSupported { .. }
+        | ControlMsg::Close
+        | ControlMsg::CloseAck
         | ControlMsg::FileOffer { .. } => false,
     }
 }
@@ -514,9 +533,6 @@ impl CoordinatorAcceptState {
 
         let mut send = send;
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
-        self.ctx
-            .register_peer_conn(conn, remote_id, &self.network_name);
-
         // Reply on the request stream before any further reconnect work. This is
         // the durable replay path for a direct peer that was admitted and marked
         // coordinator in the signed roster but crashed before persisting its key.
@@ -528,9 +544,9 @@ impl CoordinatorAcceptState {
             .flatten();
         let direct_record_published =
             grant_direct && record.as_ref().is_some_and(|signed| signed.published);
-        if let Err(e) = control::send_msg(
+        if let Err(e) = send_welcome(
             &mut send,
-            Some(self.net_pubkey()),
+            self.net_pubkey(),
             &ControlMsg::Welcome {
                 members,
                 approved,
@@ -541,12 +557,12 @@ impl CoordinatorAcceptState {
         )
         .await
         {
-            // Reconnect sends MeshHello without reading its reply, which can
-            // stop this stream before Welcome is written. The peer is already
-            // registered: continue so the demux announces its network handles
-            // and the remaining metadata refresh still runs.
+            // A peer announcing another shared network may stop the reply
+            // stream. Its membership is already known, so keep the reconnect.
             tracing::debug!(peer = %remote_id.fmt_short(), error = %e, "failed to reply Welcome to registered member; continuing reconnect");
         }
+        self.ctx
+            .register_peer_conn(conn, remote_id, &self.network_name);
 
         // Hand this (re)connecting member our current signed record over the mesh
         // so it converges to the live roster in ~1s instead of waiting out a stale
@@ -928,9 +944,9 @@ impl CoordinatorAcceptState {
         };
 
         tracing::info!(ip = %peer_ip, "new member admitted and joined");
-        let _ = control::send_msg(
+        if let Err(error) = send_welcome(
             &mut send,
-            Some(net_pubkey),
+            net_pubkey,
             &ControlMsg::Welcome {
                 members: members.clone(),
                 approved,
@@ -939,7 +955,11 @@ impl CoordinatorAcceptState {
                 direct_record_published,
             },
         )
-        .await;
+        .await
+        {
+            tracing::warn!(peer = %remote_id.fmt_short(), %error, "failed to deliver Welcome");
+            return AdmissionResult::PendingDurability;
+        }
 
         // Register the peer's route + start its single data reader (the accept-side
         // demux already owns this connection's control loop).
@@ -1547,9 +1567,9 @@ impl MemberAcceptState {
             let s = self.state.read().unwrap();
             (s.roster(), s.approved_snapshot())
         };
-        let _ = control::send_msg(
+        if let Err(error) = send_welcome(
             &mut send,
-            Some(self.net_pubkey),
+            self.net_pubkey,
             &ControlMsg::Welcome {
                 members,
                 approved: approved_list,
@@ -1560,7 +1580,11 @@ impl MemberAcceptState {
                 direct_record_published: false,
             },
         )
-        .await;
+        .await
+        {
+            tracing::warn!(peer = %peer_identity.fmt_short(), %error, "failed to deliver Welcome");
+            return None;
+        }
         self.ctx
             .register_peer_conn(conn, peer_identity, &self.network_name);
         broadcast_member_sync(
@@ -1966,6 +1990,118 @@ impl ProtocolRouter {
         Arc::clone(&self.conn_mngr)
             .drive_mesh_connection(conn, pre_registered)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod welcome_delivery_tests {
+    use super::*;
+    use iroh::RelayMode;
+    use iroh::endpoint::{ConnectionError, presets};
+
+    #[tokio::test]
+    async fn welcome_arrives_before_a_duplicate_connection_is_closed() {
+        let alpn = transport::mesh_alpn();
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let incoming = {
+                let server = server.clone();
+                tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+            };
+            let outgoing = client.connect(server.addr(), &alpn).await.unwrap();
+            connections.push((incoming.await.unwrap(), outgoing));
+        }
+        let session_id = |conn: &Connection| {
+            let mut id = [0u8; 32];
+            conn.export_keying_material(&mut id, b"EXPORTER-rayfish-mesh-selection-v1", b"")
+                .unwrap();
+            id
+        };
+        connections.sort_by_key(|(server_conn, _)| session_id(server_conn));
+        let (old_server, _old_client) = connections.remove(0);
+        let (new_server, new_client) = connections.remove(0);
+        let peers = PeerTable::new();
+        let client_id = client.id();
+        peers.add(derive_ipv6(&client_id), old_server, client_id, "existing");
+        let network_key = SecretKey::generate().public();
+        let server_peers = peers.clone();
+        let join_reply = tokio::spawn(async move {
+            let (mut send, mut recv) = new_server.accept_bi().await.unwrap();
+            assert!(matches!(
+                control::recv_msg(&mut recv).await.unwrap(),
+                ControlMsg::JoinRequest { .. }
+            ));
+            send_welcome(
+                &mut send,
+                network_key,
+                &ControlMsg::Welcome {
+                    members: Vec::new(),
+                    approved: Vec::new(),
+                    direct_key: None,
+                    direct_record: None,
+                    direct_record_published: false,
+                },
+            )
+            .await
+            .unwrap();
+            server_peers.add(derive_ipv6(&client_id), new_server, client_id, "joined");
+        });
+        let (mut send, mut recv) = new_client.open_bi().await.unwrap();
+        control::send_msg(
+            &mut send,
+            Some(network_key),
+            &ControlMsg::JoinRequest {
+                invite_secret: None,
+                hostname: None,
+                device_cert: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), control::recv_msg(&mut recv))
+                .await
+                .unwrap()
+                .unwrap(),
+            ControlMsg::Welcome { .. }
+        ));
+        recv.stop(VarInt::from_u32(0)).unwrap();
+        drop(recv);
+        join_reply.await.unwrap();
+        let (mut close_reply, mut close_request) =
+            tokio::time::timeout(Duration::from_secs(5), new_client.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            control::recv_msg(&mut close_request).await.unwrap(),
+            ControlMsg::Close
+        ));
+        control::send_msg(&mut close_reply, None, &ControlMsg::CloseAck)
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), new_client.closed())
+            .await
+            .unwrap();
+        assert!(matches!(
+            closed,
+            ConnectionError::ApplicationClosed(close)
+                if close.error_code == VarInt::from_u32(forward::REPLACED_CONNECTION_CODE)
+        ));
+        client.close().await;
+        server.close().await;
     }
 }
 

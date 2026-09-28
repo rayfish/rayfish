@@ -49,6 +49,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Pairing joins all shared networks when several joins reach the same coordinator
+  at once. Mesh links are reused, and replaced links close after an acknowledgement
+  or a 10 second timeout so join replies can finish.
+
 - mDNS discovery can be turned on or off without interrupting the VPN or existing peer connections.
 
 - The macOS app serves mesh SSH through a separate helper so macOS no longer

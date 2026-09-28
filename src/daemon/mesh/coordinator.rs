@@ -364,6 +364,8 @@ impl NetworkRegistry {
         let peer_ip = derive_ipv6(&peer_id);
         let my_identity = self.transport.identity.local_identity();
         let device_cert = self.current_device_cert();
+        let dial_lock = self.mesh_dial_lock(peer_id);
+        let _dial_guard = dial_lock.lock().await;
         // An accept or another network's dial may already have established the
         // peer. Reuse that connection and send the remaining network hellos on it.
         let connected = if let Some(conn) = self.peers.conn_for_ip(&peer_ip)

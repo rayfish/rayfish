@@ -307,7 +307,7 @@ impl Daemon {
 impl NetworkRegistry {
     /// Join an existing network by key (optionally with an invite/coordinator).
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
+    #[tracing::instrument(skip(self, hostname, invite), fields(net = name.unwrap_or(network_key)))]
     pub async fn join_network(
         self: &Arc<Self>,
         network_key: &str,
@@ -627,33 +627,44 @@ impl NetworkRegistry {
         let mut last_err = anyhow::anyhow!("no coordinators tried");
         let mut pending = false;
         for coordinator_id in &order {
+            let dial_lock = self.mesh_dial_lock(*coordinator_id);
+            let _dial_guard = dial_lock.lock().await;
             let cancel = self.shutdown_token.child_token();
             // Reconnect + cleanup are daemon-wide now (the connection supervisor),
             // so no per-network reconnect task; readers report to the shared sender.
             let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
-            tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-            let conn = match tokio::time::timeout(
-                DIAL_TIMEOUT,
-                transport::connect_to_peer_with_alpn(
-                    &self.transport.endpoint,
-                    *coordinator_id,
-                    ctx.alpn,
-                ),
-            )
-            .await
+            let peer_ip = derive_ipv6(coordinator_id);
+            let conn = if let Some(conn) = self
+                .peers
+                .conn_for_ip(&peer_ip)
+                .filter(|conn| conn.close_reason().is_none())
             {
-                Ok(Ok(c)) => c,
-                Err(_) => {
-                    abort_join_tasks(&cancel, tasks);
-                    last_err = anyhow::anyhow!("coordinator dial timed out");
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
-                    abort_join_tasks(&cancel, tasks);
-                    last_err = anyhow::anyhow!("coordinator offline: {e}");
-                    continue;
+                conn
+            } else {
+                tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+                match tokio::time::timeout(
+                    DIAL_TIMEOUT,
+                    transport::connect_to_peer_with_alpn(
+                        &self.transport.endpoint,
+                        *coordinator_id,
+                        ctx.alpn,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(conn)) => conn,
+                    Err(_) => {
+                        abort_join_tasks(&cancel, tasks);
+                        last_err = anyhow::anyhow!("coordinator dial timed out");
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
+                        abort_join_tasks(&cancel, tasks);
+                        last_err = anyhow::anyhow!("coordinator offline: {e}");
+                        continue;
+                    }
                 }
             };
 
@@ -781,14 +792,21 @@ impl NetworkRegistry {
             }));
         }
 
-        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-        let state = match transport::connect_to_peer_with_alpn(
-            &self.transport.endpoint,
-            coordinator_id,
-            ctx.alpn,
-        )
-        .await
+        let dial_lock = self.mesh_dial_lock(coordinator_id);
+        let _dial_guard = dial_lock.lock().await;
+        let peer_ip = derive_ipv6(&coordinator_id);
+        let connected = if let Some(conn) = self
+            .peers
+            .conn_for_ip(&peer_ip)
+            .filter(|conn| conn.close_reason().is_none())
         {
+            Ok(conn)
+        } else {
+            tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+            transport::connect_to_peer_with_alpn(&self.transport.endpoint, coordinator_id, ctx.alpn)
+                .await
+        };
+        let state = match connected {
             Ok(conn) => match self
                 .run_join_handshake(ctx, data, conn, false, &cancel, ctx.invite.clone())
                 .await
@@ -1416,18 +1434,29 @@ impl NetworkRegistry {
     ) {
         let ctx = self.mesh_ctx();
         let m = member;
+        let dial_lock = self.mesh_dial_lock(m.identity);
+        let _dial_guard = dial_lock.lock().await;
         // Bound each dial so a dead peer with a stale discovery record can't
         // stall restore for iroh's full internal handshake timeout; the
         // connection supervisor retries anything still unreachable.
-        let dialed = tokio::time::timeout(
-            DIAL_TIMEOUT,
-            transport::connect_to_peer_with_alpn(
-                &self.transport.endpoint,
-                m.identity,
-                &transport::mesh_alpn(),
-            ),
-        )
-        .await;
+        let peer_ip = derive_ipv6(&m.identity);
+        let dialed = if let Some(conn) = self
+            .peers
+            .conn_for_ip(&peer_ip)
+            .filter(|conn| conn.close_reason().is_none())
+        {
+            Ok(Ok(conn))
+        } else {
+            tokio::time::timeout(
+                DIAL_TIMEOUT,
+                transport::connect_to_peer_with_alpn(
+                    &self.transport.endpoint,
+                    m.identity,
+                    &transport::mesh_alpn(),
+                ),
+            )
+            .await
+        };
         match dialed {
             Ok(Ok(peer_conn)) => {
                 if let Ok((mut s, _)) = peer_conn.open_bi().await {
@@ -1590,7 +1619,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn pending_join_reaches_both_coordinators() {
+    async fn pending_join_reuses_a_shared_connection_and_reaches_both_coordinators() {
         use iroh::RelayMode;
         use iroh::endpoint::presets;
         use std::ffi::OsString;
@@ -1617,7 +1646,7 @@ mod tests {
         let alpn = transport::mesh_alpn();
         let mut members = Vec::new();
         let mut servers = Vec::new();
-        for _ in 0..2 {
+        for index in 0..2 {
             let endpoint = Endpoint::builder(presets::N0)
                 .alpns(vec![alpn.clone()])
                 .relay_mode(RelayMode::Disabled)
@@ -1628,8 +1657,9 @@ mod tests {
                 .transport
                 .warm_lookup
                 .add_endpoint_info(endpoint.addr());
+            let endpoint_id = endpoint.id();
             members.push(Member {
-                identity: endpoint.id(),
+                identity: endpoint_id,
                 is_coordinator: true,
                 hostname: None,
                 user_identity: None,
@@ -1655,6 +1685,19 @@ mod tests {
                 let _ = timeout(Duration::from_secs(5), connection.closed()).await;
                 endpoint.close().await;
             }));
+            if index == 0 {
+                let conn = transport::connect_to_peer_with_alpn(
+                    &daemon.transport.endpoint,
+                    endpoint_id,
+                    &alpn,
+                )
+                .await
+                .unwrap();
+                daemon
+                    .registry
+                    .peers
+                    .add(derive_ipv6(&endpoint_id), conn, endpoint_id, "field");
+            }
         }
         let data = crate::membership::GroupBlob {
             members,

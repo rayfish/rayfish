@@ -324,6 +324,7 @@ pub(crate) async fn join_mesh_shared(
         &device_cert,
         &worker_ctx,
         &protocol_router,
+        &registry,
     )
     .await?;
 
@@ -493,14 +494,30 @@ async fn connect_to_roster_peers(
     device_cert: &Option<control::DeviceCert>,
     ctx: &MeshCtx,
     router: &Arc<ProtocolRouter>,
+    registry: &NetworkRegistry,
 ) -> Result<()> {
     for member in members {
         if member.identity == my_identity || member.identity == skip_id {
             continue;
         }
-        match transport::connect_to_peer_with_alpn(ep, member.identity, &transport::mesh_alpn())
-            .await
+        // Another network may be establishing this same peer right now. Skip
+        // this eager dial if its handshake owns the gate; the supervisor will
+        // attach this network after that connection is registered.
+        let dial_lock = registry.mesh_dial_lock(member.identity);
+        let Ok(_dial_guard) = dial_lock.try_lock() else {
+            continue;
+        };
+        let peer_ip = derive_ipv6(&member.identity);
+        let connected = if let Some(conn) = ctx
+            .peers
+            .conn_for_ip(&peer_ip)
+            .filter(|conn| conn.close_reason().is_none())
         {
+            Ok(conn)
+        } else {
+            transport::connect_to_peer_with_alpn(ep, member.identity, &transport::mesh_alpn()).await
+        };
+        match connected {
             Ok(conn) => {
                 let (mut send, _recv) = conn.open_bi().await?;
                 control::send_msg(
