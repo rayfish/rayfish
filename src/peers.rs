@@ -49,7 +49,7 @@ async fn close_replaced_after_ack(conn: Connection, reason: &'static [u8]) {
         Ok::<(), anyhow::Error>(())
     })
     .await;
-    if !matches!(result, Ok(Ok(()))) {
+    if !result.is_ok_and(|acknowledged| acknowledged.is_ok()) {
         tracing::debug!(peer = %conn.remote_id().fmt_short(), "mesh close acknowledgement unavailable; closing after timeout or error");
     }
     conn.close(

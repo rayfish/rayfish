@@ -643,7 +643,7 @@ impl NetworkRegistry {
                 conn
             } else {
                 tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-                match tokio::time::timeout(
+                let Ok(dialed) = tokio::time::timeout(
                     DIAL_TIMEOUT,
                     transport::connect_to_peer_with_alpn(
                         &self.transport.endpoint,
@@ -652,14 +652,14 @@ impl NetworkRegistry {
                     ),
                 )
                 .await
-                {
-                    Ok(Ok(conn)) => conn,
-                    Err(_) => {
-                        abort_join_tasks(&cancel, tasks);
-                        last_err = anyhow::anyhow!("coordinator dial timed out");
-                        continue;
-                    }
-                    Ok(Err(e)) => {
+                else {
+                    abort_join_tasks(&cancel, tasks);
+                    last_err = anyhow::anyhow!("coordinator dial timed out");
+                    continue;
+                };
+                match dialed {
+                    Ok(conn) => conn,
+                    Err(e) => {
                         tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
                         abort_join_tasks(&cancel, tasks);
                         last_err = anyhow::anyhow!("coordinator offline: {e}");
@@ -1445,9 +1445,9 @@ impl NetworkRegistry {
             .conn_for_ip(&peer_ip)
             .filter(|conn| conn.close_reason().is_none())
         {
-            Ok(Ok(conn))
+            Ok(conn)
         } else {
-            tokio::time::timeout(
+            let Ok(dialed) = tokio::time::timeout(
                 DIAL_TIMEOUT,
                 transport::connect_to_peer_with_alpn(
                     &self.transport.endpoint,
@@ -1456,9 +1456,20 @@ impl NetworkRegistry {
                 ),
             )
             .await
+            else {
+                self.reachability.note_fail(m.identity);
+                tracing::debug!(
+                    network = %network_name,
+                    peer = %m.identity.fmt_short(),
+                    timeout_secs = DIAL_TIMEOUT.as_secs(),
+                    "dial timed out; connection supervisor will retry"
+                );
+                return;
+            };
+            dialed
         };
         match dialed {
-            Ok(Ok(peer_conn)) => {
+            Ok(peer_conn) => {
                 if let Ok((mut s, _)) = peer_conn.open_bi().await {
                     let _ = control::send_msg(
                         &mut s,
@@ -1490,7 +1501,7 @@ impl NetworkRegistry {
                     "dialed known member on restore/join (full mesh)"
                 );
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 // Distinguish an incompatible-version peer (ALPN gate) from a
                 // merely-unreachable one, so `ray status` can flag it instead
                 // of showing plain offline. A success later clears this in
@@ -1508,15 +1519,6 @@ impl NetworkRegistry {
                     peer = %m.identity.fmt_short(),
                     error = %e,
                     "could not dial member yet; connection supervisor will retry"
-                );
-            }
-            Err(_elapsed) => {
-                self.reachability.note_fail(m.identity);
-                tracing::debug!(
-                    network = %network_name,
-                    peer = %m.identity.fmt_short(),
-                    timeout_secs = DIAL_TIMEOUT.as_secs(),
-                    "dial timed out; connection supervisor will retry"
                 );
             }
         }
