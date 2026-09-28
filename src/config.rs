@@ -30,23 +30,11 @@ pub use ray_proto::TransportMode;
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, strum::AsRefStr, strum::EnumString,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+#[strum(serialize_all = "lowercase")]
 pub enum DnsMode {
     #[default]
-    #[strum(
-        to_string = "on",
-        serialize = "true",
-        serialize = "yes",
-        serialize = "1"
-    )]
     On,
     Partial,
-    #[strum(
-        to_string = "off",
-        serialize = "false",
-        serialize = "no",
-        serialize = "0"
-    )]
     Off,
 }
 
@@ -2379,18 +2367,22 @@ name = "test"
     }
 
     #[test]
-    fn dns_mode_parses_existing_boolean_values() {
-        for value in ["on", "ON", "true", "yes", "1"] {
-            assert_eq!(value.parse::<DnsMode>().expect("on alias"), DnsMode::On);
+    fn dns_mode_accepts_only_named_values() {
+        for (value, mode) in [
+            ("on", DnsMode::On),
+            ("partial", DnsMode::Partial),
+            ("off", DnsMode::Off),
+        ] {
+            assert_eq!(value.parse::<DnsMode>().expect("named mode"), mode);
         }
-        for value in ["off", "OFF", "false", "no", "0"] {
-            assert_eq!(value.parse::<DnsMode>().expect("off alias"), DnsMode::Off);
+        for value in [
+            "1", "yes", "true", "0", "no", "false", "ON", "OFF", "PARTIAL",
+        ] {
+            assert!(
+                value.parse::<DnsMode>().is_err(),
+                "{value} must be rejected"
+            );
         }
-        assert_eq!(
-            "partial".parse::<DnsMode>().expect("partial mode"),
-            DnsMode::Partial
-        );
-        assert!("unknown".parse::<DnsMode>().is_err());
     }
 
     #[test]

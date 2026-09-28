@@ -442,6 +442,9 @@ mod tests {
         apply_global(&mut cfg, GlobalKey::Dns, "partial", false).unwrap();
         assert_eq!(cfg.dns_mode, DnsMode::Partial);
         assert_eq!(render_global(&cfg, GlobalKey::Dns), "partial");
+        for value in ["1", "yes", "true", "0", "no", "false"] {
+            assert!(apply_global(&mut cfg, GlobalKey::Dns, value, false).is_err());
+        }
         apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
         assert_eq!(cfg.dns_mode, DnsMode::On);
     }
