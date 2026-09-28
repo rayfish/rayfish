@@ -5879,6 +5879,7 @@ dependencies = [
  "simple-dns 0.11.3",
  "smol_str 0.3.6",
  "socket2",
+ "strum",
  "system-configuration",
  "tar",
  "tempfile",

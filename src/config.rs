@@ -7,7 +7,6 @@ use std::net::{IpAddr, Ipv4Addr};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::RwLock;
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
@@ -27,12 +26,27 @@ use crate::membership::GroupMode;
 pub use ray_proto::TransportMode;
 
 /// How Rayfish integrates its resolver with the host.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, strum::AsRefStr, strum::EnumString,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum DnsMode {
     #[default]
+    #[strum(
+        to_string = "on",
+        serialize = "true",
+        serialize = "yes",
+        serialize = "1"
+    )]
     On,
     Partial,
+    #[strum(
+        to_string = "off",
+        serialize = "false",
+        serialize = "no",
+        serialize = "0"
+    )]
     Off,
 }
 
@@ -42,25 +56,6 @@ impl DnsMode {
     }
     pub fn short_names(self) -> bool {
         self == Self::On
-    }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Partial => "partial",
-            Self::Off => "off",
-        }
-    }
-}
-
-impl FromStr for DnsMode {
-    type Err = &'static str;
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "on" | "true" | "yes" | "1" => Ok(Self::On),
-            "partial" => Ok(Self::Partial),
-            "off" | "false" | "no" | "0" => Ok(Self::Off),
-            _ => Err("DNS mode must be on, partial, or off"),
-        }
     }
 }
 
@@ -75,7 +70,10 @@ fn deserialize_dns_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Dn
     match SavedMode::deserialize(deserializer)? {
         SavedMode::Legacy(true) => Ok(DnsMode::On),
         SavedMode::Legacy(false) => Ok(DnsMode::Off),
-        SavedMode::Named(value) => value.parse().map_err(Error::custom),
+        SavedMode::Named(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| Error::custom("DNS mode must be on, partial, or off")),
     }
 }
 
@@ -2378,6 +2376,21 @@ name = "test"
             load_in(tmp.path()).expect("load new setting").dns_mode,
             DnsMode::Partial
         );
+    }
+
+    #[test]
+    fn dns_mode_parses_existing_boolean_values() {
+        for value in ["on", "ON", "true", "yes", "1"] {
+            assert_eq!(value.parse::<DnsMode>().expect("on alias"), DnsMode::On);
+        }
+        for value in ["off", "OFF", "false", "no", "0"] {
+            assert_eq!(value.parse::<DnsMode>().expect("off alias"), DnsMode::Off);
+        }
+        assert_eq!(
+            "partial".parse::<DnsMode>().expect("partial mode"),
+            DnsMode::Partial
+        );
+        assert!("unknown".parse::<DnsMode>().is_err());
     }
 
     #[test]

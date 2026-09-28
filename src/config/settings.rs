@@ -41,7 +41,10 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             cfg.dns_mode = if value.trim().is_empty() {
                 DnsMode::On
             } else {
-                value.parse().map_err(anyhow::Error::msg)?
+                value
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("DNS mode must be on, partial, or off"))?
             }
         }
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
@@ -136,7 +139,7 @@ fn server_override(
 pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
-        GlobalKey::Dns => cfg.dns_mode.as_str().to_string(),
+        GlobalKey::Dns => cfg.dns_mode.as_ref().to_string(),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
