@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn partial_mode_has_no_ray_search_domains() {
-        let networks = vec!["dev".to_string()];
+        let networks = vec!["example-net".to_string()];
         assert!(search_domains_for_mode(&networks, config::DnsMode::Partial).is_empty());
         assert!(search_domains_for_mode(&networks, config::DnsMode::Off).is_empty());
         assert!(!search_domains_for_mode(&networks, config::DnsMode::On).is_empty());

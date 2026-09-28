@@ -545,7 +545,7 @@ mod tests {
 
         let table = new_hostname_table();
         let reverse = new_reverse_table();
-        update_hostname(&table, &reverse, "dev", "box", v6(5)).await;
+        update_hostname(&table, &reverse, "example-net", "example-host", v6(5)).await;
         let query = |name: &str| {
             let mut pkt = Packet::new_query(1);
             pkt.set_flags(PacketFlag::RECURSION_DESIRED);
@@ -558,7 +558,7 @@ mod tests {
             pkt.build_bytes_vec().expect("build query")
         };
 
-        for name in ["box", "box.dev"] {
+        for name in ["example-host", "example-host.example-net"] {
             assert!(
                 handle_query_with_short_names(&query(name), &table, &reverse, false)
                     .await
@@ -566,7 +566,7 @@ mod tests {
                 "{name} must go to the normal DNS path"
             );
         }
-        for name in ["box.ray", "box.dev.ray"] {
+        for name in ["example-host.ray", "example-host.example-net.ray"] {
             let bytes = handle_query_with_short_names(&query(name), &table, &reverse, false)
                 .await
                 .expect("the .ray name belongs to the roster");
