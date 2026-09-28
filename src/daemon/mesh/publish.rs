@@ -163,7 +163,7 @@ fn next_attempt_deadline(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_network_publisher(
-    client: PkarrRelayClient,
+    client: PkarrClient,
     net_secret_key: SecretKey,
     state: SharedNetworkState,
     blob_store: FsStore,
@@ -268,7 +268,7 @@ pub(crate) fn spawn_network_publisher(
 /// reachable for `ray connect` requests. Reads `contact_secret` fresh from
 /// config each cycle so a `RotateContact` takes effect without a restart.
 pub(crate) fn spawn_contact_publisher(
-    client: PkarrRelayClient,
+    client: PkarrClient,
     endpoint_id: EndpointId,
     token: CancellationToken,
 ) -> JoinHandle<()> {

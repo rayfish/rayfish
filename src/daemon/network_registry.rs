@@ -1241,7 +1241,7 @@ impl NetworkRegistry {
         ctx: &MeshCtx,
         network: &str,
         key: SecretKey,
-        pkarr_client: PkarrRelayClient,
+        pkarr_client: PkarrClient,
     ) -> bool {
         let parts = {
             let Some(mut handle) = self.networks.get_mut(network) else {
