@@ -26,7 +26,7 @@ async fn send_welcome(
         Ok(Ok(None)) => Ok(()),
         Ok(Ok(Some(code))) => anyhow::bail!("peer stopped welcome stream: {code}"),
         Ok(Err(error)) => Err(error.into()),
-        Err(_) => anyhow::bail!("timed out waiting for welcome delivery"),
+        Err(_) => anyhow::bail!("timed out waiting for welcome stream acknowledgement"),
     }
 }
 

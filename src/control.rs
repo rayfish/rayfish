@@ -337,9 +337,9 @@ pub enum ControlMsg {
     NotSupported {
         msg_kind: String,
     },
-    /// Connection-level request to retire this physical mesh connection after
-    /// outstanding control work has been handled. The reply uses the same
-    /// bidirectional stream, so the sender can wait before closing QUIC.
+    /// Connection-level request to retire this physical mesh connection. The
+    /// reply uses the same bidirectional stream and confirms that the peer
+    /// processed this request; other streams need their own delivery checks.
     Close,
     CloseAck,
 }

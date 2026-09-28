@@ -51,7 +51,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Pairing joins all shared networks when several joins reach the same coordinator
   at once. Mesh links are reused, and replaced links close after an acknowledgement
-  or a 10 second timeout so join replies can finish.
+  or a 10 second timeout to avoid interrupting join replies.
 
 - mDNS discovery can be turned on or off without interrupting the VPN or existing peer connections.
 
