@@ -22,12 +22,13 @@ async fn send_welcome(
     welcome: &ControlMsg,
 ) -> Result<()> {
     control::send_msg(send, Some(network_key), welcome).await?;
-    match tokio::time::timeout(Duration::from_secs(10), send.stopped()).await {
-        Ok(Ok(None)) => Ok(()),
-        Ok(Ok(Some(code))) => anyhow::bail!("peer stopped welcome stream: {code}"),
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => anyhow::bail!("timed out waiting for welcome stream acknowledgement"),
+    let stop_code = tokio::time::timeout(Duration::from_secs(10), send.stopped())
+        .await
+        .context("timed out waiting for welcome stream acknowledgement")??;
+    if let Some(code) = stop_code {
+        anyhow::bail!("peer stopped welcome stream: {code}");
     }
+    Ok(())
 }
 
 /// Upper bound on a closed network's in-memory pending-join queue. Keyed by peer
