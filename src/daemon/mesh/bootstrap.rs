@@ -720,7 +720,6 @@ async fn build_daemon_inner(
         protocol_router: Arc::clone(&protocol_router),
         dns,
         mdns,
-        mdns_change: AsyncMutex::new(()),
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),

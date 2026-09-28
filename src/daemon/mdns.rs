@@ -1,6 +1,7 @@
 //! Runtime mDNS discovery on an endpoint that stays alive across setting changes.
 
-use std::sync::{Arc, Mutex};
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,16 +13,30 @@ use iroh::address_lookup::{AddressLookup, EndpointData, Error, Item};
 use iroh::endpoint::Endpoint;
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::LanPeers;
+use crate::AsyncMutex;
+use crate::config;
 
-#[derive(Debug, Default)]
-struct LookupSlot {
+pub(super) struct MdnsDiscovery {
+    endpoint_id: EndpointId,
     current: ArcSwapOption<MdnsAddressLookup>,
     latest: ArcSwapOption<EndpointData>,
+    peers: Arc<LanPeers>,
+    /// Serializes config writes, worker changes, and shutdown.
+    worker: AsyncMutex<Option<JoinHandle<()>>>,
 }
 
-impl AddressLookup for LookupSlot {
+impl Debug for MdnsDiscovery {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MdnsDiscovery")
+            .field("enabled", &self.enabled())
+            .finish()
+    }
+}
+
+impl AddressLookup for MdnsDiscovery {
     fn publish(&self, data: &EndpointData) {
         self.latest.store(Some(Arc::new(data.clone())));
         if let Some(provider) = self.current.load_full() {
@@ -36,40 +51,38 @@ impl AddressLookup for LookupSlot {
     }
 }
 
-pub(super) struct MdnsDiscovery {
-    endpoint_id: EndpointId,
-    slot: Arc<LookupSlot>,
-    peers: Arc<LanPeers>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-}
-
 impl MdnsDiscovery {
-    pub(super) fn new(endpoint: &Endpoint, peers: Arc<LanPeers>) -> Result<Self> {
-        let slot = Arc::new(LookupSlot::default());
+    pub(super) fn new(endpoint: &Endpoint, peers: Arc<LanPeers>) -> Result<Arc<Self>> {
+        let discovery = Arc::new(Self {
+            endpoint_id: endpoint.id(),
+            current: ArcSwapOption::empty(),
+            latest: ArcSwapOption::empty(),
+            peers,
+            worker: AsyncMutex::new(None),
+        });
         endpoint
             .address_lookup()
             .context("mDNS requires an open endpoint")?
-            .add(Arc::clone(&slot));
-        Ok(Self {
-            endpoint_id: endpoint.id(),
-            slot,
-            peers,
-            worker: Mutex::new(None),
-        })
+            .add(Arc::clone(&discovery));
+        Ok(discovery)
     }
 
     pub(super) fn enabled(&self) -> bool {
-        self.slot.current.load().is_some()
+        self.current.load().is_some()
     }
 
-    pub(super) async fn start(&self) -> Result<()> {
+    pub(super) async fn start(self: &Arc<Self>) -> Result<()> {
+        let mut worker = self.worker.lock().await;
+        self.start_locked(&mut worker).await
+    }
+
+    async fn start_locked(self: &Arc<Self>, worker: &mut Option<JoinHandle<()>>) -> Result<()> {
         if self.enabled() {
             return Ok(());
         }
-        let previous_worker = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(worker) = previous_worker {
-            worker.abort();
-            let _ = worker.await;
+        if let Some(previous) = worker.take() {
+            previous.abort();
+            let _ = previous.await;
         }
         let provider = MdnsAddressLookup::builder()
             .service_name("rayfish")
@@ -78,15 +91,15 @@ impl MdnsDiscovery {
             .build(self.endpoint_id)
             .context("failed to start mDNS discovery")?;
         let mut events = provider.subscribe().await;
-        self.slot.current.store(Some(Arc::new(provider)));
-        if let Some(data) = self.slot.latest.load_full()
-            && let Some(provider) = self.slot.current.load_full()
+        self.current.store(Some(Arc::new(provider)));
+        if let Some(data) = self.latest.load_full()
+            && let Some(provider) = self.current.load_full()
         {
             provider.publish(&data);
         }
-        let slot = Arc::clone(&self.slot);
+        let discovery = Arc::downgrade(self);
         let peers = Arc::clone(&self.peers);
-        let worker = tokio::spawn(async move {
+        *worker = Some(tokio::spawn(async move {
             while let Some(event) = events.next().await {
                 match event {
                     DiscoveryEvent::Discovered { endpoint_info, .. } => {
@@ -106,33 +119,69 @@ impl MdnsDiscovery {
                     _ => {}
                 }
             }
-            slot.current.store(None);
-            peers.clear();
-            tracing::warn!("mDNS discovery stopped unexpectedly");
-        });
-        *self.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
+            if let Some(discovery) = discovery.upgrade() {
+                discovery.current.store(None);
+                peers.clear();
+                tracing::warn!("mDNS discovery stopped unexpectedly");
+            }
+        }));
         tracing::info!("mDNS discovery enabled (advertising _rayfish._udp.local)");
         Ok(())
     }
 
     pub(super) async fn stop(&self) {
-        self.slot.current.store(None);
-        let worker = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(worker) = worker {
-            worker.abort();
-            let _ = worker.await;
+        let mut worker = self.worker.lock().await;
+        self.stop_locked(&mut worker).await;
+    }
+
+    /// Stop discovery if the daemon is dropped without explicit shutdown.
+    pub(super) fn abort(&self) {
+        self.current.store(None);
+        if let Ok(mut worker) = self.worker.try_lock()
+            && let Some(running) = worker.take()
+        {
+            running.abort();
+        }
+        self.peers.clear();
+    }
+
+    async fn stop_locked(&self, worker: &mut Option<JoinHandle<()>>) {
+        self.current.store(None);
+        if let Some(running) = worker.take() {
+            running.abort();
+            let _ = running.await;
         }
         self.peers.clear();
         tracing::info!("mDNS discovery disabled");
     }
-}
 
-impl Drop for MdnsDiscovery {
-    fn drop(&mut self) {
-        self.slot.current.store(None);
-        if let Some(worker) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            worker.abort();
+    pub(super) async fn set_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        let mut worker = self.worker.lock().await;
+        anyhow::ensure!(!shutdown.is_cancelled(), "daemon is shutting down");
+        let mut previous = false;
+        config::update_settings(|cfg| {
+            previous = cfg.mdns_enabled;
+            cfg.mdns_enabled = enabled;
+            Ok(())
+        })?;
+        if enabled {
+            if let Err(error) = self.start_locked(&mut worker).await {
+                if let Err(rollback) = config::update_settings(|cfg| {
+                    cfg.mdns_enabled = previous;
+                    Ok(())
+                }) {
+                    tracing::warn!(%rollback, "failed to restore mDNS setting after start failure");
+                }
+                return Err(error);
+            }
+        } else {
+            self.stop_locked(&mut worker).await;
         }
+        Ok(())
     }
 }
 
@@ -175,18 +224,15 @@ mod tests {
         for (enabled, payload) in [(true, 1u8), (false, 2), (true, 3)] {
             if enabled {
                 mdns.start().await.unwrap();
-                assert!(mdns.slot.resolve(remote.id()).is_some());
-                let provider = mdns.slot.current.load_full().unwrap();
+                assert!(mdns.resolve(remote.id()).is_some());
+                let provider = mdns.current.load_full().unwrap();
                 mdns.start().await.unwrap();
-                assert!(Arc::ptr_eq(
-                    &provider,
-                    &mdns.slot.current.load_full().unwrap()
-                ));
+                assert!(Arc::ptr_eq(&provider, &mdns.current.load_full().unwrap()));
             } else {
                 peers.discovered(remote.id(), Vec::new());
                 mdns.stop().await;
                 assert!(peers.snapshot().is_empty());
-                assert!(mdns.slot.resolve(remote.id()).is_none());
+                assert!(mdns.resolve(remote.id()).is_none());
             }
             assert_eq!(mdns.enabled(), enabled);
             assert_eq!(lookups.len(), initial_lookup_count + 1);

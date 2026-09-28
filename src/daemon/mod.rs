@@ -763,8 +763,7 @@ pub struct Daemon {
     /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
     dns: Arc<DnsService>,
-    mdns: MdnsDiscovery,
-    mdns_change: AsyncMutex<()>,
+    mdns: Arc<MdnsDiscovery>,
     /// Whether this node opted into automatic stable updates
     /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
@@ -838,6 +837,12 @@ pub struct Daemon {
     /// [`crate::v4bridge`].
     #[cfg(feature = "desktop")]
     v4_bridge_token: Mutex<Option<CancellationToken>>,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.mdns.abort();
+    }
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -928,7 +933,6 @@ impl Daemon {
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
-        let _mdns_change = self.mdns_change.lock().await;
         self.mdns.stop().await;
         self.management.stop_announcements().await;
         // The DNS background tasks run on bare `tokio::spawn`s that observe their

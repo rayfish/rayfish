@@ -238,31 +238,7 @@ impl Daemon {
 
     /// Persist the setting and change discovery on the existing endpoint.
     pub async fn set_mdns_enabled(&self, enabled: bool) -> Result<()> {
-        let _change = self.mdns_change.lock().await;
-        anyhow::ensure!(
-            !self.shutdown_token.is_cancelled(),
-            "daemon is shutting down"
-        );
-        let mut previous = false;
-        config::update_settings(|cfg| {
-            previous = cfg.mdns_enabled;
-            cfg.mdns_enabled = enabled;
-            Ok(())
-        })?;
-        if enabled {
-            if let Err(error) = self.mdns.start().await {
-                if let Err(rollback) = config::update_settings(|cfg| {
-                    cfg.mdns_enabled = previous;
-                    Ok(())
-                }) {
-                    tracing::warn!(%rollback, "failed to restore mDNS setting after start failure");
-                }
-                return Err(error);
-            }
-        } else {
-            self.mdns.stop().await;
-        }
-        Ok(())
+        self.mdns.set_enabled(enabled, &self.shutdown_token).await
     }
 
     /// Apply `ray dns on|off` immediately. Unlike the other settings, DNS owns
