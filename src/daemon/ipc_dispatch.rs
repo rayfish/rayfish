@@ -151,7 +151,7 @@ impl Daemon {
     pub(crate) fn list_lan_peers(&self) -> IpcMessage {
         IpcMessage::LanPeersList {
             peers: self.lan_peer_infos(),
-            mdns_enabled: self.mdns_enabled,
+            mdns_enabled: self.mdns.enabled(),
         }
     }
 
@@ -178,6 +178,7 @@ impl Daemon {
         let key = match key {
             NodeKey::Firewall(k) => return self.registry.firewall_config_set(k, value),
             NodeKey::Global(GlobalKey::Dns) => return self.dns_config_set(value).await,
+            NodeKey::Global(GlobalKey::Mdns) => return self.mdns_config_set(value).await,
             // Not a plain config write: see `Daemon::ssh_config_set`.
             NodeKey::Global(GlobalKey::Ssh) => return self.ssh_config_set(value),
             // Likewise: the bridge's listeners follow the setting live.
@@ -193,8 +194,7 @@ impl Daemon {
             // none, with nothing to notice it. Adding a variant breaks this
             // match and forces the choice.
             NodeKey::Global(
-                k @ (GlobalKey::Mdns
-                | GlobalKey::Relay
+                k @ (GlobalKey::Relay
                 | GlobalKey::DiscoveryDns
                 | GlobalKey::DnsUpstreams
                 | GlobalKey::AutoUpdate
@@ -221,6 +221,48 @@ impl Daemon {
         IpcMessage::Ok {
             message: global_set_message(&app_config, key, reset),
         }
+    }
+
+    async fn mdns_config_set(&self, value: &str) -> IpcMessage {
+        let mut requested = AppConfig::default();
+        if let Err(error) = settings::apply_global(&mut requested, GlobalKey::Mdns, value, false) {
+            return ipc_err(error.to_string());
+        }
+        match self.set_mdns_enabled(requested.mdns_enabled).await {
+            Ok(()) => IpcMessage::Ok {
+                message: global_set_message(&requested, GlobalKey::Mdns, false),
+            },
+            Err(error) => ipc_err(error.to_string()),
+        }
+    }
+
+    /// Persist the setting and change discovery on the existing endpoint.
+    pub async fn set_mdns_enabled(&self, enabled: bool) -> Result<()> {
+        let _change = self.mdns_change.lock().await;
+        anyhow::ensure!(
+            !self.shutdown_token.is_cancelled(),
+            "daemon is shutting down"
+        );
+        let mut previous = false;
+        config::update_settings(|cfg| {
+            previous = cfg.mdns_enabled;
+            cfg.mdns_enabled = enabled;
+            Ok(())
+        })?;
+        if enabled {
+            if let Err(error) = self.mdns.start().await {
+                if let Err(rollback) = config::update_settings(|cfg| {
+                    cfg.mdns_enabled = previous;
+                    Ok(())
+                }) {
+                    tracing::warn!(%rollback, "failed to restore mDNS setting after start failure");
+                }
+                return Err(error);
+            }
+        } else {
+            self.mdns.stop().await;
+        }
+        Ok(())
     }
 
     /// Apply `ray dns on|off` immediately. Unlike the other settings, DNS owns

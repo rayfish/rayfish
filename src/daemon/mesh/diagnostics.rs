@@ -87,7 +87,7 @@ impl Daemon {
 
         IpcMessage::StatusResponse {
             endpoint_id: self.transport.endpoint.id(),
-            mdns_enabled: self.mdns_enabled,
+            mdns_enabled: self.mdns.enabled(),
             auto_update: self.auto_update,
             active: self.active.load(Ordering::SeqCst),
             contact_id: Some(self.contact_public.to_string()),

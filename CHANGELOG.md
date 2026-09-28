@@ -46,6 +46,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- mDNS discovery can be turned on or off without interrupting the VPN or existing peer connections.
+
 - The macOS app serves mesh SSH through a separate helper so macOS no longer
   drops connections to a listener inside the VPN extension. Enable Rayfish's
   background helper in Login Items & Extensions when prompted.

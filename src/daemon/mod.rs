@@ -268,6 +268,8 @@ pub(crate) use management_service::ManagementService;
 // Nodes seen on the local network over mDNS (`ray mdns scan`).
 mod lan_discovery;
 pub(crate) use lan_discovery::LanPeers;
+mod mdns;
+use mdns::MdnsDiscovery;
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -761,7 +763,8 @@ pub struct Daemon {
     /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
     dns: Arc<DnsService>,
-    mdns_enabled: bool,
+    mdns: MdnsDiscovery,
+    mdns_change: AsyncMutex<()>,
     /// Whether this node opted into automatic stable updates
     /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
@@ -925,6 +928,8 @@ impl Daemon {
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
+        let _mdns_change = self.mdns_change.lock().await;
+        self.mdns.stop().await;
         self.management.stop_announcements().await;
         // The DNS background tasks run on bare `tokio::spawn`s that observe their
         // own tokens, not `shutdown_token`, so cancelling the token above does not
@@ -1293,7 +1298,7 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
     let restart = "Restart the daemon for changes to take effect.";
     match key {
         GlobalKey::Mdns => format!(
-            "mDNS discovery {}. {restart}",
+            "mDNS discovery {}.",
             if cfg.mdns_enabled {
                 "enabled"
             } else {
@@ -1399,11 +1404,11 @@ mod confirmation_message_tests {
     fn global_keys_keep_the_exact_wording_their_handlers_printed() {
         assert_eq!(
             global_set_message(&mdns(true), GlobalKey::Mdns, false),
-            "mDNS discovery enabled. Restart the daemon for changes to take effect."
+            "mDNS discovery enabled."
         );
         assert_eq!(
             global_set_message(&mdns(false), GlobalKey::Mdns, false),
-            "mDNS discovery disabled. Restart the daemon for changes to take effect."
+            "mDNS discovery disabled."
         );
 
         assert_eq!(

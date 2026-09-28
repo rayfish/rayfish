@@ -573,10 +573,11 @@ private struct SettingsView: View {
                     ))
                     .labelsHidden()
                 }
-                Text("Discover peers on your local network. Changing this briefly reconnects the VPN.")
+                Text("Discover peers on your local network.")
                     .foregroundColor(RayfishTheme.muted)
-                if let status = controller.status, status.mdnsEnabled != status.mdnsActive {
-                    Button("Reconnect to apply mDNS") { Task { await controller.reconnect() } }
+                if let status = controller.status, status.mdnsEnabled && !status.mdnsActive {
+                    Text("mDNS discovery is not running. Check Rayfish logs.")
+                        .foregroundColor(RayfishTheme.muted)
                 }
                 if controller.status == nil {
                     Text("Connect to view and change DNS settings.").foregroundColor(RayfishTheme.faint)

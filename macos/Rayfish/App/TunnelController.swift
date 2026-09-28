@@ -268,9 +268,6 @@ final class TunnelController: ObservableObject {
         }
         guard await perform(ProviderRequest(action: .setSetting, setting: setting, enabled: enabled)) != nil else { return }
         if setting == .ssh, enabled { error = SSHHelper.approvalMessage }
-        if setting == .mdns, status?.mdnsActive != enabled {
-            await reconnect()
-        }
     }
 
     func reconnect() async {

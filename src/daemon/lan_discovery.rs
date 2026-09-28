@@ -47,6 +47,10 @@ impl LanPeers {
         self.peers.remove(id);
     }
 
+    pub(crate) fn clear(&self) {
+        self.peers.clear();
+    }
+
     pub(crate) fn contains(&self, id: &EndpointId) -> bool {
         self.peers.contains_key(id)
     }

@@ -389,7 +389,7 @@ impl Node {
     }
 
     /// Persist an embedder-owned setting using the same keys as `ray config`.
-    /// NetworkExtension applies DNS; mDNS is rebuilt on the next connection.
+    /// NetworkExtension applies DNS; mDNS changes on the running endpoint.
     pub fn set_setting(&self, key: GlobalSetting, enabled: bool) -> Result<(), AppleError> {
         let state = self.state()?;
         if matches!(key, GlobalSetting::Ssh) {
@@ -399,6 +399,12 @@ impl Node {
                     "SSH setting",
                 )
             });
+        }
+        if matches!(key, GlobalSetting::Mdns) {
+            return self
+                .runtime
+                .block_on(state.set_mdns_enabled(enabled))
+                .map_err(AppleError::network);
         }
         config::update_settings(|settings| {
             config::config_set(
@@ -857,7 +863,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
             });
-            *node.state.lock().unwrap() = Some(state);
+            *node.state.lock().unwrap() = Some(Arc::clone(&state));
             if iteration == 0 {
                 let before = node.status().unwrap();
                 assert!(before.networks.is_empty());
@@ -895,7 +901,18 @@ mod tests {
                 let after = node.status().unwrap();
                 assert!(!after.dns_enabled);
                 assert!(!after.mdns_enabled);
-                assert!(after.mdns_active, "mDNS stays active until reconnect");
+                assert!(!after.mdns_active);
+                assert_eq!(after.ipv6, before.ipv6);
+                assert_eq!(after.active, before.active);
+                node.set_setting(GlobalSetting::Mdns, true).unwrap();
+                let enabled = node.status().unwrap();
+                assert!(enabled.mdns_active);
+                assert_eq!(enabled.active, before.active);
+                node.set_setting(GlobalSetting::Mdns, false).unwrap();
+                let disabled = node.status().unwrap();
+                assert!(!disabled.mdns_active);
+                assert_eq!(disabled.active, before.active);
+                assert!(Arc::ptr_eq(&state, &node.state().unwrap()));
                 assert!(matches!(
                     node.connect_peer("invalid contact id".into(), None),
                     Err(AppleError::Network(_))

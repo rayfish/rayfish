@@ -515,12 +515,14 @@ async fn build_daemon_inner(
         Arc::clone(&dns_resolver),
         derive_ipv6(&identity.local_identity()),
     ));
-    let mdns_enabled = app_config.mdns_enabled;
     // Stays empty when mDNS is off, so `ray mdns scan` reports nothing rather
     // than stale sightings from a previous run.
     let lan_peers = Arc::new(LanPeers::new());
-    if mdns_enabled {
-        spawn_mdns_discovery(&ep, token.clone(), Arc::clone(&lan_peers));
+    let mdns = MdnsDiscovery::new(&ep, Arc::clone(&lan_peers))?;
+    if app_config.mdns_enabled {
+        if let Err(error) = mdns.start().await {
+            tracing::warn!(%error, "failed to start mDNS discovery");
+        }
     } else {
         tracing::info!("mDNS discovery disabled");
     }
@@ -717,7 +719,8 @@ async fn build_daemon_inner(
         shutdown_token: token.clone(),
         protocol_router: Arc::clone(&protocol_router),
         dns,
-        mdns_enabled,
+        mdns,
+        mdns_change: AsyncMutex::new(()),
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),
@@ -759,61 +762,6 @@ async fn build_daemon_inner(
 
     tracing::info!(ip = %my_ip, id = %daemon.transport.endpoint.id().fmt_short(), "daemon started");
     Ok(daemon)
-}
-
-/// Advertise this endpoint over mDNS (`_rayfish._udp.local`) and log LAN peer
-/// discovery events until cancellation. Non-fatal: a failure just means no
-/// local discovery.
-fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken, lan_peers: Arc<LanPeers>) {
-    let mdns = match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
-        .service_name("rayfish")
-        // Long-lived background discovery, not an interactive device picker.
-        .discovery_cadence(Duration::from_secs(30))
-        .advertise(true)
-        .build(ep.id())
-    {
-        Ok(mdns) => mdns,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to start mDNS discovery");
-            return;
-        }
-    };
-    let Ok(lookups) = ep.address_lookup() else {
-        return;
-    };
-    lookups.add(mdns.clone());
-    tracing::info!("mDNS discovery enabled (advertising _rayfish._udp.local)");
-
-    tokio::spawn(async move {
-        use futures::StreamExt;
-        let mut events = mdns.subscribe().await;
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                event = events.next() => match event {
-                    Some(iroh_mdns_address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. }) => {
-                        tracing::info!(
-                            peer = %endpoint_info.endpoint_id.fmt_short(),
-                            "mDNS: peer discovered on LAN"
-                        );
-                        lan_peers.discovered(
-                            endpoint_info.endpoint_id,
-                            endpoint_info.ip_addrs().copied().collect(),
-                        );
-                    }
-                    Some(iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
-                        tracing::info!(
-                            peer = %endpoint_id.fmt_short(),
-                            "mDNS: peer left LAN"
-                        );
-                        lan_peers.expired(&endpoint_id);
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-        }
-    });
 }
 
 /// Register rayfish counters, per-peer gauges, and iroh endpoint metrics, then
