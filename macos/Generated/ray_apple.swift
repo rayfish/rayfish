@@ -564,7 +564,7 @@ public protocol NodeProtocol: AnyObject, Sendable {
 
     /**
      * Persist an embedder-owned setting using the same keys as `ray config`.
-     * NetworkExtension applies DNS; mDNS is rebuilt on the next connection.
+     * NetworkExtension applies DNS; mDNS changes on the running endpoint.
      */
     func setSetting(key: GlobalSetting, enabled: Bool) throws
 
@@ -830,7 +830,7 @@ open func setHostname(network: String, hostname: String)throws   {try rustCallWi
 
     /**
      * Persist an embedder-owned setting using the same keys as `ray config`.
-     * NetworkExtension applies DNS; mDNS is rebuilt on the next connection.
+     * NetworkExtension applies DNS; mDNS changes on the running endpoint.
      */
 open func setSetting(key: GlobalSetting, enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_set_setting(self.uniffiClonePointer(),
@@ -2496,7 +2496,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_method_node_set_hostname() != 15380) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_apple_checksum_method_node_set_setting() != 9671) {
+    if (uniffi_ray_apple_checksum_method_node_set_setting() != 24274) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_set_ssh_rule() != 65107) {
