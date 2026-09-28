@@ -167,6 +167,8 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         | ControlMsg::CertRefresh { .. }
         | ControlMsg::RequestUnpair
         | ControlMsg::NotSupported { .. }
+        | ControlMsg::Close
+        | ControlMsg::CloseAck
         | ControlMsg::FileOffer { .. } => false,
     }
 }
