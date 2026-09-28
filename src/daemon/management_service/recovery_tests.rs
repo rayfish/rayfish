@@ -21,7 +21,7 @@ impl TestConfig {
         unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", directory.path()) };
         config::update_settings(|settings| {
             settings.mdns_enabled = false;
-            settings.dns_enabled = false;
+            settings.dns_mode = config::DnsMode::Off;
             settings.default_hostname = Some("managed-test".to_string());
             settings.endpoint_hints = vec![peer.addr()];
             Ok(())

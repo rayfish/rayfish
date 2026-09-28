@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 pub use ray_proto::settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
-use super::{AppConfig, NetworkConfig, ServerOverride};
+use super::{AppConfig, DnsMode, NetworkConfig, ServerOverride};
 use crate::firewall::{Action, FirewallConfig};
 
 /// Parse an on/off value. An empty value (what `ConfigUnset` sends) resets to
@@ -37,7 +37,13 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
     let reset = entries.is_empty() || entries == ["n0"];
     match key {
         GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
-        GlobalKey::Dns => cfg.dns_enabled = parse_bool(value, true)?,
+        GlobalKey::Dns => {
+            cfg.dns_mode = if value.trim().is_empty() {
+                DnsMode::On
+            } else {
+                value.parse().map_err(anyhow::Error::msg)?
+            }
+        }
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
@@ -130,7 +136,7 @@ fn server_override(
 pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
-        GlobalKey::Dns => on_off(cfg.dns_enabled),
+        GlobalKey::Dns => cfg.dns_mode.as_str().to_string(),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
@@ -428,10 +434,13 @@ mod tests {
     fn dns_toggle_defaults_on_and_round_trips() {
         let mut cfg = AppConfig::default();
         apply_global(&mut cfg, GlobalKey::Dns, "off", false).unwrap();
-        assert!(!cfg.dns_enabled);
+        assert_eq!(cfg.dns_mode, DnsMode::Off);
         assert_eq!(render_global(&cfg, GlobalKey::Dns), "off");
+        apply_global(&mut cfg, GlobalKey::Dns, "partial", false).unwrap();
+        assert_eq!(cfg.dns_mode, DnsMode::Partial);
+        assert_eq!(render_global(&cfg, GlobalKey::Dns), "partial");
         apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
-        assert!(cfg.dns_enabled);
+        assert_eq!(cfg.dns_mode, DnsMode::On);
     }
 
     #[test]

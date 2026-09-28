@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::RwLock;
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
@@ -16,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
 use ray_proto::ipc::{MachineHostname, UnixTimestampSecs};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::management::EnrollmentReceipt;
 use crate::membership::GroupMode;
@@ -24,6 +25,59 @@ use crate::membership::GroupMode;
 /// Per-network transport preference. Defined in `ray-proto` (shared with GUI
 /// frontends); re-exported here so existing `crate::config::TransportMode` paths work.
 pub use ray_proto::TransportMode;
+
+/// How Rayfish integrates its resolver with the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsMode {
+    #[default]
+    On,
+    Partial,
+    Off,
+}
+
+impl DnsMode {
+    pub fn enabled(self) -> bool {
+        self != Self::Off
+    }
+    pub fn short_names(self) -> bool {
+        self == Self::On
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Partial => "partial",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl FromStr for DnsMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => Ok(Self::On),
+            "partial" => Ok(Self::Partial),
+            "off" | "false" | "no" | "0" => Ok(Self::Off),
+            _ => Err("DNS mode must be on, partial, or off"),
+        }
+    }
+}
+
+fn deserialize_dns_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<DnsMode, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SavedMode {
+        Legacy(bool),
+        Named(String),
+    }
+    use serde::de::Error;
+    match SavedMode::deserialize(deserializer)? {
+        SavedMode::Legacy(true) => Ok(DnsMode::On),
+        SavedMode::Legacy(false) => Ok(DnsMode::Off),
+        SavedMode::Named(value) => value.parse().map_err(Error::custom),
+    }
+}
 
 mod secret_key_hex {
     use iroh::SecretKey;
@@ -503,9 +557,13 @@ pub struct AppConfig {
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
     #[serde(default)]
     pub dns_upstreams: ServerOverride,
-    /// Whether Rayfish configures the host resolver for Magic DNS.
-    #[serde(default = "default_true")]
-    pub dns_enabled: bool,
+    /// Whether Magic DNS resolves short names, only `.ray` names, or nothing.
+    #[serde(
+        default,
+        alias = "dns_enabled",
+        deserialize_with = "deserialize_dns_mode"
+    )]
+    pub dns_mode: DnsMode,
     /// Recently successful peer transport paths.  These are only connection
     /// hints: iroh still authenticates the endpoint identity in TLS and falls
     /// back to its normal discovery services when a hint is stale.  Keeping
@@ -609,7 +667,7 @@ impl Default for AppConfig {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
-            dns_enabled: true,
+            dns_mode: DnsMode::On,
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
             v4_bridge: true,
@@ -758,8 +816,12 @@ struct Settings {
     discovery_dns: ServerOverride,
     #[serde(default)]
     dns_upstreams: ServerOverride,
-    #[serde(default = "default_true")]
-    dns_enabled: bool,
+    #[serde(
+        default,
+        alias = "dns_enabled",
+        deserialize_with = "deserialize_dns_mode"
+    )]
+    dns_mode: DnsMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
@@ -1290,7 +1352,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         // else is the type-default.
         Settings {
             mdns_enabled: true,
-            dns_enabled: true,
+            dns_mode: DnsMode::On,
             ..Default::default()
         }
     };
@@ -1327,7 +1389,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
-        dns_enabled: settings.dns_enabled,
+        dns_mode: settings.dns_mode,
         endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         v4_bridge: settings.v4_bridge,
@@ -1401,7 +1463,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
-        dns_enabled: config.dns_enabled,
+        dns_mode: config.dns_mode,
         endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         v4_bridge: config.v4_bridge,
@@ -2299,7 +2361,23 @@ name = "test"
     fn fresh_install_enables_dns() {
         let tmp = tempfile::tempdir().unwrap();
         let loaded = load_in(tmp.path()).unwrap();
-        assert!(loaded.dns_enabled);
+        assert_eq!(loaded.dns_mode, DnsMode::On);
+    }
+
+    #[test]
+    fn legacy_dns_bool_and_partial_mode_load() {
+        let tmp = tempfile::tempdir().expect("create config directory");
+        let path = tmp.path().join(SETTINGS_FILE);
+        std::fs::write(&path, "dns_enabled = false\n").expect("write old setting");
+        assert_eq!(
+            load_in(tmp.path()).expect("load old setting").dns_mode,
+            DnsMode::Off
+        );
+        std::fs::write(&path, "dns_mode = 'partial'\n").expect("write new setting");
+        assert_eq!(
+            load_in(tmp.path()).expect("load new setting").dns_mode,
+            DnsMode::Partial
+        );
     }
 
     #[test]

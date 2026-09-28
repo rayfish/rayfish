@@ -325,7 +325,7 @@ impl Node {
                     })
                 })
                 .collect(),
-            dns_enabled: settings.dns_enabled,
+            dns_enabled: settings.dns_mode.enabled(),
             mdns_enabled: settings.mdns_enabled,
             mdns_active,
             ipv6: membership::derive_ipv6(&endpoint_id).to_string(),

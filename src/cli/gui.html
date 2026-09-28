@@ -893,7 +893,7 @@
       $("vpnState").className = "badge" + (active ? " good" : "");
       $("vpnDescription").textContent = "The Rayfish Windows service manages your connection.";
 
-      const dns = configEnabled("dns", false);
+      const dns = configEnabled("dns", false) || String(lastConfig?.dns).toLowerCase() === "partial";
       const mdns = configEnabled("mdns", data.mdns);
       const autoUpdate = configEnabled("auto-update", data.auto_update);
       $("dnsToggle").innerHTML = settingToggle(dns, ["dns", dns ? "off" : "on"], "Magic DNS", !lastData);

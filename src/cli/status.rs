@@ -207,7 +207,7 @@ fn print_not_authorized() {
     println!();
 }
 
-pub(crate) async fn ipc_status() -> Result<()> {
+pub(crate) async fn ipc_status(show_machines: bool) -> Result<()> {
     let connected = match ipc::connect().await {
         Ok(stream) => Some(stream),
         // Being refused is not the same as nothing being there, and reporting a
@@ -269,9 +269,9 @@ pub(crate) async fn ipc_status() -> Result<()> {
             lan_peers,
             ..
         } => {
-            let (controllers, managed_machines) = ipc_management_overview().await;
+            let (controllers, managed_machines) = ipc_management_overview(show_machines).await;
             if json_enabled() {
-                print_json(&serde_json::json!({
+                let mut output = serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
                     "lan_peers": lan_peers
@@ -290,7 +290,6 @@ pub(crate) async fn ipc_status() -> Result<()> {
                     "networks": networks,
                     "inactive_networks": inactive_networks,
                     "controllers": controllers,
-                    "managed_machines": managed_machines,
                     "traffic": {
                         "packets_rx": packets_rx, "packets_tx": packets_tx,
                         "bytes_rx": bytes_rx, "bytes_tx": bytes_tx,
@@ -299,7 +298,11 @@ pub(crate) async fn ipc_status() -> Result<()> {
                         "files": pending_files,
                         "connects": pending_connects,
                     },
-                }));
+                });
+                if show_machines {
+                    output["managed_machines"] = serde_json::json!(managed_machines);
+                }
+                print_json(&output);
                 return Ok(());
             }
             let _ = (packets_rx, packets_tx, bytes_rx, bytes_tx);
@@ -375,7 +378,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 }
             }
 
-            if !managed_machines.is_empty() {
+            if show_machines && !managed_machines.is_empty() {
                 println!();
                 println!("  {}", style::faint("managed machines:"));
                 for machine in &managed_machines {

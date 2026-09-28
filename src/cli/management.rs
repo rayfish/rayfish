@@ -221,8 +221,9 @@ async fn ipc_request(request: ipc::IpcMessage) -> Result<ipc::IpcMessage> {
     ipc::recv(&mut stream).await
 }
 
-pub(crate) async fn ipc_management_overview()
--> (Vec<ipc::ControllerInfo>, Vec<ipc::ManagedMachineInfo>) {
+pub(crate) async fn ipc_management_overview(
+    show_machines: bool,
+) -> (Vec<ipc::ControllerInfo>, Vec<ipc::ManagedMachineInfo>) {
     let controllers = async {
         match ipc_request(ipc::IpcMessage::ControllerList).await {
             Ok(ipc::IpcMessage::Controllers { controllers }) => controllers,
@@ -230,6 +231,9 @@ pub(crate) async fn ipc_management_overview()
         }
     };
     let machines = async {
+        if !show_machines {
+            return Vec::new();
+        }
         match ipc_request(ipc::IpcMessage::ManagedMachines { probe: true }).await {
             Ok(ipc::IpcMessage::ManagedMachinesResponse { machines }) => machines,
             _ => Vec::new(),

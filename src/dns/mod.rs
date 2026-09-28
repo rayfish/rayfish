@@ -5,7 +5,7 @@
 //! (`MAGIC_DNS_V4` = 100.100.100.53) routed through the TUN, no host-level port
 //! 53 bind is made: `forward::run_mesh` intercepts UDP DNS packets destined for
 //! the magic IP and hands them to [`resolver::Resolver`], which calls
-//! [`handle_query`] and forwards whatever it declines to the system upstreams.
+//! [`handle_query_with_short_names`] and forwards whatever it declines to the system upstreams.
 //!
 //! Outside `.ray` a name is answered only when the roster actually holds it: a
 //! `<host>.<network>` whose host is not a peer is declined so it can fall back
@@ -149,6 +149,16 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
     }
 }
 
+/// Test adapter for the default mode.
+#[cfg(test)]
+pub(crate) async fn handle_query(
+    data: &[u8],
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+) -> Option<Vec<u8>> {
+    handle_query_with_short_names(data, table, reverse, true).await
+}
+
 /// Answer a query from the roster, or return `None` for "not mine": the caller
 /// forwards those to the system resolver.
 ///
@@ -164,10 +174,11 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
 /// An A query is always NODATA: the overlay carries no IPv4, so there is no
 /// record of that type to hand out. NODATA rather than NXDOMAIN because the name
 /// exists, and NXDOMAIN would fail the AAAA alongside it in most stub resolvers.
-pub(crate) async fn handle_query(
+pub(crate) async fn handle_query_with_short_names(
     data: &[u8],
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
+    short_names: bool,
 ) -> Option<Vec<u8>> {
     let packet = Packet::parse(data).ok()?;
 
@@ -219,7 +230,7 @@ pub(crate) async fn handle_query(
 
     // Outside `.ray`, `<host>.<network>` is also a perfectly good public name,
     // so we take it only for A/AAAA and only when the peer is really there.
-    if !(is_a || is_aaaa) {
+    if !short_names || !(is_a || is_aaaa) {
         return None;
     }
     let v6 = resolve_bare_network_name(&name_lower, table).await?;
@@ -526,6 +537,43 @@ mod tests {
         let table = new_hostname_table();
         let result = resolve_name("nobody.ray", SUFFIX, &table).await;
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn partial_mode_only_answers_ray_names() {
+        use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};
+
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        update_hostname(&table, &reverse, "dev", "box", v6(5)).await;
+        let query = |name: &str| {
+            let mut pkt = Packet::new_query(1);
+            pkt.set_flags(PacketFlag::RECURSION_DESIRED);
+            pkt.questions.push(Question::new(
+                Name::new_unchecked(name).into_owned(),
+                QTYPE::TYPE(simple_dns::TYPE::AAAA),
+                QCLASS::CLASS(C::IN),
+                false,
+            ));
+            pkt.build_bytes_vec().expect("build query")
+        };
+
+        for name in ["box", "box.dev"] {
+            assert!(
+                handle_query_with_short_names(&query(name), &table, &reverse, false)
+                    .await
+                    .is_none(),
+                "{name} must go to the normal DNS path"
+            );
+        }
+        for name in ["box.ray", "box.dev.ray"] {
+            let bytes = handle_query_with_short_names(&query(name), &table, &reverse, false)
+                .await
+                .expect("the .ray name belongs to the roster");
+            let answer = Packet::parse(&bytes).expect("parse answer");
+            assert_eq!(answer.rcode(), RCODE::NoError);
+            assert_eq!(answer.answers.len(), 1);
+        }
     }
 
     /// The mesh IPv4 is not routed on any node, so an A record would point an

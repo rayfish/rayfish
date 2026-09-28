@@ -507,6 +507,7 @@ async fn build_daemon_inner(
         Arc::clone(&hostname_table),
         Arc::clone(&reverse_table),
     ));
+    dns_resolver.set_short_names(app_config.dns_mode.short_names());
     // Built here (not in the struct literal) so NetworkRegistry can share it for
     // the leave/teardown DNS cleanup.
     let dns = Arc::new(DnsService::new(

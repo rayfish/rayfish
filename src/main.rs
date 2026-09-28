@@ -98,7 +98,7 @@ fn print_pending_requests(requests: &[ipc::PendingRequestInfo], empty_message: &
 /// the seven `cli` modules that call `json_enabled`.
 fn json_requested(command: &Command) -> bool {
     match command {
-        Command::Status { json }
+        Command::Status { json, .. }
         | Command::Invite { json, .. }
         | Command::Requests { json, .. }
         | Command::Connect { json, .. }
@@ -227,6 +227,9 @@ pub(crate) enum Command {
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
         json: bool,
+        /// Include managed machines in the status output
+        #[arg(long)]
+        machines: bool,
     },
     /// Collect diagnostics and open a pre-filled GitHub issue
     ///
@@ -533,7 +536,7 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// Enable or disable Magic DNS system integration
+    /// Configure Magic DNS system integration
     Dns {
         #[command(subcommand)]
         action: DnsAction,
@@ -924,6 +927,8 @@ pub(crate) enum MdnsAction {
 pub(crate) enum DnsAction {
     /// Configure the system resolver for .ray names
     On,
+    /// Resolve only explicit .ray names, without short-name search domains
+    Partial,
     /// Remove Rayfish's system DNS configuration
     Off,
 }
@@ -1603,7 +1608,7 @@ async fn run() -> Result<()> {
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Kick { network, peer, yes } => ipc_kick(&network, &peer, yes).await,
         Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
-        Command::Status { json: _ } => ipc_status().await,
+        Command::Status { machines, .. } => ipc_status(machines).await,
         Command::Report => ipc_report().await,
         Command::Logs { since, follow } => ipc_logs(since, follow).await,
         Command::Daemon => {
@@ -1785,6 +1790,7 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
 async fn cmd_dns(action: DnsAction) -> Result<()> {
     let state = match action {
         DnsAction::On => "on",
+        DnsAction::Partial => "partial",
         DnsAction::Off => "off",
     };
     ipc_mutate(ipc::IpcMessage::ConfigSet {

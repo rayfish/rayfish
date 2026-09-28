@@ -22,6 +22,17 @@ use std::net::{Ipv6Addr, SocketAddr};
 const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
 const DNS_CONFIG_RETRY_MAX: Duration = Duration::from_secs(60);
 
+fn search_domains_for_mode(
+    network_names: &[String],
+    mode: config::DnsMode,
+) -> Vec<dns_config::SearchDomain> {
+    if mode.short_names() {
+        dns_config::search_domains_for(network_names)
+    } else {
+        Vec::new()
+    }
+}
+
 /// How often the forwarder re-checks which system resolvers actually answer.
 ///
 /// Slower than the OS-DNS re-assert tick: a resolver going away is not urgent
@@ -102,7 +113,7 @@ impl DnsService {
         if cfg!(target_os = "android") {
             return;
         }
-        if !config::load().map(|c| c.dns_enabled).unwrap_or(true) {
+        if !config::load().map(|c| c.dns_mode.enabled()).unwrap_or(true) {
             return;
         }
         // Configure system DNS to route .ray queries to our in-daemon resolver.
@@ -156,9 +167,7 @@ impl DnsService {
         // the backend we just adopted, or a host on a file-owning backend gets
         // `.ray` without the domains that make a bare `box` resolve.
         let domains = self.search_domains.lock().unwrap().clone();
-        if !domains.is_empty()
-            && let Err(e) = c.set_search_domains(&domains, tun_name).await
-        {
+        if let Err(e) = c.set_search_domains(&domains, tun_name).await {
             tracing::warn!(error = %e, "failed to install search domains");
         }
 
@@ -419,7 +428,8 @@ impl DnsService {
     /// the data plane comes up) it still tries the manager path, which is what
     /// it always did, and the list is remembered for whatever gets adopted next.
     pub(crate) async fn set_search_domains(&self, network_names: &[String], tun_name: &str) {
-        let domains = dns_config::search_domains_for(network_names);
+        let mode = config::load().map(|c| c.dns_mode).unwrap_or_default();
+        let domains = search_domains_for_mode(network_names, mode);
         *self.search_domains.lock().unwrap() = domains.clone();
         let configurator = self.configurator.lock().unwrap().clone();
         let result = match configurator.as_ref() {
@@ -592,6 +602,14 @@ impl DnsService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_mode_has_no_ray_search_domains() {
+        let networks = vec!["dev".to_string()];
+        assert!(search_domains_for_mode(&networks, config::DnsMode::Partial).is_empty());
+        assert!(search_domains_for_mode(&networks, config::DnsMode::Off).is_empty());
+        assert!(!search_domains_for_mode(&networks, config::DnsMode::On).is_empty());
+    }
 
     fn service() -> Arc<DnsService> {
         let table = dns::HostnameTable::default();

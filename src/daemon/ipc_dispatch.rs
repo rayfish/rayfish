@@ -255,25 +255,36 @@ impl Daemon {
         if let Some(e) = set_err {
             return ipc_err(e);
         }
-        let enabled = match saved {
-            Ok(cfg) => cfg.dns_enabled,
+        let mode = match saved {
+            Ok(cfg) => cfg.dns_mode,
             Err(e) => return ipc_err(format!("failed to save config: {e}")),
         };
         let tun_name = self.tun_name.load().as_str().to_owned();
-        if !enabled {
+        self.dns.resolver.set_short_names(mode.short_names());
+        if !mode.enabled() {
             self.dns.revert(&tun_name).await;
             return IpcMessage::Ok {
                 message: "DNS disabled and Rayfish's system DNS configuration removed.".to_string(),
             };
         }
+        self.registry.refresh_search_domains().await;
         if !self.active.load(Ordering::SeqCst) {
+            let state = if mode == config::DnsMode::Partial {
+                "DNS limited to .ray names."
+            } else {
+                "DNS enabled."
+            };
             return IpcMessage::Ok {
-                message: "DNS enabled. It will be configured when Rayfish is up.".to_string(),
+                message: format!("{state} It will be configured when Rayfish is up."),
             };
         }
         let mut warnings = Vec::new();
         self.dns.configure(&tun_name, &mut warnings).await;
-        let mut message = "DNS enabled.".to_string();
+        let mut message = if mode == config::DnsMode::Partial {
+            "DNS limited to .ray names.".to_string()
+        } else {
+            "DNS enabled.".to_string()
+        };
         if !warnings.is_empty() {
             message.push(' ');
             message.push_str(&warnings.join(" "));

@@ -68,6 +68,7 @@ pub struct Resolver {
     /// outside `.ray` can be declined instead of forwarded. See
     /// [`Resolver::set_defer_off_mesh`].
     defer_off_mesh: AtomicBool,
+    short_names: AtomicBool,
 }
 
 /// How many times one name may go to another mesh's resolver inside
@@ -103,6 +104,7 @@ impl Resolver {
             tunnel_upstreams: Arc::new(ArcSwapOption::empty()),
             overlay_forwards: DashMap::new(),
             defer_off_mesh: AtomicBool::new(false),
+            short_names: AtomicBool::new(true),
         }
     }
 
@@ -165,6 +167,10 @@ impl Resolver {
         self.defer_off_mesh.load(Ordering::Relaxed)
     }
 
+    pub fn set_short_names(&self, enabled: bool) {
+        self.short_names.store(enabled, Ordering::Relaxed);
+    }
+
     /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
     /// avoid a forwarding loop. The desktop capture path uses this.
     pub fn set_upstreams(&self, servers: Vec<Ipv4Addr>) {
@@ -201,9 +207,16 @@ impl Resolver {
     /// The fallback is what makes a name that looks like a mesh name but isn't
     /// work: with a network called `dev` joined, `zed.dev` misses the roster and
     /// goes upstream to the real internet instead of failing. It does not apply
-    /// inside `.ray`, where [`crate::dns::handle_query`] answers a miss itself.
+    /// inside `.ray`, where [`crate::dns::handle_query_with_short_names`] answers a miss itself.
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
-        if let Some(local) = crate::dns::handle_query(query, &self.table, &self.reverse).await {
+        if let Some(local) = crate::dns::handle_query_with_short_names(
+            query,
+            &self.table,
+            &self.reverse,
+            self.short_names.load(Ordering::Relaxed),
+        )
+        .await
+        {
             return Some(local);
         }
         // Sharing resolv.conf means the stub has another nameserver listed
