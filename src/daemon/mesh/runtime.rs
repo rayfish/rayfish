@@ -1331,6 +1331,15 @@ impl Daemon {
                 ));
             }
         };
+        #[cfg(target_os = "macos")]
+        if self.external_exit_tun.load(Ordering::Acquire) {
+            let client = self.apply_external_exit_client().await;
+            self.registry
+                .exit_install_error
+                .store(client.clone().map(Arc::new));
+            self.apply_exit_dns(client.is_none());
+            return reload.or(client);
+        }
         if tun_name.is_empty() {
             let problem = self.registry.exit_client.is_active().then(|| {
                 "exit routing is not available in this platform's packet-tunnel integration yet"
@@ -1374,6 +1383,96 @@ impl Daemon {
             "exit reconcile timing"
         );
         reload.or(server).or(client)
+    }
+
+    /// Prepare exit forwarding while NetworkExtension still owns the host routes.
+    /// Call before installing its default routes so the transport can bind to the
+    /// physical interface first.
+    #[cfg(target_os = "macos")]
+    pub async fn prepare_external_exit_node(&self) -> anyhow::Result<()> {
+        let selected = config::load()?
+            .networks
+            .iter()
+            .any(|network| network.exit_node_use.is_some());
+        self.external_exit_tun.store(true, Ordering::Release);
+        if !selected {
+            self.external_exit_staging.store(false, Ordering::Release);
+        }
+        if let Some(warning) = self.apply_exit_node().await {
+            tracing::warn!(warning, "external exit-node state needs attention");
+        }
+        self.external_exit_staging.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Pin the underlay before NetworkExtension installs capture routes. Until
+    /// the selection is committed, packets arriving on the TUN are dropped.
+    #[cfg(target_os = "macos")]
+    pub async fn prepare_external_exit_transport(&self) {
+        self.external_exit_tun.store(true, Ordering::Release);
+        self.external_exit_staging.store(true, Ordering::Release);
+        crate::exit_node::capture_physical_defaults();
+        if crate::exit_node::set_full_tunnel(true) {
+            self.transport.endpoint.network_change().await;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn select_external_exit_node(
+        &self,
+        network: &str,
+        peer: Option<String>,
+    ) -> IpcMessage {
+        let selecting = peer.is_some();
+        let reply = self.registry.exit_node_use(network, peer).await;
+        if !matches!(reply, IpcMessage::Ok { .. }) {
+            return reply;
+        }
+        if selecting {
+            let configured = match config::load() {
+                Ok(settings) => settings,
+                Err(error) => return ipc_err(error.to_string()),
+            };
+            for other in configured
+                .networks
+                .iter()
+                .filter(|n| n.name != network && n.exit_node_use.is_some())
+            {
+                let cleared = self.registry.exit_node_use(&other.name, None).await;
+                if !matches!(cleared, IpcMessage::Ok { .. }) {
+                    return cleared;
+                }
+            }
+        }
+        match self.prepare_external_exit_node().await {
+            Ok(()) => reply,
+            Err(error) => ipc_err(error.to_string()),
+        }
+    }
+
+    pub fn external_exit_node_status(&self) -> IpcMessage {
+        self.registry.exit_node_status(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn apply_external_exit_client(&self) -> Option<String> {
+        let selected = self.registry.exit_client.is_active()
+            || self.external_exit_staging.load(Ordering::Acquire);
+        if selected {
+            if !crate::exit_node::full_tunnel_active() {
+                crate::exit_node::capture_physical_defaults();
+            }
+            if crate::exit_node::set_full_tunnel(true) {
+                self.transport.endpoint.network_change().await;
+            }
+            let _ = self.exit_peer_conn().await;
+        } else {
+            if crate::exit_node::set_full_tunnel(false) {
+                self.transport.endpoint.network_change().await;
+            }
+            crate::exit_node::clear_physical_defaults();
+        }
+        None
     }
 
     /// Spawn the daemon-lifetime listener that re-runs the exit reconcile when a

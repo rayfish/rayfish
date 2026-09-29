@@ -5,6 +5,7 @@ import OSLog
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var node: Node?
     private var appliedDNS: Bool?
+    private var appliedExit = false
 
     override func startTunnel(
         options: [String: NSObject]?,
@@ -26,8 +27,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 throw ProviderError.missingOwner
             }
             try node.start(ownerUid: owner)
+            try node.prepareExitNode()
             let status = try node.status()
-            let settings = networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled)
+            let settings = networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled,
+                                           exitSelected: status.exitNodes.contains { $0.using != nil })
             setTunnelNetworkSettings(settings) { [weak self] error in
                 if let error {
                     node.stop()
@@ -44,6 +47,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     try node.activate()
                     self.node = node
                     self.appliedDNS = status.dnsEnabled
+                    self.appliedExit = status.exitNodes.contains { $0.using != nil }
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
                 } catch {
@@ -65,6 +69,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let stoppingNode = node
         node = nil
         appliedDNS = nil
+        appliedExit = false
         stoppingNode?.stop()
         let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         RayfishLog.tunnel.info("Tunnel stopped in \(elapsedMs) ms")
@@ -85,18 +90,51 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             RayfishLog.tunnel.debug("Handling \(request.action.rawValue, privacy: .public)")
             guard let node else { throw ProviderError.notStarted }
             let previousDNS = appliedDNS
-            let response = try await Task.detached {
-                try self.handle(request, node: node)
-            }.value
-            guard self.node === node else { throw ProviderError.notStarted }
-            if let status = response.status, appliedDNS != status.dnsEnabled {
+            let previousExit = appliedExit
+            let previousSelection = try node.status().exitNodes.first { $0.using != nil }
+            let stagedExit = request.action == .selectExitNode && request.peer != nil && !appliedExit
+            if stagedExit {
+                try node.prepareExitTransport()
                 do {
-                    try await setTunnelNetworkSettings(networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled))
+                    let status = try node.status()
+                    try await setTunnelNetworkSettings(networkSettings(address: status.ipv6,
+                        dnsEnabled: status.dnsEnabled, exitSelected: true))
+                    appliedExit = true
+                } catch {
+                    try? node.prepareExitNode()
+                    throw error
+                }
+            }
+            let response: ProviderResponse
+            do {
+                response = try await Task.detached { try self.handle(request, node: node) }.value
+            } catch {
+                if stagedExit, let network = request.network,
+                   (try? node.selectExitNode(network: network, peer: nil)) != nil {
+                    let status = try node.status()
+                    try await setTunnelNetworkSettings(networkSettings(address: status.ipv6,
+                        dnsEnabled: status.dnsEnabled, exitSelected: false))
+                    appliedExit = false
+                }
+                throw error
+            }
+            guard self.node === node else { throw ProviderError.notStarted }
+            if let status = response.status,
+               appliedDNS != status.dnsEnabled || appliedExit != status.exitNodes.contains(where: { $0.using != nil }) {
+                do {
+                    try await setTunnelNetworkSettings(networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled,
+                        exitSelected: status.exitNodes.contains { $0.using != nil }))
                     appliedDNS = status.dnsEnabled
+                    appliedExit = status.exitNodes.contains { $0.using != nil }
                 } catch {
                     if request.action == .setSetting, request.setting == .dns, let previousDNS {
                         try node.setSetting(key: .dns, enabled: previousDNS)
                     }
+                    if request.action == .selectExitNode, let network = request.network {
+                        let prior = previousSelection?.network == network ? previousSelection?.using : nil
+                        try? node.selectExitNode(network: network, peer: prior)
+                    }
+                    appliedExit = previousExit
                     throw error
                 }
             }
@@ -108,15 +146,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func networkSettings(address: String, dnsEnabled: Bool) -> NEPacketTunnelNetworkSettings {
+    private func networkSettings(address: String, dnsEnabled: Bool, exitSelected: Bool) -> NEPacketTunnelNetworkSettings {
         // Rayfish has no single tunnel server; macOS still requires a numeric IP here.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         let ipv6 = NEIPv6Settings(addresses: [address], networkPrefixLengths: [128])
-        ipv6.includedRoutes = [NEIPv6Route(destinationAddress: "200::", networkPrefixLength: 7)]
+        ipv6.includedRoutes = exitSelected
+            ? [NEIPv6Route(destinationAddress: "::", networkPrefixLength: 0)]
+            : [NEIPv6Route(destinationAddress: "200::", networkPrefixLength: 7)]
         settings.ipv6Settings = ipv6
+        if exitSelected {
+            let ipv4 = NEIPv4Settings(addresses: ["192.0.0.2"], subnetMasks: ["255.255.255.255"])
+            ipv4.includedRoutes = [NEIPv4Route(destinationAddress: "0.0.0.0", subnetMask: "0.0.0.0")]
+            settings.ipv4Settings = ipv4
+        }
         if dnsEnabled {
             let dns = NEDNSSettings(servers: ["200::53"])
-            dns.matchDomains = ["ray"]
+            dns.matchDomains = exitSelected ? [""] : ["ray"]
             settings.dnsSettings = dns
         }
         return settings
@@ -139,6 +184,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         switch request.action {
         case .status:
             break
+        case .selectExitNode:
+            guard let network = request.network else { throw ProviderError.missingNetworkName }
+            try node.selectExitNode(network: network, peer: request.peer)
         case .machines:
             let machines = try node.machines().map { machine in
                 ProviderMachine(identity: machine.identity, hostname: machine.hostname,
@@ -285,7 +333,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              size: file.size, state: file.state == .pending ? .pending : .received)
             },
             sshEnabled: status.sshEnabled,
-            sshRules: status.sshRules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) }
+            sshRules: status.sshRules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) },
+            exitNodes: status.exitNodes.map { ProviderExitNodeNetwork(network: $0.network, using: $0.using,
+                available: $0.available, refused: $0.refused, problem: $0.problem) }
         )
     }
 }

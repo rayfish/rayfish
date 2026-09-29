@@ -556,9 +556,15 @@ public protocol NodeProtocol: AnyObject, Sendable {
      */
     func migrateLegacyState(source: String) throws
 
+    func prepareExitNode() throws
+
+    func prepareExitTransport() throws
+
     func rejectConnection(id: String) throws
 
     func rejectFile(id: UInt64) throws
+
+    func selectExitNode(network: String, peer: String?) throws
 
     func setHostname(network: String, hostname: String) throws
 
@@ -806,6 +812,18 @@ open func migrateLegacyState(source: String)throws   {try rustCallWithError(FfiC
 }
 }
 
+open func prepareExitNode()throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_prepare_exit_node(self.uniffiClonePointer(),$0
+    )
+}
+}
+
+open func prepareExitTransport()throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_prepare_exit_transport(self.uniffiClonePointer(),$0
+    )
+}
+}
+
 open func rejectConnection(id: String)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_reject_connection(self.uniffiClonePointer(),
         FfiConverterString.lower(id),$0
@@ -816,6 +834,14 @@ open func rejectConnection(id: String)throws   {try rustCallWithError(FfiConvert
 open func rejectFile(id: UInt64)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_reject_file(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(id),$0
+    )
+}
+}
+
+open func selectExitNode(network: String, peer: String?)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
+    uniffi_ray_apple_fn_method_node_select_exit_node(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterOptionString.lower(peer),$0
     )
 }
 }
@@ -1010,6 +1036,100 @@ public func FfiConverterTypeConnectionRequest_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeConnectionRequest_lower(_ value: ConnectionRequest) -> RustBuffer {
     return FfiConverterTypeConnectionRequest.lower(value)
+}
+
+
+public struct ExitNodeNetwork {
+    public var network: String
+    public var using: String?
+    public var available: [String]
+    public var refused: [String]
+    public var problem: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(network: String, using: String?, available: [String], refused: [String], problem: String?) {
+        self.network = network
+        self.using = using
+        self.available = available
+        self.refused = refused
+        self.problem = problem
+    }
+}
+
+#if compiler(>=6)
+extension ExitNodeNetwork: Sendable {}
+#endif
+
+
+extension ExitNodeNetwork: Equatable, Hashable {
+    public static func ==(lhs: ExitNodeNetwork, rhs: ExitNodeNetwork) -> Bool {
+        if lhs.network != rhs.network {
+            return false
+        }
+        if lhs.using != rhs.using {
+            return false
+        }
+        if lhs.available != rhs.available {
+            return false
+        }
+        if lhs.refused != rhs.refused {
+            return false
+        }
+        if lhs.problem != rhs.problem {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(network)
+        hasher.combine(using)
+        hasher.combine(available)
+        hasher.combine(refused)
+        hasher.combine(problem)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeExitNodeNetwork: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExitNodeNetwork {
+        return
+            try ExitNodeNetwork(
+                network: FfiConverterString.read(from: &buf),
+                using: FfiConverterOptionString.read(from: &buf),
+                available: FfiConverterSequenceString.read(from: &buf),
+                refused: FfiConverterSequenceString.read(from: &buf),
+                problem: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ExitNodeNetwork, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.network, into: &buf)
+        FfiConverterOptionString.write(value.using, into: &buf)
+        FfiConverterSequenceString.write(value.available, into: &buf)
+        FfiConverterSequenceString.write(value.refused, into: &buf)
+        FfiConverterOptionString.write(value.problem, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExitNodeNetwork_lift(_ buf: RustBuffer) throws -> ExitNodeNetwork {
+    return try FfiConverterTypeExitNodeNetwork.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExitNodeNetwork_lower(_ value: ExitNodeNetwork) -> RustBuffer {
+    return FfiConverterTypeExitNodeNetwork.lower(value)
 }
 
 
@@ -1582,10 +1702,11 @@ public struct NodeStatus {
     public var dnsEnabled: Bool
     public var mdnsEnabled: Bool
     public var mdnsActive: Bool
+    public var exitNodes: [ExitNodeNetwork]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(active: Bool, ipv6: String, networks: [Network], pendingRequests: [JoinRequest], contactId: String?, connectionRequests: [ConnectionRequest], files: [IncomingFile], sshEnabled: Bool, sshRules: [SshRule], dnsEnabled: Bool, mdnsEnabled: Bool, mdnsActive: Bool) {
+    public init(active: Bool, ipv6: String, networks: [Network], pendingRequests: [JoinRequest], contactId: String?, connectionRequests: [ConnectionRequest], files: [IncomingFile], sshEnabled: Bool, sshRules: [SshRule], dnsEnabled: Bool, mdnsEnabled: Bool, mdnsActive: Bool, exitNodes: [ExitNodeNetwork]) {
         self.active = active
         self.ipv6 = ipv6
         self.networks = networks
@@ -1598,6 +1719,7 @@ public struct NodeStatus {
         self.dnsEnabled = dnsEnabled
         self.mdnsEnabled = mdnsEnabled
         self.mdnsActive = mdnsActive
+        self.exitNodes = exitNodes
     }
 }
 
@@ -1644,6 +1766,9 @@ extension NodeStatus: Equatable, Hashable {
         if lhs.mdnsActive != rhs.mdnsActive {
             return false
         }
+        if lhs.exitNodes != rhs.exitNodes {
+            return false
+        }
         return true
     }
 
@@ -1660,6 +1785,7 @@ extension NodeStatus: Equatable, Hashable {
         hasher.combine(dnsEnabled)
         hasher.combine(mdnsEnabled)
         hasher.combine(mdnsActive)
+        hasher.combine(exitNodes)
     }
 }
 
@@ -1683,7 +1809,8 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
                 sshRules: FfiConverterSequenceTypeSshRule.read(from: &buf),
                 dnsEnabled: FfiConverterBool.read(from: &buf),
                 mdnsEnabled: FfiConverterBool.read(from: &buf),
-                mdnsActive: FfiConverterBool.read(from: &buf)
+                mdnsActive: FfiConverterBool.read(from: &buf),
+                exitNodes: FfiConverterSequenceTypeExitNodeNetwork.read(from: &buf)
         )
     }
 
@@ -1700,6 +1827,7 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
         FfiConverterBool.write(value.dnsEnabled, into: &buf)
         FfiConverterBool.write(value.mdnsEnabled, into: &buf)
         FfiConverterBool.write(value.mdnsActive, into: &buf)
+        FfiConverterSequenceTypeExitNodeNetwork.write(value.exitNodes, into: &buf)
     }
 }
 
@@ -2246,6 +2374,31 @@ fileprivate struct FfiConverterSequenceTypeConnectionRequest: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeExitNodeNetwork: FfiConverterRustBuffer {
+    typealias SwiftType = [ExitNodeNetwork]
+
+    public static func write(_ value: [ExitNodeNetwork], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeExitNodeNetwork.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ExitNodeNetwork] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ExitNodeNetwork]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeExitNodeNetwork.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFirewallRule: FfiConverterRustBuffer {
     typealias SwiftType = [FirewallRule]
 
@@ -2487,10 +2640,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_apple_checksum_method_node_migrate_legacy_state() != 46002) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ray_apple_checksum_method_node_prepare_exit_node() != 2671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_prepare_exit_transport() != 31701) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ray_apple_checksum_method_node_reject_connection() != 11655) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_reject_file() != 4388) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_apple_checksum_method_node_select_exit_node() != 21982) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_set_hostname() != 15380) {

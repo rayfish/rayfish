@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
+  and DNS through the packet tunnel, or restore a direct connection.
+
 - Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
   with only an IPv4 internet connection.
 

@@ -356,6 +356,16 @@ RustBuffer uniffi_ray_apple_fn_method_node_machines(void*_Nonnull ptr, RustCallS
 void uniffi_ray_apple_fn_method_node_migrate_legacy_state(void*_Nonnull ptr, RustBuffer source, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_PREPARE_EXIT_NODE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_PREPARE_EXIT_NODE
+void uniffi_ray_apple_fn_method_node_prepare_exit_node(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_PREPARE_EXIT_TRANSPORT
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_PREPARE_EXIT_TRANSPORT
+void uniffi_ray_apple_fn_method_node_prepare_exit_transport(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_CONNECTION
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_CONNECTION
 void uniffi_ray_apple_fn_method_node_reject_connection(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
@@ -364,6 +374,11 @@ void uniffi_ray_apple_fn_method_node_reject_connection(void*_Nonnull ptr, RustBu
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_FILE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_REJECT_FILE
 void uniffi_ray_apple_fn_method_node_reject_file(void*_Nonnull ptr, uint64_t id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SELECT_EXIT_NODE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SELECT_EXIT_NODE
+void uniffi_ray_apple_fn_method_node_select_exit_node(void*_Nonnull ptr, RustBuffer network, RustBuffer peer, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
@@ -784,6 +799,18 @@ uint16_t uniffi_ray_apple_checksum_method_node_migrate_legacy_state(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_PREPARE_EXIT_NODE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_PREPARE_EXIT_NODE
+uint16_t uniffi_ray_apple_checksum_method_node_prepare_exit_node(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_PREPARE_EXIT_TRANSPORT
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_PREPARE_EXIT_TRANSPORT
+uint16_t uniffi_ray_apple_checksum_method_node_prepare_exit_transport(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_CONNECTION
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_CONNECTION
 uint16_t uniffi_ray_apple_checksum_method_node_reject_connection(void
@@ -793,6 +820,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_reject_connection(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_FILE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_REJECT_FILE
 uint16_t uniffi_ray_apple_checksum_method_node_reject_file(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SELECT_EXIT_NODE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SELECT_EXIT_NODE
+uint16_t uniffi_ray_apple_checksum_method_node_select_exit_node(void
 
 );
 #endif

@@ -785,6 +785,11 @@ pub struct Daemon {
     /// Handles for the packet-forwarding tasks spawned by
     /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
+    /// NetworkExtension owns routes and DNS for an externally attached macOS TUN.
+    #[cfg(target_os = "macos")]
+    external_exit_tun: AtomicBool,
+    #[cfg(target_os = "macos")]
+    external_exit_staging: AtomicBool,
     /// Serializes exit-node reconciles. `apply_exit_node` runs from the IPC
     /// dispatcher, `activate()`, and the reconverge reapply listener, each on its
     /// own task, and the kernel enable underneath is check-then-write (the sysctl
