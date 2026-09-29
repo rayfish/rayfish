@@ -8,10 +8,12 @@
 //!
 //! Firewall rules are published as suggestions; SSH grants are sent directly
 //! to enrolled controlled machines. Both are keyed by hostname. A `*` subject
-//! targets every node, and a `*` peer means any peer. In `allows`,
-//! `*-host-a,host-b` means any peer except those hosts. Exclusion groups and
-//! aliases expand to joined hostnames when applied. Specs and their output
-//! (`--dry-run`, `--example`) use YAML.
+//! targets every node, and a `*` peer means any peer. A `*-host-a,host-b`
+//! subject targets every current or explicitly declared host except those hosts;
+//! in `allows`, it means any peer except those hosts. Exclusion groups and
+//! aliases expand to joined hostnames when applied. Reapply after new hosts join
+//! to update target exclusions. Specs and their output (`--dry-run`, `--example`)
+//! use YAML.
 //!
 //! Firewall model: suggestions are additive. An `allows` list opens exactly the
 //! listed peers/ports (the node's own inbound default, Deny by default, drops
@@ -22,6 +24,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::collections::btree_map::Entry;
+use std::iter::once;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -166,8 +169,8 @@ fn validate_names(spec: &DeploySpec) -> Result<()> {
         );
     }
     for firewall in spec.networks.values() {
-        for rules in firewall.values() {
-            for peer in rules.allows.keys() {
+        for (subject, rules) in firewall {
+            for peer in once(subject).chain(rules.allows.keys()) {
                 if let Some(exclusions) = crate::firewall::parse_excluded_peer_terms(peer)? {
                     for name in exclusions {
                         if let Some(members) = spec.groups.get(name) {
@@ -257,7 +260,10 @@ pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 # means any peer. In `allows`, `*-host-a,admins` means any peer except the named
 # host and group. An alias in an exclusion needs a joined device at apply time.
 # Paired devices share a firewall identity, so excluding one also
-# excludes its user's other devices. Suggestions are advisory: each node queues
+# excludes its user's other devices as peers. As a target, `*-admins` selects
+# current and explicitly declared hosts except that group's hosts. Reapply after
+# new hosts join. Other matching target blocks still add their rules.
+# Suggestions are advisory: each node queues
 # them for `ray firewall accept`, or auto-installs them if it joined with
 # `--auto-accept-firewall`.
 #
@@ -318,7 +324,7 @@ pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
 pub fn expected_hosts_for_network(firewall: &DeployNetwork) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     for (subject, rules) in firewall {
-        if subject != "*" {
+        if subject != "*" && !subject.starts_with("*-") {
             set.insert(subject.clone());
         }
         for peer in rules
@@ -339,6 +345,7 @@ pub fn expected_hosts_for_network(firewall: &DeployNetwork) -> BTreeSet<String> 
 pub fn has_membership_wildcard(firewall: &DeployNetwork) -> bool {
     firewall.iter().any(|(subject, rules)| {
         subject == "*"
+            || subject.starts_with("*-")
             || rules
                 .allows
                 .keys()
@@ -382,20 +389,6 @@ pub fn membership_diff(
     Ok(MembershipDiff { joins, leaves })
 }
 
-/// Expand all group/alias references in one network's firewall into a pure,
-/// hostname-keyed deploy rules ready to publish or send to controlled hosts.
-///
-/// `resolve_alias(identity)` returns the hostnames currently joined for that
-/// identity *in this network* (the caller builds it from live `Status`). A name
-/// used as a subject or peer resolves by precedence: **group → alias → literal
-/// hostname** (a name matching no group or alias passes through as itself, so
-/// plain-hostname specs behave exactly as before). `*` is never expanded.
-///
-/// Returns the expanded firewall plus the sorted, unique set of alias names that
-/// resolved to zero joined hosts (the caller surfaces these as warnings; their
-/// rules simply aren't emitted yet and will materialize on a later apply once the
-/// user joins, mirroring how `firewall::materialize_suggestions` skips
-/// unresolved peers).
 /// Merge a network's stored (node-local `ray alias`) map with a spec's inline
 /// `aliases:` map. The spec wins on a name conflict. Both are already canonical
 /// (`name -> identity`); the result seeds [`expand_firewall`]. Stored aliases are
@@ -409,11 +402,30 @@ pub fn merge_aliases(
     merged
 }
 
+/// Expand all group/alias references in one network's firewall into a pure,
+/// hostname-keyed deploy rules ready to publish or send to controlled hosts.
+///
+/// `resolve_alias(identity)` returns the hostnames currently joined for that
+/// identity *in this network* (the caller builds it from live `Status`). A name
+/// used as a subject or peer resolves by precedence: **group, alias, then literal
+/// hostname** (a name matching no group or alias passes through as itself, so
+/// plain-hostname specs behave exactly as before). `*` is never expanded.
+///
+/// Returns the expanded firewall plus the sorted, unique set of alias names that
+/// resolved to zero joined hosts (the caller surfaces these as warnings; their
+/// rules simply aren't emitted yet and will materialize on a later apply once the
+/// user joins, mirroring how `firewall::materialize_suggestions` skips
+/// unresolved peers).
+///
+/// Target exclusions expand against `current` and explicit spec hosts. Empty
+/// entries preserve membership and clear prior suggestions on excluded targets.
+/// Excluded aliases with no joined devices return an error.
 pub fn expand_firewall(
     fw: &DeployNetwork,
     aliases: &BTreeMap<String, String>,
     groups: &BTreeMap<String, Vec<String>>,
     resolve_alias: &dyn Fn(&str) -> Vec<String>,
+    current: &HashSet<MachineHostname>,
 ) -> Result<(DeployNetwork, Vec<String>)> {
     let mut empty_aliases: BTreeSet<String> = BTreeSet::new();
 
@@ -493,7 +505,21 @@ pub fn expand_firewall(
         vec![name.to_string()] // literal hostname
     };
 
+    let has_target_exclusions = fw.keys().any(|subject| subject.starts_with("*-"));
+    let mut targets = BTreeSet::new();
     let mut out = DeployNetwork::new();
+    if has_target_exclusions {
+        targets.extend(current.iter().map(ToString::to_string));
+        for name in expected_hosts_for_network(fw) {
+            targets.extend(resolve_name(&name));
+        }
+        targets.remove("*");
+        // Keep excluded hosts enrolled, and replace their previous suggestions.
+        out.insert("*".to_string(), DeployHost::default());
+        for host in &targets {
+            out.insert(host.clone(), DeployHost::default());
+        }
+    }
     for (subject, rules) in fw {
         // Expand the peer side once, reused for every concrete subject.
         let mut allows: BTreeMap<String, String> = BTreeMap::new();
@@ -527,7 +553,18 @@ pub fn expand_firewall(
             }
         }
 
-        for subj in resolve_name(subject) {
+        let subjects = if subject.starts_with("*-") {
+            let exclusion = expand_exclusion(subject)?;
+            let excluded: BTreeSet<_> = exclusion[2..].split(',').collect();
+            targets
+                .iter()
+                .filter(|host| !excluded.contains(host.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            resolve_name(subject)
+        };
+        for subj in subjects {
             let entry = out.entry(subj).or_default();
             for (peer, spec) in &allows {
                 merge_spec(entry.allows.entry(peer.clone()).or_default(), spec);
@@ -626,8 +663,14 @@ networks:
             expected_hosts_for_network(network),
             ["server", "admins"].into_iter().map(String::from).collect()
         );
-        let (expanded, warnings) =
-            expand_firewall(network, &BTreeMap::new(), &spec.groups, &|_| Vec::new()).unwrap();
+        let (expanded, warnings) = expand_firewall(
+            network,
+            &BTreeMap::new(),
+            &spec.groups,
+            &|_| Vec::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(warnings.is_empty());
         assert_eq!(expanded["server"].ssh["laptop"], ["deploy"]);
         assert_eq!(expanded["server"].ssh["phone"], ["deploy"]);
@@ -654,6 +697,7 @@ networks:
             &BTreeMap::new(),
             &spec.groups,
             &|_| Vec::new(),
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(expanded["server"].ssh["laptop"], ["audit", "deploy"]);
@@ -695,11 +739,14 @@ networks:
         let diff = membership_diff(firewall, &current).unwrap();
         assert!(diff.joins.is_empty());
         assert!(diff.leaves.is_empty());
-        let (expanded, warnings) =
-            expand_firewall(firewall, &BTreeMap::new(), &BTreeMap::new(), &|_| {
-                Vec::new()
-            })
-            .unwrap();
+        let (expanded, warnings) = expand_firewall(
+            firewall,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &|_| Vec::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(warnings.is_empty());
         assert_eq!(
             expanded["target-host"].allows["*-a,b,c"],
@@ -745,6 +792,7 @@ networks:
                 assert_eq!(identity, "identity-owner");
                 vec!["owner-phone".to_string(), "owner-laptop".to_string()]
             },
+            &HashSet::new(),
         )
         .unwrap();
         assert!(warnings.is_empty());
@@ -774,10 +822,188 @@ networks:
             &spec.aliases,
             &spec.groups,
             &|_| Vec::new(),
+            &HashSet::new(),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("excluded alias 'owner' has no joined devices"));
+    }
+
+    #[test]
+    fn excluded_targets_skip_user_devices_but_preserve_ssh_and_membership() {
+        let spec = parse(
+            r#"
+aliases:
+  owner: identity-owner
+groups:
+  users: [owner, guest-laptop]
+  servers: [new-server]
+networks:
+  sample-net:
+    "*":
+      ssh:
+        owner: [deploy]
+    "*-users,spare-host":
+      allows:
+        "*": "tcp:12345"
+      denies:
+        "*": "udp:12345"
+      ssh:
+        owner: [audit]
+    servers:
+      allows:
+        "*": "tcp:23456"
+"#,
+        )
+        .unwrap();
+        let current: HashSet<MachineHostname> = [
+            "owner-laptop",
+            "owner-phone",
+            "guest-laptop",
+            "spare-host",
+            "build-box",
+        ]
+        .into_iter()
+        .map(|host| host.parse().unwrap())
+        .collect();
+        let (expanded, warnings) = expand_firewall(
+            &spec.networks["sample-net"],
+            &spec.aliases,
+            &spec.groups,
+            &|_| vec!["owner-laptop".to_string(), "owner-phone".to_string()],
+            &current,
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        assert!(!expanded.keys().any(|host| host.starts_with("*-")));
+        let suggestions = suggested_firewall(&expanded);
+        for host in ["owner-laptop", "owner-phone", "guest-laptop", "spare-host"] {
+            assert_eq!(suggestions[host], HostSuggestions::default());
+            assert!(
+                crate::firewall::materialize_suggestions("sample-net", host, &suggestions, &|_| {
+                    None
+                })
+                .is_empty()
+            );
+            assert_eq!(
+                ssh_grants_for_host(&expanded, host)["owner-laptop"],
+                ["deploy"]
+            );
+        }
+        assert_eq!(expanded["build-box"].allows["*"], "tcp:12345");
+        assert_eq!(expanded["build-box"].denies["*"], "udp:12345");
+        assert_eq!(expanded["new-server"].allows["*"], "tcp:12345,tcp:23456");
+        assert_eq!(
+            ssh_grants_for_host(&expanded, "build-box")["owner-laptop"],
+            ["audit", "deploy"]
+        );
+        let diff = membership_diff(&expanded, &current).unwrap();
+        assert_eq!(diff.joins, ["new-server".parse().unwrap()]);
+        assert!(diff.leaves.is_empty());
+    }
+
+    #[test]
+    fn excluded_targets_clear_previous_suggestions_without_pruning() {
+        let spec = parse(
+            "networks:\n  sample-net:\n    '*-laptop':\n      allows:\n        '*': 'tcp:12345'\n",
+        )
+        .unwrap();
+        let current = ["laptop", "build-box"]
+            .into_iter()
+            .map(|host| host.parse().unwrap())
+            .collect();
+        let network = &spec.networks["sample-net"];
+        assert!(expected_hosts_for_network(network).is_empty());
+        let diff = membership_diff(network, &current).unwrap();
+        assert!(diff.joins.is_empty() && diff.leaves.is_empty());
+        let (expanded, _) = expand_firewall(
+            network,
+            &spec.aliases,
+            &spec.groups,
+            &|_| Vec::new(),
+            &current,
+        )
+        .unwrap();
+        let mut live: SuggestedFirewall = ["*", "laptop", "build-box"]
+            .into_iter()
+            .map(|host| (host.to_string(), allows(&[("*", "tcp:23456")]).firewall()))
+            .collect();
+        live.extend(suggested_firewall(&expanded));
+        assert!(
+            crate::firewall::materialize_suggestions("sample-net", "laptop", &live, &|_| None)
+                .is_empty()
+        );
+        assert_eq!(live["build-box"].allows["*"], "tcp:12345");
+        assert!(
+            membership_diff(&expanded, &current)
+                .unwrap()
+                .leaves
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn target_exclusions_reapply_to_new_members_and_merge_explicit_rules() {
+        let spec = parse(
+            "networks:\n  sample-net:\n    '*-laptop':\n      allows:\n        '*': 'tcp:12345'\n    laptop:\n      allows:\n        '*': 'tcp:23456'\n",
+        )
+        .unwrap();
+        for hosts in [vec!["laptop"], vec!["laptop", "new-server"]] {
+            let current = hosts.iter().map(|host| host.parse().unwrap()).collect();
+            let (expanded, _) = expand_firewall(
+                &spec.networks["sample-net"],
+                &spec.aliases,
+                &spec.groups,
+                &|_| Vec::new(),
+                &current,
+            )
+            .unwrap();
+            assert_eq!(expanded["laptop"].allows["*"], "tcp:23456");
+            assert_eq!(expanded.contains_key("new-server"), hosts.len() == 2);
+            if let Some(server) = expanded.get("new-server") {
+                assert_eq!(server.allows["*"], "tcp:12345");
+            }
+        }
+    }
+
+    #[test]
+    fn target_exclusions_reject_malformed_selectors_and_unsafe_groups() {
+        for subject in ["*-", "*-host,", "*-INVALID"] {
+            let yaml = format!("networks:\n  sample-net:\n    '{subject}': {{}}\n");
+            assert!(parse(&yaml).is_err(), "selector {subject} should fail");
+        }
+        for members in ["[]", "['*']", "[users]"] {
+            let yaml = format!(
+                "groups:\n  users: {members}\nnetworks:\n  sample-net:\n    '*-users': {{}}\n"
+            );
+            assert!(
+                parse(&yaml).is_err(),
+                "excluded group {members} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_target_alias_without_joined_devices_rejects_apply() {
+        let spec = parse(
+            "networks:\n  sample-net:\n    '*-owner':\n      allows:\n        '*': 'tcp:12345'\n",
+        )
+        .unwrap();
+        // Stored aliases must have the same exclusion behavior as inline aliases.
+        let aliases = [("owner".to_string(), "identity-owner".to_string())].into();
+        let error = expand_firewall(
+            &spec.networks["sample-net"],
+            &aliases,
+            &spec.groups,
+            &|_| Vec::new(),
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("excluded alias 'owner' has no joined devices")
+        );
     }
 
     #[test]
@@ -974,7 +1200,8 @@ networks:
         let mut fw = DeployNetwork::new();
         fw.insert("*".to_string(), allows(&[("alice", "tcp:22")]));
 
-        let (out, warnings) = expand_firewall(&fw, &aliases, &groups, &resolve).unwrap();
+        let (out, warnings) =
+            expand_firewall(&fw, &aliases, &groups, &resolve, &HashSet::new()).unwrap();
         assert!(warnings.is_empty());
         let wild = out.get("*").unwrap();
         assert_eq!(
@@ -1029,7 +1256,8 @@ networks:
         };
         let mut fw = DeployNetwork::new();
         fw.insert("*".to_string(), allows(&[("alice", "tcp:22")]));
-        let (out, warnings) = expand_firewall(&fw, &merged, &groups, &resolve).unwrap();
+        let (out, warnings) =
+            expand_firewall(&fw, &merged, &groups, &resolve, &HashSet::new()).unwrap();
         assert!(warnings.is_empty());
         let wild = out.get("*").unwrap();
         assert_eq!(
@@ -1058,7 +1286,7 @@ networks:
         let mut fw = DeployNetwork::new();
         fw.insert("*".to_string(), allows(&[("admins", "tcp:22")]));
 
-        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve).unwrap();
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve, &HashSet::new()).unwrap();
         let wild = out.get("*").unwrap();
         assert_eq!(
             wild.allows.get("alice-laptop").map(String::as_str),
@@ -1083,7 +1311,7 @@ networks:
         let mut fw = DeployNetwork::new();
         fw.insert("webservers".to_string(), allows(&[("*", "tcp:80")]));
 
-        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve).unwrap();
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve, &HashSet::new()).unwrap();
         assert!(!out.contains_key("webservers"));
         assert_eq!(
             out.get("web1").unwrap().allows.get("*").map(String::as_str),
@@ -1116,7 +1344,7 @@ networks:
             allows(&[("admins", "tcp:22"), ("alice", "tcp:80")]),
         );
 
-        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve).unwrap();
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve, &HashSet::new()).unwrap();
         let merged = out.get("*").unwrap().allows.get("alice-laptop").unwrap();
         assert_eq!(merged, "tcp:22,tcp:80", "specs must merge sorted+deduped");
     }
@@ -1129,7 +1357,7 @@ networks:
         let mut fw = DeployNetwork::new();
         fw.insert("*".to_string(), allows(&[("*", "tcp:6969")]));
 
-        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve).unwrap();
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve, &HashSet::new()).unwrap();
         assert_eq!(
             out.get("*").unwrap().allows.get("*").map(String::as_str),
             Some("tcp:6969")
@@ -1144,7 +1372,8 @@ networks:
         let mut fw = DeployNetwork::new();
         fw.insert("jumpbox".to_string(), allows(&[("monitor", "tcp:9100")]));
 
-        let (out, warnings) = expand_firewall(&fw, &aliases, &groups, &resolve).unwrap();
+        let (out, warnings) =
+            expand_firewall(&fw, &aliases, &groups, &resolve, &HashSet::new()).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(
             out.get("jumpbox")
@@ -1165,7 +1394,8 @@ networks:
         let mut fw = DeployNetwork::new();
         fw.insert("*".to_string(), allows(&[("ghost", "tcp:22")]));
 
-        let (out, warnings) = expand_firewall(&fw, &aliases, &groups, &resolve).unwrap();
+        let (out, warnings) =
+            expand_firewall(&fw, &aliases, &groups, &resolve, &HashSet::new()).unwrap();
         assert_eq!(warnings, vec!["ghost".to_string()]);
         assert!(
             out.get("*").unwrap().allows.is_empty(),

@@ -11,6 +11,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
   with only an IPv4 internet connection.
 
+- `ray apply` accepts `*-host-a,host-b` as a target, including aliases and
+  groups, to skip firewall suggestions and SSH grants on those devices without
+  removing them from the network. Targets expand at apply time; reapply after
+  new hosts join.
+
 - `ray fw` is an alias for `ray firewall`.
 
 - The macOS app checks for stable updates and installs them when it quits. Use
@@ -30,6 +35,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The existing `ray identityof <network> <host>` form still works.
 
 ### Fixed
+
+- `ray apply` skips the local machine when applying SSH grants, avoiding a
+  misleading controlled-machine warning and failed exit status.
+
+- Local macOS release builds no longer fail while copying Sparkle.
 
 - Enabling mesh SSH automatically allows its internal TCP listener on the mesh
   interface when blocked, using active UFW or falling back to ip6tables when no

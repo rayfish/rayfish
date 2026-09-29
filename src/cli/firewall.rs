@@ -618,8 +618,12 @@ pub(crate) async fn ipc_apply(
         let resolve = |identity: &str| -> Vec<String> {
             resolve_identity_hosts(&status_networks, net_name, &self_id, identity)
         };
+        let current = joined_hostnames(&status_networks, net_name)
+            .into_iter()
+            .map(|hostname| hostname.parse())
+            .collect::<Result<HashSet<ipc::MachineHostname>, _>>()?;
         let (efw, empty_aliases) =
-            apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve)?;
+            apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve, &current)?;
         for a in empty_aliases {
             eprintln!(
                 "{}  {net_name}: alias '{a}' has no joined devices yet; its rules are skipped",
@@ -787,11 +791,17 @@ pub(crate) async fn ipc_apply(
             }
         }
 
+        let status_network = status_networks
+            .iter()
+            .find(|network| network.name == *net_name);
         for host in active_hosts {
+            // SSH apply manages remote machines, not the local controller.
+            if status_network.and_then(|network| network.my_hostname.as_deref())
+                == Some(host.as_ref())
+            {
+                continue;
+            }
             let grants = apply::ssh_grants_for_host(net_firewall, host.as_ref());
-            let status_network = status_networks
-                .iter()
-                .find(|network| network.name == *net_name);
             let Some(machine) =
                 managed_machine_for_hostname(status_network, &host, &managed_machines)
             else {

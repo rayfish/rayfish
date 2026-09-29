@@ -59,7 +59,6 @@ targets:
           PROVISIONING_PROFILE_SPECIFIER: "$(RAYFISH_APP_PROFILE)"
     dependencies:
       - package: Sparkle
-        embed: true
       - sdk: UserNotifications.framework
       - target: RayfishTunnelExtension
         embed: true

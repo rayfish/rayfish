@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		022130780000000000000001 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 022130780000000000000003 /* Sparkle */; };
-		022130780000000000000002 /* Sparkle in Embed Frameworks */ = {isa = PBXBuildFile; productRef = 022130780000000000000003 /* Sparkle */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		022130780000000000000006 /* Sparkle-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = 022130780000000000000007 /* Sparkle-LICENSE.txt */; };
 		06642DCA858987EA27C2BA74 /* RayfishNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1BD3D661631EB1DA93E7F2 /* RayfishNotifications.swift */; };
 		10CF514C0F2FBA56B5D6CE1B /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = F551764865C525E7C133EBD7 /* main.swift */; };
@@ -48,17 +47,6 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		022130780000000000000004 /* Embed Frameworks */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 10;
-			files = (
-				022130780000000000000002 /* Sparkle in Embed Frameworks */,
-			);
-			name = "Embed Frameworks";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		30D24859D5817641FFF561F0 /* Embed System Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -219,7 +207,6 @@
 				D76FB9A2773706815890D604 /* Sources */,
 				F32F4FD569FADCA723AEDB17 /* Resources */,
 				1F296514FB611F11757D2805 /* Frameworks */,
-				022130780000000000000004 /* Embed Frameworks */,
 				30D24859D5817641FFF561F0 /* Embed System Extensions */,
 				4291C25C81A92889E7B6D181 /* Bundle the Rust ray command */,
 			);
