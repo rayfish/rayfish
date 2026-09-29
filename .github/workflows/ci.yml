@@ -115,7 +115,7 @@ jobs:
         run: >-
           xcodebuild -quiet -project macos/Rayfish.xcodeproj
           -target RayfishTunnelExtension -configuration Debug
-          CODE_SIGNING_ALLOWED=NO build
+          ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
 
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
