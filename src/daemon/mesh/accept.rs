@@ -167,6 +167,8 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         | ControlMsg::CertRefresh { .. }
         | ControlMsg::RequestUnpair
         | ControlMsg::NotSupported { .. }
+        | ControlMsg::Close
+        | ControlMsg::CloseAck
         | ControlMsg::FileOffer { .. } => false,
     }
 }
@@ -2111,7 +2113,21 @@ mod welcome_delivery_tests {
         ));
         recv.stop(VarInt::from_u32(0)).unwrap();
         drop(recv);
+        let close_reply = tokio::spawn({
+            let client = new_client.clone();
+            async move {
+                let (mut send, mut recv) = client.accept_bi().await.unwrap();
+                assert!(matches!(
+                    control::recv_msg(&mut recv).await.unwrap(),
+                    ControlMsg::Close
+                ));
+                control::send_msg(&mut send, None, &ControlMsg::CloseAck)
+                    .await
+                    .unwrap();
+            }
+        });
         join_reply.await.unwrap();
+        close_reply.await.unwrap();
         let closed = tokio::time::timeout(Duration::from_secs(5), new_client.closed())
             .await
             .unwrap();

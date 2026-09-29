@@ -75,6 +75,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Pairing joins all shared networks when several joins reach the same coordinator
   at once. Concurrent joins reuse one mesh connection to that peer.
 
+- A duplicate mesh connection waits for earlier control streams to be read
+  before closing, with a 10 second limit if the peer does not acknowledge it.
+
 - Managed machines can join another network while already connected to its
   coordinator through a different network.
 

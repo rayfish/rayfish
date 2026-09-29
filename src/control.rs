@@ -337,6 +337,10 @@ pub enum ControlMsg {
     NotSupported {
         msg_kind: String,
     },
+    /// Retire this physical mesh connection after the receiver processes all
+    /// control streams opened before this one. The peer replies on this stream.
+    Close,
+    CloseAck,
 }
 
 fn default_receive_mtu() -> u16 {
