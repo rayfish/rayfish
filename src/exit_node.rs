@@ -288,10 +288,10 @@ pub fn exclude_from_tunnel(ips: &[IpAddr]) {
         );
     }
     drop(excluded);
-    if added > 0 {
-        if let Err(error) = pf_client::refresh_client_filter() {
-            tracing::warn!(%error, "could not refresh transport exclusions");
-        }
+    if added > 0
+        && let Err(error) = pf_client::refresh_client_filter()
+    {
+        tracing::warn!(%error, "could not refresh transport exclusions");
     }
 }
 
