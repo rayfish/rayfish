@@ -1435,6 +1435,9 @@ pub struct InactiveNetwork {
 pub struct NetworkStatus {
     pub name: String,
     pub role: NetworkRole,
+    /// Admission mode, known only to a coordinator. Members do not receive it.
+    #[serde(default)]
+    pub mode: Option<GroupMode>,
     pub my_ipv6: Ipv6Addr,
     pub my_hostname: Option<String>,
     pub network_key: Option<String>,
@@ -2570,6 +2573,7 @@ mod tests {
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,
+                mode: Some(GroupMode::Restricted),
                 my_ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5),
                 my_hostname: Some("alice".to_string()),
                 network_key: Some("abc123".to_string()),

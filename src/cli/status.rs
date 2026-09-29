@@ -238,9 +238,15 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
             // deliberately does not load (the daemon is down and the config is
             // all we have). The name and member count are what the listing is
             // for; `ray status --with-ips` with the daemon up prints the address.
+            let mode = net
+                .network_secret_key
+                .as_ref()
+                .map(|_| mode_label(Some(net.group_mode)))
+                .unwrap_or("mode unknown");
             println!(
-                "    {}  {}",
+                "    {}  {}  {}",
                 style::value(&net.name),
+                style::marker(mode),
                 style::faint(&format!("{} members", net.members.len()))
             );
         }
@@ -552,6 +558,14 @@ fn inactive_network_block(net: &ipc::InactiveNetwork, with_ips: bool) -> String 
 ///
 /// Built as a string rather than printed so the flags can be tested, the way the
 /// peer rows already are.
+fn mode_label(mode: Option<GroupMode>) -> &'static str {
+    match mode {
+        Some(GroupMode::Open) => "open",
+        Some(GroupMode::Restricted) => "closed",
+        None => "mode unknown",
+    }
+}
+
 fn network_header(net: &ipc::NetworkStatus, live: Liveness, with_ips: bool) -> String {
     use std::fmt::Write as _;
 
@@ -566,7 +580,13 @@ fn network_header(net: &ipc::NetworkStatus, live: Liveness, with_ips: bool) -> S
         Liveness::Live => style::bold(&net.name),
         _ => style::faint(&net.name),
     };
-    let mut out = format!("  {}  {}", name, style::marker(&role));
+    let mode = mode_label(net.mode);
+    let mut out = format!(
+        "  {}  {}  {}",
+        name,
+        style::marker(&role),
+        style::marker(mode)
+    );
     match live {
         Liveness::Live => {}
         Liveness::Connecting => {
@@ -1217,6 +1237,7 @@ mod grouping_tests {
         ipc::NetworkStatus {
             name: "n".to_string(),
             role: ipc::NetworkRole::Coordinator,
+            mode: Some(GroupMode::Restricted),
             my_ipv6: "200::1".parse().unwrap(),
             my_hostname: Some(my_hostname.to_string()),
             network_key: None,
@@ -1463,6 +1484,19 @@ mod grouping_tests {
         assert!(!out.contains("ray update"), "{out}");
     }
 
+    #[test]
+    fn network_header_shows_known_mode_and_unknown_member_mode() {
+        let mut n = net("laptop", vec![]);
+        assert!(network_header(&n, Liveness::Live, false).contains("closed"));
+
+        n.mode = Some(GroupMode::Open);
+        assert!(network_header(&n, Liveness::Live, false).contains("open"));
+
+        n.role = ipc::NetworkRole::Member;
+        n.mode = None;
+        assert!(network_header(&n, Liveness::Live, false).contains("unknown"));
+    }
+
     /// A saved network the daemon never registered still has to appear. The
     /// daemon reports it (the CLI cannot read the daemon's config: on macOS it
     /// is root-owned and `ray status` runs as someone else), and the reason it
@@ -1529,6 +1563,7 @@ mod grouping_tests {
         let mut n = net("laptop", peers);
         n.name = "homelab".to_string();
         n.role = ipc::NetworkRole::Member;
+        n.mode = None;
         n.network_key = Some("ray1abcd".to_string());
         n
     }

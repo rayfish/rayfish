@@ -149,13 +149,16 @@ impl Daemon {
             })
         };
 
-        let (members, member_count, pending_suggestions, pending_requests) = {
+        let (members, member_count, pending_suggestions, pending_requests, mode) = {
             let s = match h.state.read() {
                 Ok(s) => s,
                 Err(_) => {
                     return NetworkStatus {
                         name: h.name.clone(),
                         role,
+                        mode: net_cfg
+                            .as_ref()
+                            .and_then(|n| n.network_secret_key.as_ref().map(|_| n.group_mode)),
                         my_ipv6: derive_ipv6(&my_id),
                         my_hostname: None,
                         network_key: Some(h.network_key.to_string()),
@@ -177,6 +180,7 @@ impl Daemon {
                 count,
                 s.pending_suggestions.len(),
                 s.pending.len(),
+                s.network_secret_key.as_ref().map(|_| s.mode),
             )
         };
         // Index live connections by endpoint id for a fast lookup.
@@ -261,6 +265,7 @@ impl Daemon {
         NetworkStatus {
             name: h.name.clone(),
             role,
+            mode,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
             my_hostname: lookup_hostname(self.transport.identity.local_identity()),
             network_key: Some(h.network_key.to_string()),
@@ -1042,6 +1047,7 @@ pub(crate) fn saved_network_status(
     NetworkStatus {
         name: net.name.clone(),
         role,
+        mode: net.network_secret_key.as_ref().map(|_| net.group_mode),
         my_ipv6: derive_ipv6(&my_id),
         my_hostname: net.my_hostname.clone(),
         network_key: net.network_public_key.map(|k| k.to_string()),
@@ -1345,6 +1351,7 @@ mod saved_network_tests {
         let status = saved_network_status(&cfg, me);
 
         assert_eq!(status.name, "homelab");
+        assert_eq!(status.mode, None);
         assert_eq!(status.my_ipv6, derive_ipv6(&me));
         // Self is not a peer of itself.
         assert_eq!(status.peers.len(), 1);
@@ -1363,10 +1370,13 @@ mod saved_network_tests {
         let me = iroh::SecretKey::generate().public();
         let cfg = config::NetworkConfig {
             name: "homelab".to_string(),
+            group_mode: GroupMode::Open,
             network_secret_key: Some(iroh::SecretKey::generate()),
             ..Default::default()
         };
-        assert!(saved_network_status(&cfg, me).role.is_coordinator());
+        let status = saved_network_status(&cfg, me);
+        assert!(status.role.is_coordinator());
+        assert_eq!(status.mode, Some(GroupMode::Open));
     }
 
     /// A `ray connect` link is tagged `direct` wherever it renders, including

@@ -1335,6 +1335,7 @@ mod tests {
         ipc::NetworkStatus {
             name: "n".to_string(),
             role: ipc::NetworkRole::Member,
+            mode: None,
             my_ipv6: "200::1".parse().unwrap(),
             my_hostname: my_hostname.map(|s| s.to_string()),
             network_key: None,

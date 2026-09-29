@@ -1655,6 +1655,7 @@ mod network_state_tests {
         NetworkStatus {
             name: name.to_string(),
             role: NetworkRole::Member,
+            mode: None,
             my_ipv6: Ipv6Addr::LOCALHOST,
             my_hostname: Some("phone".to_string()),
             network_key: None,
