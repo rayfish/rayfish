@@ -406,7 +406,7 @@ pub(crate) async fn announce_network_handles(
         None,
         &ControlMsg::NetworkHandles {
             entries,
-            features: transport::FEATURE_IDLE_CLOSE,
+            features: transport::FEATURE_IDLE_CLOSE | transport::FEATURE_EXIT_IPV4,
             receive_mtu: peers.local_mtu(),
         },
     )

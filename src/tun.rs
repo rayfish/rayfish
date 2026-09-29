@@ -463,22 +463,12 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
     ("-inet6", "8000::/1"),
 ];
 
-/// Routes all traffic into the TUN via the [`SPLIT_DEFAULT`] half-space routes
-/// (the exit-node client full tunnel). Delete-then-add, so it is idempotent
-/// across re-applies. The caller is responsible for loop prevention *before*
-/// this goes in: from here on, everything the routing table decides, including
-/// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
-///
-/// Only the halves of the families the tunnel actually carries go in
-/// (`ExitFamilies::tunnelled`: what this node's data plane routes, intersected
-/// with what the gateway says it can return). That is `::/1` + `8000::/1`, or
-/// nothing at all: the overlay carries no IPv4, so IPv4 egress stays with
-/// whoever owns `100.64.0.0/10` here. Unlike Linux, no hole has to be
-/// punched for that VPN's own prefixes: the split default lives in the one routing
-/// table, where its more specific routes already win.
+/// Capture both families, including any family the selected exit cannot carry.
+/// The caller installs loop prevention and direct-egress protection first.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_default_via_tun(tun_name: &str, carries: ExitFamilies) -> Result<()> {
-    for step in split_default_plan(carries, tun_name) {
+pub async fn route_default_via_tun(tun_name: &str, _carries: ExitFamilies) -> Result<()> {
+    crate::exit_node::configure_client_ipv4(tun_name, true)?;
+    for step in split_default_plan(ExitFamilies::Dual, tun_name) {
         let _ = Command::new("route").args(&step.delete).status();
         let Some(add) = &step.add else { continue };
         let status = Command::new("route")
@@ -541,6 +531,7 @@ fn split_default_plan(carries: ExitFamilies, tun_name: &str) -> [SplitDefaultSte
 /// the other one still clears what the last left behind.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn unroute_default_via_tun(tun_name: &str) {
+    let _ = crate::exit_node::configure_client_ipv4(tun_name, false);
     for (family, net) in SPLIT_DEFAULT {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])

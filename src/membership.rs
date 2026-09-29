@@ -58,20 +58,13 @@ pub enum ExitFamilies {
     /// The gateway can egress IPv4 only.
     #[serde(rename = "4")]
     V4,
-    /// The gateway has an IPv6 uplink to masquerade onto. The only claim a
-    /// gateway makes about itself now that the overlay carries no IPv4: there is
-    /// no second family for it to offer, so "IPv6 only" is the whole of a working
-    /// gateway rather than half of one.
+    /// The gateway can egress IPv6 only.
     #[serde(rename = "6")]
     V6,
     /// The gateway can egress both families.
     #[serde(rename = "d")]
     Dual,
-    /// The gateway can egress neither: it has no IPv6 uplink, and the overlay
-    /// carries no IPv4 for it to offer instead.
-    ///
-    /// Distinct from [`Self::Unknown`], which is the absence of a claim. This is
-    /// a claim, and the claim is "nothing". Every client refuses it.
+    /// Neither uplink is available. A selected exit stays blocked until it recovers.
     #[serde(rename = "n")]
     Neither,
 }
@@ -96,40 +89,19 @@ impl ExitFamilies {
         matches!(self, Self::Unknown)
     }
 
-    /// What a client tunnel through this gateway actually carries.
-    ///
-    /// Only ever [`Self::V6`] or [`Self::Neither`]: the overlay carries no IPv4,
-    /// so a client cannot source transit from a mesh IPv4 whatever the gateway
-    /// claims, and a claim of [`Self::V4`] or [`Self::Dual`] narrows to its IPv6
-    /// half. A tunnel that carries nothing is not a tunnel, so `Neither` is what
-    /// the caller refuses on.
-    ///
-    /// [`Self::Unknown`] counts as "can carry": the claim is absent on every
-    /// network whose coordinator predates the field, and narrowing a tunnel on
-    /// the strength of nothing would quietly stop tunnelling a family that works.
+    /// Families offered by a gateway. Older gateways without a claim keep
+    /// their IPv6 behavior; IPv4 requires an explicit offer.
     pub fn tunnelled(self) -> Self {
-        if self.is_unknown() || self.carries_v6() {
-            Self::V6
-        } else {
-            Self::Neither
-        }
+        if self.is_unknown() { Self::V6 } else { self }
     }
 
-    /// The claim a gateway makes about itself: whether it found an IPv6 default
-    /// route to masquerade onto.
-    ///
-    /// Only [`Self::V6`] or [`Self::Neither`] is produced. The IPv4 half of the
-    /// old claim is gone with the overlay's IPv4: a gateway assigns no mesh IPv4
-    /// and installs no `100.64.0.0/10` route, so an un-NATted IPv4 reply has no
-    /// way back into its TUN and it could never honestly claim to carry that
-    /// family. `Neither` is not a theoretical corner: it is what a host with no
-    /// IPv6 uplink is, and refusing it is the whole point of the type.
-    ///
-    /// [`Self::V4`] and [`Self::Dual`] survive as *decodable* variants because
-    /// this rides the signed roster and a claim is read as well as written;
-    /// [`Self::tunnelled`] narrows either to IPv6.
-    pub fn from_uplink(has_v6: bool) -> Self {
-        if has_v6 { Self::V6 } else { Self::Neither }
+    pub fn from_uplinks(has_v4: bool, has_v6: bool) -> Self {
+        match (has_v4, has_v6) {
+            (true, true) => Self::Dual,
+            (true, false) => Self::V4,
+            (false, true) => Self::V6,
+            (false, false) => Self::Neither,
+        }
     }
 }
 
@@ -159,7 +131,7 @@ pub struct Member {
     #[serde(default)]
     pub exit_node: bool,
     /// Which families the exit node this member offers can egress, i.e. whether
-    /// that host has an IPv6 default route to masquerade onto. Meaningless unless
+    /// that host has default routes to masquerade onto. Meaningless unless
     /// `exit_node`.
     ///
     /// Separate from `exit_node` because a client can only use a gateway that
@@ -1488,16 +1460,12 @@ mod tests {
     /// IPv4 whatever the gateway claims. A claim that includes IPv4 narrows to
     /// its IPv6 half rather than being taken at face value.
     #[test]
-    fn a_tunnel_carries_ipv6_or_nothing() {
+    fn a_tunnel_carries_the_advertised_families() {
         use ExitFamilies::{Dual, Neither, Unknown, V4, V6};
 
-        assert_eq!(
-            Dual.tunnelled(),
-            V6,
-            "the IPv4 half has nowhere to come back"
-        );
+        assert_eq!(Dual.tunnelled(), Dual);
         assert_eq!(V6.tunnelled(), V6);
-        assert_eq!(V4.tunnelled(), Neither, "nothing left to install");
+        assert_eq!(V4.tunnelled(), V4);
         assert_eq!(Neither.tunnelled(), Neither);
 
         // No claim means no narrowing: every network whose coordinator predates

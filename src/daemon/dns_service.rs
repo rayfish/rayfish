@@ -495,26 +495,8 @@ impl DnsService {
         });
     }
 
-    /// Re-apply the current OS-DNS configuration in place (no re-detect, no
-    /// re-capture of upstreams), then put the search domains back.
-    ///
-    /// Called when the exit-node full-tunnel state flips, so the macOS
-    /// configurator rewrites its match domains: catch-all (route all DNS through
-    /// Magic DNS, forwarded upstream via the tunnel) while an exit is up,
-    /// `.ray`-only split DNS otherwise. Also how [`run_sc_reassert`] repairs a
-    /// deleted configuration. No-op if DNS was never configured.
-    ///
-    /// The second half is not optional. `apply` writes the whole key from
-    /// scratch and the only search domain it knows is `.ray` itself; the
-    /// per-network ones that make a bare `box` resolve arrive separately, via
-    /// `set_search_domains`, and a re-apply that did not reinstall them would
-    /// drop every one until the next join or leave.
-    ///
-    /// macOS-only: it is the only platform whose exit-node client rewrites match
-    /// domains, so elsewhere this is dead code and `-D warnings` says so.
-    ///
-    /// [`run_sc_reassert`]: DnsService::run_sc_reassert
-    #[cfg(target_os = "macos")]
+    /// Reapply DNS routing domains after the exit selection changes.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) async fn reassert_os_config(&self, tun_name: &str) {
         // Clone the Arc out, not the guard, so the lock isn't held across await.
         let configurator = self.configurator.lock().unwrap().clone();
@@ -531,15 +513,6 @@ impl DnsService {
         {
             tracing::warn!(error = %e, "failed to reinstall search domains after re-applying system DNS");
         }
-    }
-
-    /// The active OS-DNS backend's name, or `None` before `configure` / after
-    /// `revert`. Used to say whether a change that only affects the daemon's own
-    /// forwarder can actually reach an application's queries: on a split-DNS
-    /// backend only `.ray` is routed to us, so everything else bypasses it.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn backend_name(&self) -> Option<&'static str> {
-        self.configurator.lock().unwrap().as_ref().map(|c| c.name())
     }
 
     /// Revert the OS-DNS changes made by [`configure`](Self::configure): stop the

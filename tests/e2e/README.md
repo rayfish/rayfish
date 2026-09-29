@@ -64,12 +64,11 @@ Real droplets, one fleet per scenario. Needs `doctl` authenticated (`doctl auth
 init`, then `doctl account get` should work) and at least one SSH key on the
 account.
 
-Droplets are created with `--enable-ipv6`, which matters more than it looks:
-the overlay is IPv6-only and `exit-node/run.sh` **skips** its egress assertions
-on a host with no v6 internet, so a fleet without IPv6 makes that suite pass
-without testing the tunnel. IPv6 is settable only at create time, so a fleet
-provisioned without it is easier to destroy and recreate than to fix. Provision
-warns when a droplet comes up without a v6 address.
+Droplets are created with `--enable-ipv6`. The exit test always checks IPv4;
+IPv6 is checked when the gateway has an uplink and must stay blocked otherwise.
+The cloud harness adds a test-only SSH transport mark to stay connected while
+client direct egress is blocked. `tests/exit-ipv4-kernel.sh` tests kernel NAT and
+route-loss protection locally with no external network.
 
 Unlike some providers, DigitalOcean injects **no** SSH key unless `--ssh-keys`
 names one, so the provisioner passes every key on the account by default

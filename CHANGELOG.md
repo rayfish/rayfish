@@ -8,12 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
+  with only an IPv4 internet connection.
+
 - `ray fw` is an alias for `ray firewall`.
 
 - The macOS app checks for stable updates and installs them when it quits. Use
   "Check for Updates" in the app menu to check at any time.
 
 ### Changed
+
+- Selecting an exit node captures both IP families and DNS. Unsupported families
+  and unavailable exits stay blocked until the exit is cleared. Transport traffic
+  remains outside the tunnel. Android exit routing is deferred.
 
 - `ray firewall show` displays peer hostnames when known, falling back to short
   identities for unresolved peers. JSON output keeps identities.

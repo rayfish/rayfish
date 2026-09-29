@@ -1481,10 +1481,9 @@ fn install_panic_hook() {
         rayfish::dns::config::emergency_restore_resolv_conf();
 
         // Remove the exit-node kernel state: the forwarding/NAT (restoring the
-        // sysctls) so a crash can't leave the host an open router, and the client
-        // full-tunnel rules, which would otherwise outlive the TUN they point at.
+        // sysctls) so a crash cannot leave the host an open router.
         rayfish::exit_node::disable();
-        rayfish::exit_node::teardown_client_routing();
+        // Keep the client firewall across a crash so traffic cannot fall back to direct egress.
 
         // Print the standard panic message to stderr (journal), then fail fast so
         // the service manager restarts the daemon cleanly.
