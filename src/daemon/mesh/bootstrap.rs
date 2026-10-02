@@ -710,7 +710,7 @@ async fn build_daemon_inner(
     let daemon = Arc::new(Daemon {
         transport,
         registry,
-        rtt_history: Mutex::new(Default::default()),
+        connection_history: Mutex::new(Default::default()),
         paired_network_joins: Arc::new(DashSet::new()),
         stats: Arc::clone(&stats),
         start: Instant::now(),

@@ -19,6 +19,9 @@ pub enum DropReason {
     SendFailure,
     NoPeer,
     Malformed,
+    /// The per-peer dispatch queue filled while that peer was waiting for room
+    /// in its QUIC datagram queue. Only traffic for that peer is dropped.
+    Backpressure,
     /// Inbound datagram whose source IP did not match the sending peer's
     /// assigned mesh address (ingress anti-spoofing). A peer may only inject
     /// packets sourced from its own mesh IP.
@@ -49,11 +52,12 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    const ALL: [DropReason; 12] = [
+    const ALL: [DropReason; 13] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
         DropReason::Malformed,
+        DropReason::Backpressure,
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
@@ -426,6 +430,7 @@ mod tests {
                 | DropReason::SendFailure
                 | DropReason::NoPeer
                 | DropReason::Malformed
+                | DropReason::Backpressure
                 | DropReason::Spoof
                 | DropReason::ExitDenied
                 | DropReason::ReassemblyTimeout

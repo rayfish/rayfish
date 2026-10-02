@@ -741,7 +741,7 @@ struct TunTasks {
 
 pub struct Daemon {
     /// Recent RTT samples per peer, shared by successive status requests.
-    rtt_history: Mutex<mesh::diagnostics::RttHistory>,
+    connection_history: Mutex<mesh::diagnostics::ConnectionHistory>,
     /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
     /// contact id), grouped so extracted services can depend on `Arc<Transport>`
     /// instead of the whole daemon. During the service-decomposition transition
