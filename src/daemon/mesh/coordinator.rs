@@ -9,6 +9,11 @@ use std::net::Ipv6Addr;
 
 use super::super::*;
 
+/// Maximum time one serialized mesh dial may own or wait for a peer's dial gate.
+/// The bound covers the transport connection and mesh registration so a stalled
+/// attempt cannot block every later reconnect and on-demand dial to that peer.
+const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct NetworkToNullify {
     name: String,
     state: SharedNetworkState,
@@ -383,6 +388,30 @@ impl NetworkRegistry {
     /// per shared network. Returns whether a live connection was established. Shared
     /// by the reconnect loop and the on-demand lazy dialer.
     pub(crate) async fn dial_peer_once(
+        self: &Arc<Self>,
+        peer_id: EndpointId,
+        targets: &[DialTarget],
+    ) -> bool {
+        match tokio::time::timeout(
+            MESH_DIAL_TIMEOUT,
+            self.dial_peer_once_inner(peer_id, targets),
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(_) => {
+                self.reachability.note_fail(peer_id);
+                tracing::debug!(
+                    peer = %peer_id.fmt_short(),
+                    timeout_secs = MESH_DIAL_TIMEOUT.as_secs(),
+                    "mesh dial timed out"
+                );
+                false
+            }
+        }
+    }
+
+    async fn dial_peer_once_inner(
         self: &Arc<Self>,
         peer_id: EndpointId,
         targets: &[DialTarget],
@@ -862,6 +891,7 @@ mod sender_authority_tests {
             approved: ApprovedList::new(),
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
+            destroyed: false,
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,

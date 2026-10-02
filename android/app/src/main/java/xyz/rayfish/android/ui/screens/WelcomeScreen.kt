@@ -47,7 +47,7 @@ fun WelcomeScreen(onDone: () -> Unit) {
                 SectionLabel(stringResource(xyz.rayfish.android.R.string.label_this_device))
                 Text(
                     stringResource(xyz.rayfish.android.R.string.welcome_body),
-                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted,
+                    fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted,
                 )
                 Spacer(Modifier.height(14.dp))
                 PillButton(
@@ -66,7 +66,7 @@ fun WelcomeScreen(onDone: () -> Unit) {
                 Spacer(Modifier.height(10.dp))
                 Text(
                     stringResource(xyz.rayfish.android.R.string.welcome_restore_hint),
-                    fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
+                    fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Faint,
                 )
             }
             Spacer(Modifier.weight(1f))

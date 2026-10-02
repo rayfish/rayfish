@@ -6,7 +6,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use anyhow::Result;
-use rayfish::config::ServerOverride;
+use rayfish::config::{AppConfig, ServerOverride};
 use rayfish::exit_node::{
     ExitServer, disable, install_client_routing, ipv4, teardown_client_routing,
 };
@@ -202,18 +202,20 @@ while True:
         replace: true,
         servers: Vec::new(),
     };
-    let dns_servers = ServerOverride {
-        replace: true,
-        servers: vec!["8.8.8.8".to_owned()],
+    let settings = AppConfig {
+        relay: empty.clone(),
+        discovery_dns: empty,
+        dns_upstreams: ServerOverride {
+            replace: true,
+            servers: vec!["8.8.8.8".to_owned()],
+        },
+        ..AppConfig::default()
     };
     let (endpoint, _) = rayfish::transport::create_endpoint_with_alpns(
         iroh::SecretKey::generate(),
         vec![b"test/1".to_vec()],
         false,
-        &empty,
-        &empty,
-        &dns_servers,
-        Vec::new(),
+        &settings,
     )
     .await?;
     let addresses: Vec<_> = endpoint

@@ -14,12 +14,25 @@ SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 ElementTree.register_namespace("sparkle", SPARKLE_NS)
 
 
+def release_notes(changelog: Path, version: str) -> str:
+    text = changelog.read_text()
+    match = re.search(
+        rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if match is None or not match.group(1).strip():
+        raise ValueError(f"release notes for {version} are missing")
+    return match.group(1).strip()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sign-update", type=Path, required=True)
     parser.add_argument("--key", type=Path, required=True)
     parser.add_argument("--app", type=Path, required=True)
     parser.add_argument("--dmg", type=Path, required=True)
+    parser.add_argument("--changelog", type=Path, required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--arch", choices=("arm64", "x86_64"), required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -72,6 +85,9 @@ def main() -> None:
     ElementTree.SubElement(channel, "title").text = "Rayfish updates"
     item = ElementTree.SubElement(channel, "item")
     ElementTree.SubElement(item, "title").text = f"Rayfish {args.tag[1:]}"
+    ElementTree.SubElement(item, "description", {f"{{{SPARKLE_NS}}}format": "markdown"}).text = release_notes(
+        args.changelog, args.tag[1:]
+    )
     ElementTree.SubElement(item, f"{{{SPARKLE_NS}}}version").text = build
     ElementTree.SubElement(item, f"{{{SPARKLE_NS}}}shortVersionString").text = args.tag[1:]
     ElementTree.SubElement(item, f"{{{SPARKLE_NS}}}minimumSystemVersion").text = "13.0"

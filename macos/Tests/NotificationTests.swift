@@ -26,15 +26,31 @@ struct NotificationTests {
         precondition(tracker.update(status).added.isEmpty)
         print("PASS: first snapshot notifies pending events, skips old completed files and ignores repeated polls")
 
+        status.files?.append(ProviderFile(transferId: 11, peer: "friend", filename: "moving.jpg", size: 100,
+                                          state: .transferring, transferred: 25))
+        let started = tracker.update(status)
+        precondition(started.added.count == 1 && started.added[0].body.contains("25%"))
+        status.files?[2].transferred = 50
+        let progress = tracker.update(status)
+        precondition(progress.added.isEmpty && progress.updated.count == 1)
+        precondition(progress.updated[0].body.contains("50%") && progress.alertingUpdates.isEmpty)
+        status.files?[2].state = .received
+        status.files?[2].destination = "/path/to/work/moving.jpg"
+        let completed = tracker.update(status)
+        precondition(completed.updated.count == 1 && completed.updated[0].title == "File received")
+        precondition(completed.alertingUpdates.contains(completed.updated[0].id))
+
         status.pendingRequests.append(ProviderJoinRequest(network: "other", id: "abc", hostname: "studio", waitingSecs: 1))
         precondition(tracker.update(status).added.count == 1)
-        status.files?.append(ProviderFile(transferId: 10, peer: "friend", filename: "auto.jpg", size: 42, state: .received))
+        status.files?.append(ProviderFile(transferId: 10, peer: "friend", filename: "auto.jpg", size: 42,
+                                          state: .received, destination: "/path/to/work/auto.jpg"))
         let received = tracker.update(status)
         precondition(received.added.count == 1 && received.added[0].title == "File received")
+        precondition(received.added[0].destination == "/path/to/work/auto.jpg")
         status.pendingRequests = []
         status.connectionRequests = []
         status.files = []
-        precondition(tracker.update(status).removed.count == 6)
+        precondition(tracker.update(status).removed.count == 4)
         precondition(tracker.update(status).added.isEmpty)
         _ = tracker.update(nil)
         status.files = [ProviderFile(transferId: 1, peer: "friend", filename: "photo.jpg", size: 42, state: .pending)]

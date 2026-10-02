@@ -3,6 +3,155 @@
 use crate::*;
 use ipc::{GlobalKey, NetworkKey, NodeKey};
 
+#[derive(serde::Serialize)]
+struct FilesOutput<'a> {
+    pending: Vec<PendingFileRow<'a>>,
+    queued: Vec<QueuedFileRow<'a>>,
+    #[serde(skip)]
+    transfers: &'a [ipc::TransferFileInfo],
+}
+
+#[derive(serde::Serialize)]
+struct PendingFileRow<'a> {
+    id: u64,
+    from: &'a str,
+    filename: &'a str,
+    size: u64,
+    mime_type: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct QueuedFileRow<'a> {
+    id: u64,
+    to: &'a str,
+    filename: &'a str,
+    size: u64,
+}
+
+impl<'a> FilesOutput<'a> {
+    fn new(
+        files: &'a [ipc::PendingFileInfo],
+        outbox: &'a [ipc::OutboxFileInfo],
+        transfers: &'a [ipc::TransferFileInfo],
+    ) -> Self {
+        Self {
+            pending: files
+                .iter()
+                .map(|f| PendingFileRow {
+                    id: f.id,
+                    from: &f.from,
+                    filename: &f.filename,
+                    size: f.size,
+                    mime_type: &f.mime_type,
+                })
+                .collect(),
+            queued: outbox
+                .iter()
+                .map(|f| QueuedFileRow {
+                    id: f.id,
+                    to: &f.peer,
+                    filename: &f.filename,
+                    size: f.size,
+                })
+                .collect(),
+            transfers,
+        }
+    }
+}
+
+impl DisplayOut for FilesOutput<'_> {
+    fn print_human(&self) {
+        if self.pending.is_empty() && self.queued.is_empty() && self.transfers.is_empty() {
+            println!("\n  {}\n", style::faint("no pending file transfers"));
+            return;
+        }
+        if !self.pending.is_empty() {
+            let rows = self
+                .pending
+                .iter()
+                .map(|f| {
+                    let accept = format!("ray files accept {}", f.id);
+                    vec![
+                        layout::Cell::new(f.id.to_string(), style::rose(&f.id.to_string())),
+                        layout::Cell::new(f.from.to_string(), style::value(f.from)),
+                        layout::Cell::right(
+                            format_size(f.size),
+                            style::faint(&format_size(f.size)),
+                        ),
+                        layout::Cell::new(f.filename.to_string(), style::value(f.filename)),
+                        layout::Cell::new(accept.clone(), style::faint(&accept)),
+                    ]
+                })
+                .collect();
+            println!();
+            print!("{}", table(&["id", "from", "size", "file", ""], rows, 2));
+        }
+        if !self.queued.is_empty() {
+            let rows = self
+                .queued
+                .iter()
+                .map(|f| {
+                    let cancel = format!("ray files cancel {}", f.id);
+                    vec![
+                        layout::Cell::new(f.id.to_string(), style::rose(&f.id.to_string())),
+                        layout::Cell::new(f.to.to_string(), style::value(f.to)),
+                        layout::Cell::right(
+                            format_size(f.size),
+                            style::faint(&format_size(f.size)),
+                        ),
+                        layout::Cell::new(f.filename.to_string(), style::value(f.filename)),
+                        layout::Cell::new(cancel.clone(), style::faint(&cancel)),
+                    ]
+                })
+                .collect();
+            println!();
+            println!(
+                "  {}",
+                style::faint("queued sends (deliver when the peer comes online)")
+            );
+            print!("{}", table(&["id", "to", "size", "file", ""], rows, 2));
+        }
+        if !self.transfers.is_empty() {
+            let rows = self
+                .transfers
+                .iter()
+                .map(|t| {
+                    let state = format!("{:?}", t.state).to_lowercase();
+                    let action = if t.outgoing
+                        && matches!(
+                            t.state,
+                            ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
+                        ) {
+                        format!("ray files cancel-transfer {}", t.id)
+                    } else {
+                        String::new()
+                    };
+                    vec![
+                        layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
+                        layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
+                        layout::Cell::right(
+                            format!("{} / {}", format_size(t.transferred), format_size(t.size)),
+                            style::faint(&format_size(t.size)),
+                        ),
+                        layout::Cell::new(
+                            format!("{} ({state})", t.filename),
+                            style::value(&t.filename),
+                        ),
+                        layout::Cell::new(action.clone(), style::faint(&action)),
+                    ]
+                })
+                .collect();
+            println!();
+            println!("  {}", style::faint("transfers"));
+            print!(
+                "{}",
+                table(&["id", "peer", "progress", "file", ""], rows, 2)
+            );
+        }
+        println!();
+    }
+}
+
 /// `ray send <peer> <files...>`: one `SendFileFd` request per file. Each file
 /// gets its own IPC connection (the protocol is one request per connection);
 /// a failure on one file still sends the rest.
@@ -230,131 +379,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     outbox,
                     transfers,
                 } => {
-                    if json_enabled() {
-                        let inbound: Vec<_> = files
-                            .iter()
-                            .map(|f| {
-                                serde_json::json!({
-                                    "id": f.id, "from": f.from, "filename": f.filename,
-                                    "size": f.size, "mime_type": f.mime_type,
-                                })
-                            })
-                            .collect();
-                        let queued: Vec<_> = outbox
-                            .iter()
-                            .map(|f| {
-                                serde_json::json!({
-                                    "id": f.id, "to": f.peer, "filename": f.filename,
-                                    "size": f.size,
-                                })
-                            })
-                            .collect();
-                        print_json(&serde_json::json!({"pending": inbound, "queued": queued}));
-                    } else if files.is_empty() && outbox.is_empty() && transfers.is_empty() {
-                        println!("\n  {}\n", style::faint("no pending file transfers"));
-                    } else {
-                        if !files.is_empty() {
-                            let rows = files
-                                .iter()
-                                .map(|f| {
-                                    let accept = format!("ray files accept {}", f.id);
-                                    vec![
-                                        layout::Cell::new(
-                                            f.id.to_string(),
-                                            style::rose(&f.id.to_string()),
-                                        ),
-                                        layout::Cell::new(f.from.clone(), style::value(&f.from)),
-                                        layout::Cell::right(
-                                            format_size(f.size),
-                                            style::faint(&format_size(f.size)),
-                                        ),
-                                        layout::Cell::new(
-                                            f.filename.clone(),
-                                            style::value(&f.filename),
-                                        ),
-                                        layout::Cell::new(accept.clone(), style::faint(&accept)),
-                                    ]
-                                })
-                                .collect();
-                            println!();
-                            print!("{}", table(&["id", "from", "size", "file", ""], rows, 2));
-                        }
-                        if !outbox.is_empty() {
-                            let rows = outbox
-                                .iter()
-                                .map(|f| {
-                                    let cancel = format!("ray files cancel {}", f.id);
-                                    vec![
-                                        layout::Cell::new(
-                                            f.id.to_string(),
-                                            style::rose(&f.id.to_string()),
-                                        ),
-                                        layout::Cell::new(f.peer.clone(), style::value(&f.peer)),
-                                        layout::Cell::right(
-                                            format_size(f.size),
-                                            style::faint(&format_size(f.size)),
-                                        ),
-                                        layout::Cell::new(
-                                            f.filename.clone(),
-                                            style::value(&f.filename),
-                                        ),
-                                        layout::Cell::new(cancel.clone(), style::faint(&cancel)),
-                                    ]
-                                })
-                                .collect();
-                            println!();
-                            println!(
-                                "  {}",
-                                style::faint("queued sends (deliver when the peer comes online)")
-                            );
-                            print!("{}", table(&["id", "to", "size", "file", ""], rows, 2));
-                        }
-                        if !transfers.is_empty() {
-                            let rows = transfers
-                                .iter()
-                                .map(|t| {
-                                    let state = format!("{:?}", t.state).to_lowercase();
-                                    let action = if t.outgoing
-                                        && matches!(
-                                            t.state,
-                                            ipc::TransferFileState::Offered
-                                                | ipc::TransferFileState::Transferring
-                                        ) {
-                                        format!("ray files cancel-transfer {}", t.id)
-                                    } else {
-                                        String::new()
-                                    };
-                                    vec![
-                                        layout::Cell::new(
-                                            t.id.to_string(),
-                                            style::rose(&t.id.to_string()),
-                                        ),
-                                        layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
-                                        layout::Cell::right(
-                                            format!(
-                                                "{} / {}",
-                                                format_size(t.transferred),
-                                                format_size(t.size)
-                                            ),
-                                            style::faint(&format_size(t.size)),
-                                        ),
-                                        layout::Cell::new(
-                                            format!("{} ({state})", t.filename),
-                                            style::value(&t.filename),
-                                        ),
-                                        layout::Cell::new(action.clone(), style::faint(&action)),
-                                    ]
-                                })
-                                .collect();
-                            println!();
-                            println!("  {}", style::faint("transfers"));
-                            print!(
-                                "{}",
-                                table(&["id", "peer", "progress", "file", ""], rows, 2)
-                            );
-                        }
-                        println!();
-                    }
+                    printout(&FilesOutput::new(&files, &outbox, &transfers))?;
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),

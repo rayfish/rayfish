@@ -56,8 +56,6 @@ use anyhow::{Context, Result};
 use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::{Connection, Endpoint, VarInt};
 use iroh::{EndpointId, SecretKey};
-#[cfg(target_os = "android")]
-use iroh::{RelayConfig, RelayUrl};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
 use tokio::sync::Notify;
@@ -465,6 +463,8 @@ pub(crate) struct NetworkState {
     /// Serializes durable snapshot-pointer updates with DHT publication for this
     /// network. Clone the Arc under the state read lock, then await it separately.
     snapshot_commit: Arc<AsyncMutex<()>>,
+    /// Terminal even if an older snapshot commit is still in flight.
+    destroyed: bool,
     /// The hash of the signed record this state is converged on, which is not
     /// always the hash of [`Self::snapshot`].
     ///
@@ -740,6 +740,8 @@ struct TunTasks {
 }
 
 pub struct Daemon {
+    /// Recent RTT samples per peer, shared by successive status requests.
+    connection_history: Mutex<mesh::diagnostics::ConnectionHistory>,
     /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
     /// contact id), grouped so extracted services can depend on `Arc<Transport>`
     /// instead of the whole daemon. During the service-decomposition transition
@@ -765,6 +767,7 @@ pub struct Daemon {
     /// clones to services (FileService) and control readers (MemberAcceptState)
     /// so they call it directly instead of signalling the daemon over a channel.
     registry: Arc<NetworkRegistry>,
+    paired_network_joins: Arc<DashSet<EndpointId>>,
     shutdown_token: CancellationToken,
     protocol_router: Arc<ProtocolRouter>,
     /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
@@ -1016,7 +1019,12 @@ impl Daemon {
         // A dedicated child token so the data plane can be stopped independently
         // of a full daemon shutdown; it still cancels when `shutdown_token` does.
         let cancel = self.shutdown_token.child_token();
-        let writer_handle = forward::spawn_tun_writer(writer, new_rx, Arc::clone(&self.active));
+        let writer_handle = forward::spawn_tun_writer(
+            writer,
+            new_rx,
+            Arc::clone(&self.active),
+            Arc::clone(&self.stats),
+        );
         let mesh_handle = {
             let peers = self.registry.peers.clone();
             let firewall = self.registry.firewall.clone();
@@ -1103,8 +1111,16 @@ impl Daemon {
         self.attach_tun(reader, writer).await;
         self.active.store(true, Ordering::SeqCst);
         #[cfg(feature = "desktop")]
-        if config::load().is_ok_and(|settings| settings.ssh_enabled) {
-            self.start_ssh();
+        {
+            if config::load().is_ok_and(|settings| settings.ssh_enabled) {
+                self.start_ssh();
+            }
+            if config::load()
+                .map(|settings| settings.v4_bridge)
+                .unwrap_or(true)
+            {
+                self.start_v4_bridge();
+            }
         }
         self.registry.poll_nudge.notify_waiters();
     }
@@ -1119,7 +1135,10 @@ impl Daemon {
     /// underlying fds. Idempotent: a no-op if no interface is attached.
     pub fn detach_tun(&self) {
         #[cfg(feature = "desktop")]
-        self.stop_ssh();
+        {
+            self.stop_ssh();
+            self.stop_v4_bridge();
+        }
         self.active
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
@@ -1326,6 +1345,10 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
             config::DnsMode::Partial => "DNS limited to .ray names.".to_string(),
             config::DnsMode::Off => "DNS disabled.".to_string(),
         },
+        GlobalKey::QuicCongestion => format!(
+            "QUIC congestion controller set to {}. {restart}",
+            cfg.quic_congestion.as_ref()
+        ),
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {
@@ -1347,6 +1370,7 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         | GlobalKey::AutoUpdate
         | GlobalKey::OnDemand
         | GlobalKey::Ssh
+        | GlobalKey::SshPort
         | GlobalKey::V4Bridge
         | GlobalKey::PfPassthrough) => {
             if reset {
@@ -1836,6 +1860,7 @@ mod accept_handler_tests {
             approved: ApprovedList::new(),
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
+            destroyed: false,
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,
@@ -2105,8 +2130,6 @@ mod accept_handler_tests {
                 lan_peers: Arc::new(LanPeers::new()),
                 warm_lookup: iroh::address_lookup::memory::MemoryLookup::new(),
                 pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
-                #[cfg(target_os = "android")]
-                relay_configs: Vec::new(),
             },
         ));
         let hostname_table = dns::new_hostname_table();
@@ -3584,6 +3607,66 @@ mod headless_tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         false
+    }
+
+    #[cfg(feature = "desktop")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_tun_v4_bridge_follows_settings_and_tunnel_lifetime() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("create config directory");
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+        let daemon = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("headless startup must finish")
+            .expect("build the headless node");
+
+        for enabled in [true, false, true] {
+            config::update_settings(|cfg| {
+                cfg.v4_bridge = enabled;
+                Ok(())
+            })
+            .expect("save the bridge setting");
+            daemon
+                .attach_external_tun(
+                    FakeTunReader {
+                        _alive: Arc::new(()),
+                    },
+                    FakeTunWriter::default(),
+                )
+                .await;
+            let mut token = daemon.v4_bridge_token.lock().unwrap().clone();
+            assert_eq!(token.is_some(), enabled, "startup follows the setting");
+            if let Some(token) = &token {
+                assert!(!token.is_cancelled(), "the bridge is running");
+            }
+
+            if enabled {
+                assert!(matches!(
+                    daemon.v4_bridge_config_set("off"),
+                    IpcMessage::Ok { .. }
+                ));
+                assert!(
+                    token
+                        .as_ref()
+                        .expect("the bridge was running")
+                        .is_cancelled()
+                );
+                assert!(daemon.v4_bridge_token.lock().unwrap().is_none());
+                assert!(matches!(
+                    daemon.v4_bridge_config_set("on"),
+                    IpcMessage::Ok { .. }
+                ));
+                token = daemon.v4_bridge_token.lock().unwrap().clone();
+                assert!(!token.as_ref().expect("the bridge restarted").is_cancelled());
+            }
+
+            daemon.detach_tun();
+            assert!(daemon.v4_bridge_token.lock().unwrap().is_none());
+            if let Some(token) = token {
+                assert!(token.is_cancelled(), "disconnect stops the bridge");
+            }
+        }
     }
 
     /// Re-attaching the TUN after a `detach_tun` must resume forwarding to the

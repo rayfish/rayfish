@@ -433,14 +433,14 @@ impl Daemon {
 
     /// Apply the `ssh` settings key (`ray firewall ssh on|off`, `ray config set
     /// ssh <on|off>`), which is more than a config write: it also seeds/removes
-    /// the `allow in tcp:22` passthrough so SSH packets reach the listener under
+    /// the port's passthrough so SSH packets reach the listener under
     /// the deny-inbound default, and starts/stops the listeners if the data plane
     /// is active. The key is served here, not by the generic `config_apply` path,
     /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
     /// on its own leaves the node advertising SSH with nothing listening.
     pub fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
         // There is no Windows SSH server to start, so turning it on would write
-        // `ssh_enabled = true` and open port 22 for a listener that never
+        // `ssh_enabled = true` and open its port for a listener that never
         // arrives. Rejected before anything is persisted, so the config and the
         // firewall stay consistent with what the daemon can actually do.
         // `off` still goes through, so a config carried over from another
@@ -469,8 +469,11 @@ impl Daemon {
             Err(e) => return ipc_err(format!("failed to persist ssh setting: {e}")),
         };
         let enabled = app_config.ssh_enabled;
-        // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
-        let fw = self.registry.firewall.set_ssh_passthrough(enabled);
+        // Open/close the configured port at the packet layer.
+        let fw = self
+            .registry
+            .firewall
+            .set_ssh_passthrough(enabled, app_config.ssh_port);
         if let Err(e) = firewall::save_firewall(&fw) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
@@ -518,6 +521,48 @@ impl Daemon {
             message.push_str(&warning);
         }
         IpcMessage::Ok { message }
+    }
+
+    /// Change the port peers dial for mesh SSH without restarting its internal
+    /// listener. The packet rewrite and managed firewall rule change together.
+    pub fn ssh_port_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        let mut parse_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = settings::apply_global(cfg, GlobalKey::SshPort, value, false) {
+                parse_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = parse_err {
+            return ipc_err(e);
+        }
+        let app_config = match saved {
+            Ok(cfg) => cfg,
+            Err(e) => return ipc_err(format!("failed to persist ssh-port setting: {e}")),
+        };
+        let fw = self
+            .registry
+            .firewall
+            .set_ssh_passthrough(app_config.ssh_enabled, app_config.ssh_port);
+        if let Err(e) = firewall::save_firewall(&fw) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        crate::forward::set_ssh_nat_port(app_config.ssh_port);
+        #[cfg(all(target_os = "macos", feature = "desktop"))]
+        if self.active.load(Ordering::SeqCst)
+            && self.app_ssh_helper.load(Ordering::SeqCst)
+            && app_config.v4_bridge
+        {
+            self.stop_v4_bridge();
+            self.start_v4_bridge();
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "mesh SSH port set to {}. Connect with `ssh -p {} <user>@<host>.ray`.",
+                app_config.ssh_port, app_config.ssh_port
+            ),
+        }
     }
 
     /// Write the `pf-passthrough` setting and make the live pf anchor follow it.
@@ -694,7 +739,7 @@ impl Daemon {
             format!("ssh deny {peer} on {network}")
         };
         // Mirror of the `ssh on` nudge: a rule with the server off looks like it
-        // took effect, but `:22` still falls through to the host sshd (which
+        // took effect, but the port still falls through to the host service (which
         // asks for a password), so the failure doesn't point back here.
         if allow && !ssh_enabled {
             detail.push_str(
@@ -707,9 +752,10 @@ impl Daemon {
 
     /// Report the SSH server state + per-network allow lists.
     pub(crate) fn firewall_ssh_show(&self) -> IpcMessage {
-        let (enabled, networks) = match config::load() {
+        let (enabled, port, networks) = match config::load() {
             Ok(c) => (
                 c.ssh_enabled,
+                c.ssh_port,
                 c.networks
                     .into_iter()
                     .filter(|n| !n.ssh_allow.is_empty() || !n.managed_ssh_allow.is_empty())
@@ -727,9 +773,13 @@ impl Daemon {
                     })
                     .collect(),
             ),
-            Err(_) => (false, Vec::new()),
+            Err(_) => (false, crate::forward::SSH_PORT, Vec::new()),
         };
-        IpcMessage::FirewallSshState { enabled, networks }
+        IpcMessage::FirewallSshState {
+            enabled,
+            port,
+            networks,
+        }
     }
 }
 

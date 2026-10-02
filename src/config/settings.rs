@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 pub use ray_proto::settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
-use super::{AppConfig, DnsMode, NetworkConfig, ServerOverride};
+use super::{AppConfig, DnsMode, NetworkConfig, QuicCongestion, ServerOverride};
 use crate::firewall::{Action, FirewallConfig};
 
 /// Parse an on/off value. An empty value (what `ConfigUnset` sends) resets to
@@ -47,12 +47,37 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
                     .map_err(|_| anyhow::anyhow!("DNS mode must be on, partial, or off"))?
             }
         }
+        GlobalKey::QuicCongestion => {
+            cfg.quic_congestion = if value.trim().is_empty() {
+                QuicCongestion::default()
+            } else {
+                value.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("QUIC congestion controller must be cubic or loss-tolerant")
+                })?
+            }
+        }
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
-        // caller must also seed/remove the `allow in tcp:22` passthrough and
+        // caller must also seed/remove the passthrough for the configured port and
         // start/stop the live listener (see `Daemon::ssh_config_set`).
         GlobalKey::Ssh => cfg.ssh_enabled = parse_bool(value, false)?,
+        GlobalKey::SshPort => {
+            let port = if value.trim().is_empty() {
+                super::default_ssh_port()
+            } else {
+                value
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("ssh-port must be a TCP port from 1 to 65535"))?
+            };
+            anyhow::ensure!(port != 0, "ssh-port must be a TCP port from 1 to 65535");
+            anyhow::ensure!(
+                port != crate::forward::SSH_LISTEN_PORT,
+                "ssh-port cannot use Rayfish's internal SSH listener port"
+            );
+            cfg.ssh_port = port;
+        }
         // Like `ssh`, only half the work: the live bridge has to start or stop
         // with it (see `Daemon::v4_bridge_config_set`).
         GlobalKey::V4Bridge => cfg.v4_bridge = parse_bool(value, true)?,
@@ -140,9 +165,11 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
         GlobalKey::Dns => cfg.dns_mode.as_ref().to_string(),
+        GlobalKey::QuicCongestion => cfg.quic_congestion.as_ref().to_string(),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
+        GlobalKey::SshPort => cfg.ssh_port.to_string(),
         GlobalKey::V4Bridge => on_off(cfg.v4_bridge),
         GlobalKey::PfPassthrough => on_off(cfg.pf_passthrough),
         // Empty renders as unset, matching the `net.ephemeral-ttl` convention.
@@ -332,6 +359,19 @@ mod tests {
         assert!("hostname-default".parse::<NodeKey>().is_err());
     }
 
+    #[test]
+    fn ssh_port_accepts_an_alternate_port_and_resets_to_22() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, GlobalKey::SshPort, "2222", false).unwrap();
+        assert_eq!(render_global(&cfg, GlobalKey::SshPort), "2222");
+        for invalid in ["0", "65536", "30022", "invalid"] {
+            assert!(apply_global(&mut cfg, GlobalKey::SshPort, invalid, false).is_err());
+            assert_eq!(cfg.ssh_port, 2222);
+        }
+        apply_global(&mut cfg, GlobalKey::SshPort, "", false).unwrap();
+        assert_eq!(cfg.ssh_port, 22);
+    }
+
     /// No existing setter touches the outbound default; a key for it would be
     /// new user-facing surface, not a migration of an existing one (same rule as
     /// `hostname-default`).
@@ -447,6 +487,26 @@ mod tests {
         }
         apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
         assert_eq!(cfg.dns_mode, DnsMode::On);
+    }
+
+    #[test]
+    fn quic_congestion_defaults_cubic_and_round_trips() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(render_global(&cfg, GlobalKey::QuicCongestion), "cubic");
+        apply_global(&mut cfg, GlobalKey::QuicCongestion, "loss-tolerant", false).unwrap();
+        assert_eq!(cfg.quic_congestion, QuicCongestion::LossTolerant);
+        assert_eq!(
+            render_global(&cfg, GlobalKey::QuicCongestion),
+            "loss-tolerant"
+        );
+        // bbr3 was offered once and removed; it must not come back as a value.
+        for value in ["bbr3", "reno", "on", "LossTolerant"] {
+            let err = apply_global(&mut cfg, GlobalKey::QuicCongestion, value, false);
+            assert!(err.is_err(), "{value} must be rejected");
+        }
+        assert_eq!(cfg.quic_congestion, QuicCongestion::LossTolerant);
+        apply_global(&mut cfg, GlobalKey::QuicCongestion, "", false).unwrap();
+        assert_eq!(cfg.quic_congestion, QuicCongestion::Cubic);
     }
 
     #[test]

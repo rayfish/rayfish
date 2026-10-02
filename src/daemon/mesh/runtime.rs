@@ -231,6 +231,8 @@ impl NetworkRegistry {
             .clone()
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
+        self.check_destruction(name, net_public_key, Some(&net_secret_key))
+            .await?;
         let persisted_hostname = net_config.my_hostname.clone();
 
         // Restore membership from the authoritative published GroupBlob. The blob
@@ -262,6 +264,7 @@ impl NetworkRegistry {
             approved: approved_list,
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
+            destroyed: false,
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
@@ -422,8 +425,7 @@ impl NetworkRegistry {
 
     #[tracing::instrument(skip(self), fields(net = name))]
     pub(crate) async fn nuke_network(&self, name: &str, force: bool) -> IpcMessage {
-        // Check we're the coordinator and whether other members exist
-        let (is_coordinator, has_other_members) = {
+        let (is_coordinator, has_other_members, has_other_coordinators) = {
             let handle = match self.networks.get(name) {
                 Some(h) => h,
                 None => {
@@ -438,7 +440,14 @@ impl NetworkRegistry {
                 .map(|m| m.is_coordinator)
                 .unwrap_or(false);
             let others = state.members.all().len() > 1;
-            (is_coord, others)
+            // An offline coordinator still owns the network. Connectivity must
+            // not turn a local departure into destruction for everyone else.
+            let other_coordinators = state
+                .members
+                .all()
+                .iter()
+                .any(|member| member.identity != my_id && member.is_coordinator);
+            (is_coord, others, other_coordinators)
         };
 
         if !is_coordinator {
@@ -447,36 +456,107 @@ impl NetworkRegistry {
 
         if has_other_members && !force {
             return ipc_err(
-                "network has other members — use --force to destroy, or transfer ownership first"
+                "network has other members; use --force to leave, or destroy if the last coordinator"
                     .to_string(),
             );
         }
 
-        // Publish empty pkarr record
-        let net_secret_key = {
-            let handle = self.networks.get(name).unwrap();
-            let state = handle.state.read().unwrap();
-            state.network_secret_key.clone()
-        };
-        if let Some(key) = net_secret_key
-            && let Ok(client) =
-                dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-        {
-            let empty_hash = group_blob_hash(
-                &MemberList::new(),
-                &ApprovedList::new(),
-                &SuggestedFirewall::default(),
-                None,
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-            );
-            if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
-                tracing::warn!(error = %e, "failed to publish empty network record on nuke");
+        if has_other_coordinators {
+            if let Err(error) = self.publish_coordinator_departure(name).await {
+                return ipc_err(format!("cannot leave network '{name}': {error:#}"));
             }
+            return match self.leave_network(name).await {
+                IpcMessage::Ok { .. } => IpcMessage::Ok {
+                    message: format!("left network '{name}'; other coordinators keep it running"),
+                },
+                response => response,
+            };
         }
 
-        // Leave the network (handles cleanup, config removal, etc.)
-        self.leave_network(name).await
+        let key = self
+            .networks
+            .get(name)
+            .and_then(|h| h.state.read().ok()?.network_secret_key.clone());
+        let Some(key) = key else {
+            return ipc_err("only a network key holder can nuke a network".to_string());
+        };
+        let result = async {
+            let packet = dht::destruction::encode(&key)?;
+            self.destroy_network(name, packet).await
+        }
+        .await;
+        match result {
+            Ok(()) => IpcMessage::Ok {
+                message: format!("destroyed network '{name}'"),
+            },
+            Err(error) => ipc_err(format!("{error:#}")),
+        }
+    }
+
+    /// Publish a roster without this coordinator while its publisher is still
+    /// active. An offline coordinator needs this record to learn the departure.
+    async fn publish_coordinator_departure(&self, name: &str) -> Result<()> {
+        let handle = self
+            .networks
+            .get(name)
+            .context("network is no longer active")?;
+        let state = Arc::clone(&handle.state);
+        let cancel = handle.cancel.clone();
+        drop(handle);
+        let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
+        let _commit = commit.lock().await;
+        let my_id = self.transport.endpoint.id();
+        let (key, bytes, seeds) = {
+            let state = state.read().unwrap();
+            let key = state
+                .network_secret_key
+                .clone()
+                .context("network key is unavailable")?;
+            let mut members = state.members.clone();
+            let departing = members
+                .remove(&my_id)
+                .context("coordinator is absent from roster")?;
+            anyhow::ensure!(
+                departing.is_coordinator,
+                "local member is not a coordinator"
+            );
+            let mut seeds: Vec<EndpointId> = members
+                .all()
+                .iter()
+                .filter(|member| member.is_coordinator)
+                .map(|member| member.identity)
+                .collect();
+            anyhow::ensure!(!seeds.is_empty(), "no other coordinator remains");
+            // The departing daemon still serves blobs after leaving the mesh.
+            // An offline coordinator needs this seed to fetch the new snapshot.
+            seeds.push(my_id);
+            let bytes = canonical_group_bytes(
+                &members,
+                &state.approved,
+                &state.suggested_firewall,
+                state.group_name.as_deref(),
+                &state.reusable_keys,
+                &state.nullifiers,
+            );
+            (key, bytes, seeds)
+        };
+        let client =
+            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
+        anyhow::ensure!(
+            dht::destruction::resolve(
+                &client,
+                dht::destruction::discovery_key(&key).public(),
+                key.public(),
+            )
+            .await?
+            .is_none(),
+            "network has already been destroyed"
+        );
+        self.transport.blob_store.blobs().add_slice(&bytes).await?;
+        dht::publish_network(&client, &key, &blake3::hash(&bytes), &seeds).await?;
+        // The publisher must stop before it can overwrite this final roster.
+        cancel.cancel();
+        Ok(())
     }
 
     /// Remove a member from a closed network. Coordinator-only (any network-key
@@ -1072,6 +1152,8 @@ impl Daemon {
         drop(guard);
         self.rebuild_ssh_authz();
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
+        let ssh_port = config::load().map_or(crate::forward::SSH_PORT, |cfg| cfg.ssh_port);
+        crate::forward::set_ssh_nat_port(ssh_port);
         #[cfg(target_os = "macos")]
         if self.app_ssh_helper.load(Ordering::SeqCst) {
             crate::ssh::app_helper::spawn(
@@ -1088,7 +1170,7 @@ impl Daemon {
         // the derived mesh IPv6.
         let binds = vec![IpAddr::V6(my_v6)];
         server.spawn(binds, token);
-        // Turn on the userspace port NAT so mesh `:22` reaches the listener.
+        // Turn on the userspace port NAT so the configured mesh port reaches the listener.
         crate::forward::set_ssh_nat_active(true);
     }
 
@@ -1105,6 +1187,11 @@ impl Daemon {
         *guard = Some(token.clone());
         drop(guard);
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
+        #[cfg(target_os = "macos")]
+        if self.app_ssh_helper.load(Ordering::SeqCst) {
+            crate::ssh::app_helper::spawn_v4_bridge(my_v6, token);
+            return;
+        }
         crate::v4bridge::V4Bridge::new(my_v6).spawn(token);
     }
 
@@ -1255,7 +1342,7 @@ impl Daemon {
         self.dns.configure(&dns_tun_name, &mut warnings).await;
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
-        // port 22, so it follows the data plane (mesh addresses must be up).
+        // configured port, so it follows the data plane (mesh addresses must be up).
         #[cfg(feature = "desktop")]
         if config::load().map(|c| c.ssh_enabled).unwrap_or(false) {
             self.start_ssh();

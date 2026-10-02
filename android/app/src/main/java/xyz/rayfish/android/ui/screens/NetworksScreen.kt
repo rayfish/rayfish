@@ -8,6 +8,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -40,7 +41,7 @@ fun NetworksScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var showAdd by remember { mutableStateOf(false) }
+    var showAdd by rememberSaveable { mutableStateOf(false) }
     var inviteCode by remember { mutableStateOf<String?>(null) }   // non-null -> show invite sheet
 
     fun <T> run(block: suspend () -> T, ok: (T) -> Unit, errRes: Int) {
@@ -59,7 +60,9 @@ fun NetworksScreen(
         }
         if (nets.isEmpty()) {
             SectionCard { Text(if (starting) stringResource(R.string.status_starting_ellipsis) else stringResource(R.string.networks_empty),
-                fontFamily = Chakra, fontSize = 13.sp, color = Rf.Muted) }
+                fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
+                if (!starting) PillButton(stringResource(R.string.home_join_network), onClick = { showAdd = true })
+            }
         }
         nets.forEach { net ->
             SectionCard {
@@ -76,7 +79,7 @@ fun NetworksScreen(
                     Box(Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(dot))
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(net.name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                        Text(net.name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Rf.Heading)
                         // A network the daemon has not registered has no peer
                         // count worth printing. Say what it is doing instead, and
                         // why, when the daemon has recorded a reason.
@@ -90,8 +93,8 @@ fun NetworksScreen(
                                 if (running) pluralStringResource(R.plurals.network_peers_online, peersOnline, peersOnline)
                                 else stringResource(R.string.status_offline)
                         }
-                        Text(stringResource(R.string.network_row_subtitle, net.hostname.ifEmpty { net.ipv6 }, line),
-                            fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
+                        Text(stringResource(R.string.network_row_subtitle, net.hostname.ifEmpty { stringResource(R.string.peer_unknown) }, line),
+                            fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Muted)
                     }
                     // The device's stable .ray DNS name in this network. Prefer
                     // it over the IP for "copy address": the hostname is what
@@ -106,7 +109,7 @@ fun NetworksScreen(
                             MenuItem(stringResource(R.string.menu_copy_address)) {
                                 val address = dns ?: net.ipv6
                                 copyToClipboard(context, context.getString(R.string.clipboard_address), address)
-                                onToast(context.getString(R.string.toast_copied, address))
+                                onToast(context.getString(R.string.toast_address_copied))
                             },
                         ),
                     )
@@ -120,8 +123,8 @@ fun NetworksScreen(
                     Box(Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(Rf.Faint))
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                        Text(stringResource(R.string.networks_waiting_approval), fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
+                        Text(name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Rf.Heading)
+                        Text(stringResource(R.string.networks_waiting_approval), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Muted)
                     }
                 }
             }
@@ -151,12 +154,13 @@ fun NetworksScreen(
 private fun AddNetworkSheet(
     onDismiss: () -> Unit, onCreate: (String?) -> Unit, onSubmitCode: (String) -> Unit, onToast: (String) -> Unit,
 ) {
-    var name by remember { mutableStateOf("") }
-    var code by remember { mutableStateOf("") }
+    var name by rememberSaveable { mutableStateOf("") }
+    var code by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
     val scan = rememberQrScanner { result -> if (result != null) onSubmitCode(result.trim()) }
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet) {
-        Column(Modifier.padding(20.dp).padding(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(20.dp).padding(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             SectionLabel(stringResource(R.string.label_join_or_pair))
             RayfishTextField(code, { code = it }, stringResource(R.string.hint_invite_or_pairing_code))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -174,7 +178,8 @@ private fun AddNetworkSheet(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun QrCodeSheet(title: String, code: String, context: android.content.Context, onDismiss: () -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         // The sheet has its own window, drawn above the Scaffold that hosts the
         // snackbar, so a snackbar confirmation would be hidden behind it and the
         // copy would look like it did nothing. Confirm in the button instead.
@@ -186,10 +191,10 @@ fun QrCodeSheet(title: String, code: String, context: android.content.Context, o
                 taps = 0
             }
         }
-        Column(Modifier.fillMaxWidth().padding(20.dp).padding(bottom = 24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp).padding(bottom = 24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
             SectionLabel(title)
             QrImage(code, size = 200.dp)
-            Text(code, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted, modifier = Modifier.fillMaxWidth())
+            Text(code, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Muted, modifier = Modifier.fillMaxWidth())
             PillButton(
                 if (taps == 0) stringResource(R.string.action_copy_code) else if (copied) stringResource(R.string.action_copied) else stringResource(R.string.action_copy_failed),
                 onClick = {

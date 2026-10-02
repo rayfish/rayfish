@@ -29,7 +29,9 @@ pub(crate) async fn snapshot_is_publishable(
 ) -> bool {
     let publishable_generation = {
         let live = state.read().unwrap();
-        if live.converged_hash != Some(hash) {
+        if live.destroyed {
+            return false;
+        } else if live.converged_hash != Some(hash) {
             tracing::warn!(network, %hash, "not publishing a group snapshot that differs from live state");
             false
         } else if live.unconfirmed_durable_hash.is_some() {
@@ -166,15 +168,16 @@ pub(crate) fn spawn_network_publisher(
     client: PkarrRelayClient,
     net_secret_key: SecretKey,
     state: SharedNetworkState,
-    blob_store: FsStore,
-    endpoint_id: EndpointId,
-    peers: PeerTable,
+    registry: Arc<NetworkRegistry>,
     network_name: String,
     initially_published: Option<blake3::Hash>,
     notify: Arc<tokio::sync::Notify>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let blob_store = registry.transport.blob_store.clone();
+        let peers = registry.peers.clone();
+        let endpoint_id = registry.transport.endpoint.id();
         let mut last_publish: Option<(blake3::Hash, Instant)> =
             initially_published.map(|hash| (hash, Instant::now()));
         let mut retry: Option<(blake3::Hash, Instant)> = None;
@@ -192,8 +195,42 @@ pub(crate) fn spawn_network_publisher(
             });
 
             if due {
+                if state.read().map(|s| s.destroyed).unwrap_or(true) {
+                    break;
+                }
+                let proof = match config::destruction::load(net_secret_key.public()) {
+                    Ok(Some(packet)) => Some(packet),
+                    Ok(None) => match dht::destruction::resolve(
+                        &client,
+                        dht::destruction::discovery_key(&net_secret_key).public(),
+                        net_secret_key.public(),
+                    )
+                    .await
+                    {
+                        Ok(proof) => proof,
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot verify network destruction status");
+                            if let Some(hash) = target {
+                                retry =
+                                    Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                            }
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read local network destruction status");
+                        return;
+                    }
+                };
+                if let Some(packet) = proof {
+                    registry.schedule_destruction(&network_name, packet);
+                    break;
+                }
                 let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
                 let _commit = commit.lock().await;
+                if token.is_cancelled() {
+                    break;
+                }
                 let mut persistence_ready = true;
                 if let Some(hash) = group_hash_needing_persistence(&state, &network_name, false) {
                     persistence_ready =
@@ -356,7 +393,7 @@ pub(crate) async fn persist_group_hash_locked(
     let (current, snapshot_bytes, pending_published) = {
         let state = state.read().unwrap();
         (
-            state.converged_hash == Some(hash),
+            !state.destroyed && state.converged_hash == Some(hash),
             state
                 .snapshot
                 .as_ref()
@@ -514,6 +551,9 @@ pub(crate) async fn commit_current_snapshot(
     let ready_to_publish = loop {
         let snapshot = {
             let mut s = state.write().unwrap();
+            if s.destroyed {
+                return false;
+            }
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| {
                 (
@@ -615,6 +655,7 @@ mod tests {
                 msgpack_bytes: Vec::new(),
             }),
             snapshot_commit: Arc::new(AsyncMutex::new(())),
+            destroyed: false,
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,

@@ -2,6 +2,15 @@ name: macOS app release
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release to attach DMGs built from master
+        required: false
+        type: string
+      release_from_master:
+        description: Allow master to be newer than the release tag
+        required: false
+        type: boolean
   workflow_call:
     inputs:
       release_tag:
@@ -122,6 +131,7 @@ jobs:
       - name: Build and validate Release app
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_FROM_MASTER: ${{ github.event_name == 'workflow_dispatch' && inputs.release_from_master && github.ref == 'refs/heads/master' }}
         run: bash scripts/build-macos-release.sh
 
       - name: Test migration and provider messaging
@@ -192,5 +202,5 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           gh release view "$RELEASE_TAG"
-          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.sha256
-          gh release upload "$RELEASE_TAG" dist/*.xml
+          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.sha256 --clobber
+          gh release upload "$RELEASE_TAG" dist/*.xml --clobber

@@ -1,6 +1,6 @@
 [package]
 name = "rayfish"
-version = "0.5.4"
+version = "0.5.6"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
@@ -64,7 +64,7 @@ otel = [
 ]
 
 [dependencies]
-ray-proto = { path = "ray-proto", version = "0.1.15" }
+ray-proto = { path = "ray-proto", version = "0.1.17" }
 anyhow = "1"
 thiserror = "2"
 hickory-resolver = "0.26.1"

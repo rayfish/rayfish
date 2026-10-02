@@ -247,4 +247,26 @@
     <string name="notif_saved">保存しました</string>
     <string name="notif_transfer_failed">%s との転送に失敗しました</string>
     <string name="notif_offer_text">%1$s · %2$s</string>
+    <string name="toast_address_copied">アドレスをコピーしました</string>
+    <string name="home_files_available">ファイル利用可能 · VPN オフ</string>
+    <string name="home_stopping">切断中…</string>
+    <string name="home_no_networks">VPN 接続中 · ネットワーク未追加</string>
+    <string name="home_connection_failed">ネットワーク接続に失敗しました</string>
+    <string name="home_join_network">ネットワークに参加または作成</string>
+    <string name="error_receive_start">ダウンロードを開始できませんでした。もう一度お試しください。</string>
+    <string name="action_send_files">ファイルを送信</string>
+    <string name="error_send_start">送信を開始できませんでした。もう一度お試しください。</string>
+    <string name="label_files">ファイル</string>
+    <string name="label_requests">リクエスト</string>
+    <string name="file_saving">保存中…</string>
+    <string name="file_failed">失敗</string>
+    <string name="file_sent">送信済み</string>
+    <string name="file_received">受信済み</string>
+    <string name="file_waiting">受信者の応答待ち</string>
+    <string name="file_sending">送信中</string>
+    <string name="file_receiving">受信中</string>
+    <string name="file_transfer_detail">%1$s · %2$s · %3$s</string>
+    <string name="file_transfer_bytes">%2$s 中 %1$s</string>
+    <string name="error_status_refresh">更新できませんでした。最後に確認した状態を表示しています。</string>
+    <string name="action_retry">再試行</string>
 </resources>

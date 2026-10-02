@@ -19,6 +19,7 @@
 //! learned the hash) can't complete anyone's entry at all.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,6 +52,7 @@ pub struct TransferInfo {
     pub size: u64,
     pub transferred: u64,
     pub state: TransferState,
+    pub destination: Option<PathBuf>,
 }
 
 struct Entry {
@@ -135,6 +137,7 @@ impl TransferRegistry {
                     size,
                     transferred: 0,
                     state: TransferState::Offered,
+                    destination: None,
                 },
                 hash: Some(hash),
                 peer_id: Some(peer),
@@ -160,6 +163,7 @@ impl TransferRegistry {
                     size,
                     transferred: 0,
                     state: TransferState::Transferring,
+                    destination: None,
                 },
                 hash: None,
                 peer_id: None,
@@ -182,6 +186,14 @@ impl TransferRegistry {
     pub fn finish(&self, id: u64, ok: bool) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
             finish_entry(e, ok, None);
+            self.changed();
+        }
+    }
+
+    pub fn finish_receive(&self, id: u64, destination: &Path) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
+            e.info.destination = Some(destination.to_path_buf());
+            finish_entry(e, true, None);
             self.changed();
         }
     }
@@ -321,9 +333,9 @@ impl FinishGuard {
     /// Mark the transfer done and disarm the guard. Call this only once the
     /// work the transfer represents (fetch + write to disk) has fully
     /// succeeded.
-    pub fn success(mut self) {
+    pub fn success(mut self, destination: &Path) {
         self.armed = false;
-        self.registry.finish(self.id, true);
+        self.registry.finish_receive(self.id, destination);
     }
 }
 
@@ -416,10 +428,14 @@ mod tests {
         assert!(first.has_changed().unwrap());
         first.borrow_and_update();
         assert_eq!(registry.list()[0].transferred, 100);
-        registry.finish(id, true);
+        registry.finish_receive(id, Path::new("/path/to/work/file"));
         assert!(first.has_changed().unwrap());
         first.borrow_and_update();
         assert_eq!(registry.list()[0].state, TransferState::Done);
+        assert_eq!(
+            registry.list()[0].destination.as_deref(),
+            Some(Path::new("/path/to/work/file"))
+        );
         assert!(!first.has_changed().unwrap());
     }
 

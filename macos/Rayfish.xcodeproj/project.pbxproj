@@ -7,10 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		022130780000000000000001 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 022130780000000000000003 /* Sparkle */; };
-		022130780000000000000006 /* Sparkle-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = 022130780000000000000007 /* Sparkle-LICENSE.txt */; };
 		06642DCA858987EA27C2BA74 /* RayfishNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1BD3D661631EB1DA93E7F2 /* RayfishNotifications.swift */; };
 		10CF514C0F2FBA56B5D6CE1B /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = F551764865C525E7C133EBD7 /* main.swift */; };
+		23D81022C3F25F3820D49E9C /* Sparkle-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = 628A5267D8E8C4292351B74E /* Sparkle-LICENSE.txt */; };
 		25FEF3ADDF7FAF7D8C10120E /* com.rayfish.app.tunnel.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 2D7FF352C42FF4506E6FB496 /* com.rayfish.app.tunnel.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		3B5F8671BDFDF131BBACFCFC /* SSHSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F59BE53AD538E35FC4DA441E /* SSHSettingsView.swift */; };
 		3F18BD7B209CAAE5E1FF4F58 /* Fonts in Resources */ = {isa = PBXBuildFile; fileRef = 84FC3CD94CC9D8002DA5C496 /* Fonts */; };
@@ -25,6 +24,7 @@
 		A599B9CD1B8A1E701D5A0B0E /* LegacyDaemon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26C97C969BAC3B6E6C4CAC12 /* LegacyDaemon.swift */; };
 		AD801FDCB5C9664B2E47FA8D /* SystemExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 224C89EE4A7C4B10E79D1104 /* SystemExtensionInstaller.swift */; };
 		B91F8356EA88D8F7A63CC34C /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A419048EE7990D19B9C4E6F /* PacketTunnelProvider.swift */; };
+		BD0D4FCCF4027D44D0628347 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A040B2624FFDB04BBA0F1DE0 /* Sparkle */; };
 		C500E290BEBBD70E1B6C2463 /* ProviderMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FED4AC2218F0DF9EADFAD43 /* ProviderMessage.swift */; };
 		D0BBAA0124DBD68D69E60D49 /* TunnelPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04F957D1BDEDFDAB48E32699 /* TunnelPreferences.swift */; };
 		D1DAD4DF0D9F1B71525FBF36 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = EA6E6748C8715BF45A6683B1 /* Assets.xcassets */; };
@@ -61,7 +61,6 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		022130780000000000000007 /* Sparkle-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Sparkle-LICENSE.txt"; sourceTree = "<group>"; };
 		04F957D1BDEDFDAB48E32699 /* TunnelPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelPreferences.swift; sourceTree = "<group>"; };
 		224C89EE4A7C4B10E79D1104 /* SystemExtensionInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemExtensionInstaller.swift; sourceTree = "<group>"; };
 		26C97C969BAC3B6E6C4CAC12 /* LegacyDaemon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyDaemon.swift; sourceTree = "<group>"; };
@@ -71,6 +70,7 @@
 		4A419048EE7990D19B9C4E6F /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		4C73C637A969722045CF3293 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		586C1EF82AFF3A4027DD6CCB /* RayfishApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RayfishApp.swift; sourceTree = "<group>"; };
+		628A5267D8E8C4292351B74E /* Sparkle-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Sparkle-LICENSE.txt"; sourceTree = "<group>"; };
 		712A69B13F686BE8B5D0DA2D /* SSHHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHHelper.swift; sourceTree = "<group>"; };
 		7B808952800BA46F3429EF12 /* ray_apple.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ray_apple.swift; sourceTree = "<group>"; };
 		815A533A352D2B5C8B197DBA /* ray_appleFFI.modulemap */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.module-map"; path = ray_appleFFI.modulemap; sourceTree = "<group>"; };
@@ -97,7 +97,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				022130780000000000000001 /* Sparkle in Frameworks */,
+				BD0D4FCCF4027D44D0628347 /* Sparkle in Frameworks */,
 				79AF5623414DA00917956853 /* UserNotifications.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -150,7 +150,7 @@
 			isa = PBXGroup;
 			children = (
 				EA6E6748C8715BF45A6683B1 /* Assets.xcassets */,
-				022130780000000000000007 /* Sparkle-LICENSE.txt */,
+				628A5267D8E8C4292351B74E /* Sparkle-LICENSE.txt */,
 			);
 			path = Rayfish;
 			sourceTree = "<group>";
@@ -217,7 +217,7 @@
 			);
 			name = Rayfish;
 			packageProductDependencies = (
-				022130780000000000000003 /* Sparkle */,
+				A040B2624FFDB04BBA0F1DE0 /* Sparkle */,
 			);
 			productName = Rayfish;
 			productReference = 3D56C418C2CCB66CC3EEA18D /* Rayfish.app */;
@@ -268,7 +268,7 @@
 			mainGroup = E4870274DCC4E9944C9F835B;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				022130780000000000000005 /* XCRemoteSwiftPackageReference "Sparkle" */,
+				228710F751B53C6892728C10 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 5189EF84F1DD2ED99BD8FC64 /* Products */;
@@ -287,8 +287,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				D1DAD4DF0D9F1B71525FBF36 /* Assets.xcassets in Resources */,
-				022130780000000000000006 /* Sparkle-LICENSE.txt in Resources */,
 				3F18BD7B209CAAE5E1FF4F58 /* Fonts in Resources */,
+				23D81022C3F25F3820D49E9C /* Sparkle-LICENSE.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -379,25 +379,6 @@
 		};
 /* End PBXTargetDependency section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		022130780000000000000005 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/sparkle-project/Sparkle";
-			requirement = {
-				kind = exactVersion;
-				version = 2.10.0;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		022130780000000000000003 /* Sparkle */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 022130780000000000000005 /* XCRemoteSwiftPackageReference "Sparkle" */;
-			productName = Sparkle;
-		};
-/* End XCSwiftPackageProductDependency section */
-
 /* Begin XCBuildConfiguration section */
 		230A22BF6DE2810858888DD5 /* Release */ = {
 			isa = XCBuildConfiguration;
@@ -451,7 +432,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.2;
+				MARKETING_VERSION = 0.5.6;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				OTHER_CODE_SIGN_FLAGS = "--timestamp";
@@ -517,7 +498,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.2;
+				MARKETING_VERSION = 0.5.6;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.rayfish.app;
@@ -704,7 +685,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.2;
+				MARKETING_VERSION = 0.5.6;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -787,6 +768,25 @@
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		228710F751B53C6892728C10 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = exactVersion;
+				version = 2.10.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A040B2624FFDB04BBA0F1DE0 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 228710F751B53C6892728C10 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = DFE261A68F972C6B9DD57288 /* Project object */;
 }

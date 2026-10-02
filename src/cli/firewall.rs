@@ -3,7 +3,106 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::*;
+use firewall::Action;
 use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
+
+#[derive(serde::Serialize)]
+struct FirewallStateOutput<'a> {
+    default_inbound: Action,
+    default_outbound: Action,
+    reject: bool,
+    disabled: bool,
+    rules: &'a [ipc::FirewallRuleView],
+}
+
+impl DisplayOut for FirewallStateOutput<'_> {
+    fn print_human(&self) {
+        print!(
+            "{}",
+            render_firewall_rules(
+                Some((self.default_inbound, self.default_outbound)),
+                self.reject,
+                self.disabled,
+                self.rules,
+            )
+        );
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SshNetworkOutput<'a> {
+    network: &'a str,
+    allow: &'a [ipc::SshAllowView],
+}
+
+#[derive(serde::Serialize)]
+struct SshStateOutput<'a> {
+    enabled: bool,
+    port: u16,
+    networks: Vec<SshNetworkOutput<'a>>,
+}
+
+impl DisplayOut for SshStateOutput<'_> {
+    fn print_human(&self) {
+        println!(
+            "mesh SSH: {} (port {})",
+            if self.enabled { "on" } else { "off" },
+            self.port
+        );
+        if self.networks.is_empty() {
+            println!("  (no SSH allow rules)");
+            return;
+        }
+        for network in &self.networks {
+            let entries: Vec<String> = network
+                .allow
+                .iter()
+                .map(|rule| {
+                    let peer = if rule.peer == "*" || rule.peer.len() <= 12 {
+                        rule.peer.clone()
+                    } else {
+                        format!("{}…", &rule.peer[..12])
+                    };
+                    // Empty users permits the non-root default; `*` includes root.
+                    let users = if rule.users.is_empty() {
+                        "any non-root user".to_string()
+                    } else if rule.users.iter().any(|user| user == "*") {
+                        "any user".to_string()
+                    } else {
+                        rule.users.join(",")
+                    };
+                    format!("{peer} → {users}")
+                })
+                .collect();
+            println!("  {}: {}", network.network, entries.join("; "));
+        }
+        // Rules on an off server do not affect mesh traffic.
+        if !self.enabled {
+            println!("\nThese rules are not in effect: mesh SSH is off.");
+            println!("Start the server with `ray ssh on`.");
+            return;
+        }
+        // Self-traffic uses loopback, so it bypasses the TUN's port rewrite.
+        println!("\nThis node cannot mesh-SSH to itself; `ssh <this node>` is refused.");
+        println!("Use `ssh localhost` on the box itself.");
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PendingFirewallOutput<'a> {
+    network: &'a str,
+    rules: &'a [ipc::FirewallRuleView],
+}
+
+impl DisplayOut for PendingFirewallOutput<'_> {
+    fn print_human(&self) {
+        if self.rules.is_empty() {
+            println!("\n  {}\n", style::faint("no pending suggested rules"));
+        } else {
+            print!("{}", render_firewall_rules(None, false, false, self.rules));
+        }
+    }
+}
 
 pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     if let FirewallAction::Suggest {
@@ -34,30 +133,20 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             disabled,
             mut rules,
         } => {
-            if json_enabled() {
-                print_json(&serde_json::json!({
-                    "default_inbound": default_inbound,
-                    "default_outbound": default_outbound,
-                    "reject": reject,
-                    "disabled": disabled,
-                    "rules": rules,
-                }));
-            } else {
-                if let Ok((self_id, networks)) = ipc_status_full().await {
-                    for rule in &mut rules {
-                        rule.peer = firewall_peer_name(rule, &self_id, &networks);
-                    }
+            if !json_enabled()
+                && let Ok((self_id, networks)) = ipc_status_full().await
+            {
+                for rule in &mut rules {
+                    rule.peer = firewall_peer_name(rule, &self_id, &networks);
                 }
-                print!(
-                    "{}",
-                    render_firewall_rules(
-                        Some((default_inbound, default_outbound)),
-                        reject,
-                        disabled,
-                        &rules
-                    )
-                );
             }
+            printout(&FirewallStateOutput {
+                default_inbound,
+                default_outbound,
+                reject,
+                disabled,
+                rules: &rules,
+            })?;
         }
         ipc::IpcMessage::Error { message } => fail_with("firewall", &message),
         other => fail_unexpected(&other),
@@ -144,7 +233,7 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
 
 /// Map a `ray firewall ssh` subcommand onto its IPC request. `on|off` is the
 /// `ssh` settings key: the daemon serves it through the handler that also seeds
-/// the tcp:22 passthrough and starts/stops the listener.
+/// the configured port's passthrough and starts/stops the listener.
 fn ssh_to_ipc(action: SshAction) -> ipc::IpcMessage {
     match action {
         SshAction::On => ipc::IpcMessage::ConfigSet {
@@ -177,9 +266,8 @@ fn ssh_to_ipc(action: SshAction) -> ipc::IpcMessage {
     }
 }
 
-/// `ray firewall ssh ...`: toggle the embedded mesh SSH server and manage
-/// per-network allow lists.
-async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
+/// Toggle the embedded mesh SSH server or manage per-network allow lists.
+pub(crate) async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
     // `show` filters the reply client-side, so keep its network before the move.
     let filter = match &action {
         SshAction::Show { network } => network.clone(),
@@ -191,10 +279,12 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::FirewallSshState { enabled, networks } => {
-            render_ssh_state(enabled, networks, filter.as_deref())
-        }
-        ipc::IpcMessage::Error { message } => fail_with("firewall ssh", &message),
+        ipc::IpcMessage::FirewallSshState {
+            enabled,
+            port,
+            networks,
+        } => render_ssh_state(enabled, port, networks, filter.as_deref())?,
+        ipc::IpcMessage::Error { message } => fail_with("ssh", &message),
         other => fail_unexpected(&other),
     }
     Ok(())
@@ -204,70 +294,20 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
 /// network.
 fn render_ssh_state(
     enabled: bool,
+    port: u16,
     networks: Vec<(String, Vec<ipc::SshAllowView>)>,
     filter: Option<&str>,
-) {
-    let networks: Vec<(String, Vec<ipc::SshAllowView>)> = networks
-        .into_iter()
-        .filter(|(n, _)| filter.is_none_or(|f| f == n))
+) -> Result<()> {
+    let networks = networks
+        .iter()
+        .filter(|(network, _)| filter.is_none_or(|name| name == network))
+        .map(|(network, allow)| SshNetworkOutput { network, allow })
         .collect();
-    if json_enabled() {
-        print_json(&serde_json::json!({
-            "enabled": enabled,
-            "networks": networks.iter().map(|(n, a)| serde_json::json!({
-                "network": n,
-                "allow": a.iter().map(|r| serde_json::json!({
-                    "peer": r.peer,
-                    "users": r.users,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        }));
-        return;
-    }
-    println!("mesh SSH: {}", if enabled { "on" } else { "off" });
-    if networks.is_empty() {
-        println!("  (no SSH allow rules)");
-        return;
-    }
-    for (net, allow) in &networks {
-        let entries: Vec<String> = allow
-            .iter()
-            .map(|r| {
-                let peer = if r.peer == "*" || r.peer.len() <= 12 {
-                    r.peer.clone()
-                } else {
-                    format!("{}…", &r.peer[..12])
-                };
-                // Empty users = the non-root default; `*` = any user incl. root.
-                let users = if r.users.is_empty() {
-                    "any non-root user".to_string()
-                } else if r.users.iter().any(|u| u == "*") {
-                    "any user".to_string()
-                } else {
-                    r.users.join(",")
-                };
-                format!("{peer} → {users}")
-            })
-            .collect();
-        println!("  {net}: {}", entries.join("; "));
-    }
-    // Rules listed under an off server never fire: mesh `:22` still goes to the
-    // host sshd. Say so here rather than leaving the two lines unconnected.
-    if !enabled {
-        println!("\nThese rules are not in effect: mesh SSH is off.");
-        println!("Start the server with `ray firewall ssh on`.");
-        return;
-    }
-    // Self-traffic is delivered over loopback and never enters the TUN, so the
-    // port rewrite that makes mesh `:22` land on the server never runs and the
-    // connection is refused. Cheaper to say than to diagnose from an RST.
-    println!("\nThis node cannot mesh-SSH to itself; `ssh <this node>` is refused.");
-    println!("Use `ssh localhost` on the box itself.");
-}
-
-/// Print a JSON value as one compact line to stdout (jq-friendly).
-pub(crate) fn print_json(value: &serde_json::Value) {
-    println!("{value}");
+    printout(&SshStateOutput {
+        enabled,
+        port,
+        networks,
+    })
 }
 
 /// Resolve within the rule's network, including every device for a user grant.
@@ -428,17 +468,12 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         other => fail_unexpected(&other),
     };
 
-    if json_enabled() {
-        print_json(&serde_json::json!({ "network": network, "rules": rules }));
-        return Ok(());
-    }
-    if rules.is_empty() {
-        println!("\n  {}\n", style::faint("no pending suggested rules"));
-        return Ok(());
-    }
-    // Non-interactive (piped / NO_COLOR): print the static table and stop.
-    if !style::is_enabled() {
-        print!("{}", render_firewall_rules(None, false, false, &rules));
+    // JSON and non-interactive output stop before the picker can mutate rules.
+    if json_enabled() || rules.is_empty() || !style::is_enabled() {
+        printout(&PendingFirewallOutput {
+            network,
+            rules: &rules,
+        })?;
         return Ok(());
     }
 
@@ -600,6 +635,7 @@ pub(crate) async fn ipc_apply(
     // per-peer identities, and joined hostnames.
     let (self_id, status_networks) = ipc_status_full().await?;
     let self_id = self_id.to_string();
+    let managed_machines = ipc_managed_machines_for_apply().await?;
     let active_names: std::collections::HashSet<&str> =
         status_networks.iter().map(|n| n.name.as_str()).collect();
 
@@ -644,7 +680,16 @@ pub(crate) async fn ipc_apply(
                     .into_iter()
                     .map(|hostname| hostname.parse())
                     .collect::<std::result::Result<_, _>>()?;
-            let membership = apply::membership_diff(firewall, &current)?;
+            let status_network = status_networks
+                .iter()
+                .find(|network| network.name == *network_name);
+            let membership = membership_diff_for_apply(
+                firewall,
+                &current,
+                status_network,
+                &managed_machines,
+                network_name,
+            )?;
             for hostname in membership.joins {
                 changes += 1;
                 println!("  join   {hostname} to {network_name}");
@@ -671,8 +716,6 @@ pub(crate) async fn ipc_apply(
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
     let mut removal_failures = false;
     let mut ssh_failures = false;
-    let managed_machines = ipc_managed_machines_for_apply().await.unwrap_or_default();
-
     for (net_name, net_firewall) in &expanded.networks {
         let is_active = active_names.contains(net_name.as_str());
         // Create-if-absent (always a closed network).
@@ -720,22 +763,29 @@ pub(crate) async fn ipc_apply(
             Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
         }
 
-        // Reconcile this network's desired hostnames against its live roster.
-        // Wildcards preserve the current population; concrete names can still
-        // add controlled machines alongside it.
+        // Reconcile this network's concrete hostnames against both the
+        // coordinator roster and each online managed machine's own state.
         let current: HashSet<ipc::MachineHostname> = joined_hostnames(&status_networks, net_name)
             .into_iter()
             .map(|hostname| hostname.parse())
             .collect::<std::result::Result<_, _>>()?;
-        let membership = apply::membership_diff(net_firewall, &current)?;
+        let status_network = status_networks
+            .iter()
+            .find(|network| network.name == *net_name);
+        let membership = membership_diff_for_apply(
+            net_firewall,
+            &current,
+            status_network,
+            &managed_machines,
+            net_name,
+        )?;
 
         let mut active_hosts = current.clone();
         for host in membership.joins {
-            if managed_machines
-                .iter()
-                .any(|machine| machine.hostname == host)
+            if let Some(managed_machine) =
+                managed_machine_for_hostname(status_network, &host, &managed_machines)
             {
-                let machine = ipc::ManagedMachineSelector::new(host.to_string());
+                let machine = managed_machine.identity.into();
                 let network = ipc::NetworkName::new(net_name.clone());
                 match ipc_delegated_join_request(&machine, &network, Some(host.clone()), true, true)
                     .await
@@ -759,9 +809,6 @@ pub(crate) async fn ipc_apply(
 
         for host in membership.leaves {
             active_hosts.remove(&host);
-            let status_network = status_networks
-                .iter()
-                .find(|network| network.name == *net_name);
             let is_local = status_network.and_then(|network| network.my_hostname.as_deref())
                 == Some(host.as_ref());
             if is_local {
@@ -783,17 +830,55 @@ pub(crate) async fn ipc_apply(
                     }
                 }
             } else {
-                removal_failures = true;
-                eprintln!(
-                    "{}  {net_name}: host '{host}' is not controlled; cannot request leave",
-                    style::red("  !")
-                );
+                let peer = status_network.and_then(|network| {
+                    network
+                        .peers
+                        .iter()
+                        .find(|peer| peer.hostname.as_deref() == Some(host.as_ref()))
+                });
+                if let Some(peer) = peer {
+                    match ipc_request(ipc::IpcMessage::Kick {
+                        network: net_name.clone(),
+                        peer: peer.endpoint_id.to_string(),
+                        confirm: true,
+                    })
+                    .await
+                    {
+                        Ok(ipc::IpcMessage::Ok { message }) => {
+                            println!("{}  {message}", style::faint("kicked:"));
+                        }
+                        Ok(ipc::IpcMessage::Error { message }) => {
+                            removal_failures = true;
+                            eprintln!(
+                                "{}  {net_name}: failed to kick '{host}': {message}",
+                                style::red("  !")
+                            );
+                        }
+                        Ok(other) => {
+                            removal_failures = true;
+                            eprintln!(
+                                "{}  {net_name}: unexpected kick response for '{host}': {other:?}",
+                                style::red("  !")
+                            );
+                        }
+                        Err(error) => {
+                            removal_failures = true;
+                            eprintln!(
+                                "{}  {net_name}: failed to kick '{host}': {error}",
+                                style::red("  !")
+                            );
+                        }
+                    }
+                } else {
+                    removal_failures = true;
+                    eprintln!(
+                        "{}  {net_name}: host '{host}' is not in the roster and is not controlled",
+                        style::red("  !")
+                    );
+                }
             }
         }
 
-        let status_network = status_networks
-            .iter()
-            .find(|network| network.name == *net_name);
         for host in active_hosts {
             // SSH apply manages remote machines, not the local controller.
             if status_network.and_then(|network| network.my_hostname.as_deref())
@@ -893,6 +978,7 @@ pub(crate) async fn ipc_apply(
             );
         }
     }
+    anyhow::ensure!(!removal_failures, "some members could not be removed");
     anyhow::ensure!(!ssh_failures, "some SSH grants could not be applied");
     Ok(())
 }
@@ -921,11 +1007,57 @@ fn managed_machine_for_hostname<'a>(
         .find(|machine| machine.hostname == *hostname)
 }
 
+fn managed_machine_has_network(machine: &ipc::ManagedMachineInfo, network: &str) -> bool {
+    machine
+        .networks
+        .iter()
+        .any(|active| active.as_ref() == network)
+}
+
+fn membership_diff_for_apply(
+    firewall: &apply::DeployNetwork,
+    current: &HashSet<ipc::MachineHostname>,
+    status_network: Option<&ipc::NetworkStatus>,
+    managed_machines: &[ipc::ManagedMachineInfo],
+    network: &str,
+) -> Result<apply::MembershipDiff> {
+    let mut diff = apply::membership_diff(firewall, current)?;
+    let desired: HashSet<ipc::MachineHostname> = apply::expected_hosts_for_network(firewall)
+        .into_iter()
+        .map(|hostname| hostname.parse())
+        .collect::<std::result::Result<_, _>>()?;
+
+    for machine in managed_machines
+        .iter()
+        .filter(|machine| machine.state == ipc::ManagedMachineState::Online)
+    {
+        let hostname = status_network
+            .and_then(|status| {
+                status
+                    .peers
+                    .iter()
+                    .find(|peer| peer.endpoint_id == machine.identity)
+                    .and_then(|peer| peer.hostname.as_deref())
+            })
+            .unwrap_or(machine.hostname.as_ref())
+            .parse::<ipc::MachineHostname>()?;
+        let active = managed_machine_has_network(machine, network);
+        if desired.contains(&hostname) && !active && !diff.joins.contains(&hostname) {
+            diff.joins.push(hostname);
+        } else if !desired.contains(&hostname) && active && !diff.leaves.contains(&hostname) {
+            diff.leaves.push(hostname);
+        }
+    }
+    diff.joins.sort();
+    diff.leaves.sort();
+    Ok(diff)
+}
+
 async fn ipc_managed_machines_for_apply() -> Result<Vec<ipc::ManagedMachineInfo>> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
-        ipc::IpcMessage::ManagedMachines { probe: false },
+        ipc::IpcMessage::ManagedMachines { probe: true },
     )
     .await?;
     match ipc::recv(&mut stream).await? {
@@ -958,6 +1090,20 @@ struct HostIdentityMatch<'a> {
     hostname: &'a str,
     identity: EndpointId,
     paired: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct IdentityMatchesOutput<'a, 'b> {
+    json: serde_json::Value,
+    #[serde(skip)]
+    matches: &'a [HostIdentityMatch<'b>],
+}
+
+impl DisplayOut for IdentityMatchesOutput<'_, '_> {
+    fn print_human(&self) {
+        println!("{}", identity_matches_text(self.matches));
+    }
 }
 
 /// Search joined hostnames, optionally restricted to one network.
@@ -1025,16 +1171,40 @@ fn identity_matches_json(matches: &[HostIdentityMatch<'_>]) -> serde_json::Value
     }
 }
 
-pub(crate) async fn cmd_identityof(peer: &str, hostname: Option<&str>, json: bool) -> Result<()> {
+#[derive(serde::Serialize)]
+struct ContactIdentityOutput {
+    contact_id: EndpointId,
+    endpoint_id: EndpointId,
+}
+
+impl DisplayOut for ContactIdentityOutput {
+    fn print_human(&self) {
+        println!("{}", self.endpoint_id);
+    }
+}
+
+pub(crate) async fn cmd_identityof(peer: &str, hostname: Option<&str>) -> Result<()> {
+    if hostname.is_none()
+        && let Ok(contact_id) = peer.parse::<EndpointId>()
+    {
+        let mut stream = ipc::connect().await?;
+        ipc::send(&mut stream, ipc::IpcMessage::ResolveContact { contact_id }).await?;
+        return match ipc::recv(&mut stream).await? {
+            ipc::IpcMessage::ContactResolved { endpoint_id } => printout(&ContactIdentityOutput {
+                contact_id,
+                endpoint_id,
+            }),
+            ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!("unexpected contact lookup response: {other:?}"),
+        };
+    }
     let (self_id, networks) = ipc_status_full().await?;
     let network = hostname.map(|_| peer);
     let matches = host_identity_matches(&networks, &self_id, hostname.unwrap_or(peer), network)?;
-    if json {
-        print_json(&identity_matches_json(&matches));
-    } else {
-        println!("{}", identity_matches_text(&matches));
-    }
-    Ok(())
+    printout(&IdentityMatchesOutput {
+        json: identity_matches_json(&matches),
+        matches: &matches,
+    })
 }
 
 /// Resolve a joined hostname to `(identity, paired)` on one network: self matches
@@ -1301,7 +1471,7 @@ mod tests {
     }
 
     /// `ray firewall ssh on|off` must go through the `ssh` key, which is the
-    /// only path that also seeds the tcp:22 passthrough and starts the listener.
+    /// only path that also seeds the configured port's passthrough and starts the listener.
     #[test]
     fn ssh_toggle_maps_onto_the_ssh_key() {
         for (action, want) in [(SshAction::On, "on"), (SshAction::Off, "off")] {
@@ -1324,6 +1494,7 @@ mod tests {
             is_own_device: false,
             incompatible: false,
             connection: None,
+            rtt_high: false,
             state: ipc::PeerState::Idle,
             exit_node: false,
             exit_in_use: false,
@@ -1549,5 +1720,52 @@ mod tests {
         assert_eq!(machine.identity, identity);
         assert_eq!(machine.hostname.as_ref(), "build-box");
         assert!(managed_machine_for_hostname(Some(&network), &hostname, &machines[..1]).is_none());
+    }
+
+    #[test]
+    fn online_managed_machine_missing_network_is_rejoined() {
+        let identity = iroh::SecretKey::generate().public();
+        let mut roster_peer = peer("web", None);
+        roster_peer.endpoint_id = identity;
+        let network = net(Some("controller"), vec![roster_peer]);
+        let machine = ipc::ManagedMachineInfo {
+            identity,
+            hostname: "web".parse().unwrap(),
+            enrolled_at: ipc::UnixTimestampSecs::from_secs(100),
+            last_seen: None,
+            state: ipc::ManagedMachineState::Online,
+            networks: vec![ipc::NetworkName::new("other".to_string())],
+        };
+        let host: ipc::MachineHostname = "web".parse().unwrap();
+        let current = HashSet::from([host.clone()]);
+        let firewall = [("web".to_string(), apply::DeployHost::default())]
+            .into_iter()
+            .collect();
+
+        let membership =
+            membership_diff_for_apply(&firewall, &current, Some(&network), &[machine], "n")
+                .unwrap();
+
+        assert_eq!(membership.joins, vec![host]);
+    }
+
+    #[test]
+    fn online_managed_machine_outside_spec_is_removed() {
+        let machine = ipc::ManagedMachineInfo {
+            identity: iroh::SecretKey::generate().public(),
+            hostname: "web".parse().unwrap(),
+            enrolled_at: ipc::UnixTimestampSecs::from_secs(100),
+            last_seen: None,
+            state: ipc::ManagedMachineState::Online,
+            networks: vec![ipc::NetworkName::new("n".to_string())],
+        };
+        let host: ipc::MachineHostname = "web".parse().unwrap();
+        let current = HashSet::new();
+        let firewall = apply::DeployNetwork::new();
+
+        let membership =
+            membership_diff_for_apply(&firewall, &current, None, &[machine], "n").unwrap();
+
+        assert_eq!(membership.leaves, vec![host]);
     }
 }

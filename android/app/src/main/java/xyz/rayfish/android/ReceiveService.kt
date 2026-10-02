@@ -7,10 +7,12 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import androidx.core.content.ContextCompat
 import io.sentry.android.core.SentryLogcatAdapter as Log
 import java.io.File
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import uniffi.ray_mobile.FileOffer
 
 /**
@@ -46,8 +48,8 @@ class ReceiveService : Service() {
             // out from under it.
             synchronized(lifecycle) {
                 startForegroundNotification(getString(R.string.app_name), getString(R.string.notif_working))
-                if (inFlight.get() == 0) {
-                    stopForegroundCompat()
+                if (activeIds.isEmpty()) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf(startId)
                 } else {
                     lastStartId = startId
@@ -69,13 +71,14 @@ class ReceiveService : Service() {
         OfferNotifier.markActedOn(applicationContext, offerId)
 
         val accepting = action == ACTION_ACCEPT
-        // Counted *before* going foreground, and under the lock a finishing
+        // Registered before going foreground, under the lock a finishing
         // worker also takes. A worker whose `finally` lands between the two
         // would otherwise see the count reach zero and leave the foreground
         // again, dropping this command's transfer to a background service.
         synchronized(lifecycle) {
-            inFlight.incrementAndGet()
+            // Even a duplicate is the newest command for stopSelf(startId).
             lastStartId = startId
+            if (!activeIds.add(offerId)) return START_NOT_STICKY
             startForegroundNotification(
                 if (accepting) getString(R.string.notif_saving_file, filename) else getString(R.string.app_name),
                 if (accepting) getString(R.string.notif_from_peer, peer) else getString(R.string.notif_declining_file, filename),
@@ -112,8 +115,10 @@ class ReceiveService : Service() {
                 // call `stopSelf(1)` while 2 is the most recent, which is a no-op
                 // and leaves the service up for good.
                 synchronized(lifecycle) {
-                    if (inFlight.decrementAndGet() == 0) {
-                        stopForegroundCompat()
+                    activeIds.remove(offerId)
+                    acceptingOffers.value = acceptingOffers.value - offerId
+                    if (activeIds.isEmpty()) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf(lastStartId)
                     }
                 }
@@ -171,25 +176,35 @@ class ReceiveService : Service() {
         }
     }
 
-    private fun stopForegroundCompat() {
-        stopForeground(STOP_FOREGROUND_REMOVE)
-    }
-
     companion object {
         private const val TAG = "RayfishReceive"
+        private val activeIds = mutableSetOf<ULong>()
+        private val acceptingOffers = MutableStateFlow<Map<ULong, FileOffer>>(emptyMap())
+        val accepting = acceptingOffers.asStateFlow()
+
+        /** Reserve before service delivery so repeated taps cannot queue two saves. */
+        fun startAccept(context: Context, offer: FileOffer): Boolean = synchronized(lifecycle) {
+            if (offer.id in acceptingOffers.value || offer.id in activeIds) return true
+            acceptingOffers.value = acceptingOffers.value + (offer.id to offer)
+            try {
+                ContextCompat.startForegroundService(context, intent(context, ACTION_ACCEPT, offer))
+                true
+            } catch (t: Throwable) {
+                acceptingOffers.value = acceptingOffers.value - offer.id
+                Log.e(TAG, "could not start receive service", t)
+                false
+            }
+        }
 
         // Clear of the VPN (1) and SendService (2) foreground ids. Shared by every
         // start command: two concurrent accepts are one service with one
         // foreground notification, and the last stopSelf(startId) takes it down.
         private const val NOTIF_ONGOING = 3
 
-        /** Serializes going foreground against leaving it. Both the count and
-         * the foreground state are service-wide, so incrementing and posting must
-         * not interleave with a worker decrementing and tearing down. */
+        /** Serializes going foreground against leaving it. Both the active IDs and
+         * the foreground state are service-wide, so registering and posting must
+         * not interleave with a worker removing its ID and tearing down. */
         private val lifecycle = Any()
-
-        /** Start commands whose worker thread has not finished yet. */
-        private val inFlight = AtomicInteger(0)
 
         /** The most recent start command, which is the only id `stopSelf` acts
          * on. Guarded by [lifecycle]. */

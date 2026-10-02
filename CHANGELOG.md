@@ -14,6 +14,111 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
   with only an IPv4 internet connection.
 
+- `ray status` and the macOS app warn when a peer connection has high latency,
+  packet loss, or a backed-up send queue.
+
+- `ray identityof <contact-id>` looks up the advertised device identity without
+  connecting to the peer or requesting approval.
+
+- Android can send files from Home and network details. Home shows incoming and
+  outgoing transfer progress and recent results separately from access requests.
+
+- `ray ssh on|off` enables or disables mesh SSH and saves the setting. The
+  `ray ssh` command also manages SSH grants and shows server state.
+- Mesh SSH can use a different port with `ray config set ssh-port <port>`, so
+  another SSH service can use mesh port 22.
+- Experimental: `ray config set quic-congestion loss-tolerant` switches the
+  tunnel to a congestion controller that ignores ordinary packet loss. It
+  applies on restart; the default stays `cubic`. The macOS app has a toggle
+  for it in Settings, and tab completion offers both values.
+
+### Changed
+
+- Android shows device names instead of IPv6 addresses, uses larger text, and
+  distinguishes VPN connectivity from file-only standby on Home.
+
+- Android keeps its file relay reachable while idle so peers can deliver file
+  offers, while mesh links still close until the phone sends traffic.
+
+### Fixed
+
+- The macOS app version now matches the Rayfish version in `Cargo.toml`.
+- IPv4 listener bridging is enabled by default on fresh installs and starts
+  with the macOS app's VPN. An explicit `v4-bridge off` setting is preserved.
+- The macOS app bridges IPv4 services through its background helper so macOS
+  can deliver mesh connections to them, including when mesh SSH is disabled.
+- Android firewall forms keep the selected peer after activity recreation.
+- Android shows file transfer cancellation only for outgoing transfers.
+- Coordinators that leave with `ray nuke --force` publish their departure so
+  offline coordinators do not restore a stale roster. Valid destruction notices
+  are accepted even when the local roster is stale.
+
+- Bash completion installed by the macOS app now registers in new terminals.
+- Clicking a peer in the Android, macOS, or web UI copies its full `.ray` domain.
+- Incoming pings no longer keep Android's mesh transport awake or wake it after
+  idle suspension.
+- `ray status` groups paired devices under their primary even while they are offline.
+- Installing the macOS app's shell command also enables tab completion in new terminals.
+- Android restores the active mesh notification if it is swiped away while the
+  mesh service is still running.
+- macOS shows auto-accepted file transfers and their progress in the Files page
+  and notifications. Clicking a completed notification reveals the file in Finder.
+- `ray apply` treats concrete hosts in the spec as the desired network
+  membership, joining missing managed machines and removing machines no longer
+  named. Firewall wildcards no longer preserve undeclared members.
+- `ray apply` retries joining an online managed machine when the coordinator's
+  roster lists it but the machine does not have that network active.
+- `ray apply` kicks removed hosts from closed networks even after their managed
+  machine record is gone, and reports failed removals as errors.
+
+- Android network sheets remain scrollable with the keyboard open or in landscape.
+- Android keeps the last known status when a refresh fails and offers Retry.
+  Foreground updates now share one reader across tabs and activity recreation.
+
+- Android downloads started from Home continue when switching tabs. Navigation
+  and text inputs survive activity recreation, and Back closes network details.
+
+### Performance
+
+- Linux enables TUN TCP/UDP segmentation and receive offloads, batching packets
+  between the mesh and kernel to reduce per-packet work.
+- macOS batches packet-tunnel I/O. Peer traffic uses a bounded QUIC datagram
+  queue without adding another per-peer queue in the forwarding path.
+- Peer metrics report QUIC queue depth, congestion window, loss,
+  path MTU, and TUN offload and batching state for throughput diagnostics.
+
+## [0.5.6] - 2026-10-01
+
+### Added
+
+- The macOS Settings page shows the app version and lets you turn automatic
+  updates on or off.
+- When a macOS update is ready, a notification offers to restart Rayfish and
+  install it. The VPN reconnects if it was connected before the restart.
+
+### Fixed
+
+- Mesh SSH reuses the system OpenSSH ED25519 host key when `sshd -T` cannot
+  inspect the server configuration, instead of presenting a generated key.
+
+- The macOS app reports version 0.5.5 instead of the stale 0.4.2 value.
+
+- Peers reconnect after a dial stalls during a network outage instead of
+  remaining unreachable until Rayfish restarts.
+
+- macOS release builds sign Sparkle's update helpers so Apple accepts the app
+  for notarization.
+
+- `ray status` highlights a peer's RTT only when it exceeds that peer's recent
+  baseline, so normal long-distance connections stay neutral.
+
+## [0.5.5] - 2026-09-29
+
+### Added
+
+- Paired devices pick up networks added to their primary while they were offline.
+  New networks are joined when the device reconnects.
+
 - `ray apply` accepts `*-host-a,host-b` as a target, including aliases and
   groups, to skip firewall suggestions and SSH grants on those devices without
   removing them from the network. Targets expand at apply time; reapply after
@@ -42,6 +147,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The macOS app retries its VPN connection when the network becomes available
+  after an offline login. Disconnecting in the app still keeps it offline.
+
 - `ray apply` skips the local machine when applying SSH grants, avoiding a
   misleading controlled-machine warning and failed exit status.
 
@@ -54,6 +162,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Android release and nightly APKs use a permanent signing key so future updates
   preserve app data. Existing debug installs need a one-time backup and restore
   into the release app, which installs alongside the debug app.
+
+- `ray nuke --force` leaves the network running when another coordinator remains.
+  The last coordinator tells all peers to leave before closing connections, with
+  signed deletion records for peers that missed the notice.
 
 ## [0.5.4] - 2026-09-29
 
@@ -2542,7 +2654,9 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/rayfish/rayfish/compare/v0.5.5...v0.5.6
+[0.5.5]: https://github.com/rayfish/rayfish/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/rayfish/rayfish/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/rayfish/rayfish/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/rayfish/rayfish/compare/v0.5.1...v0.5.2

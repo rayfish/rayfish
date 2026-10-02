@@ -341,20 +341,6 @@ pub fn expected_hosts_for_network(firewall: &DeployNetwork) -> BTreeSet<String> 
     set
 }
 
-/// A wildcard refers to the live population rather than declaring it absent.
-pub fn has_membership_wildcard(firewall: &DeployNetwork) -> bool {
-    firewall.iter().any(|(subject, rules)| {
-        subject == "*"
-            || subject.starts_with("*-")
-            || rules
-                .allows
-                .keys()
-                .chain(rules.denies.keys())
-                .chain(rules.ssh.keys())
-                .any(|peer| peer == "*" || peer.starts_with("*-"))
-    })
-}
-
 /// Managed-machine joins and leaves needed to reach the desired membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipDiff {
@@ -365,13 +351,12 @@ pub struct MembershipDiff {
 }
 
 /// Compare one network's live roster with the concrete hostnames named by its
-/// new spec. A wildcard expands to the current roster, so wildcard policy does
-/// not remove machines merely because it does not spell out their names.
+/// new spec. Wildcards are policy selectors, not membership declarations.
 pub fn membership_diff(
     firewall: &DeployNetwork,
     current: &HashSet<MachineHostname>,
 ) -> Result<MembershipDiff> {
-    let mut desired: HashSet<MachineHostname> = expected_hosts_for_network(firewall)
+    let desired: HashSet<MachineHostname> = expected_hosts_for_network(firewall)
         .into_iter()
         .map(|hostname| {
             hostname
@@ -379,9 +364,6 @@ pub fn membership_diff(
                 .with_context(|| format!("invalid hostname '{hostname}' in deploy spec"))
         })
         .collect::<Result<_>>()?;
-    if has_membership_wildcard(firewall) {
-        desired.extend(current.iter().cloned());
-    }
     let mut joins: Vec<MachineHostname> = desired.difference(current).cloned().collect();
     let mut leaves: Vec<MachineHostname> = current.difference(&desired).cloned().collect();
     joins.sort();
@@ -716,7 +698,7 @@ networks:
     }
 
     #[test]
-    fn excluded_peer_selector_survives_expansion_and_preserves_membership() {
+    fn excluded_peer_selector_survives_expansion_without_declaring_membership() {
         let spec = parse(
             r#"
 networks:
@@ -738,7 +720,13 @@ networks:
             .collect();
         let diff = membership_diff(firewall, &current).unwrap();
         assert!(diff.joins.is_empty());
-        assert!(diff.leaves.is_empty());
+        assert_eq!(
+            diff.leaves,
+            ["a", "new-peer"]
+                .into_iter()
+                .map(|host| host.parse().unwrap())
+                .collect::<Vec<_>>()
+        );
         let (expanded, warnings) = expand_firewall(
             firewall,
             &BTreeMap::new(),
@@ -915,7 +903,14 @@ networks:
         let network = &spec.networks["sample-net"];
         assert!(expected_hosts_for_network(network).is_empty());
         let diff = membership_diff(network, &current).unwrap();
-        assert!(diff.joins.is_empty() && diff.leaves.is_empty());
+        assert!(diff.joins.is_empty());
+        assert_eq!(
+            diff.leaves,
+            ["build-box", "laptop"]
+                .into_iter()
+                .map(|host| host.parse().unwrap())
+                .collect::<Vec<_>>()
+        );
         let (expanded, _) = expand_firewall(
             network,
             &spec.aliases,
@@ -1156,7 +1151,7 @@ networks:
     }
 
     #[test]
-    fn membership_diff_preserves_current_hosts_for_wildcards() {
+    fn membership_diff_does_not_treat_wildcards_as_membership() {
         let mut firewall = DeployNetwork::new();
         firewall.insert("*".to_string(), allows(&[("*", "tcp:22")]));
         let current = ["alice", "bob"]
@@ -1167,7 +1162,7 @@ networks:
             membership_diff(&firewall, &current).unwrap(),
             MembershipDiff {
                 joins: Vec::new(),
-                leaves: Vec::new(),
+                leaves: vec!["alice".parse().unwrap(), "bob".parse().unwrap()],
             }
         );
     }

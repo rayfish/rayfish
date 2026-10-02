@@ -120,7 +120,7 @@ impl Daemon {
         }
 
         let response: control::PairMsg = match control::recv_framed(&mut recv).await {
-            Ok(r) => r,
+            Ok(response) => response,
             Err(e) => {
                 return ipc_err(format!("failed to read pair response: {e}"));
             }
@@ -128,7 +128,10 @@ impl Daemon {
 
         match response {
             control::PairMsg::Response { cert, networks } => {
-                if !cert.verify() {
+                if !cert.verify()
+                    || cert.device_key != self.transport.endpoint.id()
+                    || cert.user_identity != endpoint_id
+                {
                     return ipc_err("received invalid device certificate".to_string());
                 }
                 if let Err(e) = identity::store_device_cert(&cert) {
@@ -142,59 +145,123 @@ impl Daemon {
                 // coordinator), and this does not depend on the fetched blob's
                 // roster flagging it `is_coordinator`. Falls back to the blob's
                 // coordinators if the primary does not admit.
-                for net in networks {
-                    if let Ok(key) = net.network_key.parse::<EndpointId>() {
-                        if self
-                            .registry
-                            .networks
-                            .iter()
-                            .any(|entry| entry.network_key == key)
-                        {
-                            continue;
-                        }
-                        if let Ok(cfg) = config::load()
-                            && cfg
-                                .networks
-                                .iter()
-                                .any(|saved| saved.network_public_key == Some(key))
-                        {
-                            continue;
-                        }
-                    }
-                    let me = Arc::clone(self);
-                    let net_name = net.name.clone();
-                    let net_key = net.network_key.clone();
-                    tokio::spawn(async move {
-                        match me
-                            .join_network(
-                                &net_key,
-                                Some(&net_name),
-                                None,
-                                None,
-                                Some(endpoint_id),
-                                false,
-                                false,
-                            )
-                            .await
-                        {
-                            IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
-                                tracing::info!(network = %net_name, "pairing auto-join ok");
-                            }
-                            IpcMessage::Error { message } => {
-                                tracing::warn!(network = %net_name, error = %message, "pairing auto-join failed");
-                            }
-                            other => {
-                                tracing::warn!(network = %net_name, response = ?other, "pairing auto-join: unexpected response");
-                            }
-                        }
-                    });
-                }
+                self.queue_shared_networks(networks, endpoint_id);
+                self.registry.poll_nudge.notify_waiters();
                 tracing::info!("pairing complete; device certificate stored");
                 IpcMessage::PairingComplete {
                     user_identity: cert.user_identity,
                 }
             }
             _ => ipc_err("unexpected pairing response".to_string()),
+        }
+    }
+
+    fn queue_shared_networks(
+        self: &Arc<Self>,
+        networks: Vec<control::PairNetwork>,
+        primary: EndpointId,
+    ) {
+        for net in networks {
+            let Ok(key) = net.network_key.parse::<EndpointId>() else {
+                tracing::warn!(network = %net.name, "primary sent invalid network key");
+                continue;
+            };
+            if self
+                .registry
+                .networks
+                .iter()
+                .any(|entry| entry.network_key == key)
+            {
+                continue;
+            }
+            if let Ok(cfg) = config::load()
+                && (cfg
+                    .networks
+                    .iter()
+                    .any(|saved| saved.network_public_key == Some(key))
+                    || cfg
+                        .pending_joins
+                        .iter()
+                        .any(|pending| pending.network_key == net.network_key))
+            {
+                continue;
+            }
+            if !self.paired_network_joins.insert(key) {
+                continue;
+            }
+            let me = Arc::clone(self);
+            let joining = Arc::clone(&self.paired_network_joins);
+            let net_name = net.name.clone();
+            let net_key = net.network_key.clone();
+            tokio::spawn(async move {
+                let result = me
+                    .join_network(
+                        &net_key,
+                        Some(&net_name),
+                        None,
+                        None,
+                        Some(primary),
+                        false,
+                        false,
+                    )
+                    .await;
+                joining.remove(&key);
+                match result {
+                    IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
+                        tracing::info!(network = %net_name, "paired network join queued or complete");
+                    }
+                    IpcMessage::Error { message } => {
+                        tracing::warn!(network = %net_name, error = %message, "paired network join failed");
+                    }
+                    other => {
+                        tracing::warn!(network = %net_name, response = ?other, "paired network join: unexpected response");
+                    }
+                }
+            });
+        }
+    }
+
+    async fn sync_networks_from_primary(self: &Arc<Self>) {
+        let Some(cert) = self.registry.current_device_cert() else {
+            return;
+        };
+        let primary = cert.user_identity;
+        let request_cert = cert.clone();
+        let addr: iroh::EndpointAddr = primary.into();
+        let sync = async {
+            let conn = self.transport.endpoint.connect(addr, PAIR_ALPN).await?;
+            if conn.remote_id() != primary {
+                anyhow::bail!("connected to an unexpected primary");
+            }
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let request = control::PairMsg::NetworkListRequest { cert: request_cert };
+            control::send_framed(&mut send, &request).await?;
+            let response: control::PairMsg = control::recv_framed(&mut recv).await?;
+            match response {
+                control::PairMsg::NetworkListResponse { networks } => Ok(networks),
+                _ => anyhow::bail!("unexpected paired network response"),
+            }
+        };
+        match tokio::time::timeout(PAIR_CONNECT_TIMEOUT, sync).await {
+            Ok(Ok(networks)) if self.registry.current_device_cert() == Some(cert) => {
+                self.queue_shared_networks(networks, primary);
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::debug!(%error, "paired network sync failed"),
+            Err(_) => tracing::debug!("paired network sync timed out"),
+        }
+    }
+
+    pub(crate) async fn run_paired_network_sync(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+        let nudge = Arc::clone(&self.registry.poll_nudge);
+        loop {
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return,
+                _ = tick.tick() => {},
+                _ = nudge.notified() => tick.reset(),
+            }
+            self.sync_networks_from_primary().await;
         }
     }
 

@@ -469,6 +469,7 @@ async fn build_member_state(
         approved: ApprovedList::from_entries(approved),
         snapshot: None,
         snapshot_commit: Arc::new(AsyncMutex::new(())),
+        destroyed: false,
         converged_hash: None,
         unconfirmed_durable_hash: None,
         network_secret_key: direct_key.cloned(),

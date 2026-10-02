@@ -76,7 +76,8 @@ pub struct PairNetwork {
     pub network_key: String,
 }
 
-/// Messages for the device pairing protocol (ALPN `rayfish/pair/2`).
+/// Messages for device pairing and paired-device network discovery (ALPN
+/// `rayfish/pair/2`). The original variants keep their wire representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairMsg {
     Request {
@@ -86,6 +87,12 @@ pub enum PairMsg {
     Response {
         cert: DeviceCert,
         #[serde(default)]
+        networks: Vec<PairNetwork>,
+    },
+    NetworkListRequest {
+        cert: DeviceCert,
+    },
+    NetworkListResponse {
         networks: Vec<PairNetwork>,
     },
 }

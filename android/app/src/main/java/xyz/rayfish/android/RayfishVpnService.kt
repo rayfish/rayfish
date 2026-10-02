@@ -35,6 +35,8 @@ class RayfishVpnService : VpnService() {
 
     @Volatile
     private var tunnel: ParcelFileDescriptor? = null
+    @Volatile
+    private var foregroundNotificationPosted = false
     // Loopback DNS proxy forwarding non-.ray lookups through DnsResolver.rawQuery
     // (honors Private DNS / DoT). Null on API < 29 or if it failed to start.
     private var dnsProxy: DnsProxy? = null
@@ -78,6 +80,20 @@ class RayfishVpnService : VpnService() {
         }
 
         when (intent.action) {
+            ACTION_RESTORE_NOTIFICATION -> {
+                // Android 14 lets users swipe away ongoing foreground notifications.
+                // Repost only if this service is still keeping the mesh online.
+                nodeExecutor.execute {
+                    val shouldStayOnline = NodeHolder.isEnabled(applicationContext) ||
+                        !NodeHolder.isGoOfflineWhenDisabled(applicationContext)
+                    if (foregroundNotificationPosted && shouldStayOnline) {
+                        startForegroundNotification(standby = tunnel == null)
+                    } else if (!foregroundNotificationPosted) {
+                        stopSelf(startId)
+                    }
+                }
+                return START_STICKY
+            }
             ACTION_STOP -> {
                 // Persist the disable intent here, not only in the caller. The UI
                 // toggle already sets this false before sending ACTION_STOP, but
@@ -867,6 +883,7 @@ class RayfishVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        foregroundNotificationPosted = false
         // The service is going away for good, so there is no standby to hold: a
         // standby with no foreground service is exactly the process the OS kills.
         // Tear the node down fully. Routed through nodeExecutor (not called
@@ -963,6 +980,16 @@ class RayfishVpnService : VpnService() {
             .setOngoing(true)
             .setContentIntent(openIntent)
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val restoreIntent = PendingIntent.getService(
+                this,
+                2,
+                Intent(this, RayfishVpnService::class.java).apply { action = ACTION_RESTORE_NOTIFICATION },
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.setDeleteIntent(restoreIntent)
+        }
+
         // With the VPN up, offer a one-tap "Disable" straight from the shade
         // (like Tailscale), so the user can drop the tunnel and free the single
         // VpnService slot without opening the app. The action delivers ACTION_STOP
@@ -994,6 +1021,7 @@ class RayfishVpnService : VpnService() {
             } else {
                 startForeground(NOTIF_ID, notification)
             }
+            foregroundNotificationPosted = true
             true
         } catch (t: Throwable) {
             Log.e(TAG, "startForeground refused (standby=$standby); service cannot stay in the foreground", t)
@@ -1045,6 +1073,7 @@ class RayfishVpnService : VpnService() {
             private set
 
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
+        private const val ACTION_RESTORE_NOTIFICATION = "xyz.rayfish.android.RESTORE_NOTIFICATION"
         const val ACTION_STANDBY = "xyz.rayfish.android.STANDBY"
         const val ACTION_EXIT_STANDBY = "xyz.rayfish.android.EXIT_STANDBY"
 

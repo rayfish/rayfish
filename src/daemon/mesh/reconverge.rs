@@ -379,6 +379,9 @@ pub(crate) async fn reconverge_and_apply(
     // the gap and then be overwritten by this fetched state.
     let roster = {
         let mut s = state.write().unwrap();
+        if s.destroyed {
+            return;
+        }
         if current_group_hash(&s) != generation {
             tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
             return;
@@ -717,10 +720,21 @@ pub(crate) fn spawn_group_poller(
             // no-op when the flag already matches.
             registry.sync_exit_offers().await;
 
-            let (remote_hash, seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
+            let packet = match dht::resolve_network_packet(&client, net_pubkey).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::debug!(error = %e, "group poll failed");
+                    continue;
+                }
+            };
+            if dht::destruction::is_destroyed(&packet) {
+                registry.schedule_destruction(&network_name, packet);
+                break;
+            }
+            let (remote_hash, seed_peers) = match dht::decode_network_record(&packet) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::debug!(%error, "invalid group record");
                     continue;
                 }
             };
@@ -871,6 +885,9 @@ pub(crate) async fn fetch_and_apply_blob(
     // the gap and then be overwritten by this fetched state.
     {
         let mut s = state.write().unwrap();
+        if s.destroyed {
+            return ReconvergeOutcome::Departed;
+        }
         if current_group_hash(&s) != generation {
             tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
             return ReconvergeOutcome::Superseded;
@@ -972,6 +989,7 @@ mod reconverge_tests {
             approved: ApprovedList::new(),
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
+            destroyed: false,
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,

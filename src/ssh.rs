@@ -2,8 +2,8 @@
 
 //! Embedded mesh SSH server (`ray firewall ssh on`), Tailscale-style.
 //!
-//! The daemon runs a small SSH server bound to each of this node's mesh IPs on
-//! port 22. A stock `ssh` client connecting to `<peer>.ray` (or the mesh IP)
+//! The daemon runs a small SSH server on each mesh IP's configured SSH port
+//! (22 by default). A stock `ssh` client connecting to `<peer>.ray` (or the mesh IP)
 //! lands here. There are no SSH keys: the connecting peer is already
 //! cryptographically identified by the QUIC mesh link, and the kernel TCP stack
 //! delivers the connection with the peer's mesh IP as the socket source (the
@@ -48,15 +48,15 @@
 //! A connection from this host to its own mesh address never arrives here. The
 //! kernel short-circuits self-traffic over loopback (see
 //! [`crate::tun::route_self_loopback`]), so it never enters the TUN, and the
-//! port rewrite that makes mesh `:22` reach the internal listen port lives in
-//! that forwarding path. The connection lands on `<mesh ip>:22`, where nothing
+//! port rewrite that makes the configured mesh SSH port reach the internal listener lives in
+//! that forwarding path. The connection lands on the mesh IP, where nothing
 //! is bound, and the kernel refuses it. Binding `:22` as well would not fix
 //! that: the `none` auth method is safe only because the mesh link proves who
 //! the peer is, and a loopback connection proves nothing beyond "some account
 //! on this box", so admitting it would hand every local user a root shell. On
 //! the host itself, use the host sshd (`ssh localhost`), which authenticates.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod app_helper;
 mod authz;
 mod host_keys;
@@ -99,9 +99,9 @@ use crate::daemon::NetworkRegistry;
 use authz::resolve_user_policy;
 pub use authz::{SshAuthz, new_authz};
 use authz::{UserPolicy, auth_banner, resolve_user_policy_with_hostnames};
-use host_keys::{load_host_key, sftp_subsystem_command};
 #[cfg(test)]
-use host_keys::{parse_hostkey_paths, parse_sftp_subsystem};
+use host_keys::{host_key_paths, parse_hostkey_paths, parse_sftp_subsystem};
+use host_keys::{load_host_key, sftp_subsystem_command};
 use login::{LoginInfo, resolve_login};
 use permissions::{account_can, hand_over};
 use session::{Exit, SessionSpec, run_pipe_session, run_pty_session, signal_number};
@@ -111,13 +111,15 @@ use session_env::tty_name;
 
 // The port a stock `ssh` client targets (`ssh user@host.ray`) and the internal
 // port the embedded server actually binds. Both live in `crate::forward` (the
-// always-compiled core) because the userspace SSH NAT there rewrites mesh `:22`
+// always-compiled core) because the userspace SSH NAT there rewrites the mesh SSH port
 // <-> the listen port on every platform, including Android where this module is
 // gated out. We can't bind `:22` directly: a host sshd on `0.0.0.0:22` makes the
 // kernel reject a more-specific `<mesh-ip>:22` bind (EADDRINUSE), so the daemon
 // binds `SSH_LISTEN_PORT` and translates the port in the forwarding path instead
 // of an OS-firewall redirect. Re-exported here so the public path stays stable.
-pub(crate) use crate::forward::{SSH_LISTEN_PORT, SSH_PORT};
+pub(crate) use crate::forward::SSH_LISTEN_PORT;
+#[cfg(test)]
+use crate::forward::SSH_PORT;
 
 /// How long a `ssh -L` / `-D` forwarded connection may take to reach its target
 /// before the channel is dropped. Short enough that a black-holed address fails
@@ -172,9 +174,8 @@ impl SshServer {
     }
 
     /// Spawn a listener on each mesh address (at [`SSH_LISTEN_PORT`]). Runs until
-    /// `token` is cancelled. Mesh `:22` is mapped to this port by the userspace
-    /// NAT in `forward.rs`, so a stock client connects on `:22` while the host
-    /// sshd keeps `:22` on every other interface.
+    /// `token` is cancelled. The configured mesh SSH port is mapped to this port
+    /// by the userspace NAT in `forward.rs`.
     pub fn spawn(self, addrs: Vec<IpAddr>, token: CancellationToken) {
         tokio::spawn(async move {
             let key = match load_host_key() {
@@ -193,7 +194,7 @@ impl SshServer {
                         continue;
                     }
                 };
-                info!(%addr, port = SSH_LISTEN_PORT, "mesh SSH listening (reachable as :22)");
+                info!(%addr, port = SSH_LISTEN_PORT, mesh_port = crate::forward::ssh_port(), "mesh SSH listening");
                 let registry = Arc::clone(&self.registry);
                 let authz = Arc::clone(&self.authz);
                 let config = Arc::clone(&config);
@@ -281,8 +282,8 @@ async fn handle_conn(
     // `SSH_CONNECTION` and what `login` records as the origin.
     let server = stream
         .local_addr()
-        .map(|a| SocketAddr::new(a.ip(), SSH_PORT))
-        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V6(src), SSH_PORT));
+        .map(|a| SocketAddr::new(a.ip(), crate::forward::ssh_port()))
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V6(src), crate::forward::ssh_port()));
     let handler = SshHandler::new(
         policy,
         user_identity,
@@ -1450,6 +1451,25 @@ mod tests {
     #[test]
     fn parse_hostkey_paths_empty_when_no_hostkey() {
         assert!(parse_hostkey_paths("port 22\npermitrootlogin no\n").is_empty());
+    }
+
+    #[test]
+    fn host_key_paths_fall_back_when_sshd_dump_fails() {
+        assert_eq!(
+            host_key_paths(None),
+            vec![
+                PathBuf::from("/etc/ssh/ssh_host_ed25519_key"),
+                PathBuf::from("/usr/local/etc/ssh/ssh_host_ed25519_key"),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_key_paths_use_sshd_configuration_when_available() {
+        assert_eq!(
+            host_key_paths(Some("hostkey /custom/ssh_host_ed25519_key\n")),
+            vec![PathBuf::from("/custom/ssh_host_ed25519_key")]
+        );
     }
 
     #[test]

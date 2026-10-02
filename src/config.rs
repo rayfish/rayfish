@@ -47,6 +47,36 @@ impl DnsMode {
     }
 }
 
+/// Which QUIC congestion controller the endpoint builds for each path. Read
+/// once at endpoint bind, so a change takes effect on restart. See
+/// [`crate::transport`]'s `congestion` module for what each one does.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, strum::AsRefStr, strum::EnumString,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum QuicCongestion {
+    /// noq's default.
+    #[default]
+    Cubic,
+    /// Ignores ordinary loss and leaves rate control to the tunnelled flows.
+    /// Experimental.
+    LossTolerant,
+}
+
+/// An unknown saved value (a controller since removed, or a hand edit) falls
+/// back to the default rather than failing the whole settings load: this knob
+/// must never be what keeps the daemon from starting.
+fn deserialize_quic_congestion<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<QuicCongestion, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(value.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(%value, "unknown quic_congestion in settings.toml; using cubic");
+        QuicCongestion::default()
+    }))
+}
+
 fn deserialize_dns_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<DnsMode, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -110,6 +140,7 @@ mod option_secret_key_hex {
     }
 }
 
+pub(crate) mod destruction;
 mod write;
 
 pub use write::{restrict_perms, write_file};
@@ -283,6 +314,10 @@ pub struct SshRule {
 
 fn default_true() -> bool {
     true
+}
+
+pub(crate) const fn default_ssh_port() -> u16 {
+    22
 }
 
 /// In-memory aggregate of the on-disk config. Reads assemble this from
@@ -566,6 +601,9 @@ pub struct AppConfig {
         deserialize_with = "deserialize_dns_mode"
     )]
     pub dns_mode: DnsMode,
+    /// QUIC congestion controller (`ray config set quic-congestion`).
+    #[serde(default, deserialize_with = "deserialize_quic_congestion")]
+    pub quic_congestion: QuicCongestion,
     /// Recently successful peer transport paths.  These are only connection
     /// hints: iroh still authenticates the endpoint identity in TLS and falls
     /// back to its normal discovery services when a hint is stale.  Keeping
@@ -574,10 +612,13 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoint_hints: Vec<iroh::EndpointAddr>,
     /// Global toggle for the embedded mesh SSH server (`ray firewall ssh on`).
-    /// When on, the daemon listens on each mesh IP's port 22 and admits peers
+    /// When on, the daemon listens on each mesh IP's configured SSH port and admits peers
     /// authorized in a network's local or managed SSH allow list. Off by default.
     #[serde(default)]
     pub ssh_enabled: bool,
+    /// Port peers use to reach the embedded SSH server over the mesh.
+    #[serde(default = "default_ssh_port")]
+    pub ssh_port: u16,
     /// Global toggle for bridging this host's IPv4-only listeners onto the mesh
     /// address (`ray config set v4-bridge off`). On by default: the mesh
     /// firewall still denies inbound by default, so the only ports it changes
@@ -670,8 +711,10 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             dns_mode: DnsMode::On,
+            quic_congestion: QuicCongestion::default(),
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
+            ssh_port: default_ssh_port(),
             v4_bridge: true,
             pf_passthrough: true,
             on_demand: true,
@@ -800,8 +843,8 @@ fn ensure_not_in_network_update() -> Result<()> {
 /// per-network entries, which live in their own files).
 ///
 /// `Default` gives every field its type-default (so `mdns_enabled` is `false`);
-/// the fresh-install default that actually ships (`mdns` on) is built at the one
-/// `load_in` site with a `mdns_enabled: true` struct-update override.
+/// the fresh-install defaults are built at the `load_in` site with explicit
+/// overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Settings {
     #[serde(default = "default_true")]
@@ -824,10 +867,14 @@ struct Settings {
         deserialize_with = "deserialize_dns_mode"
     )]
     dns_mode: DnsMode,
+    #[serde(default, deserialize_with = "deserialize_quic_congestion")]
+    quic_congestion: QuicCongestion,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
     ssh_enabled: bool,
+    #[serde(default = "default_ssh_port")]
+    ssh_port: u16,
     #[serde(default = "default_true")]
     v4_bridge: bool,
     #[serde(default = "default_true")]
@@ -1350,11 +1397,12 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         let s = std::fs::read_to_string(&settings_path).context("reading settings.toml")?;
         toml::from_str(&s).context("parsing settings.toml")?
     } else {
-        // Fresh install: discovery and Magic DNS are on by default, everything
-        // else is the type-default.
+        // Fresh install: discovery and Magic DNS are on, and mesh SSH uses port 22.
         Settings {
             mdns_enabled: true,
             dns_mode: DnsMode::On,
+            ssh_port: default_ssh_port(),
+            v4_bridge: true,
             ..Default::default()
         }
     };
@@ -1392,8 +1440,10 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
         dns_mode: settings.dns_mode,
+        quic_congestion: settings.quic_congestion,
         endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
+        ssh_port: settings.ssh_port,
         v4_bridge: settings.v4_bridge,
         pf_passthrough: settings.pf_passthrough,
         on_demand: settings.on_demand,
@@ -1466,8 +1516,10 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
         dns_mode: config.dns_mode,
+        quic_congestion: config.quic_congestion,
         endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
+        ssh_port: config.ssh_port,
         v4_bridge: config.v4_bridge,
         pf_passthrough: config.pf_passthrough,
         on_demand: config.on_demand,
@@ -1538,6 +1590,15 @@ pub fn save_network(net: &NetworkConfig) -> Result<()> {
 /// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
 fn save_network_unlocked(dir: &Path, net: &NetworkConfig) -> Result<()> {
     validate_net_name(&net.name)?;
+    if let Some(key) = net
+        .network_public_key
+        .or_else(|| net.network_secret_key.as_ref().map(SecretKey::public))
+    {
+        anyhow::ensure!(
+            destruction::load_in(dir, key)?.is_none(),
+            "network has been destroyed"
+        );
+    }
     let ndir = dir.join(NETWORKS_SUBDIR);
     let path = ndir.join(format!("{}.toml", net.name));
     let contents = toml::to_string_pretty(net).context("serializing network config")?;
@@ -2292,6 +2353,34 @@ name = "test"
     }
 
     #[test]
+    fn ssh_port_defaults_to_22_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(load_in(tmp.path()).unwrap().ssh_port, 22);
+        let cfg = AppConfig {
+            ssh_port: 2222,
+            ..Default::default()
+        };
+        save_settings_in(tmp.path(), &cfg).unwrap();
+        assert_eq!(load_in(tmp.path()).unwrap().ssh_port, 2222);
+    }
+
+    #[test]
+    fn v4_bridge_defaults_on_and_preserves_explicit_off() {
+        let tmp = tempfile::tempdir().expect("create config directory");
+        assert!(load_in(tmp.path()).expect("load fresh settings").v4_bridge);
+        std::fs::write(tmp.path().join(SETTINGS_FILE), "mdns_enabled = false\n")
+            .expect("write settings without the bridge key");
+        assert!(load_in(tmp.path()).expect("load older settings").v4_bridge);
+
+        let cfg = AppConfig {
+            v4_bridge: false,
+            ..Default::default()
+        };
+        save_settings_in(tmp.path(), &cfg).expect("save the disabled bridge");
+        assert!(!load_in(tmp.path()).expect("reload settings").v4_bridge);
+    }
+
+    #[test]
     fn management_state_roundtrips_with_typed_values() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -2409,6 +2498,30 @@ name = "test"
         assert_eq!(
             load_in(tmp.path()).expect("load new setting").dns_mode,
             DnsMode::Partial
+        );
+    }
+
+    #[test]
+    fn quic_congestion_round_trips_and_tolerates_unknown_values() {
+        let tmp = tempfile::tempdir().expect("create config directory");
+        let path = tmp.path().join(SETTINGS_FILE);
+        assert_eq!(
+            load_in(tmp.path()).expect("fresh install").quic_congestion,
+            QuicCongestion::Cubic
+        );
+        std::fs::write(&path, "quic_congestion = 'loss-tolerant'\n").expect("write setting");
+        let loaded = load_in(tmp.path()).expect("load setting");
+        assert_eq!(loaded.quic_congestion, QuicCongestion::LossTolerant);
+        assert!(
+            settings_toml(&loaded)
+                .expect("serialize")
+                .contains("quic_congestion = \"loss-tolerant\"")
+        );
+        // A removed or hand-typed controller must not stop the daemon loading.
+        std::fs::write(&path, "quic_congestion = 'bbr3'\n").expect("write unknown");
+        assert_eq!(
+            load_in(tmp.path()).expect("load unknown").quic_congestion,
+            QuicCongestion::Cubic
         );
     }
 

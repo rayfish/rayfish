@@ -79,7 +79,7 @@ fn stage_temp(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     Ok(())
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(super) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = dir;

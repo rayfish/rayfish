@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rayfish::config;
+use rayfish::config::QuicCongestion;
 use rayfish::config::settings::GlobalKey;
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
-use rayfish::ipc::{IpcMessage, TransferFileState};
+use rayfish::ipc::{ConnectionIssue, IpcMessage, TransferFileState};
 use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
@@ -29,6 +30,14 @@ uniffi::setup_scaffolding!();
 
 const START_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn connection_issue_priority(issue: ConnectionIssue) -> u8 {
+    match issue {
+        ConnectionIssue::HighLatency => 1,
+        ConnectionIssue::PacketLoss => 2,
+        ConnectionIssue::SendQueue => 3,
+    }
+}
 
 #[derive(Debug, Error, uniffi::Error)]
 pub enum AppleError {
@@ -52,19 +61,42 @@ impl AppleError {
 
 #[derive(uniffi::Record)]
 pub struct NodeStatus {
+    pub mesh: NodeMeshStatus,
+    pub requests: NodeRequestStatus,
+    pub files: Vec<IncomingFile>,
+    pub ssh: NodeSshStatus,
+    pub services: NodeServiceStatus,
+    pub exit_nodes: Vec<ExitNodeNetwork>,
+    pub connection_warning: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeMeshStatus {
     pub active: bool,
     pub ipv6: String,
     pub networks: Vec<Network>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeRequestStatus {
     pub pending_requests: Vec<JoinRequest>,
     pub contact_id: Option<String>,
     pub connection_requests: Vec<ConnectionRequest>,
-    pub files: Vec<IncomingFile>,
-    pub ssh_enabled: bool,
-    pub ssh_rules: Vec<SshRule>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeSshStatus {
+    pub enabled: bool,
+    pub rules: Vec<SshRule>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeServiceStatus {
     pub dns_enabled: bool,
     pub mdns_enabled: bool,
     pub mdns_active: bool,
-    pub exit_nodes: Vec<ExitNodeNetwork>,
+    pub v4_bridge_enabled: bool,
+    pub quic_loss_tolerant: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -95,6 +127,7 @@ pub struct ConnectionRequest {
 #[derive(uniffi::Enum)]
 pub enum IncomingFileState {
     Pending,
+    Transferring,
     Received,
 }
 
@@ -104,14 +137,19 @@ pub struct IncomingFile {
     pub peer: String,
     pub filename: String,
     pub size: u64,
+    pub transferred: u64,
     pub state: IncomingFileState,
+    pub destination: Option<String>,
 }
 
-#[derive(uniffi::Enum)]
+#[derive(Clone, Copy, uniffi::Enum)]
 pub enum GlobalSetting {
     Dns,
     Mdns,
     Ssh,
+    /// On selects the loss-tolerant QUIC congestion controller, off cubic.
+    /// Applies when the endpoint next binds.
+    QuicLossTolerant,
 }
 
 impl From<GlobalSetting> for GlobalKey {
@@ -120,6 +158,7 @@ impl From<GlobalSetting> for GlobalKey {
             GlobalSetting::Dns => Self::Dns,
             GlobalSetting::Mdns => Self::Mdns,
             GlobalSetting::Ssh => Self::Ssh,
+            GlobalSetting::QuicLossTolerant => Self::QuicCongestion,
         }
     }
 }
@@ -334,59 +373,105 @@ impl Node {
                 Vec::new()
             }
         };
-        Ok(NodeStatus {
-            active,
+        let requests = NodeRequestStatus {
+            pending_requests,
             contact_id,
             connection_requests,
-            files: incoming_files(state.list_files())?,
-            ssh_enabled: settings.ssh_enabled,
-            ssh_rules: settings
-                .networks
-                .iter()
-                .flat_map(|network| {
-                    network.ssh_allow.iter().map(|rule| SshRule {
-                        network: network.name.clone(),
-                        peer: rule.peer.clone(),
-                        users: rule.users.clone(),
-                    })
+        };
+        let files = incoming_files(state.list_files())?;
+        let rules = settings
+            .networks
+            .iter()
+            .flat_map(|network| {
+                network.ssh_allow.iter().map(|rule| SshRule {
+                    network: network.name.clone(),
+                    peer: rule.peer.clone(),
+                    users: rule.users.clone(),
                 })
-                .collect(),
+            })
+            .collect();
+        let ssh = NodeSshStatus {
+            enabled: settings.ssh_enabled,
+            rules,
+        };
+        let services = NodeServiceStatus {
             dns_enabled: settings.dns_mode.enabled(),
             mdns_enabled: settings.mdns_enabled,
             mdns_active,
+            v4_bridge_enabled: settings.v4_bridge,
+            quic_loss_tolerant: settings.quic_congestion == QuicCongestion::LossTolerant,
+        };
+        let ipv6 = membership::derive_ipv6(&endpoint_id).to_string();
+        let connection_warning = networks
+            .iter()
+            .flat_map(|network| &network.peers)
+            .filter_map(|peer| {
+                peer.connection
+                    .as_ref()
+                    .and_then(|connection| connection.quality_issue)
+                    .map(|issue| {
+                        let name = peer
+                            .hostname
+                            .clone()
+                            .unwrap_or_else(|| peer.endpoint_id.fmt_short().to_string());
+                        let detail = match issue {
+                            ConnectionIssue::HighLatency => "has high latency",
+                            ConnectionIssue::PacketLoss => "is losing packets",
+                            ConnectionIssue::SendQueue => "cannot accept traffic fast enough",
+                        };
+                        (
+                            connection_issue_priority(issue),
+                            format!(
+                                "Connection to {name} {detail}. Rayfish traffic may be delayed."
+                            ),
+                        )
+                    })
+            })
+            .max_by_key(|(priority, _)| *priority)
+            .map(|(_, warning)| warning);
+        let networks = networks
+            .into_iter()
+            .map(|network| Network {
+                name: network.name,
+                hostname: network.my_hostname.unwrap_or_default(),
+                ipv6: network.my_ipv6.to_string(),
+                role: network.role.to_string(),
+                peers: network
+                    .peers
+                    .into_iter()
+                    .map(|peer| Peer {
+                        identity: peer.endpoint_id.to_string(),
+                        hostname: peer
+                            .hostname
+                            .unwrap_or_else(|| peer.endpoint_id.to_string()),
+                        ipv6: peer.ipv6.to_string(),
+                        state: peer
+                            .connection
+                            .as_ref()
+                            .map(|connection| connection.conn_type.to_string())
+                            .unwrap_or_else(|| peer.state.to_string()),
+                        latency_ms: peer
+                            .connection
+                            .and_then(|connection| connection.rtt_ms)
+                            .map(|latency| latency.round() as u32),
+                        is_own_device: peer.is_own_device,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mesh = NodeMeshStatus {
+            active,
+            ipv6,
+            networks,
+        };
+        Ok(NodeStatus {
+            mesh,
+            requests,
+            files,
+            ssh,
+            services,
             exit_nodes,
-            ipv6: membership::derive_ipv6(&endpoint_id).to_string(),
-            networks: networks
-                .into_iter()
-                .map(|network| Network {
-                    name: network.name,
-                    hostname: network.my_hostname.unwrap_or_default(),
-                    ipv6: network.my_ipv6.to_string(),
-                    role: network.role.to_string(),
-                    peers: network
-                        .peers
-                        .into_iter()
-                        .map(|peer| Peer {
-                            identity: peer.endpoint_id.to_string(),
-                            hostname: peer
-                                .hostname
-                                .unwrap_or_else(|| peer.endpoint_id.to_string()),
-                            ipv6: peer.ipv6.to_string(),
-                            state: peer
-                                .connection
-                                .as_ref()
-                                .map(|connection| connection.conn_type.to_string())
-                                .unwrap_or_else(|| peer.state.to_string()),
-                            latency_ms: peer
-                                .connection
-                                .and_then(|connection| connection.rtt_ms)
-                                .map(|latency| latency.round() as u32),
-                            is_own_device: peer.is_own_device,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            pending_requests,
+            connection_warning,
         })
     }
 
@@ -481,16 +566,15 @@ impl Node {
                 .block_on(state.set_mdns_enabled(enabled))
                 .map_err(AppleError::network);
         }
-        config::update_settings(|settings| {
-            config::config_set(
-                settings,
-                key.into(),
-                if enabled { "on" } else { "off" },
-                false,
-            )
-        })
-        .map(|_| ())
-        .map_err(AppleError::network)
+        let value = match (key, enabled) {
+            (GlobalSetting::QuicLossTolerant, true) => QuicCongestion::LossTolerant.as_ref(),
+            (GlobalSetting::QuicLossTolerant, false) => QuicCongestion::Cubic.as_ref(),
+            (_, true) => "on",
+            (_, false) => "off",
+        };
+        config::update_settings(|settings| config::config_set(settings, key.into(), value, false))
+            .map(|_| ())
+            .map_err(AppleError::network)
     }
 
     pub fn set_ssh_rule(
@@ -826,18 +910,31 @@ fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError>
             peer: file.from,
             filename: file.filename,
             size: file.size,
+            transferred: 0,
             state: IncomingFileState::Pending,
+            destination: None,
         })
         .chain(transfers.into_iter().filter_map(|file| {
-            (!file.outgoing && matches!(file.state, TransferFileState::Done)).then_some(
-                IncomingFile {
-                    id: file.id,
-                    peer: file.peer,
-                    filename: file.filename,
-                    size: file.size,
-                    state: IncomingFileState::Received,
+            (!file.outgoing
+                && matches!(
+                    file.state,
+                    TransferFileState::Transferring | TransferFileState::Done
+                ))
+            .then_some(IncomingFile {
+                id: file.id,
+                peer: file.peer,
+                filename: file.filename,
+                size: file.size,
+                transferred: file.transferred,
+                state: if matches!(file.state, TransferFileState::Done) {
+                    IncomingFileState::Received
+                } else {
+                    IncomingFileState::Transferring
                 },
-            )
+                destination: file
+                    .destination
+                    .map(|path| path.to_string_lossy().into_owned()),
+            })
         }))
         .collect())
 }
@@ -880,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn file_notifications_include_offers_and_successful_receives_only() {
+    fn file_status_includes_offers_and_active_or_successful_receives() {
         use rayfish::ipc::{PendingFileInfo, TransferFileInfo};
 
         let files = incoming_files(IpcMessage::FileList {
@@ -902,6 +999,17 @@ mod tests {
                     size: 8,
                     transferred: 8,
                     state: TransferFileState::Done,
+                    destination: Some(PathBuf::from("/path/to/work/received.txt")),
+                },
+                TransferFileInfo {
+                    id: 5,
+                    outgoing: false,
+                    peer: "sender".into(),
+                    filename: "moving.txt".into(),
+                    size: 8,
+                    transferred: 4,
+                    state: TransferFileState::Transferring,
+                    destination: None,
                 },
                 TransferFileInfo {
                     id: 3,
@@ -911,6 +1019,7 @@ mod tests {
                     size: 8,
                     transferred: 8,
                     state: TransferFileState::Done,
+                    destination: None,
                 },
                 TransferFileInfo {
                     id: 4,
@@ -920,14 +1029,22 @@ mod tests {
                     size: 8,
                     transferred: 0,
                     state: TransferFileState::Failed,
+                    destination: None,
                 },
             ],
         })
         .unwrap();
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert!(matches!(files[0].state, IncomingFileState::Pending));
         assert_eq!(files[1].filename, "received.txt");
         assert!(matches!(files[1].state, IncomingFileState::Received));
+        assert_eq!(
+            files[1].destination.as_deref(),
+            Some("/path/to/work/received.txt")
+        );
+        assert_eq!(files[2].filename, "moving.txt");
+        assert_eq!(files[2].transferred, 4);
+        assert!(matches!(files[2].state, IncomingFileState::Transferring));
     }
 
     #[test]
@@ -946,15 +1063,15 @@ mod tests {
             *node.state.lock().unwrap() = Some(Arc::clone(&state));
             if iteration == 0 {
                 let before = node.status().unwrap();
-                assert!(before.networks.is_empty());
-                assert!(before.connection_requests.is_empty());
-                assert!(before.contact_id.is_some());
+                assert!(before.mesh.networks.is_empty());
+                assert!(before.requests.connection_requests.is_empty());
+                assert!(before.requests.contact_id.is_some());
                 node.set_setting(GlobalSetting::Dns, false).unwrap();
                 node.set_setting(GlobalSetting::Mdns, false).unwrap();
                 #[cfg(unix)]
                 {
                     node.set_setting(GlobalSetting::Ssh, true).unwrap();
-                    assert!(node.status().unwrap().ssh_enabled);
+                    assert!(node.status().unwrap().ssh.enabled);
                     node.set_setting(GlobalSetting::Ssh, false).unwrap();
                     let mut network = config::NetworkConfig {
                         name: "ssh-test".into(),
@@ -972,26 +1089,29 @@ mod tests {
                         true,
                     )
                     .unwrap();
-                    let rules = node.status().unwrap().ssh_rules;
+                    let rules = node.status().unwrap().ssh.rules;
                     assert_eq!(rules[0].users, ["test-user"]);
                     node.set_ssh_rule("ssh-test".into(), "departed-peer".into(), Vec::new(), false)
                         .unwrap();
-                    assert!(node.status().unwrap().ssh_rules.is_empty());
+                    assert!(node.status().unwrap().ssh.rules.is_empty());
                 }
                 let after = node.status().unwrap();
-                assert!(!after.dns_enabled);
-                assert!(!after.mdns_enabled);
-                assert!(!after.mdns_active);
-                assert_eq!(after.ipv6, before.ipv6);
-                assert_eq!(after.active, before.active);
+                assert!(!after.services.dns_enabled);
+                assert!(!after.services.mdns_enabled);
+                assert!(!after.services.mdns_active);
+                assert_eq!(after.mesh.ipv6, before.mesh.ipv6);
+                assert_eq!(after.mesh.active, before.mesh.active);
                 node.set_setting(GlobalSetting::Mdns, true).unwrap();
                 let enabled = node.status().unwrap();
-                assert!(enabled.mdns_active);
-                assert_eq!(enabled.active, before.active);
+                assert!(enabled.services.mdns_active);
+                assert_eq!(enabled.mesh.active, before.mesh.active);
                 node.set_setting(GlobalSetting::Mdns, false).unwrap();
                 let disabled = node.status().unwrap();
-                assert!(!disabled.mdns_active);
-                assert_eq!(disabled.active, before.active);
+                assert!(!disabled.services.mdns_active);
+                assert_eq!(disabled.mesh.active, before.mesh.active);
+                node.set_setting(GlobalSetting::QuicLossTolerant, true)
+                    .unwrap();
+                assert!(node.status().unwrap().services.quic_loss_tolerant);
                 assert!(Arc::ptr_eq(&state, &node.state().unwrap()));
                 assert!(matches!(
                     node.connect_peer("invalid contact id".into(), None),
@@ -1020,14 +1140,15 @@ mod tests {
                 assert_eq!(machines.len(), 1);
                 assert_eq!(machines[0].hostname, "managed-host");
                 assert_eq!(machines[0].identity, endpoint_id.to_string());
-                assert_eq!(machines[0].ipv6, before.ipv6);
+                assert_eq!(machines[0].ipv6, before.mesh.ipv6);
                 assert_eq!(machines[0].state, "offline");
                 assert!(machines[0].networks.is_empty());
             } else {
                 let restarted = node.status().unwrap();
-                assert!(!restarted.dns_enabled);
-                assert!(!restarted.mdns_enabled);
-                assert!(!restarted.mdns_active);
+                assert!(!restarted.services.dns_enabled);
+                assert!(!restarted.services.mdns_enabled);
+                assert!(!restarted.services.mdns_active);
+                assert!(restarted.services.quic_loss_tolerant);
             }
             let started = Instant::now();
             node.stop();

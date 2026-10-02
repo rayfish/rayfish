@@ -163,8 +163,8 @@ pub enum RuleOrigin {
     Local,
     Network(String),
     /// Auto-seeded passthrough rule for the embedded mesh SSH server: when
-    /// `ray firewall ssh on` is set, the daemon installs an `allow in tcp:22`
-    /// rule with this origin so SSH packets reach the in-daemon listener under
+    /// `ray firewall ssh on` is set, the daemon installs an allow rule on the
+    /// configured port with this origin so SSH packets reach the listener under
     /// the deny-inbound default. `ssh off` removes exactly this rule, and
     /// reconvergence never touches it. The SSH allow-list (per-network) is the
     /// real authorization gate; this only opens the port at the packet layer.
@@ -177,16 +177,19 @@ impl RuleOrigin {
     }
 }
 
-/// The auto-seeded `allow in tcp:22` passthrough rule installed while mesh SSH
-/// is enabled (see [`RuleOrigin::Ssh`]). Opens port 22 at the packet layer so
+/// The auto-seeded passthrough rule installed while mesh SSH
+/// is enabled (see [`RuleOrigin::Ssh`]). Opens the configured port at the packet layer so
 /// the embedded SSH listener can receive connections; per-network `ssh_allow`
 /// is what actually authorizes a session.
-pub fn ssh_passthrough_rule() -> FirewallRule {
+pub fn ssh_passthrough_rule(port: u16) -> FirewallRule {
     FirewallRule {
         direction: Direction::In,
         action: Action::Allow,
         protocol: Protocol::Tcp,
-        port: Some(PortRange { start: 22, end: 22 }),
+        port: Some(PortRange {
+            start: port,
+            end: port,
+        }),
         peer: PeerFilter::Any,
         network: None,
         origin: RuleOrigin::Ssh,
@@ -595,19 +598,19 @@ impl SharedFirewall {
         config
     }
 
-    /// Install or remove the auto-seeded SSH passthrough rule (`allow in tcp:22`,
-    /// [`RuleOrigin::Ssh`]) so the embedded mesh SSH listener can receive
+    /// Install or remove the auto-seeded SSH passthrough rule
+    /// ([`RuleOrigin::Ssh`]) so the embedded mesh SSH listener can receive
     /// connections under the deny-inbound default. Idempotent: enabling twice
     /// keeps a single rule, disabling removes exactly the seeded rule and leaves
-    /// any hand-added tcp:22 rules alone. Returns the updated config to persist.
-    pub fn set_ssh_passthrough(&self, enabled: bool) -> FirewallConfig {
+    /// any hand-added rules alone. Returns the updated config to persist.
+    pub fn set_ssh_passthrough(&self, enabled: bool, port: u16) -> FirewallConfig {
         let mut config = (*self.get_config()).clone();
         config
             .rules
             .retain(|r| !matches!(&r.origin, RuleOrigin::Ssh));
         if enabled {
             // Front-insert so it wins over a stale deny, matching `firewall add`.
-            config.rules.insert(0, ssh_passthrough_rule());
+            config.rules.insert(0, ssh_passthrough_rule(port));
         }
         self.update(config.clone());
         config
@@ -2714,9 +2717,9 @@ mod tests {
         cfg.rules.push(local_22.clone());
         fw.update(cfg);
 
-        // Enabling twice keeps exactly one Ssh-origin rule (idempotent).
-        fw.set_ssh_passthrough(true);
-        let cfg = fw.set_ssh_passthrough(true);
+        // Changing ports replaces the old managed rule without touching local rules.
+        fw.set_ssh_passthrough(true, 22);
+        let cfg = fw.set_ssh_passthrough(true, 2222);
         let ssh_rules: Vec<_> = cfg
             .rules
             .iter()
@@ -2724,13 +2727,19 @@ mod tests {
             .collect();
         assert_eq!(ssh_rules.len(), 1);
         assert_eq!(ssh_rules[0].action, Action::Allow);
-        assert_eq!(ssh_rules[0].port, Some(PortRange { start: 22, end: 22 }));
+        assert_eq!(
+            ssh_rules[0].port,
+            Some(PortRange {
+                start: 2222,
+                end: 2222
+            })
+        );
         // The managed rule wins (front-inserted) and the Local rule survives.
         assert_eq!(cfg.rules[0].origin, RuleOrigin::Ssh);
         assert!(cfg.rules.contains(&local_22));
 
         // Disabling removes the managed rule but keeps the Local one.
-        let cfg = fw.set_ssh_passthrough(false);
+        let cfg = fw.set_ssh_passthrough(false, 2222);
         assert!(!cfg.rules.iter().any(|r| r.origin == RuleOrigin::Ssh));
         assert!(cfg.rules.contains(&local_22));
     }

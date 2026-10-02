@@ -29,7 +29,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             try node.start(ownerUid: owner)
             try node.prepareExitNode()
             let status = try node.status()
-            let settings = networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled,
+            let settings = networkSettings(address: status.mesh.ipv6, dnsEnabled: status.services.dnsEnabled,
                                            exitSelected: status.exitNodes.contains { $0.using != nil })
             setTunnelNetworkSettings(settings) { [weak self] error in
                 if let error {
@@ -46,7 +46,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 do {
                     try node.activate()
                     self.node = node
-                    self.appliedDNS = status.dnsEnabled
+                    self.appliedDNS = status.services.dnsEnabled
                     self.appliedExit = status.exitNodes.contains { $0.using != nil }
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
@@ -97,8 +97,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 try node.prepareExitTransport()
                 do {
                     let status = try node.status()
-                    try await setTunnelNetworkSettings(networkSettings(address: status.ipv6,
-                        dnsEnabled: status.dnsEnabled, exitSelected: true))
+                    try await setTunnelNetworkSettings(networkSettings(address: status.mesh.ipv6,
+                        dnsEnabled: status.services.dnsEnabled, exitSelected: true))
                     appliedExit = true
                 } catch {
                     try? node.prepareExitNode()
@@ -112,8 +112,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if stagedExit, let network = request.network,
                    (try? node.selectExitNode(network: network, peer: nil)) != nil {
                     let status = try node.status()
-                    try await setTunnelNetworkSettings(networkSettings(address: status.ipv6,
-                        dnsEnabled: status.dnsEnabled, exitSelected: false))
+                    try await setTunnelNetworkSettings(networkSettings(address: status.mesh.ipv6,
+                        dnsEnabled: status.services.dnsEnabled, exitSelected: false))
                     appliedExit = false
                 }
                 throw error
@@ -202,6 +202,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             case .dns: key = .dns
             case .mdns: key = .mdns
             case .ssh: key = .ssh
+            case .quicLossTolerant: key = .quicLossTolerant
             }
             try node.setSetting(key: key, enabled: enabled)
         case .setSSHRule:
@@ -293,9 +294,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func status(from status: NodeStatus) -> ProviderStatus {
         ProviderStatus(
-            active: status.active,
-            ipv6: status.ipv6,
-            networks: status.networks.map { network in
+            v4BridgeEnabled: status.services.v4BridgeEnabled,
+            active: status.mesh.active,
+            ipv6: status.mesh.ipv6,
+            networks: status.mesh.networks.map { network in
                 ProviderNetwork(
                     name: network.name,
                     hostname: network.hostname,
@@ -313,7 +315,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                 )
             },
-            pendingRequests: status.pendingRequests.map { request in
+            pendingRequests: status.requests.pendingRequests.map { request in
                 ProviderJoinRequest(
                     network: request.network,
                     id: request.id,
@@ -321,19 +323,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     waitingSecs: request.waitingSecs
                 )
             },
-            contactId: status.contactId,
-            connectionRequests: status.connectionRequests.map { request in
+            contactId: status.requests.contactId,
+            connectionRequests: status.requests.connectionRequests.map { request in
                 ProviderConnectionRequest(id: request.id, hostname: request.hostname, waitingSecs: request.waitingSecs)
             },
-            dnsEnabled: status.dnsEnabled,
-            mdnsEnabled: status.mdnsEnabled,
-            mdnsActive: status.mdnsActive,
+            dnsEnabled: status.services.dnsEnabled,
+            mdnsEnabled: status.services.mdnsEnabled,
+            mdnsActive: status.services.mdnsActive,
             files: status.files.map { file in
                 ProviderFile(transferId: file.id, peer: file.peer, filename: file.filename,
-                             size: file.size, state: file.state == .pending ? .pending : .received)
+                             size: file.size, state: file.state == .pending ? .pending
+                                 : (file.state == .transferring ? .transferring : .received),
+                             transferred: file.transferred,
+                             destination: file.destination)
             },
-            sshEnabled: status.sshEnabled,
-            sshRules: status.sshRules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) },
+            sshEnabled: status.ssh.enabled,
+            sshRules: status.ssh.rules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) },
+            connectionWarning: status.connectionWarning,
+            quicLossTolerant: status.services.quicLossTolerant,
             exitNodes: status.exitNodes.map { ProviderExitNodeNetwork(network: $0.network, using: $0.using,
                 available: $0.available, refused: $0.refused, problem: $0.problem) }
         )

@@ -2,6 +2,42 @@
 
 use crate::*;
 
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct PairedDevicesOutput<'a>(&'a [ipc::PairedDeviceInfo]);
+
+impl DisplayOut for PairedDevicesOutput<'_> {
+    fn print_human(&self) {
+        if self.0.is_empty() {
+            println!("\n  {}\n", style::faint("no paired devices"));
+            return;
+        }
+        let rows = self
+            .0
+            .iter()
+            .map(|d| {
+                let host = d.hostname.clone().unwrap_or_else(|| "—".to_string());
+                let nets = if d.networks.is_empty() {
+                    "—".to_string()
+                } else {
+                    d.networks.join(", ")
+                };
+                vec![
+                    layout::Cell::new(host.clone(), style::value(&host)),
+                    layout::Cell::new(d.short_id.clone(), style::rose(&d.short_id)),
+                    layout::Cell::new(nets.clone(), style::faint(&nets)),
+                ]
+            })
+            .collect();
+        println!();
+        print!("{}", table(&["device", "id", "networks"], rows, 2));
+        println!(
+            "\n  {}",
+            style::faint("revoke one with: ray unpair <device>")
+        );
+    }
+}
+
 pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<()> {
     match (action, ticket) {
         // `rayfish pair <ticket>` shorthand
@@ -90,46 +126,7 @@ pub(crate) async fn ipc_pair_list() -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, ipc::IpcMessage::ListPairedDevices).await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::PairedDevices { devices } => {
-            if json_enabled() {
-                print_json(&serde_json::json!(
-                    devices
-                        .iter()
-                        .map(|d| serde_json::json!({
-                            "device_id": d.device_id.to_string(),
-                            "short_id": d.short_id,
-                            "hostname": d.hostname,
-                            "networks": d.networks,
-                        }))
-                        .collect::<Vec<_>>()
-                ));
-            } else if devices.is_empty() {
-                println!("\n  {}\n", style::faint("no paired devices"));
-            } else {
-                let rows = devices
-                    .iter()
-                    .map(|d| {
-                        let host = d.hostname.clone().unwrap_or_else(|| "—".to_string());
-                        let nets = if d.networks.is_empty() {
-                            "—".to_string()
-                        } else {
-                            d.networks.join(", ")
-                        };
-                        vec![
-                            layout::Cell::new(host.clone(), style::value(&host)),
-                            layout::Cell::new(d.short_id.clone(), style::rose(&d.short_id)),
-                            layout::Cell::new(nets.clone(), style::faint(&nets)),
-                        ]
-                    })
-                    .collect();
-                println!();
-                print!("{}", table(&["device", "id", "networks"], rows, 2));
-                println!(
-                    "\n  {}",
-                    style::faint("revoke one with: ray unpair <device>")
-                );
-            }
-        }
+        ipc::IpcMessage::PairedDevices { devices } => printout(&PairedDevicesOutput(&devices))?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }

@@ -247,4 +247,26 @@
     <string name="notif_saved">已儲存</string>
     <string name="notif_transfer_failed">與 %s 的傳輸失敗</string>
     <string name="notif_offer_text">%1$s · %2$s</string>
+    <string name="toast_address_copied">位址已複製</string>
+    <string name="home_files_available">可傳輸檔案 · VPN 已關閉</string>
+    <string name="home_stopping">正在中斷連線…</string>
+    <string name="home_no_networks">VPN 已開啟 · 尚未新增網路</string>
+    <string name="home_connection_failed">網路連線失敗</string>
+    <string name="home_join_network">加入或建立網路</string>
+    <string name="error_receive_start">無法開始下載。請重試。</string>
+    <string name="action_send_files">傳送檔案</string>
+    <string name="error_send_start">無法開始傳送。請重試。</string>
+    <string name="label_files">檔案</string>
+    <string name="label_requests">請求</string>
+    <string name="file_saving">正在儲存…</string>
+    <string name="file_failed">失敗</string>
+    <string name="file_sent">已傳送</string>
+    <string name="file_received">已接收</string>
+    <string name="file_waiting">等待接收方</string>
+    <string name="file_sending">正在傳送</string>
+    <string name="file_receiving">正在接收</string>
+    <string name="file_transfer_detail">%1$s · %2$s · %3$s</string>
+    <string name="file_transfer_bytes">%1$s / %2$s</string>
+    <string name="error_status_refresh">無法重新整理。顯示的是上次取得的狀態。</string>
+    <string name="action_retry">重試</string>
 </resources>

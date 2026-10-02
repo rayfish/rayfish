@@ -2,6 +2,75 @@
 
 use crate::*;
 
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct InviteListOutput<'a>(Vec<InviteRow<'a>>);
+
+#[derive(serde::Serialize)]
+struct InviteRow<'a> {
+    id: &'a str,
+    status: &'a str,
+    redeemer: &'a Option<String>,
+    hostname: &'a Option<String>,
+    reusable: bool,
+    created: u64,
+    expires: u64,
+}
+
+impl<'a> From<&'a [ipc::InviteInfo]> for InviteListOutput<'a> {
+    fn from(invites: &'a [ipc::InviteInfo]) -> Self {
+        Self(
+            invites
+                .iter()
+                .map(|inv| InviteRow {
+                    id: &inv.id,
+                    status: &inv.status,
+                    redeemer: &inv.redeemer,
+                    hostname: &inv.hostname,
+                    reusable: inv.reusable,
+                    created: inv.created,
+                    expires: inv.expires,
+                })
+                .collect(),
+        )
+    }
+}
+
+impl DisplayOut for InviteListOutput<'_> {
+    fn print_human(&self) {
+        if self.0.is_empty() {
+            println!("\n  {}\n", style::faint("no invites"));
+            return;
+        }
+        let rows = self
+            .0
+            .iter()
+            .map(|inv| {
+                let kind = if inv.reusable {
+                    "reusable"
+                } else {
+                    "single-use"
+                };
+                let host = inv.hostname.clone().unwrap_or_else(|| "—".to_string());
+                let who = inv.redeemer.clone().unwrap_or_else(|| "—".to_string());
+                vec![
+                    layout::Cell::new(inv.id.to_string(), style::rose(inv.id)),
+                    layout::Cell::new(inv.status.to_string(), style::value(inv.status)),
+                    layout::Cell::new(kind, style::faint(kind)),
+                    layout::Cell::new(host.clone(), style::faint(&host)),
+                    layout::Cell::new(who.clone(), style::faint(&who)),
+                ]
+            })
+            .collect();
+        println!();
+        print!(
+            "{}",
+            table(&["id", "status", "kind", "host", "redeemer"], rows, 2)
+        );
+        println!();
+    }
+}
+
 /// Parse a duration like `30m`, `24h`, `7d`, `90s` into seconds.
 pub(crate) fn parse_duration_secs(s: &str) -> Result<u64> {
     let s = s.trim();
@@ -80,7 +149,9 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
             reusable_requested,
             &hostname_opt,
         ),
-        ipc::IpcMessage::InviteListResponse { invites } => print_invite_list(&invites),
+        ipc::IpcMessage::InviteListResponse { invites } => {
+            printout(&InviteListOutput::from(invites.as_slice()))?
+        }
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
@@ -142,49 +213,6 @@ fn print_invite_created(
 }
 
 /// Render the invite ledger as JSON (when `--json`) or an aligned table.
-fn print_invite_list(invites: &[ipc::InviteInfo]) {
-    if json_enabled() {
-        print_json(&serde_json::json!(
-            invites
-                .iter()
-                .map(|i| serde_json::json!({
-                    "id": i.id, "status": i.status, "redeemer": i.redeemer,
-                    "hostname": i.hostname, "reusable": i.reusable,
-                    "created": i.created, "expires": i.expires,
-                }))
-                .collect::<Vec<_>>()
-        ));
-    } else if invites.is_empty() {
-        println!("\n  {}\n", style::faint("no invites"));
-    } else {
-        let rows = invites
-            .iter()
-            .map(|inv| {
-                let kind = if inv.reusable {
-                    "reusable"
-                } else {
-                    "single-use"
-                };
-                let host = inv.hostname.clone().unwrap_or_else(|| "—".to_string());
-                let who = inv.redeemer.clone().unwrap_or_else(|| "—".to_string());
-                vec![
-                    layout::Cell::new(inv.id.clone(), style::rose(&inv.id)),
-                    layout::Cell::new(inv.status.clone(), style::value(&inv.status)),
-                    layout::Cell::new(kind, style::faint(kind)),
-                    layout::Cell::new(host.clone(), style::faint(&host)),
-                    layout::Cell::new(who.clone(), style::faint(&who)),
-                ]
-            })
-            .collect();
-        println!();
-        print!(
-            "{}",
-            table(&["id", "status", "kind", "host", "redeemer"], rows, 2)
-        );
-        println!();
-    }
-}
-
 pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send(
@@ -199,7 +227,7 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
             &requests,
             "no pending join requests",
             &format!("admit with: ray requests {network} accept <name>"),
-        ),
+        )?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }

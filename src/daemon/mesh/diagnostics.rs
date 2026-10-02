@@ -1,9 +1,10 @@
-//! Read-only diagnostics for `Daemon`: `status`, `build_report`, `ping`,
+//! Diagnostics for `Daemon`: `status`, `build_report`, `ping`,
 //! `netcheck`, and connection-info helpers. Split out of `daemon/mod.rs`.
 
+use std::collections::VecDeque;
 use std::io::SeekFrom;
 use std::net::IpAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::super::*;
 use crate::ipc::{LOG_CHUNK_BYTES, MsgpackCodec};
@@ -24,6 +25,327 @@ type ServedFramed<S> = Framed<S, MsgpackCodec<IpcMessage>>;
 /// briefly unreachable doesn't stay flagged offline forever without a re-probe.
 const STATUS_OFFLINE_WINDOW: Duration = Duration::from_secs(300);
 
+const RTT_WINDOW: usize = 32;
+const RTT_MIN_SAMPLES: usize = 8;
+const HIGH_RTT_MS: f64 = 150.0;
+const LOSS_WINDOW: Duration = Duration::from_secs(60);
+const LOSS_MAX_SAMPLES: usize = 128;
+const MIN_LOSS_SAMPLE_PACKETS: u64 = 100;
+const DEGRADED_LOSS_PERCENT: u64 = 2;
+const DEGRADED_QUEUE_BYTES: usize = 256 * 1024;
+const CONGESTED_QUEUE_BYTES: usize = 1024 * 1024;
+
+fn connection_quality(
+    recent_packet_loss: bool,
+    queued_bytes: usize,
+) -> (ipc::ConnectionQuality, Option<ipc::ConnectionIssue>) {
+    if queued_bytes >= CONGESTED_QUEUE_BYTES {
+        return (
+            ipc::ConnectionQuality::Congested,
+            Some(ipc::ConnectionIssue::SendQueue),
+        );
+    }
+    if queued_bytes >= DEGRADED_QUEUE_BYTES {
+        return (
+            ipc::ConnectionQuality::Degraded,
+            Some(ipc::ConnectionIssue::SendQueue),
+        );
+    }
+    if recent_packet_loss {
+        return (
+            ipc::ConnectionQuality::Degraded,
+            Some(ipc::ConnectionIssue::PacketLoss),
+        );
+    }
+    (ipc::ConnectionQuality::Good, None)
+}
+
+/// A steady high RTT is normal for a relayed or distant peer. Only a spike above
+/// the peer's own baseline that also crosses the floor counts as degraded.
+fn is_high_latency(rtt_ms: f64, above_baseline: bool) -> bool {
+    above_baseline && rtt_ms >= HIGH_RTT_MS
+}
+
+/// Recent RTT samples for one peer, oldest first.
+#[derive(Clone, Default)]
+struct RttHistory {
+    samples: VecDeque<f64>,
+}
+
+impl RttHistory {
+    /// Records `rtt_ms` and reports whether it spikes above the earlier samples.
+    fn observe(&mut self, rtt_ms: f64) -> bool {
+        let high = self.is_spike(rtt_ms);
+        if self.samples.len() == RTT_WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(rtt_ms);
+        high
+    }
+
+    /// Above the median by more than one standard deviation, once there is
+    /// enough history to say.
+    fn is_spike(&self, rtt_ms: f64) -> bool {
+        self.samples.len() >= RTT_MIN_SAMPLES && rtt_ms > self.median() + self.std_dev()
+    }
+
+    fn median(&self) -> f64 {
+        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let mid = sorted.len() / 2;
+        if sorted.len().is_multiple_of(2) {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        }
+    }
+
+    fn std_dev(&self) -> f64 {
+        let n = self.samples.len() as f64;
+        let mean = self.samples.iter().sum::<f64>() / n;
+        let variance = self.samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        variance.sqrt()
+    }
+}
+
+/// Cumulative connection counters at one point in time.
+#[derive(Clone, Copy)]
+struct LossSample {
+    at: Instant,
+    sent: u64,
+    lost: u64,
+}
+
+impl LossSample {
+    /// Counters only grow on one connection; a drop means they were reset.
+    fn follows(&self, earlier: &LossSample) -> bool {
+        self.sent >= earlier.sent && self.lost >= earlier.lost
+    }
+
+    fn is_lossy_since(&self, baseline: &LossSample) -> bool {
+        let sent = self.sent.saturating_sub(baseline.sent);
+        let lost = self.lost.saturating_sub(baseline.lost);
+        sent >= MIN_LOSS_SAMPLE_PACKETS
+            && lost.saturating_mul(100) >= sent.saturating_mul(DEGRADED_LOSS_PERCENT)
+    }
+}
+
+/// Loss samples for one peer connection, trimmed to about [`LOSS_WINDOW`].
+#[derive(Clone)]
+struct LossHistory {
+    connection_id: usize,
+    samples: VecDeque<LossSample>,
+}
+
+impl LossHistory {
+    fn new(connection_id: usize) -> Self {
+        Self {
+            connection_id,
+            samples: VecDeque::new(),
+        }
+    }
+
+    /// Records `sample` and reports whether loss since the window's baseline
+    /// crosses the degraded threshold.
+    fn observe(&mut self, connection_id: usize, sample: LossSample) -> bool {
+        let restarted = self.connection_id != connection_id
+            || self
+                .samples
+                .back()
+                .is_some_and(|last| !sample.follows(last));
+        if restarted {
+            self.connection_id = connection_id;
+            self.samples.clear();
+        }
+        self.samples.push_back(sample);
+        if self.samples.len() > LOSS_MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.trim(sample.at);
+        self.samples
+            .front()
+            .is_some_and(|baseline| sample.is_lossy_since(baseline))
+    }
+
+    /// Keeps the newest sample at or before the cutoff as the baseline, unless
+    /// it is so old that the rate would cover drops that already ended.
+    fn trim(&mut self, now: Instant) {
+        let cutoff = now.checked_sub(LOSS_WINDOW).unwrap_or(now);
+        let stale = now.checked_sub(LOSS_WINDOW * 2);
+        while self.samples.len() > 1
+            && (self.samples[1].at <= cutoff
+                || stale.is_some_and(|stale| self.samples[0].at < stale))
+        {
+            self.samples.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionHistory {
+    rtt: HashMap<EndpointId, RttHistory>,
+    loss: HashMap<EndpointId, LossHistory>,
+}
+
+impl ConnectionHistory {
+    fn observe(&mut self, peer: EndpointId, rtt_ms: f64) -> bool {
+        if !rtt_ms.is_finite() || rtt_ms < 0.0 {
+            return false;
+        }
+        self.rtt.entry(peer).or_default().observe(rtt_ms)
+    }
+
+    fn observe_loss(
+        &mut self,
+        peer: EndpointId,
+        connection_id: usize,
+        sent: u64,
+        lost: u64,
+    ) -> bool {
+        self.observe_loss_at(peer, connection_id, sent, lost, Instant::now())
+    }
+
+    fn observe_loss_at(
+        &mut self,
+        peer: EndpointId,
+        connection_id: usize,
+        sent: u64,
+        lost: u64,
+        at: Instant,
+    ) -> bool {
+        self.loss
+            .entry(peer)
+            .or_insert_with(|| LossHistory::new(connection_id))
+            .observe(connection_id, LossSample { at, sent, lost })
+    }
+}
+
+#[cfg(test)]
+mod connection_history_tests {
+    use super::*;
+
+    #[test]
+    fn compares_against_preceding_peer_samples() {
+        let peer = SecretKey::generate().public();
+        let other = SecretKey::generate().public();
+        let mut history = ConnectionHistory::default();
+        for i in 0..RTT_MIN_SAMPLES {
+            assert!(!history.observe(peer, if i % 2 == 0 { 165.0 } else { 185.0 }));
+            assert!(!history.observe(other, 300.0));
+        }
+        let mut above = history.clone();
+        assert!(!history.observe(peer, 185.0));
+        assert!(above.observe(peer, 186.0));
+        assert!(!history.observe(other, 300.0));
+    }
+
+    #[test]
+    fn ignores_invalid_samples_and_adapts_with_bounded_history() {
+        let peer = SecretKey::generate().public();
+        let mut history = ConnectionHistory::default();
+        assert!(!history.observe(peer, f64::NAN));
+        assert!(!history.observe(peer, f64::INFINITY));
+        assert!(!history.observe(peer, -1.0));
+        assert!(!history.rtt.contains_key(&peer));
+        for _ in 0..RTT_WINDOW {
+            assert!(!history.observe(peer, 175.0));
+        }
+        assert!(history.observe(peer, 225.0));
+        for _ in 0..RTT_WINDOW {
+            history.observe(peer, 225.0);
+        }
+        assert_eq!(history.rtt[&peer].samples.len(), RTT_WINDOW);
+        assert!(!history.observe(peer, 225.0));
+    }
+
+    #[test]
+    fn packet_loss_uses_a_recent_connection_scoped_window() {
+        let peer = SecretKey::generate().public();
+        let start = Instant::now();
+        let mut history = ConnectionHistory::default();
+
+        assert!(!history.observe_loss_at(peer, 1, 100, 20, start));
+        assert!(history.observe_loss_at(peer, 1, 200, 22, start + Duration::from_secs(1)));
+        assert!(!history.observe_loss_at(
+            peer,
+            1,
+            1_200,
+            22,
+            start + LOSS_WINDOW + Duration::from_secs(1)
+        ));
+        assert!(!history.observe_loss_at(
+            peer,
+            2,
+            100,
+            50,
+            start + LOSS_WINDOW + Duration::from_secs(2)
+        ));
+        for sent in 101..(101 + LOSS_MAX_SAMPLES as u64 * 2) {
+            history.observe_loss_at(
+                peer,
+                2,
+                sent,
+                50,
+                start + LOSS_WINDOW + Duration::from_secs(3),
+            );
+        }
+        assert_eq!(history.loss[&peer].samples.len(), LOSS_MAX_SAMPLES);
+    }
+
+    #[test]
+    fn packet_loss_ignores_a_stale_baseline() {
+        let peer = SecretKey::generate().public();
+        let start = Instant::now();
+        let mut history = ConnectionHistory::default();
+
+        assert!(!history.observe_loss_at(peer, 1, 100, 0, start));
+        let later = start + LOSS_WINDOW * 10;
+        assert!(!history.observe_loss_at(peer, 1, 1_100, 100, later));
+        assert!(!history.observe_loss_at(peer, 1, 1_200, 100, later + Duration::from_secs(1)));
+    }
+}
+
+#[cfg(test)]
+mod connection_quality_tests {
+    use super::*;
+
+    #[test]
+    fn reports_queue_pressure_before_other_signals() {
+        assert_eq!(
+            connection_quality(true, CONGESTED_QUEUE_BYTES),
+            (
+                ipc::ConnectionQuality::Congested,
+                Some(ipc::ConnectionIssue::SendQueue)
+            )
+        );
+        assert_eq!(
+            connection_quality(false, DEGRADED_QUEUE_BYTES),
+            (
+                ipc::ConnectionQuality::Degraded,
+                Some(ipc::ConnectionIssue::SendQueue)
+            )
+        );
+    }
+
+    #[test]
+    fn reports_recent_packet_loss() {
+        assert_eq!(
+            connection_quality(true, 0),
+            (
+                ipc::ConnectionQuality::Degraded,
+                Some(ipc::ConnectionIssue::PacketLoss)
+            )
+        );
+    }
+
+    #[test]
+    fn high_latency_needs_a_spike_above_the_floor() {
+        assert!(is_high_latency(HIGH_RTT_MS, true));
+        assert!(!is_high_latency(HIGH_RTT_MS, false));
+        assert!(!is_high_latency(HIGH_RTT_MS - 1.0, true));
+    }
+}
+
 impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// snapshot the daemon's status (identity, networks, peers).
@@ -43,12 +365,56 @@ impl Daemon {
                     .collect()
             })
             .unwrap_or_default();
-        let statuses: Vec<NetworkStatus> = self
+        let mut statuses: Vec<NetworkStatus> = self
             .registry
             .networks
             .iter()
             .map(|h| self.network_status(&h, my_id, hostname_snapshot.as_deref(), &direct_names))
             .collect();
+        if let Ok(mut history) = self.connection_history.lock() {
+            // A peer can belong to several networks. One status request still
+            // contributes only one sample for that peer.
+            let mut observed_rtt = HashMap::new();
+            let mut observed_loss = HashMap::new();
+            for peer in statuses.iter_mut().flat_map(|network| &mut network.peers) {
+                let connection_id = self
+                    .registry
+                    .peers
+                    .lookup_v6(&peer.ipv6)
+                    .filter(|route| route.endpoint_id == peer.endpoint_id)
+                    .map(|route| route.conn.stable_id());
+                let Some(connection) = peer.connection.as_mut() else {
+                    continue;
+                };
+                let mut high_latency = false;
+                if let Some(ms) = connection.rtt_ms {
+                    peer.rtt_high = *observed_rtt
+                        .entry(peer.endpoint_id)
+                        .or_insert_with(|| history.observe(peer.endpoint_id, ms));
+                    high_latency = is_high_latency(ms, peer.rtt_high);
+                }
+                if let Some(connection_id) = connection_id {
+                    let recent_loss = *observed_loss.entry(peer.endpoint_id).or_insert_with(|| {
+                        history.observe_loss(
+                            peer.endpoint_id,
+                            connection_id,
+                            connection.datagrams_tx,
+                            connection.lost_packets,
+                        )
+                    });
+                    if recent_loss
+                        && connection.quality_issue != Some(ipc::ConnectionIssue::SendQueue)
+                    {
+                        connection.quality = ipc::ConnectionQuality::Degraded;
+                        connection.quality_issue = Some(ipc::ConnectionIssue::PacketLoss);
+                    }
+                }
+                if high_latency && connection.quality_issue.is_none() {
+                    connection.quality = ipc::ConnectionQuality::Degraded;
+                    connection.quality_issue = Some(ipc::ConnectionIssue::HighLatency);
+                }
+            }
+        }
         // Persisted pending-join markers, minus any network that has since
         // become active (admitted while we were retrying in the background).
         let pending_networks: Vec<String> = saved
@@ -212,7 +578,9 @@ impl Daemon {
             .map(|m| {
                 let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.identity));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
-                let user_id = self.registry.device_user_map.resolve(&m.identity);
+                // The signed roster keeps this binding even when the peer has no
+                // connection. The connection-time device map may be empty here.
+                let user_id = m.user_identity.unwrap_or(m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);
                 PeerStatus {
                     endpoint_id: m.identity,
@@ -242,6 +610,7 @@ impl Daemon {
                         PeerState::Idle
                     },
                     connection,
+                    rtt_high: false,
                     exit_node: m.exit_node,
                     exit_in_use: is_my_exit(m),
                     is_coordinator: m.is_coordinator,
@@ -438,6 +807,9 @@ impl Daemon {
         };
 
         let stats = conn.stats();
+        let queued_bytes = crate::transport::DATAGRAM_SEND_BUFFER_SIZE
+            .saturating_sub(conn.datagram_send_buffer_space());
+        let (quality, quality_issue) = connection_quality(false, queued_bytes);
         ipc::ConnectionInfo {
             conn_type,
             remote_addr,
@@ -447,6 +819,8 @@ impl Daemon {
             datagrams_tx: stats.udp_tx.datagrams,
             datagrams_rx: stats.udp_rx.datagrams,
             lost_packets: stats.lost_packets,
+            quality,
+            quality_issue,
         }
     }
 
@@ -1035,6 +1409,7 @@ pub(crate) fn saved_network_status(
             is_own_device: false,
             incompatible: false,
             connection: None,
+            rtt_high: false,
             // Not `Idle`: idle means "no link, but nothing says it failed", which
             // is the optimistic default for a *registered* network. Nothing on
             // this one is reachable at all until the restore lands.

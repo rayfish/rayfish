@@ -1,8 +1,129 @@
 //! Managed-machine enrollment, inventory, and delegated network operations.
 
+use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 use crate::*;
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct ManagedMachinesOutput<'a>(&'a [ipc::ManagedMachineInfo]);
+
+impl Display for ManagedMachinesOutput<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return writeln!(f, "no enrolled machines");
+        }
+        let rows = self
+            .0
+            .iter()
+            .map(|machine| {
+                let short_id = machine.identity.fmt_short().to_string();
+                let networks = machine
+                    .networks
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let state = machine.state.as_str();
+                vec![
+                    layout::Cell::new(
+                        machine.hostname.to_string(),
+                        style::value(machine.hostname.as_ref()),
+                    ),
+                    layout::Cell::new(short_id.clone(), style::rose(&short_id)),
+                    layout::Cell::new(state, style::faint(state)),
+                    layout::Cell::new(networks.clone(), style::faint(&networks)),
+                ]
+            })
+            .collect();
+        write!(
+            f,
+            "{}",
+            table(&["machine", "id", "state", "networks"], rows, 2)
+        )
+    }
+}
+
+#[derive(serde::Serialize)]
+struct MachineEnrollmentCreatedOutput<'a> {
+    id: &'a ipc::EnrollmentCredentialId,
+    ticket: &'a ipc::EnrollmentTicket,
+    expires_at: ipc::UnixTimestampSecs,
+    reusable: bool,
+}
+
+impl Display for MachineEnrollmentCreatedOutput<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "enrollment {}", self.id)?;
+        writeln!(f, "{}", self.ticket)?;
+        writeln!(
+            f,
+            "run on the managed machine: ray up --controller {}",
+            self.ticket
+        )
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct MachineEnrollmentsOutput<'a>(&'a [ipc::MachineEnrollmentInfo]);
+
+impl Display for MachineEnrollmentsOutput<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for enrollment in self.0 {
+            let kind = if enrollment.reusable {
+                "reusable"
+            } else {
+                "one-time"
+            };
+            let status = match enrollment.status {
+                ipc::MachineEnrollmentStatus::Pending => "pending",
+                ipc::MachineEnrollmentStatus::Used => "used",
+                ipc::MachineEnrollmentStatus::Expired => "expired",
+                ipc::MachineEnrollmentStatus::Revoked => "revoked",
+            };
+            writeln!(
+                f,
+                "{}  {}  {}  uses {}",
+                enrollment.id, kind, status, enrollment.uses
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct ControllersOutput<'a>(&'a [ipc::ControllerInfo]);
+
+impl Display for ControllersOutput<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return writeln!(f, "no authorized controllers");
+        }
+        for controller in self.0 {
+            writeln!(
+                f,
+                "{}  {}",
+                controller.identity.fmt_short(),
+                controller.identity
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ManagementMessageOutput<'a> {
+    message: &'a str,
+}
+
+impl Display for ManagementMessageOutput<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.message)
+    }
+}
 
 pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
     let request = match action {
@@ -28,38 +149,7 @@ pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
     let response = ipc_request(request).await?;
     match response {
         ipc::IpcMessage::ManagedMachinesResponse { machines } => {
-            if json_enabled() {
-                print_json(&serde_json::json!(machines));
-            } else if machines.is_empty() {
-                println!("no enrolled machines");
-            } else {
-                let rows = machines
-                    .into_iter()
-                    .map(|machine| {
-                        let short_id = machine.identity.fmt_short().to_string();
-                        let networks = machine
-                            .networks
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let state = machine.state.as_str();
-                        vec![
-                            layout::Cell::new(
-                                machine.hostname.to_string(),
-                                style::value(machine.hostname.as_ref()),
-                            ),
-                            layout::Cell::new(short_id.clone(), style::rose(&short_id)),
-                            layout::Cell::new(state, style::faint(state)),
-                            layout::Cell::new(networks.clone(), style::faint(&networks)),
-                        ]
-                    })
-                    .collect();
-                print!(
-                    "{}",
-                    table(&["machine", "id", "state", "networks"], rows, 2)
-                );
-            }
+            printout(&ManagedMachinesOutput(&machines))?;
         }
         ipc::IpcMessage::MachineEnrollmentCreated {
             id,
@@ -67,43 +157,17 @@ pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
             expires_at,
             reusable,
         } => {
-            if json_enabled() {
-                print_json(&serde_json::json!({
-                    "id": id,
-                    "ticket": ticket,
-                    "expires_at": expires_at,
-                    "reusable": reusable,
-                }));
-            } else {
-                println!("enrollment {id}");
-                println!("{ticket}");
-                println!("run on the managed machine: ray up --controller {ticket}");
-            }
+            printout(&MachineEnrollmentCreatedOutput {
+                id: &id,
+                ticket: &ticket,
+                expires_at,
+                reusable,
+            })?;
         }
         ipc::IpcMessage::MachineEnrollments { enrollments } => {
-            if json_enabled() {
-                print_json(&serde_json::json!(enrollments));
-            } else {
-                for enrollment in enrollments {
-                    let kind = if enrollment.reusable {
-                        "reusable"
-                    } else {
-                        "one-time"
-                    };
-                    let status = match enrollment.status {
-                        ipc::MachineEnrollmentStatus::Pending => "pending",
-                        ipc::MachineEnrollmentStatus::Used => "used",
-                        ipc::MachineEnrollmentStatus::Expired => "expired",
-                        ipc::MachineEnrollmentStatus::Revoked => "revoked",
-                    };
-                    println!(
-                        "{}  {}  {}  uses {}",
-                        enrollment.id, kind, status, enrollment.uses
-                    );
-                }
-            }
+            printout(&MachineEnrollmentsOutput(&enrollments))?;
         }
-        ipc::IpcMessage::Ok { message } => print_management_message(&message),
+        ipc::IpcMessage::Ok { message } => print_management_message(&message)?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
@@ -117,19 +181,7 @@ pub(crate) async fn ipc_controller(action: Option<ControllerAction>) -> Result<(
             let response = ipc_request(ipc::IpcMessage::ControllerList).await?;
             match response {
                 ipc::IpcMessage::Controllers { controllers } => {
-                    if json_enabled() {
-                        print_json(&serde_json::json!(controllers));
-                    } else if controllers.is_empty() {
-                        println!("no authorized controllers");
-                    } else {
-                        for controller in controllers {
-                            println!(
-                                "{}  {}",
-                                controller.identity.fmt_short(),
-                                controller.identity
-                            );
-                        }
-                    }
+                    printout(&ControllersOutput(&controllers))?;
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
@@ -244,19 +296,15 @@ pub(crate) async fn ipc_management_overview(
 
 fn print_simple_response(response: ipc::IpcMessage) -> Result<()> {
     match response {
-        ipc::IpcMessage::Ok { message } => print_management_message(&message),
+        ipc::IpcMessage::Ok { message } => print_management_message(&message)?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
     Ok(())
 }
 
-fn print_management_message(message: &str) {
-    if json_enabled() {
-        print_json(&serde_json::json!({ "message": message }));
-    } else {
-        println!("{message}");
-    }
+fn print_management_message(message: &str) -> Result<()> {
+    printout(&ManagementMessageOutput { message })
 }
 
 fn enrollment_ttl(reusable: bool, expires: Option<&str>) -> Result<Duration> {

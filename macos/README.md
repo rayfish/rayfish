@@ -41,7 +41,8 @@ Configure these repository secrets before running it:
 | `APPLE_API_ISSUER_ID` | That API key's issuer ID |
 | `SPARKLE_ED_PRIVATE_KEY` | Base64 Ed25519 seed for signing macOS app updates |
 
-The macOS app uses Sparkle to check for stable updates and install them on quit.
+The macOS app uses Sparkle to check for stable updates. A notification offers to
+restart and install a downloaded update; quitting the app also installs it.
 Each versioned release publishes a signed appcast for each architecture after its
 notarized DMG is attached. Keep the Sparkle private key outside Git and back it
 up: every shipped app has the matching public key embedded. A missing key stops
@@ -74,6 +75,10 @@ built. Both architectures must pass signing checks and Apple notarization before
 their DMGs are attached to the existing release. Missing credentials or failed notarization
 fail the job; there is no unsigned fallback. Other platform release jobs remain
 independent.
+
+To attach DMGs built from newer master to an existing release of the same version,
+run **macOS app release** on master with `release_tag` set and
+`release_from_master` enabled. The appcast embeds that version's CHANGELOG notes.
 
 Notarization first covers the app, then the final DMG. Tickets are stapled to both
 so installation does not depend on fetching the ticket from Apple. Users drag

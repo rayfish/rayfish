@@ -20,8 +20,12 @@ use iroh::{
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-use crate::config::ServerOverride;
+use crate::config::{AppConfig, QuicCongestion, ServerOverride};
 use crate::exit_node::{LoopPrevention, is_transitable};
+
+mod congestion;
+
+use congestion::controller_factory;
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
@@ -184,14 +188,14 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
 /// When `tor` is true and the `tor` feature is enabled, adds the Tor custom transport
 /// alongside the default relay transport.
+///
+/// `settings` supplies the relay, discovery and DNS overrides, the warm path
+/// hints and the congestion controller, all read once for this bind.
 pub async fn create_endpoint_with_alpns(
     secret_key: SecretKey,
     alpns: Vec<Vec<u8>>,
     tor: bool,
-    relay: &ServerOverride,
-    discovery: &ServerOverride,
-    dns_upstreams: &ServerOverride,
-    warm_hints: Vec<EndpointAddr>,
+    settings: &AppConfig,
 ) -> Result<(Endpoint, MemoryLookup)> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
@@ -200,22 +204,25 @@ pub async fn create_endpoint_with_alpns(
     // Read the host's resolvers once, here, rather than per bind attempt: the
     // second attempt runs after the first failed, and this must be the host's
     // configuration as it stood before anything of ours touched it.
-    let nameservers =
-        control_plane_nameservers(dns_upstreams, crate::dns::config::system_nameservers());
+    let nameservers = control_plane_nameservers(
+        &settings.dns_upstreams,
+        crate::dns::config::system_nameservers(),
+    );
     tracing::debug!(?nameservers, "control-plane DNS");
 
     // This lookup is intentionally additive to pkarr/mDNS, never a replacement.
     // Hints came from paths that previously completed an identity-authenticated
     // QUIC handshake; if an address has gone stale, iroh tries discovery as usual.
-    let warm_lookup = MemoryLookup::from_endpoint_info(warm_hints);
+    let warm_lookup = MemoryLookup::from_endpoint_info(settings.endpoint_hints.clone());
     let bind = BindConfig {
         secret_key: &secret_key,
         alpns: &alpns,
         tor,
-        relay,
-        discovery,
+        relay: &settings.relay,
+        discovery: &settings.discovery_dns,
         nameservers: &nameservers,
         warm_lookup: &warm_lookup,
+        quic_congestion: settings.quic_congestion,
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -248,6 +255,7 @@ struct BindConfig<'a> {
     discovery: &'a ServerOverride,
     nameservers: &'a [Ipv4Addr],
     warm_lookup: &'a MemoryLookup,
+    quic_congestion: QuicCongestion,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -270,6 +278,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         discovery,
         nameservers,
         warm_lookup,
+        quic_congestion,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -283,9 +292,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
             BindOpts::default().set_is_required(false),
         )
         .context("invalid IPv6 bind address")?
-        // Rayfish's data plane is a single stream of QUIC datagrams per peer
-        // (TUN packets → `send_datagram`), with a few reliable control streams per
-        // connection. Tune the transport config for that shape:
+        // Rayfish's data plane is one QUIC connection per peer carrying TUN
+        // packets in DATAGRAM frames, with a few reliable control streams on the
+        // same connection. Tune the transport config for that shape:
         //   - `send_fairness(false)`: no competing data streams of equal priority
         //     to round-robin, so fairness scheduling is pure overhead. (Affects
         //     stream scheduling only, not datagrams, but is the correct setting and
@@ -293,14 +302,12 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //   - GSO on (default): confirmed explicit so a future change can't silently
         //     regress it. GSO coalesces same-destination segments into one sendmsg,
         //     cutting syscalls under burst.
-        //   - Datagrams enabled (iroh/noq default `Some` receive buffer); the send
-        //     buffer stays at the 1 MiB default, sized via `datagram_send_buffer_space`
-        //     on the hot path (see `forward::run_mesh`).
-        // The congestion controller stays at the noq default (Cubic). Switching to
-        // BBR3 would help on lossy/shallow-buffer consumer uplinks but requires a
-        // `noq-proto` dependency to reach the config type, deferred to a measured
-        // follow-up (see iroh-audit BASELINE.md, cross-parameter sweep).
-        .transport_config(quic_transport_config())
+        //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
+        //     small send limit. The forwarding path never waits for capacity;
+        //     when the queue is full, noQ discards older datagrams.
+        // The congestion controller is the `quic-congestion` setting, noq's
+        // Cubic by default (see `transport::congestion`).
+        .transport_config(quic_transport_config(quic_congestion))
         // Drop overlay addresses from the gathered direct-address candidates, so a
         // mesh IP bound on the TUN is never stored, published, or offered as a
         // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
@@ -491,21 +498,32 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-/// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one stream
-/// of QUIC datagrams per peer, plus a few reliable control streams).
+pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one QUIC
+/// connection carrying DATAGRAM frames per peer, plus reliable control streams).
 ///
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
-fn quic_transport_config() -> QuicTransportConfig {
-    QuicTransportConfig::builder()
-        // No competing data streams of equal priority → disable round-robin
-        // fairness scheduling (removes overhead; correct for a single datagram
-        // stream per peer).
+fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
+    tracing::info!(congestion_controller = cc.as_ref(), "QUIC transport config");
+    let builder = match controller_factory(cc) {
+        Some(factory) => QuicTransportConfig::builder().congestion_controller_factory(factory),
+        None => QuicTransportConfig::builder(),
+    };
+    builder
+        // There are no competing data streams of equal priority, so disable
+        // round-robin fairness scheduling. This removes overhead from the few
+        // reliable control streams; DATAGRAM frames are scheduled separately.
         .send_fairness(false)
         // Keep GSO on (default) explicitly so a future change can't silently
         // regress it.
         .enable_segmentation_offload(true)
+        // Keep the unreliable datagram queue small. When it fills, noQ discards
+        // older datagrams rather than making the forwarding path wait and add
+        // latency behind stale traffic.
+        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE)
         .build()
 }
 

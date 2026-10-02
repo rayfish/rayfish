@@ -6,6 +6,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -30,8 +31,8 @@ import xyz.rayfish.android.ui.theme.*
 fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var editing by remember { mutableStateOf(false) }
-    var hostnameInput by remember { mutableStateOf("") }
+    var editing by rememberSaveable { mutableStateOf(false) }
+    var hostnameInput by rememberSaveable { mutableStateOf("") }
     var deviceName by remember { mutableStateOf("") }
     LaunchedEffect(Unit) {
         deviceName = withContext(Dispatchers.IO) {
@@ -40,7 +41,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
     }
     var pairingTicket by remember { mutableStateOf<String?>(null) }
     var paired by remember { mutableStateOf(false) }
-    var confirmUnpair by remember { mutableStateOf(false) }
+    var confirmUnpair by rememberSaveable { mutableStateOf(false) }
     // A device that already holds a cert cannot pair again (it must not mint new
     // certs). Refresh whenever status changes so the card flips right after a pair.
     LaunchedEffect(status?.nodeId) {
@@ -65,32 +66,30 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         SectionCard {
             SectionLabel(stringResource(R.string.label_this_device))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(stringResource(R.string.device_name), fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                Text(stringResource(R.string.device_name), fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Rf.Heading)
                 TextButton(onClick = { hostnameInput = deviceName; editing = true }) {
                     val hostnameShown = deviceName.ifEmpty { stringResource(R.string.action_set) }
-                    Text(stringResource(R.string.hostname_edit, hostnameShown), fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
+                    Text(stringResource(R.string.hostname_edit, hostnameShown), fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Rose400)
                 }
             }
             val nodeId = status?.nodeId?.takeIf { it.isNotEmpty() }
-            val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
             KeyValueRow(stringResource(R.string.label_node_id), nodeId?.let { if (it.length > 12) "${it.take(6)}…${it.takeLast(4)}" else it } ?: stringResource(R.string.dash),
                 onClick = nodeId?.let { v -> { copyToClipboard(context, context.getString(R.string.label_node_id), v); onToast(context.getString(R.string.toast_copied_node_id)) } })
-            KeyValueRow(stringResource(R.string.label_ipv6), ip6 ?: stringResource(R.string.dash), onClick = ip6?.let { v -> { copyToClipboard(context, context.getString(R.string.label_ipv6), v); onToast(context.getString(R.string.toast_copied, v)) } })
         }
         SectionCard {
             SectionLabel(stringResource(R.string.label_pairing))
             val running = status?.running == true
             if (!running) {
                 Text(stringResource(R.string.pairing_need_tunnel),
-                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+                    fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
             } else if (paired) {
                 Text(stringResource(R.string.pairing_already),
-                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+                    fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
                 Spacer(Modifier.height(10.dp))
                 OutlinePillButton(stringResource(R.string.pairing_unpair), onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth())
             } else {
                 Text(stringResource(R.string.pairing_intro),
-                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+                    fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     PillButton(stringResource(R.string.pairing_show_code), onClick = {
@@ -210,8 +209,8 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         }
         SectionCard {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(stringResource(R.string.label_about), fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                Text(stringResource(R.string.about_version, version), fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Muted)
+                Text(stringResource(R.string.label_about), fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Rf.Heading)
+                Text(stringResource(R.string.about_version, version), fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Muted)
             }
         }
     }
@@ -224,7 +223,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     RayfishTextField(hostnameInput, { hostnameInput = it }, stringResource(R.string.hint_hostname))
-                    Text(stringResource(R.string.device_name_applies), fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint)
+                    Text(stringResource(R.string.device_name_applies), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Faint)
                 }
             },
             confirmButton = {
@@ -254,7 +253,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             title = { Text(stringResource(R.string.unpair_title), fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Text(stringResource(R.string.unpair_body),
-                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Body)
+                    fontFamily = Chakra, fontSize = 14.sp, color = Rf.Body)
             },
             confirmButton = {
                 TextButton(onClick = {

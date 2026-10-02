@@ -26,20 +26,37 @@ struct RayfishApp: App {
 }
 
 @MainActor
-final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
+final class RayfishAppDelegate: NSObject, NSApplicationDelegate, @preconcurrency SPUUpdaterDelegate {
     private lazy var updaterController: SPUStandardUpdaterController? = {
         guard let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
               feed.hasPrefix("https://") else { return nil }
-        return SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        return SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
     }()
     private let controller = TunnelController()
     private var mainWindow: RayfishWindow?
     private var statusMenu: RayfishMenu?
     private var isTerminating = false
+    private var updateVersion: String?
+    private var installUpdate: (() -> Void)?
+    private var updateRestartRequested = false
 
     var canCheckForUpdates: Bool { updaterController != nil }
 
     func checkForUpdates() { updaterController?.checkForUpdates(nil) }
+
+    func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem,
+                 immediateInstallationBlock immediateInstallHandler: @escaping () -> Void) -> Bool {
+        updateVersion = item.displayVersionString
+        installUpdate = immediateInstallHandler
+        controller.notifications.showUpdateReady(version: item.displayVersionString)
+        return true
+    }
+
+    private func restartToUpdate() {
+        guard !updateRestartRequested, !isTerminating, let installUpdate else { return }
+        updateRestartRequested = true
+        installUpdate()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = updaterController
@@ -48,7 +65,13 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
             self?.controller.page = page
             self?.openMainWindow()
         }
-        statusMenu = RayfishMenu(controller: controller) { [weak self] in
+        controller.notifications.onRevealFile = { url in
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+        controller.notifications.onRestartUpdate = { [weak self] in self?.restartToUpdate() }
+        statusMenu = RayfishMenu(controller: controller,
+                                 updateReady: { [weak self] in self?.updateVersion },
+                                 restartUpdate: { [weak self] in self?.restartToUpdate() }) { [weak self] in
             self?.openMainWindow()
         }
         openMainWindow()
@@ -56,7 +79,8 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
 
     func openMainWindow() {
         if mainWindow == nil {
-            mainWindow = RayfishWindow(content: NSHostingView(rootView: ContentView(controller: controller)))
+            mainWindow = RayfishWindow(content: NSHostingView(rootView: ContentView(
+                controller: controller, updater: updaterController?.updater)))
         }
         mainWindow?.show()
     }
@@ -69,9 +93,12 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
         guard !isTerminating else { return .terminateLater }
         isTerminating = true
         Task {
-            let stopped = await controller.prepareToQuit()
+            let stopped = await controller.prepareToQuit(forUpdate: updateRestartRequested)
             isTerminating = false
-            if !stopped { openMainWindow() }
+            if !stopped {
+                updateRestartRequested = false
+                openMainWindow()
+            }
             sender.reply(toApplicationShouldTerminate: stopped)
         }
         return .terminateLater
@@ -85,6 +112,7 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate {
 
 private struct ContentView: View {
     @ObservedObject var controller: TunnelController
+    let updater: SPUUpdater?
 
     private var connected: Bool { controller.isConnected }
 
@@ -119,6 +147,19 @@ private struct ContentView: View {
                     }
                     .foregroundColor(RayfishTheme.muted)
                 }
+                if let warning = controller.status?.connectionWarning {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "network.slash")
+                        Text(warning).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(RayfishTheme.text(14))
+                    .foregroundColor(RayfishTheme.amber)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RayfishTheme.amber.opacity(0.04))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(RayfishTheme.amber.opacity(0.25)))
+                }
                 if let error = controller.error {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "exclamationmark.triangle")
@@ -140,7 +181,7 @@ private struct ContentView: View {
                 case .files:
                     FilesView(controller: controller)
                 case .settings:
-                    SettingsView(controller: controller)
+                    SettingsView(controller: controller, updater: updater)
                 }
                 Spacer(minLength: 24)
             }
@@ -314,7 +355,7 @@ private struct NetworkCard: View {
             .padding(14)
             ForEach(network.peers) { peer in
                 Rectangle().fill(RayfishTheme.line).frame(height: 1)
-                PeerRow(peer: peer, domains: [peer.domain(in: network.name)])
+                PeerRow(peer: peer, domains: peer.hostname.isEmpty ? [] : [peer.domain(in: network.name)])
                     .padding(.horizontal, 14).padding(.vertical, 11)
             }
             if network.peers.isEmpty {
@@ -348,6 +389,12 @@ private struct PeerRow: View {
             if let latency = peer.latencyMs { Text("\(latency) ms").foregroundColor(RayfishTheme.faint) }
         }
         .font(RayfishTheme.mono(12))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard let domain = domains.first else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(domain, forType: .string)
+        }
         .contextMenu {
             ForEach(domains, id: \.self) { domain in
                 Button("Copy \(domain)") {
@@ -369,7 +416,7 @@ private struct DevicesView: View {
     }
     private func domains(for peer: ProviderPeer) -> [String] {
         (controller.status?.networks ?? []).compactMap { network in
-            network.peers.first { $0.ipv6 == peer.ipv6 }?.domain(in: network.name)
+            network.peers.first { $0.ipv6 == peer.ipv6 && !$0.hostname.isEmpty }?.domain(in: network.name)
         }.sorted()
     }
     var body: some View {
@@ -539,10 +586,45 @@ private struct EmptyState: View {
 
 private struct SettingsView: View {
     @ObservedObject var controller: TunnelController
+    let updater: SPUUpdater?
     @State private var shellCommandMessage: String?
+    @State private var automaticUpdatesEnabled = false
+    @State private var congestionNeedsReconnect = false
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Settings").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Rayfish version")
+                    Spacer()
+                    Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown")
+                        .font(RayfishTheme.mono(12)).foregroundColor(RayfishTheme.muted)
+                }
+                if let updater {
+                    Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                    HStack {
+                        Text("Automatically update Rayfish")
+                        Spacer()
+                        Toggle("Automatically update Rayfish", isOn: Binding(
+                            get: { automaticUpdatesEnabled },
+                            set: { enabled in
+                                updater.automaticallyChecksForUpdates = enabled
+                                updater.automaticallyDownloadsUpdates = enabled
+                                automaticUpdatesEnabled = enabled
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    }
+                    Text("Updates download in the background. Restart when notified, or they install when you quit.")
+                        .foregroundColor(RayfishTheme.muted)
+                }
+            }
+            .padding(18).rayfishCard()
+            .onAppear {
+                automaticUpdatesEnabled = updater?.automaticallyChecksForUpdates == true
+                    && updater?.automaticallyDownloadsUpdates == true
+            }
             SSHSettingsView(controller: controller)
             FirewallSettingsView(controller: controller)
             VStack(alignment: .leading, spacing: 14) {
@@ -603,10 +685,44 @@ private struct SettingsView: View {
             .disabled(controller.status == nil || controller.isLoading)
             .padding(18).rayfishCard()
             VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Loss-tolerant congestion control")
+                    Spacer()
+                    Toggle("Loss-tolerant congestion control", isOn: Binding(
+                        get: { controller.status?.quicLossTolerant ?? false },
+                        set: { enabled in
+                            Task {
+                                await controller.setSetting(.quicLossTolerant, enabled: enabled)
+                                congestionNeedsReconnect = controller.error == nil
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                }
+                Text("Experimental. Keeps throughput up on lossy links instead of slowing down on every lost packet.")
+                    .foregroundColor(RayfishTheme.muted)
+                if congestionNeedsReconnect {
+                    HStack {
+                        Text("Reconnect to apply this change.").foregroundColor(RayfishTheme.amber)
+                        Spacer()
+                        Button("Reconnect now") {
+                            congestionNeedsReconnect = false
+                            Task { await controller.reconnect() }
+                        }
+                    }
+                }
+                if controller.status == nil {
+                    Text("Connect to view and change this setting.").foregroundColor(RayfishTheme.faint)
+                }
+            }
+            .toggleStyle(.switch)
+            .disabled(controller.status == nil || controller.isLoading)
+            .padding(18).rayfishCard()
+            VStack(alignment: .leading, spacing: 14) {
                 Text("Command line").font(RayfishTheme.heading(15))
                 Text("ray status").font(RayfishTheme.mono(13)).foregroundColor(RayfishTheme.rose)
                 HStack {
-                    Text("Make ray available in new \(ShellCommandInstaller.shellName()) terminals.")
+                    Text("Make ray and tab completion available in new \(ShellCommandInstaller.shellName()) terminals.")
                         .foregroundColor(RayfishTheme.muted)
                     Spacer()
                     Button("Install shell command") {

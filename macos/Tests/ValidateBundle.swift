@@ -57,7 +57,19 @@ do {
     let network = info["NetworkExtension"] as? [String: Any] ?? [:]
     let providers = network["NEProviderClasses"] as? [String: String] ?? [:]
     try require(providers["com.apple.networkextension.packet-tunnel"] == "RayfishTunnelExtension.PacketTunnelProvider", "Missing packet tunnel provider class")
-    for code in [app, bundle, app.appendingPathComponent("Contents/MacOS/ray")] {
+    let sparkle = app.appendingPathComponent("Contents/Frameworks/Sparkle.framework")
+    let sparkleVersion = sparkle.appendingPathComponent("Versions/B")
+    let signedCode = [
+        app,
+        bundle,
+        app.appendingPathComponent("Contents/MacOS/ray"),
+        sparkle,
+        sparkleVersion.appendingPathComponent("Autoupdate"),
+        sparkleVersion.appendingPathComponent("Updater.app"),
+        sparkleVersion.appendingPathComponent("XPCServices/Downloader.xpc"),
+        sparkleVersion.appendingPathComponent("XPCServices/Installer.xpc"),
+    ]
+    for code in signedCode {
         _ = try codesign(["--verify", "--strict", code.path])
         let signature = try codesign(["-dv", "--verbose=2", code.path], captureErrors: true)
         let details = String(decoding: signature, as: UTF8.self)

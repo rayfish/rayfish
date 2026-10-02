@@ -7,6 +7,11 @@ use anyhow::{Context, Result};
 use russh::keys::{Algorithm, PrivateKey};
 use tracing::{info, warn};
 
+const DEFAULT_HOST_KEY_PATHS: [&str; 2] = [
+    "/etc/ssh/ssh_host_ed25519_key",
+    "/usr/local/etc/ssh/ssh_host_ed25519_key",
+];
+
 pub(super) fn load_host_key() -> Result<PrivateKey> {
     if let Some((path, key)) = discover_host_ed25519_key() {
         info!(path = %path.display(), "mesh SSH: reusing host ed25519 key");
@@ -23,8 +28,8 @@ pub(super) fn load_host_key() -> Result<PrivateKey> {
 }
 
 fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
-    let dump = run_sshd_dump()?;
-    for path in parse_hostkey_paths(&dump) {
+    let dump = run_sshd_dump();
+    for path in host_key_paths(dump.as_deref()) {
         let Ok(pem) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -36,6 +41,13 @@ fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
         }
     }
     None
+}
+
+pub(super) fn host_key_paths(sshd_dump: Option<&str>) -> Vec<PathBuf> {
+    match sshd_dump {
+        Some(dump) => parse_hostkey_paths(dump),
+        None => DEFAULT_HOST_KEY_PATHS.iter().map(PathBuf::from).collect(),
+    }
 }
 
 fn run_sshd_dump() -> Option<String> {

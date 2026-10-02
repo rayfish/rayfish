@@ -181,6 +181,7 @@
       font-family: var(--mono); font-size: 13px;
     }
     .peer-row:first-of-type { border-top: 0; }
+    .peer-row[data-copy] { cursor: pointer; }
     .peer-row .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
     .dot.direct { background: var(--green); box-shadow: 0 0 6px rgba(52,211,153,.6); }
     .dot.relay { background: var(--amber); }
@@ -191,8 +192,8 @@
       border: 1px solid var(--line-2); border-radius: 4px; padding: 1px 5px; margin-left: 6px;
       color: var(--faint);
     }
-    .peer-row .ip { color: var(--muted); cursor: pointer; }
-    .peer-row .ip:hover { color: var(--rose); }
+    .peer-row .ip { color: var(--muted); }
+    .peer-row[data-copy]:hover .host { color: var(--rose); }
     .peer-row .conn { color: var(--faint); }
     .peer-row .conn.direct { color: var(--green); }
     .peer-row .acts { margin-left: auto; display: flex; gap: 6px; }
@@ -770,13 +771,14 @@
         const peers = (n.peers || []).map(p => {
           const kind = peerKind(p);
           const conn = p.connection;
+          const domain = p.hostname ? `${p.hostname}.${n.name}.ray` : "";
           const connText = conn
             ? kind
             : "idle";
-          return `<div class="peer-row">
+          return `<div class="peer-row" ${domain ? `data-copy="${esc(domain)}" title="Copy ${esc(domain)}"` : ""}>
             <span class="dot ${kind}"></span>
             <span class="host">${esc(p.hostname || "?")}${p.is_own_device ? `<span class="tag">YOU</span>` : ""}</span>
-            <span class="ip" data-copy="${esc(p.ipv6 || "")}" title="Copy IP">${esc(p.ipv6 || "")}</span>
+            <span class="ip">${esc(p.ipv6 || "")}</span>
             <span class="spacer"></span>
             <span class="conn ${kind}">${esc(connText)}</span>
             ${conn && conn.rtt_ms != null ? `<span class="conn">${Math.round(conn.rtt_ms)} ms</span>` : ""}
@@ -807,10 +809,12 @@
 
     function uniquePeers(data) {
       const peers = new Map();
-      for (const network of (data.networks || [])) {
+      for (const network of [...(data.networks || [])].sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
         for (const peer of (network.peers || [])) {
           const key = peer.ipv6 || peer.endpoint_id;
-          if (!peers.has(key)) peers.set(key, peer);
+          if (!peers.has(key) || (!peers.get(key).domain && peer.hostname)) peers.set(key, {
+            ...peer, domain: peer.hostname ? `${peer.hostname}.${network.name}.ray` : ""
+          });
         }
       }
       return [...peers.values()].sort((a, b) => String(a.hostname).localeCompare(String(b.hostname)));
@@ -819,10 +823,10 @@
     function renderPeer(peer) {
       const kind = peerKind(peer);
       const conn = peer.connection;
-      return `<div class="peer-row">
+      return `<div class="peer-row" ${peer.domain ? `data-copy="${esc(peer.domain)}" title="Copy ${esc(peer.domain)}"` : ""}>
         <span class="dot ${kind}"></span>
         <span class="host">${esc(peer.hostname || "?")}${peer.is_own_device ? `<span class="tag">YOU</span>` : ""}</span>
-        <span class="ip" data-copy="${esc(peer.ipv6 || "")}" title="Copy IP">${esc(peer.ipv6 || "")}</span>
+        <span class="ip">${esc(peer.ipv6 || "")}</span>
         <span class="spacer"></span>
         <span class="conn ${kind}">${esc(conn ? kind : "idle")}</span>
         ${conn && conn.rtt_ms != null ? `<span class="conn">${Math.round(conn.rtt_ms)} ms</span>` : ""}

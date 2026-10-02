@@ -137,11 +137,16 @@ else
   fail "srv-c still present after leave"
 fi
 on "$A" "ray nuke $NET --force" 2>&1 | strip | sed 's/^/   a| /'
-# After nuke the coordinator drops the network locally.
+# Another coordinator remains, so only the caller leaves.
 if retry_until 30 "! has_net '$A' '$NET'"; then
   pass "nuke removed the network from the coordinator"
 else
   fail "network still present on coordinator after nuke"
+fi
+if has_net "$B" "$NET"; then
+  pass "remaining coordinator kept the network after nuke"
+else
+  fail "nuke removed the network from another coordinator"
 fi
 
 # ---------------------------------------------------------------------------

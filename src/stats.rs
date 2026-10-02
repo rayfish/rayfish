@@ -19,13 +19,6 @@ pub enum DropReason {
     SendFailure,
     NoPeer,
     Malformed,
-    /// Outbound packet dropped at the application boundary because the peer's
-    /// QUIC datagram send buffer was too full to accept it without evicting an
-    /// already-queued (older) packet. Dropping the *new* packet here (drop-newest)
-    /// is preferable to letting QUIC drop the *oldest* queued one: for a VPN the
-    /// oldest queued packet is more likely to be useful (already-accepted work)
-    /// than a fresh one arriving into a saturated link.
-    Backpressure,
     /// Inbound datagram whose source IP did not match the sending peer's
     /// assigned mesh address (ingress anti-spoofing). A peer may only inject
     /// packets sourced from its own mesh IP.
@@ -56,12 +49,11 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    const ALL: [DropReason; 13] = [
+    const ALL: [DropReason; 12] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
         DropReason::Malformed,
-        DropReason::Backpressure,
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
@@ -86,6 +78,12 @@ pub struct MetricsSnapshot {
     pub packets_tx: u64,
     pub bytes_rx: u64,
     pub bytes_tx: u64,
+    pub tun_write_batches: u64,
+    pub tun_write_packets: u64,
+    pub tun_write_errors: u64,
+    pub tun_write_batch_limit: i64,
+    pub tun_tcp_gso_enabled: bool,
+    pub tun_udp_gso_enabled: bool,
     /// `(reason, count)` for each drop reason, in `DropReason::ALL` order.
     pub drops: Vec<(String, u64)>,
     pub uptime_secs: u64,
@@ -98,6 +96,18 @@ pub struct ForwardMetrics {
     pub packets_rx: Counter,
     /// Total packets sent to peers
     pub packets_tx: Counter,
+    /// TUN write operations, including batched writes.
+    pub tun_write_batches: Counter,
+    /// Packets submitted through TUN write operations.
+    pub tun_write_packets: Counter,
+    /// Failed TUN write operations.
+    pub tun_write_errors: Counter,
+    /// Maximum packets supported by one TUN write on this platform.
+    pub tun_write_batch_limit: Gauge,
+    /// Whether the TUN interface accepted TCP segmentation/receive offload.
+    pub tun_tcp_gso_enabled: Gauge,
+    /// Whether the TUN interface accepted UDP segmentation/receive offload.
+    pub tun_udp_gso_enabled: Gauge,
     /// Total bytes received from peers
     pub bytes_rx: Counter,
     /// Total bytes sent to peers
@@ -178,6 +188,12 @@ impl ForwardMetrics {
             packets_tx: self.packets_tx.get(),
             bytes_rx: self.bytes_rx.get(),
             bytes_tx: self.bytes_tx.get(),
+            tun_write_batches: self.tun_write_batches.get(),
+            tun_write_packets: self.tun_write_packets.get(),
+            tun_write_errors: self.tun_write_errors.get(),
+            tun_write_batch_limit: self.tun_write_batch_limit.get(),
+            tun_tcp_gso_enabled: self.tun_tcp_gso_enabled.get() != 0,
+            tun_udp_gso_enabled: self.tun_udp_gso_enabled.get() != 0,
             drops,
             uptime_secs: start.elapsed().as_secs(),
         }
@@ -254,6 +270,18 @@ pub struct PeerMetrics {
     pub bytes_rx: Family<PeerLabels, Gauge>,
     /// Packets lost to peer
     pub lost_packets: Family<PeerLabels, Gauge>,
+    /// Bytes lost to peer
+    pub lost_bytes: Family<PeerLabels, Gauge>,
+    /// Current congestion window on the selected path
+    pub congestion_window_bytes: Family<PeerLabels, Gauge>,
+    /// Congestion events on the selected path
+    pub congestion_events: Family<PeerLabels, Gauge>,
+    /// Current UDP payload MTU on the selected path
+    pub path_mtu_bytes: Family<PeerLabels, Gauge>,
+    /// Whether the selected path uses a relay instead of direct UDP
+    pub path_is_relay: Family<PeerLabels, Gauge>,
+    /// Bytes currently retained in the peer's QUIC datagram send queue
+    pub datagram_send_queue_bytes: Family<PeerLabels, Gauge>,
 }
 
 impl PeerMetrics {
@@ -262,7 +290,7 @@ impl PeerMetrics {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
                         for (ip, conn) in peers.all_connections() {
                             let label = PeerLabels {
                                 peer: ip.to_string(),
@@ -270,14 +298,22 @@ impl PeerMetrics {
 
                             let paths = conn.paths();
                             if let Some(path) = paths.iter().find(|p| p.is_selected()) {
-                                let rtt_us = path.rtt().as_micros() as i64;
-                                metrics.rtt_us.get_or_create(&label).set(rtt_us);
+                                let stats = path.stats();
+                                metrics.rtt_us.get_or_create(&label).set(stats.rtt.as_micros() as i64);
+                                metrics.congestion_window_bytes.get_or_create(&label).set(stats.cwnd as i64);
+                                metrics.congestion_events.get_or_create(&label).set(stats.congestion_events as i64);
+                                metrics.path_mtu_bytes.get_or_create(&label).set(i64::from(stats.current_mtu));
+                                metrics.path_is_relay.get_or_create(&label).set(i64::from(path.is_relay()));
                             }
 
                             let stats = conn.stats();
                             metrics.bytes_tx.get_or_create(&label).set(stats.udp_tx.bytes as i64);
                             metrics.bytes_rx.get_or_create(&label).set(stats.udp_rx.bytes as i64);
                             metrics.lost_packets.get_or_create(&label).set(stats.lost_packets as i64);
+                            metrics.lost_bytes.get_or_create(&label).set(stats.lost_bytes as i64);
+                            let queued = crate::transport::DATAGRAM_SEND_BUFFER_SIZE
+                                .saturating_sub(conn.datagram_send_buffer_space());
+                            metrics.datagram_send_queue_bytes.get_or_create(&label).set(queued as i64);
                         }
                     }
                     _ = token.cancelled() => return,
@@ -382,7 +418,6 @@ mod tests {
                 | DropReason::SendFailure
                 | DropReason::NoPeer
                 | DropReason::Malformed
-                | DropReason::Backpressure
                 | DropReason::Spoof
                 | DropReason::ExitDenied
                 | DropReason::ReassemblyTimeout

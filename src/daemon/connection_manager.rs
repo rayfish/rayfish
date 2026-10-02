@@ -100,6 +100,11 @@ impl ConnectionManager {
             tracing::error!("mesh dispatch not set; dropping connection");
             return;
         };
+        #[cfg(target_os = "android")]
+        if !pre_registered && mesh.ctx.registry.transport.is_suspended() {
+            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"android idle");
+            return;
+        }
         MeshConnection::new(
             conn,
             Arc::clone(&self),

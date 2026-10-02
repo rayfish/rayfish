@@ -19,10 +19,12 @@ if [[ -n "${RELEASE_TAG:-}" ]]; then
         echo 'Release tag must match the rayfish Cargo version.' >&2
         exit 1
     }
-    [[ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" == "$(git rev-parse HEAD)" ]] || {
-        echo 'Release tag must point to the commit being built.' >&2
-        exit 1
-    }
+    if [[ "${RELEASE_FROM_MASTER:-false}" != true ]]; then
+        [[ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" == "$(git rev-parse HEAD)" ]] || {
+            echo 'Release tag must point to the commit being built.' >&2
+            exit 1
+        }
+    fi
 fi
 # CFBundleShortVersionString is numeric, even for a prerelease tag.
 marketing_version=${version%%[-+]*}
@@ -44,11 +46,27 @@ xcodebuild -quiet \
     build 2>&1 | tee "$output/build.log"
 
 app="$output/build/Build/Products/Release/Rayfish.app"
-[[ -d "$app/Contents/Frameworks/Sparkle.framework" ]] || {
+sparkle="$app/Contents/Frameworks/Sparkle.framework"
+[[ -d "$sparkle" ]] || {
     echo 'Sparkle framework is missing from the release app.' >&2
     exit 1
 }
-codesign --verify --strict "$app/Contents/Frameworks/Sparkle.framework"
+# Xcode signs the copied framework but leaves its bundled helpers ad hoc signed.
+# Sign from the inside out so each enclosing signature includes its signed contents.
+sparkle_version="$sparkle/Versions/B"
+signing_identity='Developer ID Application'
+codesign --force --options runtime --timestamp --sign "$signing_identity" \
+    "$sparkle_version/XPCServices/Installer.xpc"
+codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+    --sign "$signing_identity" "$sparkle_version/XPCServices/Downloader.xpc"
+codesign --force --options runtime --timestamp --sign "$signing_identity" \
+    "$sparkle_version/Autoupdate"
+codesign --force --options runtime --timestamp --sign "$signing_identity" \
+    "$sparkle_version/Updater.app"
+codesign --force --options runtime --timestamp --sign "$signing_identity" "$sparkle"
+codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+    --sign "$signing_identity" "$app"
+codesign --verify --deep --strict "$app"
 for binary in "$app/Contents/MacOS/Rayfish" "$app/Contents/MacOS/ray" \
     "$app/Contents/Library/SystemExtensions/com.rayfish.app.tunnel.systemextension/Contents/MacOS/com.rayfish.app.tunnel"; do
     lipo "$binary" -verify_arch "$MACOS_ARCH"

@@ -302,46 +302,37 @@ impl NetworkRegistry {
         }
     }
 
-    /// Wake the transport without touching the TUN/DNS plane. Android uses this
-    /// when a packet arrives after the idle transport suspension.
+    /// Resume mesh activity without touching the TUN/DNS plane. The relay stays
+    /// connected in idle mode so file offers can still arrive.
     #[cfg(target_os = "android")]
     pub(crate) async fn wake_transport(&self) {
-        // Avoid an atomic read-modify-write for every packet while the
-        // transport is already active. Only the suspended path needs the
-        // state transition and relay restoration.
+        // Avoid an atomic read-modify-write for every packet while mesh links
+        // are already active.
         if !self.transport.is_suspended() {
             return;
         }
         if self.transport.mark_awake() {
-            tracing::info!("waking suspended mesh transport");
-            for (url, config) in self.transport.relay_configs.iter() {
-                self.transport
-                    .endpoint
-                    .insert_relay(url.clone(), Arc::clone(config))
-                    .await;
-            }
+            tracing::info!("resuming idle mesh links");
             self.transport.endpoint.network_change().await;
             self.poll_nudge.notify_waiters();
-            tracing::info!("mesh transport restored after idle suspension");
+            tracing::info!("mesh links resumed after idle");
         }
     }
 
-    /// Close mesh connections while keeping the endpoint, TUN and DNS alive.
+    /// Close mesh connections while keeping the relay, endpoint, TUN and DNS
+    /// alive so file offers can still arrive.
     /// Disconnect handling sees the suspended flag and must not start retries.
     #[cfg(target_os = "android")]
-    pub(crate) async fn suspend_transport(&self) {
+    pub(crate) fn suspend_mesh_links(&self) {
         if !self.transport.mark_suspended() {
             return;
         }
-        tracing::info!("suspending idle mesh transport");
+        tracing::info!("suspending idle mesh links");
         for (ip, conn) in self.peers.all_connections() {
             conn.close(VarInt::from_u32(forward::IDLE_CODE), b"android idle");
             self.peers.remove(&ip);
         }
-        for (url, _) in self.transport.relay_configs.iter() {
-            self.transport.endpoint.remove_relay(url).await;
-        }
-        tracing::info!("mesh transport suspended after idle timeout");
+        tracing::info!("mesh links suspended after idle timeout");
     }
 
     /// The raw on-demand dial mechanism: connect to `target` across every shared
@@ -927,6 +918,7 @@ impl NetworkRegistry {
             approved,
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
+            destroyed: false,
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
@@ -1025,9 +1017,7 @@ impl NetworkRegistry {
                 pkarr_client,
                 net_secret_key.clone(),
                 Arc::clone(state),
-                self.transport.blob_store.clone(),
-                self.transport.endpoint.id(),
-                self.peers.clone(),
+                Arc::clone(&ctx.registry),
                 name.to_string(),
                 initially_published,
                 Arc::clone(dht_notify),
@@ -1309,9 +1299,7 @@ impl NetworkRegistry {
                 pkarr_client,
                 key,
                 Arc::clone(&handle.state),
-                self.transport.blob_store.clone(),
-                self.transport.endpoint.id(),
-                self.peers.clone(),
+                Arc::clone(&ctx.registry),
                 network.to_string(),
                 None,
                 Arc::clone(&notify),

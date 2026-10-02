@@ -44,7 +44,7 @@ fun BrandHeader(title: String? = null, actions: @Composable RowScope.() -> Unit 
                 modifier = Modifier.size(26.dp).clip(RoundedCornerShape(7.dp)),
             )
             Spacer(Modifier.width(9.dp))
-            Text(stringResource(xyz.rayfish.android.R.string.app_name), fontFamily = PressStart, fontSize = 12.sp, color = Rf.Heading)
+            Text(stringResource(xyz.rayfish.android.R.string.app_name), fontFamily = PressStart, fontSize = 14.sp, color = Rf.Heading)
         } else {
             Text(title, fontFamily = Chakra, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Rf.Heading)
         }
@@ -54,15 +54,15 @@ fun BrandHeader(title: String? = null, actions: @Composable RowScope.() -> Unit 
 }
 
 @Composable
-fun StatusEyebrow(connected: Boolean, text: String) {
-    val c = if (connected) Rf.Emerald else Rf.Rose400
+fun StatusEyebrow(connected: Boolean, text: String, transitioning: Boolean = false) {
+    val c = if (transitioning) Rf.Amber else if (connected) Rf.Emerald else Rf.Muted
     Row(
         Modifier.fillMaxWidth().padding(bottom = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(c))
         Spacer(Modifier.width(7.dp))
-        Text(text.uppercase(), fontFamily = PlexMono, fontSize = 10.sp, letterSpacing = 2.sp, color = c)
+        Text(text.uppercase(), fontFamily = PlexMono, fontSize = 12.sp, letterSpacing = 2.sp, color = c)
     }
 }
 
@@ -79,7 +79,7 @@ fun SectionCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.
 @Composable
 fun SectionLabel(text: String) {
     Text(
-        text.uppercase(), fontFamily = PlexMono, fontSize = 9.sp, letterSpacing = 2.sp,
+        text.uppercase(), fontFamily = PlexMono, fontSize = 12.sp, letterSpacing = 2.sp,
         color = Rf.Faint, modifier = Modifier.padding(bottom = 8.dp),
     )
 }
@@ -87,18 +87,13 @@ fun SectionLabel(text: String) {
 @Composable
 fun KeyValueRow(key: String, value: String, onClick: (() -> Unit)? = null) {
     val base = Modifier.fillMaxWidth().padding(top = 6.dp)
-    val rowMod = if (onClick != null) base.clip(RoundedCornerShape(6.dp)).clickable(onClick = onClick) else base
+    val rowMod = if (onClick != null) base.heightIn(min = 48.dp).clip(RoundedCornerShape(6.dp)).clickable(onClick = onClick) else base
     Row(rowMod, verticalAlignment = Alignment.CenterVertically) {
-        Text(key, fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+        Text(key, fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
         Spacer(Modifier.width(12.dp))
-        // Two lines, not one. The only address a node has now is a full mesh
-        // IPv6, up to 39 characters of mono at 12sp, which does not fit beside a
-        // label on a phone: at one line it ellipsised in the middle, so the row
-        // showed an address nobody could read or check against `ray status`.
-        // Wrapping costs a line on the few rows that need it; truncating cost
-        // the value itself.
+        // Long device names and .ray domains can wrap without shrinking the text.
         Text(
-            value, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Body,
+            value, fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Body,
             maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.End,
             modifier = Modifier.weight(1f),
         )
@@ -115,7 +110,7 @@ fun PillButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier,
         onClick = onClick, enabled = enabled, modifier = modifier,
         shape = RoundedCornerShape(999.dp),
         colors = ButtonDefaults.buttonColors(containerColor = Rf.Primary, contentColor = Rf.OnPrimary),
-    ) { Text(text, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp) }
+    ) { Text(text, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
 }
 
 @Composable
@@ -125,13 +120,13 @@ fun OutlinePillButton(text: String, onClick: () -> Unit, modifier: Modifier = Mo
         shape = RoundedCornerShape(999.dp),
         border = BorderStroke(1.dp, Rf.CardBorder),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = Rf.Body),
-    ) { Text(text, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp) }
+    ) { Text(text, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
 }
 
 @Composable
 fun DestructiveTextButton(text: String, onClick: () -> Unit) {
     TextButton(onClick = onClick, colors = ButtonDefaults.textButtonColors(contentColor = Rf.Rose400)) {
-        Text(text, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+        Text(text, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
     }
 }
 
@@ -144,7 +139,7 @@ fun RayfishTextField(
     password: Boolean = false,
 ) {
     OutlinedTextField(
-        value = value, onValueChange = onValueChange, label = { Text(label, fontFamily = PlexMono, fontSize = 12.sp) },
+        value = value, onValueChange = onValueChange, label = { Text(label, fontFamily = PlexMono, fontSize = 14.sp) },
         singleLine = true, modifier = modifier.fillMaxWidth(),
         visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
         keyboardOptions = if (password) {
@@ -175,7 +170,7 @@ fun RayfishDropdown(
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }, modifier = modifier) {
         OutlinedTextField(
             value = value, onValueChange = {}, readOnly = true,
-            label = { Text(label, fontFamily = PlexMono, fontSize = 12.sp) },
+            label = { Text(label, fontFamily = PlexMono, fontSize = 14.sp) },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             singleLine = true,
             modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth(),
@@ -193,7 +188,7 @@ fun RayfishDropdown(
         ) {
             options.forEach { opt ->
                 DropdownMenuItem(
-                    text = { Text(opt, fontFamily = PlexMono, fontSize = 13.sp, color = Rf.Body) },
+                    text = { Text(opt, fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Body) },
                     onClick = { onValueChange(opt); expanded = false },
                 )
             }
@@ -209,8 +204,8 @@ fun ToggleCard(title: String, subtitle: String, checked: Boolean, onCheckedChang
             // instead of pushing the Switch off the card's right edge; the
             // end padding keeps the wrapped text off the Switch.
             Column(Modifier.weight(1f).padding(end = 12.dp)) {
-                Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted, modifier = Modifier.padding(top = 3.dp))
+                Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Rf.Heading)
+                Text(subtitle, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Muted, modifier = Modifier.padding(top = 3.dp))
             }
             Switch(
                 checked = checked, onCheckedChange = onCheckedChange,
@@ -236,14 +231,14 @@ fun OverflowMenu(items: List<MenuItem>, header: String? = null) {
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = Color(0xFF27272A)) {
             if (header != null) {
                 Text(
-                    header, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted,
+                    header, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Muted,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 )
                 HorizontalDivider(color = Rf.Faint.copy(alpha = 0.2f))
             }
             items.forEach { item ->
                 DropdownMenuItem(
-                    text = { Text(item.label, fontFamily = Chakra, fontSize = 13.sp, color = if (item.destructive) Rf.Rose400 else Rf.Body) },
+                    text = { Text(item.label, fontFamily = Chakra, fontSize = 14.sp, color = if (item.destructive) Rf.Rose400 else Rf.Body) },
                     onClick = { open = false; item.onClick() },
                 )
             }

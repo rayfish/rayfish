@@ -2,6 +2,8 @@ import Foundation
 
 enum ShellCommandInstaller {
     private static let marker = "# Rayfish command"
+    private static let completionMarker = "# Rayfish completion"
+    private static let endMarker = "# End Rayfish command"
 
     static func install() throws -> URL {
         let configuration = try shellConfiguration()
@@ -17,7 +19,7 @@ enum ShellCommandInstaller {
         } else {
             ""
         }
-        let contents = replacingCommand(in: existing, executable: executable.path)
+        let contents = replacingCommand(in: existing, executable: executable.path, shell: shellName())
         try contents.write(to: configuration, atomically: true, encoding: .utf8)
         return configuration
     }
@@ -45,7 +47,7 @@ enum ShellCommandInstaller {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(fileName)
     }
 
-    static func replacingCommand(in contents: String, executable: String) -> String {
+    static func replacingCommand(in contents: String, executable: String, shell: String) -> String {
         let lines = contents.components(separatedBy: .newlines)
         var retained: [String] = []
         var index = 0
@@ -55,6 +57,15 @@ enum ShellCommandInstaller {
                 if index < lines.count, lines[index].hasPrefix("alias ray=") {
                     index += 1
                 }
+                if index < lines.count, lines[index] == completionMarker {
+                    index += 1
+                    while index < lines.count, lines[index] != endMarker {
+                        index += 1
+                    }
+                    if index < lines.count {
+                        index += 1
+                    }
+                }
                 continue
             }
             retained.append(lines[index])
@@ -63,8 +74,22 @@ enum ShellCommandInstaller {
 
         // Quote the executable when the alias runs, then quote that alias value.
         let command = "alias ray=\(shellQuoted(shellQuoted(executable)))"
+        let completion: String
+        switch shell {
+        case "zsh":
+            completion = """
+            if (( ! $+functions[compdef] )); then
+              autoload -Uz compinit && compinit
+            fi
+            source <(\(shellQuoted(executable)) completions zsh)
+            """
+        case "bash":
+            completion = "eval \"$(\(shellQuoted(executable)) completions bash)\""
+        default:
+            completion = ""
+        }
         return retained.joined(separator: "\n").trimmingCharacters(in: .newlines)
-            + "\n\n\(marker)\n\(command)\n"
+            + "\n\n\(marker)\n\(command)\n\(completionMarker)\n\(completion)\n\(endMarker)\n"
     }
 
     private static func shellQuoted(_ value: String) -> String {

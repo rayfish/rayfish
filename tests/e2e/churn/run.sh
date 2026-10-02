@@ -477,9 +477,7 @@ if retry_until 60 "! has_net '$A' '$NET'"; then
 else
   fail "coordinator still holds '$NET' after nuke --force"
 fi
-# The coordinator is gone from the mesh, so the members lose it as a peer. This
-# is the assertion that holds regardless of what a member does with the network
-# entry itself: there is no daemon left to answer.
+# Members remove the network when the last coordinator destroys it.
 if retry_until 90 "[[ \"\$(peer_online '$B' srv-a '$NET')\" == 0 ]]"; then
   pass "srv-b sees the coordinator leave after the nuke"
 else
@@ -490,14 +488,17 @@ if retry_until 60 "! on '$B' 'ping -c 1 -W 2 $IP_A' >/dev/null 2>&1"; then
 else
   fail "srv-b still reaches srv-a after the nuke"
 fi
-# A nuke orphans the members rather than deleting their local network entry:
-# the empty record it publishes names a blob nobody is left to serve, so a
-# member has nothing to converge onto. Reported, not asserted: the suite should
-# not pin a behaviour the design has not committed to. What IS asserted above is
-# that the coordinator is unreachable, which is what the user sees.
-echo "   srv-b after the nuke: network present=$(has_net "$B" "$NET" && echo yes || echo no)"
+if retry_until 90 "on '$B' 'ray status' >/dev/null 2>&1 && ! has_net '$B' '$NET'"; then
+  pass "online member removed the destroyed network"
+else
+  fail "online member kept the destroyed network"
+fi
 daemon_start "$C"
-echo "   srv-c after the nuke (returned from offline): network present=$(has_net "$C" "$NET" && echo yes || echo no)"
+if retry_until 120 "on '$C' 'ray status' >/dev/null 2>&1 && ! has_net '$C' '$NET'"; then
+  pass "returning member discovered the deletion and removed the network"
+else
+  fail "returning member kept the destroyed network"
+fi
 
 # ---------------------------------------------------------------------------
 step "9. health sweep: nothing crashed on the way through"

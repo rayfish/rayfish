@@ -354,6 +354,12 @@ impl NetworkRegistry {
                             _ = tokio::time::sleep(backoff) => {}
                         }
                         backoff = (backoff * 2).min(BACKOFF_MAX);
+                        if let Ok(key) = nk.parse::<EndpointId>()
+                            && config::destruction::load(key).ok().flatten().is_some()
+                        {
+                            let _ = config::remove_pending_join(&nk);
+                            return;
+                        }
                         match me
                             .join_network_inner(
                                 &nk,
@@ -539,6 +545,10 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
         gate: VersionGate,
     ) -> Result<ResolvedNetwork> {
+        if let Some(packet) = config::destruction::load(net_pubkey)? {
+            self.forget_destroyed_key(&packet).await?;
+            anyhow::bail!("network has been destroyed");
+        }
         let pkarr_client =
             dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
         let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
@@ -550,6 +560,10 @@ impl NetworkRegistry {
                 )
             })?;
 
+        if dht::destruction::is_destroyed(&record) {
+            self.forget_destroyed_key(&record).await?;
+            anyhow::bail!("network has been destroyed");
+        }
         let mismatch = gate_mesh_version(
             dht::mesh_version_from_record(&record),
             transport::MESH_PROTOCOL_VERSION,
@@ -719,6 +733,7 @@ impl NetworkRegistry {
             approved: ApprovedList::from_entries(data.approved.clone()),
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
+            destroyed: false,
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,
@@ -885,6 +900,7 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
     ) -> Result<bool> {
         let name = saved.name.as_str();
+        self.check_destruction(name, net_pubkey, None).await?;
         let persisted_hostname = saved.persisted_hostname.clone();
         let auto_accept_firewall = saved.auto_accept_firewall;
         let auto_accept_files = saved.auto_accept_files;
@@ -1248,10 +1264,16 @@ impl NetworkRegistry {
             &self.transport.pkarr_relay_url,
         ) {
             Ok(client) => match dht::resolve_network_packet(&client, net_pubkey).await {
-                Ok(packet) => Some(
-                    dht::decode_network_record(&packet)
-                        .context("decode signed pkarr record for roster restore")?,
-                ),
+                Ok(packet) => {
+                    if dht::destruction::is_destroyed(&packet) {
+                        self.forget_destroyed_key(&packet).await?;
+                        anyhow::bail!("network has been destroyed");
+                    }
+                    Some(
+                        dht::decode_network_record(&packet)
+                            .context("decode signed pkarr record for roster restore")?,
+                    )
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "network record unavailable during roster restore");
                     None

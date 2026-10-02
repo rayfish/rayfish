@@ -74,8 +74,12 @@ class ShareActivity : ComponentActivity() {
                 SharePicker(
                     itemCount = uris.size,
                     onPick = { target ->
-                        dispatchSend(uris, target)
-                        finish()
+                        try {
+                            dispatchSend(uris, target)
+                            finish()
+                        } catch (t: Exception) {
+                            android.widget.Toast.makeText(this, R.string.error_send_start, android.widget.Toast.LENGTH_LONG).show()
+                        }
                     },
                     onCancel = { finish() },
                 )
@@ -115,7 +119,7 @@ class ShareActivity : ComponentActivity() {
     private fun dispatchSend(uris: List<Uri>, target: Target) {
         val svc = Intent(this, SendService::class.java).apply {
             putExtra(SendService.EXTRA_PEER_ID, target.nodeId)
-            putExtra(SendService.EXTRA_PEER_NAME, target.hostname.ifBlank { target.ipv6 })
+            putExtra(SendService.EXTRA_PEER_NAME, target.hostname.ifBlank { target.nodeId.take(8) })
             putParcelableArrayListExtra(SendService.EXTRA_URIS, ArrayList(uris))
             // Grant the service read access to every shared URI via ClipData.
             clipData = ClipData.newUri(contentResolver, "shared", uris.first()).apply {
@@ -149,7 +153,7 @@ class ShareActivity : ComponentActivity() {
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 BrandHeader(title = stringResource(R.string.label_share))
                 val label = pluralStringResource(R.plurals.share_item_count, itemCount, itemCount)
-                Text(stringResource(R.string.share_send_to_peer, label), fontFamily = Chakra, fontSize = 13.sp, color = Rf.Muted)
+                Text(stringResource(R.string.share_send_to_peer, label), fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
 
                 SectionCard {
                     SectionLabel(stringResource(R.string.label_peers))
@@ -166,17 +170,17 @@ class ShareActivity : ComponentActivity() {
                                 Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(dot))
                                 Spacer(Modifier.width(9.dp))
                                 Column(Modifier.weight(1f)) {
-                                    Text(t.hostname.ifEmpty { "?" }, fontFamily = Chakra,
+                                    Text(t.hostname.ifEmpty { t.nodeId.take(8) }, fontFamily = Chakra,
                                         fontWeight = FontWeight.SemiBold, fontSize = 14.sp,
                                         color = if (t.state == PeerConnState.OFFLINE) Rf.Muted else Rf.Heading)
-                                    Text(stringResource(R.string.share_peer_subtitle, t.ipv6, t.network, note), fontFamily = PlexMono,
-                                        fontSize = 10.sp, color = Rf.Faint)
+                                    Text(stringResource(R.string.share_peer_subtitle, t.nodeId.take(8), t.network, note), fontFamily = PlexMono,
+                                        fontSize = 12.sp, color = Rf.Faint)
                                 }
                             }
                         }
-                        loading -> Text(stringResource(R.string.share_connecting), fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
+                        loading -> Text(stringResource(R.string.share_connecting), fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Faint)
                         else -> Text(stringResource(R.string.share_no_peers),
-                            fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
+                            fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Faint)
                     }
                 }
 

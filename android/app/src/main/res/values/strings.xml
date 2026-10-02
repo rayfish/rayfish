@@ -273,4 +273,26 @@
     <string name="notif_saved">Saved</string>
     <string name="notif_transfer_failed">Transfer with %s failed</string>
     <string name="notif_offer_text">%1$s · %2$s</string>
+    <string name="toast_address_copied">Address copied</string>
+    <string name="home_files_available">Files available · VPN off</string>
+    <string name="home_stopping">Disconnecting…</string>
+    <string name="home_no_networks">VPN running · no networks yet</string>
+    <string name="home_connection_failed">Network connection failed</string>
+    <string name="home_join_network">Join or create a network</string>
+    <string name="error_receive_start">Could not start the download. Try again.</string>
+    <string name="action_send_files">Send files</string>
+    <string name="error_send_start">Could not start sending. Try again.</string>
+    <string name="label_files">Files</string>
+    <string name="label_requests">Requests</string>
+    <string name="file_saving">Saving…</string>
+    <string name="file_failed">Failed</string>
+    <string name="file_sent">Sent</string>
+    <string name="file_received">Received</string>
+    <string name="file_waiting">Waiting for recipient</string>
+    <string name="file_sending">Sending</string>
+    <string name="file_receiving">Receiving</string>
+    <string name="file_transfer_detail">%1$s · %2$s · %3$s</string>
+    <string name="file_transfer_bytes">%1$s of %2$s</string>
+    <string name="error_status_refresh">Could not refresh. Showing the last known status.</string>
+    <string name="action_retry">Retry</string>
 </resources>

@@ -6,14 +6,20 @@ import SwiftUI
 final class RayfishMenu: NSObject, NSMenuDelegate {
     private let controller: TunnelController
     private let openWindow: () -> Void
+    private let updateReady: () -> String?
+    private let restartUpdate: () -> Void
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let header = NSMenuItem()
     private var observation: AnyCancellable?
     private var updateScheduled = false
 
-    init(controller: TunnelController, menu: NSMenu = NSMenu(), openWindow: @escaping () -> Void) {
+    init(controller: TunnelController, menu: NSMenu = NSMenu(),
+         updateReady: @escaping () -> String? = { nil }, restartUpdate: @escaping () -> Void = {},
+         openWindow: @escaping () -> Void) {
         self.controller = controller
         self.openWindow = openWindow
+        self.updateReady = updateReady
+        self.restartUpdate = restartUpdate
         super.init()
         let image = NSImage(named: "MenuBarIcon")?.copy() as? NSImage
         image?.size = NSSize(width: 18, height: 18)
@@ -109,6 +115,12 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
             items.append(separator("activity-start"))
             items.append(item(activity, id: "activity"))
         }
+        if let warning = controller.status?.connectionWarning {
+            items.append(separator("quality-start"))
+            let entry = item("Slow Connection: Open Rayfish", action: #selector(showWindow), id: "connection-quality")
+            entry.toolTip = warning
+            items.append(entry)
+        }
         if let error = controller.error {
             items.append(separator("error-start"))
             let entry = item("Connection Issue: Open Rayfish", action: #selector(showWindow))
@@ -116,6 +128,11 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
             items.append(entry)
         }
         items.append(separator("footer-start"))
+        if let version = updateReady() {
+            let update = item("Restart to Update Rayfish", action: #selector(restartForUpdate), id: "restart-update")
+            update.toolTip = "Install Rayfish \(version)"
+            items.append(update)
+        }
         items.append(item("Open Rayfish", action: #selector(showWindow), key: "o"))
         let quit = item("Disconnect and Quit", action: #selector(NSApplication.terminate(_:)), key: "q")
         quit.target = NSApp
@@ -163,6 +180,8 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
     }
 
     @objc private func showWindow() { openWindow() }
+
+    @objc private func restartForUpdate() { restartUpdate() }
 
     @objc private func copyAddress(_ sender: NSMenuItem) {
         guard let address = sender.representedObject as? String else { return }

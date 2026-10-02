@@ -61,12 +61,9 @@ what it knows when it returns came from the signed blob and not from a broadcast
    packets afterwards.
 7. **Recovery.** The kicked node cannot walk back in on the bare room id, and a
    fresh invite does re-admit it: a kick is a removal, not a ban.
-8. **Nuke with a member offline.** The coordinator nukes and the members lose it.
-   What a member does with its own *local* network entry after a nuke is printed
-   rather than asserted: the empty record a nuke publishes names a blob nobody is
-   left to serve, so there is nothing for a member to converge onto, and the suite
-   does not pin a behaviour the design has not committed to. What is asserted is
-   what a user sees: the coordinator is gone and unreachable.
+8. **Nuke with a member offline.** The last coordinator destroys the network.
+   Online members remove it after the notice; the offline member discovers the
+   signed deletion when it returns and removes its local entry too.
 9. **Health sweep.** Every daemon still answers IPC, no journal carries a panic
    line, and systemd never scheduled a restart of its own. `NRestarts` is
    deliberately not the evidence: systemd resets it on a manual start, and this

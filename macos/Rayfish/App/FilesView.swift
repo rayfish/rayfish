@@ -17,13 +17,19 @@ struct FilesView: View {
                         Text(file.filename).foregroundColor(RayfishTheme.ink)
                         Text("From \(file.peer) · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: file.size), countStyle: .file))")
                             .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                        if file.state == .transferring {
+                            ProgressView(value: Double(file.transferred), total: Double(max(file.size, 1)))
+                                .frame(width: 180)
+                            Text("\(ByteCountFormatter.string(fromByteCount: Int64(clamping: file.transferred), countStyle: .file)) received")
+                                .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                        }
                     }
                     Spacer()
                     if file.state == .pending {
                         Button("Decline") { Task { await controller.rejectFile(file) } }
                         Button("Save to folder...") { chooseFolder(for: file) }
                             .buttonStyle(RayfishButtonStyle(kind: .primary))
-                    } else {
+                    } else if file.state == .received {
                         Text("Received").foregroundColor(RayfishTheme.green)
                     }
                 }.padding(14).rayfishCard()

@@ -32,6 +32,16 @@ struct TunnelIPCTests {
                                     ], dnsEnabled: false, mdnsEnabled: false, mdnsActive: true)
         let decodedStatus = try JSONDecoder().decode(ProviderStatus.self, from: JSONEncoder().encode(status))
         precondition(decodedStatus == status)
+        precondition(status.needsTCPHelper)
+        var noServices = status
+        noServices.v4BridgeEnabled = false
+        noServices.sshEnabled = false
+        precondition(!noServices.needsTCPHelper)
+        noServices.sshEnabled = true
+        precondition(noServices.needsTCPHelper)
+        noServices.sshEnabled = false
+        noServices.v4BridgeEnabled = true
+        precondition(noServices.needsTCPHelper)
         print("PASS: settings, peer requests, and independent machine inventory round-trip")
 
         let barrier = ReplyBarrier()

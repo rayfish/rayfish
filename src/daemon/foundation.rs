@@ -40,14 +40,12 @@ pub(crate) struct Transport {
     /// with the endpoint prevents a later embedded daemon from inheriting a
     /// prior instance's process-global setting.
     pub(crate) pkarr_relay_url: Url,
-    /// Android keeps the TUN/DNS plane alive while suspending mesh transport
-    /// after an idle period. The first packet resumes it before dialing.
+    /// Android keeps the endpoint and relay reachable for file offers while
+    /// suspending mesh peer links after an idle period.
     #[cfg(target_os = "android")]
     pub(crate) suspended: Arc<AtomicBool>,
     #[cfg(target_os = "android")]
     pub(crate) activity_seq: Arc<AtomicU64>,
-    #[cfg(target_os = "android")]
-    pub(crate) relay_configs: Arc<Vec<(RelayUrl, Arc<RelayConfig>)>>,
 }
 
 /// Startup-only values bundled to keep [`Transport::new`] focused on its core
@@ -57,8 +55,6 @@ pub(crate) struct TransportBootstrap {
     pub(crate) lan_peers: Arc<LanPeers>,
     pub(crate) warm_lookup: MemoryLookup,
     pub(crate) pkarr_relay_url: Url,
-    #[cfg(target_os = "android")]
-    pub(crate) relay_configs: Vec<(RelayUrl, Arc<RelayConfig>)>,
 }
 
 impl Transport {
@@ -82,8 +78,6 @@ impl Transport {
             suspended: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "android")]
             activity_seq: Arc::new(AtomicU64::new(0)),
-            #[cfg(target_os = "android")]
-            relay_configs: Arc::new(bootstrap.relay_configs),
         }
     }
 

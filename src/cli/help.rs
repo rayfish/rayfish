@@ -62,7 +62,7 @@ const ROOT: Groups = &[
         ],
     ),
     ("Files", &["send", "files"]),
-    ("Policy", &["firewall", "exit-node", "apply"]),
+    ("Policy", &["firewall", "ssh", "exit-node", "apply"]),
     (
         "Service",
         &[

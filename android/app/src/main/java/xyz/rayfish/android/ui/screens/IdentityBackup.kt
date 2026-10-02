@@ -76,7 +76,7 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
         SectionLabel(stringResource(R.string.label_identity_backup))
         Text(
             stringResource(R.string.identity_backup_body),
-            fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted,
+            fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted,
         )
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -101,7 +101,7 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
             Spacer(Modifier.height(8.dp))
             Text(
                 stringResource(R.string.identity_restore_need_off),
-                fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
+                fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Faint,
             )
         }
     }
@@ -124,7 +124,7 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
                     RayfishTextField(backupConfirm, { backupConfirm = it }, stringResource(R.string.hint_confirm_password), password = true)
                     Text(
                         stringResource(R.string.backup_password_warning),
-                        fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint,
+                        fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Faint,
                     )
                 }
             },
@@ -143,7 +143,7 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
                                     NodeHolder.get(context).backupIdentity(password)
                                 }
                                 pendingCode = backup.code
-                                saveBackup.launch(suggestedFileName(backup.publicKey))
+                                saveBackup.launch("rayfish-identity-${shortId(backup.publicKey)}.txt")
                             } catch (t: Throwable) {
                                 onToast(context.getString(R.string.error_backup_failed, t.message.orEmpty()))
                             } finally {
@@ -161,5 +161,3 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
         )
     }
 }
-
-private fun suggestedFileName(publicKey: String): String = "rayfish-identity-${shortId(publicKey)}.txt"

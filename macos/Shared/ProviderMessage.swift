@@ -47,7 +47,7 @@ struct ProviderRequest: Codable {
 }
 
 enum ProviderSetting: String, Codable {
-    case dns, mdns, ssh
+    case dns, mdns, ssh, quicLossTolerant
 }
 
 struct ProviderResponse: Codable {
@@ -79,6 +79,8 @@ struct ProviderFirewallRule: Codable, Equatable, Identifiable {
 }
 
 struct ProviderStatus: Codable, Equatable {
+    var v4BridgeEnabled: Bool? = nil
+    var needsTCPHelper: Bool { sshEnabled == true || v4BridgeEnabled != false }
     var active: Bool
     var ipv6: String
     var networks: [ProviderNetwork]
@@ -91,6 +93,8 @@ struct ProviderStatus: Codable, Equatable {
     var files: [ProviderFile]? = nil
     var sshEnabled: Bool? = nil
     var sshRules: [ProviderSSHRule]? = nil
+    var connectionWarning: String? = nil
+    var quicLossTolerant: Bool? = nil
     var exitNodes: [ProviderExitNodeNetwork] = []
 
     var exitSelected: Bool { exitNodes.contains { $0.using != nil } }
@@ -118,12 +122,14 @@ struct ProviderSSHRule: Codable, Equatable, Identifiable {
 }
 
 struct ProviderFile: Codable, Equatable, Identifiable {
-    enum State: String, Codable { case pending, received }
+    enum State: String, Codable { case pending, transferring, received }
     var transferId: UInt64
     var peer: String
     var filename: String
     var size: UInt64
     var state: State
+    var transferred: UInt64 = 0
+    var destination: String? = nil
 
     var id: String { "\(state.rawValue):\(transferId)" }
 }

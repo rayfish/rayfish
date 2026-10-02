@@ -7,6 +7,8 @@ use rayfish::{
     onepassword, shutdown, stats,
 };
 
+use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
@@ -55,36 +57,87 @@ fn json_enabled() -> bool {
     JSON_FLAG.load(atomic::Ordering::Relaxed)
 }
 
-/// Render pending requests in JSON or the shared connection table.
-fn print_pending_requests(requests: &[ipc::PendingRequestInfo], empty_message: &str, footer: &str) {
+/// Print a CLI result in the format selected by `--json`.
+trait DisplayOut: serde::Serialize {
+    fn print_human(&self);
+}
+
+impl<T: serde::Serialize + Display> DisplayOut for T {
+    fn print_human(&self) {
+        print!("{self}");
+    }
+}
+
+fn printout<T: DisplayOut>(data: &T) -> Result<()> {
     if json_enabled() {
-        print_json(&serde_json::json!(
-            requests
-                .iter()
-                .map(|r| serde_json::json!({
-                    "id": r.short_id, "hostname": r.hostname, "waiting_secs": r.waiting_secs,
-                }))
-                .collect::<Vec<_>>()
-        ));
-    } else if requests.is_empty() {
-        println!("\n  {}\n", style::faint(empty_message));
+        println!("{}", serde_json::to_value(data)?);
     } else {
-        let rows = requests
+        data.print_human();
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct PendingRequestOutput<'a> {
+    id: &'a str,
+    hostname: Option<&'a str>,
+    waiting_secs: u64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct PendingRequestsOutput<'a> {
+    requests: Vec<PendingRequestOutput<'a>>,
+    #[serde(skip)]
+    empty_message: &'a str,
+    #[serde(skip)]
+    footer: &'a str,
+}
+
+impl DisplayOut for PendingRequestsOutput<'_> {
+    fn print_human(&self) {
+        if self.requests.is_empty() {
+            println!("\n  {}\n", style::faint(self.empty_message));
+            return;
+        }
+        let rows = self
+            .requests
             .iter()
-            .map(|r| {
-                let host = r.hostname.clone().unwrap_or_else(|| "—".to_string());
-                let wait = format!("{}s", r.waiting_secs);
+            .map(|request| {
+                let host = request.hostname.unwrap_or("—");
+                let wait = format!("{}s", request.waiting_secs);
                 vec![
-                    layout::Cell::new(r.short_id.clone(), style::rose(&r.short_id)),
-                    layout::Cell::new(host.clone(), style::value(&host)),
+                    layout::Cell::new(request.id, style::rose(request.id)),
+                    layout::Cell::new(host, style::value(host)),
                     layout::Cell::right(wait.clone(), style::faint(&wait)),
                 ]
             })
             .collect();
         println!();
         print!("{}", table(&["id", "host", "waiting"], rows, 2));
-        println!("\n  {}", style::faint(footer));
+        println!("\n  {}", style::faint(self.footer));
     }
+}
+
+/// Render pending requests in JSON or the shared connection table.
+fn print_pending_requests(
+    requests: &[ipc::PendingRequestInfo],
+    empty_message: &str,
+    footer: &str,
+) -> Result<()> {
+    let output = PendingRequestsOutput {
+        requests: requests
+            .iter()
+            .map(|request| PendingRequestOutput {
+                id: &request.short_id,
+                hostname: request.hostname.as_deref(),
+                waiting_secs: request.waiting_secs,
+            })
+            .collect(),
+        empty_message,
+        footer,
+    };
+    printout(&output)
 }
 
 /// Whether the parsed command carried `--json`.
@@ -93,9 +146,8 @@ fn print_pending_requests(requests: &[ipc::PendingRequestInfo], empty_message: &
 /// the 44 commands accepted it and the 30-odd that render no JSON ignored it in
 /// silence (`ray version --json` printed the same plain text). It is now declared
 /// only on the commands that honour it, so the parser rejects it elsewhere. This
-/// funnels those per-command flags back into the one `JSON_FLAG` the renderers
-/// already read, keeping the change to the enum and this function rather than
-/// the seven `cli` modules that call `json_enabled`.
+/// funnels those per-command flags into the one `JSON_FLAG` read by `printout`
+/// and the interactive firewall pending command.
 fn json_requested(command: &Command) -> bool {
     match command {
         Command::Status { json, .. }
@@ -108,6 +160,7 @@ fn json_requested(command: &Command) -> bool {
         | Command::Netcheck { json }
         | Command::Admin { json, .. }
         | Command::Firewall { json, .. }
+        | Command::Ssh { json, .. }
         | Command::ExitNode { json, .. }
         | Command::Mdns { json, .. }
         | Command::Dns { json, .. }
@@ -182,12 +235,12 @@ pub(crate) enum Command {
         #[arg(long)]
         delegate: Option<ipc::ManagedMachineSelector>,
     },
-    /// Destroy a network (coordinator only)
+    /// Leave a network, destroying it if the last coordinator
     Nuke {
         /// Three-word network name
         #[arg(add = complete::networks())]
         name: String,
-        /// Force destroy even if other members exist
+        /// Proceed even if other members exist
         #[arg(long)]
         force: bool,
     },
@@ -471,6 +524,14 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// Manage the embedded mesh SSH server and access rules
+    Ssh {
+        #[command(subcommand)]
+        action: SshAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Offer or use an internet gateway
     ///
     /// Offer this node as a gateway, or route this node's traffic through one.
@@ -513,16 +574,20 @@ pub(crate) enum Command {
         /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
     },
-    /// Print a host's identity string
+    /// Print a host's or contact's identity string
     ///
     /// The value to paste into a `ray apply` spec's `aliases:` map. Resolves to
     /// the user identity if the device is paired, else the device's transport
     /// identity. Searches all networks; different identities sharing a name
     /// are listed in a table. The older `identityof <network> <hostname>` form
     /// limits the lookup to one network.
+    ///
+    /// A contact id resolves its signed discovery record without connecting to
+    /// the peer. This returns the advertised device identity, which may differ
+    /// from its paired user identity. Requires a running daemon.
     #[command(visible_alias = "whois")]
     Identityof {
-        /// Hostname to look up across all networks
+        /// Hostname to look up across all networks, or a contact id
         #[arg(add = complete::peers())]
         peer: String,
         /// Hostname for a scoped lookup, treating PEER as the network name
@@ -1084,7 +1149,8 @@ pub(crate) enum FirewallAction {
     ///
     /// Tailscale-style, with no SSH keys. `ssh on` starts the server;
     /// `ssh allow <net> <peer>` authorizes a peer to log in. Connect with a
-    /// stock client: `ssh user@host.ray`.
+    /// stock client: `ssh user@host.ray` (or `ssh -p <port>` after setting
+    /// `ray config set ssh-port <port>` on the server).
     Ssh {
         #[command(subcommand)]
         action: SshAction,
@@ -1095,11 +1161,11 @@ pub(crate) enum FirewallAction {
 pub(crate) enum SshAction {
     /// Start the mesh SSH server on this node
     ///
-    /// Listens on the mesh IPs' port 22, and opens tcp:22 in the local firewall.
+    /// Listens on the configured mesh SSH port (22 by default).
     On,
     /// Stop the mesh SSH server
     ///
-    /// Removes the tcp:22 passthrough.
+    /// Removes the configured port's passthrough.
     Off,
     /// Authorize a peer to SSH into this node
     ///
@@ -1695,6 +1761,7 @@ async fn run() -> Result<()> {
             json: _,
         } => ipc_admin(&network, action).await,
         Command::Firewall { action, json: _ } => ipc_firewall(action).await,
+        Command::Ssh { action, json: _ } => ipc_firewall_ssh(action).await,
         Command::ExitNode { action, json: _ } => ipc_exit_node(action).await,
         Command::Apply {
             spec,
@@ -1704,20 +1771,16 @@ async fn run() -> Result<()> {
             example,
         } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
-        Command::Identityof {
-            peer,
-            hostname,
-            json,
-        } => cmd_identityof(&peer, hostname.as_deref(), json).await,
+        Command::Identityof { peer, hostname, .. } => {
+            cmd_identityof(&peer, hostname.as_deref()).await
+        }
         Command::Alias {
-            network,
-            action,
-            json,
-        } => cmd_alias(&network, action, json).await,
+            network, action, ..
+        } => cmd_alias(&network, action).await,
         Command::Mdns { action, json: _ } => cmd_mdns(action).await,
         Command::Dns { action, json: _ } => cmd_dns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
-        Command::Config { action, json } => cmd_config(action, json).await,
+        Command::Config { action, .. } => cmd_config(action).await,
         #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
@@ -1823,7 +1886,23 @@ async fn cmd_auto_update(state: &str) -> Result<()> {
 /// `ray config get/set/unset`: view or change global daemon settings via the
 /// daemon (see the module note above on why writes are not client-side). Changes
 /// to relay/discovery/dns-upstreams all take effect on the next daemon restart.
-async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct ConfigOutput<'a> {
+    values: BTreeMap<&'a str, &'a str>,
+    #[serde(skip)]
+    rows: &'a [(String, String)],
+}
+
+impl DisplayOut for ConfigOutput<'_> {
+    fn print_human(&self) {
+        for (key, value) in self.rows {
+            println!("{key} = {value}");
+        }
+    }
+}
+
+async fn cmd_config(action: Option<ConfigAction>) -> Result<()> {
     match action.unwrap_or(ConfigAction::Get { key: None }) {
         ConfigAction::Get { key } => {
             // Before the connect, so a bad key reads the same whether or not the
@@ -1835,17 +1914,14 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
             ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::ConfigValues { rows } => {
-                    if json {
-                        let map: serde_json::Map<String, serde_json::Value> = rows
-                            .into_iter()
-                            .map(|(k, v)| (k, serde_json::Value::String(v)))
-                            .collect();
-                        print_json(&serde_json::Value::Object(map));
-                    } else {
-                        for (k, v) in rows {
-                            println!("{k} = {v}");
-                        }
-                    }
+                    let output = ConfigOutput {
+                        values: rows
+                            .iter()
+                            .map(|(key, value)| (key.as_str(), value.as_str()))
+                            .collect(),
+                        rows: &rows,
+                    };
+                    printout(&output)?;
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
@@ -1987,6 +2063,12 @@ mod tests {
                 Command::Identityof { peer, hostname: Some(hostname), json: true }
                     if peer == "network-a" && hostname == "build-box"
             ));
+            let contact = iroh::SecretKey::from([7; 32]).public().to_string();
+            let cli = Cli::try_parse_from(["ray", command, &contact, "--json"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Identityof { peer, hostname: None, json: true } if peer == contact
+            ));
         }
         assert!(Cli::try_parse_from(["ray", "identityof"]).is_err());
     }
@@ -2092,6 +2174,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn ssh_commands_parse_at_root_and_under_firewall() {
+        for args in [&["ray", "ssh", "off"][..], &["ray", "fw", "ssh", "off"][..]] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Ssh {
+                    action: SshAction::Off,
+                    ..
+                } | Command::Firewall {
+                    action: FirewallAction::Ssh {
+                        action: SshAction::Off
+                    },
+                    ..
+                }
+            ));
+        }
+        let cli = Cli::try_parse_from(["ray", "ssh", "show", "--json"]).unwrap();
+        assert!(json_requested(&cli.command));
     }
 
     #[test]
