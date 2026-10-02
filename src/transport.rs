@@ -21,6 +21,10 @@ use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::config::ServerOverride;
 use crate::exit_node::{LoopPrevention, is_transitable};
+
+mod congestion;
+
+use congestion::CongestionControl;
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
@@ -288,10 +292,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
         //     small send limit. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
-        // The congestion controller stays at the noq default (Cubic). Switching to
-        // BBR3 would help on lossy/shallow-buffer consumer uplinks but requires a
-        // `noq-proto` dependency to reach the config type, deferred to a measured
-        // follow-up (see iroh-audit BASELINE.md, cross-parameter sweep).
+        // The congestion controller defaults to noq's Cubic; `RAYFISH_QUIC_CC`
+        // selects BBR3 or a loss-tolerant controller for measurement (see
+        // `transport::congestion`).
         .transport_config(quic_transport_config())
         // Drop overlay addresses from the gathered direct-address candidates, so a
         // mesh IP bound on the TUN is never stored, published, or offered as a
@@ -487,7 +490,14 @@ pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
 fn quic_transport_config() -> QuicTransportConfig {
-    QuicTransportConfig::builder()
+    let cc = CongestionControl::from_env();
+    let cc_name: &'static str = cc.into();
+    tracing::info!(congestion_controller = cc_name, "QUIC transport config");
+    let builder = match cc.factory() {
+        Some(factory) => QuicTransportConfig::builder().congestion_controller_factory(factory),
+        None => QuicTransportConfig::builder(),
+    };
+    builder
         // There are no competing data streams of equal priority, so disable
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.
