@@ -2,9 +2,22 @@ use super::*;
 
 /// Block direct egress even when a route disappears or another VPN takes priority.
 /// Only the transport mark, loopback and link configuration bypass the tunnel.
+///
+/// Replies to connections that reached this host from outside the tunnel (an SSH
+/// session to its LAN or public address) also take the mark, so they leave the
+/// way the connection came in. The gateway would drop them as spoofed otherwise.
+/// Connections addressed to the tunnel or overlay address stay in the tunnel.
+/// One that was already open when conntrack first loaded can be registered with
+/// its direction inverted and is not rescued.
 pub(super) fn client_nft_script(tun: &str) -> String {
+    let client = ipv4::CLIENT_ADDR;
     format!(
         "{reset}table inet {CLIENT_TABLE} {{
+ chain reply {{
+  type route hook output priority mangle; policy accept;
+  ct direction reply ct original ip daddr != {client} meta mark set {SOCKET_MARK}
+  ct direction reply ct original ip6 daddr != {V6_OVERLAY} meta mark set {SOCKET_MARK}
+ }}
  chain output {{
   type filter hook output priority filter; policy drop;
   oifname \"lo\" accept

@@ -154,6 +154,36 @@ while True:
         "underlay loop prevention"
     );
 
+    // Replies to a connection that arrived on the uplink leave by the uplink.
+    let inbound = UdpSocket::bind("10.0.0.1:9100").await?;
+    let answer = tokio::spawn(async move {
+        let mut buf = [0; 64];
+        let (length, from) = inbound.recv_from(&mut buf).await?;
+        inbound.send_to(&buf[..length], from).await?;
+        anyhow::Ok(())
+    });
+    let output = tokio::task::spawn_blocking(|| {
+        Command::new("ip")
+            .args([
+                "netns",
+                "exec",
+                "internet",
+                "python3",
+                "-c",
+                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+                 s.settimeout(3)\ns.sendto(b'inbound', ('10.0.0.1', 9100))\n\
+                 print(s.recv(64).decode())",
+            ])
+            .output()
+    })
+    .await??;
+    anyhow::ensure!(
+        String::from_utf8_lossy(&output.stdout).trim() == "inbound",
+        "inbound reply bypasses the tunnel: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    answer.await??;
+
     // Reapply with a gateway that lost its uplinks: both families stay captured.
     install_client_routing(&client_name, ExitFamilies::Neither)?;
     for family in ["-4", "-6"] {
