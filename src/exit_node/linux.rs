@@ -50,8 +50,11 @@ pub(super) use names::*;
 /// crash can never leave the host acting as an open router. Writing it is therefore
 /// a precondition, not a nicety: without it we could turn forwarding on and never
 /// be able to put it back, so we refuse instead. Linux only.
+///
+/// Returns whether the IPv4 lease pool is routed. A route that overlaps it
+/// leaves IPv4 transit off and IPv6 working.
 #[cfg(target_os = "linux")]
-pub(super) fn enable(tun_name: &str) -> Result<()> {
+pub(super) fn enable(tun_name: &str) -> Result<bool> {
     let path = snapshot_path().context("no config dir to snapshot the forwarding sysctls into")?;
     if !path.exists() {
         Snapshot {
@@ -62,20 +65,33 @@ pub(super) fn enable(tun_name: &str) -> Result<()> {
         }
         .save(&path)?;
     }
-    ensure_ipv4_routes_available(tun_name, ipv4::AddressSpace::Gateway)?;
-    run_ip(&[
-        "-4",
-        "route",
-        "replace",
-        ipv4::SERVER_PREFIX,
-        "dev",
-        tun_name,
-    ])?;
+    let v4_pool = match ensure_ipv4_routes_available(tun_name, ipv4::AddressSpace::Gateway) {
+        Ok(()) => {
+            run_ip(&[
+                "-4",
+                "route",
+                "replace",
+                ipv4::SERVER_PREFIX,
+                "dev",
+                tun_name,
+            ])?;
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "IPv4 exit transit disabled");
+            let _ = run_ip(&["-4", "route", "del", ipv4::SERVER_PREFIX, "dev", tun_name]);
+            false
+        }
+    };
     write_sysctl(V4_FORWARD, "1")?;
     write_sysctl(V6_FORWARD, "1")?;
     nft_load(&server_nft_ruleset(tun_name))?;
-    tracing::info!(tun = tun_name, "exit node forwarding + NAT enabled");
-    Ok(())
+    tracing::info!(
+        tun = tun_name,
+        v4_pool,
+        "exit node forwarding + NAT enabled"
+    );
+    Ok(v4_pool)
 }
 
 /// Masquerade authenticated transit arriving on our TUN. The mark keeps gateway

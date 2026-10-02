@@ -49,8 +49,11 @@ pub(super) const ANCHOR_REF: &str = if cfg!(target_os = "macos") {
 ///
 /// As on Linux, this does not open the forward path: a host whose pf ruleset blocks
 /// forwarding has to be told to permit it on its own terms.
+///
+/// Returns whether the IPv4 lease pool is routed. A route that overlaps it
+/// leaves IPv4 transit off and IPv6 working.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(super) fn enable(tun_name: &str) -> Result<()> {
+pub(super) fn enable(tun_name: &str) -> Result<bool> {
     let path = snapshot_path().context("no config dir to snapshot the forwarding sysctls into")?;
     let mut snap = if path.exists() {
         Snapshot::load(&path)
@@ -64,8 +67,17 @@ pub(super) fn enable(tun_name: &str) -> Result<()> {
         snap.save(&path)?;
         snap
     };
-    ensure_ipv4_space(tun_name, ipv4::AddressSpace::Gateway)?;
-    bsd_route_pool(tun_name, true)?;
+    let v4_pool = match ensure_ipv4_space(tun_name, ipv4::AddressSpace::Gateway) {
+        Ok(()) => {
+            bsd_route_pool(tun_name, true)?;
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "IPv4 exit transit disabled");
+            let _ = bsd_route_pool(tun_name, false);
+            false
+        }
+    };
     write_sysctl(V4_FORWARD, "1")?;
     write_sysctl(V6_FORWARD, "1")?;
 
@@ -86,8 +98,8 @@ pub(super) fn enable(tun_name: &str) -> Result<()> {
         ANCHOR,
         &nat_rules_for_uplinks(default_interface("-inet").as_deref(), v6.as_deref()),
     )?;
-    tracing::info!(v6 = ?v6, "exit node forwarding + NAT enabled");
-    Ok(())
+    tracing::info!(v6 = ?v6, v4_pool, "exit node forwarding + NAT enabled");
+    Ok(v4_pool)
 }
 
 /// IPv6 NAT uses the current address of the physical uplink.

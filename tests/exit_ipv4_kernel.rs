@@ -260,6 +260,25 @@ while True:
     endpoint.close().await;
     install_client_routing(&client_name, ExitFamilies::V4)?;
 
+    // A route overlapping the lease pool turns off IPv4 transit, not the gateway.
+    run(&["ip", "route", "add", "198.18.0.0/15", "dev", "uplink"])?;
+    if let Some(error) = server.apply_os(&client_name) {
+        anyhow::bail!("overlapping route disabled the gateway: {error}");
+    }
+    anyhow::ensure!(!server.offers_v4(), "IPv4 pool conflict still offered");
+    let pool = Command::new("ip")
+        .args(["-4", "route", "show", ipv4::SERVER_PREFIX])
+        .output()?;
+    anyhow::ensure!(
+        !String::from_utf8_lossy(&pool.stdout).contains(&client_name),
+        "lease pool routed over a conflicting route"
+    );
+    run(&["ip", "route", "del", "198.18.0.0/15", "dev", "uplink"])?;
+    if let Some(error) = server.apply_os(&client_name) {
+        anyhow::bail!("{error}");
+    }
+    anyhow::ensure!(server.offers_v4(), "IPv4 transit restored");
+
     teardown_client_routing();
     disable();
     let direct = UdpSocket::bind("0.0.0.0:0").await?;

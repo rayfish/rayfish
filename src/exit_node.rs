@@ -316,6 +316,9 @@ pub fn remove_tunnel_exclusions() {
 pub struct ExitServer {
     pub ipv4: ipv4::Nat,
     v4_uplink: Arc<AtomicBool>,
+    /// Whether `enable` routed the IPv4 lease pool to the TUN. A host route
+    /// overlapping the pool turns off IPv4 transit only, not the gateway.
+    v4_pool: Arc<AtomicBool>,
     nets: Arc<ArcSwap<HashMap<SmolStr, Allow>>>,
     /// The gateway's own addresses, refused as transit destinations: a packet to
     /// one of them would be local-delivered by the kernel, reaching this host's
@@ -446,7 +449,7 @@ impl ExitServer {
     /// [`is_offering`](Self::is_offering) when publishing the roster claim, so the
     /// two never disagree about what this host does.
     pub fn offers_v4(&self) -> bool {
-        self.v4_uplink.load(Ordering::Relaxed)
+        self.v4_uplink.load(Ordering::Relaxed) && self.v4_pool.load(Ordering::Relaxed)
     }
 
     pub fn offers_v6(&self) -> bool {
@@ -525,16 +528,21 @@ impl ExitServer {
                 self.ipv4.initialize(dir.join("exit-ipv4-leases.json"))?;
                 enable(tun_name)
             });
-            if let Err(e) = enabled {
-                disable();
-                self.clear();
-                tracing::warn!(error = %e, "failed to enable exit-node forwarding/NAT");
-                return Some(format!("failed to enable exit node: {e}"));
+            match enabled {
+                Ok(v4_pool) => self.v4_pool.store(v4_pool, Ordering::Relaxed),
+                Err(e) => {
+                    disable();
+                    self.clear();
+                    self.v4_pool.store(false, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "failed to enable exit-node forwarding/NAT");
+                    return Some(format!("failed to enable exit node: {e}"));
+                }
             }
         } else {
             disable();
             self.v6_uplink.store(false, Ordering::Relaxed);
             self.v4_uplink.store(false, Ordering::Relaxed);
+            self.v4_pool.store(false, Ordering::Relaxed);
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         let _ = tun_name;

@@ -1018,6 +1018,10 @@ pub fn spawn_peer_reader(
                             && firewall::parse_packet_info(&datagram)
                                 .is_some_and(|info| is_transitable(info.dst_ip))
                         {
+                            if !exit.server.offers_v4() {
+                                stats.record_drop(DropReason::ExitDenied);
+                                continue;
+                            }
                             match exit
                                 .server
                                 .ipv4
