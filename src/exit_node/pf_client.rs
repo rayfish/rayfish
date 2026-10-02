@@ -12,6 +12,9 @@ pub(crate) struct ControlDnsSocket {
 }
 
 static DNS_SOCKETS: Mutex<Vec<ControlDnsSocket>> = Mutex::new(Vec::new());
+/// Local UDP ports of the endpoint's underlay sockets. They are pinned to the
+/// physical interface, so every direct peer path leaves from one of them.
+static UNDERLAY_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 static FILTER_UPDATE: Mutex<()> = Mutex::new(());
 static FILTER_READY: AtomicBool = AtomicBool::new(false);
 
@@ -40,10 +43,13 @@ fn client_snapshot_path() -> Result<PathBuf> {
     Ok(crate::config::config_dir()?.join("exit-client.snapshot"))
 }
 
-pub(crate) fn install_client_filter(tun: &str) -> Result<()> {
+pub(crate) fn install_client_filter(tun: &str, underlay_ports: &[u16]) -> Result<()> {
     let _guard = FILTER_UPDATE
         .lock()
         .map_err(|_| anyhow::anyhow!("exit filter lock poisoned"))?;
+    *UNDERLAY_PORTS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("underlay port lock poisoned"))? = underlay_ports.to_vec();
     install_filter(tun)
 }
 
@@ -70,6 +76,15 @@ fn install_filter(tun: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("exit exclusions lock poisoned"))?;
     let mut rules =
         format!("pass out quick on lo0 all no state\npass out quick on {tun} all no state\n");
+    for port in UNDERLAY_PORTS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("underlay port lock poisoned"))?
+        .iter()
+    {
+        rules.push_str(&format!(
+            "pass out quick proto udp from any port {port} user 0 no state\n"
+        ));
+    }
     for ip in excluded.iter() {
         rules.push_str(&format!(
             "pass out quick proto {{ tcp, udp }} to {ip} user 0 no state\n"

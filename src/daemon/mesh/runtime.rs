@@ -1855,7 +1855,14 @@ impl Daemon {
     /// Leave protection installed on failure; only an explicit disconnect restores direct egress.
     #[cfg(target_os = "macos")]
     async fn route_exit_defaults(&self, tun_name: &str) -> Option<String> {
-        if let Err(error) = crate::exit_node::install_client_filter(tun_name) {
+        let underlay_ports: Vec<u16> = self
+            .transport
+            .endpoint
+            .bound_sockets()
+            .iter()
+            .map(|addr| addr.port())
+            .collect();
+        if let Err(error) = crate::exit_node::install_client_filter(tun_name, &underlay_ports) {
             return Some(format!("failed to protect exit traffic: {error}"));
         }
         tun::route_default_via_tun(tun_name, ExitFamilies::Dual)
