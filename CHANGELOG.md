@@ -60,6 +60,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Android downloads started from Home continue when switching tabs. Navigation
   and text inputs survive activity recreation, and Back closes network details.
 
+### Performance
+
+- Linux enables TUN TCP/UDP segmentation and receive offloads, batching packets
+  between the mesh and kernel to reduce per-packet work.
+- macOS batches UDP transport and packet-tunnel I/O. Peer traffic waits for a
+  bounded 32 MiB QUIC send queue instead of being dropped when a burst fills it.
+- Peer metrics report QUIC queue depth and wait time, congestion window, loss,
+  path MTU, and TUN offload and batching state for throughput diagnostics.
+
 ## [0.5.6] - 2026-10-01
 
 ### Added

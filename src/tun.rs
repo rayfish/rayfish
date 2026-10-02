@@ -1,15 +1,18 @@
 //! TUN device creation and I/O.
 //!
-//! The device is a single `tun-rs` [`AsyncDevice`] shared (via `Arc`) between a
-//! [`TunReader`] and a [`TunWriter`]; its `recv`/`send` take `&self`, so reads
-//! and writes run concurrently without a split or a lock.
+//! The device is split into independent [`TunReader`] and [`TunWriter`] halves.
+//! Linux uses tun-rs framing for segmentation offload, while macOS packet
+//! tunnels duplicate the utun descriptor for batched reads and writes. No I/O
+//! resource is serialized behind a lock.
+
+#[cfg(target_os = "macos")]
+mod apple;
 
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::membership::ExitFamilies;
-#[cfg(target_os = "linux")]
 use std::future::Future;
 #[cfg(target_os = "macos")]
 use std::io::Error as IoError;
@@ -38,8 +41,13 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(not(target_os = "android"))]
 use anyhow::anyhow;
+use bytes::Bytes;
+#[cfg(not(target_os = "android"))]
+use bytes::BytesMut;
 // The desktop TUN device (the `tun-rs` crate) only exists off Android, where the
 // packet interface is a `VpnService` fd instead.
+#[cfg(target_os = "linux")]
+use futures::SinkExt;
 #[cfg(not(target_os = "android"))]
 use futures::StreamExt;
 #[cfg(target_os = "macos")]
@@ -47,6 +55,8 @@ use libc::{
     AF_SYSTEM, CTLIOCGINFO, F_DUPFD_CLOEXEC, c_char, ctl_info, fcntl, getpeername, ioctl, sockaddr,
     sockaddr_ctl, socklen_t,
 };
+#[cfg(target_os = "linux")]
+use tun_rs::async_framed::DeviceFramedWrite;
 #[cfg(not(target_os = "android"))]
 use tun_rs::async_framed::{BytesCodec, DeviceFramedRead};
 #[cfg(not(target_os = "android"))]
@@ -66,9 +76,7 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 /// A dropped read must leave the reader ready for the next call. Readers should
 /// keep their receive allocation internally until a complete packet is ready.
 pub trait TunRead: Send + 'static {
-    fn read_packet(
-        &mut self,
-    ) -> impl core::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send;
+    fn read_packet(&mut self) -> impl Future<Output = anyhow::Result<Bytes>> + Send;
 }
 
 /// Write side of a packet interface. Writes one IP packet to the device.
@@ -78,10 +86,38 @@ pub trait TunWrite: Send + 'static {
         TUN_MTU
     }
 
-    fn write_packet(
-        &mut self,
-        packet: &[u8],
-    ) -> impl core::future::Future<Output = anyhow::Result<()>> + Send;
+    /// Whether the interface accepted TCP segmentation/receive offload.
+    fn tcp_gso_enabled(&self) -> bool {
+        false
+    }
+
+    /// Whether the interface accepted UDP segmentation/receive offload.
+    fn udp_gso_enabled(&self) -> bool {
+        false
+    }
+
+    fn write_packet(&mut self, packet: &[u8]) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Preferred number of packets for one write operation. Implementations
+    /// that can coalesce packets should override this together with
+    /// [`Self::write_packets`].
+    fn write_batch_size(&self) -> usize {
+        1
+    }
+
+    /// Writes a packet batch. The default preserves the single-packet contract
+    /// for platforms without a batching API.
+    fn write_packets<'a>(
+        &'a mut self,
+        packets: &'a [Bytes],
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'a {
+        async move {
+            for packet in packets {
+                self.write_packet(packet).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Maximum IP packet size for the tunnel. Mesh fragmentation carries packets
@@ -102,19 +138,41 @@ fn configure_mtu(mut set: impl FnMut(u16) -> std::io::Result<()>) -> Result<u16>
     }
 }
 
-/// Read half of the TUN device. Owned by [`forward::run_mesh`]. Holds a clone of
-/// the shared [`AsyncDevice`] through a framed reader that receives directly
-/// into a `BytesMut` allocation.
+/// Read half of the TUN device. Owned by [`forward::run_mesh`].
 #[cfg(not(target_os = "android"))]
 pub struct TunReader {
+    #[cfg(not(target_os = "macos"))]
     framed: DeviceFramedRead<BytesCodec, Arc<AsyncDevice>>,
+    #[cfg(target_os = "macos")]
+    inner: MacTunReader,
+}
+
+#[cfg(target_os = "macos")]
+enum MacTunReader {
+    Framed(DeviceFramedRead<BytesCodec, Arc<AsyncDevice>>),
+    Batched(apple::Reader),
 }
 
 /// Write half of the TUN device. Owned by [`forward::spawn_tun_writer`].
 #[cfg(not(target_os = "android"))]
 pub struct TunWriter {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     dev: Arc<AsyncDevice>,
+    #[cfg(target_os = "linux")]
+    framed: DeviceFramedWrite<BytesCodec, Arc<AsyncDevice>>,
+    #[cfg(target_os = "linux")]
+    tcp_gso: bool,
+    #[cfg(target_os = "linux")]
+    udp_gso: bool,
+    #[cfg(target_os = "macos")]
+    inner: MacTunWriter,
     mtu: u16,
+}
+
+#[cfg(target_os = "macos")]
+enum MacTunWriter {
+    Device(Arc<AsyncDevice>),
+    Batched(apple::Writer),
 }
 
 /// Creates a TUN device with this node's mesh address and shares it between
@@ -139,7 +197,7 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
         .mtu(MIN_TUN_MTU)
         .enable(true);
     #[cfg(target_os = "linux")]
-    let builder = builder.name(LINUX_TUN_NAME);
+    let builder = builder.name(LINUX_TUN_NAME).offload(true);
     #[cfg(target_os = "windows")]
     let builder = builder
         .mtu_v6(MIN_TUN_MTU)
@@ -155,6 +213,16 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     })?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
+    #[cfg(target_os = "linux")]
+    tracing::info!(
+        ipv6 = %v6,
+        tun = %tun_name,
+        mtu,
+        tcp_gso = device.tcp_gso(),
+        udp_gso = device.udp_gso(),
+        "TUN device created"
+    );
+    #[cfg(not(target_os = "linux"))]
     tracing::info!(ipv6 = %v6, tun = %tun_name, mtu, "TUN device created");
 
     let (reader, writer) = split_device(device, mtu);
@@ -163,9 +231,34 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
 
 #[cfg(not(target_os = "android"))]
 fn split_device(device: AsyncDevice, mtu: u16) -> (TunReader, TunWriter) {
+    #[cfg(target_os = "linux")]
+    let tcp_gso = device.tcp_gso();
+    #[cfg(target_os = "linux")]
+    let udp_gso = device.udp_gso();
     let dev = Arc::new(device);
+    #[cfg(not(target_os = "macos"))]
     let framed = DeviceFramedRead::new(Arc::clone(&dev), BytesCodec::new());
-    (TunReader { framed }, TunWriter { dev, mtu })
+    #[cfg(target_os = "linux")]
+    let writer = TunWriter {
+        framed: DeviceFramedWrite::new(dev, BytesCodec::new()),
+        tcp_gso,
+        udp_gso,
+        mtu,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let writer = TunWriter { dev, mtu };
+    #[cfg(target_os = "macos")]
+    let writer = TunWriter {
+        inner: MacTunWriter::Device(Arc::clone(&dev)),
+        mtu,
+    };
+    #[cfg(target_os = "macos")]
+    let reader = TunReader {
+        inner: MacTunReader::Framed(DeviceFramedRead::new(dev, BytesCodec::new())),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let reader = TunReader { framed };
+    (reader, writer)
 }
 
 /// Opens the utun interface owned by `NEPacketTunnelProvider` without routing
@@ -174,6 +267,18 @@ fn split_device(device: AsyncDevice, mtu: u16) -> (TunReader, TunWriter) {
 #[cfg(target_os = "macos")]
 pub fn open_packet_tunnel() -> Result<(TunReader, TunWriter)> {
     let fd = packet_tunnel_fd()?;
+    if apple::is_available() {
+        let (reader, writer) = apple::split(fd).context("enable batched packet tunnel I/O")?;
+        return Ok((
+            TunReader {
+                inner: MacTunReader::Batched(reader),
+            },
+            TunWriter {
+                inner: MacTunWriter::Batched(writer),
+                mtu: TUN_MTU,
+            },
+        ));
+    }
     let raw_fd = fd.into_raw_fd();
     // SAFETY: `raw_fd` is an owned duplicate of the provider's open utun fd.
     let device = unsafe { AsyncDevice::from_fd(raw_fd) }.context("open packet tunnel utun fd")?;
@@ -681,12 +786,23 @@ async fn windows_interface_index(tun_name: &str) -> Result<u32> {
 
 #[cfg(not(target_os = "android"))]
 impl TunRead for TunReader {
-    async fn read_packet(&mut self) -> anyhow::Result<bytes::Bytes> {
+    async fn read_packet(&mut self) -> anyhow::Result<Bytes> {
+        #[cfg(target_os = "macos")]
+        match &mut self.inner {
+            MacTunReader::Framed(framed) => framed
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("TUN device closed"))?
+                .map(BytesMut::freeze)
+                .map_err(Into::into),
+            MacTunReader::Batched(reader) => reader.read_packet().await.map_err(Into::into),
+        }
+        #[cfg(not(target_os = "macos"))]
         self.framed
             .next()
             .await
             .ok_or_else(|| anyhow!("TUN device closed"))?
-            .map(bytes::BytesMut::freeze)
+            .map(BytesMut::freeze)
             .map_err(Into::into)
     }
 }
@@ -697,9 +813,73 @@ impl TunWrite for TunWriter {
         self.mtu
     }
 
+    #[cfg(target_os = "linux")]
+    fn tcp_gso_enabled(&self) -> bool {
+        self.tcp_gso
+    }
+
+    #[cfg(target_os = "linux")]
+    fn udp_gso_enabled(&self) -> bool {
+        self.udp_gso
+    }
+
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        self.framed.send(Bytes::copy_from_slice(packet)).await?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         self.dev.send(packet).await?;
+        #[cfg(target_os = "macos")]
+        match &mut self.inner {
+            MacTunWriter::Device(dev) => {
+                dev.send(packet).await?;
+            }
+            MacTunWriter::Batched(writer) => {
+                writer
+                    .write_packets(&[Bytes::copy_from_slice(packet)])
+                    .await?
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_batch_size(&self) -> usize {
+        tun_rs::IDEAL_BATCH_SIZE
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_batch_size(&self) -> usize {
+        match self.inner {
+            MacTunWriter::Device(_) => 1,
+            MacTunWriter::Batched(_) => apple::BATCH_SIZE,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn write_packets(&mut self, packets: &[Bytes]) -> anyhow::Result<()> {
+        let Some((last, packets)) = packets.split_last() else {
+            return Ok(());
+        };
+        for packet in packets {
+            self.framed.feed(packet.clone()).await?;
+        }
+        self.framed.send(last.clone()).await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn write_packets(&mut self, packets: &[Bytes]) -> anyhow::Result<()> {
+        match &mut self.inner {
+            MacTunWriter::Device(dev) => {
+                for packet in packets {
+                    dev.send(packet).await?;
+                }
+                Ok(())
+            }
+            MacTunWriter::Batched(writer) => {
+                writer.write_packets(packets).await.map_err(Into::into)
+            }
+        }
     }
 }
 

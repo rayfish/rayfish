@@ -275,9 +275,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
             BindOpts::default().set_is_required(false),
         )
         .context("invalid IPv6 bind address")?
-        // Rayfish's data plane is a single stream of QUIC datagrams per peer
-        // (TUN packets → `send_datagram`), with a few reliable control streams per
-        // connection. Tune the transport config for that shape:
+        // Rayfish's data plane is one QUIC connection per peer carrying TUN
+        // packets in DATAGRAM frames, with a few reliable control streams on the
+        // same connection. Tune the transport config for that shape:
         //   - `send_fairness(false)`: no competing data streams of equal priority
         //     to round-robin, so fairness scheduling is pure overhead. (Affects
         //     stream scheduling only, not datagrams, but is the correct setting and
@@ -285,9 +285,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //   - GSO on (default): confirmed explicit so a future change can't silently
         //     regress it. GSO coalesces same-destination segments into one sendmsg,
         //     cutting syscalls under burst.
-        //   - Datagrams enabled (iroh/noq default `Some` receive buffer); the send
-        //     buffer stays at the 1 MiB default, sized via `datagram_send_buffer_space`
-        //     on the hot path (see `forward::run_mesh`).
+        //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
+        //     larger logical send limit for transient bursts. The forwarding path
+        //     waits for capacity instead of asking noQ to evict queued packets.
         // The congestion controller stays at the noq default (Cubic). Switching to
         // BBR3 would help on lossy/shallow-buffer consumer uplinks but requires a
         // `noq-proto` dependency to reach the config type, deferred to a measured
@@ -478,21 +478,27 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-/// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one stream
-/// of QUIC datagrams per peer, plus a few reliable control streams).
+pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 32 * 1024 * 1024;
+
+/// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one QUIC
+/// connection carrying DATAGRAM frames per peer, plus reliable control streams).
 ///
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
 fn quic_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
-        // No competing data streams of equal priority → disable round-robin
-        // fairness scheduling (removes overhead; correct for a single datagram
-        // stream per peer).
+        // There are no competing data streams of equal priority, so disable
+        // round-robin fairness scheduling. This removes overhead from the few
+        // reliable control streams; DATAGRAM frames are scheduled separately.
         .send_fairness(false)
         // Keep GSO on (default) explicitly so a future change can't silently
         // regress it.
         .enable_segmentation_offload(true)
+        // This is a logical per-connection limit. noQ retains packet Bytes while
+        // they are queued and releases them after transmission; it does not
+        // reserve 32 MiB for every peer at connection creation.
+        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE)
         .build()
 }
 

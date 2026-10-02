@@ -1014,7 +1014,12 @@ impl Daemon {
         // A dedicated child token so the data plane can be stopped independently
         // of a full daemon shutdown; it still cancels when `shutdown_token` does.
         let cancel = self.shutdown_token.child_token();
-        let writer_handle = forward::spawn_tun_writer(writer, new_rx, Arc::clone(&self.active));
+        let writer_handle = forward::spawn_tun_writer(
+            writer,
+            new_rx,
+            Arc::clone(&self.active),
+            Arc::clone(&self.stats),
+        );
         let mesh_handle = {
             let peers = self.registry.peers.clone();
             let firewall = self.registry.firewall.clone();

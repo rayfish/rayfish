@@ -4245,7 +4245,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.3"
-source = "git+https://github.com/n0-computer/net-tools?branch=main#d73b994abce8f683d7d6dcc163eee5eaefb952f5"
+source = "git+https://github.com/rayfish/net-tools?rev=e51c0d11781842128f5fe45869e99b43c6b66356#e51c0d11781842128f5fe45869e99b43c6b66356"
 dependencies = [
  "atomic-waker",
  "bytes",

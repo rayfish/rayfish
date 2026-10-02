@@ -238,7 +238,7 @@ iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration"
 iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
 iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
-# netwatch's configure-socket hook, which the iroh branch above threads through.
-# Merged upstream (n0-computer/net-tools#182); drop this once a netwatch release
-# past 0.19.3 carries it.
-netwatch = { git = "https://github.com/n0-computer/net-tools", branch = "main" }
+# netwatch's configure-socket hook and runtime-gated Apple UDP batch I/O. The
+# socket hook is merged upstream (n0-computer/net-tools#182); the Apple path is
+# carried in the rayfish fork until upstream exposes an equivalent option.
+netwatch = { git = "https://github.com/rayfish/net-tools", rev = "e51c0d11781842128f5fe45869e99b43c6b66356" }

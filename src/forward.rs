@@ -13,6 +13,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::time::Instant;
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
@@ -658,13 +659,10 @@ async fn flush_or_drop(
     }
 
     // The whole flush is one peer's backlog, so consecutive packets almost always
-    // share a route and go out in a single call. `staged` keeps the drop-newest
-    // budget honest across a run: the send buffer does not shrink until the batch
-    // is handed over, so each packet is measured against what the run already holds.
+    // share a route and go out as one ordered run.
     let mut batch: Vec<Bytes> = Vec::new();
     let mut packets = Vec::new();
     let mut batched: Option<PeerRoute> = None;
-    let mut staged = 0;
     for pkt in pkts {
         let Some(info) = firewall::parse_packet_info(&pkt) else {
             ctx.stats.record_drop(DropReason::Malformed);
@@ -683,16 +681,14 @@ async fn flush_or_drop(
             b.handle != route.handle || b.conn.stable_id() != route.conn.stable_id()
         }) && let Some(prev) = batched.take()
         {
-            send_batch(ctx, &prev, &batch, &packets);
+            send_batch(ctx, &prev, &batch, &packets).await;
             batch.clear();
             packets.clear();
-            staged = 0;
         }
 
         let packet_len = pkt.len();
-        if let Some(encoded) = prepare_datagrams(ctx, &route, &info, pkt, staged).await {
+        if let Some(encoded) = prepare_datagrams(ctx, &route, &info, pkt).await {
             for tagged in encoded.datagrams() {
-                staged += tagged.len();
                 batch.push(tagged.clone());
             }
             packets.push((batch.len(), packet_len));
@@ -700,7 +696,7 @@ async fn flush_or_drop(
         }
     }
     if let Some(route) = batched {
-        send_batch(ctx, &route, &batch, &packets);
+        send_batch(ctx, &route, &batch, &packets).await;
     }
 }
 
@@ -715,18 +711,13 @@ pub(crate) struct SendCtx<'a> {
 
 /// Firewall-check an outbound packet routed to `route` and turn it into tagged
 /// datagrams to put on the wire, or `None` if it must not be sent (the reason is
-/// counted, and any reject or PMTU reply already injected). Applies the reject
-/// inject, drop-newest backpressure, and SSH source-port NAT.
-///
-/// `staged` is the number of bytes already prepared for this connection but not yet
-/// handed to it, so a caller building a batch keeps the same drop-newest budget as
-/// one sending packet by packet.
+/// counted, and any reject or PMTU reply already injected). Applies reject
+/// injection and SSH source-port NAT.
 async fn prepare_datagrams(
     ctx: &SendCtx<'_>,
     route: &PeerRoute,
     info: &firewall::PacketInfo,
     pkt: Bytes,
-    staged: usize,
 ) -> Option<fragment::Encoded> {
     let n = pkt.len();
     // Reachability is "we share a network", enforced by connection existence. The
@@ -777,25 +768,8 @@ async fn prepare_datagrams(
         ctx.stats.record_drop(DropReason::PacketTooBig);
         return None;
     }
-    let Some(wire_size) = fragment::wire_size(n, max) else {
+    if fragment::wire_size(n, max).is_none() {
         ctx.stats.record_drop(DropReason::PacketTooBig);
-        return None;
-    };
-    // Drop-newest at the application boundary: if the peer's QUIC datagram send
-    // buffer is too full to accept this packet (including all fragment headers) without evicting an
-    // already-queued (older) one, drop the *new* packet here instead of handing it
-    // to noq, which would drop the *oldest* queued packet (see N6 in the datagram
-    // audit). This keeps the send path non-blocking while preferring drop-newest
-    // over drop-oldest.
-    if route.conn.datagram_send_buffer_space() < staged + wire_size {
-        tracing::trace!(
-            dst = %info.dst_ip,
-            space = route.conn.datagram_send_buffer_space(),
-            staged,
-            len = n,
-            "datagram send buffer full; dropping newest",
-        );
-        ctx.stats.record_drop(DropReason::Backpressure);
         return None;
     }
     // SSH NAT: rewrite our reply's source port to the configured mesh port.
@@ -835,39 +809,61 @@ pub(crate) async fn send_over_route(
     pkt: Bytes,
 ) {
     let n = pkt.len();
-    let Some(encoded) = prepare_datagrams(ctx, route, info, pkt, 0).await else {
+    let Some(encoded) = prepare_datagrams(ctx, route, info, pkt).await else {
         return;
     };
     let datagrams = encoded.datagrams();
-    send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]);
+    send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]).await;
 }
 
-/// Hands a run of datagrams to noq. `packets` records the end index and original
-/// IP length of each packet, so fragmentation doesn't inflate traffic counters.
-/// A partially queued packet counts as one drop; its receiver expires the pieces.
-fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes], packets: &[(usize, usize)]) {
+/// Hands an ordered run of datagrams to noq. `packets` records the end index and
+/// original IP length of each packet, so fragmentation does not inflate traffic
+/// counters. Waiting for noQ's per-connection queue prevents an application-side
+/// drop when congestion temporarily fills it. This backpressures the TUN reader
+/// only after that peer has consumed its bounded transport buffer.
+async fn send_batch(
+    ctx: &SendCtx<'_>,
+    route: &PeerRoute,
+    batch: &[Bytes],
+    packets: &[(usize, usize)],
+) {
     if batch.is_empty() {
         return;
     }
-    match route.conn.send_many_datagrams(batch) {
-        Ok(queued) => {
-            for &(end, len) in packets {
-                if end <= queued {
-                    ctx.stats.record_tx(len);
-                } else {
-                    ctx.stats.record_drop(DropReason::Backpressure);
+    let mut start = 0;
+    let mut sent_any = false;
+    for (packet_index, &(end, len)) in packets.iter().enumerate() {
+        for datagram in &batch[start..end] {
+            let wait_started =
+                (route.conn.datagram_send_buffer_space() < datagram.len()).then(Instant::now);
+            let result = route.conn.send_datagram_wait(datagram.clone()).await;
+            if let Some(wait_started) = wait_started {
+                ctx.stats.datagram_send_waits.inc();
+                ctx.stats
+                    .datagram_send_wait_us
+                    .inc_by(wait_started.elapsed().as_micros() as u64);
+            }
+            if let Err(error) = result {
+                tracing::debug!(
+                    peer = %route.endpoint_id.fmt_short(),
+                    %error,
+                    "datagram send failed"
+                );
+                for _ in packet_index..packets.len() {
+                    ctx.stats.record_drop(DropReason::SendFailure);
                 }
-            }
-            if queued > 0 {
-                route.note_activity();
-            }
-        }
-        Err(e) => {
-            tracing::debug!(peer = %route.endpoint_id.fmt_short(), error = %e, "batch datagram send failed");
-            for _ in packets {
-                ctx.stats.record_drop(DropReason::SendFailure);
+                if sent_any {
+                    route.note_activity();
+                }
+                return;
             }
         }
+        ctx.stats.record_tx(len);
+        sent_any = true;
+        start = end;
+    }
+    if sent_any {
+        route.note_activity();
     }
 }
 
@@ -1084,27 +1080,50 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
     mut tun: W,
     mut tun_rx: mpsc::Receiver<Bytes>,
     active: Arc<AtomicBool>,
+    stats: Arc<ForwardMetrics>,
 ) -> JoinHandle<()> {
     use std::sync::atomic::Ordering;
     tokio::spawn(async move {
+        let batch_size = tun.write_batch_size().max(1);
+        stats.tun_write_batch_limit.set(batch_size as i64);
+        stats
+            .tun_tcp_gso_enabled
+            .set(i64::from(tun.tcp_gso_enabled()));
+        stats
+            .tun_udp_gso_enabled
+            .set(i64::from(tun.udp_gso_enabled()));
+        let mut batch = Vec::with_capacity(batch_size);
         while let Some(packet) = tun_rx.recv().await {
-            if !active.load(Ordering::Relaxed) {
-                // Data plane is down (standby). Drain and drop so the channel
-                // never backs up while we keep the control plane connected.
-                continue;
+            batch.clear();
+            for packet in std::iter::once(packet)
+                .chain(std::iter::from_fn(|| tun_rx.try_recv().ok()))
+                .take(batch_size)
+            {
+                if !active.load(Ordering::Relaxed) {
+                    // Data plane is down (standby). Drain and drop so the channel
+                    // never backs up while we keep the control plane connected.
+                    continue;
+                }
+                // A peer reader may have queued this just before a TUN reattach
+                // lowered the MTU. Never pass an oversized packet to the device.
+                if packet.len() > usize::from(tun.mtu()) {
+                    tracing::debug!(
+                        len = packet.len(),
+                        mtu = tun.mtu(),
+                        "packet exceeds TUN MTU"
+                    );
+                    continue;
+                }
+                batch.push(packet);
             }
-            // A peer reader may have queued this just before a TUN reattach
-            // lowered the MTU. Never pass an oversized packet to the device.
-            if packet.len() > usize::from(tun.mtu()) {
-                tracing::debug!(
-                    len = packet.len(),
-                    mtu = tun.mtu(),
-                    "packet exceeds TUN MTU"
-                );
-                continue;
-            }
-            if let Err(e) = tun.write_packet(&packet).await {
-                tracing::warn!(error = %e, "TUN write failed");
+            if !batch.is_empty()
+                && let Err(e) = tun.write_packets(&batch).await
+            {
+                stats.tun_write_errors.inc();
+                tracing::warn!(error = %e, packets = batch.len(), "TUN batch write failed");
+            } else if !batch.is_empty() {
+                stats.tun_write_batches.inc();
+                stats.tun_write_packets.inc_by(batch.len() as u64);
             }
         }
     })
@@ -1507,7 +1526,7 @@ mod tests {
         let sink = Arc::clone(&writer.written);
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         let active = std::sync::Arc::new(AtomicBool::new(true));
-        let handle = spawn_tun_writer(writer, rx, active);
+        let handle = spawn_tun_writer(writer, rx, active, Arc::new(ForwardMetrics::default()));
         tx.send(Bytes::from_static(b"kept")).await.unwrap();
         drop(tx); // close channel so the writer task exits
         handle.await.unwrap();
@@ -1522,11 +1541,65 @@ mod tests {
         let sink = Arc::clone(&writer.written);
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         let active = std::sync::Arc::new(AtomicBool::new(false));
-        let handle = spawn_tun_writer(writer, rx, active);
+        let handle = spawn_tun_writer(writer, rx, active, Arc::new(ForwardMetrics::default()));
         tx.send(Bytes::from_static(b"dropped")).await.unwrap();
         drop(tx);
         handle.await.unwrap();
         assert!(sink.lock().await.is_empty());
+    }
+
+    struct BatchingTunWriter {
+        batches: Arc<AsyncMutex<Vec<Vec<Vec<u8>>>>>,
+    }
+
+    impl crate::tun::TunWrite for BatchingTunWriter {
+        async fn write_packet(&mut self, _packet: &[u8]) -> anyhow::Result<()> {
+            unreachable!("batch-capable writer must receive write_packets")
+        }
+
+        fn write_batch_size(&self) -> usize {
+            8
+        }
+
+        async fn write_packets(&mut self, packets: &[Bytes]) -> anyhow::Result<()> {
+            self.batches
+                .lock()
+                .await
+                .push(packets.iter().map(|packet| packet.to_vec()).collect());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_writer_drains_ready_packets_into_one_batch() {
+        use std::sync::atomic::AtomicBool;
+        let batches = Arc::new(AsyncMutex::new(Vec::new()));
+        let writer = BatchingTunWriter {
+            batches: Arc::clone(&batches),
+        };
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        tx.send(Bytes::from_static(b"one")).await.unwrap();
+        tx.send(Bytes::from_static(b"two")).await.unwrap();
+        tx.send(Bytes::from_static(b"three")).await.unwrap();
+        drop(tx);
+
+        let stats = Arc::new(ForwardMetrics::default());
+        spawn_tun_writer(
+            writer,
+            rx,
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&stats),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            batches.lock().await.as_slice(),
+            &[vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]]
+        );
+        assert_eq!(stats.tun_write_batches.get(), 1);
+        assert_eq!(stats.tun_write_packets.get(), 3);
+        assert_eq!(stats.tun_write_batch_limit.get(), 8);
     }
 
     #[test]
