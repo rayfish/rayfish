@@ -8,8 +8,8 @@
 //! below what the path carries, and the overflow is dropped from the datagram
 //! send buffer.
 //!
-//! The controller is picked from [`CONGESTION_ENV`] at bind so the options can
-//! be measured against each other on real paths before one becomes a setting:
+//! The controller is the `quic-congestion` setting
+//! ([`QuicCongestion`]), read once at bind:
 //!
 //! - `cubic` (default): noq's default, unchanged behaviour.
 //! - `loss-tolerant`: [`LossTolerant`], which ignores ordinary loss and leaves
@@ -28,46 +28,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use iroh::endpoint::{Controller, ControllerFactory, RttEstimator};
-use strum::{EnumString, IntoStaticStr};
 
-/// Environment variable that selects the controller, read once at bind.
-pub(crate) const CONGESTION_ENV: &str = "RAYFISH_QUIC_CC";
+use crate::config::QuicCongestion;
 
-/// Which congestion controller the endpoint builds for each path.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString, IntoStaticStr)]
-#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
-pub(crate) enum CongestionControl {
-    #[default]
-    Cubic,
-    LossTolerant,
-}
-
-impl CongestionControl {
-    /// Reads [`CONGESTION_ENV`]. Unset means the default; an unknown value is
-    /// logged and also falls back to the default, so a typo cannot stop the
-    /// daemon from starting.
-    pub(crate) fn from_env() -> Self {
-        let Some(raw) = std::env::var_os(CONGESTION_ENV) else {
-            return Self::default();
-        };
-        match raw.to_str().map(str::parse) {
-            Some(Ok(cc)) => cc,
-            _ => {
-                tracing::warn!(
-                    value = ?raw,
-                    "unknown {CONGESTION_ENV}; expected cubic or loss-tolerant"
-                );
-                Self::default()
-            }
-        }
-    }
-
-    /// The factory to install, or `None` to keep noq's default (Cubic).
-    pub(crate) fn factory(self) -> Option<Arc<dyn ControllerFactory + Send + Sync + 'static>> {
-        match self {
-            Self::Cubic => None,
-            Self::LossTolerant => Some(Arc::new(LossTolerantConfig::default())),
-        }
+/// The factory to install for `cc`, or `None` to keep noq's default (Cubic).
+pub(crate) fn controller_factory(
+    cc: QuicCongestion,
+) -> Option<Arc<dyn ControllerFactory + Send + Sync + 'static>> {
+    match cc {
+        QuicCongestion::Cubic => None,
+        QuicCongestion::LossTolerant => Some(Arc::new(LossTolerantConfig::default())),
     }
 }
 
@@ -220,17 +190,9 @@ mod tests {
     }
 
     #[test]
-    fn env_values_parse_case_insensitively() {
-        assert_eq!("cubic".parse(), Ok(CongestionControl::Cubic));
-        assert_eq!("CUBIC".parse(), Ok(CongestionControl::Cubic));
-        assert_eq!("loss-tolerant".parse(), Ok(CongestionControl::LossTolerant));
-        assert!("bbr3".parse::<CongestionControl>().is_err());
-    }
-
-    #[test]
     fn cubic_keeps_the_noq_default() {
-        assert!(CongestionControl::Cubic.factory().is_none());
-        assert!(CongestionControl::LossTolerant.factory().is_some());
+        assert!(controller_factory(QuicCongestion::Cubic).is_none());
+        assert!(controller_factory(QuicCongestion::LossTolerant).is_some());
     }
 
     #[test]

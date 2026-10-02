@@ -201,6 +201,7 @@ impl Daemon {
                 | GlobalKey::DnsUpstreams
                 | GlobalKey::AutoUpdate
                 | GlobalKey::OnDemand
+                | GlobalKey::QuicCongestion
                 | GlobalKey::DownloadDir
                 | GlobalKey::DownloadUser),
             ) => k,

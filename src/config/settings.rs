@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 pub use ray_proto::settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
-use super::{AppConfig, DnsMode, NetworkConfig, ServerOverride};
+use super::{AppConfig, DnsMode, NetworkConfig, QuicCongestion, ServerOverride};
 use crate::firewall::{Action, FirewallConfig};
 
 /// Parse an on/off value. An empty value (what `ConfigUnset` sends) resets to
@@ -45,6 +45,15 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
                     .trim()
                     .parse()
                     .map_err(|_| anyhow::anyhow!("DNS mode must be on, partial, or off"))?
+            }
+        }
+        GlobalKey::QuicCongestion => {
+            cfg.quic_congestion = if value.trim().is_empty() {
+                QuicCongestion::default()
+            } else {
+                value.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("QUIC congestion controller must be cubic or loss-tolerant")
+                })?
             }
         }
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
@@ -156,6 +165,7 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
         GlobalKey::Dns => cfg.dns_mode.as_ref().to_string(),
+        GlobalKey::QuicCongestion => cfg.quic_congestion.as_ref().to_string(),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
@@ -477,6 +487,26 @@ mod tests {
         }
         apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
         assert_eq!(cfg.dns_mode, DnsMode::On);
+    }
+
+    #[test]
+    fn quic_congestion_defaults_cubic_and_round_trips() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(render_global(&cfg, GlobalKey::QuicCongestion), "cubic");
+        apply_global(&mut cfg, GlobalKey::QuicCongestion, "loss-tolerant", false).unwrap();
+        assert_eq!(cfg.quic_congestion, QuicCongestion::LossTolerant);
+        assert_eq!(
+            render_global(&cfg, GlobalKey::QuicCongestion),
+            "loss-tolerant"
+        );
+        // bbr3 was offered once and removed; it must not come back as a value.
+        for value in ["bbr3", "reno", "on", "LossTolerant"] {
+            let err = apply_global(&mut cfg, GlobalKey::QuicCongestion, value, false);
+            assert!(err.is_err(), "{value} must be rejected");
+        }
+        assert_eq!(cfg.quic_congestion, QuicCongestion::LossTolerant);
+        apply_global(&mut cfg, GlobalKey::QuicCongestion, "", false).unwrap();
+        assert_eq!(cfg.quic_congestion, QuicCongestion::Cubic);
     }
 
     #[test]

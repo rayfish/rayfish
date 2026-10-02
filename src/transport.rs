@@ -19,12 +19,12 @@ use iroh::{
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-use crate::config::ServerOverride;
+use crate::config::{AppConfig, QuicCongestion, ServerOverride};
 use crate::exit_node::{LoopPrevention, is_transitable};
 
 mod congestion;
 
-use congestion::CongestionControl;
+use congestion::controller_factory;
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
@@ -180,14 +180,14 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
 /// When `tor` is true and the `tor` feature is enabled, adds the Tor custom transport
 /// alongside the default relay transport.
+///
+/// `settings` supplies the relay, discovery and DNS overrides, the warm path
+/// hints and the congestion controller, all read once for this bind.
 pub async fn create_endpoint_with_alpns(
     secret_key: SecretKey,
     alpns: Vec<Vec<u8>>,
     tor: bool,
-    relay: &ServerOverride,
-    discovery: &ServerOverride,
-    dns_upstreams: &ServerOverride,
-    warm_hints: Vec<EndpointAddr>,
+    settings: &AppConfig,
 ) -> Result<(Endpoint, MemoryLookup)> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
@@ -196,22 +196,25 @@ pub async fn create_endpoint_with_alpns(
     // Read the host's resolvers once, here, rather than per bind attempt: the
     // second attempt runs after the first failed, and this must be the host's
     // configuration as it stood before anything of ours touched it.
-    let nameservers =
-        control_plane_nameservers(dns_upstreams, crate::dns::config::system_nameservers());
+    let nameservers = control_plane_nameservers(
+        &settings.dns_upstreams,
+        crate::dns::config::system_nameservers(),
+    );
     tracing::debug!(?nameservers, "control-plane DNS");
 
     // This lookup is intentionally additive to pkarr/mDNS, never a replacement.
     // Hints came from paths that previously completed an identity-authenticated
     // QUIC handshake; if an address has gone stale, iroh tries discovery as usual.
-    let warm_lookup = MemoryLookup::from_endpoint_info(warm_hints);
+    let warm_lookup = MemoryLookup::from_endpoint_info(settings.endpoint_hints.clone());
     let bind = BindConfig {
         secret_key: &secret_key,
         alpns: &alpns,
         tor,
-        relay,
-        discovery,
+        relay: &settings.relay,
+        discovery: &settings.discovery_dns,
         nameservers: &nameservers,
         warm_lookup: &warm_lookup,
+        quic_congestion: settings.quic_congestion,
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -244,6 +247,7 @@ struct BindConfig<'a> {
     discovery: &'a ServerOverride,
     nameservers: &'a [Ipv4Addr],
     warm_lookup: &'a MemoryLookup,
+    quic_congestion: QuicCongestion,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -266,6 +270,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         discovery,
         nameservers,
         warm_lookup,
+        quic_congestion,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -292,10 +297,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
         //     small send limit. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
-        // The congestion controller defaults to noq's Cubic; `RAYFISH_QUIC_CC`
-        // selects a loss-tolerant controller for measurement (see
-        // `transport::congestion`).
-        .transport_config(quic_transport_config())
+        // The congestion controller is the `quic-congestion` setting, noq's
+        // Cubic by default (see `transport::congestion`).
+        .transport_config(quic_transport_config(quic_congestion))
         // Drop overlay addresses from the gathered direct-address candidates, so a
         // mesh IP bound on the TUN is never stored, published, or offered as a
         // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
@@ -489,11 +493,9 @@ pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
-fn quic_transport_config() -> QuicTransportConfig {
-    let cc = CongestionControl::from_env();
-    let cc_name: &'static str = cc.into();
-    tracing::info!(congestion_controller = cc_name, "QUIC transport config");
-    let builder = match cc.factory() {
+fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
+    tracing::info!(congestion_controller = cc.as_ref(), "QUIC transport config");
+    let builder = match controller_factory(cc) {
         Some(factory) => QuicTransportConfig::builder().congestion_controller_factory(factory),
         None => QuicTransportConfig::builder(),
     };
