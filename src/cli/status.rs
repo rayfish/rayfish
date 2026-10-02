@@ -1040,11 +1040,7 @@ fn device_row(
         .connection
         .as_ref()
         .and_then(|connection| connection.quality_issue)
-        .map(|issue| match issue {
-            ipc::ConnectionIssue::HighLatency => "slow",
-            ipc::ConnectionIssue::PacketLoss => "loss",
-            ipc::ConnectionIssue::SendQueue => "congested",
-        });
+        .map(|issue| issue.to_string());
     let (quality_plain, quality_styled) = match quality {
         Some(label) => (
             format!(" ·{label}·"),
@@ -1503,7 +1499,7 @@ mod grouping_tests {
             .lines()
             .find(|line| line.contains("slow-peer"))
             .expect("peer row");
-        assert!(slow_line.contains("·loss·"), "{out}");
+        assert!(slow_line.contains("·packet loss·"), "{out}");
     }
 
     #[test]

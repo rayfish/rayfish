@@ -798,12 +798,7 @@ fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes], packets: &[
     if batch.is_empty() {
         return;
     }
-    let result = if batch.len() == 1 {
-        route.conn.send_datagram(batch[0].clone()).map(|()| 1)
-    } else {
-        route.conn.send_many_datagrams(batch)
-    };
-    match result {
+    match route.conn.send_many_datagrams(batch) {
         Ok(queued) => {
             for &(end, len) in packets {
                 if end <= queued {
