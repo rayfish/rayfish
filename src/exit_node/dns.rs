@@ -2,7 +2,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::membership::ExitFamilies;
+use super::policy::is_transitable;
+use crate::membership::{ExitFamilies, is_overlay_ip};
 
 /// The IPv6 resolvers used when an IPv6-only tunnel has no configured IPv6
 /// resolver of its own.
@@ -12,7 +13,8 @@ pub(super) const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
 ];
 
 /// Use reachable public resolvers by default. Captured LAN resolvers must not
-/// send exit traffic outside the tunnel. Explicit replacement remains authoritative.
+/// send exit traffic outside the tunnel. Explicit replacement remains authoritative:
+/// when none of its servers is reachable, lookups fail rather than go elsewhere.
 pub(super) fn tunnel_upstreams(
     carries: ExitFamilies,
     configured: &crate::config::ServerOverride,
@@ -22,9 +24,12 @@ pub(super) fn tunnel_upstreams(
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
+    // The gateway refuses private destinations, so a LAN resolver would only
+    // time out ahead of the ones that work. Mesh resolvers do not use the exit.
     let mut servers: Vec<IpAddr> = configured_servers
         .iter()
         .copied()
+        .filter(|ip| is_overlay_ip(*ip) || is_transitable(*ip))
         .filter(|ip| match ip {
             IpAddr::V4(_) => carries.carries_v4(),
             IpAddr::V6(_) => carries.carries_v6(),

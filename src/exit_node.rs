@@ -1406,6 +1406,24 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             "an explicit --replace list is not silently swapped for public resolvers"
         );
 
+        // A LAN resolver cannot be reached through the exit. It is skipped
+        // rather than tried, and timed out, before every public lookup.
+        let lan = ServerOverride {
+            servers: strs(&["192.168.1.1", "9.9.9.9"]),
+            replace: false,
+        };
+        let got = tunnel_upstreams(V4, &lan).unwrap();
+        assert_eq!(got[0], "9.9.9.9:53".parse().unwrap());
+        assert!(!got.contains(&"192.168.1.1:53".parse().unwrap()));
+        let lan_replace = ServerOverride {
+            replace: true,
+            ..lan
+        };
+        assert_eq!(
+            tunnel_upstreams(V4, &lan_replace).unwrap(),
+            vec!["9.9.9.9:53".parse::<SocketAddr>().unwrap()]
+        );
+
         // Mixed: the IPv6 half is enough to keep everything inside the tunnel, so
         // the IPv4 entries are not needed and not used.
         let mixed = ServerOverride {
