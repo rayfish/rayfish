@@ -154,8 +154,8 @@ final class TunnelController: ObservableObject {
             let response = try await TunnelIPC.request(ProviderRequest(action: .status))
             guard !isLoading, !isQuitting else { return }
             status = response.status
-            if status?.sshEnabled == true { try SSHHelper.register() }
-            error = status?.sshEnabled == true ? SSHHelper.approvalMessage : nil
+            if status?.needsTCPHelper == true { try SSHHelper.register() }
+            error = status?.needsTCPHelper == true ? SSHHelper.approvalMessage : nil
             if Date().timeIntervalSince(lastMachinesRefresh) >= 30 { refreshMachines() }
         } catch {
             if !isLoading, !isQuitting { self.error = error.localizedDescription }
@@ -205,7 +205,7 @@ final class TunnelController: ObservableObject {
                 if isConnected {
                     let response = try await TunnelIPC.request(ProviderRequest(action: .status))
                     status = response.status
-                    if status?.sshEnabled == true {
+                    if status?.needsTCPHelper == true {
                         try SSHHelper.register(openSettings: true)
                         error = SSHHelper.approvalMessage
                     }

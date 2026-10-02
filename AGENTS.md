@@ -68,6 +68,7 @@ just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 
 - The network extension hosts the same Rust core as the daemon. The GUI uses NetworkExtension provider messages; the bundled Rust CLI uses the standard Unix socket. Do not recreate the CLI in Swift.
 - NetworkExtension owns the interface, routes, DNS, and VPN lifetime. Use `attach_external_tun`; desktop daemon activation must not reconfigure its interface. Connect and disconnect through the app.
+- Never create mesh TCP listeners inside the NetworkExtension provider: macOS blocks connections to those sockets regardless of user privileges. Run mesh SSH and IPv4 bridging in the app's launchd helper; keep packet forwarding and firewall checks in the extension.
 - Closing a window keeps the tray app alive. Cmd+Q disconnects the VPN before exiting.
 - Keep Swift logging in `OSLog` under `com.rayfish.app`; keep Rust logging in `tracing`. Do not log keys, invite codes, or other credentials.
 - `macos/project.yml` is the XcodeGen source. Update it when changing targets, sources, or shared build settings, and keep the checked-in project usable. Regeneration can overwrite local signing settings.

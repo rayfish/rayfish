@@ -1366,6 +1366,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             mdns_enabled: true,
             dns_mode: DnsMode::On,
             ssh_port: default_ssh_port(),
+            v4_bridge: true,
             ..Default::default()
         }
     };
@@ -2323,6 +2324,22 @@ name = "test"
         };
         save_settings_in(tmp.path(), &cfg).unwrap();
         assert_eq!(load_in(tmp.path()).unwrap().ssh_port, 2222);
+    }
+
+    #[test]
+    fn v4_bridge_defaults_on_and_preserves_explicit_off() {
+        let tmp = tempfile::tempdir().expect("create config directory");
+        assert!(load_in(tmp.path()).expect("load fresh settings").v4_bridge);
+        std::fs::write(tmp.path().join(SETTINGS_FILE), "mdns_enabled = false\n")
+            .expect("write settings without the bridge key");
+        assert!(load_in(tmp.path()).expect("load older settings").v4_bridge);
+
+        let cfg = AppConfig {
+            v4_bridge: false,
+            ..Default::default()
+        };
+        save_settings_in(tmp.path(), &cfg).expect("save the disabled bridge");
+        assert!(!load_in(tmp.path()).expect("reload settings").v4_bridge);
     }
 
     #[test]

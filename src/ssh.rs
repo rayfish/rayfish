@@ -56,7 +56,7 @@
 //! on this box", so admitting it would hand every local user a root shell. On
 //! the host itself, use the host sshd (`ssh localhost`), which authenticates.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod app_helper;
 mod authz;
 mod host_keys;

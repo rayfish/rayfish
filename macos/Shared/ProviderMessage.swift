@@ -78,6 +78,8 @@ struct ProviderFirewallRule: Codable, Equatable, Identifiable {
 }
 
 struct ProviderStatus: Codable, Equatable {
+    var v4BridgeEnabled: Bool? = nil
+    var needsTCPHelper: Bool { sshEnabled == true || v4BridgeEnabled != false }
     var active: Bool
     var ipv6: String
     var networks: [ProviderNetwork]

@@ -30,6 +30,9 @@
 //!   module binds every qualifying port instead of consulting the firewall, and
 //!   it is the same property that lets mesh SSH read a peer's identity off the
 //!   source address.
+//!
+//! In macOS app mode this runs in the launchd helper, because NetworkExtension
+//! cannot receive mesh connections on sockets created inside the provider.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -91,11 +94,18 @@ enum PortState {
 /// is the data plane's: the address it binds goes down with the TUN.
 pub struct V4Bridge {
     v6: Ipv6Addr,
+    ssh_port: Option<u16>,
 }
 
 impl V4Bridge {
     pub fn new(v6: Ipv6Addr) -> Self {
-        Self { v6 }
+        Self { v6, ssh_port: None }
+    }
+
+    #[cfg(any(target_os = "macos", all(unix, test)))]
+    pub(crate) fn with_ssh_port(mut self, port: u16) -> Self {
+        self.ssh_port = Some(port);
+        self
     }
 
     /// Start the rescan supervisor. Runs until `token` is cancelled, which also
@@ -114,7 +124,8 @@ impl V4Bridge {
                     .filter(|(_, state)| matches!(state, PortState::Bound(_)))
                     .map(|(port, _)| *port)
                     .collect();
-                match bridgeable_ports(self.v6, &ours) {
+                let ssh_port = self.ssh_port.unwrap_or_else(forward::ssh_port);
+                match bridgeable_ports(self.v6, &ours, ssh_port) {
                     Some(found) => self.reconcile(&found, &mut ports, &token),
                     // Nothing readable here (an unsupported host, or a listing
                     // we could not parse). Bridge nothing and stay quiet: a
@@ -229,7 +240,13 @@ fn spawn_port(port: u16, listener: TcpListener, token: CancellationToken) {
                             continue;
                         }
                     };
-                    tokio::spawn(bridge_conn(inbound, from, port));
+                    let token = token.child_token();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = token.cancelled() => {},
+                            _ = bridge_conn(inbound, from, port) => {},
+                        }
+                    });
                 }
             }
         }
@@ -273,17 +290,13 @@ async fn bridge_conn(mut inbound: TcpStream, from: SocketAddr, port: u16) {
 /// its own socket as the service having grown IPv6 support, unbinds, finds the
 /// port bare again and rebinds, leaving every bridged port answering half the
 /// time.
-fn bridgeable_ports(mesh: Ipv6Addr, ours: &BTreeSet<u16>) -> Option<BTreeSet<u16>> {
+fn bridgeable_ports(mesh: Ipv6Addr, ours: &BTreeSet<u16>, ssh_port: u16) -> Option<BTreeSet<u16>> {
     let mut ports = wildcard_v4_only_ports(mesh, ours)?;
-    ports.retain(|p| is_bridgeable_port(*p));
+    ports.retain(|p| is_bridgeable_port_for(*p, ssh_port));
     Some(ports)
 }
 
 /// The bridge skips the configured mesh SSH port and its internal listener port.
-fn is_bridgeable_port(port: u16) -> bool {
-    is_bridgeable_port_for(port, forward::ssh_port())
-}
-
 fn is_bridgeable_port_for(port: u16, ssh_port: u16) -> bool {
     port != SSH_LISTEN_PORT && port != ssh_port && port < EPHEMERAL_FLOOR
 }
@@ -701,5 +714,47 @@ tcp6       0      0  {MESH}.4000            *.*                    LISTEN
             .expect("read to end");
         assert!(buf.is_empty());
         token.cancel();
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_bridge_closes_an_active_connection() {
+        let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the IPv4 service");
+        let port = echo.local_addr().expect("service address").port();
+        let echo_task = tokio::spawn(async move {
+            let (mut socket, _) = echo.accept().await.expect("accept from the bridge");
+            let (mut reader, mut writer) = socket.split();
+            tokio::io::copy(&mut reader, &mut writer)
+                .await
+                .expect("echo the bridged bytes");
+        });
+        let listener =
+            bind_listener(IpAddr::V6(Ipv6Addr::LOCALHOST), port).expect("bind the IPv6 bridge");
+        let address = listener.local_addr().expect("bridge address");
+        let token = CancellationToken::new();
+        spawn_port(port, listener, token.clone());
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect to the bridge");
+        client.write_all(b"ping").await.expect("send bytes");
+        let mut bytes = [0; 4];
+        timeout(CONNECT_TIMEOUT, client.read_exact(&mut bytes))
+            .await
+            .expect("the echo must arrive")
+            .expect("read echoed bytes");
+        assert_eq!(&bytes, b"ping");
+
+        token.cancel();
+        let mut remaining = Vec::new();
+        timeout(CONNECT_TIMEOUT, client.read_to_end(&mut remaining))
+            .await
+            .expect("cancellation must close the client")
+            .expect("read EOF");
+        assert!(remaining.is_empty());
+        timeout(CONNECT_TIMEOUT, echo_task)
+            .await
+            .expect("cancellation must close the upstream")
+            .expect("the echo task must finish");
     }
 }

@@ -52,18 +52,39 @@ impl AppleError {
 
 #[derive(uniffi::Record)]
 pub struct NodeStatus {
+    pub mesh: NodeMeshStatus,
+    pub requests: NodeRequestStatus,
+    pub files: Vec<IncomingFile>,
+    pub ssh: NodeSshStatus,
+    pub services: NodeServiceStatus,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeMeshStatus {
     pub active: bool,
     pub ipv6: String,
     pub networks: Vec<Network>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeRequestStatus {
     pub pending_requests: Vec<JoinRequest>,
     pub contact_id: Option<String>,
     pub connection_requests: Vec<ConnectionRequest>,
-    pub files: Vec<IncomingFile>,
-    pub ssh_enabled: bool,
-    pub ssh_rules: Vec<SshRule>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeSshStatus {
+    pub enabled: bool,
+    pub rules: Vec<SshRule>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeServiceStatus {
     pub dns_enabled: bool,
     pub mdns_enabled: bool,
     pub mdns_active: bool,
+    pub v4_bridge_enabled: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -311,58 +332,75 @@ impl Node {
                 Vec::new()
             }
         };
-        Ok(NodeStatus {
-            active,
+        let requests = NodeRequestStatus {
+            pending_requests,
             contact_id,
             connection_requests,
-            files: incoming_files(state.list_files())?,
-            ssh_enabled: settings.ssh_enabled,
-            ssh_rules: settings
-                .networks
-                .iter()
-                .flat_map(|network| {
-                    network.ssh_allow.iter().map(|rule| SshRule {
-                        network: network.name.clone(),
-                        peer: rule.peer.clone(),
-                        users: rule.users.clone(),
-                    })
+        };
+        let files = incoming_files(state.list_files())?;
+        let rules = settings
+            .networks
+            .iter()
+            .flat_map(|network| {
+                network.ssh_allow.iter().map(|rule| SshRule {
+                    network: network.name.clone(),
+                    peer: rule.peer.clone(),
+                    users: rule.users.clone(),
                 })
-                .collect(),
+            })
+            .collect();
+        let ssh = NodeSshStatus {
+            enabled: settings.ssh_enabled,
+            rules,
+        };
+        let services = NodeServiceStatus {
             dns_enabled: settings.dns_mode.enabled(),
             mdns_enabled: settings.mdns_enabled,
             mdns_active,
-            ipv6: membership::derive_ipv6(&endpoint_id).to_string(),
-            networks: networks
-                .into_iter()
-                .map(|network| Network {
-                    name: network.name,
-                    hostname: network.my_hostname.unwrap_or_default(),
-                    ipv6: network.my_ipv6.to_string(),
-                    role: network.role.to_string(),
-                    peers: network
-                        .peers
-                        .into_iter()
-                        .map(|peer| Peer {
-                            identity: peer.endpoint_id.to_string(),
-                            hostname: peer
-                                .hostname
-                                .unwrap_or_else(|| peer.endpoint_id.to_string()),
-                            ipv6: peer.ipv6.to_string(),
-                            state: peer
-                                .connection
-                                .as_ref()
-                                .map(|connection| connection.conn_type.to_string())
-                                .unwrap_or_else(|| peer.state.to_string()),
-                            latency_ms: peer
-                                .connection
-                                .and_then(|connection| connection.rtt_ms)
-                                .map(|latency| latency.round() as u32),
-                            is_own_device: peer.is_own_device,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            pending_requests,
+            v4_bridge_enabled: settings.v4_bridge,
+        };
+        let ipv6 = membership::derive_ipv6(&endpoint_id).to_string();
+        let networks = networks
+            .into_iter()
+            .map(|network| Network {
+                name: network.name,
+                hostname: network.my_hostname.unwrap_or_default(),
+                ipv6: network.my_ipv6.to_string(),
+                role: network.role.to_string(),
+                peers: network
+                    .peers
+                    .into_iter()
+                    .map(|peer| Peer {
+                        identity: peer.endpoint_id.to_string(),
+                        hostname: peer
+                            .hostname
+                            .unwrap_or_else(|| peer.endpoint_id.to_string()),
+                        ipv6: peer.ipv6.to_string(),
+                        state: peer
+                            .connection
+                            .as_ref()
+                            .map(|connection| connection.conn_type.to_string())
+                            .unwrap_or_else(|| peer.state.to_string()),
+                        latency_ms: peer
+                            .connection
+                            .and_then(|connection| connection.rtt_ms)
+                            .map(|latency| latency.round() as u32),
+                        is_own_device: peer.is_own_device,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mesh = NodeMeshStatus {
+            active,
+            ipv6,
+            networks,
+        };
+        Ok(NodeStatus {
+            mesh,
+            requests,
+            files,
+            ssh,
+            services,
         })
     }
 
@@ -902,15 +940,15 @@ mod tests {
             *node.state.lock().unwrap() = Some(Arc::clone(&state));
             if iteration == 0 {
                 let before = node.status().unwrap();
-                assert!(before.networks.is_empty());
-                assert!(before.connection_requests.is_empty());
-                assert!(before.contact_id.is_some());
+                assert!(before.mesh.networks.is_empty());
+                assert!(before.requests.connection_requests.is_empty());
+                assert!(before.requests.contact_id.is_some());
                 node.set_setting(GlobalSetting::Dns, false).unwrap();
                 node.set_setting(GlobalSetting::Mdns, false).unwrap();
                 #[cfg(unix)]
                 {
                     node.set_setting(GlobalSetting::Ssh, true).unwrap();
-                    assert!(node.status().unwrap().ssh_enabled);
+                    assert!(node.status().unwrap().ssh.enabled);
                     node.set_setting(GlobalSetting::Ssh, false).unwrap();
                     let mut network = config::NetworkConfig {
                         name: "ssh-test".into(),
@@ -928,26 +966,26 @@ mod tests {
                         true,
                     )
                     .unwrap();
-                    let rules = node.status().unwrap().ssh_rules;
+                    let rules = node.status().unwrap().ssh.rules;
                     assert_eq!(rules[0].users, ["test-user"]);
                     node.set_ssh_rule("ssh-test".into(), "departed-peer".into(), Vec::new(), false)
                         .unwrap();
-                    assert!(node.status().unwrap().ssh_rules.is_empty());
+                    assert!(node.status().unwrap().ssh.rules.is_empty());
                 }
                 let after = node.status().unwrap();
-                assert!(!after.dns_enabled);
-                assert!(!after.mdns_enabled);
-                assert!(!after.mdns_active);
-                assert_eq!(after.ipv6, before.ipv6);
-                assert_eq!(after.active, before.active);
+                assert!(!after.services.dns_enabled);
+                assert!(!after.services.mdns_enabled);
+                assert!(!after.services.mdns_active);
+                assert_eq!(after.mesh.ipv6, before.mesh.ipv6);
+                assert_eq!(after.mesh.active, before.mesh.active);
                 node.set_setting(GlobalSetting::Mdns, true).unwrap();
                 let enabled = node.status().unwrap();
-                assert!(enabled.mdns_active);
-                assert_eq!(enabled.active, before.active);
+                assert!(enabled.services.mdns_active);
+                assert_eq!(enabled.mesh.active, before.mesh.active);
                 node.set_setting(GlobalSetting::Mdns, false).unwrap();
                 let disabled = node.status().unwrap();
-                assert!(!disabled.mdns_active);
-                assert_eq!(disabled.active, before.active);
+                assert!(!disabled.services.mdns_active);
+                assert_eq!(disabled.mesh.active, before.mesh.active);
                 assert!(Arc::ptr_eq(&state, &node.state().unwrap()));
                 assert!(matches!(
                     node.connect_peer("invalid contact id".into(), None),
@@ -976,14 +1014,14 @@ mod tests {
                 assert_eq!(machines.len(), 1);
                 assert_eq!(machines[0].hostname, "managed-host");
                 assert_eq!(machines[0].identity, endpoint_id.to_string());
-                assert_eq!(machines[0].ipv6, before.ipv6);
+                assert_eq!(machines[0].ipv6, before.mesh.ipv6);
                 assert_eq!(machines[0].state, "offline");
                 assert!(machines[0].networks.is_empty());
             } else {
                 let restarted = node.status().unwrap();
-                assert!(!restarted.dns_enabled);
-                assert!(!restarted.mdns_enabled);
-                assert!(!restarted.mdns_active);
+                assert!(!restarted.services.dns_enabled);
+                assert!(!restarted.services.mdns_enabled);
+                assert!(!restarted.services.mdns_active);
             }
             let started = Instant::now();
             node.stop();

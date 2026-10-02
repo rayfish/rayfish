@@ -8,7 +8,7 @@ enum SSHHelper {
 
     static var approvalMessage: String? {
         guard service.status != .enabled else { return nil }
-        return "To use mesh SSH, allow Rayfish in System Settings > General > Login Items & Extensions."
+        return "To use mesh SSH or IPv4 services, allow Rayfish in System Settings > General > Login Items & Extensions."
     }
 
     static func register(openSettings: Bool = false) throws {

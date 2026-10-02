@@ -1187,6 +1187,11 @@ impl Daemon {
         *guard = Some(token.clone());
         drop(guard);
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
+        #[cfg(target_os = "macos")]
+        if self.app_ssh_helper.load(Ordering::SeqCst) {
+            crate::ssh::app_helper::spawn_v4_bridge(my_v6, token);
+            return;
+        }
         crate::v4bridge::V4Bridge::new(my_v6).spawn(token);
     }
 

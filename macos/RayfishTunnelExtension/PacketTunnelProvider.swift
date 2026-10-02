@@ -27,7 +27,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             try node.start(ownerUid: owner)
             let status = try node.status()
-            let settings = networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled)
+            let settings = networkSettings(address: status.mesh.ipv6, dnsEnabled: status.services.dnsEnabled)
             setTunnelNetworkSettings(settings) { [weak self] error in
                 if let error {
                     node.stop()
@@ -43,7 +43,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 do {
                     try node.activate()
                     self.node = node
-                    self.appliedDNS = status.dnsEnabled
+                    self.appliedDNS = status.services.dnsEnabled
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
                 } catch {
@@ -245,9 +245,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func status(from status: NodeStatus) -> ProviderStatus {
         ProviderStatus(
-            active: status.active,
-            ipv6: status.ipv6,
-            networks: status.networks.map { network in
+            v4BridgeEnabled: status.services.v4BridgeEnabled,
+            active: status.mesh.active,
+            ipv6: status.mesh.ipv6,
+            networks: status.mesh.networks.map { network in
                 ProviderNetwork(
                     name: network.name,
                     hostname: network.hostname,
@@ -265,7 +266,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                 )
             },
-            pendingRequests: status.pendingRequests.map { request in
+            pendingRequests: status.requests.pendingRequests.map { request in
                 ProviderJoinRequest(
                     network: request.network,
                     id: request.id,
@@ -273,13 +274,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     waitingSecs: request.waitingSecs
                 )
             },
-            contactId: status.contactId,
-            connectionRequests: status.connectionRequests.map { request in
+            contactId: status.requests.contactId,
+            connectionRequests: status.requests.connectionRequests.map { request in
                 ProviderConnectionRequest(id: request.id, hostname: request.hostname, waitingSecs: request.waitingSecs)
             },
-            dnsEnabled: status.dnsEnabled,
-            mdnsEnabled: status.mdnsEnabled,
-            mdnsActive: status.mdnsActive,
+            dnsEnabled: status.services.dnsEnabled,
+            mdnsEnabled: status.services.mdnsEnabled,
+            mdnsActive: status.services.mdnsActive,
             files: status.files.map { file in
                 ProviderFile(transferId: file.id, peer: file.peer, filename: file.filename,
                              size: file.size, state: file.state == .pending ? .pending
@@ -287,8 +288,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              transferred: file.transferred,
                              destination: file.destination)
             },
-            sshEnabled: status.sshEnabled,
-            sshRules: status.sshRules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) }
+            sshEnabled: status.ssh.enabled,
+            sshRules: status.ssh.rules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) }
         )
     }
 }

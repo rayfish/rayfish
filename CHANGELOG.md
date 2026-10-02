@@ -29,6 +29,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- IPv4 listener bridging is enabled by default on fresh installs and starts
+  with the macOS app's VPN. An explicit `v4-bridge off` setting is preserved.
+- The macOS app bridges IPv4 services through its background helper so macOS
+  can deliver mesh connections to them, including when mesh SSH is disabled.
 - Android firewall forms keep the selected peer after activity recreation.
 - Android shows file transfer cancellation only for outgoing transfers.
 - Coordinators that leave with `ray nuke --force` publish their departure so

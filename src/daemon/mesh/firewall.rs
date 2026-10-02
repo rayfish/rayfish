@@ -549,6 +549,14 @@ impl Daemon {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
         crate::forward::set_ssh_nat_port(app_config.ssh_port);
+        #[cfg(all(target_os = "macos", feature = "desktop"))]
+        if self.active.load(Ordering::SeqCst)
+            && self.app_ssh_helper.load(Ordering::SeqCst)
+            && app_config.v4_bridge
+        {
+            self.stop_v4_bridge();
+            self.start_v4_bridge();
+        }
         IpcMessage::Ok {
             message: format!(
                 "mesh SSH port set to {}. Connect with `ssh -p {} <user>@<host>.ray`.",

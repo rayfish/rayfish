@@ -1106,8 +1106,16 @@ impl Daemon {
         self.attach_tun(reader, writer).await;
         self.active.store(true, Ordering::SeqCst);
         #[cfg(feature = "desktop")]
-        if config::load().is_ok_and(|settings| settings.ssh_enabled) {
-            self.start_ssh();
+        {
+            if config::load().is_ok_and(|settings| settings.ssh_enabled) {
+                self.start_ssh();
+            }
+            if config::load()
+                .map(|settings| settings.v4_bridge)
+                .unwrap_or(true)
+            {
+                self.start_v4_bridge();
+            }
         }
         self.registry.poll_nudge.notify_waiters();
     }
@@ -1122,7 +1130,10 @@ impl Daemon {
     /// underlying fds. Idempotent: a no-op if no interface is attached.
     pub fn detach_tun(&self) {
         #[cfg(feature = "desktop")]
-        self.stop_ssh();
+        {
+            self.stop_ssh();
+            self.stop_v4_bridge();
+        }
         self.active
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
@@ -3587,6 +3598,66 @@ mod headless_tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         false
+    }
+
+    #[cfg(feature = "desktop")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_tun_v4_bridge_follows_settings_and_tunnel_lifetime() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("create config directory");
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+        let daemon = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("headless startup must finish")
+            .expect("build the headless node");
+
+        for enabled in [true, false, true] {
+            config::update_settings(|cfg| {
+                cfg.v4_bridge = enabled;
+                Ok(())
+            })
+            .expect("save the bridge setting");
+            daemon
+                .attach_external_tun(
+                    FakeTunReader {
+                        _alive: Arc::new(()),
+                    },
+                    FakeTunWriter::default(),
+                )
+                .await;
+            let mut token = daemon.v4_bridge_token.lock().unwrap().clone();
+            assert_eq!(token.is_some(), enabled, "startup follows the setting");
+            if let Some(token) = &token {
+                assert!(!token.is_cancelled(), "the bridge is running");
+            }
+
+            if enabled {
+                assert!(matches!(
+                    daemon.v4_bridge_config_set("off"),
+                    IpcMessage::Ok { .. }
+                ));
+                assert!(
+                    token
+                        .as_ref()
+                        .expect("the bridge was running")
+                        .is_cancelled()
+                );
+                assert!(daemon.v4_bridge_token.lock().unwrap().is_none());
+                assert!(matches!(
+                    daemon.v4_bridge_config_set("on"),
+                    IpcMessage::Ok { .. }
+                ));
+                token = daemon.v4_bridge_token.lock().unwrap().clone();
+                assert!(!token.as_ref().expect("the bridge restarted").is_cancelled());
+            }
+
+            daemon.detach_tun();
+            assert!(daemon.v4_bridge_token.lock().unwrap().is_none());
+            if let Some(token) = token {
+                assert!(token.is_cancelled(), "disconnect stops the bridge");
+            }
+        }
     }
 
     /// Re-attaching the TUN after a `detach_tun` must resume forwarding to the
