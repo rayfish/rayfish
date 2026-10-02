@@ -72,9 +72,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Linux enables TUN TCP/UDP segmentation and receive offloads, batching packets
   between the mesh and kernel to reduce per-packet work.
-- macOS batches packet-tunnel I/O. Peer traffic waits for a bounded 32 MiB QUIC
-  send queue without letting one congested peer stall traffic to other peers.
-- Peer metrics report QUIC queue depth and wait time, congestion window, loss,
+- macOS batches packet-tunnel I/O. Peer traffic uses a bounded QUIC datagram
+  queue without adding another per-peer queue in the forwarding path.
+- Peer metrics report QUIC queue depth, congestion window, loss,
   path MTU, and TUN offload and batching state for throughput diagnostics.
 
 ## [0.5.6] - 2026-10-01

@@ -478,7 +478,7 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 32 * 1024 * 1024;
+pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one QUIC
 /// connection carrying DATAGRAM frames per peer, plus reliable control streams).
@@ -495,9 +495,9 @@ fn quic_transport_config() -> QuicTransportConfig {
         // Keep GSO on (default) explicitly so a future change can't silently
         // regress it.
         .enable_segmentation_offload(true)
-        // This is a logical per-connection limit. noQ retains packet Bytes while
-        // they are queued and releases them after transmission; it does not
-        // reserve 32 MiB for every peer at connection creation.
+        // Keep the unreliable datagram queue small. When it fills, noQ discards
+        // older datagrams rather than making the forwarding path wait and add
+        // latency behind stale traffic.
         .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE)
         .build()
 }

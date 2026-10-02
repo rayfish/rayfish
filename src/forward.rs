@@ -8,12 +8,11 @@
 mod fragment;
 mod lazy_dial;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::time::Instant;
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
@@ -77,11 +76,6 @@ pub(crate) fn untag_datagram(datagram: &[u8]) -> Option<(u16, &[u8])> {
 /// in flight for normal browser parallelism while bounding task and socket use
 /// when a local app floods the resolver address.
 const DNS_QUERIES_MAX_IN_FLIGHT: usize = 64;
-
-/// Packets retained outside noQ while one peer waits for room in its datagram
-/// queue. The transport queue carries the real burst budget; this small queue
-/// only decouples that peer's wait from the shared TUN reader.
-const PEER_SEND_QUEUE: usize = 256;
 
 /// The default port a stock `ssh` client targets (`ssh user@host.ray`). Defined here in
 /// the always-compiled forward core because the userspace SSH NAT below rewrites
@@ -465,131 +459,6 @@ pub(crate) struct MeshForwarder<R> {
     pub dialer: Option<Arc<NetworkRegistry>>,
 }
 
-struct SendJob {
-    route: PeerRoute,
-    info: firewall::PacketInfo,
-    packet: Bytes,
-}
-
-struct PeerSender {
-    connection_id: usize,
-    tx: mpsc::Sender<SendJob>,
-    cancel: CancellationToken,
-}
-
-struct SendDispatcher {
-    peers: HashMap<EndpointId, PeerSender>,
-    firewall: SharedFirewall,
-    stats: Arc<ForwardMetrics>,
-    tun_tx: mpsc::Sender<Bytes>,
-    token: CancellationToken,
-}
-
-fn record_queued_send_failures(rx: &mut mpsc::Receiver<SendJob>, stats: &ForwardMetrics) {
-    rx.close();
-    while rx.try_recv().is_ok() {
-        stats.record_drop(DropReason::SendFailure);
-    }
-}
-
-impl SendDispatcher {
-    fn new(
-        firewall: SharedFirewall,
-        stats: Arc<ForwardMetrics>,
-        tun_tx: mpsc::Sender<Bytes>,
-        token: CancellationToken,
-    ) -> Self {
-        Self {
-            peers: HashMap::new(),
-            firewall,
-            stats,
-            tun_tx,
-            token,
-        }
-    }
-
-    fn dispatch(&mut self, route: PeerRoute, info: firewall::PacketInfo, packet: Bytes) {
-        let peer = route.endpoint_id;
-        let connection_id = route.conn.stable_id();
-        let replace = self
-            .peers
-            .get(&peer)
-            .is_none_or(|sender| sender.connection_id != connection_id || sender.tx.is_closed());
-        if replace {
-            if let Some(sender) = self.peers.remove(&peer) {
-                sender.cancel.cancel();
-            }
-            let (tx, mut rx) = mpsc::channel::<SendJob>(PEER_SEND_QUEUE);
-            let firewall = self.firewall.clone();
-            let stats = Arc::clone(&self.stats);
-            let tun_tx = self.tun_tx.clone();
-            let token = self.token.child_token();
-            let worker_token = token.clone();
-            let connection = route.conn.clone();
-            tokio::spawn(async move {
-                loop {
-                    let job = tokio::select! {
-                        _ = token.cancelled() => break,
-                        _ = connection.closed() => {
-                            record_queued_send_failures(&mut rx, &stats);
-                            break;
-                        },
-                        job = rx.recv() => match job {
-                            Some(job) => job,
-                            None => break,
-                        },
-                    };
-                    let ctx = SendCtx {
-                        firewall: &firewall,
-                        stats: &stats,
-                        tun_tx: &tun_tx,
-                    };
-                    let sent = tokio::select! {
-                        _ = token.cancelled() => break,
-                        sent = send_over_route(&ctx, &job.route, &job.info, job.packet) => sent,
-                    };
-                    if !sent {
-                        record_queued_send_failures(&mut rx, &stats);
-                        break;
-                    }
-                }
-            });
-            self.peers.insert(
-                peer,
-                PeerSender {
-                    connection_id,
-                    tx,
-                    cancel: worker_token,
-                },
-            );
-        }
-
-        let job = SendJob {
-            route,
-            info,
-            packet,
-        };
-        match self.peers[&peer].tx.try_send(job) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.stats.record_drop(DropReason::Backpressure);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.peers.remove(&peer);
-                self.stats.record_drop(DropReason::SendFailure);
-            }
-        }
-    }
-}
-
-impl Drop for SendDispatcher {
-    fn drop(&mut self) {
-        for sender in self.peers.values() {
-            sender.cancel.cancel();
-        }
-    }
-}
-
 /// Main TUN read loop. Reads outgoing packets from the TUN device and sends each
 /// to its peer over QUIC. When there is no live connection to the destination, an
 /// on-demand node buffers the packet and dials the peer (see below); with no dialer
@@ -622,12 +491,6 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
         let mut in_flight: HashSet<EndpointId> = HashSet::new();
         let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
         let dns_queries = Arc::new(Semaphore::new(DNS_QUERIES_MAX_IN_FLIGHT));
-        let mut send_dispatch = SendDispatcher::new(
-            firewall.clone(),
-            Arc::clone(&stats),
-            tun_tx.clone(),
-            token.clone(),
-        );
         // Client-side exit-node selection (cheap Arc-backed clone), consulted for
         // internet-bound packets. Default (no selection) when there is no registry.
         let exit_client = dialer
@@ -641,7 +504,8 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                 Some((peer, connected)) = done_rx.recv() => {
                     in_flight.remove(&peer);
                     let pkts = buffered.take(&peer);
-                    flush_or_drop(&peers, &mut send_dispatch, &exit_client, connected, pkts);
+                    let ctx = SendCtx { firewall: &firewall, stats: &stats, tun_tx: &tun_tx };
+                    flush_or_drop(&peers, &ctx, &exit_client, connected, pkts).await;
                     continue;
                 }
             };
@@ -728,7 +592,12 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
 
                 continue;
             };
-            send_dispatch.dispatch(route, info, pkt);
+            let ctx = SendCtx {
+                firewall: &firewall,
+                stats: &stats,
+                tun_tx: &tun_tx,
+            };
+            send_over_route(&ctx, &route, &info, pkt).await;
         }
     }
 }
@@ -774,33 +643,33 @@ fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Opti
 /// each is re-routed and sent over the now-live connection (its route may differ
 /// per packet, so look it up fresh); on failure they are dropped. Called by
 /// [`run_mesh`] when a dial completes.
-fn flush_or_drop(
+async fn flush_or_drop(
     peers: &PeerTable,
-    send_dispatch: &mut SendDispatcher,
+    ctx: &SendCtx<'_>,
     exit: &ExitClient,
     connected: bool,
     pkts: VecDeque<Bytes>,
 ) {
     if !connected {
         for _ in &pkts {
-            send_dispatch.stats.record_drop(DropReason::NoPeer);
+            ctx.stats.record_drop(DropReason::NoPeer);
         }
         return;
     }
 
     for pkt in pkts {
         let Some(info) = firewall::parse_packet_info(&pkt) else {
-            send_dispatch.stats.record_drop(DropReason::Malformed);
+            ctx.stats.record_drop(DropReason::Malformed);
             continue;
         };
 
         let Some(route) = resolve_send_route(peers, exit, info.dst_ip) else {
             // The connection vanished between dialing and flushing (a racing
             // teardown); the flow's retransmit will re-drive it.
-            send_dispatch.stats.record_drop(DropReason::NoPeer);
+            ctx.stats.record_drop(DropReason::NoPeer);
             continue;
         };
-        send_dispatch.dispatch(route, info, pkt);
+        send_over_route(ctx, &route, &info, pkt).await;
     }
 }
 
@@ -911,65 +780,53 @@ pub(crate) async fn send_over_route(
     route: &PeerRoute,
     info: &firewall::PacketInfo,
     pkt: Bytes,
-) -> bool {
+) {
     let n = pkt.len();
     let Some(encoded) = prepare_datagrams(ctx, route, info, pkt).await else {
-        return true;
+        return;
     };
     let datagrams = encoded.datagrams();
-    send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]).await
+    send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]);
 }
 
 /// Hands an ordered run of datagrams to noq. `packets` records the end index and
 /// original IP length of each packet, so fragmentation does not inflate traffic
-/// counters. Waiting for noQ's per-connection queue prevents an application-side
-/// drop when congestion temporarily fills it. Each peer waits in its own worker,
-/// so a slow connection cannot block the shared TUN reader or other peers.
-async fn send_batch(
-    ctx: &SendCtx<'_>,
-    route: &PeerRoute,
-    batch: &[Bytes],
-    packets: &[(usize, usize)],
-) -> bool {
+/// counters. noQ may discard older queued datagrams when its bounded send buffer
+/// is full; QUIC datagrams are intentionally unreliable and the forwarding path
+/// never waits for capacity.
+fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes], packets: &[(usize, usize)]) {
     if batch.is_empty() {
-        return true;
+        return;
     }
-    let mut start = 0;
-    let mut sent_any = false;
-    for (packet_index, &(end, len)) in packets.iter().enumerate() {
-        for datagram in &batch[start..end] {
-            let wait_started =
-                (route.conn.datagram_send_buffer_space() < datagram.len()).then(Instant::now);
-            let result = route.conn.send_datagram_wait(datagram.clone()).await;
-            if let Some(wait_started) = wait_started {
-                ctx.stats.datagram_send_waits.inc();
-                ctx.stats
-                    .datagram_send_wait_us
-                    .inc_by(wait_started.elapsed().as_micros() as u64);
-            }
-            if let Err(error) = result {
-                tracing::debug!(
-                    peer = %route.endpoint_id.fmt_short(),
-                    %error,
-                    "datagram send failed"
-                );
-                for _ in packet_index..packets.len() {
+    let result = if batch.len() == 1 {
+        route.conn.send_datagram(batch[0].clone()).map(|()| 1)
+    } else {
+        route.conn.send_many_datagrams(batch)
+    };
+    match result {
+        Ok(queued) => {
+            for &(end, len) in packets {
+                if end <= queued {
+                    ctx.stats.record_tx(len);
+                } else {
                     ctx.stats.record_drop(DropReason::SendFailure);
                 }
-                if sent_any {
-                    route.note_activity();
-                }
-                return false;
+            }
+            if queued > 0 {
+                route.note_activity();
             }
         }
-        ctx.stats.record_tx(len);
-        sent_any = true;
-        start = end;
+        Err(error) => {
+            tracing::debug!(
+                peer = %route.endpoint_id.fmt_short(),
+                %error,
+                "datagram send failed"
+            );
+            for _ in packets {
+                ctx.stats.record_drop(DropReason::SendFailure);
+            }
+        }
     }
-    if sent_any {
-        route.note_activity();
-    }
-    true
 }
 
 /// Spawns a task that reads QUIC datagrams from a single peer connection and
@@ -1443,19 +1300,14 @@ mod tests {
         // The on-demand backlog mixes small and fragmented packets. Counters must
         // still count IP packets, not individual fragments.
         let small = Bytes::from(make_tcp_packet_between(a_ip, b_ip, 22));
-        let mut send_dispatch = SendDispatcher::new(
-            sender_fw.clone(),
-            Arc::clone(&send_stats),
-            feedback_tx.clone(),
-            token.clone(),
-        );
         flush_or_drop(
             &sender_peers,
-            &mut send_dispatch,
+            &ctx,
             &ExitClient::default(),
             true,
             VecDeque::from([small.clone(), packet.clone(), small.clone()]),
-        );
+        )
+        .await;
         for expected in [&small, &packet, &small] {
             assert_eq!(
                 &timeout(Duration::from_secs(5), tun_rx.recv())

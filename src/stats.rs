@@ -19,9 +19,6 @@ pub enum DropReason {
     SendFailure,
     NoPeer,
     Malformed,
-    /// The per-peer dispatch queue filled while that peer was waiting for room
-    /// in its QUIC datagram queue. Only traffic for that peer is dropped.
-    Backpressure,
     /// Inbound datagram whose source IP did not match the sending peer's
     /// assigned mesh address (ingress anti-spoofing). A peer may only inject
     /// packets sourced from its own mesh IP.
@@ -52,12 +49,11 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    const ALL: [DropReason; 13] = [
+    const ALL: [DropReason; 12] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
         DropReason::Malformed,
-        DropReason::Backpressure,
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
@@ -82,8 +78,6 @@ pub struct MetricsSnapshot {
     pub packets_tx: u64,
     pub bytes_rx: u64,
     pub bytes_tx: u64,
-    pub datagram_send_waits: u64,
-    pub datagram_send_wait_us: u64,
     pub tun_write_batches: u64,
     pub tun_write_packets: u64,
     pub tun_write_errors: u64,
@@ -102,10 +96,6 @@ pub struct ForwardMetrics {
     pub packets_rx: Counter,
     /// Total packets sent to peers
     pub packets_tx: Counter,
-    /// Times forwarding had to wait for a peer's QUIC datagram queue.
-    pub datagram_send_waits: Counter,
-    /// Total microseconds spent waiting for QUIC datagram queue capacity.
-    pub datagram_send_wait_us: Counter,
     /// TUN write operations, including batched writes.
     pub tun_write_batches: Counter,
     /// Packets submitted through TUN write operations.
@@ -198,8 +188,6 @@ impl ForwardMetrics {
             packets_tx: self.packets_tx.get(),
             bytes_rx: self.bytes_rx.get(),
             bytes_tx: self.bytes_tx.get(),
-            datagram_send_waits: self.datagram_send_waits.get(),
-            datagram_send_wait_us: self.datagram_send_wait_us.get(),
             tun_write_batches: self.tun_write_batches.get(),
             tun_write_packets: self.tun_write_packets.get(),
             tun_write_errors: self.tun_write_errors.get(),
@@ -430,7 +418,6 @@ mod tests {
                 | DropReason::SendFailure
                 | DropReason::NoPeer
                 | DropReason::Malformed
-                | DropReason::Backpressure
                 | DropReason::Spoof
                 | DropReason::ExitDenied
                 | DropReason::ReassemblyTimeout
