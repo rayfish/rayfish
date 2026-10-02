@@ -1903,15 +1903,17 @@ public struct NodeStatus {
     public var files: [IncomingFile]
     public var ssh: NodeSshStatus
     public var services: NodeServiceStatus
+    public var connectionWarning: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(mesh: NodeMeshStatus, requests: NodeRequestStatus, files: [IncomingFile], ssh: NodeSshStatus, services: NodeServiceStatus) {
+    public init(mesh: NodeMeshStatus, requests: NodeRequestStatus, files: [IncomingFile], ssh: NodeSshStatus, services: NodeServiceStatus, connectionWarning: String?) {
         self.mesh = mesh
         self.requests = requests
         self.files = files
         self.ssh = ssh
         self.services = services
+        self.connectionWarning = connectionWarning
     }
 }
 
@@ -1937,6 +1939,9 @@ extension NodeStatus: Equatable, Hashable {
         if lhs.services != rhs.services {
             return false
         }
+        if lhs.connectionWarning != rhs.connectionWarning {
+            return false
+        }
         return true
     }
 
@@ -1946,6 +1951,7 @@ extension NodeStatus: Equatable, Hashable {
         hasher.combine(files)
         hasher.combine(ssh)
         hasher.combine(services)
+        hasher.combine(connectionWarning)
     }
 }
 
@@ -1962,7 +1968,8 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
                 requests: FfiConverterTypeNodeRequestStatus.read(from: &buf),
                 files: FfiConverterSequenceTypeIncomingFile.read(from: &buf),
                 ssh: FfiConverterTypeNodeSshStatus.read(from: &buf),
-                services: FfiConverterTypeNodeServiceStatus.read(from: &buf)
+                services: FfiConverterTypeNodeServiceStatus.read(from: &buf),
+                connectionWarning: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -1972,6 +1979,7 @@ public struct FfiConverterTypeNodeStatus: FfiConverterRustBuffer {
         FfiConverterSequenceTypeIncomingFile.write(value.files, into: &buf)
         FfiConverterTypeNodeSshStatus.write(value.ssh, into: &buf)
         FfiConverterTypeNodeServiceStatus.write(value.services, into: &buf)
+        FfiConverterOptionString.write(value.connectionWarning, into: &buf)
     }
 }
 

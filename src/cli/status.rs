@@ -1036,11 +1036,30 @@ fn device_row(
     } else {
         (String::new(), String::new())
     };
+    let quality = peer
+        .connection
+        .as_ref()
+        .and_then(|connection| connection.quality_issue)
+        .map(|issue| match issue {
+            ipc::ConnectionIssue::HighLatency => "slow",
+            ipc::ConnectionIssue::PacketLoss => "loss",
+            ipc::ConnectionIssue::SendQueue => "congested",
+        });
+    let (quality_plain, quality_styled) = match quality {
+        Some(label) => (
+            format!(" ·{label}·"),
+            format!(" {}", style::red(&format!("·{label}·"))),
+        ),
+        None => (String::new(), String::new()),
+    };
     // Merge branch + glyph + host into the first cell so the branch sits before
     // the glyph and the columns after it (ip, via, …) still align across all rows.
     let name = layout::Cell::new(
-        format!("{prefix}{glyph_plain} {host}{coord_plain}"),
-        format!("{prefix}{glyph_styled} {}{coord_styled}", host_style(&host)),
+        format!("{prefix}{glyph_plain} {host}{coord_plain}{quality_plain}"),
+        format!(
+            "{prefix}{glyph_styled} {}{coord_styled}{quality_styled}",
+            host_style(&host)
+        ),
     );
     let mut cells = match &peer.connection {
         Some(ci) => {
@@ -1288,6 +1307,8 @@ mod grouping_tests {
             datagrams_tx: 0,
             datagrams_rx: 0,
             lost_packets: 0,
+            quality: ipc::ConnectionQuality::Good,
+            quality_issue: None,
         }
     }
 
@@ -1468,6 +1489,21 @@ mod grouping_tests {
             .find(|l| l.contains("hub"))
             .expect("coordinator row");
         assert!(coord_line.contains("·coord·"), "{out}");
+    }
+
+    #[test]
+    fn marks_a_peer_with_a_degraded_connection() {
+        let mut slow = peer("slow-peer", None, false, true, false);
+        let connection = slow.connection.as_mut().expect("peer is active");
+        connection.quality = ipc::ConnectionQuality::Degraded;
+        connection.quality_issue = Some(ipc::ConnectionIssue::PacketLoss);
+
+        let out = render(&net("laptop", vec![slow]));
+        let slow_line = out
+            .lines()
+            .find(|line| line.contains("slow-peer"))
+            .expect("peer row");
+        assert!(slow_line.contains("·loss·"), "{out}");
     }
 
     #[test]

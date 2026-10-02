@@ -289,7 +289,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              destination: file.destination)
             },
             sshEnabled: status.ssh.enabled,
-            sshRules: status.ssh.rules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) }
+            sshRules: status.ssh.rules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) },
+            connectionWarning: status.connectionWarning
         )
     }
 }

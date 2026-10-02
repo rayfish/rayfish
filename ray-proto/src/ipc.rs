@@ -1591,6 +1591,52 @@ pub struct ConnectionInfo {
     pub datagrams_tx: u64,
     pub datagrams_rx: u64,
     pub lost_packets: u64,
+    #[serde(default)]
+    pub quality: ConnectionQuality,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_issue: Option<ConnectionIssue>,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
+)]
+pub enum ConnectionQuality {
+    #[default]
+    #[display("good")]
+    Good,
+    #[display("degraded")]
+    Degraded,
+    #[display("congested")]
+    Congested,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    derive_more::IsVariant,
+    derive_more::Display,
+)]
+pub enum ConnectionIssue {
+    #[display("high latency")]
+    HighLatency,
+    #[display("packet loss")]
+    PacketLoss,
+    #[display("send queue full")]
+    SendQueue,
 }
 
 #[derive(

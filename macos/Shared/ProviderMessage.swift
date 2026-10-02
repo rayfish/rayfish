@@ -92,6 +92,7 @@ struct ProviderStatus: Codable, Equatable {
     var files: [ProviderFile]? = nil
     var sshEnabled: Bool? = nil
     var sshRules: [ProviderSSHRule]? = nil
+    var connectionWarning: String? = nil
 }
 
 struct ProviderSSHRule: Codable, Equatable, Identifiable {

@@ -64,6 +64,7 @@ struct AppUITests {
             ProviderPeer(hostname: "second", ipv6: "278::2", state: "relay", latencyMs: nil, isOwnDevice: false)
         )
         controller.error = "Test connection issue"
+        controller.status!.connectionWarning = "Connection quality is poor."
         drainTrackingUpdates()
         precondition(row("network:testnet", in: menu) === network)
         precondition(network.submenu === submenu)
@@ -71,6 +72,7 @@ struct AppUITests {
         precondition(peer.title == "renamed (direct)")
         precondition(peer.representedObject as? String == "renamed.testnet.ray")
         precondition(network.title == "testnet (2 devices)")
+        precondition(row("connection-quality", in: menu)?.toolTip == "Connection quality is poor.")
         precondition(row("Connection Issue: Open Rayfish", in: menu)?.toolTip == "Test connection issue")
         print("PASS: peer updates preserve submenu and row identity")
 
@@ -79,6 +81,7 @@ struct AppUITests {
         controller.connectionStatus = .disconnected
         drainTrackingUpdates()
         precondition(row("network:testnet", in: menu) == nil)
+        precondition(row("connection-quality", in: menu) == nil)
         precondition(row("Connection Issue: Open Rayfish", in: menu) == nil)
         precondition(row("Open Rayfish", in: menu) != nil)
         print("PASS: disconnect clears stale networks and errors")

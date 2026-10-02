@@ -86,6 +86,12 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
             items.append(separator("activity-start"))
             items.append(item(activity, id: "activity"))
         }
+        if let warning = controller.status?.connectionWarning {
+            items.append(separator("quality-start"))
+            let entry = item("Slow Connection: Open Rayfish", action: #selector(showWindow), id: "connection-quality")
+            entry.toolTip = warning
+            items.append(entry)
+        }
         if let error = controller.error {
             items.append(separator("error-start"))
             let entry = item("Connection Issue: Open Rayfish", action: #selector(showWindow))

@@ -27,6 +27,46 @@ const STATUS_OFFLINE_WINDOW: Duration = Duration::from_secs(300);
 
 const RTT_WINDOW: usize = 32;
 const RTT_MIN_SAMPLES: usize = 8;
+const HIGH_RTT_MS: f64 = 150.0;
+const MIN_LOSS_SAMPLE_PACKETS: u64 = 100;
+const DEGRADED_LOSS_PERCENT: u64 = 2;
+const DEGRADED_QUEUE_BYTES: usize = 256 * 1024;
+const CONGESTED_QUEUE_BYTES: usize = 1024 * 1024;
+
+fn connection_quality(
+    rtt_ms: Option<f64>,
+    sent_packets: u64,
+    lost_packets: u64,
+    queued_bytes: usize,
+) -> (ipc::ConnectionQuality, Option<ipc::ConnectionIssue>) {
+    if queued_bytes >= CONGESTED_QUEUE_BYTES {
+        return (
+            ipc::ConnectionQuality::Congested,
+            Some(ipc::ConnectionIssue::SendQueue),
+        );
+    }
+    if queued_bytes >= DEGRADED_QUEUE_BYTES {
+        return (
+            ipc::ConnectionQuality::Degraded,
+            Some(ipc::ConnectionIssue::SendQueue),
+        );
+    }
+    if sent_packets >= MIN_LOSS_SAMPLE_PACKETS
+        && lost_packets.saturating_mul(100) >= sent_packets.saturating_mul(DEGRADED_LOSS_PERCENT)
+    {
+        return (
+            ipc::ConnectionQuality::Degraded,
+            Some(ipc::ConnectionIssue::PacketLoss),
+        );
+    }
+    if rtt_ms.is_some_and(|rtt| rtt >= HIGH_RTT_MS) {
+        return (
+            ipc::ConnectionQuality::Degraded,
+            Some(ipc::ConnectionIssue::HighLatency),
+        );
+    }
+    (ipc::ConnectionQuality::Good, None)
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct RttHistory(HashMap<EndpointId, VecDeque<f64>>);
@@ -97,6 +137,55 @@ mod rtt_history_tests {
         }
         assert_eq!(history.0[&peer].len(), RTT_WINDOW);
         assert!(!history.observe(peer, 225.0));
+    }
+}
+
+#[cfg(test)]
+mod connection_quality_tests {
+    use super::*;
+
+    #[test]
+    fn reports_queue_pressure_before_other_signals() {
+        assert_eq!(
+            connection_quality(Some(250.0), 100, 20, CONGESTED_QUEUE_BYTES),
+            (
+                ipc::ConnectionQuality::Congested,
+                Some(ipc::ConnectionIssue::SendQueue)
+            )
+        );
+        assert_eq!(
+            connection_quality(Some(20.0), 100, 0, DEGRADED_QUEUE_BYTES),
+            (
+                ipc::ConnectionQuality::Degraded,
+                Some(ipc::ConnectionIssue::SendQueue)
+            )
+        );
+    }
+
+    #[test]
+    fn requires_enough_packets_before_reporting_loss() {
+        assert_eq!(
+            connection_quality(Some(20.0), 99, 50, 0),
+            (ipc::ConnectionQuality::Good, None)
+        );
+        assert_eq!(
+            connection_quality(Some(20.0), 100, 2, 0),
+            (
+                ipc::ConnectionQuality::Degraded,
+                Some(ipc::ConnectionIssue::PacketLoss)
+            )
+        );
+    }
+
+    #[test]
+    fn reports_high_latency() {
+        assert_eq!(
+            connection_quality(Some(HIGH_RTT_MS), 0, 0, 0),
+            (
+                ipc::ConnectionQuality::Degraded,
+                Some(ipc::ConnectionIssue::HighLatency)
+            )
+        );
     }
 }
 
@@ -529,6 +618,14 @@ impl Daemon {
         };
 
         let stats = conn.stats();
+        let queued_bytes = crate::transport::DATAGRAM_SEND_BUFFER_SIZE
+            .saturating_sub(conn.datagram_send_buffer_space());
+        let (quality, quality_issue) = connection_quality(
+            rtt_ms,
+            stats.udp_tx.datagrams,
+            stats.lost_packets,
+            queued_bytes,
+        );
         ipc::ConnectionInfo {
             conn_type,
             remote_addr,
@@ -538,6 +635,8 @@ impl Daemon {
             datagrams_tx: stats.udp_tx.datagrams,
             datagrams_rx: stats.udp_rx.datagrams,
             lost_packets: stats.lost_packets,
+            quality,
+            quality_issue,
         }
     }
 

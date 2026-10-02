@@ -16,7 +16,7 @@ use rayfish::daemon::start_embedded_ipc;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
-use rayfish::ipc::{IpcMessage, TransferFileState};
+use rayfish::ipc::{ConnectionIssue, IpcMessage, TransferFileState};
 use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
@@ -29,6 +29,14 @@ uniffi::setup_scaffolding!();
 
 const START_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn connection_issue_priority(issue: ConnectionIssue) -> u8 {
+    match issue {
+        ConnectionIssue::HighLatency => 1,
+        ConnectionIssue::PacketLoss => 2,
+        ConnectionIssue::SendQueue => 3,
+    }
+}
 
 #[derive(Debug, Error, uniffi::Error)]
 pub enum AppleError {
@@ -57,6 +65,7 @@ pub struct NodeStatus {
     pub files: Vec<IncomingFile>,
     pub ssh: NodeSshStatus,
     pub services: NodeServiceStatus,
+    pub connection_warning: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -360,6 +369,33 @@ impl Node {
             v4_bridge_enabled: settings.v4_bridge,
         };
         let ipv6 = membership::derive_ipv6(&endpoint_id).to_string();
+        let connection_warning = networks
+            .iter()
+            .flat_map(|network| &network.peers)
+            .filter_map(|peer| {
+                peer.connection
+                    .as_ref()
+                    .and_then(|connection| connection.quality_issue)
+                    .map(|issue| {
+                        let name = peer
+                            .hostname
+                            .clone()
+                            .unwrap_or_else(|| peer.endpoint_id.fmt_short().to_string());
+                        let detail = match issue {
+                            ConnectionIssue::HighLatency => "has high latency",
+                            ConnectionIssue::PacketLoss => "is losing packets",
+                            ConnectionIssue::SendQueue => "cannot accept traffic fast enough",
+                        };
+                        (
+                            connection_issue_priority(issue),
+                            format!(
+                                "Connection to {name} {detail}. Rayfish traffic may be delayed."
+                            ),
+                        )
+                    })
+            })
+            .max_by_key(|(priority, _)| *priority)
+            .map(|(_, warning)| warning);
         let networks = networks
             .into_iter()
             .map(|network| Network {
@@ -401,6 +437,7 @@ impl Node {
             files,
             ssh,
             services,
+            connection_warning,
         })
     }
 

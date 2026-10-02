@@ -147,6 +147,19 @@ private struct ContentView: View {
                     }
                     .foregroundColor(RayfishTheme.muted)
                 }
+                if let warning = controller.status?.connectionWarning {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "network.slash")
+                        Text(warning).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(RayfishTheme.text(14))
+                    .foregroundColor(RayfishTheme.amber)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RayfishTheme.amber.opacity(0.04))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(RayfishTheme.amber.opacity(0.25)))
+                }
                 if let error = controller.error {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "exclamationmark.triangle")

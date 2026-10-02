@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `ray status` and the macOS app warn when a peer connection has high latency,
+  packet loss, or a backed-up send queue.
+
 - `ray identityof <contact-id>` looks up the advertised device identity without
   connecting to the peer or requesting approval.
 
