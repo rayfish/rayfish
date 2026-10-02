@@ -74,7 +74,12 @@ macos-notification-test:
 
 # Build a locally testable app with automatic Apple Development signing.
 macos-dev:
-    env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration Debug -destination platform=macOS,arch=arm64 ARCHS=arm64 -derivedDataPath target/macos-development -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version=$(cargo pkgid -p rayfish)
+    version=${version##*@}
+    marketing_version=${version%%[-+]*}
+    env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration Debug -destination platform=macOS,arch=arm64 ARCHS=arm64 MARKETING_VERSION="$marketing_version" -derivedDataPath target/macos-development -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
 
 # Build an optimized app for this Mac with automatic Apple Development signing.
 macos-release:
@@ -85,6 +90,9 @@ macos-release:
         exit 1
     fi
     arch=$(uname -m)
+    version=$(cargo pkgid -p rayfish)
+    version=${version##*@}
+    marketing_version=${version%%[-+]*}
     team=${RAYFISH_DEVELOPMENT_TEAM:-}
     if [[ -z "$team" ]]; then
         installed_signature=$(codesign -dv --verbose=4 /Applications/Rayfish.app 2>&1 || true)
@@ -111,7 +119,7 @@ macos-release:
         echo "RAYFISH_LOCAL_BUILD_NUMBER must be a positive integer" >&2
         exit 1
     fi
-    env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration LocalRelease -destination "platform=macOS,arch=$arch" ARCHS="$arch" ONLY_ACTIVE_ARCH=YES DEVELOPMENT_TEAM="$team" CURRENT_PROJECT_VERSION="$build_number" -derivedDataPath target/macos-local-release -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+    env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration LocalRelease -destination "platform=macOS,arch=$arch" ARCHS="$arch" ONLY_ACTIVE_ARCH=YES DEVELOPMENT_TEAM="$team" MARKETING_VERSION="$marketing_version" CURRENT_PROJECT_VERSION="$build_number" -derivedDataPath target/macos-local-release -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
     app=target/macos-local-release/Build/Products/LocalRelease/Rayfish.app
     codesign --verify --strict "$app"
     codesign --verify --strict "$app/Contents/Library/SystemExtensions/com.rayfish.app.tunnel.systemextension"
