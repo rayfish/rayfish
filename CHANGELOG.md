@@ -60,6 +60,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Android downloads started from Home continue when switching tabs. Navigation
   and text inputs survive activity recreation, and Back closes network details.
 
+### Performance
+
+- Bursty peer traffic such as Screen Sharing gets a larger send queue, reducing
+  packet loss when QUIC temporarily lowers its sending rate.
+
 ## [0.5.6] - 2026-10-01
 
 ### Added
