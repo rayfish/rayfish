@@ -73,7 +73,7 @@ impl RuntimeProvider for UnderlayRuntime {
         Box::pin(async move {
             let socket = UdpSocket::bind(local).await?;
             LoopPrevention.configure(SockRef::from(&socket), Domain::for_address(local))?;
-            UnderlayUdp::new(socket, server)
+            UnderlayUdp::new(socket, server).await
         })
     }
 }

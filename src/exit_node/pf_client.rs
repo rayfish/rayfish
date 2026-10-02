@@ -4,39 +4,39 @@ use super::*;
 
 const CLIENT_ANCHOR: &str = "com.apple/rayfish_exit_client";
 
+/// A resolver the endpoint's own DNS client may reach directly, as root.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ControlDnsSocket {
-    pub local_port: u16,
+pub(crate) struct ControlDnsServer {
     pub server: SocketAddr,
     pub tcp: bool,
 }
 
-static DNS_SOCKETS: Mutex<Vec<ControlDnsSocket>> = Mutex::new(Vec::new());
+/// Only grows: the control-plane resolvers are a short fixed list, and keeping
+/// them avoids a pf rebuild for every DNS socket the endpoint opens and closes.
+static DNS_SERVERS: Mutex<Vec<ControlDnsServer>> = Mutex::new(Vec::new());
 /// Local UDP ports of the endpoint's underlay sockets. They are pinned to the
 /// physical interface, so every direct peer path leaves from one of them.
 static UNDERLAY_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 static FILTER_UPDATE: Mutex<()> = Mutex::new(());
 static FILTER_READY: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn allow_control_dns(socket: ControlDnsSocket) -> Result<()> {
-    DNS_SOCKETS
-        .lock()
-        .map_err(|_| anyhow::anyhow!("DNS socket lock poisoned"))?
-        .push(socket);
+pub(crate) fn allow_control_dns(server: ControlDnsServer) -> Result<()> {
+    {
+        let mut servers = DNS_SERVERS
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DNS server lock poisoned"))?;
+        if servers.contains(&server) {
+            return Ok(());
+        }
+        servers.push(server);
+    }
     if let Err(error) = refresh_client_filter() {
-        remove_control_dns(&socket);
+        if let Ok(mut servers) = DNS_SERVERS.lock() {
+            servers.retain(|s| *s != server);
+        }
         return Err(error);
     }
     Ok(())
-}
-
-pub(crate) fn remove_control_dns(socket: &ControlDnsSocket) {
-    if let Ok(mut sockets) = DNS_SOCKETS.lock() {
-        sockets.retain(|s| s != socket);
-    }
-    if let Err(error) = refresh_client_filter() {
-        tracing::warn!(%error, "could not remove DNS transport exception");
-    }
 }
 
 fn client_snapshot_path() -> Result<PathBuf> {
@@ -90,17 +90,16 @@ fn install_filter(tun: &str) -> Result<()> {
             "pass out quick proto {{ tcp, udp }} to {ip} user 0 no state\n"
         ));
     }
-    for socket in DNS_SOCKETS
+    for dns in DNS_SERVERS
         .lock()
-        .map_err(|_| anyhow::anyhow!("DNS socket lock poisoned"))?
+        .map_err(|_| anyhow::anyhow!("DNS server lock poisoned"))?
         .iter()
     {
-        let protocol = if socket.tcp { "tcp" } else { "udp" };
+        let protocol = if dns.tcp { "tcp" } else { "udp" };
         rules.push_str(&format!(
-            "pass out quick proto {protocol} from any port {} to {} port {} no state\n",
-            socket.local_port,
-            socket.server.ip(),
-            socket.server.port()
+            "pass out quick proto {protocol} to {} port {} user 0 no state\n",
+            dns.server.ip(),
+            dns.server.port()
         ));
     }
     rules.push_str("pass out quick inet proto udp from any port 68 to any port 67 no state\n");

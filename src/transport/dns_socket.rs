@@ -1,4 +1,4 @@
-//! Keep macOS DNS firewall exceptions tied to the lifetime of their bound sockets.
+//! Let the endpoint's own DNS sockets past the macOS exit filter.
 
 use std::io;
 use std::net::SocketAddr;
@@ -10,50 +10,28 @@ use hickory_resolver::net::runtime::{DnsUdpSocket, RuntimeProvider, TokioRuntime
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
-struct Permit {
+/// Lets the endpoint's own DNS reach `server` past the macOS exit filter. The
+/// first use of a server reloads pf, so it runs on the blocking pool.
+async fn allow(server: SocketAddr, tcp: bool) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    socket: crate::exit_node::ControlDnsSocket,
-}
-
-impl Permit {
-    fn new(local_port: u16, server: SocketAddr, tcp: bool) -> io::Result<Self> {
-        #[cfg(target_os = "macos")]
-        {
-            let socket = crate::exit_node::ControlDnsSocket {
-                local_port,
-                server,
-                tcp,
-            };
-            crate::exit_node::allow_control_dns(socket).map_err(io::Error::other)?;
-            Ok(Self { socket })
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (local_port, server, tcp);
-            Ok(Self {})
-        }
-    }
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        crate::exit_node::remove_control_dns(&self.socket);
-    }
+    tokio::task::spawn_blocking(move || {
+        crate::exit_node::allow_control_dns(crate::exit_node::ControlDnsServer { server, tcp })
+            .map_err(io::Error::other)
+    })
+    .await??;
+    #[cfg(not(target_os = "macos"))]
+    let _ = (server, tcp);
+    Ok(())
 }
 
 pub(super) struct UnderlayUdp {
-    _permit: Permit,
     socket: UdpSocket,
 }
 
 impl UnderlayUdp {
-    pub(super) fn new(socket: UdpSocket, server: SocketAddr) -> io::Result<Self> {
-        let permit = Permit::new(socket.local_addr()?.port(), server, false)?;
-        Ok(Self {
-            socket,
-            _permit: permit,
-        })
+    pub(super) async fn new(socket: UdpSocket, server: SocketAddr) -> io::Result<Self> {
+        allow(server, false).await?;
+        Ok(Self { socket })
     }
 }
 
@@ -81,16 +59,14 @@ impl DnsUdpSocket for UnderlayUdp {
 }
 
 pub(super) struct UnderlayTcp {
-    _permit: Permit,
     socket: TcpStream,
 }
 
 impl UnderlayTcp {
     pub(super) async fn connect(socket: TcpSocket, server: SocketAddr) -> io::Result<Self> {
-        let permit = Permit::new(socket.local_addr()?.port(), server, true)?;
+        allow(server, true).await?;
         Ok(Self {
             socket: socket.connect(server).await?,
-            _permit: permit,
         })
     }
 }

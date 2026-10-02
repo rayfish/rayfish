@@ -902,8 +902,7 @@ pub use linux::{disable, install_client_routing, teardown_client_routing};
 mod pf_client;
 #[cfg(target_os = "macos")]
 pub(crate) use pf_client::{
-    ControlDnsSocket, allow_control_dns, install_client_filter, remove_client_filter,
-    remove_control_dns,
+    ControlDnsServer, allow_control_dns, install_client_filter, remove_client_filter,
 };
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
