@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
@@ -128,6 +128,7 @@ struct ActiveConnection {
     /// held open like an eager node so it never flaps.
     supports_idle_close: Arc<AtomicBool>,
     receive_mtu: Arc<AtomicU16>,
+    exit_ipv4: Arc<AtomicU8>,
 }
 
 impl ActiveConnection {
@@ -139,6 +140,7 @@ impl ActiveConnection {
             last_active: Arc::new(AtomicU64::new(now_ms())),
             supports_idle_close: Arc::new(AtomicBool::new(false)),
             receive_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            exit_ipv4: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -170,12 +172,17 @@ pub struct PeerRoute {
     /// The outbound datagram tag for `network` on this connection.
     pub handle: u16,
     receive_mtu: Arc<AtomicU16>,
+    exit_ipv4: Arc<AtomicU8>,
     /// Shared last-activity clock for this peer's connection; the sender bumps it
     /// after a successful send so the idle reaper sees the connection as active.
     last_active: Arc<AtomicU64>,
 }
 
 impl PeerRoute {
+    pub fn supports_exit_ipv4(&self) -> bool {
+        self.exit_ipv4.load(Ordering::Relaxed) == 2
+    }
+
     /// The peer's advertised IP packet limit; conservative until it announces.
     pub fn receive_mtu(&self) -> u16 {
         self.receive_mtu.load(Ordering::Relaxed)
@@ -281,6 +288,7 @@ impl PeerEntry {
             network,
             handle,
             receive_mtu: Arc::clone(&self.active.receive_mtu),
+            exit_ipv4: Arc::clone(&self.active.exit_ipv4),
             last_active: Arc::clone(&self.active.last_active),
         })
     }
@@ -440,6 +448,23 @@ impl PeerTable {
         self.peers.contains_key(&ip).then_some(ip)
     }
 
+    pub fn note_exit_ipv4_support(&self, peer: &EndpointId, conn: &Connection, supported: bool) {
+        self.update_current(&membership::derive_ipv6(peer), conn, |entry| {
+            entry
+                .active
+                .exit_ipv4
+                .store(if supported { 2 } else { 1 }, Ordering::Relaxed);
+        });
+    }
+
+    pub fn exit_ipv4_support(&self, ip: &Ipv6Addr) -> Option<bool> {
+        match self.peers.get(ip)?.active.exit_ipv4.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
     /// Record whether `peer_id` advertised idle-close support in its `MeshHello`
     /// (`features & FEATURE_IDLE_CLOSE`). Drives whether the per-connection idle
     /// timer is allowed to close this link.
@@ -552,6 +577,7 @@ impl PeerTable {
             network: SmolStr::new(network),
             handle,
             receive_mtu: Arc::clone(&e.active.receive_mtu),
+            exit_ipv4: Arc::clone(&e.active.exit_ipv4),
             last_active: Arc::clone(&e.active.last_active),
         })
     }

@@ -14,6 +14,7 @@ final class TunnelController: ObservableObject {
     var connectionLabel: String { isConnected ? "connected" : "disconnected" }
     func connect() async { connectionStatus = .connected }
     func disconnect() async { connectionStatus = .disconnected }
+    func selectExitNode(network: String, peer: String?) async {}
 }
 
 @main
@@ -45,7 +46,10 @@ struct AppUITests {
             ProviderNetwork(name: "testnet", hostname: "local-device", ipv6: "287::1", role: "coordinator", peers: [
                 ProviderPeer(hostname: "remote-device", ipv6: "278::1", state: "idle", latencyMs: nil, isOwnDevice: false)
             ])
-        ], pendingRequests: [])
+        ], pendingRequests: [], exitNodes: [
+            ProviderExitNodeNetwork(network: "testnet", using: nil, available: ["remote-device"],
+                                    refused: [], problem: nil)
+        ])
         controller.connectionStatus = .connected
         controller.activity = nil
         controller.isLoading = false
@@ -56,7 +60,17 @@ struct AppUITests {
         let submenu = network.submenu!
         let peer = row("peer:278::1", in: submenu)!
         precondition(peer.representedObject as? String == "remote-device.testnet.ray")
+        let exits = row("exit-node", in: menu)!.submenu!
+        precondition(row("exit-direct", in: exits)?.state == .on)
+        precondition(row("exit:testnet:remote-device", in: exits)?.isEnabled == true)
         print("PASS: connecting menu receives networks while tracking")
+
+        controller.status!.networks[0].peers[0].identity = "peer-id"
+        controller.status!.exitNodes[0].using = "peer-id"
+        drainTrackingUpdates()
+        precondition(row("exit-node", in: menu)?.submenu === exits)
+        precondition(row("exit-direct", in: exits)?.state == .off)
+        precondition(row("exit:testnet:remote-device", in: exits)?.state == .on)
 
         controller.status!.networks[0].peers[0].hostname = "renamed"
         controller.status!.networks[0].peers[0].state = "direct"

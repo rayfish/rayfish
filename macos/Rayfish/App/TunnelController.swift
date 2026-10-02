@@ -348,6 +348,10 @@ final class TunnelController: ObservableObject {
         if setting == .ssh, enabled { error = SSHHelper.approvalMessage }
     }
 
+    func selectExitNode(network: String, peer: String?) async {
+        _ = await perform(ProviderRequest(action: .selectExitNode, peer: peer, network: network))
+    }
+
     func reconnect() async {
         await disconnect()
         guard connectionStatus == .disconnected || connectionStatus == .invalid else { return }

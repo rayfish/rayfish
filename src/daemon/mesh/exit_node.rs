@@ -24,15 +24,7 @@ fn display_name(m: &Member) -> String {
         .unwrap_or_else(|| m.identity.fmt_short().to_string())
 }
 
-/// Why this node cannot route through `member`, or `None` when it can. `member`
-/// is `None` when the roster does not list the peer at all.
-///
-/// Two refusals, both about a gateway that would take our traffic and drop it.
-/// The first is the long-standing one: a peer that does not advertise an exit
-/// node has no allow-list entry for us and would refuse every packet. The second
-/// is the family gate: the tunnel carries IPv6 alone, so a gateway with no IPv6
-/// uplink has nothing to masquerade onto and would black-hole us in silence. Both
-/// are cheaper to say here than to diagnose from a dead tunnel.
+/// Refuse a new selection when the peer offers no exit or has no usable uplink.
 fn gateway_refusal(member: Option<&Member>, name: &str, network: &str) -> Option<String> {
     match member {
         None
@@ -42,50 +34,29 @@ fn gateway_refusal(member: Option<&Member>, name: &str, network: &str) -> Option
             "{name} does not advertise an exit node on '{network}' \
              (see `ray exit-node status`)"
         )),
-        Some(m) => ipv6_gateway_refusal(m, name),
+        Some(m) => gateway_family_refusal(m, name),
     }
 }
 
-/// The family half of [`gateway_refusal`], on its own because the two halves have
-/// different lifetimes. "Does not advertise an exit node" is a roster fact that
-/// flickers (a coordinator rebuild, a gateway mid-restart) and must not drop a
-/// live tunnel, so it is only ever checked when the user picks. This one is a
-/// standing property of the pair: while it holds, the tunnel carries nothing, so
-/// it is re-checked on every re-apply as well.
-///
-/// Refuses only when the tunnel would carry *nothing*
-/// ([`ExitFamilies::tunnelled`] is [`ExitFamilies::Neither`]). A gateway claiming
-/// IPv4 as well is not refused: the tunnel narrows to IPv6 and the host's IPv4
-/// leaves directly, which is what it did before the tunnel existed.
-///
-/// [`ExitFamilies::Unknown`] never refuses, because `tunnelled` reads it as "can
-/// carry": it is what a coordinator on a release that predates the field leaves
-/// behind, and treating silence as denial would make exit nodes unusable on every
-/// such network. Allowing it can be wrong, but wrongly is the direction that
-/// fails loudly (the user chose this gateway, sees no internet, and clears it),
-/// while the silent black hole this exists to prevent is a gateway confidently
-/// marked usable. The caller warns instead, so the reason is in the log before the
-/// traffic stops.
-fn ipv6_gateway_refusal(m: &Member, name: &str) -> Option<String> {
+/// An unknown claim permits legacy IPv6 exits. A known empty claim cannot
+/// serve a new selection. An existing selection remains installed and blocked.
+fn gateway_family_refusal(m: &Member, name: &str) -> Option<String> {
     if m.exit_families.tunnelled() != ExitFamilies::Neither {
         return None;
     }
     Some(format!(
-        "{name} offers an exit node but cannot carry IPv6, which is the only family \
-         the mesh routes, so nothing would reach the internet through it. Pick a \
-         gateway shown as (IPv6) in `ray exit-node status`, or give that host an \
-         IPv6 uplink."
+        "{name} offers an exit node but cannot carry IPv4 or IPv6. Give that host an internet uplink."
     ))
 }
 
 /// Whether selecting `m` as a gateway is a guess: it offers an exit node, we need
 /// IPv6 out of it, and nothing on the roster says whether it has any. Distinct
-/// from [`ipv6_gateway_refusal`], which answers a claim that was actually made.
+/// from [`gateway_family_refusal`], which answers a claim that was actually made.
 ///
 /// Fires on any unclaimed gateway: every tunnel needs IPv6 out of it now, so a
 /// roster that says nothing about a gateway's uplink is a roster we are guessing
 /// against. That includes every network whose coordinator predates the field.
-fn ipv6_gateway_unverified(m: &Member) -> bool {
+fn gateway_unverified(m: &Member) -> bool {
     m.exit_node && m.exit_families.is_unknown()
 }
 
@@ -103,14 +74,17 @@ fn selection_problem(
     data_plane_up: bool,
     member: Option<&Member>,
 ) -> Option<String> {
-    // First, because a failed install leaves the selection resolved: it rolled
-    // its own rules back and the next re-apply will retry, so the config is
-    // still what the user wants and nothing is carrying traffic meanwhile.
+    // Installation failures take precedence over roster state.
     if let Some(e) = install_error {
         return Some(format!("the tunnel could not be installed: {e}"));
     }
     if selection_resolved {
-        return None;
+        return match member {
+            None => Some(
+                "the selected exit is missing from the roster; traffic remains blocked".to_string(),
+            ),
+            Some(member) => gateway_family_refusal(member, &display_name(member)),
+        };
     }
     if !data_plane_up {
         return Some("the data plane is down (`ray up`)".to_string());
@@ -118,7 +92,7 @@ fn selection_problem(
     let Some(member) = member else {
         return Some("the peer is not in this network's roster".to_string());
     };
-    ipv6_gateway_refusal(member, &display_name(member)).or(Some(
+    gateway_family_refusal(member, &display_name(member)).or(Some(
         "the full tunnel is not installed; see the daemon log".to_string(),
     ))
 }
@@ -168,7 +142,7 @@ fn offer_disagrees(
 /// live registry.
 ///
 /// Two states need it, and only one of them is a pending selection. An
-/// *installed* tunnel is the other: [`ipv6_gateway_refusal`] is a standing
+/// *installed* tunnel is the other: [`gateway_family_refusal`] is a standing
 /// property re-checked on every apply, and the roster is exactly where it
 /// changes, so a gateway that loses its IPv6 uplink (or a coordinator that
 /// upgrades and fills in a claim we had to guess at) has to reach a re-apply.
@@ -279,14 +253,7 @@ impl NetworkRegistry {
         IpcMessage::Ok { message: detail }
     }
 
-    /// Select or clear the exit peer this node routes non-mesh traffic through.
-    /// On select, the peer must be in the roster and advertise `exit_node`, and on
-    /// an IPv6-only node the roster must not say it is IPv4-only (an absent claim is allowed, and warned about).
-    ///
-    /// That extra condition is the whole reason the flag exists. An IPv6-only data
-    /// plane tunnels IPv6 and nothing else, so a gateway that reaches the internet
-    /// over IPv4 alone would receive this node's traffic and have no uplink to
-    /// masquerade it onto. Refusing here turns a silent black hole into a sentence.
+    /// Select an advertised gateway with at least one usable address family.
     pub(crate) async fn exit_node_use(&self, network: &str, peer: Option<String>) -> IpcMessage {
         // Validate the selection against the live roster before persisting.
         // Set when the gateway is allowed on an absent IPv6 claim rather than a
@@ -306,15 +273,21 @@ impl NetworkRegistry {
                 // gateway's IPv6, which is what a coordinator too old to carry the
                 // claim leaves behind. Say so once, here, rather than let a dead
                 // tunnel be the first news of it.
-                unverified = member.as_ref().is_some_and(ipv6_gateway_unverified);
+                unverified = member.as_ref().is_some_and(gateway_unverified);
+                if self
+                    .roster_member(network, id)
+                    .is_some_and(|m| m.exit_families.carries_v4())
+                    && self.peers.exit_ipv4_support(&derive_ipv6(&id)) == Some(false)
+                {
+                    return ipc_err(
+                        "the gateway does not support IPv4 exit translation; upgrade it first",
+                    );
+                }
                 if unverified {
                     tracing::warn!(
                         gateway = %name,
                         network = %network,
-                        "selected gateway does not say whether it can carry IPv6, the only \
-                         family the mesh routes; allowing it because the claim is absent \
-                         rather than negative (a coordinator on an older release drops it). \
-                         If nothing reaches the internet, that is why"
+                        "selected gateway has no family claim; using IPv6 only"
                     );
                 }
                 Some(id.to_string())
@@ -329,50 +302,26 @@ impl NetworkRegistry {
             Ok(None) => return ipc_err(format!("no such network: {network}")),
             Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
         }
-        // "All traffic" would be a lie: the mesh carries no IPv4, so the tunnel
-        // takes IPv6 and leaves the host's IPv4 egress where it already was. Say
-        // so rather than let the user find out from a leak test.
         let message = match &peer {
-            Some(name) => format!(
-                "routing IPv6 traffic through {name} on {network}. IPv4 is not tunnelled \
-                 and still leaves this host directly{}",
-                if unverified {
-                    ". Note: this network's coordinator does not report whether that \
-                     gateway has an IPv6 uplink, so this is unverified. If nothing \
-                     reaches the internet, that is the first thing to check"
-                } else {
-                    ""
-                }
-            ),
+            Some(name) => {
+                format!(
+                    "exit node {name} selected on {network}{}",
+                    if unverified {
+                        ". Gateway capabilities are unknown; using IPv6 only"
+                    } else {
+                        ". See `ray exit-node status` for tunnelled families"
+                    }
+                )
+            }
             None => format!("direct egress restored on {network}"),
         };
         IpcMessage::Ok { message }
     }
 
-    /// Rebuild both halves of the runtime exit-node state from the on-disk config:
-    /// the gateway allow policy the inbound data path enforces
-    /// (`forward::evaluate_inbound`), and this node's own exit selection.
-    ///
-    /// The selection is the first network with `exit_node_use` set whose peer is a
-    /// resolvable roster member, resolved to its mesh IPv4 (to route to) and user
-    /// identity (to match its return traffic); it clears when the config selects
-    /// nothing. There is one default route, so only one selection can win: a
-    /// second one is reported rather than silently ignored. Cheap; called on
-    /// `activate()` and after any `ray exit-node` change while up. Returns a
-    /// user-facing warning when the state could not (yet) be made to match.
-    pub(crate) fn reload_exit_state(&self) -> Option<String> {
-        let networks = match config::load() {
-            Ok(c) => c.networks,
-            Err(e) => {
-                // A transient read failure must not be taken for an empty config:
-                // that would clear a live gateway's allow policy and tear down a
-                // live full tunnel, leaking the traffic the user chose to route.
-                tracing::warn!(error = %e, "config unreadable; exit-node state left as it was");
-                return Some(format!(
-                    "config unreadable, exit-node state left as it was: {e}"
-                ));
-            }
-        };
+    /// Keep a configured exit active through roster gaps and uplink loss.
+    /// Only clearing the selection permits direct egress.
+    pub(crate) fn reload_exit_state(&self) -> anyhow::Result<Option<String>> {
+        let networks = config::load()?.networks;
         self.exit_server.reload(
             networks
                 .iter()
@@ -391,82 +340,51 @@ impl NetworkRegistry {
                  `ray exit-node none`.",
             );
         }
-        // Note this does not require the peer to still advertise `exit_node`: a
-        // roster that briefly loses the flag must not silently drop us back to
-        // direct egress, leaking out our own uplink the traffic we chose to tunnel.
-        let wanted = !selected.is_empty();
-        // A refusal found while resolving the selection, kept out of the closure
-        // so the no-silent-fallback rule below can tell it apart from a peer the
-        // roster simply hasn't landed yet.
-        let mut refused: Option<String> = None;
-        let selection = selected.into_iter().find_map(|nc| {
-            let id = nc.exit_node_use.as_ref()?.parse::<EndpointId>().ok()?;
-            let member = self.roster_member(&nc.name, id)?;
-            // The IPv6 gate cannot live only in `exit_node_use`: a gateway can
-            // republish a narrower claim with nobody touching the selection, and
-            // the selection outlives a restart. Re-checking here is what keeps the
-            // claim's promise true after boot. Only the IPv6 half, though: a peer
-            // that momentarily stops advertising `exit_node` keeps its tunnel, per
-            // the note above.
-            if let Some(why) = ipv6_gateway_refusal(
-                &member,
-                member
-                    .hostname
-                    .as_deref()
-                    .unwrap_or("the selected exit node"),
-            ) {
-                refused = Some(why);
-                return None;
-            }
-            Some(ExitSelection {
-                peer_user: self.device_user_map.resolve(&member.identity),
-                ipv6: derive_ipv6(&member.identity),
-                network: SmolStr::new(&nc.name),
-                carries: member.exit_families.tunnelled(),
+        let candidates: Vec<_> = selected
+            .iter()
+            .filter_map(|nc| {
+                let raw = nc.exit_node_use.as_deref().unwrap_or_default();
+                match raw.parse::<EndpointId>() {
+                    Ok(id) => Some((*nc, id)),
+                    Err(error) => {
+                        tracing::warn!(network = %nc.name, %error, "invalid exit node selection");
+                        None
+                    }
+                }
             })
+            .collect();
+        if !selected.is_empty() && candidates.is_empty() {
+            return Ok(Some(
+                "the selected exit node is not a valid identity; existing routing is retained"
+                    .to_string(),
+            ));
+        }
+        let chosen = prefer_usable(&candidates, |(nc, id)| {
+            self.roster_member(&nc.name, *id)
+                .is_some_and(|m| m.exit_families.tunnelled() != ExitFamilies::Neither)
         });
-        // Unlike the missing-peer case below, this is not a roster gap a
-        // reconverge will heal: the gateway is present and simply cannot carry
-        // the only family this tunnel would route. Keeping or installing it would
-        // black-hole every flow, so direct egress is the better side to fail on
-        // (the opposite of the leak that rule guards against). The config entry is
-        // left alone so `ray exit-node status` still shows what to clear.
-        //
-        // Gated on there being no selection at all: `find_map` keeps looking after
-        // a refusal, so with an exit selected on more than one network (warned
-        // about above) a later usable gateway still wins over an earlier bad one.
-        if let Some(why) = refused.filter(|_| selection.is_none()) {
-            // Stays *pending*, unlike every other terminal branch here. The
-            // refusal rests on a roster fact that the gateway itself can change:
-            // it gains an IPv6 uplink, `refresh_v6_uplink` re-probes on the
-            // reconverge that republishes the offer, and the claim reaches us. The
-            // reconverge only nudges `exit_reapply` while this flag is set, so
-            // clearing it here would leave the client on direct egress until
-            // someone reran `ray up`, having built the gateway half of exactly
-            // that loop. Re-applying is idempotent and costs a roster read.
-            self.exit_selection_pending.store(true, Ordering::Relaxed);
-            self.exit_client.set(None);
-            tracing::warn!(reason = %why, "exit selection unusable; using direct egress");
-            return Some(why);
-        }
-        // The same no-silent-fallback rule when the roster cannot resolve the
-        // selected peer at all (boot before the first reconverge, or the peer
-        // temporarily absent): keep whatever tunnel is in place rather than
-        // dropping to direct egress, mark the selection pending, and let the
-        // reconverge that lands the roster nudge a re-apply.
-        if wanted && selection.is_none() {
-            self.exit_selection_pending.store(true, Ordering::Relaxed);
-            return Some(if self.exit_client.is_active() {
-                "the selected exit peer is missing from the roster; keeping the \
-                 existing tunnel until it reappears"
-                    .to_string()
-            } else {
-                "the selected exit peer is not in the roster yet; the full tunnel \
-                 will be installed when it appears"
-                    .to_string()
-            });
-        }
-        self.exit_selection_pending.store(false, Ordering::Relaxed);
+        let mut warning = None;
+        let selection = chosen.map(|(nc, id)| {
+            let member = self.roster_member(&nc.name, *id);
+            let carries = member
+                .as_ref()
+                .map_or(ExitFamilies::Neither, |m| m.exit_families.tunnelled());
+            if member.is_none() || carries == ExitFamilies::Neither {
+                warning = Some(
+                    "the selected exit is unavailable; internet traffic remains blocked"
+                        .to_string(),
+                );
+            }
+            let peer = member.as_ref().map_or(*id, |m| m.identity);
+            ExitSelection {
+                peer_user: self.device_user_map.resolve(&peer),
+                ipv6: derive_ipv6(&peer),
+                network: SmolStr::new(&nc.name),
+                carries,
+            }
+        });
+        self.exit_selection_pending
+            .store(warning.is_some(), Ordering::Relaxed);
         match &selection {
             Some(s) => tracing::info!(
                 network = %s.network,
@@ -477,7 +395,7 @@ impl NetworkRegistry {
             None => tracing::debug!("exit selection cleared (direct egress)"),
         }
         self.exit_client.set(selection);
-        None
+        Ok(warning)
     }
 
     /// Reconcile the advertised `Member.exit_node` flag with what this node
@@ -501,7 +419,7 @@ impl NetworkRegistry {
         // it shells out, and this runs from the reconverge worker.
         {
             let server = self.exit_server.clone();
-            let _ = tokio::task::spawn_blocking(move || server.refresh_v6_uplink()).await;
+            let _ = tokio::task::spawn_blocking(move || server.refresh_uplinks()).await;
         }
         let names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         for name in names {
@@ -556,23 +474,13 @@ impl NetworkRegistry {
     /// reply, and claiming otherwise is the black hole this exists to prevent.
     fn claimed_exit_families(&self, offering: bool) -> ExitFamilies {
         if offering {
-            ExitFamilies::from_uplink(self.exit_server.offers_v6())
+            ExitFamilies::from_uplinks(self.exit_server.offers_v4(), self.exit_server.offers_v6())
         } else {
             ExitFamilies::Unknown
         }
     }
 
-    /// Why the selection configured on `network` is not the tunnel that is
-    /// actually installed, or `None` when it is.
-    ///
-    /// The two are allowed to disagree, and both directions of that are
-    /// deliberate: [`Self::reload_exit_state`] keeps a live tunnel through a
-    /// roster that briefly loses the peer, and drops one whose gateway now says
-    /// it cannot carry our family. Neither touches the config, so `ray exit-node
-    /// status` keeps showing what to change. What it must not do is keep printing
-    /// `using: <peer>` while the traffic leaves directly: the second case needs no
-    /// user action to arrive (the gateway republishes a claim), so the user has no
-    /// reason to suspect it.
+    /// Report why a configured exit cannot currently carry traffic.
     fn exit_selection_problem(&self, network: &str, selected: &str) -> Option<String> {
         let resolved = self
             .exit_client
@@ -624,7 +532,7 @@ impl NetworkRegistry {
             // cannot disagree with what the command does.
             let refused = offers
                 .iter()
-                .filter(|m| ipv6_gateway_refusal(m, "gw").is_some())
+                .filter(|m| gateway_family_refusal(m, "gw").is_some())
                 .map(display_name)
                 .collect();
             let not_in_effect = n
@@ -857,6 +765,15 @@ impl NetworkRegistry {
     }
 }
 
+/// The first selection whose peer can carry traffic now. With none, the first
+/// one stays selected so internet traffic remains blocked.
+fn prefer_usable<T>(selections: &[T], usable: impl Fn(&T) -> bool) -> Option<&T> {
+    selections
+        .iter()
+        .find(|s| usable(s))
+        .or_else(|| selections.first())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Member, gateway_refusal};
@@ -879,15 +796,10 @@ mod tests {
     /// Which gateways `ray exit-node use` will accept, and why it turns the
     /// unusable cases into a sentence instead of a dead tunnel.
     #[test]
-    fn a_gateway_must_carry_ipv6() {
+    fn a_gateway_can_carry_either_family() {
         use ExitFamilies::{Dual, Unknown, V4};
 
-        // IPv6 is the only family the mesh routes, so a gateway that says it has
-        // no IPv6 uplink would receive the traffic and have nowhere to send it.
-        let refusal = gateway_refusal(Some(&gateway(true, V4)), "gw", "net")
-            .expect("a v4-only gateway carries nothing we can send it");
-        assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
-        // A claim that includes IPv6 is fine however it is spelled.
+        assert!(gateway_refusal(Some(&gateway(true, V4)), "gw", "net").is_none());
         assert!(gateway_refusal(Some(&gateway(true, Dual)), "gw", "net").is_none());
 
         // No claim on the roster is not a denial. It is what a coordinator on a
@@ -895,12 +807,12 @@ mod tests {
         // exit nodes unusable on that whole network. Allowed, and flagged as a
         // guess so the caller can warn.
         assert!(gateway_refusal(Some(&gateway(true, Unknown)), "gw", "net").is_none());
-        assert!(super::ipv6_gateway_unverified(&gateway(true, Unknown)));
-        assert!(!super::ipv6_gateway_unverified(&gateway(true, Dual)));
-        assert!(!super::ipv6_gateway_unverified(&gateway(true, V4)));
+        assert!(super::gateway_unverified(&gateway(true, Unknown)));
+        assert!(!super::gateway_unverified(&gateway(true, Dual)));
+        assert!(!super::gateway_unverified(&gateway(true, V4)));
         // Nor is a peer that offers no exit node at all a guess: that is the
         // other refusal's business, and reporting it twice would be noise.
-        assert!(!super::ipv6_gateway_unverified(&gateway(false, Unknown)));
+        assert!(!super::gateway_unverified(&gateway(false, Unknown)));
 
         // No offer at all, and not on the roster, are the same answer: there is
         // nothing there to route through.
@@ -977,58 +889,41 @@ mod tests {
         assert!(super::offer_disagrees((false, Unknown), true, V4));
     }
 
-    /// The two halves of the refusal have different lifetimes, and `reload_exit_state`
-    /// re-checks only one of them on every apply.
-    ///
-    /// "Does not advertise an exit node" is a roster fact that flickers, and
-    /// dropping a live tunnel on it would leak the traffic the user chose to
-    /// tunnel, so it stays a selection-time check. The IPv6 one is a standing
-    /// property: while it holds the tunnel carries nothing, and the gateway can
-    /// republish a narrower claim with no user action at all, so a selection made
-    /// against a gateway that had IPv6 has to be caught later.
+    /// A withdrawn offer preserves the selection; lost uplinks block traffic.
     #[test]
-    fn only_the_ipv6_half_of_the_refusal_is_re_checked_after_selection() {
-        use ExitFamilies::{Dual, Unknown, V4};
+    fn uplink_capability_is_rechecked_after_selection() {
+        use ExitFamilies::{Dual, Unknown};
 
         // A gateway that stopped advertising keeps its tunnel: no refusal from the
         // half `reload_exit_state` consults.
-        assert!(super::ipv6_gateway_refusal(&gateway(false, Dual), "gw").is_none());
-        // A gateway that says it has no IPv6 uplink is refused on every re-apply,
-        // not just at selection time.
-        let refusal = super::ipv6_gateway_refusal(&gateway(true, V4), "gw")
+        assert!(super::gateway_family_refusal(&gateway(false, Dual), "gw").is_none());
+        // A gateway with neither family cannot carry the selected traffic.
+        let refusal = super::gateway_family_refusal(&gateway(true, ExitFamilies::Neither), "gw")
             .expect("a gateway that cannot carry IPv6 stays unusable");
-        assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
+        assert!(refusal.contains("cannot carry IPv4 or IPv6"), "{refusal}");
         // An unknown claim never tears down a live tunnel. A roster that lost the
         // key (a coordinator on an older build republished it) must not read as a
         // gateway that lost its uplink.
-        assert!(super::ipv6_gateway_refusal(&gateway(true, Unknown), "gw").is_none());
+        assert!(super::gateway_family_refusal(&gateway(true, Unknown), "gw").is_none());
     }
 
-    /// A configured selection that is not the installed tunnel says so.
-    ///
-    /// `reload_exit_state` deliberately leaves the config alone when it refuses a
-    /// gateway or cannot resolve one, so the status line is the only place the
-    /// gap can show. Printing `using: gw` for a node whose packets all leave
-    /// directly is the failure this pins, and it needs no user action to arrive:
-    /// the gateway republishes a family claim it worked out for itself.
+    /// Status reports failed installs and unusable selections.
     #[test]
     fn a_selection_that_is_not_installed_is_reported_as_not_installed() {
         use super::selection_problem;
         use ExitFamilies::{Dual, V4};
 
-        // Resolved and installed: nothing to say, whatever the roster now claims.
+        // A resolved IPv4 gateway is usable.
         assert!(selection_problem(None, true, true, Some(&gateway(true, V4))).is_none());
 
-        // A failed install rolls back its rules and leaves the selection
-        // resolved, so it has to be answered ahead of it or the status line
-        // reports a tunnel the kernel refused.
+        // The selected peer alone does not prove the routes were installed.
         let why = selection_problem(
             Some("RTNETLINK answers: operation not permitted"),
             true,
             true,
             Some(&gateway(true, Dual)),
         )
-        .expect("a rolled-back install is not a tunnel");
+        .expect("a failed install must be reported");
         assert!(why.contains("operation not permitted"), "{why}");
 
         // Down is a wait, and says which command ends it.
@@ -1042,18 +937,48 @@ mod tests {
 
         // The one that is not a wait: the reason the tunnel came down is the same
         // string `ray exit-node use` would have refused with.
-        let why = selection_problem(None, false, true, Some(&gateway(true, V4)))
-            .expect("a gateway that cannot carry IPv6 is unusable");
-        assert!(why.contains("cannot carry IPv6"), "{why}");
+        let why = selection_problem(
+            None,
+            false,
+            true,
+            Some(&gateway(true, ExitFamilies::Neither)),
+        )
+        .expect("a gateway with neither family is unusable");
+        assert!(why.contains("cannot carry IPv4 or IPv6"), "{why}");
     }
 
-    /// A gateway that can carry nothing is refused by everyone.
-    ///
-    /// A host on an ordinary IPv4-only uplink is the common shape of this, not a
-    /// corner: the overlay gives it no IPv4 to return traffic over and it has no
-    /// IPv6 to offer instead. Reporting that as `V4`
-    /// makes it a positive claim to carry IPv4, which a dual-stack client
-    /// accepts, and the tunnel then carries nothing in silence.
+    /// A selection on a later network is used when the first one's peer is gone.
+    #[test]
+    fn a_later_usable_selection_wins() {
+        use super::prefer_usable;
+
+        assert_eq!(
+            prefer_usable(&["gone", "live"], |s| *s == "live"),
+            Some(&"live")
+        );
+        assert_eq!(
+            prefer_usable(&["gone", "also gone"], |_| false),
+            Some(&"gone")
+        );
+        assert_eq!(prefer_usable::<&str>(&[], |_| true), None);
+    }
+
+    #[test]
+    fn active_selection_reports_missing_or_unusable_gateway() {
+        let missing = super::selection_problem(None, true, true, None)
+            .expect("a missing gateway must be reported");
+        assert!(missing.contains("traffic remains blocked"));
+        let unusable = super::selection_problem(
+            None,
+            true,
+            true,
+            Some(&gateway(true, ExitFamilies::Neither)),
+        )
+        .expect("an unusable gateway must be reported");
+        assert!(unusable.contains("cannot carry IPv4 or IPv6"));
+    }
+
+    /// A gateway with neither uplink cannot carry exit traffic.
     #[test]
     fn a_gateway_that_can_carry_nothing_is_refused_in_both_modes() {
         use ExitFamilies::Neither;
@@ -1068,9 +993,9 @@ mod tests {
             "it is a claim, not the absence of one, so it must not read as unverified"
         );
         {
-            let refusal = super::ipv6_gateway_refusal(&gateway(true, Neither), "gw")
+            let refusal = super::gateway_family_refusal(&gateway(true, Neither), "gw")
                 .expect("a gateway that carries nothing must be refused");
-            assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
+            assert!(refusal.contains("cannot carry IPv4 or IPv6"), "{refusal}");
         }
     }
 }

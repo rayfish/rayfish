@@ -248,6 +248,11 @@ impl MeshConnection {
                         &self.conn,
                         features & crate::transport::FEATURE_IDLE_CLOSE != 0,
                     );
+                    self.ctx.peers.note_exit_ipv4_support(
+                        &self.peer_id,
+                        &self.conn,
+                        features & crate::transport::FEATURE_EXIT_IPV4 != 0,
+                    );
                     continue;
                 }
                 ControlMsg::Ping { nonce } => {

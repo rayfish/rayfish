@@ -111,6 +111,12 @@ jobs:
           perl -0pi -e 's/\n+\z/\n/' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
           git diff --exit-code macos/Generated
 
+      - name: Build packet tunnel extension
+        run: >-
+          xcodebuild -quiet -project macos/Rayfish.xcodeproj
+          -target RayfishTunnelExtension -configuration Debug
+          ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
+
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
   # neither is compiled by the job above, so a PR could go green and break the

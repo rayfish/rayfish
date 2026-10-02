@@ -1,8 +1,9 @@
 //! DNS upstream selection for an active exit tunnel.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::membership::ExitFamilies;
+use super::policy::is_transitable;
+use crate::membership::{ExitFamilies, is_overlay_ip};
 
 /// The IPv6 resolvers used when an IPv6-only tunnel has no configured IPv6
 /// resolver of its own.
@@ -11,44 +12,45 @@ pub(super) const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
     Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
 ];
 
-/// Returns DNS upstreams for an IPv6-only exit tunnel. Other tunnel modes keep
-/// the normal resolver configuration.
+/// Use reachable public resolvers by default. Captured LAN resolvers must not
+/// send exit traffic outside the tunnel. Explicit replacement remains authoritative:
+/// when none of its servers is reachable, lookups fail rather than go elsewhere.
 pub(super) fn tunnel_upstreams(
     carries: ExitFamilies,
     configured: &crate::config::ServerOverride,
 ) -> Option<Vec<SocketAddr>> {
-    if carries.carries_v4() || !carries.carries_v6() {
-        return None;
-    }
-
-    let ipv6_servers: Vec<Ipv6Addr> = configured
+    let configured_servers: Vec<IpAddr> = configured
         .servers
         .iter()
-        .filter_map(|server| server.parse().ok())
+        .filter_map(|s| s.parse().ok())
         .collect();
-    if configured.replace {
-        if !ipv6_servers.is_empty() {
-            return Some(with_dns_port(ipv6_servers));
+    // The gateway refuses private destinations, so a LAN resolver would only
+    // time out ahead of the ones that work. Mesh resolvers do not use the exit.
+    let mut servers: Vec<IpAddr> = configured_servers
+        .iter()
+        .copied()
+        .filter(|ip| is_overlay_ip(*ip) || is_transitable(*ip))
+        .filter(|ip| match ip {
+            IpAddr::V4(_) => carries.carries_v4(),
+            IpAddr::V6(_) => carries.carries_v6(),
+        })
+        .collect();
+    if configured.replace && !configured_servers.is_empty() {
+        if servers.is_empty() {
+            servers = configured_servers;
         }
-        let configured_servers: Vec<SocketAddr> = configured
-            .servers
-            .iter()
-            .filter_map(|server| server.parse::<IpAddr>().ok())
-            .map(|ip| SocketAddr::from((ip, 53)))
-            .collect();
-        if !configured_servers.is_empty() {
-            return Some(configured_servers);
-        }
+    } else if carries.carries_v4() {
+        servers.extend([
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        ]);
+    } else {
+        servers.extend(PUBLIC_FALLBACK_DNS_V6.into_iter().map(IpAddr::V6));
     }
-
-    let mut servers = ipv6_servers;
-    servers.extend(PUBLIC_FALLBACK_DNS_V6);
-    Some(with_dns_port(servers))
-}
-
-fn with_dns_port(servers: Vec<Ipv6Addr>) -> Vec<SocketAddr> {
-    servers
-        .into_iter()
-        .map(|ip| SocketAddr::from((ip, 53)))
-        .collect()
+    Some(
+        servers
+            .into_iter()
+            .map(|ip| SocketAddr::from((ip, 53)))
+            .collect(),
+    )
 }

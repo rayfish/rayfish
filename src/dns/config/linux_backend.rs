@@ -18,6 +18,9 @@ pub(super) async fn set_search_domains_linux(
         // `.ray` is the only routing domain (~ray); bare network names are not
         // registered, so a network named `dev` never captures `*.dev`.
         let mut domains: Vec<(String, bool)> = vec![(DNS_DOMAIN.to_string(), true)];
+        if crate::exit_node::full_tunnel_active() {
+            domains.push((".".to_owned(), true));
+        }
         for d in rayfish_domains {
             domains.push((d.to_string(), false));
         }
@@ -44,6 +47,9 @@ pub(super) async fn set_search_domains_linux(
     {
         let mut args = vec!["domain".to_string(), tun_name.to_string()];
         args.push(format!("~{DNS_DOMAIN}"));
+        if crate::exit_node::full_tunnel_active() {
+            args.push("~.".to_owned());
+        }
         args.extend(rayfish_domains.iter().map(SearchDomain::to_string));
         let status = Command::new("resolvectl")
             .args(&args)
@@ -182,7 +188,10 @@ impl DnsConfigurator for SystemdResolvedDBus {
         .context("SetLinkDNS failed")?;
 
         // SetLinkDomains(ifindex, [(domain, routing_only)])
-        let domains: Vec<(&str, bool)> = vec![(DNS_DOMAIN, true)];
+        let mut domains: Vec<(&str, bool)> = vec![(DNS_DOMAIN, true)];
+        if crate::exit_node::full_tunnel_active() {
+            domains.push((".", true));
+        }
         conn.call_method(
             Some("org.freedesktop.resolve1"),
             "/org/freedesktop/resolve1",
@@ -260,6 +269,7 @@ impl DnsConfigurator for SystemdResolvedCli {
 
         let status = Command::new("resolvectl")
             .args(["domain", &self.tun_iface, &format!("~{DNS_DOMAIN}")])
+            .args(crate::exit_node::full_tunnel_active().then_some("~."))
             .status()
             .await
             .context("resolvectl domain")?;

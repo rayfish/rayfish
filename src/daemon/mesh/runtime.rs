@@ -1410,16 +1410,42 @@ impl Daemon {
         let _guard = self.exit_reconcile.lock().await;
         let locked = started.elapsed();
         let tun_name = self.tun_name.load().as_str().to_owned();
-        let reload = self.registry.reload_exit_state();
+        let reload = match self.registry.reload_exit_state() {
+            Ok(warning) => warning,
+            Err(error) => {
+                return Some(format!(
+                    "cannot read exit configuration; existing routing is retained: {error}"
+                ));
+            }
+        };
+        #[cfg(target_os = "macos")]
+        if self.external_exit_tun.load(Ordering::Acquire) {
+            let client = self.apply_external_exit_client().await;
+            self.registry
+                .exit_install_error
+                .store(client.clone().map(Arc::new));
+            self.apply_exit_dns(client.is_none());
+            return reload.or(client);
+        }
+        if tun_name.is_empty() {
+            let problem = self.registry.exit_client.is_active().then(|| {
+                "exit routing is not available in this platform's packet-tunnel integration yet"
+                    .to_string()
+            });
+            self.registry
+                .exit_install_error
+                .store(problem.clone().map(Arc::new));
+            return problem;
+        }
+
         let reloaded = started.elapsed();
         // Both halves run even if the first one failed: they are independent roles,
         // and each one's teardown path has to happen regardless.
         let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
         let served = started.elapsed();
         let client = self.apply_exit_client(&tun_name).await;
-        // What the kernel accepted, for `ray exit-node status`: a failed install
-        // rolls back its own rules and leaves the selection standing, so the
-        // selection alone cannot say whether anything is being tunnelled.
+        // Report installation failures even though the selection and traffic
+        // guard remain in place.
         self.registry
             .exit_install_error
             .store(client.clone().map(Arc::new));
@@ -1444,6 +1470,96 @@ impl Daemon {
             "exit reconcile timing"
         );
         reload.or(server).or(client)
+    }
+
+    /// Prepare exit forwarding while NetworkExtension still owns the host routes.
+    /// Call before installing its default routes so the transport can bind to the
+    /// physical interface first.
+    #[cfg(target_os = "macos")]
+    pub async fn prepare_external_exit_node(&self) -> anyhow::Result<()> {
+        let selected = config::load()?
+            .networks
+            .iter()
+            .any(|network| network.exit_node_use.is_some());
+        self.external_exit_tun.store(true, Ordering::Release);
+        if !selected {
+            self.external_exit_staging.store(false, Ordering::Release);
+        }
+        if let Some(warning) = self.apply_exit_node().await {
+            tracing::warn!(warning, "external exit-node state needs attention");
+        }
+        self.external_exit_staging.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Pin the underlay before NetworkExtension installs capture routes. Until
+    /// the selection is committed, packets arriving on the TUN are dropped.
+    #[cfg(target_os = "macos")]
+    pub async fn prepare_external_exit_transport(&self) {
+        self.external_exit_tun.store(true, Ordering::Release);
+        self.external_exit_staging.store(true, Ordering::Release);
+        crate::exit_node::capture_physical_defaults();
+        if crate::exit_node::set_full_tunnel(true) {
+            self.transport.endpoint.network_change().await;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn select_external_exit_node(
+        &self,
+        network: &str,
+        peer: Option<String>,
+    ) -> IpcMessage {
+        let selecting = peer.is_some();
+        let reply = self.registry.exit_node_use(network, peer).await;
+        if !matches!(reply, IpcMessage::Ok { .. }) {
+            return reply;
+        }
+        if selecting {
+            let configured = match config::load() {
+                Ok(settings) => settings,
+                Err(error) => return ipc_err(error.to_string()),
+            };
+            for other in configured
+                .networks
+                .iter()
+                .filter(|n| n.name != network && n.exit_node_use.is_some())
+            {
+                let cleared = self.registry.exit_node_use(&other.name, None).await;
+                if !matches!(cleared, IpcMessage::Ok { .. }) {
+                    return cleared;
+                }
+            }
+        }
+        match self.prepare_external_exit_node().await {
+            Ok(()) => reply,
+            Err(error) => ipc_err(error.to_string()),
+        }
+    }
+
+    pub fn external_exit_node_status(&self) -> IpcMessage {
+        self.registry.exit_node_status(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn apply_external_exit_client(&self) -> Option<String> {
+        let selected = self.registry.exit_client.is_active()
+            || self.external_exit_staging.load(Ordering::Acquire);
+        if selected {
+            if !crate::exit_node::full_tunnel_active() {
+                crate::exit_node::capture_physical_defaults();
+            }
+            if crate::exit_node::set_full_tunnel(true) {
+                self.transport.endpoint.network_change().await;
+            }
+            let _ = self.exit_peer_conn().await;
+        } else {
+            if crate::exit_node::set_full_tunnel(false) {
+                self.transport.endpoint.network_change().await;
+            }
+            crate::exit_node::clear_physical_defaults();
+        }
+        None
     }
 
     /// Spawn the daemon-lifetime listener that re-runs the exit reconcile when a
@@ -1507,55 +1623,17 @@ impl Daemon {
             .unwrap_or(ExitFamilies::Neither)
     }
 
-    /// Point the Magic DNS forwarder at upstreams the tunnel can actually reach,
-    /// or put the captured ones back when no tunnel is up.
-    ///
-    /// Only a tunnel that carries IPv6 and not IPv4 needs this: every upstream the
-    /// desktop capture produces is IPv4, so without an override the exit node
-    /// would carry the traffic while each lookup that steered it went out the
-    /// physical link. See [`exit_node::tunnel_upstreams`].
-    /// `installed` is whether the tunnel actually went in, not merely whether one
-    /// is selected. A failed install rolls the routing back but leaves the
-    /// selection active, and pointing the forwarder at a public IPv6 resolver with
-    /// no tunnel to reach it through is worse than leaving DNS alone: a host in
-    /// this mode usually has no native IPv6 at all (the mode is about an IPv4
-    /// conflict, not about having v6 transit), so every lookup would SERVFAIL on a
-    /// host whose DNS worked a moment earlier.
-    fn apply_exit_dns(&self, installed: bool) {
-        let over = installed.then(|| {
-            let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
-            crate::exit_node::tunnel_upstreams(self.tunnel_carries(), &configured)
-        });
-        // `None` from either level means "no override": no tunnel, or a tunnel
-        // whose own family already carries the captured upstreams.
-        let over = over.flatten();
-        // The override only moves the daemon's *own* forwarder. Whether an app's
-        // query ever reaches that forwarder is the OS backend's decision, and on
-        // Linux only the direct-resolv.conf backend sends us everything: the
-        // split-DNS backends register `~ray` as the sole routing domain, so
-        // non-`.ray` lookups go to the host's other links, over IPv4, which this
-        // mode deliberately does not tunnel. macOS has no such gap, because
-        // `apply_exit_client` re-asserts a catch-all match domain while the tunnel
-        // is up. Giving Linux the same flip is the real fix and is not done here.
-        //
-        // Sharing `/etc/resolv.conf` with another mesh is the same gap by a
-        // different route: we are the first nameserver and get every name, but a
-        // name outside `.ray` is answered REFUSED so the stub asks the next line,
-        // which is that mesh's resolver. The forwarder is out of the path either
-        // way, and this is the host the mode is for, so it is worth saying.
-        #[cfg(target_os = "linux")]
-        if over.is_some()
-            && let Some(backend) = self.dns.backend_name()
-            && (backend != "direct-resolv.conf" || self.dns.resolver.defers_off_mesh())
-        {
-            tracing::warn!(
-                backend,
-                shared_resolv_conf = self.dns.resolver.defers_off_mesh(),
-                "IPv6-only full tunnel is up, but non-`.ray` lookups do not reach \
-                 rayfish's forwarder on this host, so they still leave over IPv4, \
-                 outside the exit node"
-            );
-        }
+    /// Forward DNS through the selected exit, restoring captured resolvers on disconnect.
+    fn apply_exit_dns(&self, _installed: bool) {
+        let over = self
+            .registry
+            .exit_client
+            .is_active()
+            .then(|| {
+                let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+                crate::exit_node::tunnel_upstreams(self.tunnel_carries(), &configured)
+            })
+            .flatten();
         self.dns.resolver.set_tunnel_upstreams(over);
     }
 
@@ -1567,21 +1645,18 @@ impl Daemon {
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let install = self.registry.exit_client.is_active();
         let carries = self.tunnel_carries();
-        let tun_name = tun_name.to_owned();
+        let owned_tun_name = tun_name.to_owned();
         let result = tokio::task::spawn_blocking(move || {
             if !install {
                 crate::exit_node::teardown_client_routing();
                 return Ok(());
             }
-            crate::exit_node::install_client_routing(&tun_name, carries).inspect_err(|_| {
-                // A partial install must not stay live: rules that went in before
-                // the failure (say v4's, with `ipv6.disable=1` failing the v6 half)
-                // would keep routing traffic into a tunnel that was never fully set
-                // up. Mirror the macOS branch and roll all of it back.
-                crate::exit_node::teardown_client_routing();
-            })
+            crate::exit_node::install_client_routing(&owned_tun_name, carries)
         })
         .await;
+        if crate::exit_node::set_full_tunnel(install) {
+            self.dns.reassert_os_config(tun_name).await;
+        }
         match result {
             Ok(Ok(())) => None,
             Ok(Err(e)) => {
@@ -1606,9 +1681,10 @@ impl Daemon {
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let result = if !self.registry.exit_client.is_active() {
             tun::unroute_default_via_tun(tun_name).await;
+            crate::exit_node::remove_client_filter();
             crate::exit_node::remove_tunnel_exclusions();
             crate::exit_node::clear_physical_defaults();
-            if crate::exit_node::set_full_tunnel(false, false) {
+            if crate::exit_node::set_full_tunnel(false) {
                 self.transport.endpoint.network_change().await;
                 // The rebind that releases the pin drops every direct path too.
                 self.nudge_all_peers();
@@ -1630,7 +1706,7 @@ impl Daemon {
             // has nothing keeping it out of the tunnel.
             // Rebind whenever the pin state changed, which now includes the tunnel
             // narrowing or widening under a live selection, not just coming up.
-            if crate::exit_node::set_full_tunnel(true, self.tunnel_carries().carries_v4()) {
+            if crate::exit_node::set_full_tunnel(true) {
                 self.transport.endpoint.network_change().await;
             }
             let conn = self.exit_peer_conn().await;
@@ -1644,7 +1720,7 @@ impl Daemon {
                     &self.tunnel_relevant(peer_underlay_ips(conn)),
                 );
             }
-            let failure = self.route_default_or_rollback(tun_name).await;
+            let failure = self.route_exit_defaults(tun_name).await;
             if failure.is_none() {
                 // Only now is the routing table in its final shape. Everything
                 // before this point gets invalidated by it: a rebind drops every
@@ -1699,28 +1775,9 @@ impl Daemon {
         self.registry.peers.conn_for_ip(&sel.ipv6)
     }
 
-    /// Narrow underlay addresses to the families the tunnel actually captures.
-    ///
-    /// The exclusions exist to keep iroh's own traffic off the split default. For a
-    /// family the tunnel does not carry there is no default of ours to route
-    /// around, so a host route is not just wasted work: it pins that address to the
-    /// physical gateway, carving it out of whichever co-resident VPN owns that
-    /// family on this Mac.
-    ///
-    /// Reads [`Self::tunnel_carries`], the same fact the routing install and the
-    /// socket pin read. It used to read this node's mode, which was the same answer
-    /// only until the gateway's claim could narrow a tunnel too: a dual-stack Mac
-    /// through a gateway that can only return IPv6 has no IPv4 default of ours and
-    /// was still excluding IPv4 addresses from it.
     #[cfg(target_os = "macos")]
     fn tunnel_relevant(&self, ips: Vec<IpAddr>) -> Vec<IpAddr> {
-        let carries = self.tunnel_carries();
-        ips.into_iter()
-            .filter(|ip| match ip {
-                IpAddr::V4(_) => carries.carries_v4() || carries.is_unknown(),
-                IpAddr::V6(_) => carries.carries_v6() || carries.is_unknown(),
-            })
-            .collect()
+        ips
     }
 
     /// Block until the exit peer answers over the finished tunnel, so
@@ -1776,11 +1833,18 @@ impl Daemon {
         let mut ips = Vec::new();
         for url in urls {
             let Some(host) = url.host_str() else { continue };
-            let port = url.port_or_known_default().unwrap_or(443);
-            if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
-                for a in addrs {
-                    if !ips.contains(&a.ip()) {
-                        ips.push(a.ip());
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                ips.push(ip);
+                continue;
+            }
+            if let Ok(resolver) = self.transport.endpoint.dns_resolver()
+                && let Ok(addrs) = resolver
+                    .lookup_ipv4_ipv6(host, Duration::from_secs(3))
+                    .await
+            {
+                for ip in addrs {
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
                     }
                 }
             }
@@ -1788,22 +1852,23 @@ impl Daemon {
         ips
     }
 
-    /// Install the split default routes into the TUN, rolling the full-tunnel pin
-    /// back on failure so a partial install (one family in, the other not) does
-    /// not blackhole traffic.
+    /// Leave protection installed on failure; only an explicit disconnect restores direct egress.
     #[cfg(target_os = "macos")]
-    async fn route_default_or_rollback(&self, tun_name: &str) -> Option<String> {
-        match tun::route_default_via_tun(tun_name, self.tunnel_carries()).await {
-            Ok(()) => None,
-            Err(e) => {
-                tun::unroute_default_via_tun(tun_name).await;
-                if crate::exit_node::set_full_tunnel(false, false) {
-                    self.transport.endpoint.network_change().await;
-                }
-                tracing::warn!(error = %e, "failed to install exit-node client routing");
-                Some(format!("failed to route traffic through exit node: {e}"))
-            }
+    async fn route_exit_defaults(&self, tun_name: &str) -> Option<String> {
+        let underlay_ports: Vec<u16> = self
+            .transport
+            .endpoint
+            .bound_sockets()
+            .iter()
+            .map(|addr| addr.port())
+            .collect();
+        if let Err(error) = crate::exit_node::install_client_filter(tun_name, &underlay_ports) {
+            return Some(format!("failed to protect exit traffic: {error}"));
         }
+        tun::route_default_via_tun(tun_name, ExitFamilies::Dual)
+            .await
+            .err()
+            .map(|error| format!("failed to route traffic through exit node: {error}"))
     }
 
     /// Using an exit node needs full-tunnel routing plus loop prevention for the

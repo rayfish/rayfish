@@ -108,32 +108,8 @@ impl Resolver {
         }
     }
 
-    /// Override the upstream set for as long as a full tunnel is up, or with
-    /// `None` go back to the captured one.
-    ///
-    /// A layer rather than a write to `upstreams`, so teardown restores what the
-    /// system capture found without having to re-detect the OS DNS backend.
-    ///
-    /// It exists for the IPv6-only client tunnel. The daemon forwards non-`.ray`
-    /// queries itself, and every upstream the desktop capture can produce is IPv4
-    /// (`DnsConfigurator::captured_upstreams`), while that tunnel carries IPv6
-    /// alone: left as they are, the exit node would see the traffic and none of
-    /// the lookups that steered it. Pointing the forwarder at an IPv6 resolver
-    /// puts the queries back inside the tunnel.
-    ///
-    /// Filters the magic IPs for the same reason [`Self::set_upstream_addrs`]
-    /// does: `dns_upstreams` now accepts any `IpAddr`, so `ray config set
-    /// dns-upstreams 200::53` would otherwise hand the forwarder its own address
-    /// and every miss would recurse through `handle_tun_query`. Only those two,
-    /// though: see [`is_own_resolver`] for why a *peer's* mesh address has to
-    /// survive this, being the one upstream a tunnel is guaranteed to reach.
-    ///
-    /// It governs only what *we* forward, so it does nothing on a host that
-    /// declines off-mesh names ([`Self::set_defer_off_mesh`]): there the stub
-    /// asks the next `nameserver` itself and never reaches the forwarder. That
-    /// combination is not hypothetical, it is the same host this mode exists
-    /// for, so `apply_exit_dns` warns about it rather than leaving the override
-    /// looking effective.
+    /// Override captured resolvers while an exit is selected. Remove our own
+    /// resolver addresses to avoid recursion. Clearing this restores normal DNS.
     pub fn set_tunnel_upstreams(&self, addrs: Option<Vec<SocketAddr>>) {
         // An override that filters down to nothing becomes no override: `forward`
         // reads an empty list as "no upstream configured" and refuses, where
@@ -226,7 +202,7 @@ impl Resolver {
         // flattens whatever the other resolver does natively (its own split
         // DNS, its own encrypted upstreams) into one plain UDP query, and is
         // the only reason two resolvers pointed at each other can loop.
-        if self.defer_off_mesh.load(Ordering::Relaxed) {
+        if self.defer_off_mesh.load(Ordering::Relaxed) && self.tunnel_upstreams.load().is_none() {
             // `.ray` is ours to answer, misses included: passing those on would
             // hand a mesh name to the other resolver for the same failure.
             return crate::dns::nxdomain_if_in_zone(query).or_else(|| refused(query));

@@ -22,6 +22,7 @@ struct ProviderRequest: Codable {
         case firewallAdd
         case firewallRemove
         case firewallSetDefault
+        case selectExitNode
     }
 
     var action: Action
@@ -94,6 +95,17 @@ struct ProviderStatus: Codable, Equatable {
     var sshRules: [ProviderSSHRule]? = nil
     var connectionWarning: String? = nil
     var quicLossTolerant: Bool? = nil
+    var exitNodes: [ProviderExitNodeNetwork] = []
+
+    var exitSelected: Bool { exitNodes.contains { $0.using != nil } }
+}
+
+struct ProviderExitNodeNetwork: Codable, Equatable {
+    var network: String
+    var using: String?
+    var available: [String]
+    var refused: [String]
+    var problem: String?
 }
 
 struct ProviderSSHRule: Codable, Equatable, Identifiable {

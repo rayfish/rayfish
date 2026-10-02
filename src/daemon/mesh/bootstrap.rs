@@ -714,6 +714,10 @@ async fn build_daemon_inner(
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),
+        #[cfg(target_os = "macos")]
+        external_exit_tun: AtomicBool::new(false),
+        #[cfg(target_os = "macos")]
+        external_exit_staging: AtomicBool::new(false),
         exit_reconcile: AsyncMutex::new(()),
         _metrics_server: metrics_server,
         router,

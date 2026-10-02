@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
+  and DNS through the packet tunnel, or restore a direct connection.
+
+- Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
+  with only an IPv4 internet connection.
+
 - `ray status` and the macOS app warn when a peer connection has high latency,
   packet loss, or a backed-up send queue.
 
@@ -124,6 +130,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Check for Updates" in the app menu to check at any time.
 
 ### Changed
+
+- Selecting an exit node captures both IP families and DNS. Unsupported families
+  and unavailable exits stay blocked until the exit is cleared. Transport traffic
+  remains outside the tunnel. Android exit routing is deferred.
 
 - `ray status` shows each network's admission mode. Member networks show
   `mode unknown` because the coordinator does not share this setting.

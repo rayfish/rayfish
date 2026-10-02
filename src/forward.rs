@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::NetworkRegistry;
 use crate::dns;
-use crate::exit_node::{ExitClient, ExitContext, is_transitable};
+use crate::exit_node::{ExitClient, ExitContext, ipv4, is_transitable};
 use crate::firewall::{self, Direction, SharedFirewall};
 use crate::membership::is_overlay_ip;
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
@@ -239,10 +239,11 @@ pub(crate) fn evaluate_inbound(
     // IP) is dropped before the firewall or any in-daemon listener sees it, so
     // identity-from-source-IP (used by mesh SSH) stays trustworthy.
     //
-    // The mesh address is the peer's derived IPv6, so an IPv4 source is never a
-    // legitimate mesh source. It still reaches the exit-node exemption below,
-    // which is where a routable public IPv4 return packet belongs.
-    let src_ok = matches!(info.src_ip, IpAddr::V6(v6) if v6 == peer_ipv6);
+    // IPv4 clients use a local source address only for exit transit. Gateway
+    // translation assigns a lease to the authenticated peer and network.
+    let src_ok = matches!(info.src_ip, IpAddr::V6(v6) if v6 == peer_ipv6)
+        || (info.src_ip == IpAddr::V4(ipv4::CLIENT_ADDR) && is_transitable(info.dst_ip));
+    let mut returning = false;
     if !src_ok {
         // Exit-node client return traffic: replies to our internet-bound flows come
         // back from our chosen exit peer sourced from the *host we reached*, not
@@ -259,11 +260,17 @@ pub(crate) fn evaluate_inbound(
         // (It is on-path for our real flows and can forge within them, as any
         // gateway or ISP can; that is what TLS is for. Reaching a service we never
         // dialed is a different matter, and it can't.)
-        let dst_is_me = matches!(info.dst_ip, IpAddr::V6(v6) if v6 == exit.my_v6);
+        let dst_is_me = matches!(info.dst_ip, IpAddr::V6(v6) if v6 == exit.my_v6)
+            || (info.dst_ip == IpAddr::V4(ipv4::CLIENT_ADDR)
+                && exit
+                    .client
+                    .selection()
+                    .is_some_and(|s| s.carries.carries_v4()));
         let exit_return = exit.client.is_return_from(peer_id, peer_ipv6)
             && !is_overlay_ip(info.src_ip)
             && is_transitable(info.src_ip)
             && dst_is_me;
+        returning = exit_return;
         if !exit_return {
             // A non-overlay source is a would-be exit-node reply: log why the
             // exemption did not fire so a broken return path is diagnosable.
@@ -296,7 +303,7 @@ pub(crate) fn evaluate_inbound(
     // gateway host itself. `peer_id` is already the sender's user
     // identity, matching the allow-list. The normal inbound firewall is bypassed:
     // this is transit, not traffic addressed to us.
-    if !is_overlay_ip(info.dst_ip) {
+    if !returning && !is_overlay_ip(info.dst_ip) {
         let permitted = exit.server.allows(network, peer_id)
             && is_transitable(info.dst_ip)
             && !exit.server.is_on_link(info.dst_ip)
@@ -536,6 +543,42 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     reg.wake_transport().await;
                 }
             }
+            // Kernel NAT returns IPv4 to a gateway-owned lease. Resolve the
+            // authenticated peer before restoring its local client address.
+            if let IpAddr::V4(dst) = info.dst_ip
+                && ipv4::is_server_addr(dst)
+            {
+                let route = dialer.as_ref().and_then(|reg| {
+                    let lease = reg.exit_server.ipv4.return_lease(dst)?;
+                    let route = peers.route_on_network(&lease.peer, &lease.network)?;
+                    let user = reg.device_user_map.resolve(&route.endpoint_id);
+                    reg.exit_server
+                        .allows(&lease.network, &user)
+                        .then_some(route)
+                });
+                let Some(route) = route else {
+                    stats.record_drop(DropReason::ExitDenied);
+                    continue;
+                };
+                if !is_transitable(info.src_ip) {
+                    stats.record_drop(DropReason::Spoof);
+                    continue;
+                }
+                let Ok(pkt) = ipv4::rewrite(pkt, dst, ipv4::CLIENT_ADDR) else {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
+                };
+                let Some(info) = firewall::parse_packet_info(&pkt) else {
+                    continue;
+                };
+                let ctx = SendCtx {
+                    firewall: &firewall,
+                    stats: &stats,
+                    tun_tx: &tun_tx,
+                };
+                send_over_route(&ctx, &route, &info, pkt).await;
+                continue;
+            }
             if is_magic_dns(&info) {
                 let Ok(permit) = Arc::clone(&dns_queries).try_acquire_owned() else {
                     stats.record_drop(DropReason::DnsConcurrency);
@@ -612,11 +655,22 @@ fn is_icmp_echo_reply(info: &firewall::PacketInfo) -> bool {
 /// The mesh peer an outbound packet is sent to: the destination itself for overlay
 /// traffic, the selected exit peer for internet-bound traffic. `None` when a packet
 /// is internet-bound and no exit node is selected (it has nowhere to go).
+fn carries_destination(carries: crate::membership::ExitFamilies, dst: IpAddr) -> bool {
+    match dst {
+        IpAddr::V4(_) => carries.carries_v4(),
+        IpAddr::V6(_) => carries.carries_v6(),
+    }
+}
+
 fn dial_dst(exit: &ExitClient, dst: IpAddr) -> Option<IpAddr> {
     if is_overlay_ip(dst) {
         return Some(dst);
     }
-    Some(IpAddr::V6(exit.selection()?.ipv6))
+    let selection = exit.selection()?;
+    if !carries_destination(selection.carries, dst) {
+        return None;
+    }
+    Some(IpAddr::V6(selection.ipv6))
 }
 
 /// Resolve the live route to send an outbound packet over: the destination's own
@@ -636,6 +690,9 @@ fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Opti
     // Internet-bound: route it through the selected exit peer, pinned to the exit
     // network's handle (the network whose allow-list permits us).
     let sel = exit.selection()?;
+    if !carries_destination(sel.carries, dst) {
+        return None;
+    }
     peers.route_on_network(&sel.ipv6, &sel.network)
 }
 
@@ -693,6 +750,10 @@ async fn prepare_datagrams(
     pkt: Bytes,
 ) -> Option<fragment::Encoded> {
     let n = pkt.len();
+    if info.dst_ip.is_ipv4() && !route.supports_exit_ipv4() {
+        ctx.stats.record_drop(DropReason::NoPeer);
+        return None;
+    }
     // Reachability is "we share a network", enforced by connection existence. The
     // per-host firewall is the fine-grained gate.
     if ctx
@@ -953,6 +1014,30 @@ pub fn spawn_peer_reader(
                             }
                             continue;
                         }
+                        let datagram = if datagram.first().is_some_and(|byte| byte >> 4 == 4)
+                            && firewall::parse_packet_info(&datagram)
+                                .is_some_and(|info| is_transitable(info.dst_ip))
+                        {
+                            if !exit.server.offers_v4() {
+                                stats.record_drop(DropReason::ExitDenied);
+                                continue;
+                            }
+                            match exit
+                                .server
+                                .ipv4
+                                .outbound(datagram, peer_ipv6, network.clone())
+                                .await
+                            {
+                                Ok(packet) => packet,
+                                Err(error) => {
+                                    tracing::debug!(%error, "IPv4 exit translation failed");
+                                    stats.record_drop(DropReason::ExitDenied);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            datagram
+                        };
                         stats.record_rx(datagram.len());
                         // SSH NAT: a packet to our configured mesh SSH port is rewritten to the
                         // SSH server's internal listen port before injection. The
@@ -1860,15 +1945,75 @@ mod tests {
         assert_eq!(csum_replace2(csum_replace2(c, 22, 41384), 41384, 22), c);
     }
 
-    /// The overlay routes no IPv4, and there is no longer a rule that names it:
-    /// `DropIpv4Disabled` went with the setting, having been unreachable twice
-    /// over. What must not go with it is the outcome. An IPv4 destination makes
-    /// the whole packet IPv4, so its source is IPv4 too, and a mesh source is
-    /// always the peer's derived IPv6: anti-spoofing takes it and neither the
-    /// exit-return exemption nor the transit branch below can hand it back, the
-    /// first because `dst_is_me` compares an IPv6, the second because it is never
-    /// reached. Accepting one would half-work, which is the failure the deleted
-    /// rule existed to prevent.
+    /// IPv4 transit still requires a canonical source and an exit grant.
+    #[test]
+    fn ipv4_transit_requires_canonical_source_and_network_permission() {
+        let peer = iroh::SecretKey::generate().public();
+        let fw = inbound_fw(Action::Deny, vec![]);
+        let exit = no_exit();
+        let packet = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
+        assert!(matches!(
+            evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
+            InboundDecision::DropExit
+        ));
+        exit.server.reload([("example", &[peer.to_string()][..])]);
+        assert!(matches!(
+            evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
+            InboundDecision::Accept
+        ));
+        assert!(matches!(
+            evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "other"),
+            InboundDecision::DropExit
+        ));
+        for destination in [
+            [127, 0, 0, 1],
+            [10, 0, 0, 1],
+            [169, 254, 169, 254],
+            [192, 0, 0, 2],
+            [198, 19, 0, 1],
+        ] {
+            let packet = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), destination, 443);
+            assert!(!matches!(
+                evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
+                InboundDecision::Accept
+            ));
+        }
+        let spoof = make_tcp_packet_v4([192, 0, 0, 3], [8, 8, 8, 8], 443);
+        assert!(matches!(
+            evaluate_inbound(&spoof, &fw, &exit, &peer, TEST_V6, "example"),
+            InboundDecision::DropSpoof
+        ));
+    }
+
+    #[test]
+    fn ipv4_return_traffic_requires_selected_gateway_and_open_flow() {
+        let peer = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = exit_via(peer);
+        let mut reply = make_tcp_packet_v4([8, 8, 8, 8], ipv4::CLIENT_ADDR.octets(), 50000);
+        reply[20..22].copy_from_slice(&443u16.to_be_bytes());
+        assert!(matches!(
+            evaluate_inbound(&reply, &fw, &exit, &peer, TEST_V6, "test-net"),
+            InboundDecision::DropFirewall(_)
+        ));
+        let mut request = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
+        request[20..22].copy_from_slice(&50000u16.to_be_bytes());
+        let info = firewall::parse_packet_info(&request).unwrap();
+        assert!(
+            fw.evaluate_packet(Direction::Out, &info, &peer, Some("test-net"))
+                .is_allow()
+        );
+        assert!(matches!(
+            evaluate_inbound(&reply, &fw, &exit, &peer, TEST_V6, "test-net"),
+            InboundDecision::Accept
+        ));
+        assert!(matches!(
+            evaluate_inbound(&reply, &fw, &exit, &other, OTHER_V6, "test-net"),
+            InboundDecision::DropSpoof
+        ));
+    }
+
     #[test]
     fn inbound_mesh_ipv4_is_never_accepted() {
         let peer = iroh::SecretKey::generate().public();

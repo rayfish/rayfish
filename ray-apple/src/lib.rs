@@ -66,6 +66,7 @@ pub struct NodeStatus {
     pub files: Vec<IncomingFile>,
     pub ssh: NodeSshStatus,
     pub services: NodeServiceStatus,
+    pub exit_nodes: Vec<ExitNodeNetwork>,
     pub connection_warning: Option<String>,
 }
 
@@ -96,6 +97,15 @@ pub struct NodeServiceStatus {
     pub mdns_active: bool,
     pub v4_bridge_enabled: bool,
     pub quic_loss_tolerant: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct ExitNodeNetwork {
+    pub network: String,
+    pub using: Option<String>,
+    pub available: Vec<String>,
+    pub refused: Vec<String>,
+    pub problem: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -333,6 +343,22 @@ impl Node {
             })
             .collect();
         let settings = config::load().map_err(AppleError::network)?;
+        let exit_nodes = match state.external_exit_node_status() {
+            IpcMessage::ExitNodeState { networks } => networks
+                .into_iter()
+                .map(|network| ExitNodeNetwork {
+                    network: network.network,
+                    using: network.using,
+                    available: network.available,
+                    refused: network.refused,
+                    problem: network.not_in_effect,
+                })
+                .collect(),
+            response => {
+                expect_ok(response, "exit-node status")?;
+                Vec::new()
+            }
+        };
         let connection_requests = match state.list_connections() {
             IpcMessage::PendingRequests { requests } => requests
                 .into_iter()
@@ -444,8 +470,57 @@ impl Node {
             files,
             ssh,
             services,
+            exit_nodes,
             connection_warning,
         })
+    }
+
+    pub fn prepare_exit_node(&self) -> Result<(), AppleError> {
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.state()?;
+            self.runtime
+                .block_on(state.prepare_external_exit_node())
+                .map_err(AppleError::network)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AppleError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn prepare_exit_transport(&self) -> Result<(), AppleError> {
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.state()?;
+            self.runtime
+                .block_on(state.prepare_external_exit_transport());
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AppleError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn select_exit_node(
+        &self,
+        network: String,
+        peer: Option<String>,
+    ) -> Result<(), AppleError> {
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.state()?;
+            let response = self
+                .runtime
+                .block_on(state.select_external_exit_node(&network, peer));
+            expect_ok(response, "exit-node selection")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (network, peer);
+            Err(AppleError::UnsupportedPlatform)
+        }
     }
 
     /// Probe enrolled machines separately so an offline machine cannot delay status.
@@ -774,6 +849,11 @@ impl Node {
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(state) = &state {
             state.detach_tun();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            rayfish::exit_node::set_full_tunnel(false);
+            rayfish::exit_node::clear_physical_defaults();
         }
         #[cfg(target_os = "macos")]
         {
