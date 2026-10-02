@@ -77,6 +77,8 @@ macos-dev:
     #!/usr/bin/env bash
     set -euo pipefail
     version=$(cargo pkgid -p rayfish)
+    # pkgid omits `rayfish@` when the checkout directory is named rayfish.
+    version=${version##*#}
     version=${version##*@}
     marketing_version=${version%%[-+]*}
     env CARGO_PROFILE_RELEASE_STRIP=none xcodebuild -quiet -project macos/Rayfish.xcodeproj -scheme Rayfish -configuration Debug -destination platform=macOS,arch=arm64 ARCHS=arm64 MARKETING_VERSION="$marketing_version" -derivedDataPath target/macos-development -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
@@ -91,6 +93,8 @@ macos-release:
     fi
     arch=$(uname -m)
     version=$(cargo pkgid -p rayfish)
+    # pkgid omits `rayfish@` when the checkout directory is named rayfish.
+    version=${version##*#}
     version=${version##*@}
     marketing_version=${version%%[-+]*}
     team=${RAYFISH_DEVELOPMENT_TEAM:-}

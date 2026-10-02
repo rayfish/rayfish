@@ -11,7 +11,7 @@ use std::ptr::null_mut;
 use std::sync::OnceLock;
 
 use bytes::{Bytes, BytesMut};
-use libc::{AF_INET, AF_INET6, F_DUPFD_CLOEXEC, fcntl, iovec};
+use libc::{AF_INET, AF_INET6, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, O_NONBLOCK, fcntl, iovec};
 use tokio::io::unix::AsyncFd;
 
 use super::TUN_MTU;
@@ -90,12 +90,31 @@ fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFL and F_SETFL only read and update the descriptor's status flags.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & O_NONBLOCK != 0 {
+        return Ok(());
+    }
+    // SAFETY: as above; the new flags keep the existing ones.
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(super) fn is_available() -> bool {
     batch_syscalls().is_some()
 }
 
 pub(super) fn split(fd: OwnedFd) -> io::Result<(Reader, Writer)> {
     let syscalls = batch_syscalls().expect("availability checked before splitting utun");
+    // AsyncFd relies on EWOULDBLOCK. The duplicate shares this open file
+    // description, so one call covers both halves.
+    set_nonblocking(fd.as_raw_fd())?;
     let writer = duplicate(fd.as_raw_fd())?;
     Ok((Reader::new(fd, syscalls)?, Writer::new(writer, syscalls)?))
 }

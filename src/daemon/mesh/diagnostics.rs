@@ -36,7 +36,6 @@ const DEGRADED_QUEUE_BYTES: usize = 256 * 1024;
 const CONGESTED_QUEUE_BYTES: usize = 1024 * 1024;
 
 fn connection_quality(
-    rtt_ms: Option<f64>,
     recent_packet_loss: bool,
     queued_bytes: usize,
 ) -> (ipc::ConnectionQuality, Option<ipc::ConnectionIssue>) {
@@ -58,15 +57,58 @@ fn connection_quality(
             Some(ipc::ConnectionIssue::PacketLoss),
         );
     }
-    if rtt_ms.is_some_and(|rtt| rtt >= HIGH_RTT_MS) {
-        return (
-            ipc::ConnectionQuality::Degraded,
-            Some(ipc::ConnectionIssue::HighLatency),
-        );
-    }
     (ipc::ConnectionQuality::Good, None)
 }
 
+/// A steady high RTT is normal for a relayed or distant peer. Only a spike above
+/// the peer's own baseline that also crosses the floor counts as degraded.
+fn is_high_latency(rtt_ms: f64, above_baseline: bool) -> bool {
+    above_baseline && rtt_ms >= HIGH_RTT_MS
+}
+
+/// Recent RTT samples for one peer, oldest first.
+#[derive(Clone, Default)]
+struct RttHistory {
+    samples: VecDeque<f64>,
+}
+
+impl RttHistory {
+    /// Records `rtt_ms` and reports whether it spikes above the earlier samples.
+    fn observe(&mut self, rtt_ms: f64) -> bool {
+        let high = self.is_spike(rtt_ms);
+        if self.samples.len() == RTT_WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(rtt_ms);
+        high
+    }
+
+    /// Above the median by more than one standard deviation, once there is
+    /// enough history to say.
+    fn is_spike(&self, rtt_ms: f64) -> bool {
+        self.samples.len() >= RTT_MIN_SAMPLES && rtt_ms > self.median() + self.std_dev()
+    }
+
+    fn median(&self) -> f64 {
+        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let mid = sorted.len() / 2;
+        if sorted.len().is_multiple_of(2) {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        }
+    }
+
+    fn std_dev(&self) -> f64 {
+        let n = self.samples.len() as f64;
+        let mean = self.samples.iter().sum::<f64>() / n;
+        let variance = self.samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        variance.sqrt()
+    }
+}
+
+/// Cumulative connection counters at one point in time.
 #[derive(Clone, Copy)]
 struct LossSample {
     at: Instant,
@@ -74,45 +116,83 @@ struct LossSample {
     lost: u64,
 }
 
+impl LossSample {
+    /// Counters only grow on one connection; a drop means they were reset.
+    fn follows(&self, earlier: &LossSample) -> bool {
+        self.sent >= earlier.sent && self.lost >= earlier.lost
+    }
+
+    fn is_lossy_since(&self, baseline: &LossSample) -> bool {
+        let sent = self.sent.saturating_sub(baseline.sent);
+        let lost = self.lost.saturating_sub(baseline.lost);
+        sent >= MIN_LOSS_SAMPLE_PACKETS
+            && lost.saturating_mul(100) >= sent.saturating_mul(DEGRADED_LOSS_PERCENT)
+    }
+}
+
+/// Loss samples for one peer connection, trimmed to about [`LOSS_WINDOW`].
 #[derive(Clone)]
-struct LossSamples {
+struct LossHistory {
     connection_id: usize,
     samples: VecDeque<LossSample>,
 }
 
+impl LossHistory {
+    fn new(connection_id: usize) -> Self {
+        Self {
+            connection_id,
+            samples: VecDeque::new(),
+        }
+    }
+
+    /// Records `sample` and reports whether loss since the window's baseline
+    /// crosses the degraded threshold.
+    fn observe(&mut self, connection_id: usize, sample: LossSample) -> bool {
+        let restarted = self.connection_id != connection_id
+            || self
+                .samples
+                .back()
+                .is_some_and(|last| !sample.follows(last));
+        if restarted {
+            self.connection_id = connection_id;
+            self.samples.clear();
+        }
+        self.samples.push_back(sample);
+        if self.samples.len() > LOSS_MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.trim(sample.at);
+        self.samples
+            .front()
+            .is_some_and(|baseline| sample.is_lossy_since(baseline))
+    }
+
+    /// Keeps the newest sample at or before the cutoff as the baseline, unless
+    /// it is so old that the rate would cover drops that already ended.
+    fn trim(&mut self, now: Instant) {
+        let cutoff = now.checked_sub(LOSS_WINDOW).unwrap_or(now);
+        let stale = now.checked_sub(LOSS_WINDOW * 2);
+        while self.samples.len() > 1
+            && (self.samples[1].at <= cutoff
+                || stale.is_some_and(|stale| self.samples[0].at < stale))
+        {
+            self.samples.pop_front();
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ConnectionHistory {
-    rtt: HashMap<EndpointId, VecDeque<f64>>,
-    loss: HashMap<EndpointId, LossSamples>,
+    rtt: HashMap<EndpointId, RttHistory>,
+    loss: HashMap<EndpointId, LossHistory>,
 }
 
 impl ConnectionHistory {
-    fn observe(&mut self, peer: EndpointId, current: f64) -> bool {
-        if !current.is_finite() || current < 0.0 {
+    fn observe(&mut self, peer: EndpointId, rtt_ms: f64) -> bool {
+        if !rtt_ms.is_finite() || rtt_ms < 0.0 {
             return false;
         }
-        let samples = self.rtt.entry(peer).or_default();
-        let high = if samples.len() >= RTT_MIN_SAMPLES {
-            let mut sorted: Vec<f64> = samples.iter().copied().collect();
-            sorted.sort_by(f64::total_cmp);
-            let mid = sorted.len() / 2;
-            let median = if sorted.len().is_multiple_of(2) {
-                (sorted[mid - 1] + sorted[mid]) / 2.0
-            } else {
-                sorted[mid]
-            };
-            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-            let variance =
-                samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / samples.len() as f64;
-            current > median + variance.sqrt()
-        } else {
-            false
-        };
-        if samples.len() == RTT_WINDOW {
-            samples.pop_front();
-        }
-        samples.push_back(current);
-        high
+        self.rtt.entry(peer).or_default().observe(rtt_ms)
     }
 
     fn observe_loss(
@@ -131,40 +211,12 @@ impl ConnectionHistory {
         connection_id: usize,
         sent: u64,
         lost: u64,
-        now: Instant,
+        at: Instant,
     ) -> bool {
-        let history = self.loss.entry(peer).or_insert_with(|| LossSamples {
-            connection_id,
-            samples: VecDeque::new(),
-        });
-        if history.connection_id != connection_id
-            || history
-                .samples
-                .back()
-                .is_some_and(|sample| sent < sample.sent || lost < sample.lost)
-        {
-            history.connection_id = connection_id;
-            history.samples.clear();
-        }
-        history.samples.push_back(LossSample {
-            at: now,
-            sent,
-            lost,
-        });
-        if history.samples.len() > LOSS_MAX_SAMPLES {
-            history.samples.pop_front();
-        }
-        let cutoff = now.checked_sub(LOSS_WINDOW).unwrap_or(now);
-        while history.samples.len() > 1 && history.samples[1].at <= cutoff {
-            history.samples.pop_front();
-        }
-        let Some(first) = history.samples.front() else {
-            return false;
-        };
-        let sent = sent.saturating_sub(first.sent);
-        let lost = lost.saturating_sub(first.lost);
-        sent >= MIN_LOSS_SAMPLE_PACKETS
-            && lost.saturating_mul(100) >= sent.saturating_mul(DEGRADED_LOSS_PERCENT)
+        self.loss
+            .entry(peer)
+            .or_insert_with(|| LossHistory::new(connection_id))
+            .observe(connection_id, LossSample { at, sent, lost })
     }
 }
 
@@ -202,7 +254,7 @@ mod connection_history_tests {
         for _ in 0..RTT_WINDOW {
             history.observe(peer, 225.0);
         }
-        assert_eq!(history.rtt[&peer].len(), RTT_WINDOW);
+        assert_eq!(history.rtt[&peer].samples.len(), RTT_WINDOW);
         assert!(!history.observe(peer, 225.0));
     }
 
@@ -239,6 +291,18 @@ mod connection_history_tests {
         }
         assert_eq!(history.loss[&peer].samples.len(), LOSS_MAX_SAMPLES);
     }
+
+    #[test]
+    fn packet_loss_ignores_a_stale_baseline() {
+        let peer = SecretKey::generate().public();
+        let start = Instant::now();
+        let mut history = ConnectionHistory::default();
+
+        assert!(!history.observe_loss_at(peer, 1, 100, 0, start));
+        let later = start + LOSS_WINDOW * 10;
+        assert!(!history.observe_loss_at(peer, 1, 1_100, 100, later));
+        assert!(!history.observe_loss_at(peer, 1, 1_200, 100, later + Duration::from_secs(1)));
+    }
 }
 
 #[cfg(test)]
@@ -248,14 +312,14 @@ mod connection_quality_tests {
     #[test]
     fn reports_queue_pressure_before_other_signals() {
         assert_eq!(
-            connection_quality(Some(250.0), true, CONGESTED_QUEUE_BYTES),
+            connection_quality(true, CONGESTED_QUEUE_BYTES),
             (
                 ipc::ConnectionQuality::Congested,
                 Some(ipc::ConnectionIssue::SendQueue)
             )
         );
         assert_eq!(
-            connection_quality(Some(20.0), false, DEGRADED_QUEUE_BYTES),
+            connection_quality(false, DEGRADED_QUEUE_BYTES),
             (
                 ipc::ConnectionQuality::Degraded,
                 Some(ipc::ConnectionIssue::SendQueue)
@@ -266,7 +330,7 @@ mod connection_quality_tests {
     #[test]
     fn reports_recent_packet_loss() {
         assert_eq!(
-            connection_quality(Some(20.0), true, 0),
+            connection_quality(true, 0),
             (
                 ipc::ConnectionQuality::Degraded,
                 Some(ipc::ConnectionIssue::PacketLoss)
@@ -275,14 +339,10 @@ mod connection_quality_tests {
     }
 
     #[test]
-    fn reports_high_latency() {
-        assert_eq!(
-            connection_quality(Some(HIGH_RTT_MS), false, 0),
-            (
-                ipc::ConnectionQuality::Degraded,
-                Some(ipc::ConnectionIssue::HighLatency)
-            )
-        );
+    fn high_latency_needs_a_spike_above_the_floor() {
+        assert!(is_high_latency(HIGH_RTT_MS, true));
+        assert!(!is_high_latency(HIGH_RTT_MS, false));
+        assert!(!is_high_latency(HIGH_RTT_MS - 1.0, true));
     }
 }
 
@@ -326,10 +386,12 @@ impl Daemon {
                 let Some(connection) = peer.connection.as_mut() else {
                     continue;
                 };
+                let mut high_latency = false;
                 if let Some(ms) = connection.rtt_ms {
                     peer.rtt_high = *observed_rtt
                         .entry(peer.endpoint_id)
                         .or_insert_with(|| history.observe(peer.endpoint_id, ms));
+                    high_latency = is_high_latency(ms, peer.rtt_high);
                 }
                 if let Some(connection_id) = connection_id {
                     let recent_loss = *observed_loss.entry(peer.endpoint_id).or_insert_with(|| {
@@ -346,6 +408,10 @@ impl Daemon {
                         connection.quality = ipc::ConnectionQuality::Degraded;
                         connection.quality_issue = Some(ipc::ConnectionIssue::PacketLoss);
                     }
+                }
+                if high_latency && connection.quality_issue.is_none() {
+                    connection.quality = ipc::ConnectionQuality::Degraded;
+                    connection.quality_issue = Some(ipc::ConnectionIssue::HighLatency);
                 }
             }
         }
@@ -743,7 +809,7 @@ impl Daemon {
         let stats = conn.stats();
         let queued_bytes = crate::transport::DATAGRAM_SEND_BUFFER_SIZE
             .saturating_sub(conn.datagram_send_buffer_space());
-        let (quality, quality_issue) = connection_quality(rtt_ms, false, queued_bytes);
+        let (quality, quality_issue) = connection_quality(false, queued_bytes);
         ipc::ConnectionInfo {
             conn_type,
             remote_addr,

@@ -286,8 +286,8 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     regress it. GSO coalesces same-destination segments into one sendmsg,
         //     cutting syscalls under burst.
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
-        //     larger logical send limit for transient bursts. The forwarding path
-        //     waits for capacity instead of asking noQ to evict queued packets.
+        //     small send limit. The forwarding path never waits for capacity;
+        //     when the queue is full, noQ discards older datagrams.
         // The congestion controller stays at the noq default (Cubic). Switching to
         // BBR3 would help on lossy/shallow-buffer consumer uplinks but requires a
         // `noq-proto` dependency to reach the config type, deferred to a measured
