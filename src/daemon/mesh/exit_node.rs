@@ -340,18 +340,32 @@ impl NetworkRegistry {
                  `ray exit-node none`.",
             );
         }
-        let selected_id = selected
-            .first()
-            .map(|nc| {
-                nc.exit_node_use
-                    .as_deref()
-                    .unwrap_or_default()
-                    .parse::<EndpointId>()
+        let candidates: Vec<_> = selected
+            .iter()
+            .filter_map(|nc| {
+                let raw = nc.exit_node_use.as_deref().unwrap_or_default();
+                match raw.parse::<EndpointId>() {
+                    Ok(id) => Some((*nc, id)),
+                    Err(error) => {
+                        tracing::warn!(network = %nc.name, %error, "invalid exit node selection");
+                        None
+                    }
+                }
             })
-            .transpose()?;
+            .collect();
+        if !selected.is_empty() && candidates.is_empty() {
+            return Ok(Some(
+                "the selected exit node is not a valid identity; existing routing is retained"
+                    .to_string(),
+            ));
+        }
+        let chosen = prefer_usable(&candidates, |(nc, id)| {
+            self.roster_member(&nc.name, *id)
+                .is_some_and(|m| m.exit_families.tunnelled() != ExitFamilies::Neither)
+        });
         let mut warning = None;
-        let selection = selected.first().zip(selected_id).map(|(nc, id)| {
-            let member = self.roster_member(&nc.name, id);
+        let selection = chosen.map(|(nc, id)| {
+            let member = self.roster_member(&nc.name, *id);
             let carries = member
                 .as_ref()
                 .map_or(ExitFamilies::Neither, |m| m.exit_families.tunnelled());
@@ -361,7 +375,7 @@ impl NetworkRegistry {
                         .to_string(),
                 );
             }
-            let peer = member.as_ref().map_or(id, |m| m.identity);
+            let peer = member.as_ref().map_or(*id, |m| m.identity);
             ExitSelection {
                 peer_user: self.device_user_map.resolve(&peer),
                 ipv6: derive_ipv6(&peer),
@@ -751,6 +765,15 @@ impl NetworkRegistry {
     }
 }
 
+/// The first selection whose peer can carry traffic now. With none, the first
+/// one stays selected so internet traffic remains blocked.
+fn prefer_usable<T>(selections: &[T], usable: impl Fn(&T) -> bool) -> Option<&T> {
+    selections
+        .iter()
+        .find(|s| usable(s))
+        .or_else(|| selections.first())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Member, gateway_refusal};
@@ -922,6 +945,22 @@ mod tests {
         )
         .expect("a gateway with neither family is unusable");
         assert!(why.contains("cannot carry IPv4 or IPv6"), "{why}");
+    }
+
+    /// A selection on a later network is used when the first one's peer is gone.
+    #[test]
+    fn a_later_usable_selection_wins() {
+        use super::prefer_usable;
+
+        assert_eq!(
+            prefer_usable(&["gone", "live"], |s| *s == "live"),
+            Some(&"live")
+        );
+        assert_eq!(
+            prefer_usable(&["gone", "also gone"], |_| false),
+            Some(&"gone")
+        );
+        assert_eq!(prefer_usable::<&str>(&[], |_| true), None);
     }
 
     #[test]
