@@ -12,10 +12,13 @@
 //! be measured against each other on real paths before one becomes a setting:
 //!
 //! - `cubic` (default): noq's default, unchanged behaviour.
-//! - `bbr3`: models bottleneck bandwidth and RTT instead of reacting to loss.
 //! - `loss-tolerant`: [`LossTolerant`], which ignores ordinary loss and leaves
 //!   rate control to the inner flows, the way WireGuard does, with a window
 //!   ceiling and a persistent-congestion reset as the safety bound.
+//!
+//! noq's BBR3 is not offered. On a netem-shaped link (40 ms RTT, 100 Mbit/s,
+//! 0 to 2% loss) it was slower than Cubic in every case, with ping spikes up to
+//! a second under load from overfilling the bottleneck queue.
 //!
 //! The choice only governs what this node sends. Each side of a connection
 //! runs its own controller.
@@ -25,7 +28,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use iroh::endpoint::{Controller, ControllerFactory, RttEstimator};
-use noq_proto::congestion::Bbr3Config;
 use strum::{EnumString, IntoStaticStr};
 
 /// Environment variable that selects the controller, read once at bind.
@@ -37,7 +39,6 @@ pub(crate) const CONGESTION_ENV: &str = "RAYFISH_QUIC_CC";
 pub(crate) enum CongestionControl {
     #[default]
     Cubic,
-    Bbr3,
     LossTolerant,
 }
 
@@ -54,7 +55,7 @@ impl CongestionControl {
             _ => {
                 tracing::warn!(
                     value = ?raw,
-                    "unknown {CONGESTION_ENV}; expected cubic, bbr3 or loss-tolerant"
+                    "unknown {CONGESTION_ENV}; expected cubic or loss-tolerant"
                 );
                 Self::default()
             }
@@ -65,13 +66,12 @@ impl CongestionControl {
     pub(crate) fn factory(self) -> Option<Arc<dyn ControllerFactory + Send + Sync + 'static>> {
         match self {
             Self::Cubic => None,
-            Self::Bbr3 => Some(Arc::new(Bbr3Config::default())),
             Self::LossTolerant => Some(Arc::new(LossTolerantConfig::default())),
         }
     }
 }
 
-/// Starting window, matching noq's BBR3 and Cubic defaults (about ten
+/// Starting window, matching noq's Cubic default (about ten
 /// 1200-byte datagrams) so a new path does not burst.
 const INITIAL_WINDOW: u64 = 14_720;
 
@@ -222,15 +222,14 @@ mod tests {
     #[test]
     fn env_values_parse_case_insensitively() {
         assert_eq!("cubic".parse(), Ok(CongestionControl::Cubic));
-        assert_eq!("BBR3".parse(), Ok(CongestionControl::Bbr3));
+        assert_eq!("CUBIC".parse(), Ok(CongestionControl::Cubic));
         assert_eq!("loss-tolerant".parse(), Ok(CongestionControl::LossTolerant));
-        assert!("reno".parse::<CongestionControl>().is_err());
+        assert!("bbr3".parse::<CongestionControl>().is_err());
     }
 
     #[test]
     fn cubic_keeps_the_noq_default() {
         assert!(CongestionControl::Cubic.factory().is_none());
-        assert!(CongestionControl::Bbr3.factory().is_some());
         assert!(CongestionControl::LossTolerant.factory().is_some());
     }
 

@@ -5865,7 +5865,6 @@ dependencies = [
  "libc",
  "mime_guess",
  "nom 8.0.0",
- "noq-proto",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

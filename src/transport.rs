@@ -293,7 +293,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     small send limit. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
         // The congestion controller defaults to noq's Cubic; `RAYFISH_QUIC_CC`
-        // selects BBR3 or a loss-tolerant controller for measurement (see
+        // selects a loss-tolerant controller for measurement (see
         // `transport::congestion`).
         .transport_config(quic_transport_config())
         // Drop overlay addresses from the gathered direct-address candidates, so a
