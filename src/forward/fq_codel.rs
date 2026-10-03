@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use ahash::RandomState;
-use async_channel::{Sender as PacketSender, bounded};
+use tokio::sync::mpsc::{Sender as PacketSender, channel, error::TrySendError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
@@ -43,21 +43,22 @@ pub(crate) struct Sender {
 
 impl Sender {
     pub(super) fn spawn(route: &PeerRoute, stats: Arc<ForwardMetrics>) -> Self {
-        let (ingress, rx) = bounded::<Packet>(INGRESS_CAPACITY);
-        let shutdown = ingress.clone();
+        let (ingress, mut rx) = channel::<Packet>(INGRESS_CAPACITY);
         let conn = route.conn.clone();
         let activity = route.activity_clock();
         let worker_stats = Arc::clone(&stats);
         tokio::spawn(async move {
             let mut queue = Queue::new(Arc::clone(&worker_stats));
             'worker: loop {
+                if rx.is_closed() {
+                    break;
+                }
                 let next = tokio::select! {
                     biased;
                     _ = conn.closed() => break,
-                    _ = shutdown.closed() => break,
                     packet = rx.recv() => match packet {
-                        Ok(packet) => Some(packet),
-                        Err(_) => break,
+                        Some(packet) => Some(packet),
+                        None => break,
                     },
                     _ = ready(()), if queue.packets > 0 => None,
                 };
@@ -91,13 +92,9 @@ impl Sender {
                                         worker_stats.record_drop(DropReason::NoPeer);
                                         break 'worker;
                                     },
-                                    _ = shutdown.closed() => {
-                                        worker_stats.record_drop(DropReason::NoPeer);
-                                        break 'worker;
-                                    },
                                     result = &mut send => break result,
                                     incoming = rx.recv() => match incoming {
-                                        Ok(incoming) => {
+                                        Some(incoming) => {
                                             queue.enqueue(incoming);
                                             incoming_batch += 1;
                                             if incoming_batch == INGRESS_BATCH {
@@ -105,7 +102,7 @@ impl Sender {
                                                 tokio::task::yield_now().await;
                                             }
                                         },
-                                        Err(_) => {
+                                        None => {
                                             worker_stats.record_drop(DropReason::NoPeer);
                                             break 'worker;
                                         }
@@ -173,22 +170,15 @@ impl Sender {
             _permit: permit,
         };
         if let Err(error) = self.ingress.try_send(packet) {
-            self.stats.record_drop(if error.is_closed() {
-                DropReason::NoPeer
-            } else {
-                DropReason::QueueFull
+            self.stats.record_drop(match error {
+                TrySendError::Closed(_) => DropReason::NoPeer,
+                TrySendError::Full(_) => DropReason::QueueFull,
             });
         }
     }
 
     pub(crate) fn queued_bytes(&self) -> usize {
         self.backlog.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for Sender {
-    fn drop(&mut self) {
-        self.ingress.close();
     }
 }
 
@@ -443,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn ingress_overflow_and_close_release_packet_budget() {
         let stats = Arc::new(ForwardMetrics::default());
-        let (ingress, rx) = bounded(2);
+        let (ingress, mut rx) = channel(2);
         let sender = Sender {
             ingress,
             hash: RandomState::new(),
@@ -498,7 +488,7 @@ mod tests {
             drop(packet);
         }
         assert_eq!(sender.queued_bytes(), 0);
-        assert!(rx.recv().await.is_err());
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]

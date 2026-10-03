@@ -5834,7 +5834,6 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "argon2 0.5.3",
- "async-channel",
  "async-trait",
  "blake3",
  "bs58",

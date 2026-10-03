@@ -72,7 +72,6 @@ bytes = "1"
 # completers in src/cli/complete.rs get attached to the arguments they answer for.
 clap = { version = "4.6.6", features = ["derive", "unstable-ext", "wrap_help"] }
 ahash = "0.8"
-async-channel = "2.5"
 # `unstable-dynamic` moves completion from a generated script to the binary
 # itself, which is the only way a tab can list the networks and peers you have
 # right now rather than the ones that existed when the script was written.
