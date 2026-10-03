@@ -16,6 +16,10 @@
 //!   and leaves rate control to the inner flows, the way WireGuard does, with
 //!   a window ceiling and a persistent-congestion reset as the safety bound.
 //!
+//! - `fq-codel`: Cubic plus inner-flow scheduling and CoDel queue management
+//!   in `forward::fq_codel`. QUIC backpressure keeps the backlog in the
+//!   scheduler, where sparse flows can bypass bulk traffic.
+//!
 //! noq's BBR3 is not offered. On a netem-shaped link (40 ms RTT, 100 Mbit/s,
 //! 0 to 2% loss) it was slower than Cubic in every case, with ping spikes up to
 //! a second under load from overfilling the bottleneck queue.
@@ -61,7 +65,7 @@ pub(crate) fn controller_factory(
     cc: QuicCongestion,
 ) -> Option<Arc<dyn ControllerFactory + Send + Sync + 'static>> {
     match cc {
-        QuicCongestion::Cubic => None,
+        QuicCongestion::Cubic | QuicCongestion::FqCodel => None,
         QuicCongestion::LossTolerant => Some(Arc::new(LossTolerantConfig::default())),
     }
 }
@@ -217,6 +221,7 @@ mod tests {
     #[test]
     fn cubic_keeps_the_noq_default() {
         assert!(controller_factory(QuicCongestion::Cubic).is_none());
+        assert!(controller_factory(QuicCongestion::FqCodel).is_none());
         assert!(controller_factory(QuicCongestion::LossTolerant).is_some());
     }
 

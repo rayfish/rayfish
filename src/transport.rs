@@ -487,13 +487,21 @@ fn is_unroutable(e: &io::Error) -> bool {
 
 pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// Keep most of the backlog in FQ-CoDel, rather than the QUIC FIFO.
+pub(crate) fn datagram_send_buffer_size(cc: QuicCongestion) -> usize {
+    match cc {
+        QuicCongestion::FqCodel => 16 * 1024,
+        _ => DATAGRAM_SEND_BUFFER_SIZE,
+    }
+}
+
 /// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one QUIC
 /// connection carrying DATAGRAM frames per peer, plus reliable control streams).
 ///
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
-fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
+pub(crate) fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
     tracing::info!(congestion_controller = cc.as_ref(), "QUIC transport config");
     let builder = match controller_factory(cc) {
         Some(factory) => QuicTransportConfig::builder().congestion_controller_factory(factory),
@@ -510,7 +518,7 @@ fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
         // Keep the unreliable datagram queue small. When it fills, noQ discards
         // older datagrams rather than making the forwarding path wait and add
         // latency behind stale traffic.
-        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE)
+        .datagram_send_buffer_size(datagram_send_buffer_size(cc))
         .build()
 }
 

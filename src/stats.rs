@@ -46,10 +46,14 @@ pub enum DropReason {
     /// resolver tasks was full. Keeping this separate from generic send
     /// backpressure makes resolver overload visible in diagnostics.
     DnsConcurrency,
+    /// FQ-CoDel discarded a packet to control sustained queue delay.
+    QueueDelay,
+    /// The bounded flow scheduler exhausted its retention budget.
+    QueueFull,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 12] = [
+    const ALL: [DropReason; 14] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -62,6 +66,8 @@ impl DropReason {
         DropReason::LazyDialBufferFull,
         DropReason::LazyDialConcurrency,
         DropReason::DnsConcurrency,
+        DropReason::QueueDelay,
+        DropReason::QueueFull,
     ];
 }
 
@@ -425,7 +431,9 @@ mod tests {
                 | DropReason::PacketTooBig
                 | DropReason::LazyDialBufferFull
                 | DropReason::LazyDialConcurrency
-                | DropReason::DnsConcurrency => 1,
+                | DropReason::DnsConcurrency
+                | DropReason::QueueDelay
+                | DropReason::QueueFull => 1,
             }
         });
         assert_eq!(counted, DropReason::ALL.len());

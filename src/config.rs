@@ -47,7 +47,7 @@ impl DnsMode {
     }
 }
 
-/// Which QUIC congestion controller the endpoint builds for each path. Read
+/// Congestion control and optional flow scheduling for the data plane. Read
 /// once at endpoint bind, so a change takes effect on restart. See
 /// [`crate::transport`]'s `congestion` module for what each one does.
 #[derive(
@@ -62,6 +62,8 @@ pub enum QuicCongestion {
     /// Experimental.
     #[default]
     LossTolerant,
+    /// Cubic with FQ-CoDel scheduling of inner IP flows. Experimental.
+    FqCodel,
 }
 
 /// An unknown saved value (a controller since removed, or a hand edit) falls
@@ -2528,7 +2530,11 @@ name = "test"
                 .quic_congestion,
             QuicCongestion::LossTolerant
         );
-        for controller in [QuicCongestion::Cubic, QuicCongestion::LossTolerant] {
+        for controller in [
+            QuicCongestion::Cubic,
+            QuicCongestion::LossTolerant,
+            QuicCongestion::FqCodel,
+        ] {
             let value = controller.as_ref();
             write(&path, format!("quic_congestion = '{value}'\n")).expect("write setting");
             let loaded = load_in(tmp.path()).expect("load setting");

@@ -577,7 +577,9 @@ impl Daemon {
             .filter(|m| m.identity != my_id)
             .map(|m| {
                 let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.identity));
-                let connection = connected.get(&m.identity).map(Self::gather_conn_info);
+                let connection = connected
+                    .get(&m.identity)
+                    .map(|conn| self.gather_conn_info(conn));
                 // The signed roster keeps this binding even when the peer has no
                 // connection. The connection-time device map may be empty here.
                 let user_id = m.user_identity.unwrap_or(m.identity);
@@ -768,7 +770,10 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn gather_conn_info(conn: &iroh::endpoint::Connection) -> ipc::ConnectionInfo {
+    pub(crate) fn gather_conn_info(
+        &self,
+        conn: &iroh::endpoint::Connection,
+    ) -> ipc::ConnectionInfo {
         let paths = conn.paths();
         // Classify every path, then pick which one to report. iroh only marks a
         // path `is_selected()` once its path-selector has promoted a winner;
@@ -807,8 +812,17 @@ impl Daemon {
         };
 
         let stats = conn.stats();
-        let queued_bytes = crate::transport::DATAGRAM_SEND_BUFFER_SIZE
-            .saturating_sub(conn.datagram_send_buffer_space());
+        let queued_bytes = self
+            .registry
+            .peers
+            .datagram_send_buffer_size()
+            .saturating_sub(conn.datagram_send_buffer_space())
+            + self
+                .registry
+                .peers
+                .lookup_v6(&derive_ipv6(&conn.remote_id()))
+                .filter(|route| route.conn.stable_id() == conn.stable_id())
+                .map_or(0, |route| route.queued_bytes());
         let (quality, quality_issue) = connection_quality(false, queued_bytes);
         ipc::ConnectionInfo {
             conn_type,
@@ -952,7 +966,7 @@ impl Daemon {
             probes.push(rtt);
         }
 
-        let info = Self::gather_conn_info(&conn);
+        let info = self.gather_conn_info(&conn);
         IpcMessage::PingResponse {
             peer_name: display,
             conn_type: info.conn_type,
