@@ -9,8 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Experimental `ray config set quic-congestion fq-codel` gives inner flows
-  separate queues and favors sparse traffic over bulk transfers. It combines
-  CoDel queue management with Cubic and applies after restarting the daemon.
+  separate queues and favors sparse traffic over bulk transfers. Packets enter
+  their flow queues directly. It combines CoDel queue management with Cubic
+  and applies after restarting the daemon.
 
 - `ray files auto-accept add/remove <peer>` saves trusted file senders; `list`
   shows their identities. The macOS Files page can add and remove them too.
