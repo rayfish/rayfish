@@ -62,6 +62,91 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  docker-e2e:
+    runs-on: ubuntu-24.04
+    env:
+      E2E_BACKEND: docker
+      E2E_AUTO_TEARDOWN: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test E2E harness
+        run: bash tests/test-e2e-harness.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-docker-e2e-x86_64"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Install just and cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cross
+
+      - name: Set up TUN device
+        run: sudo modprobe tun
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
+
+      - name: Build E2E node Docker image
+        run: docker build -t rayfish-e2e-node tests/docker
+
+      - name: "E2E: closed-net"
+        run: bash tests/e2e.sh closed-net run
+
+      - name: "E2E: firewall"
+        if: ${{ !cancelled() }}
+        run: bash tests/e2e.sh firewall run
+
+      - name: "E2E: connect"
+        if: ${{ !cancelled() }}
+        run: bash tests/e2e.sh connect run
+
+      - name: Teardown remaining E2E containers
+        if: always()
+        run: |
+          for s in closed-net firewall connect; do
+            bash tests/e2e.sh "$s" teardown || true
+          done
+          docker network rm rayfish-e2e 2>/dev/null || true
+          leaked=0
+          if all_containers="$(docker ps -a --format '{{.Names}}')"; then
+            for c in rayfish-closednet-a rayfish-closednet-b rayfish-closednet-c \
+                     rayfish-fw-a rayfish-fw-b rayfish-fw-c \
+                     rayfish-connect-a rayfish-connect-b; do
+              if echo "$all_containers" | grep -qxF "$c"; then
+                echo "::error::Container $c remains after fallback teardown" >&2
+                leaked=1
+              fi
+            done
+          else
+            echo "::error::Cannot query Docker containers (API unavailable?)" >&2
+            leaked=1
+          fi
+          if all_networks="$(docker network ls --format '{{.Name}}')"; then
+            if echo "$all_networks" | grep -qxF "rayfish-e2e"; then
+              echo "::error::Docker network rayfish-e2e remains after fallback teardown" >&2
+              leaked=1
+            fi
+          else
+            echo "::error::Cannot query Docker networks (API unavailable?)" >&2
+            leaked=1
+          fi
+          if [[ $leaked -ne 0 ]]; then
+            echo "Fallback cleanup failed: lingering containers or network detected." >&2
+            exit 1
+          fi
+
+
   # Same gap the Android job closes, for the other platform whose code no Linux
   # build compiles: the TUN/route/DNS backends are per-OS `cfg` branches, and
   # macOS was only ever built on release, where a break costs a failed tag.

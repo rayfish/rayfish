@@ -455,29 +455,33 @@ impl NetworkRegistry {
                 return false;
             }
         };
-        // Announce ourselves on every still-shared network over the one connection
-        // and register the peer's route per network. `conn_changed` accumulates
-        // whether the connection became newly current (it always is for a fresh
-        // dial / reconnect), which gates driving its demux.
-        let mut conn_changed = false;
+        // Establish each shared network over the one connection. Start a fresh
+        // connection's driver as soon as its first route is registered: a later
+        // hello may time out, but already-established networks must stay usable.
         for t in targets {
-            let Ok((mut send, _)) = conn.open_bi().await else {
-                continue;
-            };
             let hello = ControlMsg::MeshHello {
                 identity: my_identity,
                 hostname: outgoing_hostname(&t.network),
                 device_cert: device_cert.clone(),
             };
-            if control::send_msg(&mut send, Some(t.network_key), &hello)
-                .await
-                .is_err()
-            {
+            if send_mesh_hello(&conn, t.network_key, &hello).await.is_err() {
                 continue;
             }
-            conn_changed |= self
+            let conn_changed = self
                 .mesh_ctx()
                 .register_peer_conn(&conn, peer_id, &t.network);
+            if conn_changed
+                && self
+                    .peers
+                    .conn_for_ip(&peer_ip)
+                    .is_some_and(|selected| selected.stable_id() == conn.stable_id())
+            {
+                tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
+                let router = Arc::clone(self.protocol_router());
+                let dconn = conn.clone();
+                tokio::spawn(router.drive_mesh_connection(dconn, true));
+            }
+            announce_network_handles(&self.peers, &conn, peer_ip).await;
         }
         // Registration may have kept a different, globally preferred connection.
         // Success means a live selected connection exists, not that this dial won.
@@ -489,12 +493,6 @@ impl NetworkRegistry {
             return false;
         };
         self.reachability.note_ok(peer_id);
-        if conn_changed && selected.stable_id() == conn.stable_id() {
-            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
-            let router = Arc::clone(self.protocol_router());
-            let dconn = conn.clone();
-            tokio::spawn(router.drive_mesh_connection(dconn, true));
-        }
         announce_network_handles(&self.peers, &selected, peer_ip).await;
         true
     }

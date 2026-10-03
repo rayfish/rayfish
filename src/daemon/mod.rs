@@ -2531,30 +2531,175 @@ mod accept_handler_tests {
         // reconnect loop kept dialing forever. It must also reuse this session
         // when announcing another network instead of opening another connection.
         for _ in 0..2 {
-            assert!(
+            let (connected, ()) = tokio::join!(
                 tokio::time::timeout(
                     Duration::from_secs(5),
                     registry.dial_peer_once(remote.id(), &targets)
-                )
-                .await
-                .expect("reuse completes without another dial")
+                ),
+                async {
+                    for target in &targets {
+                        loop {
+                            let (send, mut recv) = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                remote_conn.accept_bi(),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                            let control::FrameRead::Frame(frame) =
+                                control::recv_frame(&mut recv).await.unwrap()
+                            else {
+                                panic!("expected a known control frame");
+                            };
+                            match frame.msg {
+                                ControlMsg::NetworkHandles { .. } => continue,
+                                ControlMsg::MeshHello { .. } => {
+                                    assert_eq!(frame.net, Some(target.network_key));
+                                    // A known member finishes its optional reply
+                                    // without a body, as the real demux does.
+                                    drop(send);
+                                    break;
+                                }
+                                other => panic!("expected MeshHello, got {other:?}"),
+                            }
+                        }
+                    }
+                },
             );
+            assert!(connected.expect("reuse completes without another dial"));
             assert!(registry.peers.conn_is_current(&peer_ip, conn.stable_id()));
-            for target in &targets {
-                let (_, mut recv) =
-                    tokio::time::timeout(Duration::from_secs(5), remote_conn.accept_bi())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                let control::FrameRead::Frame(frame) =
-                    control::recv_frame(&mut recv).await.unwrap()
-                else {
-                    panic!("expected MeshHello frame");
-                };
-                assert_eq!(frame.net, Some(target.network_key));
-                assert!(matches!(frame.msg, ControlMsg::MeshHello { .. }));
-            }
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_second_hello_keeps_the_first_network_connection_driven() {
+        let alpn = transport::mesh_alpn();
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let local = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .address_lookup(lookup.clone())
+            .bind()
+            .await
+            .unwrap();
+        let remote = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        lookup.add_endpoint_info(remote.addr());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsStore::load(tmp.path()).await.unwrap();
+        let registry = sample_registry(
+            local.clone(),
+            IrohIdentityProvider::new(local.id()),
+            store.clone(),
+            local.id(),
+        );
+        let router = Arc::new(ProtocolRouter::new(
+            BlobsProtocol::new(&store, None),
+            Arc::new(FileService::new(
+                SecretKey::generate(),
+                Arc::clone(&registry.transport),
+                Arc::clone(&registry),
+                None,
+                registry.device_user_map.clone(),
+                Arc::new(transfers::TransferRegistry::new()),
+            )),
+            Arc::new(ConnectService::new(
+                Arc::clone(&registry.transport),
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&registry),
+            )),
+            Arc::new(ManagementService::new(
+                Arc::clone(&registry.transport),
+                Arc::clone(&registry),
+                SecretKey::generate(),
+            )),
+            Arc::clone(&registry.conn),
+        ));
+        router.set_mesh_dispatch(MeshDispatch {
+            ctx: registry.mesh_ctx(),
+            token: registry.shutdown_token.clone(),
+            on_peer_connected: Arc::new(|_| {}),
+        });
+        registry.set_protocol_router(router);
+        let targets = ["net-a", "net-b"].map(|network| DialTarget {
+            network: network.to_string(),
+            network_key: SecretKey::generate().public(),
+        });
+        let remote_id = remote.id();
+        let dial = {
+            let registry = Arc::clone(&registry);
+            let targets = targets.clone();
+            tokio::spawn(async move { registry.dial_peer_once(remote_id, &targets).await })
+        };
+        let (second_hello_tx, second_hello_rx) = tokio::sync::oneshot::channel();
+        let accepting = {
+            let remote = remote.clone();
+            tokio::spawn(async move {
+                let conn = remote.accept().await.unwrap().await.unwrap();
+                for (index, target) in targets.iter().enumerate() {
+                    loop {
+                        let (send, mut recv) = conn.accept_bi().await.unwrap();
+                        let control::FrameRead::Frame(frame) =
+                            control::recv_frame(&mut recv).await.unwrap()
+                        else {
+                            panic!("expected a known control frame");
+                        };
+                        match frame.msg {
+                            ControlMsg::NetworkHandles { .. } => continue,
+                            ControlMsg::MeshHello { .. } => {
+                                assert_eq!(frame.net, Some(target.network_key));
+                                if index == 0 {
+                                    drop(send);
+                                    break;
+                                }
+                                // Keep the second reply unfinished while the
+                                // caller cancels the dial, without sleeping for
+                                // its production deadline.
+                                second_hello_tx.send((conn, send)).unwrap();
+                                return;
+                            }
+                            other => panic!("expected MeshHello, got {other:?}"),
+                        }
+                    }
+                }
+            })
+        };
+        let (remote_conn, second_reply) =
+            tokio::time::timeout(Duration::from_secs(5), second_hello_rx)
+                .await
+                .expect("the first hello completes and the second starts")
+                .unwrap();
+        dial.abort();
+        assert!(dial.await.unwrap_err().is_cancelled());
+        accepting.await.unwrap();
+        let peer_ip = derive_ipv6(&remote_id);
+        assert!(registry.peers.shares_network_v6(&peer_ip, "net-a"));
+        assert!(!registry.peers.shares_network_v6(&peer_ip, "net-b"));
+        open_and_send(&remote_conn, None, &ControlMsg::Ping { nonce: 7 })
+            .await
+            .unwrap();
+        let nonce = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (_, mut recv) = remote_conn.accept_bi().await.unwrap();
+                match control::recv_msg(&mut recv).await.unwrap() {
+                    ControlMsg::NetworkHandles { .. } => continue,
+                    ControlMsg::Pong { nonce } => break nonce,
+                    other => panic!("expected Pong from the connection driver, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelling the second hello must preserve the first network's driver");
+        assert_eq!(nonce, 7);
+        drop(second_reply);
+        registry.shutdown_token.cancel();
+        local.close().await;
+        remote.close().await;
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2591,7 +2736,7 @@ mod accept_handler_tests {
             let (mut send, recv) = outgoing.open_bi().await.unwrap();
             let mut recv = Some(recv);
             if stop_reply {
-                // Match dial_peer_once: it discards the receive half immediately.
+                // A legacy peer can discard the receive half immediately.
                 drop(recv.take());
             }
             control::send_msg(

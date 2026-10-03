@@ -40,8 +40,7 @@ wait_all_ssh "$A" "$B" "$C"
 seed_known_hosts "$A" "$B" "$C"
 reset_state "$A" "$B" "$C"
 deploy_all "$ROOT" "$A" "$B" "$C"
-for h in "$A" "$B" "$C"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
-wait_daemons "$A" "$B" "$C"
+activate_daemons "$A" "$B" "$C" || summary
 
 # ---------------------------------------------------------------------------
 step "1. srv-a creates the closed network"
@@ -74,10 +73,39 @@ else
   fail "srv-c never queued"; CID=""
 fi
 [[ -n "$CID" ]] && on "$A" "ray requests $NET deny $CID" 2>&1 | strip | sed 's/^/   a| /'
-# A denied peer must not become a member. Give it a window; expect still offline.
-sleep 15
-[[ "$(peer_online "$A" srv-c "$NET")" == "0" ]] && pass "denied peer is not admitted" \
-  || fail "denied peer unexpectedly became a member"
+# Wait until the deny request has been processed (request cleared).
+if retry_until 15 "request_cleared '$A' '$NET' srv-c"; then
+  pass "deny request processed (request cleared)"
+else
+  fail "join request for srv-c was not cleared after deny"
+fi
+# After deny is processed, observe for a finite period (15s).
+# Each observation must successfully obtain valid structured state.
+# If srv-c appears in the network roster at any point, fail immediately.
+# Only PASS after the full observation window consists of successful observations showing srv-c absent.
+denied_stayed_out=1
+query_failures=0
+successful_observations=0
+end=$((SECONDS + 15))
+while (( SECONDS < end )); do
+  if peer_in_roster "$A" srv-c "$NET"; then
+    denied_stayed_out=0
+    fail "denied peer unexpectedly appeared in the network roster"
+    break
+  elif peer_absent "$A" srv-c "$NET"; then
+    successful_observations=$((successful_observations + 1))
+  else
+    query_failures=$((query_failures + 1))
+  fi
+  sleep 2
+done
+if [[ $denied_stayed_out -eq 1 ]]; then
+  if [[ $query_failures -eq 0 && $successful_observations -gt 0 ]]; then
+    pass "denied peer remained unadmitted throughout observation window ($successful_observations checks)"
+  else
+    fail "could not reliably observe denied peer state ($successful_observations successful, $query_failures failed)"
+  fi
+fi
 on "$C" "ray leave $NET" >/dev/null 2>&1 || true   # stop srv-c's background retries
 
 # ---------------------------------------------------------------------------
@@ -92,8 +120,12 @@ if retry_until 30 "[[ \"\$(on '$A' 'ray admin $NET list --json' | jq -r 'length'
 else
   fail "srv-b not reflected as a key-holder"
 fi
-# Let the promotion (is_coordinator=true) propagate into the blob before srv-a drops.
-sleep 8
+# Wait until the promotion propagates to srv-b before srv-a drops.
+if retry_until 30 "[[ \"\$(net_role '$B' '$NET')\" == coordinator ]] && holds_key '$B' '$NET'"; then
+  pass "promotion propagated to srv-b (co-coordinator)"
+else
+  fail "promotion did not reach srv-b"
+fi
 
 # ---------------------------------------------------------------------------
 step "5. gatekeeper resilience — co-coordinator admits while srv-a is offline"
@@ -103,12 +135,24 @@ step "5. gatekeeper resilience — co-coordinator admits while srv-a is offline"
 # fleet that only accepts a non-default SSH_KEY.
 REUSABLE="$(mint_reusable "$B" "$NET")"   # srv-b (now a co-coordinator) mints a reusable key
 [[ -n "$REUSABLE" ]] && pass "co-coordinator minted a reusable key (${REUSABLE:0:12}…)" || fail "co-coordinator could not mint a key"
-on "$A" 'ray down' >/dev/null 2>&1 || true   # original coordinator goes offline
-sleep 3
+# A. Prove the daemon on srv-a was actually stopped.
+if on "$A" 'systemctl stop rayfish' >/dev/null 2>&1 \
+   && on "$A" '! systemctl is-active --quiet rayfish' >/dev/null 2>&1; then
+  pass "srv-a daemon stopped"
+else
+  fail "srv-a daemon could not be stopped"; summary
+fi
+# B. From srv-b's view, bounded-poll until there is no live connection to srv-a.
+if retry_until 30 "peer_has_no_connection '$B' srv-a '$NET'"; then
+  pass "srv-b observes no live connection to srv-a"
+else
+  fail "srv-b still has a live connection to srv-a after coordinator stop"; summary
+fi
 # srv-c joins unattended; only srv-b is online to admit it.
 on "$C" "ray join $REUSABLE --hostname srv-c --auto-accept-firewall" 2>&1 | strip | sed 's/^/   c| /'
 wait_roster "$B" srv-c
-on "$A" 'ray up' >/dev/null 2>&1 || true     # bring the coordinator back
+on "$A" 'systemctl start rayfish' || { fail "srv-a daemon could not be started"; summary; }
+activate_daemons "$A" || summary
 
 # ---------------------------------------------------------------------------
 step "6. hostname change propagates to roster + magic DNS"
@@ -131,17 +175,17 @@ fi
 step "7. graceful leave + nuke"
 on "$C" "ray leave $NET" 2>&1 | strip | sed 's/^/   c| /'
 # A graceful leave (LEAVE_CODE) prunes the member promptly, not on a timeout.
-if retry_until 45 "[[ \"\$(peer_online '$B' srv-c '$NET')\" == 0 ]]"; then
+if retry_until 45 "peer_absent '$B' srv-c '$NET'"; then
   pass "graceful leave pruned srv-c from the roster"
 else
   fail "srv-c still present after leave"
 fi
 on "$A" "ray nuke $NET --force" 2>&1 | strip | sed 's/^/   a| /'
 # Another coordinator remains, so only the caller leaves.
-if retry_until 30 "! has_net '$A' '$NET'"; then
+if retry_until 30 "net_absent '$A' '$NET'"; then
   pass "nuke removed the network from the coordinator"
 else
-  fail "network still present on coordinator after nuke"
+  fail "could not verify network removed from coordinator after nuke"
 fi
 if has_net "$B" "$NET"; then
   pass "remaining coordinator kept the network after nuke"
@@ -159,7 +203,7 @@ on "$A" "printf 'networks:\n  demo:\n    srv-a:\n      allows:\n        \"*\": i
 on "$A" 'ray apply /tmp/spec.yaml --dry-run' 2>&1 | strip | sed 's/^/   a| /'
 on "$A" 'ray apply /tmp/spec.yaml --dry-run' 2>&1 | strip | grep -qi 'demo' \
   && pass "ray apply --dry-run normalizes the spec" || fail "ray apply --dry-run did not echo the spec"
-! has_net "$A" demo && pass "dry-run created no network" || fail "dry-run unexpectedly created 'demo'"
+net_absent "$A" demo && pass "dry-run created no network" || fail "could not verify dry-run left 'demo' absent"
 
 # ---------------------------------------------------------------------------
 summary

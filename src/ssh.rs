@@ -1580,6 +1580,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
             let (stream, client) = listener.accept().await.expect("accept");
+            disable_nagle(&stream);
             let mut policy = UserPolicy::default();
             policy.add(&["*".to_string()]);
             // The same origin the live path builds: the client's real address,
@@ -1593,7 +1594,10 @@ mod tests {
         });
 
         let mut handle = client::connect(
-            Arc::new(client::Config::default()),
+            Arc::new(client::Config {
+                nodelay: true,
+                ..client::Config::default()
+            }),
             addr,
             AcceptAnyHost { opened },
         )
@@ -1656,9 +1660,11 @@ mod tests {
     async fn an_authenticated_session_outlives_the_login_grace() {
         // The grace has to stop counting once a peer is admitted, or every
         // session would be cut off partway through whatever it was doing.
-        let handle =
-            connect_watching_openings(None, test_account(), Duration::from_millis(200)).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Allow the cryptographic handshake to complete under parallel test
+        // load, then wait past the same grace before using the session.
+        let grace = Duration::from_secs(2);
+        let handle = connect_watching_openings(None, test_account(), grace).await;
+        tokio::time::sleep(grace + Duration::from_millis(100)).await;
         let mut channel = handle
             .channel_open_session()
             .await

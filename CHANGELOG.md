@@ -36,6 +36,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- New members and reconnecting peers no longer get stuck with a connection
+  that appears online but cannot carry traffic.
 - The macOS app version now matches the Rayfish version in `Cargo.toml`.
 - IPv4 listener bridging is enabled by default on fresh installs and starts
   with the macOS app's VPN. An explicit `v4-bridge off` setting is preserved.

@@ -1492,17 +1492,25 @@ impl NetworkRegistry {
         };
         match dialed {
             Ok(peer_conn) => {
-                if let Ok((mut s, _)) = peer_conn.open_bi().await {
-                    let _ = control::send_msg(
-                        &mut s,
-                        Some(net_pubkey),
-                        &ControlMsg::MeshHello {
-                            identity: my_identity,
-                            hostname: my_hostname.clone(),
-                            device_cert: self.current_device_cert(),
-                        },
-                    )
-                    .await;
+                if let Err(error) = send_mesh_hello(
+                    &peer_conn,
+                    net_pubkey,
+                    &ControlMsg::MeshHello {
+                        identity: my_identity,
+                        hostname: my_hostname.clone(),
+                        device_cert: self.current_device_cert(),
+                    },
+                )
+                .await
+                {
+                    self.reachability.note_fail(m.identity);
+                    tracing::debug!(
+                        network = %network_name,
+                        peer = %m.identity.fmt_short(),
+                        error = %error,
+                        "member hello did not complete; connection supervisor will retry"
+                    );
+                    return;
                 }
                 crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                 // Register the route, then drive the new connection's control

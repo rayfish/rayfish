@@ -494,10 +494,34 @@ async fn build_member_state(
     Arc::new(std::sync::RwLock::new(ns))
 }
 
+/// Finish a roster peer's hello exchange before registering its local route.
+/// An already-seated member closes the reply stream without a body, while a
+/// peer that still knows us as approved sends a Welcome before registering us.
+/// Dropping the receive half early stops that Welcome and leaves the two ends
+/// disagreeing about whether the connection carries this network. Consume the
+/// optional reply through FIN, without applying its unsigned roster contents.
+pub(crate) async fn send_mesh_hello(
+    conn: &Connection,
+    network_key: EndpointId,
+    hello: &ControlMsg,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        control::send_msg(&mut send, Some(network_key), hello).await?;
+        // Same maximum body size as the framed control reader, plus its prefix.
+        recv.read_to_end(65_536 + 4)
+            .await
+            .context("read mesh hello reply")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("timeout awaiting mesh hello completion")?
+}
+
 /// Dial every other roster member (skipping ourselves and the already-connected
 /// coordinator), send each a `MeshHello` over the single mesh ALPN, and register
 /// it as a peer (route + data reader + control demux). A member that's offline is
-/// logged and skipped; a stream-open/send failure aborts the join.
+/// logged and skipped, as is a peer whose hello exchange fails.
 #[allow(clippy::too_many_arguments)]
 async fn connect_to_roster_peers(
     ep: &Endpoint,
@@ -534,17 +558,20 @@ async fn connect_to_roster_peers(
         };
         match connected {
             Ok(conn) => {
-                let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(
-                    &mut send,
-                    Some(net_pubkey),
+                if let Err(error) = send_mesh_hello(
+                    &conn,
+                    net_pubkey,
                     &ControlMsg::MeshHello {
                         identity: my_identity,
                         hostname: outgoing_hostname(network_name),
                         device_cert: device_cert.clone(),
                     },
                 )
-                .await?;
+                .await
+                {
+                    tracing::warn!(peer = %member.identity.fmt_short(), error = %error, "mesh peer hello did not complete");
+                    continue;
+                }
                 register_dialed_peer(ctx, router, conn, member.identity, network_name).await;
                 tracing::info!(peer_ip = %derive_ipv6(&member.identity), "connected to mesh peer");
             }
@@ -785,6 +812,136 @@ fn spawn_reconverge_worker(
             .await;
         }
     });
+}
+
+#[cfg(test)]
+mod mesh_hello_reply_tests {
+    use super::*;
+    use iroh::RelayMode;
+    use iroh::endpoint::{SendStream, presets};
+
+    async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let alpn = transport::mesh_alpn();
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let accepting = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let outgoing = client.connect(server.addr(), &alpn).await.unwrap();
+        let incoming = accepting.await.unwrap();
+        (server, client, incoming, outgoing)
+    }
+
+    async fn receive_hello(conn: &Connection, network_key: EndpointId) -> SendStream {
+        let (send, mut recv) = conn.accept_bi().await.unwrap();
+        let control::FrameRead::Frame(frame) = control::recv_frame(&mut recv).await.unwrap() else {
+            panic!("expected a known hello frame");
+        };
+        assert_eq!(frame.net, Some(network_key));
+        assert!(matches!(frame.msg, ControlMsg::MeshHello { .. }));
+        send
+    }
+
+    fn hello(identity: EndpointId) -> ControlMsg {
+        ControlMsg::MeshHello {
+            identity,
+            hostname: None,
+            device_cert: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_member_welcome_is_delivered_before_registering_the_route() {
+        let (server, client, incoming, outgoing) = connected_pair().await;
+        let network_key = SecretKey::generate().public();
+        let client_id = client.id();
+        let peers = PeerTable::new();
+        let registered = peers.clone();
+        let replying = tokio::spawn(async move {
+            let mut send = receive_hello(&incoming, network_key).await;
+            // Admission can persist a roster before replying. The receive half
+            // must survive this delay instead of stopping the eventual Welcome.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            control::send_msg(
+                &mut send,
+                Some(network_key),
+                &ControlMsg::Welcome {
+                    members: Vec::new(),
+                    approved: Vec::new(),
+                    direct_key: None,
+                    direct_record: None,
+                    direct_record_published: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), send.stopped())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                None,
+                "the hello reader must consume the reply through FIN"
+            );
+            registered.add(derive_ipv6(&client_id), incoming, client_id, "mesh");
+        });
+        send_mesh_hello(&outgoing, network_key, &hello(client_id))
+            .await
+            .unwrap();
+        replying.await.unwrap();
+        assert!(peers.conn_for_ip(&derive_ipv6(&client_id)).is_some());
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn known_member_without_a_welcome_completes_the_hello() {
+        let (server, client, incoming, outgoing) = connected_pair().await;
+        let network_key = SecretKey::generate().public();
+        let replying = tokio::spawn(async move {
+            let send = receive_hello(&incoming, network_key).await;
+            // The known-member handler sends no body; dropping its SendStream
+            // finishes that half, which is a valid completion of the hello.
+            drop(send);
+            incoming
+        });
+        send_mesh_hello(&outgoing, network_key, &hello(client.id()))
+            .await
+            .unwrap();
+        let _incoming = replying.await.unwrap();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn reset_reply_does_not_complete_the_hello() {
+        let (server, client, incoming, outgoing) = connected_pair().await;
+        let network_key = SecretKey::generate().public();
+        let replying = tokio::spawn(async move {
+            let mut send = receive_hello(&incoming, network_key).await;
+            send.reset(VarInt::from_u32(42)).unwrap();
+            incoming
+        });
+        assert!(
+            send_mesh_hello(&outgoing, network_key, &hello(client.id()))
+                .await
+                .is_err()
+        );
+        let _incoming = replying.await.unwrap();
+        client.close().await;
+        server.close().await;
+    }
 }
 
 #[cfg(test)]

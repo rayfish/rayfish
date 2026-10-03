@@ -45,6 +45,11 @@ provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 The throughput/latency benchmark (`tests/e2e.sh bench`) is a sibling suite
 under [`../bench/`](../bench) (same shared `tests/lib/`).
 
+Run `bash tests/test-e2e-harness.sh` to check daemon activation, listener readiness,
+probe errors, bounded diagnostics, cleanup retries, and offline-contact failures
+without Docker or cloud credentials. It includes the focused cleanup and connect
+regression scripts. These checks also run in CI.
+
 ## Prerequisites (both backends)
 
 - `jq` (the assertions parse `ray status --json` on the runner), plus `just` and
@@ -127,6 +132,7 @@ against a direct-public-IP baseline that on one host is the same bridge.
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `E2E_BACKEND` | `digitalocean` | `digitalocean` or `docker` |
+| `E2E_AUTO_TEARDOWN` | `0` | `1` tears down the active backend's fleet after `run`; intended for unattended CI. Docker failures dump diagnostics first; with DigitalOcean this destroys the provisioned droplets. Default `0` preserves the fleet for interactive inspection. |
 | `REGION` | `fra1` | droplet region (provision) |
 | `SIZE` | `s-1vcpu-1gb` | droplet size slug (provision) |
 | `IMAGE` | `ubuntu-22-04-x64` | droplet image slug (provision) |
