@@ -7,12 +7,14 @@
 //! This controls our queue, not queues already built in a router or Wi-Fi link.
 
 use std::collections::VecDeque;
+use std::future::ready;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use ahash::RandomState;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use async_channel::{Sender as PacketSender, bounded};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use super::fragment::Encoded;
@@ -26,12 +28,14 @@ const TARGET: Duration = Duration::from_millis(5);
 const INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_PACKETS: usize = 10_240;
+const INGRESS_CAPACITY: usize = 256;
+const INGRESS_BATCH: usize = 64;
 const SEND_BATCH: usize = 32;
 const PACKET_OVERHEAD: usize = 256;
 static BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8 * MAX_BYTES)));
 
 pub(crate) struct Sender {
-    shared: Arc<SharedQueue>,
+    ingress: PacketSender<Packet>,
     hash: RandomState,
     backlog: Arc<AtomicUsize>,
     stats: Arc<ForwardMetrics>,
@@ -39,65 +43,102 @@ pub(crate) struct Sender {
 
 impl Sender {
     pub(super) fn spawn(route: &PeerRoute, stats: Arc<ForwardMetrics>) -> Self {
-        let shared = Arc::new(SharedQueue::new(Arc::clone(&stats)));
-        let worker_queue = Arc::clone(&shared);
+        let (ingress, rx) = bounded::<Packet>(INGRESS_CAPACITY);
+        let shutdown = ingress.clone();
         let conn = route.conn.clone();
         let activity = route.activity_clock();
         let worker_stats = Arc::clone(&stats);
         tokio::spawn(async move {
-            let mut batch = 0;
+            let mut queue = Queue::new(Arc::clone(&worker_stats));
             'worker: loop {
-                if conn.close_reason().is_some() {
-                    break;
-                }
-                let Some(packet) = worker_queue.dequeue() else {
-                    tokio::select! {
-                        _ = conn.closed() => break,
-                        _ = worker_queue.stopped.notified() => break,
-                        _ = worker_queue.ready.notified() => continue,
-                    }
+                let next = tokio::select! {
+                    biased;
+                    _ = conn.closed() => break,
+                    _ = shutdown.closed() => break,
+                    packet = rx.recv() => match packet {
+                        Ok(packet) => Some(packet),
+                        Err(_) => break,
+                    },
+                    _ = ready(()), if queue.packets > 0 => None,
                 };
-                let frames = packet.encoded.datagrams();
-                let mut sent = true;
-                if conn.datagram_send_buffer_space() >= packet.bytes {
-                    sent = conn
-                        .send_many_datagrams(frames)
-                        .is_ok_and(|n| n == frames.len());
-                } else {
-                    for frame in frames {
-                        let result = tokio::select! {
-                            result = conn.send_datagram_wait(frame.clone()) => result,
-                            _ = conn.closed() => {
-                                worker_stats.record_drop(DropReason::NoPeer);
-                                break 'worker;
-                            },
-                            _ = worker_queue.stopped.notified() => {
-                                worker_stats.record_drop(DropReason::NoPeer);
-                                break 'worker;
-                            },
-                        };
-                        if result.is_err() {
-                            sent = false;
-                            break;
+                if let Some(packet) = next {
+                    queue.enqueue(packet);
+                }
+                // Classify a bounded batch before selecting a flow.
+                for _ in 0..INGRESS_BATCH {
+                    let Ok(packet) = rx.try_recv() else { break };
+                    queue.enqueue(packet);
+                }
+                for _ in 0..SEND_BATCH {
+                    let Some(packet) = queue.dequeue(Instant::now()) else {
+                        break;
+                    };
+                    let frames = packet.encoded.datagrams();
+                    let mut sent = true;
+                    if conn.datagram_send_buffer_space() >= packet.bytes {
+                        sent = conn
+                            .send_many_datagrams(frames)
+                            .is_ok_and(|n| n == frames.len());
+                    } else {
+                        for frame in frames {
+                            let send = conn.send_datagram_wait(frame.clone());
+                            tokio::pin!(send);
+                            let mut incoming_batch = 0;
+                            let result = loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = conn.closed() => {
+                                        worker_stats.record_drop(DropReason::NoPeer);
+                                        break 'worker;
+                                    },
+                                    _ = shutdown.closed() => {
+                                        worker_stats.record_drop(DropReason::NoPeer);
+                                        break 'worker;
+                                    },
+                                    result = &mut send => break result,
+                                    incoming = rx.recv() => match incoming {
+                                        Ok(incoming) => {
+                                            queue.enqueue(incoming);
+                                            incoming_batch += 1;
+                                            if incoming_batch == INGRESS_BATCH {
+                                                incoming_batch = 0;
+                                                tokio::task::yield_now().await;
+                                            }
+                                        },
+                                        Err(_) => {
+                                            worker_stats.record_drop(DropReason::NoPeer);
+                                            break 'worker;
+                                        }
+                                    },
+                                }
+                            };
+                            if result.is_err() {
+                                sent = false;
+                                break;
+                            }
                         }
                     }
+                    if sent {
+                        worker_stats.record_tx(packet.ip_len);
+                        activity.store(crate::peers::now_ms(), Ordering::Relaxed);
+                    } else {
+                        worker_stats.record_drop(DropReason::SendFailure);
+                    }
                 }
-                if sent {
-                    worker_stats.record_tx(packet.ip_len);
-                    activity.store(crate::peers::now_ms(), Ordering::Relaxed);
-                } else {
-                    worker_stats.record_drop(DropReason::SendFailure);
-                }
-                batch += 1;
-                if batch == SEND_BATCH {
-                    batch = 0;
-                    tokio::task::yield_now().await;
-                }
+                tokio::task::yield_now().await;
             }
-            worker_queue.close();
+            // Close before draining so racing producers cannot retain packets.
+            rx.close();
+            while let Ok(packet) = rx.try_recv() {
+                drop(packet);
+                worker_stats.record_drop(DropReason::NoPeer);
+            }
+            for _ in 0..queue.packets {
+                worker_stats.record_drop(DropReason::NoPeer);
+            }
         });
         Self {
-            shared,
+            ingress,
             hash: RandomState::new(),
             backlog: Arc::new(AtomicUsize::new(0)),
             stats,
@@ -131,7 +172,13 @@ impl Sender {
             backlog: Arc::clone(&self.backlog),
             _permit: permit,
         };
-        self.shared.enqueue(packet);
+        if let Err(error) = self.ingress.try_send(packet) {
+            self.stats.record_drop(if error.is_closed() {
+                DropReason::NoPeer
+            } else {
+                DropReason::QueueFull
+            });
+        }
     }
 
     pub(crate) fn queued_bytes(&self) -> usize {
@@ -141,59 +188,7 @@ impl Sender {
 
 impl Drop for Sender {
     fn drop(&mut self) {
-        self.shared.close();
-    }
-}
-
-/// Only queue state is shared. The worker owns the connection, and never
-/// holds the queue lock while sending or awaiting QUIC buffer space.
-struct SharedQueue {
-    queue: Mutex<Option<Queue>>,
-    ready: Notify,
-    stopped: Notify,
-    stats: Arc<ForwardMetrics>,
-}
-
-impl SharedQueue {
-    fn new(stats: Arc<ForwardMetrics>) -> Self {
-        Self {
-            queue: Mutex::new(Some(Queue::new(Arc::clone(&stats)))),
-            ready: Notify::new(),
-            stopped: Notify::new(),
-            stats,
-        }
-    }
-
-    fn enqueue(&self, packet: Packet) {
-        {
-            let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(queue) = guard.as_mut() else {
-                self.stats.record_drop(DropReason::NoPeer);
-                return;
-            };
-            queue.enqueue(packet);
-        }
-        // notify_one retains a permit if the worker has not started waiting.
-        self.ready.notify_one();
-    }
-
-    fn dequeue(&self) -> Option<Packet> {
-        self.queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()?
-            .dequeue(Instant::now())
-    }
-
-    fn close(&self) {
-        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(queue) = queue {
-            for _ in 0..queue.packets {
-                self.stats.record_drop(DropReason::NoPeer);
-            }
-            drop(queue);
-            self.stopped.notify_one();
-        }
+        self.ingress.close();
     }
 }
 
@@ -414,7 +409,9 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::DropLabels;
     use bytes::Bytes;
+    use std::net::Ipv6Addr;
     use tokio::time::timeout;
 
     fn drops(stats: &ForwardMetrics) -> u64 {
@@ -444,51 +441,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_enqueue_preserves_sparse_flow_and_idle_wakeup() {
+    async fn ingress_overflow_and_close_release_packet_budget() {
         let stats = Arc::new(ForwardMetrics::default());
-        let shared = SharedQueue::new(Arc::clone(&stats));
-        let now = Instant::now();
+        let (ingress, rx) = bounded(2);
+        let sender = Sender {
+            ingress,
+            hash: RandomState::new(),
+            backlog: Arc::new(AtomicUsize::new(0)),
+            stats: Arc::clone(&stats),
+        };
+        let info = PacketInfo {
+            src_ip: Ipv6Addr::LOCALHOST.into(),
+            dst_ip: Ipv6Addr::UNSPECIFIED.into(),
+            protocol: 6,
+            src_port: 12345,
+            dst_port: 22,
+            tcp_flags: 0,
+            icmp_type: 0,
+            icmp_id: 0,
+        };
         for _ in 0..3 {
-            shared.enqueue(packet(0, 1500, now));
+            sender.enqueue(&info, 0, Encoded::Whole(Bytes::from_static(b"packet")), 6);
         }
-        for _ in 0..3 {
-            shared.dequeue().unwrap();
+        assert_eq!(sender.queued_bytes(), 12);
+        assert_eq!(
+            stats
+                .drops
+                .get_or_create(&DropLabels {
+                    reason: DropReason::QueueFull
+                })
+                .get(),
+            1
+        );
+        // An idle worker can receive packets sent before it starts waiting.
+        drop(
+            timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(sender.queued_bytes(), 6);
+        rx.close();
+        sender.enqueue(&info, 0, Encoded::Whole(Bytes::from_static(b"rejected")), 8);
+        assert_eq!(sender.queued_bytes(), 6);
+        assert_eq!(
+            stats
+                .drops
+                .get_or_create(&DropLabels {
+                    reason: DropReason::NoPeer
+                })
+                .get(),
+            1
+        );
+        // Closing rejects new packets while allowing retained packets to drain.
+        while let Ok(packet) = rx.try_recv() {
+            drop(packet);
         }
-        // Move the empty bulk flow off the new list before refilling it.
-        assert!(shared.dequeue().is_none());
-        for _ in 0..600 {
-            shared.enqueue(packet(0, 1000, now));
-        }
-        shared.dequeue().unwrap();
-        shared.dequeue().unwrap();
-        shared.dequeue().unwrap();
-        shared.enqueue(packet(1, 100, now));
-        assert_eq!(shared.dequeue().unwrap().bucket, 1);
-        assert_eq!(drops(&stats), 0);
-        // Enqueue happened before waiting; the notification must be retained.
-        timeout(Duration::from_secs(1), shared.ready.notified())
-            .await
-            .unwrap();
-        shared.close();
-    }
-
-    #[test]
-    fn closed_queue_releases_backlog_and_rejects_new_packets() {
-        let stats = Arc::new(ForwardMetrics::default());
-        let shared = SharedQueue::new(Arc::clone(&stats));
-        let queued = packet(0, 100, Instant::now());
-        let backlog = Arc::clone(&queued.backlog);
-        shared.enqueue(queued);
-        shared.close();
-        shared.close();
-        assert_eq!(backlog.load(Ordering::Relaxed), 0);
-        assert_eq!(drops(&stats), 1);
-        let rejected = packet(1, 100, Instant::now());
-        let backlog = Arc::clone(&rejected.backlog);
-        shared.enqueue(rejected);
-        assert_eq!(backlog.load(Ordering::Relaxed), 0);
-        assert_eq!(drops(&stats), 2);
-        assert!(shared.dequeue().is_none());
+        assert_eq!(sender.queued_bytes(), 0);
+        assert!(rx.recv().await.is_err());
     }
 
     #[test]
@@ -680,7 +690,7 @@ mod tests {
         // Dropping a sender stops its worker without closing the peer connection.
         let stopped_stats = Arc::new(ForwardMetrics::default());
         let standalone = Sender::spawn(&route, Arc::clone(&stopped_stats));
-        let shared = Arc::clone(&standalone.shared);
+        let backlog = Arc::clone(&standalone.backlog);
         standalone.enqueue(
             &info,
             route.handle,
@@ -689,7 +699,7 @@ mod tests {
         );
         drop(standalone);
         timeout(Duration::from_secs(5), async {
-            while Arc::strong_count(&shared) > 1 {
+            while backlog.load(Ordering::Relaxed) > 0 {
                 tokio::task::yield_now().await;
             }
         })
