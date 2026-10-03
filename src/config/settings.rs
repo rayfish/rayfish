@@ -73,7 +73,9 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
                 QuicCongestion::default()
             } else {
                 value.trim().parse().map_err(|_| {
-                    anyhow::anyhow!("QUIC congestion controller must be cubic or loss-tolerant")
+                    anyhow::anyhow!(
+                        "QUIC congestion controller must be cubic, loss-tolerant, or fq-codel"
+                    )
                 })?
             }
         }
@@ -559,6 +561,10 @@ mod tests {
         assert_eq!(render_global(&cfg, GlobalKey::QuicCongestion), "cubic");
         apply_global(&mut cfg, GlobalKey::QuicCongestion, "loss-tolerant", false).unwrap();
         assert_eq!(cfg.quic_congestion, QuicCongestion::LossTolerant);
+        apply_global(&mut cfg, GlobalKey::QuicCongestion, "cubic", false).unwrap();
+        apply_global(&mut cfg, GlobalKey::QuicCongestion, "fq-codel", false).unwrap();
+        assert_eq!(cfg.quic_congestion, QuicCongestion::FqCodel);
+        assert_eq!(render_global(&cfg, GlobalKey::QuicCongestion), "fq-codel");
         apply_global(&mut cfg, GlobalKey::QuicCongestion, "cubic", false).unwrap();
         // bbr3 was offered once and removed; it must not come back as a value.
         for value in ["bbr3", "reno", "on", "LossTolerant"] {

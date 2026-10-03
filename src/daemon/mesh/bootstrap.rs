@@ -466,6 +466,7 @@ async fn build_daemon_inner(
             PeerTable::new()
         }
     };
+    let peers = peers.with_congestion(app_config.quic_congestion);
     let fw_config = firewall::load_firewall().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "failed to load firewall config, using defaults");
         firewall::FirewallConfig::default()

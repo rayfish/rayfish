@@ -5,6 +5,7 @@
 //! - [`spawn_peer_reader`]: one per peer, reads incoming datagrams and forwards to TUN writer
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
+pub(crate) mod fq_codel;
 mod fragment;
 mod lazy_dial;
 
@@ -678,7 +679,7 @@ async fn flush_or_drop(
 /// reject or PMTU reply is injected back into.
 pub(crate) struct SendCtx<'a> {
     pub firewall: &'a SharedFirewall,
-    pub stats: &'a ForwardMetrics,
+    pub stats: &'a Arc<ForwardMetrics>,
     pub tun_tx: &'a mpsc::Sender<Bytes>,
 }
 
@@ -785,8 +786,13 @@ pub(crate) async fn send_over_route(
     let Some(encoded) = prepare_datagrams(ctx, route, info, pkt).await else {
         return;
     };
-    let datagrams = encoded.datagrams();
-    send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]);
+    if let Some(slot) = &route.scheduler {
+        let sender = slot.get_or_init(|| fq_codel::Sender::spawn(route, Arc::clone(ctx.stats)));
+        sender.enqueue(info, route.handle, encoded, n);
+    } else {
+        let datagrams = encoded.datagrams();
+        send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]);
+    }
 }
 
 /// Hands an ordered run of datagrams to noq. `packets` records the end index and
@@ -1090,6 +1096,7 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
 mod tests {
     use super::*;
     use crate::AsyncMutex;
+    use crate::config::QuicCongestion;
     use crate::firewall::Action;
     use iroh::SecretKey;
     use smol_str::SmolStr;
@@ -1122,12 +1129,17 @@ mod tests {
 
     #[tokio::test]
     async fn fragmented_tcp_crosses_small_quic_path_and_keeps_policy_checks() {
-        check_fragmented_tcp(1280).await;
+        check_fragmented_tcp(1280, QuicCongestion::Cubic).await;
     }
 
     #[tokio::test]
     async fn full_tun_mtu_crosses_small_quic_path_and_keeps_policy_checks() {
-        check_fragmented_tcp(crate::tun::TUN_MTU as usize).await;
+        check_fragmented_tcp(crate::tun::TUN_MTU as usize, QuicCongestion::Cubic).await;
+    }
+
+    #[tokio::test]
+    async fn fq_codel_preserves_fragmentation_firewall_and_lazy_dial_flush() {
+        check_fragmented_tcp(crate::tun::TUN_MTU as usize, QuicCongestion::FqCodel).await;
     }
 
     #[tokio::test]
@@ -1170,7 +1182,7 @@ mod tests {
         let route = peers.lookup_v6(&b_ip).unwrap();
         let (feedback_tx, mut feedback_rx) = mpsc::channel(4);
         let fw = inbound_fw(Action::Allow, vec![]);
-        let stats = ForwardMetrics::default();
+        let stats = Arc::new(ForwardMetrics::default());
         let ctx = SendCtx {
             firewall: &fw,
             stats: &stats,
@@ -1203,19 +1215,20 @@ mod tests {
     /// Exercise the production sender, lazy-dial batch flush and receiver over
     /// real QUIC, with discovery disabled so full IP packets need fragmentation
     /// even on loopback.
-    async fn check_fragmented_tcp(packet_len: usize) {
+    async fn check_fragmented_tcp(packet_len: usize, cc: QuicCongestion) {
         use iroh::endpoint::{QuicTransportConfig, presets};
         use iroh::{Endpoint, RelayMode};
         use std::time::{Duration, Instant};
         use tokio::time::timeout;
 
-        async fn endpoint() -> Endpoint {
+        async fn endpoint(cc: QuicCongestion) -> Endpoint {
             Endpoint::builder(presets::N0)
                 .alpns(vec![crate::transport::mesh_alpn()])
                 .relay_mode(RelayMode::Disabled)
                 .transport_config(
                     QuicTransportConfig::builder()
                         .initial_mtu(1200)
+                        .datagram_send_buffer_size(crate::transport::datagram_send_buffer_size(cc))
                         .mtu_discovery_config(None)
                         .build(),
                 )
@@ -1223,8 +1236,8 @@ mod tests {
                 .await
                 .unwrap()
         }
-        let a = endpoint().await;
-        let b = endpoint().await;
+        let a = endpoint(cc).await;
+        let b = endpoint(cc).await;
         let connect = async {
             let alpn = crate::transport::mesh_alpn();
             let (send, recv) = tokio::join!(a.connect(b.addr(), &alpn), async {
@@ -1236,7 +1249,7 @@ mod tests {
         assert!(send.max_datagram_size().unwrap() < 1282);
         let a_ip = crate::membership::derive_ipv6(&a.id());
         let b_ip = crate::membership::derive_ipv6(&b.id());
-        let sender_peers = PeerTable::new();
+        let sender_peers = PeerTable::new().with_congestion(cc);
         sender_peers.add(b_ip, send.clone(), b.id(), "test");
         sender_peers.note_receive_mtu(&b.id(), &send, crate::tun::TUN_MTU);
         let receiver_peers = PeerTable::new();

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
@@ -11,6 +11,8 @@ use iroh::endpoint::{Connection, VarInt};
 use smol_str::SmolStr;
 
 use crate::audit::AuditLog;
+use crate::config::QuicCongestion;
+use crate::forward::fq_codel::Sender as FqSender;
 use crate::membership;
 
 mod device_user_map;
@@ -30,7 +32,7 @@ use std::collections::HashSet;
 static ACTIVITY_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Milliseconds since [`ACTIVITY_EPOCH`]. Wraps far past any process lifetime.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     ACTIVITY_EPOCH.elapsed().as_millis() as u64
 }
 
@@ -82,6 +84,7 @@ pub struct PeerTable {
     version_incompatible: Arc<DashSet<EndpointId>>,
     /// Actual local TUN limit, shared with readers across TUN reattachments.
     local_mtu: Arc<AtomicU16>,
+    fq_codel: bool,
 }
 
 /// A single peer's identity, its one shared connection, and the network-handle
@@ -109,6 +112,7 @@ pub struct PeerEntry {
 
 struct ActiveConnection {
     conn: Connection,
+    scheduler: Option<Arc<OnceLock<FqSender>>>,
     /// Identical at both ends of this TLS session, unlike `stable_id()` which
     /// only identifies a local connection object. Both peers keep the connection
     /// with the lowest ID, regardless of initiator or registration order.
@@ -131,8 +135,9 @@ struct ActiveConnection {
 }
 
 impl ActiveConnection {
-    fn new(conn: Connection) -> Self {
+    fn new(conn: Connection, fq_codel: bool) -> Self {
         Self {
+            scheduler: fq_codel.then(|| Arc::new(OnceLock::new())),
             selection_id: connection_selection_id(&conn),
             conn,
             in_handles: HashMap::new(),
@@ -162,6 +167,7 @@ fn connection_selection_id(conn: &Connection) -> [u8; 32] {
 /// handle to tag the datagram with.
 pub struct PeerRoute {
     pub conn: Connection,
+    pub(crate) scheduler: Option<Arc<OnceLock<FqSender>>>,
     pub endpoint_id: EndpointId,
     /// The network the outbound packet is attributed to (firewall context). A
     /// multi-homed peer has one IP, so an IP packet carries no network by itself;
@@ -179,6 +185,17 @@ impl PeerRoute {
     /// The peer's advertised IP packet limit; conservative until it announces.
     pub fn receive_mtu(&self) -> u16 {
         self.receive_mtu.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn activity_clock(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.last_active)
+    }
+
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.scheduler
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .map_or(0, FqSender::queued_bytes)
     }
 
     /// Record that traffic just went out on this connection (resets its idle timer).
@@ -199,13 +216,13 @@ fn next_free_handle(used: &HashMap<SmolStr, u16>) -> u16 {
 }
 
 impl PeerEntry {
-    fn new(endpoint_id: EndpointId, conn: Connection, network: SmolStr) -> Self {
+    fn new(endpoint_id: EndpointId, conn: Connection, network: SmolStr, fq_codel: bool) -> Self {
         let mut out_handles = HashMap::new();
         out_handles.insert(network, 1);
         Self {
             endpoint_id,
             out_handles,
-            active: ActiveConnection::new(conn),
+            active: ActiveConnection::new(conn, fq_codel),
         }
     }
 
@@ -229,7 +246,11 @@ impl PeerEntry {
             );
             return false;
         }
-        let old = std::mem::replace(&mut self.active, ActiveConnection::new(conn.clone()));
+        let fq_codel = self.active.scheduler.is_some();
+        let old = std::mem::replace(
+            &mut self.active,
+            ActiveConnection::new(conn.clone(), fq_codel),
+        );
         old.conn.close(
             VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
             b"replaced",
@@ -277,6 +298,7 @@ impl PeerEntry {
         let handle = self.out_handles.get(&network).copied().unwrap_or(0);
         Some(PeerRoute {
             conn: self.active.conn.clone(),
+            scheduler: self.active.scheduler.clone(),
             endpoint_id: self.endpoint_id,
             network,
             handle,
@@ -300,6 +322,7 @@ impl PeerTable {
             audit: None,
             version_incompatible: Arc::new(DashSet::default()),
             local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            fq_codel: false,
         }
     }
 
@@ -312,7 +335,22 @@ impl PeerTable {
             audit: Some(audit),
             version_incompatible: Arc::new(DashSet::default()),
             local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            fq_codel: false,
         }
+    }
+
+    /// Selected at boot together with the endpoint transport configuration.
+    pub(crate) fn with_congestion(mut self, cc: QuicCongestion) -> Self {
+        self.fq_codel = cc == QuicCongestion::FqCodel;
+        self
+    }
+
+    pub(crate) fn datagram_send_buffer_size(&self) -> usize {
+        crate::transport::datagram_send_buffer_size(if self.fq_codel {
+            QuicCongestion::FqCodel
+        } else {
+            QuicCongestion::Cubic
+        })
     }
 
     /// Receive limit advertised to peers and enforced before TUN delivery.
@@ -414,7 +452,12 @@ impl PeerTable {
                 Entry::Vacant(v) => {
                     first_ever = true;
                     conn_changed = true;
-                    v.insert(PeerEntry::new(endpoint_id, conn.clone(), net.clone()));
+                    v.insert(PeerEntry::new(
+                        endpoint_id,
+                        conn.clone(),
+                        net.clone(),
+                        self.fq_codel,
+                    ));
                 }
             }
         }
@@ -548,6 +591,7 @@ impl PeerTable {
         let handle = e.out_handles.get(network).copied().unwrap_or(0);
         Some(PeerRoute {
             conn: e.active.conn.clone(),
+            scheduler: e.active.scheduler.clone(),
             endpoint_id: e.endpoint_id,
             network: SmolStr::new(network),
             handle,
