@@ -8,12 +8,13 @@
 
 use std::collections::VecDeque;
 use std::future::ready;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use ahash::RandomState;
-use tokio::sync::mpsc::{Sender as PacketSender, channel, error::TrySendError};
+use iroh::endpoint::Connection;
+use tokio::sync::mpsc::{Receiver, Sender as PacketSender, channel, error::TrySendError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
@@ -43,97 +44,13 @@ pub(crate) struct Sender {
 
 impl Sender {
     pub(super) fn spawn(route: &PeerRoute, stats: Arc<ForwardMetrics>) -> Self {
-        let (ingress, mut rx) = channel::<Packet>(INGRESS_CAPACITY);
-        let conn = route.conn.clone();
-        let activity = route.activity_clock();
-        let worker_stats = Arc::clone(&stats);
-        tokio::spawn(async move {
-            let mut queue = Queue::new(Arc::clone(&worker_stats));
-            'worker: loop {
-                if rx.is_closed() {
-                    break;
-                }
-                let next = tokio::select! {
-                    biased;
-                    _ = conn.closed() => break,
-                    packet = rx.recv() => match packet {
-                        Some(packet) => Some(packet),
-                        None => break,
-                    },
-                    _ = ready(()), if queue.packets > 0 => None,
-                };
-                if let Some(packet) = next {
-                    queue.enqueue(packet);
-                }
-                // Classify a bounded batch before selecting a flow.
-                for _ in 0..INGRESS_BATCH {
-                    let Ok(packet) = rx.try_recv() else { break };
-                    queue.enqueue(packet);
-                }
-                for _ in 0..SEND_BATCH {
-                    let Some(packet) = queue.dequeue(Instant::now()) else {
-                        break;
-                    };
-                    let frames = packet.encoded.datagrams();
-                    let mut sent = true;
-                    if conn.datagram_send_buffer_space() >= packet.bytes {
-                        sent = conn
-                            .send_many_datagrams(frames)
-                            .is_ok_and(|n| n == frames.len());
-                    } else {
-                        for frame in frames {
-                            let send = conn.send_datagram_wait(frame.clone());
-                            tokio::pin!(send);
-                            let mut incoming_batch = 0;
-                            let result = loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = conn.closed() => {
-                                        worker_stats.record_drop(DropReason::NoPeer);
-                                        break 'worker;
-                                    },
-                                    result = &mut send => break result,
-                                    incoming = rx.recv() => match incoming {
-                                        Some(incoming) => {
-                                            queue.enqueue(incoming);
-                                            incoming_batch += 1;
-                                            if incoming_batch == INGRESS_BATCH {
-                                                incoming_batch = 0;
-                                                tokio::task::yield_now().await;
-                                            }
-                                        },
-                                        None => {
-                                            worker_stats.record_drop(DropReason::NoPeer);
-                                            break 'worker;
-                                        }
-                                    },
-                                }
-                            };
-                            if result.is_err() {
-                                sent = false;
-                                break;
-                            }
-                        }
-                    }
-                    if sent {
-                        worker_stats.record_tx(packet.ip_len);
-                        activity.store(crate::peers::now_ms(), Ordering::Relaxed);
-                    } else {
-                        worker_stats.record_drop(DropReason::SendFailure);
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-            // Close before draining so racing producers cannot retain packets.
-            rx.close();
-            while let Ok(packet) = rx.try_recv() {
-                drop(packet);
-                worker_stats.record_drop(DropReason::NoPeer);
-            }
-            for _ in 0..queue.packets {
-                worker_stats.record_drop(DropReason::NoPeer);
-            }
-        });
+        let (ingress, rx) = channel(INGRESS_CAPACITY);
+        tokio::spawn(run_sender(
+            route.conn.clone(),
+            route.activity_clock(),
+            rx,
+            Arc::clone(&stats),
+        ));
         Self {
             ingress,
             hash: RandomState::new(),
@@ -180,6 +97,106 @@ impl Sender {
     pub(crate) fn queued_bytes(&self) -> usize {
         self.backlog.load(Ordering::Relaxed)
     }
+}
+
+async fn run_sender(
+    conn: Connection,
+    activity: Arc<AtomicU64>,
+    mut rx: Receiver<Packet>,
+    stats: Arc<ForwardMetrics>,
+) {
+    let mut queue = Queue::new(Arc::clone(&stats));
+    'worker: loop {
+        if rx.is_closed() {
+            break;
+        }
+        let next = tokio::select! {
+            biased;
+            _ = conn.closed() => break,
+            packet = rx.recv() => match packet {
+                Some(packet) => Some(packet),
+                None => break,
+            },
+            _ = ready(()), if queue.packets > 0 => None,
+        };
+        if let Some(packet) = next {
+            queue.enqueue(packet);
+        }
+        // Classify a bounded batch before selecting a flow.
+        for _ in 0..INGRESS_BATCH {
+            let Ok(packet) = rx.try_recv() else { break };
+            queue.enqueue(packet);
+        }
+        for _ in 0..SEND_BATCH {
+            let Some(packet) = queue.dequeue(Instant::now()) else {
+                break;
+            };
+            match send_packet(&conn, &mut rx, &mut queue, &packet).await {
+                Ok(()) => {
+                    stats.record_tx(packet.ip_len);
+                    activity.store(crate::peers::now_ms(), Ordering::Relaxed);
+                }
+                Err(reason) => {
+                    stats.record_drop(reason);
+                    if reason == DropReason::NoPeer {
+                        break 'worker;
+                    }
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    // Close before draining so racing producers cannot retain packets.
+    rx.close();
+    while let Ok(packet) = rx.try_recv() {
+        drop(packet);
+        stats.record_drop(DropReason::NoPeer);
+    }
+    for _ in 0..queue.packets {
+        stats.record_drop(DropReason::NoPeer);
+    }
+}
+
+async fn send_packet(
+    conn: &Connection,
+    rx: &mut Receiver<Packet>,
+    queue: &mut Queue,
+    packet: &Packet,
+) -> Result<(), DropReason> {
+    let frames = packet.encoded.datagrams();
+    if conn.datagram_send_buffer_space() >= packet.bytes {
+        return match conn.send_many_datagrams(frames) {
+            Ok(n) if n == frames.len() => Ok(()),
+            _ => Err(DropReason::SendFailure),
+        };
+    }
+    for frame in frames {
+        let send = conn.send_datagram_wait(frame.clone());
+        tokio::pin!(send);
+        let mut incoming_batch = 0;
+        loop {
+            tokio::select! {
+                biased;
+                _ = conn.closed() => return Err(DropReason::NoPeer),
+                result = &mut send => {
+                    result.map_err(|_| DropReason::SendFailure)?;
+                    break;
+                },
+                incoming = rx.recv() => {
+                    let Some(incoming) = incoming else {
+                        return Err(DropReason::NoPeer);
+                    };
+                    queue.enqueue(incoming);
+                    incoming_batch += 1;
+                    if incoming_batch == INGRESS_BATCH {
+                        incoming_batch = 0;
+                        tokio::task::yield_now().await;
+                    }
+                },
+            }
+        }
+    }
+    Ok(())
 }
 
 struct Packet {
