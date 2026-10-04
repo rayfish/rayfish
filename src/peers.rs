@@ -11,7 +11,7 @@ use iroh::endpoint::{Connection, VarInt};
 use smol_str::SmolStr;
 
 use crate::audit::AuditLog;
-use crate::config::QuicCongestion;
+use crate::config::QuicEngine;
 use crate::forward::fq_codel::Sender as FqSender;
 use crate::membership;
 
@@ -340,16 +340,16 @@ impl PeerTable {
     }
 
     /// Selected at boot together with the endpoint transport configuration.
-    pub(crate) fn with_congestion(mut self, cc: QuicCongestion) -> Self {
-        self.fq_codel = cc == QuicCongestion::FqCodel;
+    pub(crate) fn with_engine(mut self, engine: QuicEngine) -> Self {
+        self.fq_codel = engine == QuicEngine::FqCodel;
         self
     }
 
     pub(crate) fn datagram_send_buffer_size(&self) -> usize {
         crate::transport::datagram_send_buffer_size(if self.fq_codel {
-            QuicCongestion::FqCodel
+            QuicEngine::FqCodel
         } else {
-            QuicCongestion::Cubic
+            QuicEngine::Standalone
         })
     }
 

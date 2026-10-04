@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rayfish::config;
-use rayfish::config::QuicCongestion;
+use rayfish::config::QuicEngine;
 use rayfish::config::settings::GlobalKey;
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
@@ -96,7 +96,7 @@ pub struct NodeServiceStatus {
     pub mdns_enabled: bool,
     pub mdns_active: bool,
     pub v4_bridge_enabled: bool,
-    pub quic_loss_tolerant: bool,
+    pub quic_fq_codel: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -138,9 +138,9 @@ pub enum GlobalSetting {
     Dns,
     Mdns,
     Ssh,
-    /// On selects the loss-tolerant QUIC congestion controller, off cubic.
+    /// On selects FQ-CoDel scheduling, off standalone forwarding.
     /// Applies when the endpoint next binds.
-    QuicLossTolerant,
+    QuicFqCodel,
 }
 
 impl From<GlobalSetting> for GlobalKey {
@@ -149,7 +149,7 @@ impl From<GlobalSetting> for GlobalKey {
             GlobalSetting::Dns => Self::Dns,
             GlobalSetting::Mdns => Self::Mdns,
             GlobalSetting::Ssh => Self::Ssh,
-            GlobalSetting::QuicLossTolerant => Self::QuicCongestion,
+            GlobalSetting::QuicFqCodel => Self::QuicEngine,
         }
     }
 }
@@ -374,7 +374,7 @@ impl Node {
             mdns_enabled: settings.mdns_enabled,
             mdns_active,
             v4_bridge_enabled: settings.v4_bridge,
-            quic_loss_tolerant: settings.quic_congestion == QuicCongestion::LossTolerant,
+            quic_fq_codel: settings.quic_engine == QuicEngine::FqCodel,
         };
         let ipv6 = membership::derive_ipv6(&endpoint_id).to_string();
         let connection_warning = networks
@@ -498,8 +498,8 @@ impl Node {
                 .map_err(AppleError::network);
         }
         let value = match (key, enabled) {
-            (GlobalSetting::QuicLossTolerant, true) => QuicCongestion::LossTolerant.as_ref(),
-            (GlobalSetting::QuicLossTolerant, false) => QuicCongestion::Cubic.as_ref(),
+            (GlobalSetting::QuicFqCodel, true) => QuicEngine::FqCodel.as_ref(),
+            (GlobalSetting::QuicFqCodel, false) => QuicEngine::Standalone.as_ref(),
             (_, true) => "on",
             (_, false) => "off",
         };
@@ -1091,9 +1091,8 @@ mod tests {
                 let disabled = node.status().unwrap();
                 assert!(!disabled.services.mdns_active);
                 assert_eq!(disabled.mesh.active, before.mesh.active);
-                node.set_setting(GlobalSetting::QuicLossTolerant, true)
-                    .unwrap();
-                assert!(node.status().unwrap().services.quic_loss_tolerant);
+                node.set_setting(GlobalSetting::QuicFqCodel, true).unwrap();
+                assert!(node.status().unwrap().services.quic_fq_codel);
                 assert!(Arc::ptr_eq(&state, &node.state().unwrap()));
                 assert!(matches!(
                     node.connect_peer("invalid contact id".into(), None),
@@ -1130,7 +1129,7 @@ mod tests {
                 assert!(!restarted.services.dns_enabled);
                 assert!(!restarted.services.mdns_enabled);
                 assert!(!restarted.services.mdns_active);
-                assert!(restarted.services.quic_loss_tolerant);
+                assert!(restarted.services.quic_fq_codel);
             }
             let started = Instant::now();
             node.stop();

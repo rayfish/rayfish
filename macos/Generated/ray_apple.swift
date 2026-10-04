@@ -1757,16 +1757,16 @@ public struct NodeServiceStatus {
     public var mdnsEnabled: Bool
     public var mdnsActive: Bool
     public var v4BridgeEnabled: Bool
-    public var quicLossTolerant: Bool
+    public var quicFqCodel: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(dnsEnabled: Bool, mdnsEnabled: Bool, mdnsActive: Bool, v4BridgeEnabled: Bool, quicLossTolerant: Bool) {
+    public init(dnsEnabled: Bool, mdnsEnabled: Bool, mdnsActive: Bool, v4BridgeEnabled: Bool, quicFqCodel: Bool) {
         self.dnsEnabled = dnsEnabled
         self.mdnsEnabled = mdnsEnabled
         self.mdnsActive = mdnsActive
         self.v4BridgeEnabled = v4BridgeEnabled
-        self.quicLossTolerant = quicLossTolerant
+        self.quicFqCodel = quicFqCodel
     }
 }
 
@@ -1789,7 +1789,7 @@ extension NodeServiceStatus: Equatable, Hashable {
         if lhs.v4BridgeEnabled != rhs.v4BridgeEnabled {
             return false
         }
-        if lhs.quicLossTolerant != rhs.quicLossTolerant {
+        if lhs.quicFqCodel != rhs.quicFqCodel {
             return false
         }
         return true
@@ -1800,7 +1800,7 @@ extension NodeServiceStatus: Equatable, Hashable {
         hasher.combine(mdnsEnabled)
         hasher.combine(mdnsActive)
         hasher.combine(v4BridgeEnabled)
-        hasher.combine(quicLossTolerant)
+        hasher.combine(quicFqCodel)
     }
 }
 
@@ -1817,7 +1817,7 @@ public struct FfiConverterTypeNodeServiceStatus: FfiConverterRustBuffer {
                 mdnsEnabled: FfiConverterBool.read(from: &buf),
                 mdnsActive: FfiConverterBool.read(from: &buf),
                 v4BridgeEnabled: FfiConverterBool.read(from: &buf),
-                quicLossTolerant: FfiConverterBool.read(from: &buf)
+                quicFqCodel: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1826,7 +1826,7 @@ public struct FfiConverterTypeNodeServiceStatus: FfiConverterRustBuffer {
         FfiConverterBool.write(value.mdnsEnabled, into: &buf)
         FfiConverterBool.write(value.mdnsActive, into: &buf)
         FfiConverterBool.write(value.v4BridgeEnabled, into: &buf)
-        FfiConverterBool.write(value.quicLossTolerant, into: &buf)
+        FfiConverterBool.write(value.quicFqCodel, into: &buf)
     }
 }
 
@@ -2314,10 +2314,10 @@ public enum GlobalSetting {
     case mdns
     case ssh
     /**
-     * On selects the loss-tolerant QUIC congestion controller, off cubic.
+     * On selects FQ-CoDel scheduling, off standalone forwarding.
      * Applies when the endpoint next binds.
      */
-    case quicLossTolerant
+    case quicFqCodel
 }
 
 
@@ -2341,7 +2341,7 @@ public struct FfiConverterTypeGlobalSetting: FfiConverterRustBuffer {
 
         case 3: return .ssh
 
-        case 4: return .quicLossTolerant
+        case 4: return .quicFqCodel
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2363,7 +2363,7 @@ public struct FfiConverterTypeGlobalSetting: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
 
 
-        case .quicLossTolerant:
+        case .quicFqCodel:
             writeInt(&buf, Int32(4))
 
         }

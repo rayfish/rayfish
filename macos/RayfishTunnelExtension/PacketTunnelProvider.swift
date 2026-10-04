@@ -154,7 +154,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             case .dns: key = .dns
             case .mdns: key = .mdns
             case .ssh: key = .ssh
-            case .quicLossTolerant: key = .quicLossTolerant
+            case .quicFqCodel: key = .quicFqCodel
             }
             try node.setSetting(key: key, enabled: enabled)
         case .setFileAutoAccept:
@@ -301,7 +301,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             sshRules: status.ssh.rules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) },
             fileAutoAcceptPeers: status.fileAutoAcceptPeers,
             connectionWarning: status.connectionWarning,
-            quicLossTolerant: status.services.quicLossTolerant
+            quicFqCodel: status.services.quicFqCodel
         )
     }
 }

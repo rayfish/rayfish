@@ -8,18 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Experimental `ray config set quic-congestion fq-codel` gives inner flows
+- Experimental `ray config set quic-engine fq-codel` gives inner flows
   separate queues and favors sparse traffic over bulk transfers. It combines
-  CoDel queue management with Cubic and applies after restarting the daemon.
+  CoDel queue management with loss-tolerant congestion control and applies after restarting the daemon.
 
 - `ray files auto-accept add/remove <peer>` saves trusted file senders; `list`
   shows their identities. The macOS Files page can add and remove them too.
 
 ### Changed
 
-- Loss-tolerant QUIC congestion control is the default for new or unset
-  configurations, improving TCP throughput on lossy links. Saved controller
-  choices are preserved; Cubic remains available for latency-sensitive UDP.
+- `quic-engine` replaces `quic-congestion`, with `standalone` (default) and
+  `fq-codel` choices. Both use loss-tolerant congestion control. Saved controller
+  settings migrate to the corresponding engine; the macOS toggle selects FQ-CoDel.
 
 ### Fixed
 

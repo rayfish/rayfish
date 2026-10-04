@@ -2,7 +2,8 @@
 //!
 //! RFC 8290: salted flow buckets, byte deficits, new/old active lists, and
 //! RFC 8289 CoDel per bucket (5 ms target, 100 ms interval). We drop rather
-//! than mark ECN. The `fq-codel` transport uses Cubic and a short QUIC queue:
+//! than mark ECN. The `fq-codel` engine uses loss-tolerant congestion control
+//! and a short QUIC queue:
 //! backpressure must retain packets here for scheduling and delay measurement.
 //! This controls our queue, not queues already built in a router or Wi-Fi link.
 
@@ -624,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduled_packets_cross_quic_and_close_releases_queue() {
-        use crate::config::QuicCongestion;
+        use crate::config::QuicEngine;
         use crate::membership::derive_ipv6;
         use crate::peers::PeerTable;
         use iroh::Endpoint;
@@ -633,9 +634,7 @@ mod tests {
         async fn endpoint() -> Endpoint {
             Endpoint::builder(presets::Minimal)
                 .alpns(vec![crate::transport::mesh_alpn()])
-                .transport_config(crate::transport::quic_transport_config(
-                    QuicCongestion::FqCodel,
-                ))
+                .transport_config(crate::transport::quic_transport_config(QuicEngine::FqCodel))
                 .bind()
                 .await
                 .unwrap()
@@ -651,7 +650,7 @@ mod tests {
         .await
         .unwrap();
         let send = send.unwrap();
-        let peers = PeerTable::new().with_congestion(QuicCongestion::FqCodel);
+        let peers = PeerTable::new().with_engine(QuicEngine::FqCodel);
         let b_ip = derive_ipv6(&b.id());
         peers.add(b_ip, send.clone(), b.id(), "test");
         let route = peers.lookup_v6(&b_ip).unwrap();

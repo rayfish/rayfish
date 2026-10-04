@@ -238,7 +238,7 @@ impl Daemon {
                 | GlobalKey::DnsUpstreams
                 | GlobalKey::AutoUpdate
                 | GlobalKey::OnDemand
-                | GlobalKey::QuicCongestion
+                | GlobalKey::QuicEngine
                 | GlobalKey::DownloadDir
                 | GlobalKey::DownloadUser
                 | GlobalKey::FileAutoAcceptPeers),

@@ -19,7 +19,7 @@ use iroh::{
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-use crate::config::{AppConfig, QuicCongestion, ServerOverride};
+use crate::config::{AppConfig, QuicCongestion, QuicEngine, ServerOverride};
 use crate::exit_node::{LoopPrevention, is_transitable};
 
 mod congestion;
@@ -214,7 +214,7 @@ pub async fn create_endpoint_with_alpns(
         discovery: &settings.discovery_dns,
         nameservers: &nameservers,
         warm_lookup: &warm_lookup,
-        quic_congestion: settings.quic_congestion,
+        quic_engine: settings.quic_engine,
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -247,7 +247,7 @@ struct BindConfig<'a> {
     discovery: &'a ServerOverride,
     nameservers: &'a [Ipv4Addr],
     warm_lookup: &'a MemoryLookup,
-    quic_congestion: QuicCongestion,
+    quic_engine: QuicEngine,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -270,7 +270,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         discovery,
         nameservers,
         warm_lookup,
-        quic_congestion,
+        quic_engine,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -297,9 +297,8 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
         //     small send limit. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
-        // The congestion controller is the `quic-congestion` setting, noq's
-        // Cubic by default (see `transport::congestion`).
-        .transport_config(quic_transport_config(quic_congestion))
+        // Both forwarding engines use loss-tolerant congestion control.
+        .transport_config(quic_transport_config(quic_engine))
         // Drop overlay addresses from the gathered direct-address candidates, so a
         // mesh IP bound on the TUN is never stored, published, or offered as a
         // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
@@ -488,9 +487,9 @@ fn is_unroutable(e: &io::Error) -> bool {
 pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Keep most of the backlog in FQ-CoDel, rather than the QUIC FIFO.
-pub(crate) fn datagram_send_buffer_size(cc: QuicCongestion) -> usize {
-    match cc {
-        QuicCongestion::FqCodel => 16 * 1024,
+pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
+    match engine {
+        QuicEngine::FqCodel => 16 * 1024,
         _ => DATAGRAM_SEND_BUFFER_SIZE,
     }
 }
@@ -501,9 +500,9 @@ pub(crate) fn datagram_send_buffer_size(cc: QuicCongestion) -> usize {
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
-pub(crate) fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
-    tracing::info!(congestion_controller = cc.as_ref(), "QUIC transport config");
-    let builder = match controller_factory(cc) {
+pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
+    tracing::info!(engine = engine.as_ref(), "QUIC transport config");
+    let builder = match controller_factory(QuicCongestion::LossTolerant) {
         Some(factory) => QuicTransportConfig::builder().congestion_controller_factory(factory),
         None => QuicTransportConfig::builder(),
     };
@@ -518,7 +517,7 @@ pub(crate) fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
         // Keep the unreliable datagram queue small. When it fills, noQ discards
         // older datagrams rather than making the forwarding path wait and add
         // latency behind stale traffic.
-        .datagram_send_buffer_size(datagram_send_buffer_size(cc))
+        .datagram_send_buffer_size(datagram_send_buffer_size(engine))
         .build()
 }
 

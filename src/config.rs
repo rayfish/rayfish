@@ -47,35 +47,40 @@ impl DnsMode {
     }
 }
 
-/// Congestion control and optional flow scheduling for the data plane. Read
-/// once at endpoint bind, so a change takes effect on restart. See
-/// [`crate::transport`]'s `congestion` module for what each one does.
+/// QUIC congestion controller, independent of packet scheduling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuicCongestion {
+    Cubic,
+    #[default]
+    LossTolerant,
+}
+
+/// Packet forwarding engine, selected when the endpoint binds. Both engines
+/// use loss-tolerant QUIC congestion control.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, strum::AsRefStr, strum::EnumString,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
-pub enum QuicCongestion {
-    /// noq's default.
-    Cubic,
-    /// Ignores ordinary loss and leaves rate control to the tunnelled flows.
-    /// Experimental.
+pub enum QuicEngine {
+    /// Send packets directly to QUIC without per-flow scheduling.
     #[default]
-    LossTolerant,
-    /// Cubic with FQ-CoDel scheduling of inner IP flows. Experimental.
+    Standalone,
+    /// FQ-CoDel scheduling of inner IP flows. Experimental.
     FqCodel,
 }
 
-/// An unknown saved value (a controller since removed, or a hand edit) falls
-/// back to the default rather than failing the whole settings load: this knob
-/// must never be what keeps the daemon from starting.
-fn deserialize_quic_congestion<'de, D: Deserializer<'de>>(
+/// Accept legacy saved controller choices while writing only the engine name.
+fn deserialize_quic_engine<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<QuicCongestion, D::Error> {
+) -> Result<QuicEngine, D::Error> {
     let value = String::deserialize(deserializer)?;
+    if matches!(value.trim(), "cubic" | "loss-tolerant") {
+        return Ok(QuicEngine::Standalone);
+    }
     Ok(value.trim().parse().unwrap_or_else(|_| {
-        tracing::warn!(%value, "unknown quic_congestion in settings.toml; using default controller");
-        QuicCongestion::default()
+        tracing::warn!(%value, "unknown quic_engine in settings.toml; using default engine");
+        QuicEngine::default()
     }))
 }
 
@@ -603,9 +608,13 @@ pub struct AppConfig {
         deserialize_with = "deserialize_dns_mode"
     )]
     pub dns_mode: DnsMode,
-    /// QUIC congestion controller (`ray config set quic-congestion`).
-    #[serde(default, deserialize_with = "deserialize_quic_congestion")]
-    pub quic_congestion: QuicCongestion,
+    /// QUIC forwarding engine (`ray config set quic-engine`).
+    #[serde(
+        default,
+        alias = "quic_congestion",
+        deserialize_with = "deserialize_quic_engine"
+    )]
+    pub quic_engine: QuicEngine,
     /// Recently successful peer transport paths.  These are only connection
     /// hints: iroh still authenticates the endpoint identity in TLS and falls
     /// back to its normal discovery services when a hint is stale.  Keeping
@@ -716,7 +725,7 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             dns_mode: DnsMode::On,
-            quic_congestion: QuicCongestion::default(),
+            quic_engine: QuicEngine::default(),
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
             ssh_port: default_ssh_port(),
@@ -873,8 +882,12 @@ struct Settings {
         deserialize_with = "deserialize_dns_mode"
     )]
     dns_mode: DnsMode,
-    #[serde(default, deserialize_with = "deserialize_quic_congestion")]
-    quic_congestion: QuicCongestion,
+    #[serde(
+        default,
+        alias = "quic_congestion",
+        deserialize_with = "deserialize_quic_engine"
+    )]
+    quic_engine: QuicEngine,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
@@ -1448,7 +1461,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
         dns_mode: settings.dns_mode,
-        quic_congestion: settings.quic_congestion,
+        quic_engine: settings.quic_engine,
         endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         ssh_port: settings.ssh_port,
@@ -1525,7 +1538,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
         dns_mode: config.dns_mode,
-        quic_congestion: config.quic_congestion,
+        quic_engine: config.quic_engine,
         endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         ssh_port: config.ssh_port,
@@ -2514,42 +2527,50 @@ name = "test"
     }
 
     #[test]
-    fn quic_congestion_round_trips_and_tolerates_unknown_values() {
+    fn quic_engine_round_trips_and_tolerates_unknown_values() {
         use std::fs::write;
 
         let tmp = tempfile::tempdir().expect("create config directory");
         let path = tmp.path().join(SETTINGS_FILE);
         assert_eq!(
-            load_in(tmp.path()).expect("fresh install").quic_congestion,
-            QuicCongestion::LossTolerant
+            load_in(tmp.path()).expect("fresh install").quic_engine,
+            QuicEngine::Standalone
         );
         write(&path, "").expect("write settings without a controller");
         assert_eq!(
             load_in(tmp.path())
                 .expect("load unset controller")
-                .quic_congestion,
-            QuicCongestion::LossTolerant
+                .quic_engine,
+            QuicEngine::Standalone
         );
-        for controller in [
-            QuicCongestion::Cubic,
-            QuicCongestion::LossTolerant,
-            QuicCongestion::FqCodel,
-        ] {
+        for controller in [QuicEngine::Standalone, QuicEngine::FqCodel] {
             let value = controller.as_ref();
-            write(&path, format!("quic_congestion = '{value}'\n")).expect("write setting");
+            write(&path, format!("quic_engine = '{value}'\n")).expect("write setting");
             let loaded = load_in(tmp.path()).expect("load setting");
-            assert_eq!(loaded.quic_congestion, controller);
+            assert_eq!(loaded.quic_engine, controller);
             assert!(
                 settings_toml(&loaded)
                     .expect("serialize")
-                    .contains(&format!("quic_congestion = \"{value}\""))
+                    .contains(&format!("quic_engine = \"{value}\""))
             );
         }
+        for (legacy, engine) in [
+            ("cubic", QuicEngine::Standalone),
+            ("loss-tolerant", QuicEngine::Standalone),
+            ("fq-codel", QuicEngine::FqCodel),
+        ] {
+            write(&path, format!("quic_congestion = '{legacy}'\n")).expect("write legacy setting");
+            let loaded = load_in(tmp.path()).expect("load legacy setting");
+            assert_eq!(loaded.quic_engine, engine);
+            let saved = settings_toml(&loaded).expect("serialize migrated setting");
+            assert!(saved.contains(&format!("quic_engine = \"{}\"", engine.as_ref())));
+            assert!(!saved.contains("quic_congestion"));
+        }
         // A removed or hand-typed controller must not stop the daemon loading.
-        write(&path, "quic_congestion = 'bbr3'\n").expect("write unknown");
+        write(&path, "quic_engine = 'bbr3'\n").expect("write unknown");
         assert_eq!(
-            load_in(tmp.path()).expect("load unknown").quic_congestion,
-            QuicCongestion::LossTolerant
+            load_in(tmp.path()).expect("load unknown").quic_engine,
+            QuicEngine::Standalone
         );
     }
 

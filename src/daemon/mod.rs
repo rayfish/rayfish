@@ -1341,10 +1341,9 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
             config::DnsMode::Partial => "DNS limited to .ray names.".to_string(),
             config::DnsMode::Off => "DNS disabled.".to_string(),
         },
-        GlobalKey::QuicCongestion => format!(
-            "QUIC congestion controller set to {}. {restart}",
-            cfg.quic_congestion.as_ref()
-        ),
+        GlobalKey::QuicEngine => {
+            format!("QUIC engine set to {}. {restart}", cfg.quic_engine.as_ref())
+        }
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {

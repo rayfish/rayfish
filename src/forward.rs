@@ -1111,7 +1111,7 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
 mod tests {
     use super::*;
     use crate::AsyncMutex;
-    use crate::config::QuicCongestion;
+    use crate::config::QuicEngine;
     use crate::firewall::Action;
     use iroh::SecretKey;
     use smol_str::SmolStr;
@@ -1165,17 +1165,17 @@ mod tests {
 
     #[tokio::test]
     async fn fragmented_tcp_crosses_small_quic_path_and_keeps_policy_checks() {
-        check_fragmented_tcp(1280, QuicCongestion::Cubic).await;
+        check_fragmented_tcp(1280, QuicEngine::Standalone).await;
     }
 
     #[tokio::test]
     async fn full_tun_mtu_crosses_small_quic_path_and_keeps_policy_checks() {
-        check_fragmented_tcp(crate::tun::TUN_MTU as usize, QuicCongestion::Cubic).await;
+        check_fragmented_tcp(crate::tun::TUN_MTU as usize, QuicEngine::Standalone).await;
     }
 
     #[tokio::test]
     async fn fq_codel_preserves_fragmentation_firewall_and_lazy_dial_flush() {
-        check_fragmented_tcp(crate::tun::TUN_MTU as usize, QuicCongestion::FqCodel).await;
+        check_fragmented_tcp(crate::tun::TUN_MTU as usize, QuicEngine::FqCodel).await;
     }
 
     #[tokio::test]
@@ -1252,13 +1252,13 @@ mod tests {
     /// Exercise the production sender, lazy-dial batch flush and receiver over
     /// real QUIC, with discovery disabled so full IP packets need fragmentation
     /// even on loopback.
-    async fn check_fragmented_tcp(packet_len: usize, cc: QuicCongestion) {
+    async fn check_fragmented_tcp(packet_len: usize, cc: QuicEngine) {
         use iroh::endpoint::{QuicTransportConfig, presets};
         use iroh::{Endpoint, RelayMode};
         use std::time::{Duration, Instant};
         use tokio::time::timeout;
 
-        async fn endpoint(cc: QuicCongestion) -> Endpoint {
+        async fn endpoint(cc: QuicEngine) -> Endpoint {
             Endpoint::builder(presets::N0)
                 .alpns(vec![crate::transport::mesh_alpn()])
                 .relay_mode(RelayMode::Disabled)
@@ -1286,7 +1286,7 @@ mod tests {
         assert!(send.max_datagram_size().unwrap() < 1282);
         let a_ip = crate::membership::derive_ipv6(&a.id());
         let b_ip = crate::membership::derive_ipv6(&b.id());
-        let sender_peers = PeerTable::new().with_congestion(cc);
+        let sender_peers = PeerTable::new().with_engine(cc);
         sender_peers.add(b_ip, send.clone(), b.id(), "test");
         sender_peers.note_receive_mtu(&b.id(), &send, crate::tun::TUN_MTU);
         let receiver_peers = PeerTable::new();

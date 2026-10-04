@@ -8,17 +8,10 @@
 //! below what the path carries, and the overflow is dropped from the datagram
 //! send buffer.
 //!
-//! The controller is the `quic-congestion` setting
-//! ([`QuicCongestion`]), read once at bind:
-//!
-//! - `cubic`: noq's default controller, available as an explicit choice.
-//! - `loss-tolerant` (default): [`LossTolerant`], which ignores ordinary loss
-//!   and leaves rate control to the inner flows, the way WireGuard does, with
-//!   a window ceiling and a persistent-congestion reset as the safety bound.
-//!
-//! - `fq-codel`: Cubic plus inner-flow scheduling and CoDel queue management
-//!   in `forward::fq_codel`. QUIC backpressure keeps the backlog in the
-//!   scheduler, where sparse flows can bypass bulk traffic.
+//! Both `quic-engine` choices use [`LossTolerant`], which ignores ordinary
+//! loss and leaves rate control to the inner flows, with a window ceiling
+//! and a persistent-congestion reset. `fq-codel` adds inner-flow scheduling
+//! and CoDel queue management in `forward::fq_codel`.
 //!
 //! noq's BBR3 is not offered. On a netem-shaped link (40 ms RTT, 100 Mbit/s,
 //! 0 to 2% loss) it was slower than Cubic in every case, with ping spikes up to
@@ -50,7 +43,7 @@
 //! 443.50 / 859.00 ms (medians of two forward runs). At 80 Mbit/s offered in
 //! 1200-byte payloads, both delivered 80 Mbit/s and p99 stayed near 42 ms.
 //! These Linux measurements cover short runs, not long-term fairness or
-//! macOS/Wi-Fi behavior. Cubic remains selectable for latency-sensitive UDP.
+//! macOS/Wi-Fi behavior. Cubic was the comparison controller.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -65,7 +58,7 @@ pub(crate) fn controller_factory(
     cc: QuicCongestion,
 ) -> Option<Arc<dyn ControllerFactory + Send + Sync + 'static>> {
     match cc {
-        QuicCongestion::Cubic | QuicCongestion::FqCodel => None,
+        QuicCongestion::Cubic => None,
         QuicCongestion::LossTolerant => Some(Arc::new(LossTolerantConfig::default())),
     }
 }
@@ -221,7 +214,6 @@ mod tests {
     #[test]
     fn cubic_keeps_the_noq_default() {
         assert!(controller_factory(QuicCongestion::Cubic).is_none());
-        assert!(controller_factory(QuicCongestion::FqCodel).is_none());
         assert!(controller_factory(QuicCongestion::LossTolerant).is_some());
     }
 

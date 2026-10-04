@@ -80,7 +80,7 @@ setting_keys! {
         Relay = "relay", "iroh relay servers (preset or URL, comma-separated)";
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
         Dns = "dns", "Magic DNS mode (on|partial|off)";
-        QuicCongestion = "quic-congestion", "experimental QUIC congestion controller, applies on restart (cubic|loss-tolerant|fq-codel)";
+        QuicEngine = "quic-engine", "QUIC forwarding engine, applies on restart (standalone|fq-codel)";
         DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders, including mesh peer IPv6 addresses (comma-separated)";
         AutoUpdate = "auto-update", "install new releases automatically (on|off)";
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";

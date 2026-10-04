@@ -589,7 +589,7 @@ private struct SettingsView: View {
     let updater: SPUUpdater?
     @State private var shellCommandMessage: String?
     @State private var automaticUpdatesEnabled = false
-    @State private var congestionNeedsReconnect = false
+    @State private var engineNeedsReconnect = false
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Settings").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
@@ -686,27 +686,27 @@ private struct SettingsView: View {
             .padding(18).rayfishCard()
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("Loss-tolerant congestion control")
+                    Text("FQ-CoDel scheduling")
                     Spacer()
-                    Toggle("Loss-tolerant congestion control", isOn: Binding(
-                        get: { controller.status?.quicLossTolerant ?? false },
+                    Toggle("FQ-CoDel scheduling", isOn: Binding(
+                        get: { controller.status?.quicFqCodel ?? false },
                         set: { enabled in
                             Task {
-                                await controller.setSetting(.quicLossTolerant, enabled: enabled)
-                                congestionNeedsReconnect = controller.error == nil
+                                await controller.setSetting(.quicFqCodel, enabled: enabled)
+                                engineNeedsReconnect = controller.error == nil
                             }
                         }
                     ))
                     .labelsHidden()
                 }
-                Text("Experimental. Keeps throughput up on lossy links instead of slowing down on every lost packet.")
+                Text("Experimental. Gives each flow its own queue so small transfers can compete with bulk traffic.")
                     .foregroundColor(RayfishTheme.muted)
-                if congestionNeedsReconnect {
+                if engineNeedsReconnect {
                     HStack {
                         Text("Reconnect to apply this change.").foregroundColor(RayfishTheme.amber)
                         Spacer()
                         Button("Reconnect now") {
-                            congestionNeedsReconnect = false
+                            engineNeedsReconnect = false
                             Task { await controller.reconnect() }
                         }
                     }

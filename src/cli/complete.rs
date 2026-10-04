@@ -1026,10 +1026,7 @@ mod tests {
         };
         assert_eq!(domain("mdns"), ["on", "off"]);
         assert_eq!(domain("firewall.default-in"), ["allow", "deny"]);
-        assert_eq!(
-            domain("quic-congestion"),
-            ["cubic", "loss-tolerant", "fq-codel"]
-        );
+        assert_eq!(domain("quic-engine"), ["standalone", "fq-codel"]);
 
         // Free-form values: a trailing parenthesis that is prose, not a domain.
         assert!(domain("relay").is_empty());
