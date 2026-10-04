@@ -51,18 +51,6 @@ use std::time::Instant;
 
 use iroh::endpoint::{Controller, ControllerFactory, RttEstimator};
 
-use crate::config::QuicCongestion;
-
-/// The factory to install for `cc`, or `None` to keep noq's default (Cubic).
-pub(crate) fn controller_factory(
-    cc: QuicCongestion,
-) -> Option<Arc<dyn ControllerFactory + Send + Sync + 'static>> {
-    match cc {
-        QuicCongestion::Cubic => None,
-        QuicCongestion::LossTolerant => Some(Arc::new(LossTolerantConfig::default())),
-    }
-}
-
 /// Starting window, matching noq's Cubic default (about ten
 /// 1200-byte datagrams) so a new path does not burst.
 const INITIAL_WINDOW: u64 = 14_720;
@@ -209,12 +197,6 @@ mod tests {
     fn congestion(cc: &mut LossTolerant, persistent: bool, ecn: bool) {
         let now = Instant::now();
         cc.on_congestion_event(now, now, persistent, ecn, 1200, 0);
-    }
-
-    #[test]
-    fn cubic_keeps_the_noq_default() {
-        assert!(controller_factory(QuicCongestion::Cubic).is_none());
-        assert!(controller_factory(QuicCongestion::LossTolerant).is_some());
     }
 
     #[test]

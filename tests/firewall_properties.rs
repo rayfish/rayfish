@@ -255,7 +255,7 @@ fn verdict(
     peer: &EndpointId,
     network: Option<&str>,
 ) -> Action {
-    SharedFirewall::new(config).evaluate_packet(direction, info, peer, network)
+    SharedFirewall::new(config).evaluate_packet(direction, info, peer, |name| Some(name) == network)
 }
 
 /// Whether `rule` selects this packet, determined by observation rather than
@@ -410,7 +410,7 @@ proptest! {
         let fw = SharedFirewall::new(FirewallConfig::default());
         let peer = test_id(seed);
 
-        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, |_| false), Action::Allow);
 
         let reply = PacketInfo {
             src_ip: out.dst_ip,
@@ -419,7 +419,7 @@ proptest! {
             dst_port: out.src_port,
             ..out
         };
-        prop_assert_eq!(fw.evaluate_packet(Direction::In, &reply, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::In, &reply, &peer, |_| false), Action::Allow);
     }
 
     /// Conntrack admits *only* that flow. An inbound packet that differs in
@@ -437,7 +437,7 @@ proptest! {
 
         let fw = SharedFirewall::new(FirewallConfig::default());
         let peer = test_id(seed);
-        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, |_| false), Action::Allow);
 
         // Same flow except for the peer's port: a different connection.
         let unrelated = PacketInfo {
@@ -448,7 +448,7 @@ proptest! {
             ..out
         };
         prop_assert_eq!(
-            fw.evaluate_packet(Direction::In, &unrelated, &peer, None),
+            fw.evaluate_packet(Direction::In, &unrelated, &peer, |_| false),
             Action::Deny,
         );
     }
@@ -476,7 +476,7 @@ proptest! {
         let fw = SharedFirewall::new(config);
         let peer = test_id(seed);
 
-        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, |_| false), Action::Allow);
 
         let inbound_request = PacketInfo {
             src_ip: out.dst_ip,
@@ -484,7 +484,7 @@ proptest! {
             ..out
         };
         prop_assert_eq!(
-            fw.evaluate_packet(Direction::In, &inbound_request, &peer, None),
+            fw.evaluate_packet(Direction::In, &inbound_request, &peer, |_| false),
             Action::Deny,
         );
     }

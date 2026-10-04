@@ -47,14 +47,6 @@ impl DnsMode {
     }
 }
 
-/// QUIC congestion controller, independent of packet scheduling.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum QuicCongestion {
-    Cubic,
-    #[default]
-    LossTolerant,
-}
-
 /// Packet forwarding engine, selected when the endpoint binds. Both engines
 /// use loss-tolerant QUIC congestion control.
 #[derive(

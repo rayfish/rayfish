@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::future::ready;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use tokio::time::Instant;
 
 use super::fragment::Encoded;
 use crate::firewall::PacketInfo;
-use crate::peers::PeerRoute;
+use crate::peers::{ActivityClock, PeerRoute};
 use crate::stats::{DropReason, ForwardMetrics};
 
 const BUCKETS: usize = 1024;
@@ -102,7 +102,7 @@ impl Sender {
 
 async fn run_sender(
     conn: Connection,
-    activity: Arc<AtomicU64>,
+    activity: ActivityClock,
     mut rx: Receiver<Packet>,
     stats: Arc<ForwardMetrics>,
 ) {
@@ -135,7 +135,7 @@ async fn run_sender(
             match send_packet(&conn, &mut rx, &mut queue, &packet).await {
                 Ok(()) => {
                     stats.record_tx(packet.ip_len);
-                    activity.store(crate::peers::now_ms(), Ordering::Relaxed);
+                    activity.touch();
                 }
                 Err(reason) => {
                     stats.record_drop(reason);
@@ -417,20 +417,9 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::DropLabels;
     use bytes::Bytes;
     use std::net::Ipv6Addr;
     use tokio::time::timeout;
-
-    fn drops(stats: &ForwardMetrics) -> u64 {
-        use std::time::Instant as StdInstant;
-        stats
-            .snapshot(StdInstant::now())
-            .drops
-            .iter()
-            .map(|(_, count)| count)
-            .sum()
-    }
 
     fn packet(bucket: usize, bytes: usize, arrived: Instant) -> Packet {
         let backlog = Arc::new(AtomicUsize::new(bytes));
@@ -472,15 +461,7 @@ mod tests {
             sender.enqueue(&info, 0, Encoded::Whole(Bytes::from_static(b"packet")), 6);
         }
         assert_eq!(sender.queued_bytes(), 12);
-        assert_eq!(
-            stats
-                .drops
-                .get_or_create(&DropLabels {
-                    reason: DropReason::QueueFull
-                })
-                .get(),
-            1
-        );
+        assert_eq!(stats.drop_count(DropReason::QueueFull), 1);
         // An idle worker can receive packets sent before it starts waiting.
         drop(
             timeout(Duration::from_secs(1), rx.recv())
@@ -492,15 +473,7 @@ mod tests {
         rx.close();
         sender.enqueue(&info, 0, Encoded::Whole(Bytes::from_static(b"rejected")), 8);
         assert_eq!(sender.queued_bytes(), 6);
-        assert_eq!(
-            stats
-                .drops
-                .get_or_create(&DropLabels {
-                    reason: DropReason::NoPeer
-                })
-                .get(),
-            1
-        );
+        assert_eq!(stats.drop_count(DropReason::NoPeer), 1);
         // Closing rejects new packets while allowing retained packets to drain.
         while let Ok(packet) = rx.try_recv() {
             drop(packet);
@@ -561,19 +534,19 @@ mod tests {
         }
         queue.dequeue(now + TARGET);
         queue.dequeue(now + INTERVAL);
-        assert_eq!(drops(&stats), 0);
+        assert_eq!(stats.total_drops(), 0);
         queue.dequeue(now + INTERVAL + TARGET);
-        assert_eq!(drops(&stats), 1);
+        assert_eq!(stats.total_drops(), 1);
         assert!(queue.flows[0].codel.dropping);
         queue.dequeue(now + INTERVAL * 2 + TARGET);
-        assert_eq!(drops(&stats), 2);
+        assert_eq!(stats.total_drops(), 2);
         // A return below target leaves the dropping state.
         for p in &mut queue.flows[0].packets {
             p.arrived = now + INTERVAL * 3;
         }
         queue.dequeue(now + INTERVAL * 3);
         assert!(!queue.flows[0].codel.dropping);
-        assert_eq!(drops(&stats), 2);
+        assert_eq!(stats.total_drops(), 2);
     }
 
     #[test]
@@ -587,7 +560,7 @@ mod tests {
         assert!(queue.dequeue(now + INTERVAL * 20).is_some());
         assert!(queue.dequeue(now + INTERVAL * 21).is_some());
         assert!(queue.dequeue(now + INTERVAL * 22).is_none());
-        assert_eq!(drops(&stats), 0);
+        assert_eq!(stats.total_drops(), 0);
     }
 
     #[test]
@@ -602,7 +575,7 @@ mod tests {
             queue.enqueue(packet(0, 1500, now));
         }
         assert!(queue.bytes <= MAX_BYTES);
-        assert!(drops(&stats) > 0);
+        assert!(stats.total_drops() > 0);
         assert_eq!(queue.flows[1].packets.len(), 1);
         assert_eq!(queue.dequeue(now).unwrap().bucket, 1);
         assert_eq!(backlog.load(Ordering::Relaxed), 0);
@@ -711,7 +684,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(drops(&stopped_stats), 1);
+        assert_eq!(stopped_stats.total_drops(), 1);
         assert!(send.close_reason().is_none());
         for _ in 0..256 {
             sender.enqueue(

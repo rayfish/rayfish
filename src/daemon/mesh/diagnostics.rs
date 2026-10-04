@@ -812,17 +812,7 @@ impl Daemon {
         };
 
         let stats = conn.stats();
-        let queued_bytes = self
-            .registry
-            .peers
-            .datagram_send_buffer_size()
-            .saturating_sub(conn.datagram_send_buffer_space())
-            + self
-                .registry
-                .peers
-                .lookup_v6(&derive_ipv6(&conn.remote_id()))
-                .filter(|route| route.conn.stable_id() == conn.stable_id())
-                .map_or(0, |route| route.queued_bytes());
+        let queued_bytes = self.registry.peers.queued_bytes(conn);
         let (quality, quality_issue) = connection_quality(false, queued_bytes);
         ipc::ConnectionInfo {
             conn_type,

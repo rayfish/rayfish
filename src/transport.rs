@@ -19,13 +19,12 @@ use iroh::{
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-use crate::config::{AppConfig, QuicCongestion, QuicEngine, ServerOverride};
+use crate::config::{AppConfig, QuicEngine, ServerOverride};
 use crate::exit_node::{LoopPrevention, is_transitable};
 
 mod congestion;
 
-use congestion::controller_factory;
-#[cfg(feature = "tor")]
+use congestion::LossTolerantConfig;
 use std::sync::Arc;
 
 /// ALPN for the file-transfer protocol. The trailing `/1` is its protocol
@@ -484,13 +483,13 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Keep most of the backlog in FQ-CoDel, rather than the QUIC FIFO.
 pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
     match engine {
         QuicEngine::FqCodel => 16 * 1024,
-        _ => DATAGRAM_SEND_BUFFER_SIZE,
+        QuicEngine::Standalone => DATAGRAM_SEND_BUFFER_SIZE,
     }
 }
 
@@ -502,11 +501,8 @@ pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
 pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
     tracing::info!(engine = engine.as_ref(), "QUIC transport config");
-    let builder = match controller_factory(QuicCongestion::LossTolerant) {
-        Some(factory) => QuicTransportConfig::builder().congestion_controller_factory(factory),
-        None => QuicTransportConfig::builder(),
-    };
-    builder
+    QuicTransportConfig::builder()
+        .congestion_controller_factory(Arc::new(LossTolerantConfig::default()))
         // There are no competing data streams of equal priority, so disable
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.

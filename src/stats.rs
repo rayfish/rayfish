@@ -170,14 +170,14 @@ impl ForwardMetrics {
         self.pending_joins_evicted.inc();
     }
 
-    fn drop_count(&self, reason: DropReason) -> u64 {
+    pub(crate) fn drop_count(&self, reason: DropReason) -> u64 {
         self.drops
             .get(&DropLabels { reason })
             .map(|c| c.get())
             .unwrap_or(0)
     }
 
-    fn total_drops(&self) -> u64 {
+    pub(crate) fn total_drops(&self) -> u64 {
         DropReason::ALL.iter().map(|r| self.drop_count(*r)).sum()
     }
 
@@ -286,7 +286,7 @@ pub struct PeerMetrics {
     pub path_mtu_bytes: Family<PeerLabels, Gauge>,
     /// Whether the selected path uses a relay instead of direct UDP
     pub path_is_relay: Family<PeerLabels, Gauge>,
-    /// Bytes currently retained in the peer's QUIC datagram send queue
+    /// Bytes waiting to send to the peer: QUIC's datagram queue plus any FQ-CoDel backlog
     pub datagram_send_queue_bytes: Family<PeerLabels, Gauge>,
 }
 
@@ -317,8 +317,7 @@ impl PeerMetrics {
                             metrics.bytes_rx.get_or_create(&label).set(stats.udp_rx.bytes as i64);
                             metrics.lost_packets.get_or_create(&label).set(stats.lost_packets as i64);
                             metrics.lost_bytes.get_or_create(&label).set(stats.lost_bytes as i64);
-                            let queued = crate::transport::DATAGRAM_SEND_BUFFER_SIZE
-                                .saturating_sub(conn.datagram_send_buffer_space());
+                            let queued = peers.queued_bytes(&conn);
                             metrics.datagram_send_queue_bytes.get_or_create(&label).set(queued as i64);
                         }
                     }

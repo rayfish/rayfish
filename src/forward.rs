@@ -320,7 +320,7 @@ fn evaluate_inbound(
         };
     }
     if firewall
-        .evaluate_packet_in_networks(Direction::In, &info, peer_id, shares_network)
+        .evaluate_packet(Direction::In, &info, peer_id, shares_network)
         .is_deny()
     {
         return InboundDecision::DropFirewall(info);
@@ -710,9 +710,8 @@ async fn prepare_datagrams(
     // per-host firewall is the fine-grained gate.
     if ctx
         .firewall
-        .evaluate_packet_in_networks(Direction::Out, info, &route.endpoint_id, |network| {
-            ctx.peers
-                .shares_network_v6(&crate::membership::derive_ipv6(&route.endpoint_id), network)
+        .evaluate_packet(Direction::Out, info, &route.endpoint_id, |network| {
+            ctx.peers.shares_network_v6(&route.ipv6, network)
         })
         .is_deny()
     {
@@ -1406,15 +1405,7 @@ mod tests {
         receiver_peers.remove_peer_from_network(&a_ip, "z-allowed");
         send_over_route(&ctx, &route, &info, packet.clone()).await;
         timeout(Duration::from_secs(5), async {
-            loop {
-                let snapshot = stats.snapshot(Instant::now());
-                if snapshot
-                    .drops
-                    .iter()
-                    .any(|(name, count)| name == "Firewall" && *count > 0)
-                {
-                    break;
-                }
+            while stats.drop_count(DropReason::Firewall) == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -2251,7 +2242,7 @@ mod tests {
         p[43] = 0xbb; // dst port 443
         let info = firewall::parse_packet_info(&p).unwrap();
         assert!(
-            fw.evaluate_packet(Direction::Out, &info, peer, Some("test-net"))
+            fw.evaluate_packet(Direction::Out, &info, peer, |name| name == "test-net")
                 .is_allow()
         );
     }

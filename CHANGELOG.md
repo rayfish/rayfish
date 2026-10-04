@@ -24,6 +24,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Peer send queue metrics include the FQ-CoDel backlog and use the selected
+  engine's QUIC buffer size.
+
 - Network-scoped firewall rules apply to peers sharing that network, regardless
   of which shared network carries their packets.
 

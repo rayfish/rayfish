@@ -365,11 +365,6 @@ impl SharedFirewall {
             if rule.direction != direction {
                 continue;
             }
-            if let Some(ref rule_net) = rule.network
-                && !shares_network(rule_net)
-            {
-                continue;
-            }
             if !protocol_matches(rule.protocol, protocol) {
                 continue;
             }
@@ -390,6 +385,12 @@ impl SharedFirewall {
                         continue;
                     }
                 }
+            }
+            // Last, since it is the only check that consults the peer table.
+            if let Some(ref rule_net) = rule.network
+                && !shares_network(rule_net)
+            {
+                continue;
             }
             return Some(rule.action);
         }
@@ -435,22 +436,10 @@ impl SharedFirewall {
         self.inner.load().disabled
     }
 
-    /// Stateful evaluation with at most one shared network. The data plane uses
-    /// [`Self::evaluate_packet_in_networks`] to check all shared memberships.
+    /// Stateful evaluation of a fully-parsed packet against the peer's shared
+    /// networks. Rules keep their configured order across networks, so an
+    /// explicit deny cannot be bypassed by choosing another transport handle.
     pub fn evaluate_packet(
-        &self,
-        direction: Direction,
-        info: &PacketInfo,
-        peer: &EndpointId,
-        network: Option<&str>,
-    ) -> Action {
-        self.evaluate_packet_in_networks(direction, info, peer, |name| Some(name) == network)
-    }
-
-    /// Evaluate rules against the peer's shared networks. Rules keep their
-    /// configured order across networks, so an explicit deny cannot be bypassed
-    /// by choosing another transport handle.
-    pub fn evaluate_packet_in_networks(
         &self,
         direction: Direction,
         info: &PacketInfo,
@@ -1418,20 +1407,20 @@ mod tests {
         // Unsolicited inbound -> denied.
         let unsolicited = tcp_pkt(peer, 51000, me, 8080, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, |_| false),
             Action::Deny
         );
 
         // We initiate outbound -> allowed (default_outbound), and tracked.
         let out = tcp_pkt(me, 50000, peer, 443, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &out, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &out, &peer_id, |_| false),
             Action::Allow
         );
         // Its return traffic -> allowed via conntrack despite deny-inbound.
         let ret = tcp_pkt(peer, 443, me, 50000, SYN | ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &ret, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &ret, &peer_id, |_| false),
             Action::Allow
         );
 
@@ -1443,7 +1432,7 @@ mod tests {
         icmp[16..20].copy_from_slice(&me.octets());
         let icmp = parse_packet_info(&icmp).unwrap();
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &icmp, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &icmp, &peer_id, |_| false),
             Action::Allow
         );
     }
@@ -1462,13 +1451,13 @@ mod tests {
         // Unsolicited inbound TCP would be denied when enforcing; here it passes.
         let unsolicited = tcp_pkt(peer, 51000, me, 8080, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, |_| false),
             Action::Allow
         );
         // Outbound also allowed (trivially, but confirms the short-circuit path).
         let out = tcp_pkt(me, 50000, peer, 443, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &out, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &out, &peer_id, |_| false),
             Action::Allow
         );
     }
@@ -1493,7 +1482,7 @@ mod tests {
         let peer = Ipv4Addr::new(100, 64, 0, 3);
         let ssh = tcp_pkt(peer, 51000, me, 22, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &ssh, &test_id(1), None),
+            fw.evaluate_packet(Direction::In, &ssh, &test_id(1), |_| false),
             Action::Allow
         );
     }
@@ -1569,19 +1558,19 @@ mod tests {
         let peer = test_id(1);
         // The peer shares both networks, so the scoped deny applies.
         assert_eq!(
-            fw.evaluate_packet_in_networks(Direction::In, &info, &peer, |name| {
+            fw.evaluate_packet(Direction::In, &info, &peer, |name| {
                 ["db", "dev"].contains(&name)
             }),
             Action::Deny
         );
         // A peer sharing only another network does not match.
         assert_eq!(
-            fw.evaluate_packet_in_networks(Direction::In, &info, &peer, |name| name == "dev"),
+            fw.evaluate_packet(Direction::In, &info, &peer, |name| name == "dev"),
             Action::Allow
         );
         // No shared network means the scoped rule cannot match.
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &info, &peer, None),
+            fw.evaluate_packet(Direction::In, &info, &peer, |_| false),
             Action::Allow
         );
     }
@@ -1616,7 +1605,7 @@ mod tests {
             ..Default::default()
         });
         let evaluate = |peer, networks: &[&str]| {
-            fw.evaluate_packet_in_networks(Direction::In, &packet, peer, |name| {
+            fw.evaluate_packet(Direction::In, &packet, peer, |name| {
                 networks.contains(&name)
             })
         };
@@ -1880,14 +1869,14 @@ mod tests {
         // Unsolicited inbound to port 22 -> blocked.
         let inbound_ssh = tcp_pkt(peer, 51000, me, 22, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &inbound_ssh, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &inbound_ssh, &peer_id, |_| false),
             Action::Deny
         );
 
         // Outbound SSH to a peer's port 22 -> allowed (default allow).
         let outbound_ssh = tcp_pkt(me, 54321, peer, 22, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &outbound_ssh, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &outbound_ssh, &peer_id, |_| false),
             Action::Allow
         );
 
@@ -1895,7 +1884,7 @@ mod tests {
         // and would be allowed by default anyway).
         let ret = tcp_pkt(peer, 22, me, 54321, ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &ret, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &ret, &peer_id, |_| false),
             Action::Allow
         );
     }
@@ -1928,7 +1917,7 @@ mod tests {
         // We initiate HTTPS: outbound SYN me:50000 -> peer:443, allowed by rule.
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &syn, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &syn, &peer_id, |_| false),
             Action::Allow
         );
 
@@ -1936,14 +1925,14 @@ mod tests {
         // flow is established from our outbound SYN -> allowed.
         let ret = tcp_pkt(peer, 443, me, 50000, SYN | ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &ret, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &ret, &peer_id, |_| false),
             Action::Allow
         );
 
         // Unsolicited inbound to some other port -> denied by default.
         let unsolicited = tcp_pkt(peer, 1234, me, 8080, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, |_| false),
             Action::Deny
         );
 
@@ -1951,12 +1940,12 @@ mod tests {
         // (so its would-be return traffic is also denied).
         let blocked_out = tcp_pkt(me, 40000, peer, 6667, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &blocked_out, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &blocked_out, &peer_id, |_| false),
             Action::Deny
         );
         let blocked_ret = tcp_pkt(peer, 6667, me, 40000, ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &blocked_ret, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &blocked_ret, &peer_id, |_| false),
             Action::Deny
         );
     }
@@ -1988,26 +1977,26 @@ mod tests {
         // Establish the flow.
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &syn, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &syn, &peer_id, |_| false),
             Action::Allow
         );
         let ret = tcp_pkt(peer, 443, me, 50000, ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &ret, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &ret, &peer_id, |_| false),
             Action::Allow
         );
 
         // We close with FIN. Flow should be evicted.
         let fin = tcp_pkt(me, 50000, peer, 443, FIN | ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &fin, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &fin, &peer_id, |_| false),
             Action::Allow
         );
 
         // Now return traffic from the closed flow is denied again.
         let after = tcp_pkt(peer, 443, me, 50000, ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &after, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &after, &peer_id, |_| false),
             Action::Deny
         );
     }
@@ -2036,21 +2025,21 @@ mod tests {
         // Outbound DNS query me:53000 -> peer:53.
         let q = udp_pkt(me, 53000, peer, 53);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &q, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &q, &peer_id, |_| false),
             Action::Allow
         );
 
         // Return response peer:53 -> me:53000 allowed via established flow.
         let resp = udp_pkt(peer, 53, me, 53000);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &resp, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &resp, &peer_id, |_| false),
             Action::Allow
         );
 
         // Unsolicited inbound UDP -> denied.
         let unsolicited = udp_pkt(peer, 9999, me, 53);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, |_| false),
             Action::Deny
         );
     }
@@ -2081,10 +2070,10 @@ mod tests {
         // Even if we (somehow) had an outbound flow to bad_peer, inbound from
         // them hits the explicit deny first.
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
-        fw.evaluate_packet(Direction::Out, &syn, &bad_peer, None); // track
+        fw.evaluate_packet(Direction::Out, &syn, &bad_peer, |_| false); // track
         let ret = tcp_pkt(peer, 443, me, 50000, ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &ret, &bad_peer, None),
+            fw.evaluate_packet(Direction::In, &ret, &bad_peer, |_| false),
             Action::Deny
         );
     }
@@ -2126,12 +2115,12 @@ mod tests {
 
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &syn, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &syn, &peer_id, |_| false),
             Action::Allow
         );
         let ret = tcp_pkt(peer, 443, me, 50000, ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &ret, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &ret, &peer_id, |_| false),
             Action::Allow
         );
 
@@ -2139,13 +2128,13 @@ mod tests {
         // outbound RST should evict. Send an outbound RST.
         let rst = tcp_pkt(me, 50000, peer, 443, RST | ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &rst, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &rst, &peer_id, |_| false),
             Action::Allow
         );
 
         let after = tcp_pkt(peer, 443, me, 50000, ACK);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &after, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &after, &peer_id, |_| false),
             Action::Deny
         );
     }
@@ -2203,7 +2192,7 @@ mod tests {
         // We ping the peer: outbound echo-request, allowed (default) + tracked.
         let out_req = icmp_pkt(me, peer, ECHO_REQUEST_V4, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, |_| false),
             Action::Allow
         );
 
@@ -2211,7 +2200,7 @@ mod tests {
         // the default, not masked by the tracked outbound flow.
         let in_req = icmp_pkt(peer, me, ECHO_REQUEST_V4, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &in_req, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &in_req, &peer_id, |_| false),
             Action::Deny
         );
     }
@@ -2233,13 +2222,13 @@ mod tests {
 
         let out_req = icmp_pkt(me, peer, ECHO_REQUEST_V4, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, |_| false),
             Action::Allow
         );
         // Inbound echo-reply with the matching id -> allowed return traffic.
         let in_reply = icmp_pkt(peer, me, ECHO_REPLY_V4, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, |_| false),
             Action::Allow
         );
     }
@@ -2260,10 +2249,10 @@ mod tests {
         let peer_id = test_id(1);
 
         let out_req = icmp_pkt(me, peer, ECHO_REQUEST_V4, 0x1111);
-        fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None);
+        fw.evaluate_packet(Direction::Out, &out_req, &peer_id, |_| false);
         let in_reply = icmp_pkt(peer, me, ECHO_REPLY_V4, 0x2222);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, |_| false),
             Action::Deny
         );
     }
@@ -2287,13 +2276,13 @@ mod tests {
         // We emit an outbound echo-reply (id chosen by the original requester).
         let out_reply = icmp_pkt(me, peer, ECHO_REPLY_V4, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &out_reply, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &out_reply, &peer_id, |_| false),
             Action::Allow
         );
         // The peer's subsequent unsolicited echo-request stays denied.
         let in_req = icmp_pkt(peer, me, ECHO_REQUEST_V4, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &in_req, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &in_req, &peer_id, |_| false),
             Action::Deny
         );
     }
@@ -2314,18 +2303,18 @@ mod tests {
 
         let out_req = icmp6_pkt(me, peer, ECHO_REQUEST_V6, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None),
+            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, |_| false),
             Action::Allow
         );
         let in_req = icmp6_pkt(peer, me, ECHO_REQUEST_V6, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &in_req, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &in_req, &peer_id, |_| false),
             Action::Deny
         );
         // The matching reply still gets in.
         let in_reply = icmp6_pkt(peer, me, ECHO_REPLY_V6, 0x1234);
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, None),
+            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, |_| false),
             Action::Allow
         );
     }
