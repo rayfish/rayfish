@@ -73,6 +73,8 @@ use std::time::Duration;
 #[cfg(target_os = "android")]
 use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
+use rayfish::config::QuicEngine as CoreQuicEngine;
+use rayfish::config::settings::GlobalKey;
 use rayfish::control;
 use rayfish::daemon::transfers;
 use rayfish::daemon::{DaemonState, build_headless};
@@ -227,6 +229,31 @@ pub struct NetworkDetail {
     /// The daemon's one-line reason for the last failed restore, when `state` is
     /// [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
     pub reason: Option<String>,
+}
+
+/// Packet forwarding engine, applied when the node next starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum QuicEngine {
+    Standalone,
+    FqCodel,
+}
+
+impl From<CoreQuicEngine> for QuicEngine {
+    fn from(engine: CoreQuicEngine) -> Self {
+        match engine {
+            CoreQuicEngine::Standalone => Self::Standalone,
+            CoreQuicEngine::FqCodel => Self::FqCodel,
+        }
+    }
+}
+
+impl From<QuicEngine> for CoreQuicEngine {
+    fn from(engine: QuicEngine) -> Self {
+        match engine {
+            QuicEngine::Standalone => Self::Standalone,
+            QuicEngine::FqCodel => Self::FqCodel,
+        }
+    }
 }
 
 /// Health/addresses/networks snapshot for the UI.
@@ -729,6 +756,23 @@ impl Node {
         })
         .map_err(RayError::network)?;
         Ok(())
+    }
+
+    /// Saved engine selection. Available before the node starts.
+    pub fn quic_engine(&self) -> Result<QuicEngine, RayError> {
+        config::load()
+            .map(|cfg| cfg.quic_engine.into())
+            .map_err(RayError::network)
+    }
+
+    /// Save the engine selection. Restart the node to apply it.
+    pub fn set_quic_engine(&self, engine: QuicEngine) -> Result<(), RayError> {
+        let engine = CoreQuicEngine::from(engine);
+        config::update_settings(|cfg| {
+            config::config_set(cfg, GlobalKey::QuicEngine, engine.as_ref(), false)
+        })
+        .map(|_| ())
+        .map_err(RayError::network)
     }
 
     /// Current firewall posture and rules.
@@ -1545,6 +1589,14 @@ mod device_name_tests {
 
             // Invalid name is rejected and does not overwrite the stored value.
             assert!(node.set_default_hostname("BAD NAME".into()).is_err());
+            assert_eq!(node.default_hostname(), "my-phone");
+
+            assert_eq!(node.quic_engine().unwrap(), QuicEngine::Standalone);
+            node.set_quic_engine(QuicEngine::FqCodel).unwrap();
+            assert_eq!(node.quic_engine().unwrap(), QuicEngine::FqCodel);
+            assert_eq!(config::load().unwrap().quic_engine, CoreQuicEngine::FqCodel);
+            node.set_quic_engine(QuicEngine::Standalone).unwrap();
+            assert_eq!(node.quic_engine().unwrap(), QuicEngine::Standalone);
             assert_eq!(node.default_hostname(), "my-phone");
         }
 

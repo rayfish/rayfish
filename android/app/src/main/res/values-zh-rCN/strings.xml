@@ -269,4 +269,10 @@
     <string name="file_transfer_bytes">%1$s / %2$s</string>
     <string name="error_status_refresh">无法刷新。显示的是上次获取的状态。</string>
     <string name="action_retry">重试</string>
+    <string name="quic_engine_title">QUIC 引擎</string>
+    <string name="quic_engine_standalone">Standalone</string>
+    <string name="quic_engine_fq_codel">FQ-CoDel（实验性）</string>
+    <string name="quic_engine_description">Standalone 直接发送数据包。FQ-CoDel 让小规模传输也能在大量流量中获得发送机会。</string>
+    <string name="quic_engine_restart_hint">重启 Rayfish 以应用更改。正在进行的传输将被中断。</string>
+    <string name="quic_engine_restart">重启 Rayfish</string>
 </resources>

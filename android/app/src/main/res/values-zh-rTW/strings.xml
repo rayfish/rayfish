@@ -269,4 +269,10 @@
     <string name="file_transfer_bytes">%1$s / %2$s</string>
     <string name="error_status_refresh">無法重新整理。顯示的是上次取得的狀態。</string>
     <string name="action_retry">重試</string>
+    <string name="quic_engine_title">QUIC 引擎</string>
+    <string name="quic_engine_standalone">Standalone</string>
+    <string name="quic_engine_fq_codel">FQ-CoDel（實驗性）</string>
+    <string name="quic_engine_description">Standalone 直接傳送封包。FQ-CoDel 讓小型傳輸也能在大量流量中獲得傳送機會。</string>
+    <string name="quic_engine_restart_hint">重新啟動 Rayfish 以套用變更。進行中的傳輸將會中斷。</string>
+    <string name="quic_engine_restart">重新啟動 Rayfish</string>
 </resources>

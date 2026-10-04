@@ -242,9 +242,8 @@ class RayfishVpnService : VpnService() {
             ACTION_RESTART_NODE -> {
                 // A start-time setting changed. The daemon reads those once, when
                 // it is built, so the only way to apply one is to build a new
-                // daemon: stop the node and start it again. No sender today (the
-                // IPv6-only toggle this was built for is gone with the setting);
-                // kept because the next start-time setting will want it.
+                // daemon: stop the node and start it again. The QUIC engine
+                // selector uses this to apply its saved choice.
                 //
                 // The tunnel has to go with it. Its addressing is decided from the
                 // same setting (see startTunnelBlocking), and Node.stop() drops the

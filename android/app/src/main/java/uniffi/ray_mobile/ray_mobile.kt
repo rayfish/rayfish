@@ -851,6 +851,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
 
     fun uniffi_ray_mobile_checksum_method_node_pair(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_quic_engine(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(): Short
@@ -864,6 +866,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
     fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_set_hostname(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_set_quic_engine(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_start(): Short
 
@@ -1135,6 +1139,11 @@ internal interface UniffiLib : Library {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    fun uniffi_ray_mobile_fn_method_node_quic_engine(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     fun uniffi_ray_mobile_fn_method_node_reject_connect_request(
         `ptr`: Pointer,
         `shortId`: RustBuffer.ByValue,
@@ -1178,6 +1187,12 @@ internal interface UniffiLib : Library {
         `ptr`: Pointer,
         `network`: RustBuffer.ByValue,
         `hostname`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_set_quic_engine(
+        `ptr`: Pointer,
+        `engine`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1551,6 +1566,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_quic_engine() != 16059.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_reject_connect_request() != 60575.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1570,6 +1588,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_quic_engine() != 39138.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_start() != 4927.toShort()) {
@@ -2488,6 +2509,11 @@ public interface NodeInterface {
     fun `pair`(`ticket`: kotlin.String)
 
     /**
+     * Saved engine selection. Available before the node starts.
+     */
+    fun `quicEngine`(): QuicEngine
+
+    /**
      * Decline an incoming connect request.
      */
     fun `rejectConnectRequest`(`shortId`: kotlin.String)
@@ -2552,6 +2578,11 @@ public interface NodeInterface {
         `network`: kotlin.String,
         `hostname`: kotlin.String,
     )
+
+    /**
+     * Save the engine selection. Restart the node to apply it.
+     */
+    fun `setQuicEngine`(`engine`: QuicEngine)
 
     /**
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
@@ -3169,6 +3200,19 @@ open class Node :
         }
 
     /**
+     * Saved engine selection. Available before the node starts.
+     */
+    @Throws(RayException::class)
+    override fun `quicEngine`(): QuicEngine =
+        FfiConverterTypeQuicEngine.lift(
+            callWithPointer {
+                uniffiRustCallWithError(RayException) { _status ->
+                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_quic_engine(it, _status)
+                }
+            },
+        )
+
+    /**
      * Decline an incoming connect request.
      */
     @Throws(RayException::class)
@@ -3295,6 +3339,17 @@ open class Node :
             )
         }
     }
+
+    /**
+     * Save the engine selection. Restart the node to apply it.
+     */
+    @Throws(RayException::class)
+    override fun `setQuicEngine`(`engine`: QuicEngine) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_quic_engine(it, FfiConverterTypeQuicEngine.lower(`engine`), _status)
+            }
+        }
 
     /**
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
@@ -4264,6 +4319,39 @@ public object FfiConverterTypePeerConnState : FfiConverterRustBuffer<PeerConnSta
 
     override fun write(
         value: PeerConnState,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * Packet forwarding engine, applied when the node next starts.
+ */
+
+enum class QuicEngine {
+    STANDALONE,
+    FQ_CODEL,
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeQuicEngine : FfiConverterRustBuffer<QuicEngine> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            QuicEngine.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: QuicEngine) = 4UL
+
+    override fun write(
+        value: QuicEngine,
         buf: ByteBuffer,
     ) {
         buf.putInt(value.ordinal + 1)

@@ -295,4 +295,10 @@
     <string name="file_transfer_bytes">%1$s of %2$s</string>
     <string name="error_status_refresh">Could not refresh. Showing the last known status.</string>
     <string name="action_retry">Retry</string>
+    <string name="quic_engine_title">QUIC engine</string>
+    <string name="quic_engine_standalone">Standalone</string>
+    <string name="quic_engine_fq_codel">FQ-CoDel (experimental)</string>
+    <string name="quic_engine_description">Standalone sends packets directly. FQ-CoDel gives small transfers a turn alongside bulk traffic.</string>
+    <string name="quic_engine_restart_hint">Restart Rayfish to apply this change. Active transfers will be interrupted.</string>
+    <string name="quic_engine_restart">Restart Rayfish</string>
 </resources>

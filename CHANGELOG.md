@@ -19,7 +19,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `quic-engine` replaces `quic-congestion`, with `standalone` (default) and
   `fq-codel` choices. Both use loss-tolerant congestion control. Saved controller
-  settings migrate to the corresponding engine; the macOS toggle selects FQ-CoDel.
+  settings migrate to the corresponding engine. macOS Settings and Android You
+  offer an engine selector and a reconnect or restart action.
 
 ### Fixed
 

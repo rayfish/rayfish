@@ -686,9 +686,9 @@ private struct SettingsView: View {
             .padding(18).rayfishCard()
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("FQ-CoDel scheduling")
+                    Text("QUIC engine")
                     Spacer()
-                    Toggle("FQ-CoDel scheduling", isOn: Binding(
+                    Picker("QUIC engine", selection: Binding(
                         get: { controller.status?.quicFqCodel ?? false },
                         set: { enabled in
                             Task {
@@ -696,10 +696,15 @@ private struct SettingsView: View {
                                 engineNeedsReconnect = controller.error == nil
                             }
                         }
-                    ))
+                    )) {
+                        Text("Standalone").tag(false)
+                        Text("FQ-CoDel").tag(true)
+                    }
                     .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
                 }
-                Text("Experimental. Gives each flow its own queue so small transfers can compete with bulk traffic.")
+                Text("Standalone sends packets directly. FQ-CoDel is experimental and gives small transfers a turn alongside bulk traffic.")
                     .foregroundColor(RayfishTheme.muted)
                 if engineNeedsReconnect {
                     HStack {

@@ -269,4 +269,10 @@
     <string name="file_transfer_bytes">%2$s 中 %1$s</string>
     <string name="error_status_refresh">更新できませんでした。最後に確認した状態を表示しています。</string>
     <string name="action_retry">再試行</string>
+    <string name="quic_engine_title">QUIC エンジン</string>
+    <string name="quic_engine_standalone">Standalone</string>
+    <string name="quic_engine_fq_codel">FQ-CoDel（実験的）</string>
+    <string name="quic_engine_description">Standalone はパケットを直接送信します。FQ-CoDel は大量の通信がある場合も小さな転送を順番に処理します。</string>
+    <string name="quic_engine_restart_hint">変更を適用するには Rayfish を再起動してください。進行中の転送は中断されます。</string>
+    <string name="quic_engine_restart">Rayfish を再起動</string>
 </resources>

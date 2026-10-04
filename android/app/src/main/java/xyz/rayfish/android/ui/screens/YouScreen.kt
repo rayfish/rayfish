@@ -102,6 +102,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        QuicEngineCard(onToast = onToast, onChanged = onChanged)
         IdentityBackupCard(status = status, onToast = onToast, onChanged = onChanged)
         // Default off: standby is the normal behavior now, so disabling Rayfish
         // keeps files working with the VPN off (that is what lets you run another
