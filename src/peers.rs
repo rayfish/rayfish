@@ -163,13 +163,13 @@ fn connection_selection_id(conn: &Connection) -> [u8; 32] {
 }
 
 /// Result of a routing lookup: the connection to send over, the peer identity,
-/// the network the packet is attributed to (firewall context), and the outbound
+/// the network used to tag the packet, and the outbound
 /// handle to tag the datagram with.
 pub struct PeerRoute {
     pub conn: Connection,
     pub(crate) scheduler: Option<Arc<OnceLock<FqSender>>>,
     pub endpoint_id: EndpointId,
-    /// The network the outbound packet is attributed to (firewall context). A
+    /// The network used for the outbound transport handle. A
     /// multi-homed peer has one IP, so an IP packet carries no network by itself;
     /// this is the deterministic pick (lexically-smallest shared network).
     pub network: SmolStr,
@@ -259,7 +259,7 @@ impl PeerEntry {
     }
 
     /// Picks the network a packet to this peer is attributed to (the lexically
-    /// smallest one both ends still share) so routing/firewall context is stable
+    /// smallest one both ends still share) so transport tagging is stable
     /// across lookups, and returns the connection + that network's outbound
     /// handle.
     ///

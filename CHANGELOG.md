@@ -21,6 +21,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   configurations, improving TCP throughput on lossy links. Saved controller
   choices are preserved; Cubic remains available for latency-sensitive UDP.
 
+### Fixed
+
+- Network-scoped firewall rules apply to peers sharing that network, regardless
+  of which shared network carries their packets.
+
 ## [0.5.7] - 2026-10-03
 
 ### Added

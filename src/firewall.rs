@@ -231,10 +231,8 @@ pub struct FirewallRule {
     pub protocol: Protocol,
     pub port: Option<PortRange>,
     pub peer: PeerFilter,
-    /// Restrict the rule to traffic on a specific network. `None` (the default,
-    /// so older `firewall.toml` files keep working) matches any network. Lets a
-    /// multi-homed host scope a rule to the network a packet arrived on, e.g.
-    /// "allow :8080 only from peers reached via `db`".
+    /// Restrict the rule to peers sharing this network, regardless of the
+    /// packet's transport handle. `None` matches any reachable peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
     /// Provenance: hand-added (`Local`) vs. materialized from a network's
@@ -361,14 +359,14 @@ impl SharedFirewall {
         protocol: u8,
         dst_port: u16,
         peer: &EndpointId,
-        network: Option<&str>,
+        shares_network: impl Fn(&str) -> bool,
     ) -> Option<Action> {
         for rule in &config.rules {
             if rule.direction != direction {
                 continue;
             }
             if let Some(ref rule_net) = rule.network
-                && Some(rule_net.as_str()) != network
+                && !shares_network(rule_net)
             {
                 continue;
             }
@@ -420,7 +418,7 @@ impl SharedFirewall {
         peer: &EndpointId,
     ) -> Action {
         let config = self.inner.load();
-        Self::match_rule(&config, direction, protocol, dst_port, peer, None)
+        Self::match_rule(&config, direction, protocol, dst_port, peer, |_| false)
             .unwrap_or_else(|| Self::default_for(&config, direction))
     }
 
@@ -437,22 +435,27 @@ impl SharedFirewall {
         self.inner.load().disabled
     }
 
-    /// Stateful evaluation of a fully-parsed packet. This is what the data plane
-    /// (`forward.rs`) calls. See the module docs for the full semantics.
-    ///
-    /// Order:
-    /// 1. Explicit rules (first-match wins), for both directions.
-    /// 2. If outbound and permitted: record/refresh the flow so the peer's return
-    ///    traffic is recognized. Denied outbound is never tracked (otherwise a
-    ///    denied connection could whitelist its own return traffic).
-    /// 3. If inbound and no explicit rule matched: allow established return
-    ///    traffic; otherwise fall back to the default action.
+    /// Stateful evaluation with at most one shared network. The data plane uses
+    /// [`Self::evaluate_packet_in_networks`] to check all shared memberships.
     pub fn evaluate_packet(
         &self,
         direction: Direction,
         info: &PacketInfo,
         peer: &EndpointId,
         network: Option<&str>,
+    ) -> Action {
+        self.evaluate_packet_in_networks(direction, info, peer, |name| Some(name) == network)
+    }
+
+    /// Evaluate rules against the peer's shared networks. Rules keep their
+    /// configured order across networks, so an explicit deny cannot be bypassed
+    /// by choosing another transport handle.
+    pub fn evaluate_packet_in_networks(
+        &self,
+        direction: Direction,
+        info: &PacketInfo,
+        peer: &EndpointId,
+        shares_network: impl Fn(&str) -> bool,
     ) -> Action {
         // Hold one immutable firewall generation for this packet. A concurrent
         // configuration update is allowed to affect the next packet, but never
@@ -481,9 +484,14 @@ impl SharedFirewall {
         };
 
         // 1. Explicit rules always win.
-        if let Some(action) =
-            Self::match_rule(&config, direction, proto, info.dst_port, peer, network)
-        {
+        if let Some(action) = Self::match_rule(
+            &config,
+            direction,
+            proto,
+            info.dst_port,
+            peer,
+            shares_network,
+        ) {
             if direction == Direction::Out && action.is_allow() {
                 self.track_outbound(&flow, info);
             }
@@ -1531,10 +1539,8 @@ mod tests {
     }
 
     #[test]
-    fn rule_scoped_to_arrival_network() {
-        // A deny rule scoped to network "db" must only bite traffic arriving via
-        // "db", letting a multi-homed host (in `db` and `dev`) restrict a peer
-        // on one network while leaving the other untouched.
+    fn rule_scoped_to_shared_network() {
+        // A scoped rule applies to every packet from a peer sharing its network.
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
@@ -1561,21 +1567,68 @@ mod tests {
             icmp_id: 0,
         };
         let peer = test_id(1);
-        // Arrives via db -> rule matches -> denied.
+        // The peer shares both networks, so the scoped deny applies.
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &info, &peer, Some("db")),
+            fw.evaluate_packet_in_networks(Direction::In, &info, &peer, |name| {
+                ["db", "dev"].contains(&name)
+            }),
             Action::Deny
         );
-        // Arrives via another network -> rule skipped -> default allow.
+        // A peer sharing only another network does not match.
         assert_eq!(
-            fw.evaluate_packet(Direction::In, &info, &peer, Some("dev")),
+            fw.evaluate_packet_in_networks(Direction::In, &info, &peer, |name| name == "dev"),
             Action::Allow
         );
-        // No network context -> network-scoped rule can't match -> default allow.
+        // No shared network means the scoped rule cannot match.
         assert_eq!(
             fw.evaluate_packet(Direction::In, &info, &peer, None),
             Action::Allow
         );
+    }
+
+    #[test]
+    fn shared_network_rules_keep_order_and_peer_filters() {
+        let peer = test_id(1);
+        let other = test_id(2);
+        let packet = tcp_pkt(
+            Ipv4Addr::new(100, 64, 0, 1),
+            40000,
+            Ipv4Addr::new(100, 64, 0, 2),
+            8080,
+            SYN,
+        );
+        let allow = FirewallRule {
+            direction: Direction::In,
+            action: Action::Allow,
+            protocol: Protocol::Any,
+            port: None,
+            peer: PeerFilter::Identity(peer),
+            network: Some("allowed".to_string()),
+            origin: RuleOrigin::Local,
+        };
+        let deny = FirewallRule {
+            action: Action::Deny,
+            network: Some("restricted".to_string()),
+            ..allow.clone()
+        };
+        let fw = SharedFirewall::new(FirewallConfig {
+            rules: vec![deny.clone(), allow.clone()],
+            ..Default::default()
+        });
+        let evaluate = |peer, networks: &[&str]| {
+            fw.evaluate_packet_in_networks(Direction::In, &packet, peer, |name| {
+                networks.contains(&name)
+            })
+        };
+        assert_eq!(evaluate(&peer, &["allowed"]), Action::Allow);
+        assert_eq!(evaluate(&other, &["allowed"]), Action::Deny);
+        assert_eq!(evaluate(&peer, &["unrelated"]), Action::Deny);
+        assert_eq!(evaluate(&peer, &["allowed", "restricted"]), Action::Deny);
+        fw.update(FirewallConfig {
+            rules: vec![allow, deny],
+            ..Default::default()
+        });
+        assert_eq!(evaluate(&peer, &["allowed", "restricted"]), Action::Allow);
     }
 
     #[test]
@@ -2315,11 +2368,13 @@ mod tests {
             ..FirewallConfig::default()
         };
         assert_eq!(
-            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &excluded, Some("prod")),
+            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &excluded, |name| name
+                == "prod"),
             None
         );
         assert_eq!(
-            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, Some("prod")),
+            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, |name| name
+                == "prod"),
             Some(Action::Allow)
         );
 
@@ -2335,7 +2390,8 @@ mod tests {
             ..FirewallConfig::default()
         };
         assert_eq!(
-            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, Some("prod")),
+            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, |name| name
+                == "prod"),
             None
         );
     }
@@ -2365,11 +2421,13 @@ mod tests {
             ..FirewallConfig::default()
         };
         assert_eq!(
-            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &user, Some("prod")),
+            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &user, |name| name
+                == "prod"),
             None
         );
         assert_eq!(
-            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, Some("prod")),
+            SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, |name| name
+                == "prod"),
             Some(Action::Allow)
         );
     }
