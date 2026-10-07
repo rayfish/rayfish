@@ -590,3 +590,89 @@ async fn member_poller_learns_destruction_without_a_broadcast() {
     assert!(config::destruction::load(key.public()).unwrap().is_some());
     daemon.shutdown_and_close().await;
 }
+
+/// A member whose link to its coordinator has idle-closed still gets its leave
+/// there (#129). The coordinator is dialed even though the last dial to it
+/// failed, and has the message before the member tears the network down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn leave_dials_a_coordinator_with_no_live_link() {
+    let _lock = config::CONFIG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = ConfigDir::set(dir.path());
+    let relay = Relay::start().await;
+    relay.configure();
+    let daemon = build_headless(false).await.unwrap();
+    let coordinator = Endpoint::builder(presets::N0)
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .alpns(vec![transport::mesh_alpn()])
+        .bind()
+        .await
+        .unwrap();
+    daemon
+        .transport
+        .warm_lookup
+        .add_endpoint_info(coordinator.addr());
+
+    let net = create(&daemon, "home").await;
+    let net_pubkey = net.network_secret_key.as_ref().unwrap().public();
+    let roster = {
+        let mut handle = daemon.registry.networks.get_mut("home").unwrap();
+        handle.role = NetworkRole::Member;
+        let mut state = handle.state.write().unwrap();
+        state.network_secret_key = None;
+        let template = state.members.all()[0].clone();
+        state.members.add(Member {
+            identity: coordinator.id(),
+            is_coordinator: true,
+            hostname: Some("laptop".to_string()),
+            ..template
+        });
+        state.roster()
+    };
+    daemon.registry.seed_route_map("home", &roster);
+    // No live link, and a recent failed dial: a `MemberSync` would skip it.
+    daemon.registry.reachability.note_fail(coordinator.id());
+    assert!(
+        daemon
+            .registry
+            .peers
+            .conn_for_ip(&derive_ipv6(&coordinator.id()))
+            .is_none()
+    );
+
+    // The coordinator's end: complete each `MeshHello`, then report the network
+    // a `LeaveNetwork` names. The link is returned to stay open until the leave
+    // has finished.
+    let receive = async {
+        let conn = coordinator.accept().await.unwrap().await.unwrap();
+        loop {
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let control::FrameRead::Frame(frame) = control::recv_frame(&mut recv).await.unwrap()
+            else {
+                continue;
+            };
+            match frame.msg {
+                ControlMsg::MeshHello { .. } => send.finish().unwrap(),
+                ControlMsg::LeaveNetwork => return (frame.net, conn),
+                _ => {}
+            }
+        }
+    };
+    let (result, (left, _link)) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(daemon.registry.leave_network("home"), receive)
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert_eq!(left, Some(net_pubkey));
+    assert!(!daemon.registry.networks.contains_key("home"));
+    assert!(config::load_network("home").unwrap().is_none());
+    coordinator.close().await;
+    daemon.shutdown_and_close().await;
+}

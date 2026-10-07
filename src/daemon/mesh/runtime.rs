@@ -424,7 +424,7 @@ impl NetworkRegistry {
     }
 
     #[tracing::instrument(skip(self), fields(net = name))]
-    pub(crate) async fn nuke_network(&self, name: &str, force: bool) -> IpcMessage {
+    pub(crate) async fn nuke_network(self: &Arc<Self>, name: &str, force: bool) -> IpcMessage {
         let (is_coordinator, has_other_members, has_other_coordinators) = {
             let handle = match self.networks.get(name) {
                 Some(h) => h,

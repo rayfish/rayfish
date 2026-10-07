@@ -13,6 +13,7 @@
 
 use super::*;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use futures::future::BoxFuture;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -22,6 +23,12 @@ use tokio::sync::Notify;
 /// most this long for the connection; past it the buffered packets are dropped and
 /// the peer is marked unreachable until a later packet retries the dial.
 const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on delivering a `ray leave` before the network is torn down: a
+/// dial ([`LAZY_DIAL_TIMEOUT`]) plus its acknowledgement, with room to spare. A
+/// leave is attempted once, so this is how long an unreachable coordinator can
+/// hold up `ray leave`.
+const LEAVE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Keep the persisted hint set small and bounded.  A hint is only a speed-up;
 /// the endpoint id in the QUIC certificate remains the authentication boundary.
@@ -529,7 +536,7 @@ impl NetworkRegistry {
     /// Called by the phone's unpair control, the IPC path, and the device-side
     /// `ControlMsg::Unpaired` / self-nullify handlers (was the `self_unpair_tx`
     /// hand-off to the daemon loop). A device with no cert (a primary) is a no-op.
-    pub(crate) async fn unpair_self(&self) -> IpcMessage {
+    pub(crate) async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
         let Some(cert) = self.current_device_cert() else {
             return ipc_err("this device is not paired to a primary".to_string());
         };
@@ -605,15 +612,15 @@ impl NetworkRegistry {
     /// carries every network two peers share: closing it would sever the peer on
     /// networks we are *not* leaving (and, on a peer that coordinates one of them,
     /// get us pruned from a network we never left). A coordinator that receives the
-    /// message prunes us from that one network's roster and republishes.
+    /// message prunes us from that one network's roster and republishes, so
+    /// [`Self::announce_leave`] dials any coordinator no live link reaches.
     /// `teardown_network_runtime` then closes only the links left sharing no
     /// network at all.
-    pub(crate) async fn leave_network(&self, name: &str) -> IpcMessage {
-        // Send the in-band leave while the peer entries still list this network
-        // (before teardown drops them). Best-effort: a peer that misses it converges
-        // from the coordinator's republish, or ages us out as an offline member.
+    pub(crate) async fn leave_network(self: &Arc<Self>, name: &str) -> IpcMessage {
+        // Announce the leave while the peer entries still list this network
+        // (before teardown drops them), and let it land before tearing down.
         if let Some(net_pubkey) = self.networks.get(name).map(|h| h.network_key) {
-            broadcast_control_msg(&self.peers, net_pubkey, name, &ControlMsg::LeaveNetwork).await;
+            self.announce_leave(name, net_pubkey).await;
         }
 
         if self.remove_network_locally(name).await {
@@ -624,6 +631,72 @@ impl NetworkRegistry {
         } else {
             ipc_err(format!("network '{}' not found", name))
         }
+    }
+
+    /// Deliver `ControlMsg::LeaveNetwork` to every peer sharing `name` over a live
+    /// link, and to every coordinator without one, dialing it first. Waits, at most
+    /// [`LEAVE_DELIVERY_TIMEOUT`], until each has acknowledged the message.
+    ///
+    /// Only a coordinator prunes the roster, and nothing ages out a member that
+    /// left without being heard: the roster keeps it, holding its hostname, until
+    /// a `ray kick`. An on-demand node's link to its coordinator is usually
+    /// idle-closed by the time it leaves, so the live links alone are not enough.
+    /// Ordinary members need no dial: the coordinator's republish and `MemberSync`
+    /// reach them, dialing idle ones in turn.
+    async fn announce_leave(self: &Arc<Self>, name: &str, net_pubkey: EndpointId) {
+        let live = self.peers.peers_for_network_with_conn(name);
+        let reached: HashSet<EndpointId> = live.iter().map(|(id, _, _)| *id).collect();
+        let absent = leave_recipients(
+            &self.roster(name),
+            self.transport.identity.local_identity(),
+            &reached,
+        );
+        let deliveries = live
+            .into_iter()
+            .map(|(_, ip, _)| ip)
+            .chain(absent)
+            .map(|ip| async move { (ip, self.deliver_leave(ip, net_pubkey).await) });
+        match tokio::time::timeout(
+            LEAVE_DELIVERY_TIMEOUT,
+            futures::future::join_all(deliveries),
+        )
+        .await
+        {
+            Ok(results) => {
+                for (ip, result) in results {
+                    if let Err(e) = result {
+                        tracing::warn!(network = %name, peer_ip = %ip, error = %format!("{e:#}"), "failed to deliver leave");
+                    }
+                }
+            }
+            Err(_) => tracing::warn!(network = %name, "timed out delivering leave"),
+        }
+    }
+
+    /// Send `LeaveNetwork` to the peer at `ip`, dialing it first when no link is up.
+    ///
+    /// A named, boxed future rather than an `async fn`: the dial spawns the new
+    /// link's control loop, and an `Unpaired` arriving on that loop leaves networks
+    /// through here again (`unpair_self`), so the loop's future type would
+    /// otherwise contain itself.
+    fn deliver_leave(
+        self: &Arc<Self>,
+        ip: Ipv6Addr,
+        net_pubkey: EndpointId,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if self.peers.conn_for_ip(&ip).is_none() {
+                let target = self
+                    .resolve_route(IpAddr::V6(ip))
+                    .context("no route to the peer")?;
+                anyhow::ensure!(self.dial_target(&target).await, "could not dial the peer");
+            }
+            let conn = self
+                .peers
+                .conn_for_ip(&ip)
+                .context("the link closed before the leave was sent")?;
+            send_leave(&conn, net_pubkey).await
+        })
     }
 
     /// Tear down and forget a network after its signed roster confirms that this

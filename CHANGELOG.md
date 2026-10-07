@@ -36,6 +36,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Network-scoped firewall rules apply to peers sharing that network, regardless
   of which shared network carries their packets.
 
+- `ray leave` reaches the network's coordinator even when the connection to it
+  had gone idle, as it usually has on a phone. The device no longer stays on the
+  roster holding its hostname until someone runs `ray kick`.
+
 ## [0.5.7] - 2026-10-03
 
 ### Added
