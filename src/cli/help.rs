@@ -98,7 +98,7 @@ const ROOT: Groups = &[
 /// edit, switches that change how they are enforced, the coordinator-suggestion
 /// queue, and the SSH server that rides the same policy.
 const FIREWALL: Groups = &[
-    ("Rules", &["show", "add", "remove"]),
+    ("Rules", &["show", "add", "remove", "test"]),
     ("Mode", &["on", "off", "default", "reject"]),
     (
         "Coordinator suggestions",
@@ -440,12 +440,13 @@ mod tests {
     #[test]
     fn json_parses_after_a_nested_action() {
         for line in [
-            ["ray", "firewall", "show", "--json"],
-            ["ray", "pair", "list", "--json"],
-            ["ray", "exit-node", "status", "--json"],
+            vec!["ray", "firewall", "show", "--json"],
+            vec!["ray", "pair", "list", "--json"],
+            vec!["ray", "exit-node", "status", "--json"],
+            vec!["ray", "firewall", "test", "laptop", "tcp:22", "--json"],
         ] {
             assert!(
-                command().try_get_matches_from(line).is_ok(),
+                command().try_get_matches_from(line.clone()).is_ok(),
                 "`{}` should parse",
                 line.join(" ")
             );

@@ -58,9 +58,9 @@
 //! Explicit rules always win (first-match). Established return traffic only
 //! bypasses the *default* action, never an explicit rule.
 
-use std::net::IpAddr;
 #[cfg(test)]
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -336,6 +336,32 @@ struct Flow {
     icmp_id: u16,
 }
 
+/// What decided a [`Verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// The firewall is off (`ray firewall off`), so nothing was checked.
+    Disabled,
+    /// The first matching rule, at `index` in [`FirewallConfig::rules`], which
+    /// is also its number in `ray firewall show`.
+    Rule { index: usize, rule: FirewallRule },
+    /// No rule matched, so the direction's default applied.
+    Default,
+}
+
+/// [`SharedFirewall::explain`]'s answer: how a packet would be treated, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub action: Action,
+    pub decided_by: DecidedBy,
+    /// Denied with REJECT mode on, so the sender gets a TCP RST or ICMP
+    /// unreachable instead of a silent drop.
+    pub reject: bool,
+    /// Denied by the inbound default, which conntrack lifts for return traffic
+    /// of a flow this device opened. Never set when a rule decided: return
+    /// traffic bypasses only the default.
+    pub return_traffic: bool,
+}
+
 #[derive(Clone)]
 pub struct SharedFirewall {
     inner: Arc<ArcSwap<FirewallConfig>>,
@@ -352,16 +378,17 @@ impl SharedFirewall {
         }
     }
 
-    /// First matching explicit rule's action, or `None` if no rule matches.
-    fn match_rule(
-        config: &FirewallConfig,
+    /// First matching explicit rule and its index in `config.rules`, or `None`
+    /// if no rule matches.
+    fn match_rule<'c>(
+        config: &'c FirewallConfig,
         direction: Direction,
         protocol: u8,
         dst_port: u16,
         peer: &EndpointId,
         shares_network: impl Fn(&str) -> bool,
-    ) -> Option<Action> {
-        for rule in &config.rules {
+    ) -> Option<(usize, &'c FirewallRule)> {
+        for (index, rule) in config.rules.iter().enumerate() {
             if rule.direction != direction {
                 continue;
             }
@@ -392,7 +419,7 @@ impl SharedFirewall {
             {
                 continue;
             }
-            return Some(rule.action);
+            return Some((index, rule));
         }
         None
     }
@@ -420,6 +447,7 @@ impl SharedFirewall {
     ) -> Action {
         let config = self.inner.load();
         Self::match_rule(&config, direction, protocol, dst_port, peer, |_| false)
+            .map(|(_, rule)| rule.action)
             .unwrap_or_else(|| Self::default_for(&config, direction))
     }
 
@@ -473,7 +501,7 @@ impl SharedFirewall {
         };
 
         // 1. Explicit rules always win.
-        if let Some(action) = Self::match_rule(
+        if let Some((_, rule)) = Self::match_rule(
             &config,
             direction,
             proto,
@@ -481,6 +509,7 @@ impl SharedFirewall {
             peer,
             shares_network,
         ) {
+            let action = rule.action;
             if direction == Direction::Out && action.is_allow() {
                 self.track_outbound(&flow, info);
             }
@@ -507,15 +536,66 @@ impl SharedFirewall {
                 // the rules/default. Without this, a request and reply share a
                 // flow (ICMP has no ports) and a recent outbound ping would
                 // wrongly whitelist the peer's inbound pings.
-                let conntrack_eligible =
-                    !is_icmp(proto) || is_icmp_echo_reply(proto, info.icmp_type);
-                if conntrack_eligible && self.flow_active(&flow) {
+                if conntrack_eligible(info) && self.flow_active(&flow) {
                     self.conntrack.insert(flow, Instant::now());
                     Action::Allow
                 } else {
                     Self::default_for(&config, Direction::In)
                 }
             }
+        }
+    }
+
+    /// How [`Self::evaluate_packet`] would decide `info` as a new packet, and
+    /// what decided it, without recording anything: an allowed outbound packet
+    /// opens no conntrack flow here. `ray firewall test` asks this, so its answer
+    /// comes from the matcher and defaults the data path enforces, not a copy of
+    /// them. Conntrack is not consulted, since a new packet has no flow;
+    /// [`Verdict::return_traffic`] says whether it would rescue a reply.
+    pub fn explain(
+        &self,
+        direction: Direction,
+        info: &PacketInfo,
+        peer: &EndpointId,
+        shares_network: impl Fn(&str) -> bool,
+    ) -> Verdict {
+        // One generation for the whole answer, as in `evaluate_packet`: the rule
+        // index and the rule it names must come from the same config.
+        let config = self.inner.load();
+        if config.disabled {
+            return Verdict {
+                action: Action::Allow,
+                decided_by: DecidedBy::Disabled,
+                reject: false,
+                return_traffic: false,
+            };
+        }
+        if let Some((index, rule)) = Self::match_rule(
+            &config,
+            direction,
+            info.protocol,
+            info.dst_port,
+            peer,
+            shares_network,
+        ) {
+            return Verdict {
+                action: rule.action,
+                decided_by: DecidedBy::Rule {
+                    index,
+                    rule: rule.clone(),
+                },
+                reject: config.reject && rule.action.is_deny(),
+                return_traffic: false,
+            };
+        }
+        let action = Self::default_for(&config, direction);
+        Verdict {
+            action,
+            decided_by: DecidedBy::Default,
+            reject: config.reject && action.is_deny(),
+            return_traffic: direction == Direction::In
+                && action.is_deny()
+                && conntrack_eligible(info),
         }
     }
 
@@ -638,6 +718,12 @@ fn is_icmp_echo_reply(proto: u8, icmp_type: u8) -> bool {
     (proto == 1 && icmp_type == 0) || (proto == 58 && icmp_type == 129)
 }
 
+/// Whether conntrack may admit `info` inbound as return traffic: any TCP or UDP
+/// packet, but of ICMP only an echo reply (see `evaluate_packet`).
+fn conntrack_eligible(info: &PacketInfo) -> bool {
+    !is_icmp(info.protocol) || is_icmp_echo_reply(info.protocol, info.icmp_type)
+}
+
 pub fn firewall_path() -> Result<PathBuf> {
     Ok(crate::config::config_dir()?.join("firewall.toml"))
 }
@@ -749,6 +835,60 @@ pub fn parse_spec_token(tok: &str) -> Result<(Protocol, Option<PortRange>)> {
             }
         }
     }
+}
+
+/// Parse the packet `ray firewall test` asks about: `tcp:<port>`, `udp:<port>`,
+/// or `icmp`, in the [`parse_spec_token`] grammar. A spec there can cover many
+/// packets; this one names a single packet, so TCP and UDP need exactly one port
+/// and `any` is refused.
+pub fn parse_probe(spec: &str) -> Result<(Protocol, Option<u16>)> {
+    match parse_spec_token(spec)? {
+        (Protocol::Any, _) => {
+            bail!("'{spec}' names no single protocol; use tcp:<port>, udp:<port>, or icmp")
+        }
+        (Protocol::Icmp, _) => Ok((Protocol::Icmp, None)),
+        (protocol, Some(range)) if range.start == range.end => Ok((protocol, Some(range.start))),
+        (protocol, _) => bail!("'{spec}' is not a single port; use e.g. {protocol}:22"),
+    }
+}
+
+/// The opening packet of a new exchange with a peer, as the data path would see
+/// it: a TCP SYN, a UDP datagram, or an ICMPv6 echo request (the overlay is
+/// IPv6-only), to `port` on the receiving end. Inbound runs from `peer` to
+/// `local`, outbound the other way. Only what the rules and conntrack read is
+/// filled in.
+pub fn probe_packet(
+    direction: Direction,
+    protocol: Protocol,
+    port: Option<u16>,
+    local: Ipv6Addr,
+    peer: Ipv6Addr,
+) -> Result<PacketInfo> {
+    const TCP_SYN: u8 = 0x02;
+    const ICMPV6: u8 = 58;
+    const ICMPV6_ECHO_REQUEST: u8 = 128;
+    let (proto, dst_port, tcp_flags, icmp_type) = match (protocol, port) {
+        (Protocol::Tcp, Some(port)) => (6, port, TCP_SYN, 0),
+        (Protocol::Udp, Some(port)) => (17, port, 0, 0),
+        (Protocol::Icmp, None) => (ICMPV6, 0, 0, ICMPV6_ECHO_REQUEST),
+        (Protocol::Tcp | Protocol::Udp, None) => bail!("{protocol} needs a port"),
+        (Protocol::Icmp, Some(_)) => bail!("icmp has no port"),
+        (Protocol::Any, _) => bail!("name one protocol: tcp, udp, or icmp"),
+    };
+    let (src, dst) = match direction {
+        Direction::In => (peer, local),
+        Direction::Out => (local, peer),
+    };
+    Ok(PacketInfo {
+        src_ip: IpAddr::V6(src),
+        dst_ip: IpAddr::V6(dst),
+        protocol: proto,
+        src_port: 0,
+        dst_port,
+        tcp_flags,
+        icmp_type,
+        icmp_id: 0,
+    })
 }
 
 /// Build the concrete local firewall rules a node enforces for network `net`,
@@ -2363,7 +2503,8 @@ mod tests {
         );
         assert_eq!(
             SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, |name| name
-                == "prod"),
+                == "prod")
+            .map(|(_, rule)| rule.action),
             Some(Action::Allow)
         );
 
@@ -2416,7 +2557,8 @@ mod tests {
         );
         assert_eq!(
             SharedFirewall::match_rule(&config, Direction::In, 6, 12345, &other, |name| name
-                == "prod"),
+                == "prod")
+            .map(|(_, rule)| rule.action),
             Some(Action::Allow)
         );
     }
@@ -2789,5 +2931,208 @@ mod tests {
         let cfg = fw.set_ssh_passthrough(false, 2222);
         assert!(!cfg.rules.iter().any(|r| r.origin == RuleOrigin::Ssh));
         assert!(cfg.rules.contains(&local_22));
+    }
+
+    // -- `ray firewall test` -------------------------------------------------
+
+    const LOCAL_V6: Ipv6Addr = Ipv6Addr::new(0x200, 0, 0, 0, 0, 0, 0, 1);
+    const PEER_V6: Ipv6Addr = Ipv6Addr::new(0x200, 0, 0, 0, 0, 0, 0, 2);
+
+    fn probe(direction: Direction, protocol: Protocol, port: Option<u16>) -> PacketInfo {
+        probe_packet(direction, protocol, port, LOCAL_V6, PEER_V6).unwrap()
+    }
+
+    fn tcp_rule(action: Action, port: u16, peer: PeerFilter) -> FirewallRule {
+        FirewallRule {
+            direction: Direction::In,
+            action,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange {
+                start: port,
+                end: port,
+            }),
+            peer,
+            network: None,
+            origin: RuleOrigin::Local,
+        }
+    }
+
+    #[test]
+    fn explain_names_the_rule_or_default_that_decides() {
+        let fw = SharedFirewall::new(FirewallConfig::default());
+        let peer = test_id(1);
+
+        // The seeded rule, #0 in `ray firewall show`, admits pings.
+        let ping = probe(Direction::In, Protocol::Icmp, None);
+        let verdict = fw.explain(Direction::In, &ping, &peer, |_| false);
+        assert_eq!(verdict.action, Action::Allow);
+        assert_eq!(
+            verdict.decided_by,
+            DecidedBy::Rule {
+                index: 0,
+                rule: default_icmp_rule()
+            }
+        );
+
+        // Inbound TCP falls to the deny default, which still lets replies to
+        // this device's own connections in.
+        let ssh = probe(Direction::In, Protocol::Tcp, Some(22));
+        let verdict = fw.explain(Direction::In, &ssh, &peer, |_| false);
+        assert_eq!(verdict.action, Action::Deny);
+        assert_eq!(verdict.decided_by, DecidedBy::Default);
+        assert!(verdict.return_traffic);
+        assert!(!verdict.reject);
+
+        let web = probe(Direction::Out, Protocol::Tcp, Some(443));
+        let verdict = fw.explain(Direction::Out, &web, &peer, |_| false);
+        assert_eq!(verdict.action, Action::Allow);
+        assert_eq!(verdict.decided_by, DecidedBy::Default);
+        assert!(!verdict.return_traffic);
+    }
+
+    #[test]
+    fn explain_reports_the_first_match_by_its_show_index() {
+        let peer = test_id(1);
+        let deny_peer = tcp_rule(Action::Deny, 22, PeerFilter::Identity(peer));
+        let allow_all = tcp_rule(Action::Allow, 22, PeerFilter::Any);
+        let fw = SharedFirewall::new(FirewallConfig {
+            rules: vec![default_icmp_rule(), deny_peer.clone(), allow_all.clone()],
+            ..FirewallConfig::default()
+        });
+        let ssh = probe(Direction::In, Protocol::Tcp, Some(22));
+
+        // The peer meets its own deny first; anyone else falls through to #2.
+        assert_eq!(
+            fw.explain(Direction::In, &ssh, &peer, |_| false).decided_by,
+            DecidedBy::Rule {
+                index: 1,
+                rule: deny_peer
+            }
+        );
+        assert_eq!(
+            fw.explain(Direction::In, &ssh, &test_id(2), |_| false)
+                .decided_by,
+            DecidedBy::Rule {
+                index: 2,
+                rule: allow_all
+            }
+        );
+    }
+
+    #[test]
+    fn explain_matches_a_network_scoped_rule_only_on_a_shared_network() {
+        let rule = FirewallRule {
+            network: Some("home".into()),
+            origin: RuleOrigin::Network("home".into()),
+            ..tcp_rule(Action::Allow, 8080, PeerFilter::Any)
+        };
+        let fw = SharedFirewall::new(FirewallConfig {
+            rules: vec![rule.clone()],
+            ..FirewallConfig::default()
+        });
+        let info = probe(Direction::In, Protocol::Tcp, Some(8080));
+        let peer = test_id(1);
+
+        let shared = fw.explain(Direction::In, &info, &peer, |net| net == "home");
+        assert_eq!(shared.decided_by, DecidedBy::Rule { index: 0, rule });
+        let elsewhere = fw.explain(Direction::In, &info, &peer, |net| net == "work");
+        assert_eq!(elsewhere.decided_by, DecidedBy::Default);
+        assert_eq!(elsewhere.action, Action::Deny);
+    }
+
+    #[test]
+    fn explain_reports_reject_for_denials_only_and_nothing_when_off() {
+        let peer = test_id(1);
+        let ssh = probe(Direction::In, Protocol::Tcp, Some(22));
+        let fw = SharedFirewall::new(FirewallConfig {
+            reject: true,
+            ..FirewallConfig::default()
+        });
+        assert!(fw.explain(Direction::In, &ssh, &peer, |_| false).reject);
+        let ping = probe(Direction::In, Protocol::Icmp, None);
+        assert!(!fw.explain(Direction::In, &ping, &peer, |_| false).reject);
+
+        let fw = SharedFirewall::new(FirewallConfig {
+            reject: true,
+            disabled: true,
+            ..FirewallConfig::default()
+        });
+        let off = fw.explain(Direction::In, &ssh, &peer, |_| false);
+        assert_eq!(off.action, Action::Allow);
+        assert_eq!(off.decided_by, DecidedBy::Disabled);
+        assert!(!off.reject && !off.return_traffic);
+    }
+
+    #[test]
+    fn explain_records_no_conntrack_flow() {
+        let fw = SharedFirewall::new(FirewallConfig::default());
+        let peer = test_id(1);
+        let syn = probe(Direction::Out, Protocol::Tcp, Some(22));
+        let reply = PacketInfo {
+            src_ip: syn.dst_ip,
+            dst_ip: syn.src_ip,
+            src_port: syn.dst_port,
+            dst_port: syn.src_port,
+            tcp_flags: SYN | ACK,
+            ..syn
+        };
+
+        // Asking about the SYN does not open its flow, so the reply stays out...
+        assert_eq!(
+            fw.explain(Direction::Out, &syn, &peer, |_| false).action,
+            Action::Allow
+        );
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &reply, &peer, |_| false),
+            Action::Deny
+        );
+        // ...where sending it would have let the reply in.
+        fw.evaluate_packet(Direction::Out, &syn, &peer, |_| false);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &reply, &peer, |_| false),
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn an_inbound_ping_is_never_return_traffic() {
+        let mut config = FirewallConfig::default();
+        config.rules.clear();
+        let fw = SharedFirewall::new(config);
+        let ping = probe(Direction::In, Protocol::Icmp, None);
+        let verdict = fw.explain(Direction::In, &ping, &test_id(1), |_| false);
+        assert_eq!(verdict.action, Action::Deny);
+        assert!(!verdict.return_traffic);
+    }
+
+    #[test]
+    fn a_probe_spec_names_one_packet() {
+        assert_eq!(parse_probe("tcp:22").unwrap(), (Protocol::Tcp, Some(22)));
+        assert_eq!(parse_probe("udp:53").unwrap(), (Protocol::Udp, Some(53)));
+        assert_eq!(parse_probe("icmp").unwrap(), (Protocol::Icmp, None));
+        for spec in ["any", "any:*", "tcp", "tcp:*", "udp:80-443", "22", "ftp:21"] {
+            assert!(parse_probe(spec).is_err(), "{spec} is not one packet");
+        }
+    }
+
+    #[test]
+    fn a_probe_packet_opens_an_exchange_in_the_asked_direction() {
+        let syn = probe(Direction::In, Protocol::Tcp, Some(22));
+        assert_eq!(syn.src_ip, IpAddr::V6(PEER_V6));
+        assert_eq!(syn.dst_ip, IpAddr::V6(LOCAL_V6));
+        assert_eq!((syn.protocol, syn.dst_port, syn.tcp_flags), (6, 22, SYN));
+
+        let ping = probe(Direction::Out, Protocol::Icmp, None);
+        assert_eq!(ping.src_ip, IpAddr::V6(LOCAL_V6));
+        assert_eq!(ping.dst_ip, IpAddr::V6(PEER_V6));
+        assert!(is_icmp_echo_request(ping.protocol, ping.icmp_type));
+
+        for (protocol, port) in [
+            (Protocol::Tcp, None),
+            (Protocol::Icmp, Some(1)),
+            (Protocol::Any, None),
+        ] {
+            assert!(probe_packet(Direction::In, protocol, port, LOCAL_V6, PEER_V6).is_err());
+        }
     }
 }

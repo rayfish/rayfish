@@ -18,8 +18,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use common::{assert_info_eq, packet_spec};
 use proptest::prelude::*;
 use rayfish::firewall::{
-    Action, Direction, FirewallConfig, FirewallRule, PacketInfo, PeerFilter, PortRange, Protocol,
-    RuleOrigin, SharedFirewall, parse_packet_info,
+    Action, DecidedBy, Direction, FirewallConfig, FirewallRule, PacketInfo, PeerFilter, PortRange,
+    Protocol, RuleOrigin, SharedFirewall, parse_packet_info,
 };
 
 use iroh::EndpointId;
@@ -393,6 +393,52 @@ proptest! {
             prop_assert_eq!(after, rule.action);
         } else {
             prop_assert_eq!(after, before);
+        }
+    }
+
+    /// `ray firewall test` cannot drift from enforcement: `explain` reaches the
+    /// verdict `evaluate_packet` does for a new packet (a fresh instance, so no
+    /// flow to return on), and the rule it names is the first that selects the
+    /// packet, at its index in the config.
+    #[test]
+    fn explain_agrees_with_enforcement(
+        config in config_strategy(),
+        disabled in any::<bool>(),
+        reject in any::<bool>(),
+        spec in packet_spec(),
+        direction in direction_strategy(),
+        seed in 0u8..4,
+        network in network_strategy(),
+    ) {
+        let config = FirewallConfig { disabled, reject, ..config };
+        let info = spec.expected();
+        let peer = test_id(seed);
+        let net = network.as_deref();
+
+        let explained = SharedFirewall::new(config.clone())
+            .explain(direction, &info, &peer, |name| Some(name) == net);
+        prop_assert_eq!(
+            explained.action,
+            verdict(config.clone(), direction, &info, &peer, net),
+        );
+        prop_assert_eq!(explained.reject, reject && explained.action == Action::Deny);
+        match &explained.decided_by {
+            DecidedBy::Disabled => prop_assert!(disabled),
+            DecidedBy::Default => {
+                prop_assert!(!disabled);
+                for rule in &config.rules {
+                    prop_assert!(!rule_matches(rule, direction, &info, &peer, net));
+                }
+            }
+            DecidedBy::Rule { index, rule } => {
+                prop_assert!(!disabled);
+                prop_assert_eq!(rule, &config.rules[*index]);
+                prop_assert!(rule_matches(rule, direction, &info, &peer, net));
+                for earlier in &config.rules[..*index] {
+                    prop_assert!(!rule_matches(earlier, direction, &info, &peer, net));
+                }
+                prop_assert!(!explained.return_traffic);
+            }
         }
     }
 
