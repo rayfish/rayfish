@@ -135,6 +135,101 @@ impl NetworkRegistry {
         }
     }
 
+    /// `ray firewall test`: how the firewall would treat a new packet from or to
+    /// `peer`. [`firewall::SharedFirewall::explain`] decides it from the inputs
+    /// the data path would pass for that packet (`forward::spawn_peer_reader`
+    /// inbound, `forward::prepare_datagrams` outbound). Read-only.
+    pub(crate) async fn firewall_test(
+        &self,
+        peer: &str,
+        direction: firewall::Direction,
+        protocol: firewall::Protocol,
+        port: Option<u16>,
+        network: Option<&str>,
+    ) -> IpcMessage {
+        let device = match network {
+            Some(net) if !self.networks.contains_key(net) => {
+                return ipc_err(format!("network '{net}' not found"));
+            }
+            Some(net) => self.resolve_peer_in_network(net, peer),
+            None => self.resolve_peer_flexible(peer).await,
+        };
+        let Some(device) = device else {
+            return ipc_err(format!(
+                "unknown peer '{peer}' (try a hostname, mesh IP, short id, or identity)"
+            ));
+        };
+        let me = self.transport.endpoint.id();
+        if device == me {
+            return ipc_err(format!(
+                "'{peer}' is this node; the firewall only checks traffic to and from peers"
+            ));
+        }
+        let peer_ip = derive_ipv6(&device);
+        let info =
+            match firewall::probe_packet(direction, protocol, port, derive_ipv6(&me), peer_ip) {
+                Ok(info) => info,
+                Err(e) => return ipc_err(e.to_string()),
+            };
+        // The identity each direction's rules are keyed on: inbound sees a paired
+        // device as its user identity, outbound sees the device (see `firewall_add`).
+        let matched = match direction {
+            firewall::Direction::In => self.device_user_map.resolve(&device),
+            firewall::Direction::Out => device,
+        };
+        // A network-scoped rule asks whether we share the network with the peer,
+        // which the data path answers from the live connection. An offline peer
+        // has none, so answer for the networks it would share on connecting: the
+        // ones whose roster lists it.
+        let connected = self.peers.ipv6_for_id(&device).is_some();
+        let shares = |net: &str| {
+            if connected {
+                self.peers.shares_network_v6(&peer_ip, net)
+            } else {
+                self.networks
+                    .get(net)
+                    .is_some_and(|handle| handle.state.read().unwrap().members.is_member(&device))
+            }
+        };
+        let verdict = self.firewall.explain(direction, &info, &matched, shares);
+
+        // Collected before filtering: `shares` reads `self.networks`, and holding
+        // an iterator into a DashMap while reading it again can deadlock.
+        let names: Vec<String> = self
+            .networks
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let networks = names.into_iter().filter(|net| shares(net)).collect();
+        let peer_name = self
+            .networks
+            .iter()
+            .find_map(|entry| {
+                let state = entry.state.read().unwrap();
+                state.members.get(&device).and_then(|m| m.hostname.clone())
+            })
+            .unwrap_or_else(|| device.fmt_short().to_string());
+        let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
+        let (rule_index, rule) = match &verdict.decided_by {
+            firewall::DecidedBy::Rule { index, rule } => {
+                (Some(*index), Some(firewall::rule_view(rule, &short_id)))
+            }
+            firewall::DecidedBy::Disabled | firewall::DecidedBy::Default => (None, None),
+        };
+        IpcMessage::FirewallTestResult {
+            peer_name,
+            identity: matched.fmt_short().to_string(),
+            action: verdict.action,
+            rule_index,
+            rule,
+            disabled: verdict.decided_by == firewall::DecidedBy::Disabled,
+            reject: verdict.reject,
+            return_traffic: verdict.return_traffic,
+            networks,
+            connected,
+        }
+    }
+
     /// Coordinator-only: replace a network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the per-network
     /// secret key (so any admin granted the key can suggest). Suggestions are

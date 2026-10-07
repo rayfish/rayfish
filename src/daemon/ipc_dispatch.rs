@@ -10,6 +10,7 @@ impl Daemon {
                 | IpcMessage::Report
                 | IpcMessage::Logs { .. }
                 | IpcMessage::FirewallShow
+                | IpcMessage::FirewallTest { .. }
                 | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::FirewallPending { .. }
                 | IpcMessage::FirewallSshShow
@@ -503,6 +504,17 @@ impl Daemon {
             }
             IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
             IpcMessage::FirewallShow => self.registry.firewall_show(),
+            IpcMessage::FirewallTest {
+                peer,
+                direction,
+                protocol,
+                port,
+                network,
+            } => {
+                self.registry
+                    .firewall_test(&peer, direction, protocol, port, network.as_deref())
+                    .await
+            }
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
@@ -755,6 +767,21 @@ mod tests {
     fn contact_lookup_is_an_open_read() {
         let request = IpcMessage::ResolveContact {
             contact_id: SecretKey::from([7; 32]).public(),
+        };
+        assert!(Daemon::is_open_read(&request));
+        assert!(Daemon::check_authorized(&request, None).is_none());
+    }
+
+    /// Like `ray firewall show`, a test only reads the rules, so any local user
+    /// may run it.
+    #[test]
+    fn firewall_test_is_an_open_read() {
+        let request = IpcMessage::FirewallTest {
+            peer: "laptop".to_string(),
+            direction: firewall::Direction::In,
+            protocol: firewall::Protocol::Tcp,
+            port: Some(22),
+            network: None,
         };
         assert!(Daemon::is_open_read(&request));
         assert!(Daemon::check_authorized(&request, None).is_none());

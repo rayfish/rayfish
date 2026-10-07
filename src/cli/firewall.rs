@@ -102,6 +102,99 @@ impl DisplayOut for PendingFirewallOutput<'_> {
     }
 }
 
+/// The packet a `ray firewall test` asked about, which its reply does not repeat.
+struct Probe {
+    direction: firewall::Direction,
+    protocol: firewall::Protocol,
+    port: Option<u16>,
+}
+
+#[derive(serde::Serialize)]
+struct FirewallTestOutput {
+    peer: String,
+    /// The identity the rules were matched against, as a short id.
+    identity: String,
+    direction: firewall::Direction,
+    protocol: firewall::Protocol,
+    port: Option<u16>,
+    action: Action,
+    /// `rule`, `default`, or `disabled` (the firewall is off).
+    decided_by: &'static str,
+    rule_index: Option<usize>,
+    rule: Option<ipc::FirewallRuleView>,
+    reject: bool,
+    return_traffic: bool,
+    networks: Vec<String>,
+    connected: bool,
+}
+
+impl DisplayOut for FirewallTestOutput {
+    fn print_human(&self) {
+        let word = if self.reject {
+            "reject".to_string()
+        } else {
+            self.action.to_string()
+        };
+        let verdict = if self.action.is_deny() {
+            style::red(&word)
+        } else {
+            style::green(&word)
+        };
+        let port = self.port.map(|port| format!("/{port}")).unwrap_or_default();
+        let towards = match self.direction {
+            firewall::Direction::In => "from",
+            firewall::Direction::Out => "to",
+        };
+        println!(
+            "\n  {verdict}  {} {}{port} {towards} {}\n",
+            self.direction,
+            self.protocol,
+            style::value(&self.peer)
+        );
+        match (self.rule_index, &self.rule) {
+            (Some(index), Some(rule)) => {
+                println!("{}", table(RULE_COLUMNS, vec![rule_row(index, rule)], 2));
+            }
+            _ if self.decided_by == "disabled" => println!(
+                "  {}",
+                style::red("the firewall is off, so every packet passes (ray firewall on)")
+            ),
+            _ => {
+                println!(
+                    "  no rule matched, so default {} applies: {}",
+                    self.direction, self.action
+                );
+                if self.return_traffic {
+                    println!(
+                        "  {}",
+                        style::faint("replies to connections this device opens still get in")
+                    );
+                }
+            }
+        }
+        // What a network-scoped rule matched against, moot with the firewall off.
+        if self.decided_by == "disabled" {
+            println!();
+            return;
+        }
+        let networks = if self.networks.is_empty() {
+            "none".to_string()
+        } else {
+            self.networks.join(", ")
+        };
+        let source = if self.connected {
+            ""
+        } else {
+            " (peer offline: from the rosters)"
+        };
+        println!(
+            "\n  {}  {networks}{}\n",
+            style::label("shared networks"),
+            style::faint(source)
+        );
+    }
+}
+
 pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     if let FirewallAction::Suggest {
         network,
@@ -119,6 +212,20 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         return ipc_firewall_ssh(action).await;
     }
     let req = to_ipc(action)?;
+    if let ipc::IpcMessage::FirewallTest {
+        direction,
+        protocol,
+        port,
+        ..
+    } = &req
+    {
+        let probe = Probe {
+            direction: *direction,
+            protocol: *protocol,
+            port: *port,
+        };
+        return ipc_firewall_test(req, probe).await;
+    }
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
@@ -152,6 +259,59 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     Ok(())
 }
 
+/// `ray firewall test`: send the request [`to_ipc`] built and print the verdict.
+async fn ipc_firewall_test(req: ipc::IpcMessage, probe: Probe) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, req).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::FirewallTestResult {
+            peer_name,
+            identity,
+            action,
+            rule_index,
+            mut rule,
+            disabled,
+            reject,
+            return_traffic,
+            networks,
+            connected,
+        } => {
+            // Name the rule's peer as `ray firewall show` does.
+            if !json_enabled()
+                && let Some(rule) = &mut rule
+                && let Ok((self_id, statuses)) = ipc_status_full().await
+            {
+                rule.peer = firewall_peer_name(rule, &self_id, &statuses);
+            }
+            let decided_by = if disabled {
+                "disabled"
+            } else if rule.is_some() {
+                "rule"
+            } else {
+                "default"
+            };
+            printout(&FirewallTestOutput {
+                peer: peer_name,
+                identity,
+                direction: probe.direction,
+                protocol: probe.protocol,
+                port: probe.port,
+                action,
+                decided_by,
+                rule_index,
+                rule,
+                reject,
+                return_traffic,
+                networks,
+                connected,
+            })?;
+        }
+        ipc::IpcMessage::Error { message } => fail_with("firewall test", &message),
+        other => fail_unexpected(&other),
+    }
+    Ok(())
+}
+
 /// Map a `ray firewall` subcommand onto the IPC request that serves it. The
 /// single-value toggles carry no variant of their own: they name a settings key
 /// and hand the raw `on|off` / `allow|deny` word to the daemon, which parses it
@@ -180,6 +340,21 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
         },
         FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
         FirewallAction::Show => ipc::IpcMessage::FirewallShow,
+        FirewallAction::Test {
+            peer,
+            spec,
+            direction,
+            network,
+        } => {
+            let (protocol, port) = firewall::parse_probe(&spec)?;
+            ipc::IpcMessage::FirewallTest {
+                peer,
+                direction: direction.parse().map_err(anyhow::Error::msg)?,
+                protocol,
+                port,
+                network,
+            }
+        }
         FirewallAction::Default { action } => {
             // Lowercased to match the daemon's own parse (`settings::apply_firewall`):
             // otherwise `ray firewall default ALLOW` fails here while
@@ -409,44 +584,46 @@ pub(crate) fn render_firewall_rules(
     let rows = rules
         .iter()
         .enumerate()
-        .map(|(i, r)| {
-            let direction = r.direction.to_string();
-            let protocol = r.protocol.to_string();
-            let action_s = r.action.to_string();
-            let action = if r.action.is_deny() {
-                style::red(&action_s)
-            } else {
-                style::green(&action_s)
-            };
-            let sugg = r
-                .suggested_by
-                .as_ref()
-                .map(|s| style::marker(&format!("suggested by {s}")))
-                .unwrap_or_default();
-            let sugg_plain = r
-                .suggested_by
-                .as_ref()
-                .map(|s| format!("·suggested by {s}·"))
-                .unwrap_or_default();
-            vec![
-                layout::Cell::new(i.to_string(), style::faint(&i.to_string())),
-                layout::Cell::new(direction.clone(), style::value(&direction)),
-                layout::Cell::new(action_s.clone(), action),
-                layout::Cell::new(protocol.clone(), style::value(&protocol)),
-                layout::Cell::right(r.port.clone(), style::value(&r.port)),
-                layout::Cell::new(r.peer.clone(), style::value(&r.peer)),
-                layout::Cell::new(r.network.clone(), style::faint(&r.network)),
-                layout::Cell::new(sugg_plain, sugg),
-            ]
-        })
+        .map(|(i, r)| rule_row(i, r))
         .collect();
-    out.push_str(&table(
-        &["#", "dir", "action", "proto", "port", "peer", "network", ""],
-        rows,
-        4,
-    ));
+    out.push_str(&table(RULE_COLUMNS, rows, 4));
     out.push('\n');
     out
+}
+
+/// The header of a rule table, one column per [`rule_row`] cell.
+const RULE_COLUMNS: &[&str] = &["#", "dir", "action", "proto", "port", "peer", "network", ""];
+
+/// One rule as a table row, numbered `index`, as `ray firewall show` numbers it.
+fn rule_row(index: usize, r: &ipc::FirewallRuleView) -> Vec<layout::Cell> {
+    let direction = r.direction.to_string();
+    let protocol = r.protocol.to_string();
+    let action_s = r.action.to_string();
+    let action = if r.action.is_deny() {
+        style::red(&action_s)
+    } else {
+        style::green(&action_s)
+    };
+    let sugg = r
+        .suggested_by
+        .as_ref()
+        .map(|s| style::marker(&format!("suggested by {s}")))
+        .unwrap_or_default();
+    let sugg_plain = r
+        .suggested_by
+        .as_ref()
+        .map(|s| format!("·suggested by {s}·"))
+        .unwrap_or_default();
+    vec![
+        layout::Cell::new(index.to_string(), style::faint(&index.to_string())),
+        layout::Cell::new(direction.clone(), style::value(&direction)),
+        layout::Cell::new(action_s.clone(), action),
+        layout::Cell::new(protocol.clone(), style::value(&protocol)),
+        layout::Cell::right(r.port.clone(), style::value(&r.port)),
+        layout::Cell::new(r.peer.clone(), style::value(&r.peer)),
+        layout::Cell::new(r.network.clone(), style::faint(&r.network)),
+        layout::Cell::new(sugg_plain, sugg),
+    ]
 }
 
 /// `ray firewall pending`: fetch the queued suggestions, then either run the
@@ -1466,6 +1643,39 @@ mod tests {
             err.to_string(),
             "invalid action 'maybe' (expected 'allow' or 'deny')"
         );
+    }
+
+    /// `firewall test` parses its packet and direction here, so a malformed one
+    /// fails the command before the daemon is asked.
+    #[test]
+    fn firewall_test_maps_onto_its_request() {
+        let test = |spec: &str, direction: &str| {
+            to_ipc(FirewallAction::Test {
+                peer: "laptop".into(),
+                spec: spec.into(),
+                direction: direction.into(),
+                network: Some("home".into()),
+            })
+        };
+        match test("udp:53", "out").unwrap() {
+            ipc::IpcMessage::FirewallTest {
+                peer,
+                direction,
+                protocol,
+                port,
+                network,
+            } => {
+                assert_eq!(peer, "laptop");
+                assert_eq!(direction, firewall::Direction::Out);
+                assert_eq!(protocol, firewall::Protocol::Udp);
+                assert_eq!(port, Some(53));
+                assert_eq!(network.as_deref(), Some("home"));
+            }
+            other => panic!("expected FirewallTest, got {other:?}"),
+        }
+        assert!(test("tcp:80-443", "in").is_err());
+        assert!(test("any", "in").is_err());
+        assert!(test("tcp:22", "sideways").is_err());
     }
 
     /// `ray firewall ssh on|off` must go through the `ssh` key, which is the

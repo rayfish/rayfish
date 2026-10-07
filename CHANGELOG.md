@@ -15,6 +15,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ray files auto-accept add/remove <peer>` saves trusted file senders; `list`
   shows their identities. The macOS Files page can add and remove them too.
 
+- `ray firewall test <peer> <proto:port>` shows whether the firewall would let a
+  packet through and which rule or default decides, without sending anything.
+  `--direction out` checks traffic to the peer, `--network` looks the peer up on
+  one network, and `--json` prints the verdict for scripts.
+
 ### Changed
 
 - `quic-engine` replaces `quic-congestion`, with `standalone` (default) and

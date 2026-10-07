@@ -1054,6 +1054,25 @@ pub(crate) enum FirewallAction {
     /// Show current firewall rules
     #[command(visible_aliases = ["ls", "list"])]
     Show,
+    /// Check whether the firewall would let a packet through
+    ///
+    /// Runs the rules and defaults the data path enforces against one packet
+    /// and names what decides it, without sending anything: by default a new
+    /// packet from the peer, with `--direction out` one to it.
+    Test {
+        /// Peer: hostname, mesh IP, short id, endpoint id, or user identity
+        #[arg(add = complete::peers())]
+        peer: String,
+        /// Packet to check: tcp:<port>, udp:<port>, or icmp
+        #[arg(value_name = "PROTO[:PORT]")]
+        spec: String,
+        /// Direction: in (from the peer) or out (to the peer)
+        #[arg(long, default_value = "in", add = complete::words(&["in", "out"]))]
+        direction: String,
+        /// Look the peer up on this network only
+        #[arg(long, add = complete::networks())]
+        network: Option<String>,
+    },
     /// Set the inbound default policy (allow or deny)
     ///
     /// `deny` (the secure built-in default) blocks unsolicited inbound TCP/UDP;
