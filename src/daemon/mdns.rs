@@ -3,16 +3,20 @@
 //! Discovery runs in short windows instead of keeping its sockets open. An
 //! open mDNS socket receives every mDNS packet on the LAN, and a busy network
 //! (hotel or office Wi-Fi) sends hundreds a second, which kept the radio and
-//! CPU awake for nothing. A window opens at start, every [`WINDOW_INTERVAL`],
-//! and right away when the node's LAN addresses change (it joined another
-//! network). Sightings survive between windows and expire by age.
+//! CPU awake for nothing. A window opens at start, right away when the node's
+//! LAN addresses change (it joined another network), and on every wall-clock
+//! multiple of [`WINDOW_INTERVAL`] (:00, :05, :10, ...). Clock alignment is what
+//! lets two nodes meet: windows on independent timers would rarely overlap.
+//! Android's 15-minute boundaries are also 5-minute ones, so phones and
+//! desktops share every Android window. Sightings survive between windows and
+//! expire by age.
 
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
@@ -36,7 +40,8 @@ const LISTEN_WINDOW: Duration = Duration::from_secs(30);
 /// Query cadence inside a window, so one window sends a few queries.
 const QUERY_CADENCE: Duration = Duration::from_secs(10);
 
-/// Time between windows when nothing changed.
+/// Time between windows when nothing changed. Must divide an hour, so
+/// windows land on the same minutes on every node.
 #[cfg(not(target_os = "android"))]
 const WINDOW_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -263,7 +268,7 @@ async fn run_windows(
         };
         if !reopen_now {
             tokio::select! {
-                () = tokio::time::sleep(WINDOW_INTERVAL) => {}
+                () = tokio::time::sleep(until_next_window(SystemTime::now())) => {}
                 () = wake.notified() => {}
             }
         }
@@ -275,6 +280,15 @@ async fn run_windows(
             Err(error) => tracing::warn!(%error, "failed to open mDNS discovery window"),
         }
     }
+}
+
+/// Time from `now` to the next wall-clock multiple of [`WINDOW_INTERVAL`].
+fn until_next_window(now: SystemTime) -> Duration {
+    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let interval = WINDOW_INTERVAL.as_millis();
+    let into_interval = since_epoch.as_millis() % interval;
+    // Truncation is safe: the remainder is below one interval.
+    Duration::from_millis((interval - into_interval) as u64)
 }
 
 /// Record sightings for one window. Returns true when the LAN addresses
@@ -331,6 +345,22 @@ mod tests {
             tokio::task::yield_now().await;
         }
         done()
+    }
+
+    #[test]
+    fn windows_land_on_wall_clock_boundaries() {
+        let hour = UNIX_EPOCH + Duration::from_secs(1_800_000_000 / 3600 * 3600);
+        assert_eq!(until_next_window(hour), WINDOW_INTERVAL);
+        assert_eq!(
+            until_next_window(hour + Duration::from_secs(61)),
+            WINDOW_INTERVAL - Duration::from_secs(61)
+        );
+        assert_eq!(until_next_window(hour + WINDOW_INTERVAL), WINDOW_INTERVAL);
+        assert_eq!(
+            3600 % WINDOW_INTERVAL.as_secs(),
+            0,
+            "interval divides an hour"
+        );
     }
 
     fn data(addrs: &[&str]) -> EndpointData {
