@@ -8,6 +8,8 @@
 pub(crate) mod fq_codel;
 mod fragment;
 mod lazy_dial;
+#[cfg(test)]
+mod mock_tun_tests;
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
