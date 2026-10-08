@@ -17,6 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Standalone forwarding uses a 16 KiB QUIC send queue instead of 1 MiB so
+  excess traffic is dropped sooner rather than building a long backlog.
+
 - `quic-engine` replaces `quic-congestion`, with `standalone` (default) and
   `fq-codel` choices. Both use loss-tolerant congestion control. Saved controller
   settings migrate to the corresponding engine. macOS Settings and Android You
