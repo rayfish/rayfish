@@ -7,9 +7,8 @@
 //! LAN addresses change (it joined another network), and on every wall-clock
 //! multiple of [`WINDOW_INTERVAL`] (:00, :05, :10, ...). Clock alignment is what
 //! lets two nodes meet: windows on independent timers would rarely overlap.
-//! Android's 15-minute boundaries are also 5-minute ones, so phones and
-//! desktops share every Android window. Sightings survive between windows and
-//! expire by age.
+//! Every platform uses the same interval, so every window is shared.
+//! Sightings survive between windows and expire by age.
 
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
@@ -40,14 +39,9 @@ const LISTEN_WINDOW: Duration = Duration::from_secs(30);
 /// Query cadence inside a window, so one window sends a few queries.
 const QUERY_CADENCE: Duration = Duration::from_secs(10);
 
-/// Time between windows when nothing changed. Must divide an hour, so
-/// windows land on the same minutes on every node.
-#[cfg(not(target_os = "android"))]
+/// Time between windows when nothing changed. Must divide an hour and be the
+/// same on every platform, so windows land on the same minutes on every node.
 const WINDOW_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
-/// The same on a battery-powered node, matching its roster poll.
-#[cfg(target_os = "android")]
-const WINDOW_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// A sighting missing from two windows in a row is dropped.
 const SIGHTING_TTL: Duration = WINDOW_INTERVAL

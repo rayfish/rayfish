@@ -21,8 +21,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   excess traffic is dropped sooner rather than building a long backlog.
 
 - mDNS discovery listens in 30-second windows instead of keeping its sockets
-  open. Windows start on the clock (every 5 minutes on desktop, every 15 on
-  Android, at :00, :05, ...) so nodes listen at the same time, and right away
+  open. Windows start on the clock every 5 minutes (:00, :05, ...) on
+  every platform, so nodes listen at the same time, and right away
   after joining another network. On busy Wi-Fi the open sockets received every mDNS
   packet on the LAN, which drained Android batteries. LAN sightings now expire
   after two missed windows.
