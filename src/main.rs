@@ -1359,16 +1359,16 @@ pub(crate) enum FilesAutoAcceptAction {
 }
 
 fn check_root() {
-    #[cfg(windows)]
-    return;
     #[cfg(unix)]
-    if uzers::get_effective_uid() == 0 || has_cap_net_admin() {
-        return;
+    {
+        if uzers::get_effective_uid() == 0 || has_cap_net_admin() {
+            return;
+        }
+        eprintln!(
+            "rayfish needs root or CAP_NET_ADMIN to create TUN devices. Run with sudo, or use the systemd unit (which grants CAP_NET_ADMIN to a dynamic user)."
+        );
+        std::process::exit(1);
     }
-    eprintln!(
-        "rayfish needs root or CAP_NET_ADMIN to create TUN devices. Run with sudo, or use the systemd unit (which grants CAP_NET_ADMIN to a dynamic user)."
-    );
-    std::process::exit(1);
 }
 
 /// Whether this process holds CAP_NET_ADMIN — i.e. it is running under a
