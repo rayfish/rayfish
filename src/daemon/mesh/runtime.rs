@@ -639,11 +639,10 @@ impl NetworkRegistry {
         if targets.len() > 1 && !confirm {
             let rows = {
                 let s = state.read().unwrap();
-                let members = s.members.all();
                 targets
                     .iter()
                     .map(|id| {
-                        let row = members.iter().find(|m| m.identity == *id);
+                        let row = s.members.get(id);
                         ipc::KickTarget {
                             hostname: row.and_then(|m| m.hostname.clone()),
                             short_id: id.fmt_short().to_string(),
@@ -672,8 +671,7 @@ impl NetworkRegistry {
         // when no other authorized network shares it.
         let ctx = self.mesh_ctx();
         for member_id in &targets {
-            remove_member_roster_only(&ctx, network, &state, *member_id, derive_ipv6(member_id))
-                .await;
+            remove_member_roster_only(&ctx, network, &state, *member_id).await;
         }
         // One finalize for the whole set: it publishes the snapshot once and
         // sends every removed member its own `KickedFromNetwork`, so a person and
@@ -1062,10 +1060,8 @@ impl NetworkRegistry {
                 return;
             }
         };
-        let mut count = 0;
         let mut coordinator_restores = Vec::new();
         for net in &app_config.networks {
-            count += 1;
             if net.network_secret_key.is_some() {
                 // We hold the secret key, restore as coordinator.
                 coordinator_restores.extend(self.spawn_coordinator_restore(net));
@@ -1115,7 +1111,10 @@ impl NetworkRegistry {
             });
         }
 
-        tracing::info!(networks = count, "control plane connected");
+        tracing::info!(
+            networks = app_config.networks.len(),
+            "control plane connected"
+        );
     }
 }
 

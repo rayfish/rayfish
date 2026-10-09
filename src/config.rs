@@ -819,14 +819,9 @@ struct NetworkUpdateScope;
 
 impl NetworkUpdateScope {
     fn enter() -> Result<Self> {
-        IN_NETWORK_CONFIG_UPDATE.with(|active| {
-            anyhow::ensure!(
-                !active.get(),
-                "network config update callbacks must not call network config APIs"
-            );
-            active.set(true);
-            Ok(Self)
-        })
+        ensure_not_in_network_update()?;
+        IN_NETWORK_CONFIG_UPDATE.with(|active| active.set(true));
+        Ok(Self)
     }
 }
 
@@ -1668,22 +1663,7 @@ fn update_network_in(
     let Some(mut net) = load_network_unlocked(dir, name)? else {
         return Ok(None);
     };
-    anyhow::ensure!(
-        net.name == name,
-        "network config {name:?} contains mismatched name {:?}",
-        net.name
-    );
-    let before = toml::to_string(&net).context("serializing network config")?;
-    let update_scope = NetworkUpdateScope::enter()?;
-    update(&mut net)?;
-    drop(update_scope);
-    anyhow::ensure!(
-        net.name == name,
-        "network update cannot rename {name:?} to {:?}",
-        net.name
-    );
-    let after = toml::to_string(&net).context("serializing network config")?;
-    if after != before {
+    if apply_network_update(name, &mut net, update)? {
         save_network_unlocked(dir, &net)?;
     } else {
         // A prior atomic write may have installed this exact file and then
@@ -1693,6 +1673,32 @@ fn update_network_in(
         sync_file_and_parent(&path)?;
     }
     Ok(Some(net))
+}
+
+/// Run one network update callback against `net`, which was loaded for `name`.
+/// Refuses a stored record or an update that names a different network, and
+/// returns whether the callback changed the serialized record.
+fn apply_network_update(
+    name: &str,
+    net: &mut NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<bool> {
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(net).context("serializing network config")?;
+    let update_scope = NetworkUpdateScope::enter()?;
+    update(net)?;
+    drop(update_scope);
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(net).context("serializing network config")?;
+    Ok(after != before)
 }
 
 /// Atomically update the latest network config, inserting `initial` only when
@@ -1719,22 +1725,8 @@ fn update_network_or_insert_in(
     let existing = load_network_unlocked(dir, name)?;
     let inserting = existing.is_none();
     let mut net = existing.unwrap_or(initial);
-    anyhow::ensure!(
-        net.name == name,
-        "network config {name:?} contains mismatched name {:?}",
-        net.name
-    );
-    let before = toml::to_string(&net).context("serializing network config")?;
-    let update_scope = NetworkUpdateScope::enter()?;
-    update(&mut net)?;
-    drop(update_scope);
-    anyhow::ensure!(
-        net.name == name,
-        "network update cannot rename {name:?} to {:?}",
-        net.name
-    );
-    let after = toml::to_string(&net).context("serializing network config")?;
-    if inserting || after != before {
+    let changed = apply_network_update(name, &mut net, update)?;
+    if inserting || changed {
         save_network_unlocked(dir, &net)?;
     }
     Ok(net)

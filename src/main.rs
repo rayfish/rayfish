@@ -1886,12 +1886,7 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
         .await
         .context("rayfish daemon is not running; start it with: sudo ray up")?;
     ipc::send(&mut stream, msg).await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(ipc::recv(&mut stream).await?)
 }
 
 /// `ray mdns on|off|scan`. The two toggles are the `mdns` settings key under
@@ -2077,16 +2072,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
         let uid = uid_for_user(user).ok_or_else(|| {
             anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)")
         })?;
-        let mut stream = ipc::connect()
-            .await
-            .context("rayfish daemon is not running; start it with: sudo ray up")?;
-        ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
-        match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => fail_with("error", &message),
-            other => fail_unexpected(&other),
-        }
-        Ok(())
+        ipc_mutate(ipc::IpcMessage::SetOperator { uid }).await
     }
 }
 

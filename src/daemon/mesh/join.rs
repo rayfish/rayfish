@@ -37,37 +37,43 @@ struct DirectAdmissionRecord {
     published: bool,
 }
 
+/// A verified direct-network (`ray connect`) co-coordinator grant: the network
+/// secret key together with the exact signed admission record it is bound to.
+/// A Welcome carries both or neither, so they travel as one value.
+struct DirectAdmission {
+    key: [u8; 32],
+    record: DirectAdmissionRecord,
+}
+
 fn verify_direct_admission(
     direct_key: Option<[u8; 32]>,
     direct_record: Option<Vec<u8>>,
     direct_record_published: bool,
     net_pubkey: EndpointId,
-) -> Result<(Option<[u8; 32]>, Option<DirectAdmissionRecord>)> {
-    if let Some(key) = direct_key {
-        anyhow::ensure!(
-            admin_grant_key_valid(key, net_pubkey),
-            "direct-network key in Welcome does not match network public key"
-        );
-    }
-    let direct_record = match (direct_key.as_ref(), direct_record) {
-        (Some(_), Some(bytes)) => {
-            let packet = dht::verify_network_record(&bytes, net_pubkey)
-                .context("verify direct-network admission record")?;
-            let (hash, seeds) = dht::decode_network_record(&packet)
-                .context("decode direct-network admission record")?;
-            Some(DirectAdmissionRecord {
-                hash,
-                seeds,
-                timestamp: packet.timestamp().as_micros(),
-                published: direct_record_published,
-            })
-        }
-        (Some(_), None) => {
-            anyhow::bail!("direct-network Welcome omitted its signed admission record")
-        }
-        (None, _) => None,
+) -> Result<Option<DirectAdmission>> {
+    let Some(key) = direct_key else {
+        return Ok(None);
     };
-    Ok((direct_key, direct_record))
+    anyhow::ensure!(
+        admin_grant_key_valid(key, net_pubkey),
+        "direct-network key in Welcome does not match network public key"
+    );
+    let Some(bytes) = direct_record else {
+        anyhow::bail!("direct-network Welcome omitted its signed admission record")
+    };
+    let packet = dht::verify_network_record(&bytes, net_pubkey)
+        .context("verify direct-network admission record")?;
+    let (hash, seeds) =
+        dht::decode_network_record(&packet).context("decode direct-network admission record")?;
+    Ok(Some(DirectAdmission {
+        key,
+        record: DirectAdmissionRecord {
+            hash,
+            seeds,
+            timestamp: packet.timestamp().as_micros(),
+            published: direct_record_published,
+        },
+    }))
 }
 
 /// Result of [`perform_join_handshake`]: the admitted roster, or a closed-network
@@ -78,13 +84,12 @@ enum HandshakeOutcome {
         /// but every signed field travels together so a later promotion cannot
         /// publish a lossy projection.
         blob: Box<crate::membership::GroupBlob>,
-        /// The per-network secret key, present only when we were admitted onto a
-        /// `direct` (`ray connect`) network as a co-coordinator. Already verified
-        /// against the network pubkey (`admin_grant_key_valid`); adopting it makes
-        /// this node a key-holder so `finalize_join` registers it as a coordinator.
-        direct_key: Option<[u8; 32]>,
-        /// Exact signed admission record paired with `direct_key`.
-        direct_record: Option<DirectAdmissionRecord>,
+        /// The per-network secret key and its exact signed admission record,
+        /// present only when we were admitted onto a `direct` (`ray connect`)
+        /// network as a co-coordinator. The key is already verified against the
+        /// network pubkey (`admin_grant_key_valid`); adopting it makes this node
+        /// a key-holder so `finalize_join` registers it as a coordinator.
+        direct: Option<DirectAdmission>,
         /// Author timestamp of the signed record this roster came from, when it
         /// came from one. Seeds `NetworkState::last_record_timestamp` so the
         /// replay floor is set from the first roster the node adopts rather than
@@ -173,73 +178,62 @@ pub(crate) async fn join_mesh_shared(
         None
     };
 
-    let (mut admitted_blob, direct_key, direct_record, mut record_ts) =
-        match perform_join_handshake(
-            &initial_conn,
-            ep,
-            &registry.transport.pkarr_relay_url,
-            network_name,
-            &blob_store,
-            &peers,
-            net_pubkey,
-            my_identity,
-            initial,
-            invite_secret,
-            &my_hostname,
-            &device_cert,
-            &group_blob,
-        )
-        .await?
-        {
-            HandshakeOutcome::Admitted {
-                blob,
-                direct_key,
-                direct_record,
-                record_ts,
-            } => (
-                *blob,
-                direct_key.map(SecretKey::from),
-                direct_record,
-                record_ts,
-            ),
-            HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
-        };
+    let (mut admitted_blob, direct, mut record_ts) = match perform_join_handshake(
+        &initial_conn,
+        ep,
+        &registry.transport.pkarr_relay_url,
+        network_name,
+        &blob_store,
+        &peers,
+        net_pubkey,
+        my_identity,
+        initial,
+        invite_secret,
+        &my_hostname,
+        &device_cert,
+        &group_blob,
+    )
+    .await?
+    {
+        HandshakeOutcome::Admitted {
+            blob,
+            direct,
+            record_ts,
+        } => (*blob, direct, record_ts),
+        HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
+    };
 
     // A direct join adopts coordinator authority. Welcome binds the key to the
     // exact network-key-signed admission record, so fetch that generation rather
     // than racing a second DHT resolve that could return either its predecessor
     // or a later publication.
-    let (exact_group_hash, exact_hash_published) = if let Some(record) = direct_record {
-        anyhow::ensure!(
-            direct_key.is_some(),
-            "direct admission record arrived without a coordinator key"
-        );
-        let data = fetch_verified_blob(
-            ep,
-            &blob_store,
-            &peers,
-            record.hash,
-            network_name,
-            &record.seeds,
-        )
-        .await
-        .context("fetch admitted direct-network roster")?;
-        anyhow::ensure!(
-            data.members
-                .iter()
-                .any(|member| member.identity == my_identity && member.is_coordinator),
-            "signed direct-network roster does not contain this node's coordinator admission"
-        );
-        admitted_blob = data;
-        record_ts = Some(record.timestamp);
-        (Some(record.hash), Some(record.published))
-    } else {
-        anyhow::ensure!(
-            direct_key.is_none(),
-            "direct-network coordinator key arrived without its exact signed admission record"
-        );
-        (None, None)
-    };
+    let direct_key = direct
+        .as_ref()
+        .map(|admission| SecretKey::from(admission.key));
+    let (exact_group_hash, exact_hash_published) =
+        if let Some(DirectAdmission { record, .. }) = direct {
+            let data = fetch_verified_blob(
+                ep,
+                &blob_store,
+                &peers,
+                record.hash,
+                network_name,
+                &record.seeds,
+            )
+            .await
+            .context("fetch admitted direct-network roster")?;
+            anyhow::ensure!(
+                data.members
+                    .iter()
+                    .any(|member| member.identity == my_identity && member.is_coordinator),
+                "signed direct-network roster does not contain this node's coordinator admission"
+            );
+            admitted_blob = data;
+            record_ts = Some(record.timestamp);
+            (Some(record.hash), Some(record.published))
+        } else {
+            (None, None)
+        };
     let crate::membership::GroupBlob {
         members,
         approved,
@@ -351,7 +345,7 @@ pub(crate) async fn join_mesh_shared(
 /// connection (which owns the data reader), and announce our handle table so it
 /// can decode our tagged datagrams. Shared by the coordinator connection and each
 /// roster peer.
-async fn register_dialed_peer(
+pub(crate) async fn register_dialed_peer(
     ctx: &MeshCtx,
     router: &Arc<ProtocolRouter>,
     conn: Connection,
@@ -636,7 +630,7 @@ async fn perform_join_handshake(
                 direct_record_published,
             } => {
                 tracing::info!(network = %network_name, "welcomed to network");
-                let (direct_key, direct_record) = verify_direct_admission(
+                let direct = verify_direct_admission(
                     direct_key,
                     direct_record,
                     direct_record_published,
@@ -647,8 +641,7 @@ async fn perform_join_handshake(
                 blob.approved = approved;
                 Ok(HandshakeOutcome::Admitted {
                     blob: Box::new(blob),
-                    direct_key,
-                    direct_record,
+                    direct,
                     // A fresh join takes its roster from the coordinator's
                     // Welcome, not from a record, so there is no floor to set.
                     record_ts: None,
@@ -684,7 +677,7 @@ async fn perform_join_handshake(
             .await
             .context("timeout awaiting reconnect response")??;
         drop(recv);
-        let (welcome_members, welcome_approved, direct_key, direct_record) = match response {
+        let (welcome_members, welcome_approved, direct) = match response {
             ControlMsg::Welcome {
                 members,
                 approved,
@@ -692,24 +685,23 @@ async fn perform_join_handshake(
                 direct_record,
                 direct_record_published,
             } => {
-                let (direct_key, direct_record) = verify_direct_admission(
+                let direct = verify_direct_admission(
                     direct_key,
                     direct_record,
                     direct_record_published,
                     net_pubkey,
                 )?;
-                (members, approved, direct_key, direct_record)
+                (members, approved, direct)
             }
             other => anyhow::bail!("expected Welcome after reconnect hello, got {other:?}"),
         };
-        if direct_key.is_some() {
+        if direct.is_some() {
             let mut blob = fallback_blob.clone();
             blob.members = welcome_members;
             blob.approved = welcome_approved;
             return Ok(HandshakeOutcome::Admitted {
                 blob: Box::new(blob),
-                direct_key,
-                direct_record,
+                direct,
                 record_ts: None,
             });
         }
@@ -739,8 +731,7 @@ async fn perform_join_handshake(
         // cold path, never re-granted here.
         Ok(HandshakeOutcome::Admitted {
             blob: Box::new(blob),
-            direct_key: None,
-            direct_record: None,
+            direct: None,
             record_ts,
         })
     }
@@ -980,12 +971,14 @@ mod persist_config_tests {
             .as_bytes()
             .to_vec();
 
-        let (granted, record) =
-            verify_direct_admission(Some(key.to_bytes()), Some(packet), true, key.public())
-                .unwrap();
-        let record = record.unwrap();
+        let DirectAdmission {
+            key: granted,
+            record,
+        } = verify_direct_admission(Some(key.to_bytes()), Some(packet), true, key.public())
+            .unwrap()
+            .expect("a key with its record is a direct admission");
 
-        assert_eq!(granted, Some(key.to_bytes()));
+        assert_eq!(granted, key.to_bytes());
         assert_eq!(record.hash, hash);
         assert_eq!(record.seeds, vec![id(3)]);
         assert!(record.published);

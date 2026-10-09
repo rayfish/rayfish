@@ -480,7 +480,7 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         // Ctrl-C: leave the queue untouched.
         return Ok(());
     };
-    if resolution.accept.is_empty() && resolution.deny.is_empty() {
+    if resolution.is_empty() {
         println!("  {}", style::faint("no changes"));
         return Ok(());
     }
@@ -577,21 +577,12 @@ pub(crate) async fn ipc_firewall_suggest(
         suggestions.remove(subject);
     }
 
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallSuggest {
-            network: network.to_string(),
-            suggestions,
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::FirewallSuggest {
+        network: network.to_string(),
+        suggestions,
+    })
     .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 /// `ray apply <spec>`: reconcile trusted networks against a deploy spec.

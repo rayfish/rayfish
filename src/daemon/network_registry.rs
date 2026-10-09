@@ -683,8 +683,7 @@ impl NetworkRegistry {
     pub(crate) fn network_shared_with(&self, peer: &EndpointId) -> Option<String> {
         self.networks.iter().find_map(|h| {
             let s = h.state.read().ok()?;
-            let has = s.members.all().iter().any(|m| &m.identity == peer);
-            has.then(|| h.key().clone())
+            s.members.is_member(peer).then(|| h.key().clone())
         })
     }
 
@@ -706,8 +705,7 @@ impl NetworkRegistry {
                 return None;
             }
             let s = h.state.read().ok()?;
-            let has = s.members.all().iter().any(|m| &m.identity == peer)
-                || s.approved.all().iter().any(|a| &a.identity == peer);
+            let has = s.members.is_member(peer) || s.approved.is_approved(peer);
             has.then(|| h.key().clone())
         })
     }
@@ -1233,7 +1231,7 @@ impl NetworkRegistry {
                 .value()
                 .state
                 .read()
-                .map(|s| s.members.all().iter().any(|m| m.identity == identity))
+                .map(|s| s.members.is_member(&identity))
                 .unwrap_or(false);
             if is_member {
                 return true;
@@ -1287,14 +1285,18 @@ impl NetworkRegistry {
         key: SecretKey,
         pkarr_client: PkarrRelayClient,
     ) -> bool {
-        let parts = {
+        let state;
+        let invite_lock;
+        let notify;
+        let network_key;
+        {
             let Some(mut handle) = self.networks.get_mut(network) else {
                 return false;
             };
             if !should_promote(handle.role.clone()) {
                 return false;
             }
-            let notify = Arc::new(Notify::new());
+            notify = Arc::new(Notify::new());
             let publisher = spawn_network_publisher(
                 pkarr_client,
                 key,
@@ -1308,22 +1310,17 @@ impl NetworkRegistry {
             handle.tasks.push(publisher);
             handle.dht_notify = Some(Arc::clone(&notify));
             handle.role = NetworkRole::Coordinator;
-            (
-                Arc::clone(&handle.state),
-                Arc::clone(&handle.invite_lock),
-                notify,
-                handle.network_key,
-            )
-        }; // DashMap ref dropped before connection-handler registration.
-        self.conn.register(
-            parts.3,
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                ctx: ctx.clone(),
-                network_name: network.to_string(),
-                state: parts.0,
-                dht_notify: Some(parts.2),
-                invite_lock: parts.1,
-            })),
+            state = Arc::clone(&handle.state);
+            invite_lock = Arc::clone(&handle.invite_lock);
+            network_key = handle.network_key;
+        } // DashMap ref dropped before connection-handler registration.
+        self.register_coordinator_handler(
+            ctx,
+            network,
+            state,
+            invite_lock,
+            Some(notify),
+            network_key,
         );
         tracing::info!(
             network,

@@ -77,12 +77,7 @@ impl Display for MachineEnrollmentsOutput<'_> {
             } else {
                 "one-time"
             };
-            let status = match enrollment.status {
-                ipc::MachineEnrollmentStatus::Pending => "pending",
-                ipc::MachineEnrollmentStatus::Used => "used",
-                ipc::MachineEnrollmentStatus::Expired => "expired",
-                ipc::MachineEnrollmentStatus::Revoked => "revoked",
-            };
+            let status = enrollment.status.as_str();
             writeln!(
                 f,
                 "{}  {}  {}  uses {}",

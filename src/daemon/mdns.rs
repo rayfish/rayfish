@@ -246,33 +246,38 @@ async fn run_windows(
     wake: Arc<Notify>,
     first: Events,
 ) {
-    let mut events = Some(first);
+    let mut events = first;
     loop {
-        let reopen_now = match events.take() {
-            Some(mut open) => {
-                let reopen_now = listen(&peers, &wake, &mut open).await;
-                let Some(discovery) = discovery.upgrade() else {
-                    return;
-                };
-                discovery.current.store(None);
-                peers.expire_unseen(SIGHTING_TTL);
-                reopen_now
-            }
-            None => false,
-        };
+        let reopen_now = listen(&peers, &wake, &mut events).await;
+        match discovery.upgrade() {
+            Some(discovery) => discovery.current.store(None),
+            None => return,
+        }
+        peers.expire_unseen(SIGHTING_TTL);
         if !reopen_now {
-            tokio::select! {
-                () = tokio::time::sleep(until_next_window(SystemTime::now())) => {}
-                () = wake.notified() => {}
+            wait_for_window(&wake).await;
+        }
+        // The strong reference lives only for the open, never across a wait,
+        // so dropping the discovery ends this task.
+        events = loop {
+            let opened = match discovery.upgrade() {
+                Some(discovery) => discovery.open_window().await,
+                None => return,
+            };
+            match opened {
+                Ok(open) => break open,
+                Err(error) => tracing::warn!(%error, "failed to open mDNS discovery window"),
             }
-        }
-        let Some(discovery) = discovery.upgrade() else {
-            return;
+            wait_for_window(&wake).await;
         };
-        match discovery.open_window().await {
-            Ok(open) => events = Some(open),
-            Err(error) => tracing::warn!(%error, "failed to open mDNS discovery window"),
-        }
+    }
+}
+
+/// Sleep until the next clock-aligned window, or until the LAN addresses change.
+async fn wait_for_window(wake: &Notify) {
+    tokio::select! {
+        () = tokio::time::sleep(until_next_window(SystemTime::now())) => {}
+        () = wake.notified() => {}
     }
 }
 

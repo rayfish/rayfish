@@ -408,9 +408,9 @@ impl SharedFirewall {
         }
     }
 
-    /// Stateless rule + default evaluation (no connection tracking).
-    /// Retained for compatibility and direct rule testing; the data plane uses
-    /// [`Self::evaluate_packet`] which is stateful.
+    /// Stateless rule + default evaluation (no connection tracking), for direct
+    /// rule tests. The data plane uses [`Self::evaluate_packet`], which is stateful.
+    #[cfg(test)]
     pub fn evaluate(
         &self,
         direction: Direction,
@@ -428,12 +428,6 @@ impl SharedFirewall {
     /// dropping it silently.
     pub fn reject_enabled(&self) -> bool {
         self.inner.load().reject
-    }
-
-    /// Whether the firewall is globally disabled (`ray firewall off`). When true,
-    /// `evaluate_packet` allows every packet.
-    pub fn disabled(&self) -> bool {
-        self.inner.load().disabled
     }
 
     /// Stateful evaluation of a fully-parsed packet against the peer's shared
@@ -633,8 +627,9 @@ fn is_icmp_echo_request(proto: u8, icmp_type: u8) -> bool {
     (proto == 1 && icmp_type == 8) || (proto == 58 && icmp_type == 128)
 }
 
-/// True when an ICMP echo reply can be treated as return traffic.
-fn is_icmp_echo_reply(proto: u8, icmp_type: u8) -> bool {
+/// True when an ICMP echo reply can be treated as return traffic. Also tells
+/// the Android forwarder that a kernel reply to a remote ping is not local demand.
+pub(crate) fn is_icmp_echo_reply(proto: u8, icmp_type: u8) -> bool {
     (proto == 1 && icmp_type == 0) || (proto == 58 && icmp_type == 129)
 }
 

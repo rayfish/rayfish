@@ -51,10 +51,8 @@ impl NetworkRegistry {
         };
         let minted = {
             let _guard = lock.lock().await;
-            match crate::invite::InviteStore::load(network) {
-                Ok(mut store) => store.mint(Duration::from_secs(expires_secs), hostname),
-                Err(e) => Err(e),
-            }
+            crate::invite::InviteStore::load(network)
+                .and_then(|mut store| store.mint(Duration::from_secs(expires_secs), hostname))
         };
         match minted {
             Ok((secret, id)) => {
@@ -254,10 +252,7 @@ impl NetworkRegistry {
         // Fall back to the local single-use invite ledger.
         let result = {
             let _guard = lock.lock().await;
-            match crate::invite::InviteStore::load(network) {
-                Ok(mut store) => store.revoke(id),
-                Err(e) => Err(e),
-            }
+            crate::invite::InviteStore::load(network).and_then(|mut store| store.revoke(id))
         };
         match result {
             Ok(()) => IpcMessage::Ok {

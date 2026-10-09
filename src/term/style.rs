@@ -18,7 +18,10 @@ pub fn set_plain(plain: bool) {
     PLAIN.store(plain, Ordering::Relaxed);
 }
 
-fn enabled() -> bool {
+/// Whether colorized/styled output is active (TTY + not `NO_COLOR`). Exposed so
+/// callers can gate interactive UI (spinners, the firewall picker) on the same
+/// signal as coloring.
+pub fn is_enabled() -> bool {
     if PLAIN.load(Ordering::Relaxed) {
         return false;
     }
@@ -40,12 +43,8 @@ fn enabled() -> bool {
     })
 }
 
-fn paint(code: &str, s: &str) -> String {
-    if enabled() {
-        format!("\x1b[{code}m{s}\x1b[0m")
-    } else {
-        s.to_string()
-    }
+fn paint(code: &'static str, s: &str) -> String {
+    Styled { code, value: s }.to_string()
 }
 
 struct Styled<'a> {
@@ -55,7 +54,7 @@ struct Styled<'a> {
 
 impl fmt::Display for Styled<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if enabled() {
+        if is_enabled() {
             write!(f, "\x1b[{}m{}\x1b[0m", self.code, self.value)
         } else {
             f.write_str(self.value)
@@ -115,13 +114,6 @@ pub fn bold(s: &str) -> String {
 /// Warning / loss. red-400-ish.
 pub fn red(s: &str) -> String {
     red_display(s).to_string()
-}
-
-/// Whether colorized/styled output is active (TTY + not `NO_COLOR`). Exposed so
-/// callers can gate interactive UI (spinners, the firewall picker) on the same
-/// signal as coloring.
-pub fn is_enabled() -> bool {
-    enabled()
 }
 
 /// A filled status dot, colored by liveness.

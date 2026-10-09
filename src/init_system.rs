@@ -102,16 +102,21 @@ impl InitSystem {
         }
     }
 
-    /// Write (or refresh) the service definition, pointing it at `exe`.
-    /// Idempotent, so it is safe on every `ray up`.
-    pub fn install_unit(self, exe: &str) -> Result<()> {
-        let template = match self {
+    /// The bundled service definition for this init, with [`EXE_PLACEHOLDER`]
+    /// still in it.
+    fn template(self) -> &'static str {
+        match self {
             Self::Systemd => include_str!("../contrib/rayfish.service"),
             Self::OpenRc => include_str!("../contrib/rayfish.openrc"),
             Self::SysVInit => include_str!("../contrib/rayfish.init"),
-        };
+        }
+    }
+
+    /// Write (or refresh) the service definition, pointing it at `exe`.
+    /// Idempotent, so it is safe on every `ray up`.
+    pub fn install_unit(self, exe: &str) -> Result<()> {
         let path = self.unit_path();
-        std::fs::write(path, template.replace(EXE_PLACEHOLDER, exe))
+        std::fs::write(path, self.template().replace(EXE_PLACEHOLDER, exe))
             .with_context(|| format!("failed to write {}", path.display()))?;
 
         match self {
@@ -247,13 +252,8 @@ mod tests {
             InitSystem::OpenRc,
             InitSystem::SysVInit,
         ] {
-            let template = match init {
-                InitSystem::Systemd => include_str!("../contrib/rayfish.service"),
-                InitSystem::OpenRc => include_str!("../contrib/rayfish.openrc"),
-                InitSystem::SysVInit => include_str!("../contrib/rayfish.init"),
-            };
             assert!(
-                template.contains(EXE_PLACEHOLDER),
+                init.template().contains(EXE_PLACEHOLDER),
                 "{} template has no {EXE_PLACEHOLDER} placeholder",
                 init.label()
             );

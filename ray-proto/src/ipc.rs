@@ -896,6 +896,18 @@ pub enum MachineEnrollmentStatus {
     Revoked,
 }
 
+impl MachineEnrollmentStatus {
+    /// Returns the protocol name of this status.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Used => "used",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
 /// Controller authorized to manage the local machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerInfo {
@@ -1047,41 +1059,49 @@ impl fmt::Display for InvalidMachineHostname {
 
 impl std::error::Error for InvalidMachineHostname {}
 
+/// The shared surface of a free-form string newtype: `new`, `AsRef<str>`,
+/// `Display` and an infallible `FromStr`.
+macro_rules! string_newtype {
+    ($name:ident, $new_doc:literal) => {
+        impl $name {
+            #[doc = $new_doc]
+            pub fn new(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = Infallible;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Ok(Self::new(value.to_string()))
+            }
+        }
+    };
+}
+
 /// Network name carried across the IPC and management protocols.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NetworkName(String);
 
-impl NetworkName {
-    /// Wraps a network name.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for NetworkName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
+string_newtype!(NetworkName, "Wraps a network name.");
 
 impl From<NetworkName> for String {
     fn from(network: NetworkName) -> Self {
         network.0
-    }
-}
-
-impl fmt::Display for NetworkName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for NetworkName {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
     }
 }
 
@@ -1090,64 +1110,20 @@ impl FromStr for NetworkName {
 #[serde(transparent)]
 pub struct EnrollmentCredentialId(String);
 
-impl EnrollmentCredentialId {
-    /// Wraps an enrollment credential identifier.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for EnrollmentCredentialId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnrollmentCredentialId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for EnrollmentCredentialId {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(
+    EnrollmentCredentialId,
+    "Wraps an enrollment credential identifier."
+);
 
 /// Full or prefix selector for an enrollment credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EnrollmentCredentialSelector(String);
 
-impl EnrollmentCredentialSelector {
-    /// Wraps an enrollment credential selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for EnrollmentCredentialSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnrollmentCredentialSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for EnrollmentCredentialSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(
+    EnrollmentCredentialSelector,
+    "Wraps an enrollment credential selector."
+);
 
 /// Shareable capability for enrolling a machine with a controller.
 ///
@@ -1247,36 +1223,11 @@ impl<'de> Deserialize<'de> for EnrollmentTicket {
 #[serde(transparent)]
 pub struct ManagedMachineSelector(String);
 
-impl ManagedMachineSelector {
-    /// Wraps a managed-machine selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
+string_newtype!(ManagedMachineSelector, "Wraps a managed-machine selector.");
 
 impl From<EndpointId> for ManagedMachineSelector {
     fn from(identity: EndpointId) -> Self {
         Self(identity.to_string())
-    }
-}
-
-impl AsRef<str> for ManagedMachineSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedMachineSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for ManagedMachineSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
     }
 }
 
@@ -1285,32 +1236,7 @@ impl FromStr for ManagedMachineSelector {
 #[serde(transparent)]
 pub struct ControllerSelector(String);
 
-impl ControllerSelector {
-    /// Wraps a controller selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for ControllerSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ControllerSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for ControllerSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(ControllerSelector, "Wraps a controller selector.");
 
 /// One roster row a pending kick would remove (reply to an unconfirmed
 /// [`IpcMessage::Kick`]).
