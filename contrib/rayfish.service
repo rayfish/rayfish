@@ -9,50 +9,6 @@ ExecStart=/usr/local/bin/ray daemon
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
-KillMode=control-group
-
-# Run as a transient user/group created and removed with the unit. Note this
-# replaces the historical root:rayfish ownership of /etc/rayfish — with a
-# DynamicUser the config, log, and runtime dirs created below are owned by
-# the dynamic user instead.
-DynamicUser=yes
-RuntimeDirectory=rayfish
-ConfigurationDirectory=rayfish
-ConfigurationDirectoryMode=0750
-LogsDirectory=rayfish
-LogsDirectoryMode=0750
-
-# TUN setup, routes, SO_MARK and DNS changes are all CAP_NET_ADMIN.
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
-NoNewPrivileges=true
-LimitNOFILE=65536
-
-# Filesystem / devices: read-only root, fresh /tmp, only the TUN device.
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-DeviceAllow=/dev/net/tun rw
-
-# Kernel interfaces the network daemon should not need.
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectClock=true
-ProtectHostname=true
-
-# Namespace, IPC and personality lockdown.
-RestrictNamespaces=true
-RestrictSUIDSGID=true
-RestrictRealtime=true
-LockPersonality=true
-RemoveIPC=true
-
-# The daemon speaks IPv4/IPv6 to peers, Unix sockets to local clients, and
-# netlink to the kernel for routes/addresses.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
