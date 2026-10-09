@@ -200,11 +200,13 @@ impl MdnsDiscovery {
 
     async fn stop_locked(&self, worker: &mut Option<JoinHandle<()>>) {
         self.enabled.store(false, Ordering::Release);
-        self.current.store(None);
         if let Some(running) = worker.take() {
             running.abort();
             let _ = running.await;
         }
+        // Cleared only once the worker has ended: a worker caught mid-open on
+        // another thread could otherwise store a fresh provider after this.
+        self.current.store(None);
         self.peers.clear();
         tracing::info!("mDNS discovery disabled");
     }

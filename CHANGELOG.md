@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Turning mDNS discovery off while a window was opening could leave the mDNS
+  sockets open and still answering lookups.
+
 - Failed file downloads stay in `ray files` for retry with `ray files accept <id>`,
   reusing data already downloaded. Android offers Retry on Home and in notifications.
 
