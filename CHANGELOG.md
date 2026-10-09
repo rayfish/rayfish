@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The macOS app reuses its VPN session for status updates and commands, avoiding
+  memory growth while it stays open.
+
 - Mesh SSH port mapping, TCP resets and Magic DNS replies now find the
   TCP or UDP header after IPv6 extension headers instead of assuming it
   starts at byte 40, which wrote the new port into the extension header.

@@ -1,4 +1,5 @@
 import Foundation
+import NetworkExtension
 
 @MainActor
 private final class ReplyBarrier {
@@ -19,6 +20,7 @@ struct TunnelIPCTests {
     @MainActor
     static func main() async throws {
         setbuf(stdout, nil)
+        try await testManagerCache()
         let setting = ProviderRequest(action: .setSetting, setting: .dns, enabled: false)
         let decodedSetting = try JSONDecoder().decode(ProviderRequest.self, from: JSONEncoder().encode(setting))
         precondition(decodedSetting.setting == .dns && decodedSetting.enabled == false)
@@ -84,5 +86,102 @@ struct TunnelIPCTests {
         }
         precondition(immediate == Data("immediate".utf8))
         print("PASS: completed response cannot be replaced by an error")
+    }
+
+    @MainActor
+    private static func testManagerCache() async throws {
+        func manager(provider: String = TunnelManagerCache.providerIdentifier) -> NETunnelProviderManager {
+            let manager = NETunnelProviderManager()
+            let configuration = NETunnelProviderProtocol()
+            configuration.providerBundleIdentifier = provider
+            manager.protocolConfiguration = configuration
+            return manager
+        }
+
+        let center = NotificationCenter()
+        let original = manager()
+        let replacement = manager()
+        var available = [manager(provider: "com.example.other"), original]
+        var loads = 0
+        let cache = TunnelManagerCache(notificationCenter: center) {
+            loads += 1
+            await Task.yield()
+            return available
+        }
+        async let first = cache.load()
+        async let second = cache.load()
+        let concurrent = try await [first, second]
+        precondition(concurrent.allSatisfy { $0 === original } && loads == 1)
+        for _ in 0..<1_000 {
+            let loaded = try await cache.load()
+            precondition(loaded === original)
+        }
+        precondition(loads == 1)
+        print("PASS: concurrent requests and repeated polls share one VPN manager")
+
+        available = [replacement]
+        // Connection state notifications must not replace the manager/session.
+        center.post(name: .NEVPNStatusDidChange, object: original.connection)
+        let unchanged = try await cache.load()
+        precondition(unchanged === original && loads == 1)
+        center.post(name: .NEVPNConfigurationChange, object: nil)
+        let changed = try await cache.load()
+        precondition(changed === replacement && loads == 2)
+        available = []
+        center.post(name: .NEVPNConfigurationChange, object: nil)
+        let removed = try await cache.load()
+        let stillRemoved = try await cache.load()
+        precondition(removed == nil && stillRemoved == nil && loads == 3)
+        available = [original]
+        center.post(name: .NEVPNConfigurationChange, object: nil)
+        let added = try await cache.load()
+        precondition(added === original && loads == 4)
+        print("PASS: configuration changes refresh replaced, removed and newly added VPNs")
+
+        var pending: CheckedContinuation<[NETunnelProviderManager], Error>?
+        let delayed = TunnelManagerCache(notificationCenter: center) {
+            try await withCheckedThrowingContinuation { pending = $0 }
+        }
+        let stale = Task { try await delayed.load() }
+        while pending == nil { await Task.yield() }
+        delayed.store(replacement)
+        pending?.resume(returning: [original])
+        let stored = try await stale.value
+        precondition(stored === replacement)
+        print("PASS: saving a VPN configuration supersedes an older in-flight load")
+
+        var resume: CheckedContinuation<Void, Never>?
+        var reloads = 0
+        let changing = TunnelManagerCache(notificationCenter: center) {
+            reloads += 1
+            if reloads == 1 {
+                await withCheckedContinuation { resume = $0 }
+                return [original]
+            }
+            return [replacement]
+        }
+        let outdated = Task { try await changing.load() }
+        while resume == nil { await Task.yield() }
+        center.post(name: .NEVPNConfigurationChange, object: nil)
+        let fresh = try await changing.load()
+        resume?.resume()
+        let afterChange = try await outdated.value
+        precondition(fresh === replacement && afterChange === replacement && reloads == 2)
+        print("PASS: a configuration change during loading cannot restore a stale manager")
+
+        var attempts = 0
+        let failure = NSError(domain: "ManagerCacheTest", code: 1)
+        let retrying = TunnelManagerCache(notificationCenter: center) {
+            attempts += 1
+            if attempts == 1 { throw failure }
+            return [original]
+        }
+        do {
+            _ = try await retrying.load()
+            fatalError("A preference loading error was ignored")
+        } catch { precondition(error as NSError == failure) }
+        let retried = try await retrying.load()
+        precondition(retried === original && attempts == 2)
+        print("PASS: failed preference loads can be retried")
     }
 }
