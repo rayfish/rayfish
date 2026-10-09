@@ -25,7 +25,7 @@ impl Display for ManagedMachinesOutput<'_> {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
-                let state = machine.state.as_str();
+                let state = <&str>::from(machine.state);
                 vec![
                     layout::Cell::new(
                         machine.hostname.to_string(),
@@ -77,7 +77,7 @@ impl Display for MachineEnrollmentsOutput<'_> {
             } else {
                 "one-time"
             };
-            let status = enrollment.status.as_str();
+            let status = <&str>::from(enrollment.status);
             writeln!(
                 f,
                 "{}  {}  {}  uses {}",

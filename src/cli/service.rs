@@ -187,7 +187,7 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
             println!(
                 "note: {} does not restart the daemon if it exits; \
                  use `sudo ray start` to bring it back.",
-                init.label()
+                init
             );
         }
     }

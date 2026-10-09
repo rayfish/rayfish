@@ -31,10 +31,13 @@ const EXE_PLACEHOLDER: &str = "/usr/local/bin/ray";
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/rayfish.service";
 const INITD_SCRIPT: &str = "/etc/init.d/rayfish";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display)]
 pub enum InitSystem {
+    #[strum(to_string = "systemd")]
     Systemd,
+    #[strum(to_string = "OpenRC")]
     OpenRc,
+    #[strum(to_string = "SysV init")]
     SysVInit,
 }
 
@@ -84,14 +87,6 @@ impl InitSystem {
             };
         }
         None
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Systemd => "systemd",
-            Self::OpenRc => "OpenRC",
-            Self::SysVInit => "SysV init",
-        }
     }
 
     /// Where this init's service definition lives.
@@ -255,7 +250,7 @@ mod tests {
             assert!(
                 init.template().contains(EXE_PLACEHOLDER),
                 "{} template has no {EXE_PLACEHOLDER} placeholder",
-                init.label()
+                init
             );
         }
     }

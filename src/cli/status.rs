@@ -12,7 +12,7 @@ struct ManagedMachineStateOutput(ipc::ManagedMachineState);
 
 impl fmt::Display for ManagedMachineStateOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = self.0.as_str();
+        let value = <&str>::from(self.0);
         match self.0 {
             ipc::ManagedMachineState::Online => style::green_display(value).fmt(f),
             ipc::ManagedMachineState::Offline | ipc::ManagedMachineState::Unknown => {

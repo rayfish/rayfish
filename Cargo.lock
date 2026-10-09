@@ -5806,6 +5806,7 @@ dependencies = [
  "postcard",
  "rmp-serde",
  "serde",
+ "strum",
  "tempfile",
  "tokio",
  "tokio-util",

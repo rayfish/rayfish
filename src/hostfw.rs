@@ -39,7 +39,8 @@ pub enum Verdict {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum Manager {
     Ufw,
     Firewalld,
@@ -48,15 +49,6 @@ pub enum Manager {
 }
 
 impl Manager {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Manager::Ufw => "ufw",
-            Manager::Firewalld => "firewalld",
-            Manager::Iptables => "iptables",
-            Manager::Nftables => "nftables",
-        }
-    }
-
     /// The command that opens `port` for inbound TCP on `tun` only. Mesh SSH
     /// binds the overlay's IPv6 address, so `ip6tables` is the only raw ruleset
     /// that can drop the connection. ufw and firewalld apply to both families
@@ -89,7 +81,7 @@ impl Verdict {
                 "{} is blocking inbound TCP port {port} on the mesh interface, which is where \
                  mesh SSH actually listens (mesh `:22` is mapped to {port} internally, so an \
                  \"allow 22\" rule does not cover it). Connections will hang until you run:\n  {fix}",
-                manager.as_str(),
+                <&str>::from(manager),
             )),
             _ => None,
         }
@@ -204,7 +196,7 @@ fn ensure_inbound_tcp_with(
     };
     if !installed {
         tracing::warn!(
-            manager = manager.as_str(),
+            manager = <&str>::from(manager),
             "could not add the mesh SSH firewall rule"
         );
         return before;
@@ -212,7 +204,7 @@ fn ensure_inbound_tcp_with(
     match check_inbound_tcp_with(tun, port, run) {
         Verdict::Clear => {
             tracing::info!(
-                manager = manager.as_str(),
+                manager = <&str>::from(manager),
                 interface = tun,
                 port,
                 "allowed mesh SSH through the host firewall"

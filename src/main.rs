@@ -981,7 +981,8 @@ pub(crate) enum ConfigAction {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum MdnsAction {
     /// Enable mDNS local peer discovery
     On,
@@ -994,7 +995,8 @@ pub(crate) enum MdnsAction {
     Scan,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum DnsAction {
     /// Configure the system resolver for .ray names
     On,
@@ -1892,14 +1894,12 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
 /// `ray mdns on|off|scan`. The two toggles are the `mdns` settings key under
 /// another name; `scan` is a read and goes its own way.
 async fn cmd_mdns(action: MdnsAction) -> Result<()> {
-    let state = match action {
-        MdnsAction::On => "on",
-        MdnsAction::Off => "off",
-        MdnsAction::Scan => return ipc_lan_peers().await,
-    };
+    if matches!(action, MdnsAction::Scan) {
+        return ipc_lan_peers().await;
+    }
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
-        value: state.to_string(),
+        value: action.to_string(),
         replace: false,
     })
     .await
@@ -1907,14 +1907,9 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
 
 /// `ray dns on|off`: apply or remove Magic DNS without changing the data plane.
 async fn cmd_dns(action: DnsAction) -> Result<()> {
-    let state = match action {
-        DnsAction::On => "on",
-        DnsAction::Partial => "partial",
-        DnsAction::Off => "off",
-    };
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Dns),
-        value: state.to_string(),
+        value: action.to_string(),
         replace: false,
     })
     .await

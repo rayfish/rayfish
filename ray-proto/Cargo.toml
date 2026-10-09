@@ -23,6 +23,7 @@ iroh-tickets = "1"
 postcard = { version = "1", features = ["use-std"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 tokio = { version = "1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
