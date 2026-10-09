@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `ray files` shows transfer progress and state again instead of only the
+  total size and file name.
+
 - A fresh install without `settings.toml` now starts with on-demand mode and
   the macOS pf passthrough on, as documented. A pending-join update no longer
   races with other settings writes and loses one of them.
