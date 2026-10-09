@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Leaving a network could close a peer connection that a concurrent reconnect
+  had just reused for another network.
+
 - Turning mDNS discovery off while a window was opening could leave the mDNS
   sockets open and still answering lookups.
 

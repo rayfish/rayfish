@@ -803,20 +803,16 @@ impl PeerTable {
     /// peer's connection **iff** this removed its last shared network (so the
     /// caller can close the now-unused connection); `None` otherwise.
     pub fn remove_peer_from_network(&self, ip: &Ipv6Addr, network: &str) -> Option<Connection> {
-        let mut last_conn = None;
-        let mut dropped_id = None;
-        if let Some(mut e) = self.peers.get_mut(ip) {
+        // One locked pass: a separate check and removal would let a concurrent
+        // `add` keep the entry while its connection is still handed back to close.
+        let (_, entry) = self.peers.remove_if_mut(ip, |_, e| {
             e.out_handles.remove(network);
-            if e.out_handles.is_empty() {
-                last_conn = Some(e.active.conn.clone());
-                dropped_id = Some(e.endpoint_id);
-            }
+            e.out_handles.is_empty()
+        })?;
+        if let Some(audit) = &self.audit {
+            audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
         }
-        self.peers.remove_if(ip, |_, e| e.out_handles.is_empty());
-        if let (Some(endpoint_id), Some(audit)) = (dropped_id, &self.audit) {
-            audit.log_disconnect(*ip, &endpoint_id.to_string());
-        }
-        last_conn
+        Some(entry.active.conn)
     }
 
     /// Drop the peer identified by its transport `peer_id` from `network`. Used by
