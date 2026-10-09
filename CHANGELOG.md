@@ -34,6 +34,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A fresh install without `settings.toml` now starts with on-demand mode and
+  the macOS pf passthrough on, as documented. A pending-join update no longer
+  races with other settings writes and loses one of them.
+
 - Leaving a network could close a peer connection that a concurrent reconnect
   had just reused for another network.
 
