@@ -374,14 +374,20 @@ pub struct ControlFrame {
     pub msg: ControlMsg,
 }
 
+/// Borrowed twin of [`ControlFrame`] for encoding, so sending a message does not
+/// clone it. Same fields in the same order: the frame is array-encoded, so this
+/// writes exactly the bytes a `ControlFrame` would.
+#[derive(Serialize)]
+struct ControlFrameRef<'a> {
+    net: Option<EndpointId>,
+    msg: &'a ControlMsg,
+}
+
 /// Encode a network-scoped mesh control message as a length-prefixed msgpack
 /// [`ControlFrame`]. `net` is the network public key the message pertains to
 /// (`None` for connection-level messages like [`ControlMsg::NetworkHandles`]).
 pub fn encode_msg(net: Option<EndpointId>, msg: &ControlMsg) -> Vec<u8> {
-    let frame = ControlFrame {
-        net,
-        msg: msg.clone(),
-    };
+    let frame = ControlFrameRef { net, msg };
     let body = rmp_serde::to_vec(&frame).expect("serialize control frame");
     let len = (body.len() as u32).to_be_bytes();
     [len.as_slice(), &body].concat()

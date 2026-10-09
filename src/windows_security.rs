@@ -38,9 +38,12 @@ const PROTECTED_DIR_DACL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 const PROTECTED_DACL_SECURITY_INFO: u32 =
     DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Converts to its SDDL alias (`SY`, `BA`) for an owner field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
 enum TrustedOwner {
+    #[strum(serialize = "SY")]
     LocalSystem,
+    #[strum(serialize = "BA")]
     Administrators,
 }
 
@@ -63,10 +66,7 @@ fn owner_action(
 }
 
 fn protected_sddl(owner: TrustedOwner, directory: bool) -> String {
-    let owner = match owner {
-        TrustedOwner::LocalSystem => "SY",
-        TrustedOwner::Administrators => "BA",
-    };
+    let owner = <&str>::from(owner);
     let dacl = if directory {
         PROTECTED_DIR_DACL
     } else {
@@ -260,10 +260,7 @@ pub(crate) fn create_protected_new_file(path: &Path) -> Result<File> {
 pub(crate) fn create_report_file(path: &Path, requester: Option<&str>) -> Result<File> {
     let owner = current_trusted_owner()
         .context("writing a diagnostics bundle requires LocalSystem or elevated Administrator")?;
-    let owner = match owner {
-        TrustedOwner::LocalSystem => "SY",
-        TrustedOwner::Administrators => "BA",
-    };
+    let owner = <&str>::from(owner);
     let sddl = match requester {
         Some(sid) => format!("O:{owner}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;{sid})"),
         None => format!("O:{owner}{PROTECTED_FILE_DACL}"),

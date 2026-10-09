@@ -24,15 +24,14 @@ pub struct RouteMember {
 
 struct RouteEntry {
     endpoint_id: EndpointId,
-    ipv6: Ipv6Addr,
     networks: HashSet<SmolStr>,
 }
 
 impl RouteEntry {
-    fn to_target(&self) -> RouteTarget {
+    fn to_target(&self, ipv6: Ipv6Addr) -> RouteTarget {
         RouteTarget {
             endpoint_id: self.endpoint_id,
-            ipv6: self.ipv6,
+            ipv6,
             networks: self.networks.iter().cloned().collect(),
         }
     }
@@ -69,7 +68,6 @@ impl RosterRouteMap {
     fn upsert(&self, ipv6: Ipv6Addr, endpoint_id: EndpointId, network: SmolStr) {
         let mut entry = self.peers.entry(ipv6).or_insert_with(|| RouteEntry {
             endpoint_id,
-            ipv6,
             networks: HashSet::new(),
         });
         entry.endpoint_id = endpoint_id;
@@ -77,11 +75,10 @@ impl RosterRouteMap {
     }
 
     fn drop_network(&self, ipv6: &Ipv6Addr, network: &SmolStr) {
-        if let Some(mut entry) = self.peers.get_mut(ipv6) {
+        self.peers.remove_if_mut(ipv6, |_, entry| {
             entry.networks.remove(network);
-        }
-        self.peers
-            .remove_if(ipv6, |_, entry| entry.networks.is_empty());
+            entry.networks.is_empty()
+        });
     }
 
     pub fn remove_network(&self, network: &str) {
@@ -102,6 +99,6 @@ impl RosterRouteMap {
     }
 
     pub fn resolve_v6(&self, ipv6: &Ipv6Addr) -> Option<RouteTarget> {
-        self.peers.get(ipv6).map(|entry| entry.to_target())
+        self.peers.get(ipv6).map(|entry| entry.to_target(*ipv6))
     }
 }

@@ -74,6 +74,7 @@ pub struct DeployHost {
     pub ssh: BTreeMap<String, Vec<String>>,
 }
 
+#[cfg(test)]
 impl From<HostSuggestions> for DeployHost {
     fn from(value: HostSuggestions) -> Self {
         Self {
@@ -109,12 +110,7 @@ pub fn ssh_grants_for_host(network: &DeployNetwork, host: &str) -> BTreeMap<Stri
         .unwrap_or_default();
     if let Some(rules) = network.get(host) {
         for (peer, users) in &rules.ssh {
-            match grants.entry(peer.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(users.clone());
-                }
-                Entry::Occupied(mut entry) => merge_ssh_users(entry.get_mut(), users),
-            }
+            add_ssh_grant(&mut grants, peer.clone(), users);
         }
     }
     grants
@@ -308,10 +304,11 @@ networks:
 "#;
 
 /// Union of every concrete hostname mentioned in the spec, both subjects and
-/// peer hostnames in `allows`/`denies`. This is the set of hosts the spec
-/// expects to exist; it is diffed against the joined hosts. The `*` wildcard
-/// (subject or peer) is not a real host and is excluded.
-pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
+/// peer hostnames in `allows`/`denies`. The `*` wildcard (subject or peer) is
+/// not a real host and is excluded. Test-only: apply diffs per network through
+/// [`expected_hosts_for_network`].
+#[cfg(test)]
+fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for firewall in spec.networks.values() {
         set.extend(expected_hosts_for_network(firewall));
@@ -424,23 +421,9 @@ pub fn expand_firewall(
         let exclusions = crate::firewall::parse_excluded_peer_terms(selector)?
             .context("expected excluded-peer selector")?;
         let mut hosts = BTreeSet::new();
-        for name in exclusions {
-            let members = groups.get(name).map(Vec::as_slice);
-            for member in members.unwrap_or(&[]) {
-                if let Some(identity) = aliases.get(member) {
-                    let joined = resolve_alias(identity);
-                    anyhow::ensure!(
-                        !joined.is_empty(),
-                        "excluded alias '{member}' has no joined devices"
-                    );
-                    hosts.extend(joined);
-                } else {
-                    hosts.insert(member.clone());
-                }
-            }
-            if members.is_some() {
-                continue;
-            }
+        // An alias expands to its joined devices; anything else is a literal
+        // hostname.
+        let mut add = |name: &str| -> Result<()> {
             if let Some(identity) = aliases.get(name) {
                 let joined = resolve_alias(identity);
                 anyhow::ensure!(
@@ -450,6 +433,16 @@ pub fn expand_firewall(
                 hosts.extend(joined);
             } else {
                 hosts.insert(name.to_string());
+            }
+            Ok(())
+        };
+        for name in exclusions {
+            if let Some(members) = groups.get(name) {
+                for member in members {
+                    add(member)?;
+                }
+            } else {
+                add(name)?;
             }
         }
         anyhow::ensure!(
@@ -524,14 +517,7 @@ pub fn expand_firewall(
         let mut ssh: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (peer, users) in &rules.ssh {
             for host in resolve_name(peer) {
-                match ssh.entry(host) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(users.clone());
-                    }
-                    Entry::Occupied(mut entry) => {
-                        merge_ssh_users(entry.get_mut(), users);
-                    }
-                }
+                add_ssh_grant(&mut ssh, host, users);
             }
         }
 
@@ -555,19 +541,24 @@ pub fn expand_firewall(
                 merge_spec(entry.denies.entry(peer.clone()).or_default(), spec);
             }
             for (peer, users) in &ssh {
-                match entry.ssh.entry(peer.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(users.clone());
-                    }
-                    Entry::Occupied(mut entry) => {
-                        merge_ssh_users(entry.get_mut(), users);
-                    }
-                }
+                add_ssh_grant(&mut entry.ssh, peer.clone(), users);
             }
         }
     }
 
     Ok((out, empty_aliases.into_iter().collect()))
+}
+
+/// Add one peer's ssh grant to `grants`. A new peer takes `users` as given: an
+/// empty list there means any non-root account, so it must not go through
+/// [`merge_ssh_users`] against an empty existing list.
+fn add_ssh_grant(grants: &mut BTreeMap<String, Vec<String>>, peer: String, users: &[String]) {
+    match grants.entry(peer) {
+        Entry::Vacant(entry) => {
+            entry.insert(users.to_vec());
+        }
+        Entry::Occupied(mut entry) => merge_ssh_users(entry.get_mut(), users),
+    }
 }
 
 fn merge_ssh_users(existing: &mut Vec<String>, new: &[String]) {

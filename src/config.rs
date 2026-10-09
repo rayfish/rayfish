@@ -819,14 +819,9 @@ struct NetworkUpdateScope;
 
 impl NetworkUpdateScope {
     fn enter() -> Result<Self> {
-        IN_NETWORK_CONFIG_UPDATE.with(|active| {
-            anyhow::ensure!(
-                !active.get(),
-                "network config update callbacks must not call network config APIs"
-            );
-            active.set(true);
-            Ok(Self)
-        })
+        ensure_not_in_network_update()?;
+        IN_NETWORK_CONFIG_UPDATE.with(|active| active.set(true));
+        Ok(Self)
     }
 }
 
@@ -1410,12 +1405,15 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         let s = std::fs::read_to_string(&settings_path).context("reading settings.toml")?;
         toml::from_str(&s).context("parsing settings.toml")?
     } else {
-        // Fresh install: discovery and Magic DNS are on, and mesh SSH uses port 22.
+        // Fresh install: discovery, Magic DNS, on-demand and the pf passthrough
+        // are on, and mesh SSH uses port 22, matching the serde field defaults.
         Settings {
             mdns_enabled: true,
             dns_mode: DnsMode::On,
             ssh_port: default_ssh_port(),
             v4_bridge: true,
+            pf_passthrough: true,
+            on_demand: true,
             ..Default::default()
         }
     };
@@ -1563,17 +1561,19 @@ pub fn add_pending_join(entry: PendingJoinEntry) -> Result<()> {
 }
 
 fn add_pending_join_in(dir: &Path, entry: PendingJoinEntry) -> Result<()> {
-    let mut cfg = load_in(dir)?;
-    if let Some(existing) = cfg
-        .pending_joins
-        .iter_mut()
-        .find(|e| e.network_key == entry.network_key)
-    {
-        existing.name = entry.name;
-    } else {
-        cfg.pending_joins.push(entry);
-    }
-    save_settings_in(dir, &cfg)
+    update_settings_in(dir, |cfg| {
+        if let Some(existing) = cfg
+            .pending_joins
+            .iter_mut()
+            .find(|e| e.network_key == entry.network_key)
+        {
+            existing.name = entry.name;
+        } else {
+            cfg.pending_joins.push(entry);
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Drop a pending-join marker once the network is admitted (or abandoned).
@@ -1582,12 +1582,10 @@ pub fn remove_pending_join(network_key: &str) -> Result<()> {
 }
 
 fn remove_pending_join_in(dir: &Path, network_key: &str) -> Result<()> {
-    let mut cfg = load_in(dir)?;
-    let before = cfg.pending_joins.len();
-    cfg.pending_joins.retain(|e| e.network_key != network_key);
-    if cfg.pending_joins.len() != before {
-        save_settings_in(dir, &cfg)?;
-    }
+    update_settings_in(dir, |cfg| {
+        cfg.pending_joins.retain(|e| e.network_key != network_key);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1668,22 +1666,7 @@ fn update_network_in(
     let Some(mut net) = load_network_unlocked(dir, name)? else {
         return Ok(None);
     };
-    anyhow::ensure!(
-        net.name == name,
-        "network config {name:?} contains mismatched name {:?}",
-        net.name
-    );
-    let before = toml::to_string(&net).context("serializing network config")?;
-    let update_scope = NetworkUpdateScope::enter()?;
-    update(&mut net)?;
-    drop(update_scope);
-    anyhow::ensure!(
-        net.name == name,
-        "network update cannot rename {name:?} to {:?}",
-        net.name
-    );
-    let after = toml::to_string(&net).context("serializing network config")?;
-    if after != before {
+    if apply_network_update(name, &mut net, update)? {
         save_network_unlocked(dir, &net)?;
     } else {
         // A prior atomic write may have installed this exact file and then
@@ -1693,6 +1676,32 @@ fn update_network_in(
         sync_file_and_parent(&path)?;
     }
     Ok(Some(net))
+}
+
+/// Run one network update callback against `net`, which was loaded for `name`.
+/// Refuses a stored record or an update that names a different network, and
+/// returns whether the callback changed the serialized record.
+fn apply_network_update(
+    name: &str,
+    net: &mut NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<bool> {
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(net).context("serializing network config")?;
+    let update_scope = NetworkUpdateScope::enter()?;
+    update(net)?;
+    drop(update_scope);
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(net).context("serializing network config")?;
+    Ok(after != before)
 }
 
 /// Atomically update the latest network config, inserting `initial` only when
@@ -1719,22 +1728,8 @@ fn update_network_or_insert_in(
     let existing = load_network_unlocked(dir, name)?;
     let inserting = existing.is_none();
     let mut net = existing.unwrap_or(initial);
-    anyhow::ensure!(
-        net.name == name,
-        "network config {name:?} contains mismatched name {:?}",
-        net.name
-    );
-    let before = toml::to_string(&net).context("serializing network config")?;
-    let update_scope = NetworkUpdateScope::enter()?;
-    update(&mut net)?;
-    drop(update_scope);
-    anyhow::ensure!(
-        net.name == name,
-        "network update cannot rename {name:?} to {:?}",
-        net.name
-    );
-    let after = toml::to_string(&net).context("serializing network config")?;
-    if inserting || after != before {
+    let changed = apply_network_update(name, &mut net, update)?;
+    if inserting || changed {
         save_network_unlocked(dir, &net)?;
     }
     Ok(net)
@@ -2500,6 +2495,17 @@ name = "test"
         let tmp = tempfile::tempdir().unwrap();
         let loaded = load_in(tmp.path()).unwrap();
         assert_eq!(loaded.dns_mode, DnsMode::On);
+    }
+
+    #[test]
+    fn fresh_install_matches_an_empty_settings_file() {
+        let fresh = tempfile::tempdir().expect("create config directory");
+        let empty = tempfile::tempdir().expect("create config directory");
+        std::fs::write(empty.path().join(SETTINGS_FILE), "").expect("write empty settings");
+        let fresh = load_in(fresh.path()).expect("load fresh install");
+        let empty = load_in(empty.path()).expect("load empty settings");
+        assert!(fresh.on_demand && empty.on_demand);
+        assert!(fresh.pf_passthrough && empty.pf_passthrough);
     }
 
     #[test]

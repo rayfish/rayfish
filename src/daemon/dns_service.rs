@@ -52,7 +52,7 @@ pub(crate) struct DnsService {
     /// The system-DNS configurator owned while active, so `revert` can undo it and
     /// `reassert_os_config` can re-apply it. `Arc` (not `Box`) so a re-apply can
     /// clone it out and run without holding the lock across the await.
-    configurator: Arc<Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>>,
+    configurator: Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>,
     /// Cancellation token for the re-assert task that repairs the OS DNS
     /// configuration after another program tramples it: `run_resolv_reassert`
     /// on Linux (direct mode only), `run_sc_reassert` on macOS.
@@ -83,7 +83,7 @@ impl DnsService {
             hostname_table,
             reverse_table,
             resolver,
-            configurator: Arc::new(Mutex::new(None)),
+            configurator: Mutex::new(None),
             reassert_token: Mutex::new(None),
             configure_retry: Mutex::new(None),
             search_domains: Mutex::new(Vec::new()),
@@ -546,12 +546,7 @@ impl DnsService {
     /// re-assert watcher, restore the captured configurator, and clear the TUN's
     /// search domains. Idempotent (no-op if never configured).
     pub(crate) async fn revert(&self, tun_name: &str) {
-        if let Some(rt) = self.reassert_token.lock().unwrap().take() {
-            rt.cancel();
-        }
-        if let Some(retry) = self.configure_retry.lock().unwrap().take() {
-            retry.cancel();
-        }
+        self.shutdown_background();
 
         // Revert system DNS (extract the configurator before reverting so the
         // mutex guard isn't held across the call).

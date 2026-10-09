@@ -205,6 +205,17 @@ fn gate_mesh_version(
     Ok(Some(MeshVersionMismatch { network, ours }))
 }
 
+/// This machine's default hostname, steered clear of names other members of the
+/// roster already hold.
+fn default_join_hostname(members: &[crate::membership::Member], me: EndpointId) -> String {
+    let taken: Vec<&str> = members
+        .iter()
+        .filter(|m| m.identity != me)
+        .filter_map(|m| m.hostname.as_deref())
+        .collect();
+    crate::hostname::default_hostname(config::load().ok().and_then(|c| c.default_hostname), &taken)
+}
+
 fn reconnect_coordinator(
     explicit: Option<EndpointId>,
     members: &[crate::membership::Member],
@@ -219,23 +230,13 @@ fn reconnect_coordinator(
 }
 
 /// A live mesh connection produced by the dial phase: the per-network state cell
-/// plus the cancellation token and background tasks that `finalize_join` folds
-/// into the `NetworkHandle`.
+/// plus the cancellation token that `finalize_join` folds into the
+/// `NetworkHandle`.
 struct EstablishedMesh {
     state: SharedNetworkState,
     direct_exact_hash: Option<blake3::Hash>,
     direct_hash_published: Option<bool>,
     cancel: CancellationToken,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-}
-
-/// Tear down a failed dial attempt: cancel the token and abort every spawned
-/// task. Used on each unreachable/denied coordinator before trying the next.
-fn abort_join_tasks(cancel: &CancellationToken, tasks: Vec<tokio::task::JoinHandle<()>>) {
-    cancel.cancel();
-    for t in tasks {
-        t.abort();
-    }
 }
 
 impl Daemon {
@@ -479,19 +480,7 @@ impl NetworkRegistry {
             // No name given: this machine's own, unless the roster we just
             // fetched already has it. The blob is in hand before we dial, so
             // that clash is visible here and needs nothing from the wire.
-            None => {
-                let me = self.transport.identity.local_identity();
-                let taken: Vec<&str> = data
-                    .members
-                    .iter()
-                    .filter(|m| m.identity != me)
-                    .filter_map(|m| m.hostname.as_deref())
-                    .collect();
-                crate::hostname::default_hostname(
-                    config::load().ok().and_then(|c| c.default_hostname),
-                    &taken,
-                )
-            }
+            None => default_join_hostname(&data.members, self.transport.identity.local_identity()),
         };
 
         // One invite-ledger lock for this network, shared between the join's
@@ -643,10 +632,9 @@ impl NetworkRegistry {
         for coordinator_id in &order {
             let dial_lock = self.mesh_dial_lock(*coordinator_id);
             let _dial_guard = dial_lock.lock().await;
-            let cancel = self.shutdown_token.child_token();
             // Reconnect + cleanup are daemon-wide now (the connection supervisor),
             // so no per-network reconnect task; readers report to the shared sender.
-            let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
+            let cancel = self.shutdown_token.child_token();
 
             let peer_ip = derive_ipv6(coordinator_id);
             let conn = if let Some(conn) = self
@@ -667,7 +655,7 @@ impl NetworkRegistry {
                 )
                 .await
                 else {
-                    abort_join_tasks(&cancel, tasks);
+                    cancel.cancel();
                     last_err = anyhow::anyhow!("coordinator dial timed out");
                     continue;
                 };
@@ -675,7 +663,7 @@ impl NetworkRegistry {
                     Ok(conn) => conn,
                     Err(e) => {
                         tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
-                        abort_join_tasks(&cancel, tasks);
+                        cancel.cancel();
                         last_err = anyhow::anyhow!("coordinator offline: {e}");
                         continue;
                     }
@@ -683,7 +671,7 @@ impl NetworkRegistry {
             };
 
             match self
-                .run_join_handshake(ctx, data, conn, true, &cancel, ctx.invite.clone())
+                .run_join_handshake(ctx, data, conn, true, &cancel)
                 .await
             {
                 Ok(JoinResult::Joined {
@@ -696,16 +684,15 @@ impl NetworkRegistry {
                         direct_exact_hash,
                         direct_hash_published,
                         cancel,
-                        tasks,
                     }));
                 }
                 Ok(JoinResult::Pending) => {
-                    abort_join_tasks(&cancel, tasks);
+                    cancel.cancel();
                     pending = true;
                 }
                 Err(e) => {
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
-                    abort_join_tasks(&cancel, tasks);
+                    cancel.cancel();
                     last_err = e;
                 }
             }
@@ -773,9 +760,8 @@ impl NetworkRegistry {
         // dial it back when it returns. Without this a member that reboots while
         // its coordinator is down silently drops the network from its running
         // state until a lucky restart.
-        let cancel = self.shutdown_token.child_token();
         // Reconnect + cleanup are daemon-wide now (the connection supervisor).
-        let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
+        let cancel = self.shutdown_token.child_token();
 
         // Seed the route map from the verified blob so the data path can re-dial the
         // coordinator or any member that has since been idle-closed, before the first
@@ -803,7 +789,6 @@ impl NetworkRegistry {
                 direct_exact_hash: None,
                 direct_hash_published: None,
                 cancel,
-                tasks,
             }));
         }
 
@@ -823,7 +808,7 @@ impl NetworkRegistry {
         };
         let state = match connected {
             Ok(conn) => match self
-                .run_join_handshake(ctx, data, conn, false, &cancel, ctx.invite.clone())
+                .run_join_handshake(ctx, data, conn, false, &cancel)
                 .await
             {
                 Ok(JoinResult::Joined {
@@ -835,7 +820,7 @@ impl NetworkRegistry {
                     // Closed network: queued for live approval. Stop the just-
                     // spawned reconnect loop (nothing connected yet); caller
                     // retries on a backoff until `ray accept` lets us in.
-                    abort_join_tasks(&cancel, tasks);
+                    cancel.cancel();
                     return Ok(None);
                 }
                 Err(e) => {
@@ -866,7 +851,6 @@ impl NetworkRegistry {
             direct_exact_hash: None,
             direct_hash_published: None,
             cancel,
-            tasks,
         }))
     }
 
@@ -940,18 +924,7 @@ impl NetworkRegistry {
                     .find(|member| member.identity == my_identity)
                     .and_then(|member| member.hostname.clone())
             })
-            .unwrap_or_else(|| {
-                let taken: Vec<&str> = data
-                    .members
-                    .iter()
-                    .filter(|member| member.identity != my_identity)
-                    .filter_map(|member| member.hostname.as_deref())
-                    .collect();
-                crate::hostname::default_hostname(
-                    config::load().ok().and_then(|cfg| cfg.default_hostname),
-                    &taken,
-                )
-            });
+            .unwrap_or_else(|| default_join_hostname(&data.members, my_identity));
         let alpn = transport::mesh_alpn();
         let invite_lock = Arc::new(AsyncMutex::new(()));
         let ctx = JoinContext {
@@ -975,7 +948,6 @@ impl NetworkRegistry {
             direct_exact_hash: None,
             direct_hash_published: None,
             cancel: cancel.clone(),
-            tasks: Vec::new(),
         };
         match self.finalize_join(ctx, &data, mesh).await? {
             TryJoin::Joined(_) => {}
@@ -1021,7 +993,6 @@ impl NetworkRegistry {
         conn: iroh::endpoint::Connection,
         initial: bool,
         cancel: &CancellationToken,
-        invite_secret: Option<Vec<u8>>,
     ) -> Result<JoinResult> {
         join_mesh_shared(
             conn,
@@ -1033,7 +1004,7 @@ impl NetworkRegistry {
                 my_hostname: Some(ctx.my_hostname.to_string()),
                 net_pubkey: ctx.net_pubkey,
                 device_cert: self.current_device_cert(),
-                invite_secret,
+                invite_secret: ctx.invite.clone(),
                 group_blob: data.clone(),
                 auto_accept_firewall: ctx.auto_accept_firewall,
                 auto_accept_files: ctx.auto_accept_files,
@@ -1061,7 +1032,6 @@ impl NetworkRegistry {
             direct_exact_hash,
             direct_hash_published,
             cancel,
-            mut tasks,
         } = mesh;
         let JoinContext {
             display_name,
@@ -1091,8 +1061,8 @@ impl NetworkRegistry {
             .unwrap()
             .snapshot
             .as_ref()
-            .map(|s| (s.hash, s.msgpack_bytes.clone()));
-        if let Some((_hash, bytes)) = snapshot
+            .map(|s| s.msgpack_bytes.clone());
+        if let Some(bytes) = snapshot
             && let Err(e) = self.transport.blob_store.blobs().add_slice(&bytes).await
         {
             tracing::warn!(error = %e, "failed to store local group snapshot");
@@ -1129,6 +1099,7 @@ impl NetworkRegistry {
         drop(commit_guard);
 
         let role = role_for_key_holder(held_key.is_some());
+        let mut tasks = Vec::new();
         let dht_notify = if let Some(key) = held_key.as_ref() {
             let notify = Arc::new(tokio::sync::Notify::new());
             let initially_published = (finalized_config.last_group_hash == converged_hash
@@ -1515,13 +1486,14 @@ impl NetworkRegistry {
                 crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                 // Register the route, then drive the new connection's control
                 // demux (which owns the data reader) and announce our handles.
-                let conn_changed = ctx.register_peer_conn(&peer_conn, m.identity, network_name);
-                if conn_changed {
-                    let router = Arc::clone(self.protocol_router());
-                    let dconn = peer_conn.clone();
-                    tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
-                }
-                announce_network_handles(&self.peers, &peer_conn, derive_ipv6(&m.identity)).await;
+                register_dialed_peer(
+                    &ctx,
+                    self.protocol_router(),
+                    peer_conn,
+                    m.identity,
+                    network_name,
+                )
+                .await;
                 // Eager-connect reachability: a successful dial marks the peer
                 // reachable so `ray status` shows it active/idle, not offline.
                 self.reachability.note_ok(m.identity);

@@ -90,7 +90,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::daemon::NetworkRegistry;
-use crate::membership::IdentityProvider;
 #[cfg(test)]
 use authz::resolve_user_policy;
 pub use authz::{SshAuthz, new_authz};
@@ -520,8 +519,6 @@ struct SshHandler {
     /// Shown before auth when the peer is unauthorized or restricted, so a
     /// refusal reaches the person connecting instead of only this node's log.
     banner: Option<String>,
-    /// The unix user the client asked to log in as (the `user` in `user@host`).
-    login_user: String,
     /// The resolved login account, set in `auth_none` once the requested user
     /// passes the policy, so the session task doesn't re-run `getpwnam`. Shared,
     /// never consumed: every channel on the connection logs in as this account.
@@ -564,7 +561,6 @@ impl SshHandler {
             policy,
             user,
             banner,
-            login_user: String::new(),
             login: None,
             channels: HashMap::new(),
             forwards: HashMap::new(),
@@ -696,7 +692,6 @@ impl Handler for SshHandler {
     }
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        self.login_user = user.to_string();
         if !self.policy.authorized() {
             info!(peer = %self.user.fmt_short(), "mesh SSH: rejecting unauthorized peer");
             return Ok(Auth::reject());
@@ -1043,7 +1038,7 @@ impl Handler for SshHandler {
             return Ok(false);
         }
         let peer = self.user;
-        let (agent_dir, listener, path) = match open_agent_socket(&info) {
+        let (agent_dir, listener) = match open_agent_socket(&info) {
             Ok(a) => a,
             Err(e) => {
                 warn!(peer = %peer.fmt_short(), error = %e,
@@ -1051,6 +1046,7 @@ impl Handler for SshHandler {
                 return Ok(false);
             }
         };
+        let path = agent_dir.join(AGENT_SOCKET);
         let token = self.token.child_token();
         let accept_token = token.clone();
         let socket = path.clone();
@@ -1312,21 +1308,24 @@ where
     let _ = handle.close(channel_id).await;
 }
 
+/// File name of the agent-forwarding socket inside its private directory.
+const AGENT_SOCKET: &str = "agent.sock";
+
 /// Create the agent-forwarding socket for one session: a private directory
 /// holding a single unix socket, both owned by the login account, so nothing
 /// but that account can talk to the peer's ssh-agent through it. Returns the
-/// directory, the bound listener, and the socket path the session's
-/// `SSH_AUTH_SOCK` will name.
+/// directory and the bound listener; the socket the session's `SSH_AUTH_SOCK`
+/// names is [`AGENT_SOCKET`] inside that directory.
 ///
 /// The directory name is random and created exclusively (`create_dir` fails on
 /// an existing path), so nothing can be waiting at the path to be handed the
 /// socket when the daemon chowns it away from root.
-fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf)> {
+fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener)> {
     let dir =
         std::env::temp_dir().join(format!("rayfish-ssh-agent.{:016x}", rand::random::<u64>()));
     std::fs::create_dir(&dir).context("creating the agent socket directory")?;
     hand_over(&dir, info, 0o700)?;
-    let path = dir.join("agent.sock");
+    let path = dir.join(AGENT_SOCKET);
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
@@ -1338,7 +1337,7 @@ fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    Ok((dir, listener, path))
+    Ok((dir, listener))
 }
 
 /// Which local address an `ssh -R` listener binds. A reverse forward publishes

@@ -34,6 +34,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Mesh SSH port mapping, TCP resets and Magic DNS replies now find the
+  TCP or UDP header after IPv6 extension headers instead of assuming it
+  starts at byte 40, which wrote the new port into the extension header.
+
+- Mesh SSH reports a child killed by USR2, TSTP, CONT or WINCH by its signal
+  name instead of a bare number the client could not read.
+
+- `ray files` shows transfer progress and state instead of only the
+  total size and file name.
+
+- A fresh install without `settings.toml` now starts with on-demand mode and
+  the macOS pf passthrough on, as documented. A pending-join update no longer
+  races with other settings writes and loses one of them.
+
+- Leaving a network could close a peer connection that a concurrent reconnect
+  had just reused for another network.
+
+- Turning mDNS discovery off while a window was opening could leave the mDNS
+  sockets open and still answering lookups.
+
 - Failed file downloads stay in `ray files` for retry with `ray files accept <id>`,
   reusing data already downloaded. Android offers Retry on Home and in notifications.
 

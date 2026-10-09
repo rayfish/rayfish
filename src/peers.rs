@@ -305,7 +305,12 @@ impl PeerEntry {
                 .clone()
         };
         let handle = self.out_handles.get(&network).copied().unwrap_or(0);
-        Some(PeerRoute {
+        Some(self.route_to(ip, network, handle))
+    }
+
+    /// The route over the current connection, tagged for `network` with `handle`.
+    fn route_to(&self, ip: Ipv6Addr, network: SmolStr, handle: u16) -> PeerRoute {
+        PeerRoute {
             conn: self.active.conn.clone(),
             scheduler: self.active.scheduler.clone(),
             endpoint_id: self.endpoint_id,
@@ -314,7 +319,7 @@ impl PeerEntry {
             handle,
             receive_mtu: Arc::clone(&self.active.receive_mtu),
             last_active: Arc::clone(&self.active.last_active),
-        })
+        }
     }
 }
 
@@ -341,11 +346,8 @@ impl PeerTable {
     /// to every per-network task (clones share the same audit handle).
     pub fn with_audit(audit: Arc<AuditLog>) -> Self {
         Self {
-            peers: Arc::new(FastDashMap::default()),
             audit: Some(audit),
-            version_incompatible: Arc::new(DashSet::default()),
-            local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
-            engine: QuicEngine::Standalone,
+            ..Self::new()
         }
     }
 
@@ -607,25 +609,14 @@ impl PeerTable {
     /// allow-list permits us. `None` if the peer isn't connected on `network`.
     pub fn route_on_network(&self, ip: &Ipv6Addr, network: &str) -> Option<PeerRoute> {
         let e = self.peers.get(ip)?;
-        if !e.out_handles.contains_key(network) {
-            return None;
-        }
-        let handle = e.out_handles.get(network).copied().unwrap_or(0);
-        Some(PeerRoute {
-            conn: e.active.conn.clone(),
-            scheduler: e.active.scheduler.clone(),
-            endpoint_id: e.endpoint_id,
-            ipv6: *ip,
-            network: SmolStr::new(network),
-            handle,
-            receive_mtu: Arc::clone(&e.active.receive_mtu),
-            last_active: Arc::clone(&e.active.last_active),
-        })
+        let handle = *e.out_handles.get(network)?;
+        Some(e.route_to(*ip, SmolStr::new(network), handle))
     }
 
     /// Resolve the network an inbound datagram belongs to from the peer's mesh
     /// IPv6 and the `u16` handle the peer stamped on it (looked up in the peer's
     /// announced inbound table). `None` if the peer or handle is unknown.
+    #[cfg(test)]
     pub fn inbound_network_v6(&self, ip: &Ipv6Addr, handle: u16) -> Option<SmolStr> {
         self.peers
             .get(ip)
@@ -812,20 +803,16 @@ impl PeerTable {
     /// peer's connection **iff** this removed its last shared network (so the
     /// caller can close the now-unused connection); `None` otherwise.
     pub fn remove_peer_from_network(&self, ip: &Ipv6Addr, network: &str) -> Option<Connection> {
-        let mut last_conn = None;
-        let mut dropped_id = None;
-        if let Some(mut e) = self.peers.get_mut(ip) {
+        // One locked pass: a separate check and removal would let a concurrent
+        // `add` keep the entry while its connection is still handed back to close.
+        let (_, entry) = self.peers.remove_if_mut(ip, |_, e| {
             e.out_handles.remove(network);
-            if e.out_handles.is_empty() {
-                last_conn = Some(e.active.conn.clone());
-                dropped_id = Some(e.endpoint_id);
-            }
+            e.out_handles.is_empty()
+        })?;
+        if let Some(audit) = &self.audit {
+            audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
         }
-        self.peers.remove_if(ip, |_, e| e.out_handles.is_empty());
-        if let (Some(endpoint_id), Some(audit)) = (dropped_id, &self.audit) {
-            audit.log_disconnect(*ip, &endpoint_id.to_string());
-        }
-        last_conn
+        Some(entry.active.conn)
     }
 
     /// Drop the peer identified by its transport `peer_id` from `network`. Used by
@@ -840,36 +827,6 @@ impl PeerTable {
         network: &str,
     ) -> Option<Connection> {
         self.remove_peer_from_network(&membership::derive_ipv6(peer_id), network)
-    }
-
-    /// Connection-aware variant of [`remove_peer_from_network`]: drops the
-    /// peer's membership in `network` only if the connection currently stored is
-    /// the same one identified by `stable_id`. Returns the connection iff this
-    /// removed the peer's last shared network (same contract as
-    /// [`remove_peer_from_network`]); `None` if it did not act (stale connection)
-    /// or other networks remain.
-    ///
-    /// This guards the ABA race described on [`forward::DisconnectEvent`]: a
-    /// stale connection's delayed disconnect must not evict the fresh connection
-    /// that already replaced it in the table after a peer re-dialed.
-    pub fn remove_peer_from_network_if(
-        &self,
-        ip: &Ipv6Addr,
-        network: &str,
-        stable_id: usize,
-    ) -> Option<Connection> {
-        // Read-and-compare in its own statement so the DashMap read guard is
-        // dropped before remove_peer_from_network takes a write guard on the
-        // same shard.
-        let matches = self
-            .peers
-            .get(ip)
-            .map(|e| e.out_handles.contains_key(network) && e.active.conn.stable_id() == stable_id)
-            .unwrap_or(false);
-        if !matches {
-            return None;
-        }
-        self.remove_peer_from_network(ip, network)
     }
 
     /// True if the stored connection for the peer at `ip` is the one identified

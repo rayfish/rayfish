@@ -292,6 +292,8 @@ impl DnsConfigurator for SystemdResolvedCli {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
+#[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub(super) enum ResolvconfVariant {
     Debian,
     Openresolv,
@@ -407,12 +409,8 @@ impl Resolvconf {
 impl DnsConfigurator for Resolvconf {
     async fn apply(&self) -> Result<()> {
         self.register().await?;
-        let variant_name = match self.variant {
-            ResolvconfVariant::Debian => "debian",
-            ResolvconfVariant::Openresolv => "openresolv",
-        };
         tracing::info!(
-            variant = variant_name,
+            variant = <&str>::from(&self.variant),
             "configured resolvconf for .{DNS_DOMAIN}"
         );
         Ok(())

@@ -1,6 +1,6 @@
 //! The set of rayfish nodes seen on the local network over mDNS.
 //!
-//! The mDNS browse loop in `mesh::bootstrap` feeds this map; it is the only
+//! The mDNS discovery windows in `daemon::mdns` feed this map; it is the only
 //! place LAN sightings are kept. Two consumers read it: `ray mdns scan` (which
 //! lists it) and `ConnectService::connect` (which uses it to dial a neighbour by
 //! endpoint id, skipping the pkarr contact lookup).
@@ -69,7 +69,8 @@ impl LanPeers {
             .iter()
             .map(|e| (*e.key(), e.value().clone()))
             .collect();
-        out.sort_by_key(|(id, _)| id.to_string());
+        // Key bytes order the same as their fixed-width hex form.
+        out.sort_by_key(|(id, _)| *id);
         out
     }
 

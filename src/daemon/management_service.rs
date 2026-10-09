@@ -512,6 +512,15 @@ impl ManagementService {
         }
     }
 
+    /// The networks this node is currently on, as reported in a status reply.
+    fn local_networks(&self) -> Vec<NetworkName> {
+        self.registry
+            .networks
+            .iter()
+            .map(|entry| NetworkName::new(entry.key().clone()))
+            .collect()
+    }
+
     fn local_hostname(&self) -> anyhow::Result<MachineHostname> {
         let settings = config::load()?;
         if let Some(hostname) = settings.default_hostname {
@@ -611,32 +620,28 @@ impl ManagementService {
                 self.send_request(machine.identity, ManagementAction::Status),
             )
             .await;
+            // Unreachable or failed probes keep the recorded last-seen time.
+            let mut info = ipc::ManagedMachineInfo {
+                identity: machine.identity,
+                hostname: machine.hostname,
+                enrolled_at: machine.enrolled_at,
+                last_seen: machine.last_seen,
+                state: ipc::ManagedMachineState::Offline,
+                networks: Vec::new(),
+            };
             match status {
-                Ok(Ok(ManagementResult::Status { networks, .. })) => ipc::ManagedMachineInfo {
-                    identity: machine.identity,
-                    hostname: machine.hostname,
-                    enrolled_at: machine.enrolled_at,
-                    last_seen: Some(now()),
-                    state: ipc::ManagedMachineState::Online,
-                    networks,
-                },
-                Ok(Ok(ManagementResult::Unauthorized)) => ipc::ManagedMachineInfo {
-                    identity: machine.identity,
-                    hostname: machine.hostname,
-                    enrolled_at: machine.enrolled_at,
-                    last_seen: Some(now()),
-                    state: ipc::ManagedMachineState::Unauthorized,
-                    networks: Vec::new(),
-                },
-                _ => ipc::ManagedMachineInfo {
-                    identity: machine.identity,
-                    hostname: machine.hostname,
-                    enrolled_at: machine.enrolled_at,
-                    last_seen: machine.last_seen,
-                    state: ipc::ManagedMachineState::Offline,
-                    networks: Vec::new(),
-                },
+                Ok(Ok(ManagementResult::Status { networks, .. })) => {
+                    info.state = ipc::ManagedMachineState::Online;
+                    info.last_seen = Some(now());
+                    info.networks = networks;
+                }
+                Ok(Ok(ManagementResult::Unauthorized)) => {
+                    info.state = ipc::ManagedMachineState::Unauthorized;
+                    info.last_seen = Some(now());
+                }
+                _ => {}
             }
+            info
         }))
         .await;
         IpcMessage::ManagedMachinesResponse { machines: results }
@@ -1154,12 +1159,7 @@ impl ManagementService {
                         self.hello_notify.notify_one();
                         ManagementResult::Status {
                             hostname,
-                            networks: self
-                                .registry
-                                .networks
-                                .iter()
-                                .map(|entry| NetworkName::new(entry.key().clone()))
-                                .collect(),
+                            networks: self.local_networks(),
                         }
                     }
                     Err(error) => ManagementResult::Error {
@@ -1170,12 +1170,7 @@ impl ManagementService {
             ManagementAction::Status => match self.local_hostname() {
                 Ok(hostname) => ManagementResult::Status {
                     hostname,
-                    networks: self
-                        .registry
-                        .networks
-                        .iter()
-                        .map(|entry| NetworkName::new(entry.key().clone()))
-                        .collect(),
+                    networks: self.local_networks(),
                 },
                 Err(error) => ManagementResult::Error {
                     message: format!("failed to read machine hostname: {error}"),
