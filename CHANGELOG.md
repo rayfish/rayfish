@@ -34,6 +34,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Mesh SSH port mapping, TCP resets and Magic DNS replies now find the
+  TCP or UDP header after IPv6 extension headers instead of assuming it
+  starts at byte 40, which wrote the new port into the extension header.
+
 - Mesh SSH reports a child killed by USR2, TSTP, CONT or WINCH by its signal
   name instead of a bare number the client could not read.
 

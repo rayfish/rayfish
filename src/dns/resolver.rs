@@ -249,15 +249,9 @@ impl Resolver {
         if info.protocol != 17 {
             return; // TCP/other: drop cleanly.
         }
-        // UDP payload begins after the IP header + the 8-byte UDP header. IPv4's
-        // header is IHL words long; IPv6's is a fixed 40 bytes (`parse_packet_info`
-        // read the next-header field directly, so there are no extension headers
-        // to walk past here).
-        let ip_header_len = match info.dst_ip {
-            IpAddr::V6(_) => 40,
-            IpAddr::V4(_) => ((pkt.first().copied().unwrap_or(0) & 0x0f) as usize) * 4,
-        };
-        let payload_start = ip_header_len + 8;
+        // UDP payload begins after the UDP header, which starts where the parser
+        // found it (past IPv4 options or any IPv6 extension headers).
+        let payload_start = info.transport_offset + 8;
         let Some(dns_query) = pkt.get(payload_start..) else {
             return;
         };
@@ -656,6 +650,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let query_pkt = crate::dns::packet::build_udp_reply(
             &crate::firewall::PacketInfo {
@@ -697,6 +692,7 @@ mod tests {
             tcp_flags: 0x02,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 20,
         };
         r.handle_tun_query(&[0u8; 40], &info, &tx).await;
         assert!(rx.try_recv().is_err(), "TCP must be dropped, no reply");
@@ -841,6 +837,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let query_pkt = crate::dns::packet::build_udp_reply(
             &crate::firewall::PacketInfo {
@@ -919,6 +916,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let query_pkt = crate::dns::packet::build_udp_reply(
             &crate::firewall::PacketInfo {

@@ -109,6 +109,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let dns = b"\x12\x34\x81\x80\x00\x00\x00\x00\x00\x00\x00\x00";
         let pkt = build_udp_reply(&query, dns).expect("v6 reply");
@@ -148,6 +149,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 20,
         };
         assert!(build_udp_reply(&query, b"\x00\x00").is_none());
     }
@@ -163,6 +165,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         // One byte past what fits: the largest payload that does still builds.
         let fits = MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN;

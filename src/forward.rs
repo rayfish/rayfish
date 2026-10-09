@@ -169,11 +169,9 @@ fn rewrite_ssh_port(pkt: &mut [u8], info: &firewall::PacketInfo, inbound: bool) 
     if info.protocol != 6 {
         return false; // TCP only
     }
-    let ihl = match pkt.first().map(|b| b >> 4) {
-        Some(4) => ((pkt[0] & 0x0f) as usize) * 4,
-        Some(6) => 40, // rayfish packets carry no IPv6 extension headers
-        _ => return false,
-    };
+    // The parser already walked any IPv6 extension headers, so this is where
+    // the TCP header really starts.
+    let ihl = info.transport_offset;
     if pkt.len() < ihl + 18 {
         return false;
     }
@@ -534,8 +532,8 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             }
             tracing::trace!(len = n, first_byte = pkt[0], "TUN read");
             let Some(info) = firewall::parse_packet_info(&pkt) else {
-                // Not IP, truncated, or IPv6 carrying an extension header we refuse
-                // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
+                // Not IP, truncated, a fragment, or IPv6 with an extension-header
+                // chain the parser refuses to walk. Counted rather than merely
                 // logged: a UDP send past the TUN MTU arrives here as kernel-made
                 // fragments, and a silent drop reads as the link going quiet.
                 tracing::debug!(len = n, "outbound packet not classifiable, dropping");
@@ -1202,6 +1200,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 129,
             icmp_id: 1,
+            transport_offset: 40,
         };
         assert!(firewall::is_icmp_echo_reply(info.protocol, info.icmp_type));
         info.icmp_type = 128;
@@ -1916,7 +1915,12 @@ mod tests {
     /// the upper-layer length as a 32-bit big-endian, three zero bytes and the
     /// next-header value, followed by the TCP segment itself.
     fn tcp_csum_v6(pkt: &[u8]) -> u16 {
-        let tcp = &pkt[40..];
+        tcp_csum_v6_at(pkt, 40)
+    }
+
+    /// [`tcp_csum_v6`] for a TCP header at `tcp_off`, past any extension headers.
+    fn tcp_csum_v6_at(pkt: &[u8], tcp_off: usize) -> u16 {
+        let tcp = &pkt[tcp_off..];
         let mut sum: u32 = 0;
         for chunk in pkt[8..40].chunks(2) {
             sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
@@ -1993,6 +1997,41 @@ mod tests {
         assert!(rewrite_ssh_port(&mut pkt, &reply, false));
         assert_eq!(firewall::parse_packet_info(&pkt).unwrap().src_port, 2222);
         assert_eq!(u16::from_be_bytes([pkt[56], pkt[57]]), tcp_csum_v6(&pkt));
+
+        // A hop-by-hop header before TCP: the port and checksum live past it, at
+        // the offset the parser found, and the extension header is left alone.
+        // Kept in this test because the NAT config is process-global.
+        let mut ext = vec![0u8; 68];
+        ext[0] = 0x60;
+        ext[4..6].copy_from_slice(&28u16.to_be_bytes()); // 8 hop-by-hop + 20 TCP
+        ext[6] = 0; // next header = hop-by-hop
+        ext[7] = 64;
+        ext[8..24].copy_from_slice(&Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 9).octets());
+        ext[24..40].copy_from_slice(&our_v6.octets());
+        ext[40] = 6; // hop-by-hop next header = TCP
+        ext[41] = 0; // 8 octets
+        ext[42] = 1; // PadN option filling the rest
+        ext[43] = 4;
+        ext[48..50].copy_from_slice(&5000u16.to_be_bytes());
+        ext[50..52].copy_from_slice(&2222u16.to_be_bytes());
+        ext[60] = 0x50;
+        let ck = tcp_csum_v6_at(&ext, 48);
+        ext[64..66].copy_from_slice(&ck.to_be_bytes());
+        let hop_by_hop: [u8; 8] = ext[40..48].try_into().expect("8-byte slice");
+
+        let info = firewall::parse_packet_info(&ext).unwrap();
+        assert_eq!(info.transport_offset, 48);
+        assert!(rewrite_ssh_port(&mut ext, &info, true));
+        assert_eq!(ext[40..48], hop_by_hop, "extension header untouched");
+        assert_eq!(
+            firewall::parse_packet_info(&ext).unwrap().dst_port,
+            listen_port
+        );
+        assert_eq!(
+            u16::from_be_bytes([ext[64], ext[65]]),
+            tcp_csum_v6_at(&ext, 48),
+            "checksum stays valid behind an extension header"
+        );
 
         // Inactive -> no rewrite.
         set_ssh_nat_active(false);
@@ -2491,6 +2530,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         assert!(is_magic_dns(&mk(IpAddr::V6(crate::dns::MAGIC_DNS_V6), 53)));
         assert!(!is_magic_dns(&mk(IpAddr::V6(crate::dns::MAGIC_DNS_V6), 80)));

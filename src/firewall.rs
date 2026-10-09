@@ -977,8 +977,8 @@ mod tests {
         assert!(parse_packet_info(&pkt).is_none());
     }
 
-    /// An extension header is refused rather than read as the upper-layer
-    /// protocol. The reason is the conntrack key, not the parse: see
+    /// An extension header is walked past rather than read as the upper-layer
+    /// protocol, and the transport offset records where the walk ended. See
     /// [`IPV6_EXTENSION_HEADERS`].
     #[test]
     fn an_ipv6_extension_header_is_walked_past_to_the_real_protocol() {
@@ -989,6 +989,10 @@ mod tests {
             parse_packet_info(&pkt).map(|i| (i.protocol, i.src_port, i.dst_port)),
             Some((6, 4444, 443)),
             "byte 6 is the chain's first link, not the protocol"
+        );
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| i.transport_offset),
+            Some(48)
         );
 
         // Two links deep: hop-by-hop, destination options, then TCP at 56.
@@ -1549,6 +1553,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 20,
         };
         let peer = test_id(1);
         // The peer shares both networks, so the scoped deny applies.
