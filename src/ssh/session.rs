@@ -47,47 +47,134 @@ impl Exit {
     }
 }
 
-fn signal_name(signal: i32) -> Sig {
-    match signal {
-        libc::SIGABRT => Sig::ABRT,
-        libc::SIGALRM => Sig::ALRM,
-        libc::SIGFPE => Sig::FPE,
-        libc::SIGHUP => Sig::HUP,
-        libc::SIGILL => Sig::ILL,
-        libc::SIGINT => Sig::INT,
-        libc::SIGKILL => Sig::KILL,
-        libc::SIGPIPE => Sig::PIPE,
-        libc::SIGQUIT => Sig::QUIT,
-        libc::SIGSEGV => Sig::SEGV,
-        libc::SIGTERM => Sig::TERM,
-        libc::SIGUSR1 => Sig::USR1,
+/// A unix signal with its RFC 4254 section 6.10 name, which drops the `SIG`
+/// prefix (`USR2`, not `SIGUSR2` or `12`).
+struct NamedSignal {
+    name: &'static str,
+    number: i32,
+}
+
+/// The one table both directions read, so the exit-signal names sent to the
+/// client and the signal requests accepted from it cannot drift apart.
+const SIGNALS: &[NamedSignal] = &[
+    NamedSignal {
+        name: "ABRT",
+        number: libc::SIGABRT,
+    },
+    NamedSignal {
+        name: "ALRM",
+        number: libc::SIGALRM,
+    },
+    NamedSignal {
+        name: "FPE",
+        number: libc::SIGFPE,
+    },
+    NamedSignal {
+        name: "HUP",
+        number: libc::SIGHUP,
+    },
+    NamedSignal {
+        name: "ILL",
+        number: libc::SIGILL,
+    },
+    NamedSignal {
+        name: "INT",
+        number: libc::SIGINT,
+    },
+    NamedSignal {
+        name: "KILL",
+        number: libc::SIGKILL,
+    },
+    NamedSignal {
+        name: "PIPE",
+        number: libc::SIGPIPE,
+    },
+    NamedSignal {
+        name: "QUIT",
+        number: libc::SIGQUIT,
+    },
+    NamedSignal {
+        name: "SEGV",
+        number: libc::SIGSEGV,
+    },
+    NamedSignal {
+        name: "TERM",
+        number: libc::SIGTERM,
+    },
+    NamedSignal {
+        name: "USR1",
+        number: libc::SIGUSR1,
+    },
+    NamedSignal {
+        name: "USR2",
+        number: libc::SIGUSR2,
+    },
+    NamedSignal {
+        name: "TSTP",
+        number: libc::SIGTSTP,
+    },
+    NamedSignal {
+        name: "CONT",
+        number: libc::SIGCONT,
+    },
+    NamedSignal {
+        name: "WINCH",
+        number: libc::SIGWINCH,
+    },
+];
+
+/// The wire name of `sig`. russh keeps its own `Sig::name` private.
+fn sig_wire_name(sig: &Sig) -> &str {
+    match sig {
+        Sig::ABRT => "ABRT",
+        Sig::ALRM => "ALRM",
+        Sig::FPE => "FPE",
+        Sig::HUP => "HUP",
+        Sig::ILL => "ILL",
+        Sig::INT => "INT",
+        Sig::KILL => "KILL",
+        Sig::PIPE => "PIPE",
+        Sig::QUIT => "QUIT",
+        Sig::SEGV => "SEGV",
+        Sig::TERM => "TERM",
+        Sig::USR1 => "USR1",
+        Sig::Custom(name) => name,
+    }
+}
+
+/// Builds the `Sig` russh would decode for `name`, so named variants stay
+/// named and everything else becomes `Custom`.
+fn sig_from_wire_name(name: &str) -> Sig {
+    match name {
+        "ABRT" => Sig::ABRT,
+        "ALRM" => Sig::ALRM,
+        "FPE" => Sig::FPE,
+        "HUP" => Sig::HUP,
+        "ILL" => Sig::ILL,
+        "INT" => Sig::INT,
+        "KILL" => Sig::KILL,
+        "PIPE" => Sig::PIPE,
+        "QUIT" => Sig::QUIT,
+        "SEGV" => Sig::SEGV,
+        "TERM" => Sig::TERM,
+        "USR1" => Sig::USR1,
         other => Sig::Custom(other.to_string()),
+    }
+}
+
+/// Maps a local unix signal to the name reported in an SSH exit-signal.
+/// A signal outside the table falls back to its number.
+fn signal_name(signal: i32) -> Sig {
+    match SIGNALS.iter().find(|s| s.number == signal) {
+        Some(s) => sig_from_wire_name(s.name),
+        None => Sig::Custom(signal.to_string()),
     }
 }
 
 /// Maps a client's SSH signal request to its local unix signal number.
 pub(super) fn signal_number(signal: &Sig) -> Option<i32> {
-    Some(match signal {
-        Sig::ABRT => libc::SIGABRT,
-        Sig::ALRM => libc::SIGALRM,
-        Sig::FPE => libc::SIGFPE,
-        Sig::HUP => libc::SIGHUP,
-        Sig::ILL => libc::SIGILL,
-        Sig::INT => libc::SIGINT,
-        Sig::KILL => libc::SIGKILL,
-        Sig::PIPE => libc::SIGPIPE,
-        Sig::QUIT => libc::SIGQUIT,
-        Sig::SEGV => libc::SIGSEGV,
-        Sig::TERM => libc::SIGTERM,
-        Sig::USR1 => libc::SIGUSR1,
-        Sig::Custom(name) => match name.as_str() {
-            "USR2" => libc::SIGUSR2,
-            "TSTP" => libc::SIGTSTP,
-            "CONT" => libc::SIGCONT,
-            "WINCH" => libc::SIGWINCH,
-            _ => return None,
-        },
-    })
+    let name = sig_wire_name(signal);
+    SIGNALS.iter().find(|s| s.name == name).map(|s| s.number)
 }
 
 /// Allocate a PTY, spawn the login shell (or `exec` command), and transfer
@@ -260,5 +347,29 @@ where
             Ok(length) if send(Bytes::copy_from_slice(&buf[..length])).await.is_err() => break,
             Ok(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_signal_round_trips() {
+        for s in SIGNALS {
+            let sig = signal_name(s.number);
+            assert_eq!(sig_wire_name(&sig), s.name, "signal {}", s.number);
+            assert_eq!(signal_number(&sig), Some(s.number), "signal {}", s.name);
+            let decoded = sig_from_wire_name(s.name);
+            assert_eq!(signal_number(&decoded), Some(s.number), "signal {}", s.name);
+        }
+    }
+
+    #[test]
+    fn custom_names_have_no_prefix_or_number() {
+        assert_eq!(sig_wire_name(&signal_name(libc::SIGUSR2)), "USR2");
+        assert_eq!(sig_wire_name(&signal_name(libc::SIGWINCH)), "WINCH");
+        assert_eq!(signal_number(&Sig::Custom("SIGUSR2".into())), None);
+        assert_eq!(signal_number(&Sig::Custom("12".into())), None);
     }
 }

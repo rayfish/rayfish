@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Mesh SSH reports a child killed by USR2, TSTP, CONT or WINCH by its signal
+  name instead of a bare number the client could not read.
+
 - `ray files` shows transfer progress and state again instead of only the
   total size and file name.
 
