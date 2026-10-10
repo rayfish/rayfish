@@ -981,7 +981,8 @@ pub(crate) enum ConfigAction {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum MdnsAction {
     /// Enable mDNS local peer discovery
     On,
@@ -994,7 +995,8 @@ pub(crate) enum MdnsAction {
     Scan,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum DnsAction {
     /// Configure the system resolver for .ray names
     On,
@@ -1357,16 +1359,16 @@ pub(crate) enum FilesAutoAcceptAction {
 }
 
 fn check_root() {
-    #[cfg(windows)]
-    return;
     #[cfg(unix)]
-    if uzers::get_effective_uid() == 0 || has_cap_net_admin() {
-        return;
+    {
+        if uzers::get_effective_uid() == 0 || has_cap_net_admin() {
+            return;
+        }
+        eprintln!(
+            "rayfish needs root or CAP_NET_ADMIN to create TUN devices. Run with sudo, or use the systemd unit (which grants CAP_NET_ADMIN to a dynamic user)."
+        );
+        std::process::exit(1);
     }
-    eprintln!(
-        "rayfish needs root or CAP_NET_ADMIN to create TUN devices. Run with sudo, or use the systemd unit (which grants CAP_NET_ADMIN to a dynamic user)."
-    );
-    std::process::exit(1);
 }
 
 /// Whether this process holds CAP_NET_ADMIN — i.e. it is running under a
@@ -1886,25 +1888,18 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
         .await
         .context("rayfish daemon is not running; start it with: sudo ray up")?;
     ipc::send(&mut stream, msg).await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(ipc::recv(&mut stream).await?)
 }
 
 /// `ray mdns on|off|scan`. The two toggles are the `mdns` settings key under
 /// another name; `scan` is a read and goes its own way.
 async fn cmd_mdns(action: MdnsAction) -> Result<()> {
-    let state = match action {
-        MdnsAction::On => "on",
-        MdnsAction::Off => "off",
-        MdnsAction::Scan => return ipc_lan_peers().await,
-    };
+    if matches!(action, MdnsAction::Scan) {
+        return ipc_lan_peers().await;
+    }
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
-        value: state.to_string(),
+        value: action.to_string(),
         replace: false,
     })
     .await
@@ -1912,14 +1907,9 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
 
 /// `ray dns on|off`: apply or remove Magic DNS without changing the data plane.
 async fn cmd_dns(action: DnsAction) -> Result<()> {
-    let state = match action {
-        DnsAction::On => "on",
-        DnsAction::Partial => "partial",
-        DnsAction::Off => "off",
-    };
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Dns),
-        value: state.to_string(),
+        value: action.to_string(),
         replace: false,
     })
     .await
@@ -2077,16 +2067,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
         let uid = uid_for_user(user).ok_or_else(|| {
             anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)")
         })?;
-        let mut stream = ipc::connect()
-            .await
-            .context("rayfish daemon is not running; start it with: sudo ray up")?;
-        ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
-        match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => fail_with("error", &message),
-            other => fail_unexpected(&other),
-        }
-        Ok(())
+        ipc_mutate(ipc::IpcMessage::SetOperator { uid }).await
     }
 }
 

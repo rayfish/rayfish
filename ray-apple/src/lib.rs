@@ -464,7 +464,7 @@ impl Node {
                     identity: machine.identity.to_string(),
                     hostname: machine.hostname.to_string(),
                     ipv6: membership::derive_ipv6(&machine.identity).to_string(),
-                    state: machine.state.as_str().to_owned(),
+                    state: <&str>::from(machine.state).to_owned(),
                     networks: machine
                         .networks
                         .into_iter()

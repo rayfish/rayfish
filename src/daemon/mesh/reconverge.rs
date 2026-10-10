@@ -173,7 +173,7 @@ pub(crate) async fn fetch_verified_blob(
         .map(|(id, _)| id)
         .collect();
     peer_ids.extend_from_slice(seeds);
-    peer_ids.sort_by_key(|id| id.to_string());
+    peer_ids.sort();
     peer_ids.dedup();
     for pid in &peer_ids {
         let Ok(conn) =
@@ -242,6 +242,30 @@ fn current_group_hash(state: &NetworkState) -> blake3::Hash {
     )
 }
 
+/// Replace the blob-derived fields of `state` with a verified blob at `signed`
+/// and refresh the snapshot. The caller holds `snapshot_commit` and the write
+/// guard, and has already revalidated the generation.
+fn adopt_blob(state: &mut NetworkState, data: crate::membership::GroupBlob, signed: blake3::Hash) {
+    state.members = MemberList::from_members(data.members);
+    state.approved = ApprovedList::from_entries(data.approved);
+    state.suggested_firewall = data.suggested_firewall;
+    state.group_name = data.name;
+    state.reusable_keys = data.reusable_keys;
+    state.nullifiers = data.nullifiers;
+    state.refresh_snapshot();
+    state.converged_hash = Some(signed);
+}
+
+/// Our own primary nullified this device in a verified blob: tear ourselves
+/// out on a separate task, so teardown does not wait on the caller.
+fn spawn_self_unpair(registry: &Arc<NetworkRegistry>, network_name: &str) {
+    tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+    let registry = Arc::clone(registry);
+    tokio::spawn(async move {
+        let _ = registry.unpair_self().await;
+    });
+}
+
 /// Reconverge the live network state from the signed pkarr record and apply it
 /// (roster + DNS + suggested firewall). Invoked when a peer sends a `MemberSync`
 /// or `BlobUpdated` *hint*: the hint is only a trigger; the roster/firewall come
@@ -305,11 +329,7 @@ pub(crate) async fn reconverge_and_apply(
         if let Some(cert) = device_cert
             && self_is_nullified(cert, &roster, &nullifiers)
         {
-            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = Arc::clone(registry);
-            tokio::spawn(async move {
-                let _ = registry.unpair_self().await;
-            });
+            spawn_self_unpair(registry, network_name);
             return;
         }
         drain_pending_rename(
@@ -388,23 +408,12 @@ pub(crate) async fn reconverge_and_apply(
         }
         if self_nullified {
             drop(s);
-            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = Arc::clone(registry);
-            tokio::spawn(async move {
-                let _ = registry.unpair_self().await;
-            });
+            spawn_self_unpair(registry, network_name);
             return;
         }
-        s.members = MemberList::from_members(data.members.clone());
-        s.approved = ApprovedList::from_entries(data.approved.clone());
-        s.suggested_firewall = data.suggested_firewall.clone();
-        s.group_name = data.name.clone();
-        s.reusable_keys = data.reusable_keys.clone();
-        s.nullifiers = data.nullifiers.clone();
-        s.refresh_snapshot();
         // What the network agreed on, which is not our re-encoding of it unless
         // the publisher writes the same bytes we would. See `converged_hash`.
-        s.converged_hash = Some(signed);
+        adopt_blob(&mut s, data, signed);
         s.last_record_timestamp = Some(record_ts);
         s.roster()
     };
@@ -640,11 +649,11 @@ pub(crate) async fn apply_roster_to_dns(
                     blob = blob_self.as_deref().unwrap_or("<none>"),
                     "rename still unconfirmed by signed blob; holding local name and keeping it queued for delivery"
                 );
-                if let Some(me) = members.iter().find(|m| m.identity == my_identity) {
+                if members.iter().any(|m| m.identity == my_identity) {
                     // Override our own DNS entry so `.ray` resolution and
                     // `ray status` reflect the pending name immediately.
                     let v6 = derive_ipv6(&my_identity);
-                    entries.retain(|(_, addr)| *addr != derive_ipv6(&me.identity));
+                    entries.retain(|(_, addr)| *addr != v6);
                     entries.push((pending.clone(), v6));
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
@@ -894,11 +903,7 @@ pub(crate) async fn fetch_and_apply_blob(
         }
         if self_nullified {
             drop(s);
-            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = Arc::clone(registry);
-            tokio::spawn(async move {
-                let _ = registry.unpair_self().await;
-            });
+            spawn_self_unpair(registry, network_name);
             return ReconvergeOutcome::Departed;
         }
         if self_removed {
@@ -914,16 +919,9 @@ pub(crate) async fn fetch_and_apply_blob(
             });
             return ReconvergeOutcome::Departed;
         }
-        s.members = MemberList::from_members(data.members.clone());
-        s.approved = ApprovedList::from_entries(data.approved.clone());
-        s.suggested_firewall = data.suggested_firewall.clone();
-        s.group_name = data.name.clone();
-        s.reusable_keys = data.reusable_keys.clone();
-        s.nullifiers = data.nullifiers.clone();
-        s.refresh_snapshot();
         // The hash the network agreed on, not our re-encoding of it. See
         // `converged_hash`.
-        s.converged_hash = Some(remote_hash);
+        adopt_blob(&mut s, data, remote_hash);
     }
 
     // Revoke the removed peer's network route immediately. If this was the last
@@ -956,12 +954,7 @@ pub(crate) async fn fetch_and_apply_blob(
 
 /// Current Unix time in seconds. Reusable-key expiry uses wall-clock time (the
 /// same convention as the single-use invite ledger).
-pub(crate) fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+pub(crate) use crate::membership::now_secs;
 
 #[cfg(test)]
 mod reconverge_tests {

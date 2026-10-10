@@ -8,6 +8,8 @@
 pub(crate) mod fq_codel;
 mod fragment;
 mod lazy_dial;
+#[cfg(test)]
+mod mock_tun_tests;
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
@@ -169,11 +171,9 @@ fn rewrite_ssh_port(pkt: &mut [u8], info: &firewall::PacketInfo, inbound: bool) 
     if info.protocol != 6 {
         return false; // TCP only
     }
-    let ihl = match pkt.first().map(|b| b >> 4) {
-        Some(4) => ((pkt[0] & 0x0f) as usize) * 4,
-        Some(6) => 40, // rayfish packets carry no IPv6 extension headers
-        _ => return false,
-    };
+    // The parser already walked any IPv6 extension headers, so this is where
+    // the TCP header really starts.
+    let ihl = info.transport_offset;
     if pkt.len() < ihl + 18 {
         return false;
     }
@@ -199,8 +199,9 @@ fn rewrite_ssh_port(pkt: &mut [u8], info: &firewall::PacketInfo, inbound: bool) 
 
 /// Decision returned by [`evaluate_inbound`] for a datagram received from a peer.
 pub(crate) enum InboundDecision {
-    /// Packet passed the firewall check and may be written to the TUN.
-    Accept,
+    /// Packet passed the firewall check and may be written to the TUN. Carries
+    /// the parsed packet so the accept path does not parse it again.
+    Accept(firewall::PacketInfo),
     /// Dropped by the local firewall. Carries the parsed packet so a fail-fast
     /// REJECT reply can be built without re-parsing.
     DropFirewall(firewall::PacketInfo),
@@ -273,7 +274,6 @@ fn evaluate_inbound(
         // dialed is a different matter, and it can't.)
         let dst_is_me = matches!(info.dst_ip, IpAddr::V6(v6) if v6 == exit.my_v6);
         let exit_return = exit.client.is_return_from(peer_id, peer_ipv6)
-            && !is_overlay_ip(info.src_ip)
             && is_transitable(info.src_ip)
             && dst_is_me;
         if !exit_return {
@@ -314,7 +314,7 @@ fn evaluate_inbound(
             && !exit.server.is_on_link(info.dst_ip)
             && !exit.server.is_self_addr(info.dst_ip);
         return if permitted {
-            InboundDecision::Accept
+            InboundDecision::Accept(info)
         } else {
             InboundDecision::DropExit
         };
@@ -325,7 +325,7 @@ fn evaluate_inbound(
     {
         return InboundDecision::DropFirewall(info);
     }
-    InboundDecision::Accept
+    InboundDecision::Accept(info)
 }
 
 /// Application close code a peer sends when it deliberately leaves a network
@@ -511,6 +511,12 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             .as_ref()
             .map(|r| r.exit_client.clone())
             .unwrap_or_default();
+        let ctx = SendCtx {
+            firewall: &firewall,
+            peers: &peers,
+            stats: &stats,
+            tun_tx: &tun_tx,
+        };
         loop {
             let pkt = tokio::select! {
                 _ = token.cancelled() => return Ok(()),
@@ -518,8 +524,7 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                 Some((peer, connected)) = done_rx.recv() => {
                     in_flight.remove(&peer);
                     let pkts = buffered.take(&peer);
-                    let ctx = SendCtx { firewall: &firewall, peers: &peers, stats: &stats, tun_tx: &tun_tx };
-                    flush_or_drop(&peers, &ctx, &exit_client, connected, pkts).await;
+                    flush_or_drop(&ctx, &exit_client, connected, pkts).await;
                     continue;
                 }
             };
@@ -529,8 +534,8 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             }
             tracing::trace!(len = n, first_byte = pkt[0], "TUN read");
             let Some(info) = firewall::parse_packet_info(&pkt) else {
-                // Not IP, truncated, or IPv6 carrying an extension header we refuse
-                // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
+                // Not IP, truncated, a fragment, or IPv6 with an extension-header
+                // chain the parser refuses to walk. Counted rather than merely
                 // logged: a UDP send past the TUN MTU arrives here as kernel-made
                 // fragments, and a silent drop reads as the link going quiet.
                 tracing::debug!(len = n, "outbound packet not classifiable, dropping");
@@ -553,7 +558,7 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             // are idle. A kernel echo reply to a remote ping is not local demand.
             #[cfg(target_os = "android")]
             if let Some(reg) = dialer.as_ref() {
-                if is_icmp_echo_reply(&info) {
+                if firewall::is_icmp_echo_reply(info.protocol, info.icmp_type) {
                     if reg.transport.is_suspended() {
                         continue;
                     }
@@ -618,22 +623,9 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
 
                 continue;
             };
-            let ctx = SendCtx {
-                firewall: &firewall,
-                peers: &peers,
-                stats: &stats,
-                tun_tx: &tun_tx,
-            };
             send_over_route(&ctx, &route, &info, pkt).await;
         }
     }
-}
-
-/// An echo reply is generated by the kernel after a peer pings us. It must not
-/// wake Android's transport or extend its awake period.
-#[cfg(any(target_os = "android", test))]
-fn is_icmp_echo_reply(info: &firewall::PacketInfo) -> bool {
-    (info.protocol == 1 && info.icmp_type == 0) || (info.protocol == 58 && info.icmp_type == 129)
 }
 
 /// The mesh peer an outbound packet is sent to: the destination itself for overlay
@@ -671,7 +663,6 @@ fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Opti
 /// per packet, so look it up fresh); on failure they are dropped. Called by
 /// [`run_mesh`] when a dial completes.
 async fn flush_or_drop(
-    peers: &PeerTable,
     ctx: &SendCtx<'_>,
     exit: &ExitClient,
     connected: bool,
@@ -690,7 +681,7 @@ async fn flush_or_drop(
             continue;
         };
 
-        let Some(route) = resolve_send_route(peers, exit, info.dst_ip) else {
+        let Some(route) = resolve_send_route(ctx.peers, exit, info.dst_ip) else {
             // The connection vanished between dialing and flushing (a racing
             // teardown); the flow's retransmit will re-drive it.
             ctx.stats.record_drop(DropReason::NoPeer);
@@ -971,16 +962,15 @@ pub fn spawn_peer_reader(
                     shares_network: &|name| peers.shares_network_v6(&peer_ipv6, name),
                 };
                 match evaluate_inbound(&datagram, &firewall, &exit, peer) {
-                    InboundDecision::Accept => {
+                    InboundDecision::Accept(info) => {
                         // The TUN can be replaced with a smaller one while this
                         // connection stays open. Guard in-flight packets too,
                         // before peers have received the new MTU announcement.
                         let mtu = peers.local_mtu();
                         if datagram.len() > usize::from(mtu) {
                             stats.record_drop(DropReason::PacketTooBig);
-                            if let Some(info) = firewall::parse_packet_info(&datagram)
-                                && let Some(reply) =
-                                    crate::reject::build_packet_too_big(&datagram, &info, mtu)
+                            if let Some(reply) =
+                                crate::reject::build_packet_too_big(&datagram, &info, mtu)
                                 && let Some(handle) = peers.out_handle(&peer_ipv6, &network)
                             {
                                 send_peer_reply(&conn, handle, &reply);
@@ -994,18 +984,15 @@ pub fn spawn_peer_reader(
                         // original packet. Cheap pre-check avoids a copy on
                         // ordinary traffic.
                         let datagram = match ssh_nat() {
-                            Some(s) => match firewall::parse_packet_info(&datagram) {
-                                Some(info)
-                                    if info.protocol == 6
-                                        && info.dst_port == s.mesh_port.load(Ordering::Relaxed) =>
-                                {
-                                    let mut v = datagram.to_vec();
-                                    rewrite_ssh_port(&mut v, &info, true);
-                                    Bytes::from(v)
-                                }
-                                _ => datagram,
-                            },
-                            None => datagram,
+                            Some(s)
+                                if info.protocol == 6
+                                    && info.dst_port == s.mesh_port.load(Ordering::Relaxed) =>
+                            {
+                                let mut v = datagram.to_vec();
+                                rewrite_ssh_port(&mut v, &info, true);
+                                Bytes::from(v)
+                            }
+                            _ => datagram,
                         };
                         // Resolve the live writer for each packet: the sender is
                         // swapped on every TUN re-attach (VPN toggle). A send error
@@ -1215,15 +1202,16 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 129,
             icmp_id: 1,
+            transport_offset: 40,
         };
-        assert!(is_icmp_echo_reply(&info));
+        assert!(firewall::is_icmp_echo_reply(info.protocol, info.icmp_type));
         info.icmp_type = 128;
-        assert!(!is_icmp_echo_reply(&info));
+        assert!(!firewall::is_icmp_echo_reply(info.protocol, info.icmp_type));
         info.protocol = 1;
         info.icmp_type = 0;
-        assert!(is_icmp_echo_reply(&info));
+        assert!(firewall::is_icmp_echo_reply(info.protocol, info.icmp_type));
         info.icmp_type = 8;
-        assert!(!is_icmp_echo_reply(&info));
+        assert!(!firewall::is_icmp_echo_reply(info.protocol, info.icmp_type));
     }
 
     fn test_peer(seed: u8) -> EndpointId {
@@ -1438,7 +1426,6 @@ mod tests {
         // still count IP packets, not individual fragments.
         let small = Bytes::from(make_tcp_packet_between(a_ip, b_ip, 22));
         flush_or_drop(
-            &sender_peers,
             &ctx,
             &ExitClient::default(),
             true,
@@ -1889,7 +1876,7 @@ mod tests {
         ));
         assert!(matches!(
             evaluate_inbound(&allowed, &fw, &no_exit(), &peer, TEST_V6, "test-net"),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -1922,7 +1909,7 @@ mod tests {
         pkt[40] = 128; // ICMPv6 echo request
         assert!(matches!(
             evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V6, "test-net"),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -1930,7 +1917,12 @@ mod tests {
     /// the upper-layer length as a 32-bit big-endian, three zero bytes and the
     /// next-header value, followed by the TCP segment itself.
     fn tcp_csum_v6(pkt: &[u8]) -> u16 {
-        let tcp = &pkt[40..];
+        tcp_csum_v6_at(pkt, 40)
+    }
+
+    /// [`tcp_csum_v6`] for a TCP header at `tcp_off`, past any extension headers.
+    fn tcp_csum_v6_at(pkt: &[u8], tcp_off: usize) -> u16 {
+        let tcp = &pkt[tcp_off..];
         let mut sum: u32 = 0;
         for chunk in pkt[8..40].chunks(2) {
             sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
@@ -2008,6 +2000,41 @@ mod tests {
         assert_eq!(firewall::parse_packet_info(&pkt).unwrap().src_port, 2222);
         assert_eq!(u16::from_be_bytes([pkt[56], pkt[57]]), tcp_csum_v6(&pkt));
 
+        // A hop-by-hop header before TCP: the port and checksum live past it, at
+        // the offset the parser found, and the extension header is left alone.
+        // Kept in this test because the NAT config is process-global.
+        let mut ext = vec![0u8; 68];
+        ext[0] = 0x60;
+        ext[4..6].copy_from_slice(&28u16.to_be_bytes()); // 8 hop-by-hop + 20 TCP
+        ext[6] = 0; // next header = hop-by-hop
+        ext[7] = 64;
+        ext[8..24].copy_from_slice(&Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 9).octets());
+        ext[24..40].copy_from_slice(&our_v6.octets());
+        ext[40] = 6; // hop-by-hop next header = TCP
+        ext[41] = 0; // 8 octets
+        ext[42] = 1; // PadN option filling the rest
+        ext[43] = 4;
+        ext[48..50].copy_from_slice(&5000u16.to_be_bytes());
+        ext[50..52].copy_from_slice(&2222u16.to_be_bytes());
+        ext[60] = 0x50;
+        let ck = tcp_csum_v6_at(&ext, 48);
+        ext[64..66].copy_from_slice(&ck.to_be_bytes());
+        let hop_by_hop: [u8; 8] = ext[40..48].try_into().expect("8-byte slice");
+
+        let info = firewall::parse_packet_info(&ext).unwrap();
+        assert_eq!(info.transport_offset, 48);
+        assert!(rewrite_ssh_port(&mut ext, &info, true));
+        assert_eq!(ext[40..48], hop_by_hop, "extension header untouched");
+        assert_eq!(
+            firewall::parse_packet_info(&ext).unwrap().dst_port,
+            listen_port
+        );
+        assert_eq!(
+            u16::from_be_bytes([ext[64], ext[65]]),
+            tcp_csum_v6_at(&ext, 48),
+            "checksum stays valid behind an extension header"
+        );
+
         // Inactive -> no rewrite.
         set_ssh_nat_active(false);
         let mut pkt2 = pkt.clone();
@@ -2077,7 +2104,7 @@ mod tests {
         // With the matching peer IP it passes.
         assert!(matches!(
             evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V6, "test-net"),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -2150,7 +2177,7 @@ mod tests {
                 TEST_V6,
                 "test-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -2172,7 +2199,7 @@ mod tests {
                 TEST_V6,
                 "test-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
         // A different sender we don't allow is still dropped.
         let other = iroh::SecretKey::generate().public();
@@ -2226,7 +2253,7 @@ mod tests {
                 TEST_V6,
                 "test-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -2265,7 +2292,7 @@ mod tests {
                 TEST_V6,
                 "test-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -2335,7 +2362,7 @@ mod tests {
                 TEST_V6,
                 "test-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -2434,7 +2461,7 @@ mod tests {
                 TEST_V6,        // but the verified mesh IP does
                 "test-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -2458,7 +2485,7 @@ mod tests {
                 TEST_V6,
                 "another-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
     }
 
@@ -2505,6 +2532,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         assert!(is_magic_dns(&mk(IpAddr::V6(crate::dns::MAGIC_DNS_V6), 53)));
         assert!(!is_magic_dns(&mk(IpAddr::V6(crate::dns::MAGIC_DNS_V6), 80)));
@@ -2541,7 +2569,7 @@ mod tests {
                 TEST_V6,
                 "test-net"
             ),
-            InboundDecision::Accept
+            InboundDecision::Accept(_)
         ));
         // A different port stays denied.
         assert!(matches!(

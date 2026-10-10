@@ -3,12 +3,10 @@ import NetworkExtension
 
 @MainActor
 enum TunnelPreferences {
-    static let providerIdentifier = "com.rayfish.app.tunnel"
+    static let providerIdentifier = TunnelManagerCache.providerIdentifier
 
     static func load() async throws -> NETunnelProviderManager? {
-        try await NETunnelProviderManager.loadAllFromPreferences().first {
-            ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == providerIdentifier
-        }
+        try await TunnelManagerCache.shared.load()
     }
 
     static func configured() async throws -> NETunnelProviderManager {
@@ -26,6 +24,7 @@ enum TunnelPreferences {
         manager.isEnabled = true
         try await manager.saveToPreferences()
         try await manager.loadFromPreferences()
+        TunnelManagerCache.shared.store(manager)
         return manager
     }
 }

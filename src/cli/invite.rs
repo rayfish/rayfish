@@ -235,37 +235,19 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
 }
 
 pub(crate) async fn ipc_accept_request(network: &str, id: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::AcceptRequest {
-            network: network.to_string(),
-            id: id.to_string(),
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::AcceptRequest {
+        network: network.to_string(),
+        id: id.to_string(),
+    })
     .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 pub(crate) async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::DenyRequest {
-            network: network.to_string(),
-            id: id.to_string(),
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::DenyRequest {
+        network: network.to_string(),
+        id: id.to_string(),
+    })
     .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }

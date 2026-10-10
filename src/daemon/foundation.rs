@@ -16,8 +16,6 @@ use iroh::address_lookup::memory::MemoryLookup;
 use std::sync::atomic;
 use url::Url;
 
-// Fields are read starting in M2 (extracted services consume `Arc<Transport>`);
-// during M1 only the bundle is constructed, so silence the transitional warning.
 #[derive(Clone)]
 pub(crate) struct Transport {
     /// The one shared iroh endpoint (all ALPNs, all networks) for the process.

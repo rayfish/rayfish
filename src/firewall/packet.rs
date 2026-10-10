@@ -21,6 +21,10 @@ pub struct PacketInfo {
     pub icmp_type: u8,
     /// ICMP echo identifier (0 for non-echo ICMP).
     pub icmp_id: u16,
+    /// Byte offset of the transport header: IHL * 4 for IPv4, 40 plus any
+    /// extension headers for IPv6. Anything that edits or reads the transport
+    /// header must use this rather than assume a fixed IP header length.
+    pub transport_offset: usize,
 }
 
 pub fn parse_packet_info(packet: &[u8]) -> Option<PacketInfo> {
@@ -128,6 +132,7 @@ fn packet_info(
         tcp_flags: tcp_flags(packet, protocol, header_len),
         icmp_type: icmp_type(packet, protocol, header_len),
         icmp_id: icmp_id(packet, protocol, header_len),
+        transport_offset: header_len,
     })
 }
 

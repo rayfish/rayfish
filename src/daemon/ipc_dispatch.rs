@@ -244,20 +244,9 @@ impl Daemon {
                 | GlobalKey::FileAutoAcceptPeers),
             ) => k,
         };
-        let mut set_err = None;
-        let saved = config::update_settings(|cfg| {
-            if let Err(e) = config::config_set(cfg, key, value, replace) {
-                set_err = Some(e.to_string());
-                anyhow::bail!("rejected");
-            }
-            Ok(())
-        });
-        if let Some(e) = set_err {
-            return ipc_err(e);
-        }
-        let app_config = match saved {
+        let app_config = match save_global(key, value, replace) {
             Ok(cfg) => cfg,
-            Err(e) => return ipc_err(format!("failed to save config: {e}")),
+            Err(response) => return response,
         };
         if key == GlobalKey::FileAutoAcceptPeers {
             self.files.drain_auto_acceptable().await;
@@ -288,20 +277,9 @@ impl Daemon {
     /// Apply `ray dns on|off` immediately. Unlike the other settings, DNS owns
     /// host state that must be restored before the command reports success.
     async fn dns_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mut set_err = None;
-        let saved = config::update_settings(|cfg| {
-            if let Err(e) = config::config_set(cfg, GlobalKey::Dns, value, false) {
-                set_err = Some(e.to_string());
-                anyhow::bail!("rejected");
-            }
-            Ok(())
-        });
-        if let Some(e) = set_err {
-            return ipc_err(e);
-        }
-        let mode = match saved {
+        let mode = match save_global(GlobalKey::Dns, value, false) {
             Ok(cfg) => cfg.dns_mode,
-            Err(e) => return ipc_err(format!("failed to save config: {e}")),
+            Err(response) => return response,
         };
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.resolver.set_short_names(mode.short_names());
@@ -312,23 +290,19 @@ impl Daemon {
             };
         }
         self.registry.refresh_search_domains().await;
+        let state = if mode == config::DnsMode::Partial {
+            "DNS limited to .ray names."
+        } else {
+            "DNS enabled."
+        };
         if !self.active.load(Ordering::SeqCst) {
-            let state = if mode == config::DnsMode::Partial {
-                "DNS limited to .ray names."
-            } else {
-                "DNS enabled."
-            };
             return IpcMessage::Ok {
                 message: format!("{state} It will be configured when Rayfish is up."),
             };
         }
         let mut warnings = Vec::new();
         self.dns.configure(&tun_name, &mut warnings).await;
-        let mut message = if mode == config::DnsMode::Partial {
-            "DNS limited to .ray names.".to_string()
-        } else {
-            "DNS enabled.".to_string()
-        };
+        let mut message = state.to_string();
         if !warnings.is_empty() {
             message.push(' ');
             message.push_str(&warnings.join(" "));
@@ -745,6 +719,29 @@ impl Daemon {
             other => ipc_err(format!("unexpected message: {:?}", other)),
         }
     }
+}
+
+/// Validate and persist one plain global key. A rejected value is reported
+/// as-is, ahead of any save failure, so the user sees why the value was wrong
+/// rather than a generic write error.
+#[allow(clippy::result_large_err)]
+fn save_global(
+    key: GlobalKey,
+    value: &str,
+    replace: bool,
+) -> std::result::Result<AppConfig, IpcMessage> {
+    let mut set_err = None;
+    let saved = config::update_settings(|cfg| {
+        if let Err(e) = config::config_set(cfg, key, value, replace) {
+            set_err = Some(e.to_string());
+            anyhow::bail!("rejected");
+        }
+        Ok(())
+    });
+    if let Some(e) = set_err {
+        return Err(ipc_err(e));
+    }
+    saved.map_err(|e| ipc_err(format!("failed to save config: {e}")))
 }
 
 #[cfg(test)]

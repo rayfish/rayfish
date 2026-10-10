@@ -8,58 +8,64 @@
 //! `ray`'s `firewall` module re-exports them so the
 //! daemon's logic keeps its original `firewall::Action` paths.
 
-use std::str::FromStr;
-
 use serde::{Deserialize, Serialize};
 
 /// Traffic direction a rule applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, derive_more::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(
+    serialize_all = "lowercase",
+    parse_err_ty = String,
+    parse_err_fn = invalid_direction
+)]
 pub enum Direction {
-    #[display("in")]
     In,
-    #[display("out")]
     Out,
 }
 
-impl FromStr for Direction {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "in" => Ok(Direction::In),
-            "out" => Ok(Direction::Out),
-            _ => Err(format!("invalid direction '{s}' (expected 'in' or 'out')")),
-        }
-    }
+fn invalid_direction(s: &str) -> String {
+    format!("invalid direction '{s}' (expected 'in' or 'out')")
 }
 
 /// Transport protocol a rule matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, derive_more::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(
+    serialize_all = "lowercase",
+    parse_err_ty = String,
+    parse_err_fn = invalid_protocol
+)]
 pub enum Protocol {
-    #[display("tcp")]
     Tcp,
-    #[display("udp")]
     Udp,
-    #[display("icmp")]
     Icmp,
-    #[display("any")]
     Any,
 }
 
-impl FromStr for Protocol {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "tcp" => Ok(Protocol::Tcp),
-            "udp" => Ok(Protocol::Udp),
-            "icmp" => Ok(Protocol::Icmp),
-            "any" => Ok(Protocol::Any),
-            _ => Err(format!(
-                "invalid protocol '{s}' (expected 'tcp', 'udp', 'icmp', or 'any')"
-            )),
-        }
-    }
+fn invalid_protocol(s: &str) -> String {
+    format!("invalid protocol '{s}' (expected 'tcp', 'udp', 'icmp', or 'any')")
 }
 
 /// Whether a matching rule (or the default) allows or denies traffic.
@@ -73,23 +79,47 @@ impl FromStr for Protocol {
     Serialize,
     Deserialize,
     derive_more::IsVariant,
-    derive_more::Display,
+    strum::Display,
+    strum::EnumString,
 )]
 #[serde(rename_all = "lowercase")]
+#[strum(
+    serialize_all = "lowercase",
+    parse_err_ty = String,
+    parse_err_fn = invalid_action
+)]
 pub enum Action {
-    #[display("allow")]
     Allow,
-    #[display("deny")]
     Deny,
 }
 
-impl FromStr for Action {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "allow" => Ok(Action::Allow),
-            "deny" => Ok(Action::Deny),
-            _ => Err(format!("invalid action '{s}' (expected 'allow' or 'deny')")),
+fn invalid_action(s: &str) -> String {
+    format!("invalid action '{s}' (expected 'allow' or 'deny')")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_round_trip_and_bad_names_say_what_was_expected() {
+        for direction in [Direction::In, Direction::Out] {
+            assert_eq!(direction.to_string().parse(), Ok(direction));
         }
+        for protocol in [Protocol::Tcp, Protocol::Udp, Protocol::Icmp, Protocol::Any] {
+            assert_eq!(protocol.to_string().parse(), Ok(protocol));
+        }
+        for action in [Action::Allow, Action::Deny] {
+            assert_eq!(action.to_string().parse(), Ok(action));
+        }
+        assert_eq!(
+            "up".parse::<Direction>(),
+            Err("invalid direction 'up' (expected 'in' or 'out')".to_string())
+        );
+        assert_eq!(
+            "sctp".parse::<Protocol>(),
+            Err("invalid protocol 'sctp' (expected 'tcp', 'udp', 'icmp', or 'any')".to_string())
+        );
+        assert_eq!(Protocol::Icmp.to_string(), "icmp");
     }
 }

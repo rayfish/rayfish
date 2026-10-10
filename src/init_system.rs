@@ -31,10 +31,13 @@ const EXE_PLACEHOLDER: &str = "/usr/local/bin/ray";
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/rayfish.service";
 const INITD_SCRIPT: &str = "/etc/init.d/rayfish";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display)]
 pub enum InitSystem {
+    #[strum(to_string = "systemd")]
     Systemd,
+    #[strum(to_string = "OpenRC")]
     OpenRc,
+    #[strum(to_string = "SysV init")]
     SysVInit,
 }
 
@@ -86,14 +89,6 @@ impl InitSystem {
         None
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Systemd => "systemd",
-            Self::OpenRc => "OpenRC",
-            Self::SysVInit => "SysV init",
-        }
-    }
-
     /// Where this init's service definition lives.
     pub fn unit_path(self) -> &'static Path {
         match self {
@@ -102,16 +97,21 @@ impl InitSystem {
         }
     }
 
-    /// Write (or refresh) the service definition, pointing it at `exe`.
-    /// Idempotent, so it is safe on every `ray up`.
-    pub fn install_unit(self, exe: &str) -> Result<()> {
-        let template = match self {
+    /// The bundled service definition for this init, with [`EXE_PLACEHOLDER`]
+    /// still in it.
+    fn template(self) -> &'static str {
+        match self {
             Self::Systemd => include_str!("../contrib/rayfish.service"),
             Self::OpenRc => include_str!("../contrib/rayfish.openrc"),
             Self::SysVInit => include_str!("../contrib/rayfish.init"),
-        };
+        }
+    }
+
+    /// Write (or refresh) the service definition, pointing it at `exe`.
+    /// Idempotent, so it is safe on every `ray up`.
+    pub fn install_unit(self, exe: &str) -> Result<()> {
         let path = self.unit_path();
-        std::fs::write(path, template.replace(EXE_PLACEHOLDER, exe))
+        std::fs::write(path, self.template().replace(EXE_PLACEHOLDER, exe))
             .with_context(|| format!("failed to write {}", path.display()))?;
 
         match self {
@@ -247,15 +247,10 @@ mod tests {
             InitSystem::OpenRc,
             InitSystem::SysVInit,
         ] {
-            let template = match init {
-                InitSystem::Systemd => include_str!("../contrib/rayfish.service"),
-                InitSystem::OpenRc => include_str!("../contrib/rayfish.openrc"),
-                InitSystem::SysVInit => include_str!("../contrib/rayfish.init"),
-            };
             assert!(
-                template.contains(EXE_PLACEHOLDER),
+                init.template().contains(EXE_PLACEHOLDER),
                 "{} template has no {EXE_PLACEHOLDER} placeholder",
-                init.label()
+                init
             );
         }
     }

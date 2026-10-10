@@ -540,9 +540,10 @@ impl Daemon {
                     };
                 }
             };
-            let count = s.members.all().len();
+            let roster = s.roster();
+            let count = roster.len();
             (
-                s.roster(),
+                roster,
                 count,
                 s.pending_suggestions.len(),
                 s.pending.len(),
@@ -839,7 +840,7 @@ impl Daemon {
         let id = self.resolve_peer_name(name).await?;
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state.members.all().iter().find(|m| m.identity == id) {
+            if let Some(m) = state.members.get(&id) {
                 let display = m
                     .hostname
                     .clone()
@@ -884,7 +885,7 @@ impl Daemon {
     fn member_ipv6(&self, id: &EndpointId) -> Option<Ipv6Addr> {
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if state.members.all().iter().any(|m| &m.identity == id) {
+            if state.members.is_member(id) {
                 return Some(derive_ipv6(id));
             }
         }

@@ -8,15 +8,84 @@ enum RayfishLog {
     static let ipc = Logger(subsystem: "com.rayfish.app", category: "ipc")
 }
 
+// NetworkExtension retains sessions created by preference loads. Reuse the
+// manager until its configuration changes, including while polling status.
+@MainActor
+final class TunnelManagerCache {
+    nonisolated static let providerIdentifier = "com.rayfish.app.tunnel"
+    static let shared = TunnelManagerCache()
+
+    private let loadManagers: @MainActor () async throws -> [NETunnelProviderManager]
+    private let notificationCenter: NotificationCenter
+    private var observer: NSObjectProtocol?
+    private var manager: NETunnelProviderManager?
+    private var hasLoaded = false
+    private var generation = 0
+    private var loading: Task<NETunnelProviderManager?, Error>?
+
+    init(notificationCenter: NotificationCenter = .default,
+         loadManagers: @escaping @MainActor () async throws -> [NETunnelProviderManager] = {
+             try await NETunnelProviderManager.loadAllFromPreferences()
+         }) {
+        self.notificationCenter = notificationCenter
+        self.loadManagers = loadManagers
+        observer = notificationCenter.addObserver(forName: .NEVPNConfigurationChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.invalidate() }
+        }
+    }
+
+    deinit {
+        if let observer { notificationCenter.removeObserver(observer) }
+    }
+
+    func load() async throws -> NETunnelProviderManager? {
+        if hasLoaded { return manager }
+        let task: Task<NETunnelProviderManager?, Error>
+        if let loading {
+            task = loading
+        } else {
+            generation += 1
+            task = Task { try await loadManagers().first {
+                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == Self.providerIdentifier
+            } }
+            loading = task
+        }
+        let currentGeneration = generation
+        do {
+            let loaded = try await task.value
+            // A configuration change can arrive while preferences are loading.
+            guard generation == currentGeneration else { return try await load() }
+            manager = loaded
+            hasLoaded = true
+            loading = nil
+            return loaded
+        } catch {
+            if generation == currentGeneration { loading = nil }
+            throw error
+        }
+    }
+
+    func store(_ manager: NETunnelProviderManager) {
+        invalidate()
+        self.manager = manager
+        hasLoaded = true
+    }
+
+    private func invalidate() {
+        generation += 1
+        manager = nil
+        hasLoaded = false
+        loading = nil
+    }
+}
+
 @MainActor
 enum TunnelIPC {
     static func request(_ request: ProviderRequest) async throws -> ProviderResponse {
         RayfishLog.ipc.debug("Sending \(request.action.rawValue, privacy: .public)")
         do {
-            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
-            guard let manager = managers.first(where: {
-                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == "com.rayfish.app.tunnel"
-            }), let session = manager.connection as? NETunnelProviderSession else {
+            guard let manager = try await TunnelManagerCache.shared.load(),
+                  let session = manager.connection as? NETunnelProviderSession else {
                 throw TunnelIPCError.unavailable
             }
             // NetworkExtension authenticates the containing app and routes messages to its provider.

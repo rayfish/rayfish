@@ -60,15 +60,15 @@ pub(crate) fn evict_oldest_connect(
 pub(crate) struct ConnectService {
     /// `ray connect` requests received on `CONNECT_ALPN`, awaiting approval.
     /// Keyed by the requester's transport endpoint id.
-    pub(crate) pending_connects: Arc<DashMap<EndpointId, PendingConnect>>,
+    pub(crate) pending_connects: DashMap<EndpointId, PendingConnect>,
     /// Approved connect requests: requester endpoint id → (room id, coordinator).
     /// The `CONNECT_ALPN` handler replies `Approved` from here when the requester
     /// re-dials after `ray connect approve`.
-    pub(crate) approved_connects: Arc<DashMap<EndpointId, (EndpointId, EndpointId)>>,
+    pub(crate) approved_connects: DashMap<EndpointId, (EndpointId, EndpointId)>,
     /// Peer endpoints we have sent an outgoing `ray connect` request to. Used by
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
-    pub(crate) outgoing_connects: Arc<DashSet<EndpointId>>,
+    pub(crate) outgoing_connects: DashSet<EndpointId>,
     /// Foundation handles (endpoint + contact id) for the connect handshake and
     /// contact-record publishing.
     transport: Arc<Transport>,
@@ -87,9 +87,9 @@ impl ConnectService {
         registry: Arc<NetworkRegistry>,
     ) -> Self {
         Self {
-            pending_connects: Arc::new(DashMap::new()),
-            approved_connects: Arc::new(DashMap::new()),
-            outgoing_connects: Arc::new(DashSet::new()),
+            pending_connects: DashMap::new(),
+            approved_connects: DashMap::new(),
+            outgoing_connects: DashSet::new(),
             transport,
             active,
             registry,
@@ -130,33 +130,9 @@ impl ConnectService {
     /// already linked; defers to the higher endpoint id on a simultaneous
     /// cross-connect). The initiator's connect-retry loop then joins it.
     pub(crate) async fn approve_connection(&self, selector: &str) -> IpcMessage {
-        let identity = match resolve_named_identity(
-            selector,
-            self.pending_connects
-                .iter()
-                .map(|request| (request.from_contact_id, request.hostname.clone())),
-        ) {
-            Ok(Some(identity)) => identity,
-            Ok(None) => {
-                return ipc_err(format!(
-                    "no pending connection request matching '{selector}'"
-                ));
-            }
-            Err(()) => {
-                return ipc_err(format!(
-                    "pending connection request '{selector}' is ambiguous"
-                ));
-            }
-        };
-        let Some(req) = self
-            .pending_connects
-            .iter()
-            .find(|request| request.from_contact_id == identity)
-            .map(|request| request.value().clone())
-        else {
-            return ipc_err(format!(
-                "pending connection request '{selector}' disappeared"
-            ));
+        let req = match self.find_pending(selector) {
+            Ok(req) => req,
+            Err(message) => return ipc_err(message),
         };
         let peer = req.from_endpoint;
 
@@ -382,36 +358,43 @@ impl ConnectService {
 
     /// Decline a pending connection request by hostname or contact-id prefix.
     pub(crate) fn reject_connect(&self, selector: &str) -> IpcMessage {
-        let found = resolve_named_identity(
+        let req = match self.find_pending(selector) {
+            Ok(req) => req,
+            Err(message) => return ipc_err(message),
+        };
+        self.pending_connects.remove(&req.from_endpoint);
+        IpcMessage::Ok {
+            message: format!("declined connection request '{selector}'"),
+        }
+    }
+
+    /// The pending request named by `selector` (hostname or contact-id
+    /// prefix), or the error message for a miss. Requests are keyed by
+    /// `from_endpoint`, so the returned request's `from_endpoint` is its key.
+    fn find_pending(&self, selector: &str) -> Result<PendingConnect, String> {
+        let identity = match resolve_named_identity(
             selector,
             self.pending_connects
                 .iter()
                 .map(|request| (request.from_contact_id, request.hostname.clone())),
-        );
-        match found {
-            Ok(Some(identity)) => {
-                let peer = self
-                    .pending_connects
-                    .iter()
-                    .find(|request| request.from_contact_id == identity)
-                    .map(|request| *request.key());
-                let Some(peer) = peer else {
-                    return ipc_err(format!(
-                        "pending connection request '{selector}' disappeared"
-                    ));
-                };
-                self.pending_connects.remove(&peer);
-                IpcMessage::Ok {
-                    message: format!("declined connection request '{selector}'"),
-                }
+        ) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                return Err(format!(
+                    "no pending connection request matching '{selector}'"
+                ));
             }
-            Ok(None) => ipc_err(format!(
-                "no pending connection request matching '{selector}'"
-            )),
-            Err(()) => ipc_err(format!(
-                "pending connection request '{selector}' is ambiguous"
-            )),
-        }
+            Err(()) => {
+                return Err(format!(
+                    "pending connection request '{selector}' is ambiguous"
+                ));
+            }
+        };
+        self.pending_connects
+            .iter()
+            .find(|request| request.from_contact_id == identity)
+            .map(|request| request.value().clone())
+            .ok_or_else(|| format!("pending connection request '{selector}' disappeared"))
     }
 
     /// Rotate this node's contact key and, if the data plane is active, republish
@@ -442,8 +425,6 @@ impl ConnectService {
     /// to the dialing identity, replies `Approved` if already accepted
     /// (idempotent), else queues it as `Pending` for `ray connect approve`.
     pub(crate) async fn accept_connect_request(&self, conn: Connection) {
-        let pending = Arc::clone(&self.pending_connects);
-        let approved = Arc::clone(&self.approved_connects);
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
@@ -475,15 +456,22 @@ impl ConnectService {
                     }
                     // Already approved? Reply with the minted room id so
                     // a re-dialing requester joins it (idempotent).
-                    let already = approved.get(&from_endpoint).map(|r| *r.value());
+                    let already = self
+                        .approved_connects
+                        .get(&from_endpoint)
+                        .map(|r| *r.value());
                     let reply = if let Some((room_id, coordinator)) = already {
                         control::ConnectMsg::Approved {
                             room_id,
                             coordinator,
                         }
                     } else {
-                        evict_oldest_connect(&pending, from_endpoint, MAX_PENDING_CONNECTS);
-                        pending.insert(
+                        evict_oldest_connect(
+                            &self.pending_connects,
+                            from_endpoint,
+                            MAX_PENDING_CONNECTS,
+                        );
+                        self.pending_connects.insert(
                             from_endpoint,
                             PendingConnect {
                                 from_contact_id,

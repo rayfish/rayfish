@@ -316,18 +316,8 @@ pub(crate) async fn ipc_connections_list() -> Result<()> {
 }
 
 pub(crate) async fn ipc_connections_approve(id: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::ApproveConnection { id: id.to_string() },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    let response = ipc_request(ipc::IpcMessage::ApproveConnection { id: id.to_string() }).await?;
+    print_ok_reply(response)
 }
 
 /// `ray mdns scan`: the rayfish nodes mDNS has seen on this LAN.

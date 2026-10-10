@@ -456,6 +456,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         for _ in 0..3 {
             sender.enqueue(&info, 0, Encoded::Whole(Bytes::from_static(b"packet")), 6);
@@ -643,6 +644,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let frames = Encoded::Fragments(vec![
             Bytes::from_static(b"first"),

@@ -1,6 +1,6 @@
 //! The set of rayfish nodes seen on the local network over mDNS.
 //!
-//! The mDNS browse loop in `mesh::bootstrap` feeds this map; it is the only
+//! The mDNS discovery windows in `daemon::mdns` feed this map; it is the only
 //! place LAN sightings are kept. Two consumers read it: `ray mdns scan` (which
 //! lists it) and `ConnectService::connect` (which uses it to dial a neighbour by
 //! endpoint id, skipping the pkarr contact lookup).
@@ -47,6 +47,12 @@ impl LanPeers {
         self.peers.remove(id);
     }
 
+    /// Drop sightings not refreshed within `ttl`. Discovery runs in windows,
+    /// so a peer that left without a goodbye is only noticed by its absence.
+    pub(crate) fn expire_unseen(&self, ttl: Duration) {
+        self.peers.retain(|_, peer| peer.last_seen.elapsed() < ttl);
+    }
+
     pub(crate) fn clear(&self) {
         self.peers.clear();
     }
@@ -63,7 +69,8 @@ impl LanPeers {
             .iter()
             .map(|e| (*e.key(), e.value().clone()))
             .collect();
-        out.sort_by_key(|(id, _)| id.to_string());
+        // Key bytes order the same as their fixed-width hex form.
+        out.sort_by_key(|(id, _)| *id);
         out
     }
 
@@ -134,6 +141,19 @@ mod tests {
         assert!(peers.snapshot().is_empty());
         assert!(!peers.contains(&id(1)));
         assert_eq!(peers.resolve(&id(1).to_string(), id(9)), None);
+    }
+
+    #[test]
+    fn unseen_peers_expire_and_fresh_ones_stay() {
+        let peers = LanPeers::new();
+        peers.discovered(id(1), vec![addr(41641)]);
+        peers.peers.get_mut(&id(1)).unwrap().last_seen -= Duration::from_secs(120);
+        peers.discovered(id(2), vec![addr(41642)]);
+
+        peers.expire_unseen(Duration::from_secs(60));
+
+        assert!(!peers.contains(&id(1)));
+        assert!(peers.contains(&id(2)));
     }
 
     #[test]

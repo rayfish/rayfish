@@ -252,7 +252,7 @@ pub(crate) fn spawn_network_publisher(
                             .map(|(id, _)| id)
                             .collect();
                         seed_peers.push(endpoint_id);
-                        seed_peers.sort_by_key(|id| id.to_string());
+                        seed_peers.sort();
                         seed_peers.dedup();
 
                         match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers)
@@ -352,30 +352,45 @@ fn persist_current_snapshot_hash(
     if !current {
         return SnapshotPersist::Superseded;
     }
+    if write_group_hash_pointer(state, network, hash, false) {
+        SnapshotPersist::Persisted
+    } else {
+        SnapshotPersist::Failed
+    }
+}
+
+/// Write the recovery pointer for `hash` and settle its durability marker:
+/// confirmed on success, pending on any failure.
+fn write_group_hash_pointer(
+    state: &SharedNetworkState,
+    network: &str,
+    hash: blake3::Hash,
+    published: bool,
+) -> bool {
     match config::update_network(network, |net| {
         net.last_group_hash = Some(hash);
-        net.last_group_hash_published = false;
+        net.last_group_hash_published = published;
         Ok(())
     }) {
         Ok(Some(_)) => {
             confirm_current_group_hash_durable(state, hash);
-            SnapshotPersist::Persisted
+            true
         }
         Ok(None) => {
-            mark_group_hash_durability_pending(state, hash, false);
+            mark_group_hash_durability_pending(state, hash, published);
             tracing::warn!(
                 network,
                 "failed to persist group snapshot hash: network was deleted"
             );
-            SnapshotPersist::Failed
+            false
         }
         Err(e) => {
             // Atomic rename may have installed this exact generation before the
             // parent-directory sync failed. Treat every such error as ambiguous
             // until an exact retry completes its durability barrier.
-            mark_group_hash_durability_pending(state, hash, false);
+            mark_group_hash_durability_pending(state, hash, published);
             tracing::warn!(network, error = %e, "failed to persist complete group snapshot hash");
-            SnapshotPersist::Failed
+            false
         }
     }
 }
@@ -438,29 +453,7 @@ pub(crate) async fn persist_group_hash_locked(
             return false;
         }
     }
-    match config::update_network(network, |net| {
-        net.last_group_hash = Some(hash);
-        net.last_group_hash_published = published;
-        Ok(())
-    }) {
-        Ok(Some(_)) => {
-            confirm_current_group_hash_durable(state, hash);
-            true
-        }
-        Ok(None) => {
-            mark_group_hash_durability_pending(state, hash, published);
-            tracing::warn!(
-                network,
-                "failed to persist group snapshot hash: network was deleted"
-            );
-            false
-        }
-        Err(e) => {
-            mark_group_hash_durability_pending(state, hash, published);
-            tracing::warn!(network, error = %e, "failed to persist complete group snapshot hash");
-            false
-        }
-    }
+    write_group_hash_pointer(state, network, hash, published)
 }
 
 pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash) -> bool {

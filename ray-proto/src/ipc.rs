@@ -883,8 +883,9 @@ pub struct MachineEnrollmentInfo {
 }
 
 /// Lifecycle state of a controller ticket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum MachineEnrollmentStatus {
     /// Valid and unused.
     Pending,
@@ -924,8 +925,9 @@ pub struct ManagedMachineInfo {
 }
 
 /// Reachability and authorization state of an enrolled machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ManagedMachineState {
     /// The machine responded and authorized this controller.
     Online,
@@ -935,18 +937,6 @@ pub enum ManagedMachineState {
     Unauthorized,
     /// The machine was not probed.
     Unknown,
-}
-
-impl ManagedMachineState {
-    /// Returns the protocol name of this state.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Online => "online",
-            Self::Offline => "offline",
-            Self::Unauthorized => "unauthorized",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 /// Whole seconds since the Unix epoch.
@@ -1047,41 +1037,49 @@ impl fmt::Display for InvalidMachineHostname {
 
 impl std::error::Error for InvalidMachineHostname {}
 
+/// The shared surface of a free-form string newtype: `new`, `AsRef<str>`,
+/// `Display` and an infallible `FromStr`.
+macro_rules! string_newtype {
+    ($name:ident, $new_doc:literal) => {
+        impl $name {
+            #[doc = $new_doc]
+            pub fn new(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = Infallible;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Ok(Self::new(value.to_string()))
+            }
+        }
+    };
+}
+
 /// Network name carried across the IPC and management protocols.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NetworkName(String);
 
-impl NetworkName {
-    /// Wraps a network name.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for NetworkName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
+string_newtype!(NetworkName, "Wraps a network name.");
 
 impl From<NetworkName> for String {
     fn from(network: NetworkName) -> Self {
         network.0
-    }
-}
-
-impl fmt::Display for NetworkName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for NetworkName {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
     }
 }
 
@@ -1090,64 +1088,20 @@ impl FromStr for NetworkName {
 #[serde(transparent)]
 pub struct EnrollmentCredentialId(String);
 
-impl EnrollmentCredentialId {
-    /// Wraps an enrollment credential identifier.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for EnrollmentCredentialId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnrollmentCredentialId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for EnrollmentCredentialId {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(
+    EnrollmentCredentialId,
+    "Wraps an enrollment credential identifier."
+);
 
 /// Full or prefix selector for an enrollment credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EnrollmentCredentialSelector(String);
 
-impl EnrollmentCredentialSelector {
-    /// Wraps an enrollment credential selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for EnrollmentCredentialSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnrollmentCredentialSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for EnrollmentCredentialSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(
+    EnrollmentCredentialSelector,
+    "Wraps an enrollment credential selector."
+);
 
 /// Shareable capability for enrolling a machine with a controller.
 ///
@@ -1247,36 +1201,11 @@ impl<'de> Deserialize<'de> for EnrollmentTicket {
 #[serde(transparent)]
 pub struct ManagedMachineSelector(String);
 
-impl ManagedMachineSelector {
-    /// Wraps a managed-machine selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
+string_newtype!(ManagedMachineSelector, "Wraps a managed-machine selector.");
 
 impl From<EndpointId> for ManagedMachineSelector {
     fn from(identity: EndpointId) -> Self {
         Self(identity.to_string())
-    }
-}
-
-impl AsRef<str> for ManagedMachineSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedMachineSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for ManagedMachineSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
     }
 }
 
@@ -1285,32 +1214,7 @@ impl FromStr for ManagedMachineSelector {
 #[serde(transparent)]
 pub struct ControllerSelector(String);
 
-impl ControllerSelector {
-    /// Wraps a controller selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for ControllerSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ControllerSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for ControllerSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(ControllerSelector, "Wraps a controller selector.");
 
 /// One roster row a pending kick would remove (reply to an unconfirmed
 /// [`IpcMessage::Kick`]).
@@ -1494,17 +1398,15 @@ pub struct NetworkStatus {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, derive_more::IsVariant, derive_more::Display,
+    Debug, Clone, PartialEq, Serialize, Deserialize, derive_more::IsVariant, strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum NetworkRole {
-    #[display("coordinator")]
     Coordinator,
-    #[display("member")]
     Member,
     /// An auto-minted 2-peer direct connection (`ray connect`). Display-only: the
     /// node is structurally still the coordinator or a member, but `ray status`
     /// surfaces these as `direct` and hides the (non-shareable) room id.
-    #[display("direct")]
     Direct,
 }
 
@@ -1565,19 +1467,17 @@ pub struct PeerStatus {
     Serialize,
     Deserialize,
     derive_more::IsVariant,
-    derive_more::Display,
+    strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum PeerState {
     /// A live mesh connection to the peer exists right now.
-    #[display("active")]
     Active,
     /// No live connection, but no failed reach either: presumed reachable (dialed
     /// lazily on demand). The optimistic default for a freshly booted node.
     #[default]
-    #[display("idle")]
     Idle,
     /// A recent reach attempt failed and wasn't cleared by a later success.
-    #[display("offline")]
     Offline,
 }
 
@@ -1607,15 +1507,13 @@ pub struct ConnectionInfo {
     Serialize,
     Deserialize,
     derive_more::IsVariant,
-    derive_more::Display,
+    strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum ConnectionQuality {
     #[default]
-    #[display("good")]
     Good,
-    #[display("degraded")]
     Degraded,
-    #[display("congested")]
     Congested,
 }
 
@@ -1628,35 +1526,25 @@ pub enum ConnectionQuality {
     Serialize,
     Deserialize,
     derive_more::IsVariant,
-    derive_more::Display,
+    strum::Display,
 )]
 pub enum ConnectionIssue {
-    #[display("high latency")]
+    #[strum(to_string = "high latency")]
     HighLatency,
-    #[display("packet loss")]
+    #[strum(to_string = "packet loss")]
     PacketLoss,
-    #[display("send queue full")]
+    #[strum(to_string = "send queue full")]
     SendQueue,
 }
 
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    derive_more::IsVariant,
-    derive_more::Display,
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant, strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum ConnType {
-    #[display("direct")]
     Direct,
-    #[display("relay")]
     Relay,
-    #[display("tor")]
     Tor,
-    #[display("unknown")]
     Unknown,
 }
 
@@ -2039,6 +1927,41 @@ pub async fn recv_with_fds(stream: &UnixStream) -> Result<(IpcMessage, Vec<Owned
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_enums_display_their_status_words() {
+        assert_eq!(NetworkRole::Coordinator.to_string(), "coordinator");
+        assert_eq!(PeerState::Offline.to_string(), "offline");
+        assert_eq!(ConnectionQuality::Degraded.to_string(), "degraded");
+        assert_eq!(ConnType::Relay.to_string(), "relay");
+        assert_eq!(ConnectionIssue::SendQueue.to_string(), "send queue full");
+    }
+
+    #[test]
+    fn management_state_names_match_their_serde_names() {
+        for status in [
+            MachineEnrollmentStatus::Pending,
+            MachineEnrollmentStatus::Used,
+            MachineEnrollmentStatus::Expired,
+            MachineEnrollmentStatus::Revoked,
+        ] {
+            let bytes = rmp_serde::to_vec(&status).expect("a unit variant serializes");
+            let serde_name: String =
+                rmp_serde::from_slice(&bytes).expect("a unit variant is a string");
+            assert_eq!(serde_name, <&str>::from(status));
+        }
+        for state in [
+            ManagedMachineState::Online,
+            ManagedMachineState::Offline,
+            ManagedMachineState::Unauthorized,
+            ManagedMachineState::Unknown,
+        ] {
+            let bytes = rmp_serde::to_vec(&state).expect("a unit variant serializes");
+            let serde_name: String =
+                rmp_serde::from_slice(&bytes).expect("a unit variant is a string");
+            assert_eq!(serde_name, <&str>::from(state));
+        }
+    }
 
     #[test]
     fn test_request_roundtrip() {

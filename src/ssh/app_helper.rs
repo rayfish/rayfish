@@ -46,8 +46,6 @@ use super::{
 use super::{SshAuthz, auth_banner, load_host_key, resolve_user_policy_with_hostnames};
 #[cfg(target_os = "macos")]
 use crate::daemon::NetworkRegistry;
-#[cfg(target_os = "macos")]
-use crate::membership::IdentityProvider;
 
 #[cfg(target_os = "macos")]
 const SOCKET: &str = "/var/run/com.rayfish.app.ssh.sock";
