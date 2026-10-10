@@ -20,6 +20,7 @@ use iroh::{
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::config::{AppConfig, QuicEngine, ServerOverride};
+use crate::exit_node::dns::PUBLIC_FALLBACK_DNS_V6;
 use crate::exit_node::{LoopPrevention, is_transitable};
 
 mod congestion;
@@ -156,22 +157,26 @@ const MAX_CONTROL_PLANE_NAMESERVERS: usize = 4;
 /// has none: with nothing configured either, the answer is an empty list and the
 /// caller leaves iroh's own reader in place. Naming a public server there would
 /// step over Android's Private DNS and downgrade those lookups to cleartext.
-fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) -> Vec<Ipv4Addr> {
+/// Both families are kept: configured IPv6 upstreams survive, and the public
+/// fallback appends `PUBLIC_FALLBACK_DNS_V6`, so an IPv6-only host still has a
+/// reachable public resolver even with an empty captured set.
+fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) -> Vec<IpAddr> {
     if system.is_none() && o.servers.is_empty() {
         return Vec::new();
     }
-    let mut out: Vec<Ipv4Addr> = crate::config::resolve_upstreams(o, system.unwrap_or_default())
-        .into_iter()
-        .filter_map(|ip| match ip {
-            IpAddr::V4(ip) => Some(ip),
-            IpAddr::V6(_) => None,
-        })
-        .collect();
+    // Both families survive: an IPv6-only host must not lose the operator's v6
+    // upstreams to fit an IPv4-typed helper, and the resolver dials each entry
+    // per its own family, so a v4 entry simply fails to connect there.
+    let mut out: Vec<IpAddr> = crate::config::resolve_upstreams(o, system.unwrap_or_default());
     if !o.replace {
-        out.extend(PUBLIC_FALLBACK_DNS);
+        out.extend(PUBLIC_FALLBACK_DNS.into_iter().map(IpAddr::V4));
+        out.extend(PUBLIC_FALLBACK_DNS_V6.into_iter().map(IpAddr::V6));
     }
     let mut seen = std::collections::HashSet::new();
-    out.retain(|ip| !crate::membership::is_cgnat_range(*ip) && seen.insert(*ip));
+    out.retain(|ip| {
+        !matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(*v4))
+            && seen.insert(*ip)
+    });
     out.truncate(MAX_CONTROL_PLANE_NAMESERVERS);
     out
 }
@@ -244,7 +249,7 @@ struct BindConfig<'a> {
     tor: bool,
     relay: &'a ServerOverride,
     discovery: &'a ServerOverride,
-    nameservers: &'a [Ipv4Addr],
+    nameservers: &'a [IpAddr],
     warm_lookup: &'a MemoryLookup,
     quic_engine: QuicEngine,
 }
@@ -701,8 +706,8 @@ mod tests {
         let magic = crate::dns::MAGIC_DNS_V4;
         let tailnet: Ipv4Addr = "100.100.100.100".parse().unwrap();
         let got = control_plane_nameservers(&ServerOverride::default(), Some(vec![magic, tailnet]));
-        assert!(!got.contains(&magic));
-        assert!(!got.contains(&tailnet));
+        assert!(!got.contains(&IpAddr::V4(magic)));
+        assert!(!got.contains(&IpAddr::V4(tailnet)));
         // And it still has somewhere to ask.
         assert!(!got.is_empty());
     }
@@ -710,7 +715,9 @@ mod tests {
     #[test]
     fn control_plane_falls_back_to_public_when_the_host_has_no_resolver() {
         let got = control_plane_nameservers(&ServerOverride::default(), Some(vec![]));
-        assert_eq!(got, PUBLIC_FALLBACK_DNS.to_vec());
+        let mut want: Vec<IpAddr> = PUBLIC_FALLBACK_DNS.into_iter().map(IpAddr::V4).collect();
+        want.extend(PUBLIC_FALLBACK_DNS_V6.into_iter().map(IpAddr::V6));
+        assert_eq!(got, want);
     }
 
     /// A platform whose resolvers we cannot read is not a host without any: it
@@ -728,15 +735,19 @@ mod tests {
             servers: vec![custom.to_string()],
             replace: false,
         };
-        assert_eq!(control_plane_nameservers(&o, None)[0], custom);
+        assert_eq!(control_plane_nameservers(&o, None)[0], IpAddr::V4(custom));
     }
 
     #[test]
     fn control_plane_prefers_the_host_then_the_fallback() {
         let lan: Ipv4Addr = "192.168.1.1".parse().unwrap();
         let got = control_plane_nameservers(&ServerOverride::default(), Some(vec![lan]));
-        assert_eq!(got[0], lan, "the host's own resolver is asked first");
-        assert_eq!(got[1..], PUBLIC_FALLBACK_DNS);
+        assert_eq!(got[0], IpAddr::V4(lan), "the host's own resolver is asked first");
+        let mut want: Vec<IpAddr> = PUBLIC_FALLBACK_DNS.into_iter().map(IpAddr::V4).collect();
+        want.extend(PUBLIC_FALLBACK_DNS_V6.into_iter().map(IpAddr::V6));
+        // The cap keeps the first MAX entries; with one host entry the v6 side is
+        // only partly present.
+        assert_eq!(&got[1..], &want[..MAX_CONTROL_PLANE_NAMESERVERS - 1]);
     }
 
     #[test]
@@ -752,7 +763,12 @@ mod tests {
         let got = control_plane_nameservers(&aug, Some(vec![lan]));
         assert_eq!(
             got,
-            vec![custom, lan, PUBLIC_FALLBACK_DNS[0], PUBLIC_FALLBACK_DNS[1]]
+            vec![
+                IpAddr::V4(custom),
+                IpAddr::V4(lan),
+                IpAddr::V4(PUBLIC_FALLBACK_DNS[0]),
+                IpAddr::V4(PUBLIC_FALLBACK_DNS[1]),
+            ]
         );
 
         // Replace means only these: no host resolver, and no public fallback
@@ -763,7 +779,7 @@ mod tests {
         };
         assert_eq!(
             control_plane_nameservers(&rep, Some(vec![lan])),
-            vec![custom]
+            vec![IpAddr::V4(custom)]
         );
     }
 
@@ -777,14 +793,46 @@ mod tests {
         );
         assert_eq!(
             got,
-            vec![lan, PUBLIC_FALLBACK_DNS[0], PUBLIC_FALLBACK_DNS[1]]
+            vec![
+                IpAddr::V4(lan),
+                IpAddr::V4(PUBLIC_FALLBACK_DNS[0]),
+                IpAddr::V4(PUBLIC_FALLBACK_DNS[1]),
+                IpAddr::V6(PUBLIC_FALLBACK_DNS_V6[0]),
+            ]
         );
 
         // A long resolv.conf is truncated rather than fanned out over.
         let many: Vec<Ipv4Addr> = (1..=8).map(|i| Ipv4Addr::new(192, 168, 1, i)).collect();
         let got = control_plane_nameservers(&ServerOverride::default(), Some(many.clone()));
         assert_eq!(got.len(), MAX_CONTROL_PLANE_NAMESERVERS);
-        assert_eq!(got, many[..MAX_CONTROL_PLANE_NAMESERVERS]);
+        assert_eq!(
+            got,
+            many[..MAX_CONTROL_PLANE_NAMESERVERS]
+                .iter()
+                .map(|&ip| IpAddr::V4(ip))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// An IPv6-only operator's servers survive the merge (they used to be
+    /// dropped by the IPv4 narrowing), and `replace` leaves the public v6
+    /// fallback out entirely.
+    #[test]
+    fn control_plane_keeps_operator_ipv6() {
+        let v6: std::net::Ipv6Addr = "2606:4700:4700::1001".parse().unwrap();
+        let aug = ServerOverride {
+            servers: vec![v6.to_string()],
+            replace: false,
+        };
+        let got = control_plane_nameservers(&aug, None);
+        assert_eq!(got[0], IpAddr::V6(v6));
+        assert!(got.contains(&IpAddr::V6(PUBLIC_FALLBACK_DNS_V6[0])));
+
+        let rep = ServerOverride {
+            servers: vec![v6.to_string()],
+            replace: true,
+        };
+        assert_eq!(control_plane_nameservers(&rep, None), vec![IpAddr::V6(v6)]);
     }
 
     #[test]
