@@ -1644,6 +1644,22 @@ async fn open_and_send(conn: &Connection, net: Option<EndpointId>, msg: &Control
     control::send_msg(&mut send, net, msg).await
 }
 
+/// Send `ControlMsg::LeaveNetwork` on a fresh stream and wait until the peer has
+/// acknowledged all of it. `ray leave` tears the network down right after, which
+/// closes every link sharing no other network, and a close discards whatever is
+/// still unsent (the same wait as `send_welcome`).
+async fn send_leave(conn: &Connection, net_pubkey: EndpointId) -> Result<()> {
+    let (mut send, _recv) = conn.open_bi().await.context("open control stream")?;
+    control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::LeaveNetwork).await?;
+    // A reader that took the frame but not the FIN stops the stream with code 0.
+    if let Some(code) = send.stopped().await.context("await leave delivery")?
+        && code != VarInt::from_u32(0)
+    {
+        anyhow::bail!("peer stopped the leave stream: {code}");
+    }
+    Ok(())
+}
+
 /// Reply to a `ray ping` probe by echoing `Pong{nonce}` over a fresh stream
 /// (see [`open_and_send`] for why the reply can't ride the request stream back).
 /// Connection-level (`net = None`): the ping/pong path isn't tied to a network.
@@ -1704,6 +1720,22 @@ fn absent_member_ips(
         .filter(|(_, v6)| Some(*v6) != exclude_ip)
         .filter(|(m, _)| !is_offline(&m.identity))
         .map(|(_, v6)| v6)
+        .collect()
+}
+
+/// The coordinators a departure must still reach after the live links carried it:
+/// every coordinator on the roster but us that `reached` lacks. Only a coordinator
+/// prunes a member, so these are dialed whatever their recent dial history: unlike
+/// the `MemberSync` hint [`absent_member_ips`] serves, a leave is never retried.
+fn leave_recipients(
+    roster: &[Member],
+    my_id: EndpointId,
+    reached: &HashSet<EndpointId>,
+) -> Vec<Ipv6Addr> {
+    roster
+        .iter()
+        .filter(|m| m.is_coordinator && m.identity != my_id && !reached.contains(&m.identity))
+        .map(|m| derive_ipv6(&m.identity))
         .collect()
 }
 
@@ -1836,6 +1868,24 @@ mod absent_member_tests {
         let offline = id(1);
         let got = absent_member_ips(&roster, id(9), None, &HashSet::new(), |i| *i == offline);
         assert_eq!(got, vec![derive_ipv6(&id(2))]);
+    }
+
+    fn coordinator(seed: u8) -> Member {
+        Member {
+            is_coordinator: true,
+            ..member(seed)
+        }
+    }
+
+    /// A leave must reach a coordinator, the only member that can prune it, so
+    /// the coordinators the live links missed are dialed and nobody else is:
+    /// ordinary members learn of the leave from the coordinator's republish.
+    #[test]
+    fn a_leave_dials_only_the_coordinators_it_missed() {
+        let roster = vec![coordinator(1), coordinator(2), member(3), coordinator(4)];
+        let reached: HashSet<EndpointId> = [id(2)].into_iter().collect();
+        let got = leave_recipients(&roster, id(4), &reached);
+        assert_eq!(got, vec![derive_ipv6(&id(1))]);
     }
 }
 
