@@ -74,31 +74,30 @@ impl NetworkRegistry {
         if let Some(net) = unknown_network {
             tracing::warn!(network = %net, "firewall rule scoped to a network this node is not on");
         }
-        let mut config = (*self.firewall.get_config()).clone();
-        for port in ports.iter().cloned() {
-            let rule = firewall::FirewallRule {
-                direction,
-                action,
-                protocol,
-                port,
-                peer: peer.clone(),
-                network: network.map(str::to_string),
-                origin: firewall::RuleOrigin::Local,
-            };
-            // A new rule supersedes a contradicting one with the *same selector*
-            // (direction/proto/port/peer/network, ignoring action): drop the old
-            // entry, then insert at the front so it wins under first-match. So
-            // `deny in icmp` after the seeded `allow in icmp` makes deny prevail
-            // (and re-adding `allow` flips it back) without leaving dead rules. A
-            // narrower selector (e.g. `deny in icmp --peer X`) keeps the broader
-            // rule and just layers ahead of it. With a comma list each range
-            // inserts at the front, so they end up in reverse spec order; order
-            // doesn't matter between same-action rules that differ only by port.
-            config.rules.retain(|r| !firewall::same_selector(r, &rule));
-            config.rules.insert(0, rule);
-        }
-        self.firewall.update(config.clone());
-        save_firewall_warn(&config);
+        self.edit_firewall(|config| {
+            for port in ports.iter().cloned() {
+                let rule = firewall::FirewallRule {
+                    direction,
+                    action,
+                    protocol,
+                    port,
+                    peer: peer.clone(),
+                    network: network.map(str::to_string),
+                    origin: firewall::RuleOrigin::Local,
+                };
+                // A new rule supersedes a contradicting one with the *same selector*
+                // (direction/proto/port/peer/network, ignoring action): drop the old
+                // entry, then insert at the front so it wins under first-match. So
+                // `deny in icmp` after the seeded `allow in icmp` makes deny prevail
+                // (and re-adding `allow` flips it back) without leaving dead rules. A
+                // narrower selector (e.g. `deny in icmp --peer X`) keeps the broader
+                // rule and just layers ahead of it. With a comma list each range
+                // inserts at the front, so they end up in reverse spec order; order
+                // doesn't matter between same-action rules that differ only by port.
+                config.rules.retain(|r| !firewall::same_selector(r, &rule));
+                config.rules.insert(0, rule);
+            }
+        });
         let count = ports.len();
         let plural = if count == 1 { "rule" } else { "rules" };
         let message = match unknown_network {

@@ -735,18 +735,6 @@ impl ExitClient {
         self.inner.load().is_some()
     }
 
-    /// Whether a datagram from sender `peer_user` is our own exit-node return
-    /// traffic (the sender is our chosen exit peer). Deliberately not scoped to
-    /// the arrival network: the gateway tags replies with whatever shared network
-    /// its generic route picks, which need not be the network we selected the
-    /// exit on. The sender identity is what the exemption trusts.
-    pub fn is_return_traffic(&self, peer_user: &EndpointId) -> bool {
-        self.inner
-            .load()
-            .as_ref()
-            .is_some_and(|s| &s.peer_user == peer_user)
-    }
-
     /// Whether return traffic arriving from a peer whose verified mesh address is
     /// `peer_v6` is our own exit-node return traffic. The sender's address is
     /// derived by the reader from our own roster (so it cannot be forged), which

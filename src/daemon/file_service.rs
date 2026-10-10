@@ -53,8 +53,8 @@ pub(crate) const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 mod blob_tags {
     use super::*;
 
-    pub(super) fn send(hash: &blake3::Hash, peer: &EndpointId) -> String {
-        format!("send/{}/{}", hash.to_hex(), peer.fmt_short())
+    pub(super) fn send(hash: &iroh_blobs::Hash, peer: &EndpointId) -> String {
+        format!("send/{hash}/{}", peer.fmt_short())
     }
 
     /// Keyed by the pending offer's id, which is unique per received offer.
@@ -107,13 +107,21 @@ impl Drop for ReceiveOfferGuard {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
             let mut queue = self.pending.lock().unwrap();
-            if let Some(evicted) = evict_oldest_file(&mut queue, MAX_PENDING_FILES) {
-                let hash = iroh_blobs::Hash::from_bytes(*evicted.blob_hash.as_bytes());
-                reclaim_blob(self.store.clone(), blob_tags::recv(&hash, evicted.id));
-            }
+            make_room(&mut queue, &self.store);
             queue.push(file);
             self.transfers.changed();
         }
+    }
+}
+
+/// Evict the oldest queued offer if the queue is full, and release the receive
+/// tag that kept its partially fetched data.
+fn make_room(queue: &mut Vec<PendingFile>, store: &FsStore) {
+    if let Some(evicted) = evict_oldest_file(queue, MAX_PENDING_FILES) {
+        reclaim_blob(
+            store.clone(),
+            blob_tags::recv(&evicted.blob_hash, evicted.id),
+        );
     }
 }
 
@@ -154,7 +162,7 @@ pub(crate) struct PendingFile {
     pub(crate) filename: String,
     pub(crate) size: u64,
     pub(crate) mime_type: String,
-    pub(crate) blob_hash: blake3::Hash,
+    pub(crate) blob_hash: iroh_blobs::Hash,
 }
 
 /// An open pairing session: the secret the ticket carries, and when it opened.
@@ -263,10 +271,10 @@ pub(crate) struct FileService {
     /// Received file offers awaiting `ray files accept`.
     pub(crate) pending_files: Arc<Mutex<Vec<PendingFile>>>,
     /// Monotonic id source for pending offers.
-    pub(crate) file_id_counter: Arc<AtomicU64>,
+    file_id_counter: AtomicU64,
     /// Active pairing secret and when it was opened (set by `start_pairing`,
     /// consumed by a matching pair request, and expired by [`PAIRING_TTL`]).
-    pub(crate) pairing_secret: Arc<Mutex<Option<PairingSession>>>,
+    pairing_secret: Mutex<Option<PairingSession>>,
     /// This node's transport secret key, used to sign device certs on pairing.
     secret_key: SecretKey,
     /// Foundation handles (endpoint + blob store) for fetching accepted files.
@@ -308,13 +316,13 @@ impl FileService {
                 entry.peer,
                 entry.filename.clone(),
                 entry.size,
-                iroh_blobs::Hash::from_bytes(*entry.blob_hash.as_bytes()),
+                entry.blob_hash.into(),
             );
         }
         Self {
             pending_files: Arc::new(Mutex::new(Vec::new())),
-            file_id_counter: Arc::new(ids),
-            pairing_secret: Arc::new(Mutex::new(None)),
+            file_id_counter: ids,
+            pairing_secret: Mutex::new(None),
             secret_key,
             transport,
             registry,
@@ -331,8 +339,6 @@ impl FileService {
     /// An idle Android node also checks the current roster before reading an
     /// offer, so unknown endpoints cannot make the phone process file metadata.
     pub(crate) async fn accept_file_offer(self: &Arc<Self>, conn: Connection) {
-        let pending = Arc::clone(&self.pending_files);
-        let counter = Arc::clone(&self.file_id_counter);
         let remote_id = conn.remote_id();
         #[cfg(target_os = "android")]
         if self.transport.is_suspended()
@@ -355,24 +361,18 @@ impl FileService {
                         blob_hash,
                     }) => {
                         if from == remote_id {
-                            let id = counter.fetch_add(1, Ordering::Relaxed);
+                            let id = self.file_id_counter.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
                             {
-                                let mut queue = pending.lock().unwrap();
-                                if let Some(evicted) =
-                                    evict_oldest_file(&mut queue, MAX_PENDING_FILES)
-                                {
-                                    let hash =
-                                        iroh_blobs::Hash::from_bytes(*evicted.blob_hash.as_bytes());
-                                    self.reclaim_blob(blob_tags::recv(&hash, evicted.id));
-                                }
+                                let mut queue = self.pending_files.lock().unwrap();
+                                make_room(&mut queue, &self.transport.blob_store);
                                 queue.push(PendingFile {
                                     id,
                                     from,
                                     filename,
                                     size,
                                     mime_type,
-                                    blob_hash,
+                                    blob_hash: blob_hash.into(),
                                 });
                             }
                             self.transfers.changed();
@@ -514,7 +514,7 @@ impl FileService {
     ) -> IpcMessage {
         #[cfg(windows)]
         let _ = peer_cred;
-        let blob_hash = iroh_blobs::Hash::from_bytes(*pending_file.blob_hash.as_bytes());
+        let blob_hash = pending_file.blob_hash;
         let peer_label = pending_file.from.fmt_short().to_string();
         let transfer_id = self.transfers.register_receive(
             peer_label,
@@ -823,7 +823,7 @@ impl FileService {
         size: u64,
         temp: iroh_blobs::api::TempTag,
     ) -> IpcMessage {
-        let hash = blake3::Hash::from_bytes(*temp.hash().as_bytes());
+        let hash = temp.hash();
         if let Err(e) = self.tag_blob(blob_tags::send(&hash, &peer_id), temp).await {
             return ipc_err(e);
         }
@@ -833,19 +833,15 @@ impl FileService {
         // and on auto-accept the receiver can fetch the entire blob the moment
         // the offer lands, so every provider event (Started/Progress/Completed)
         // must find the entry already registered.
-        self.transfers.register_send(
-            peer_id,
-            filename.clone(),
-            size,
-            iroh_blobs::Hash::from_bytes(*hash.as_bytes()),
-        );
+        self.transfers
+            .register_send(peer_id, filename.clone(), size, hash);
 
         let entry = OutboxEntry {
             id: self.file_id_counter.fetch_add(1, Ordering::Relaxed),
             peer: peer_id,
             filename: filename.clone(),
             size,
-            blob_hash: hash,
+            blob_hash: hash.into(),
         };
         self.outbox.lock().unwrap().push(entry);
         self.save_outbox();
@@ -876,7 +872,6 @@ impl FileService {
     ///
     /// Not called on an aborted pull: keep the bytes for the receiver's retry.
     pub(crate) fn note_send_completed(self: &Arc<Self>, hash: iroh_blobs::Hash, peer: EndpointId) {
-        let hash = blake3::Hash::from_bytes(*hash.as_bytes());
         self.reclaim_blob(blob_tags::send(&hash, &peer));
     }
 
@@ -992,10 +987,8 @@ impl FileService {
         };
         match removed {
             Some(entry) => {
-                self.transfers.fail_offer_by(
-                    iroh_blobs::Hash::from_bytes(*entry.blob_hash.as_bytes()),
-                    entry.peer,
-                );
+                self.transfers
+                    .fail_offer_by(entry.blob_hash.into(), entry.peer);
                 self.save_outbox();
                 IpcMessage::Ok {
                     message: format!(
@@ -1015,10 +1008,7 @@ impl FileService {
     pub(crate) fn cancel_transfer(&self, id: u64) -> IpcMessage {
         match self.transfers.cancel(id) {
             Some((hash, peer)) => {
-                self.reclaim_blob(blob_tags::send(
-                    &blake3::Hash::from_bytes(*hash.as_bytes()),
-                    &peer,
-                ));
+                self.reclaim_blob(blob_tags::send(&hash, &peer));
                 IpcMessage::Ok {
                     message: format!("canceled file transfer {id}"),
                 }
@@ -1103,8 +1093,7 @@ impl FileService {
         let mut pending = self.pending_files.lock().unwrap();
         match take_pending(&mut pending, id) {
             Some(f) => {
-                let hash = iroh_blobs::Hash::from_bytes(*f.blob_hash.as_bytes());
-                self.reclaim_blob(blob_tags::recv(&hash, f.id));
+                self.reclaim_blob(blob_tags::recv(&f.blob_hash, f.id));
                 self.transfers.changed();
                 IpcMessage::Ok {
                     message: format!("declined {} from {}", f.filename, f.from.fmt_short()),
@@ -1162,8 +1151,6 @@ impl FileService {
     /// secret against the active pairing session and, on match, signs and returns
     /// a `DeviceCert` binding the new device key to our identity.
     pub(crate) async fn accept_pair_request(&self, conn: Connection) {
-        let pairing_secret = Arc::clone(&self.pairing_secret);
-        let secret_key = self.secret_key.clone();
         let remote_id = conn.remote_id();
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
@@ -1207,7 +1194,7 @@ impl FileService {
                         // early-exiting `==` over 32 bytes would answer how much
                         // of the prefix was right.
                         let check = {
-                            let mut held = pairing_secret.lock().unwrap();
+                            let mut held = self.pairing_secret.lock().unwrap();
                             match held.as_ref() {
                                 // Expired: clear it on the way past, so the state
                                 // does not outlive the window the user opened.
@@ -1250,7 +1237,7 @@ impl FileService {
                                 let generation =
                                     config::load().map(|c| c.cert_generation).unwrap_or(0);
                                 let cert = control::DeviceCert::create(
-                                    &secret_key,
+                                    &self.secret_key,
                                     &device_pubkey,
                                     generation,
                                 );
@@ -1355,7 +1342,7 @@ mod tests {
             filename: format!("file{id}.bin"),
             size: 1,
             mime_type: "application/octet-stream".to_string(),
-            blob_hash: blake3::hash(b"payload"),
+            blob_hash: blake3::hash(b"payload").into(),
         }
     }
 
@@ -1398,7 +1385,7 @@ mod tests {
         drop(temp);
 
         let mut file = pending(1);
-        file.blob_hash = blake3::Hash::from_bytes(*hash.as_bytes());
+        file.blob_hash = hash;
         let queue = Arc::new(Mutex::new(vec![file, pending(2)]));
         let transfers = Arc::new(transfers::TransferRegistry::new());
         let mut changes = transfers.subscribe();
@@ -1414,7 +1401,7 @@ mod tests {
         changes.changed().await.unwrap();
 
         let retried = take_pending(&mut queue.lock().unwrap(), 1).unwrap();
-        assert_eq!(retried.blob_hash.as_bytes(), hash.as_bytes());
+        assert_eq!(retried.blob_hash, hash);
         assert_eq!(queue.lock().unwrap()[0].id, 2);
         let junk = canary(&store, tmp.path(), "canary.bin").await;
         collected(&store, junk, "the untagged canary").await;
@@ -1457,7 +1444,7 @@ mod tests {
             .unwrap();
         drop(temp);
         let mut files: Vec<_> = (1..=MAX_PENDING_FILES as u64).map(pending).collect();
-        files[0].blob_hash = blake3::Hash::from_bytes(*hash.as_bytes());
+        files[0].blob_hash = hash;
         let queue = Arc::new(Mutex::new(files));
         let offer = ReceiveOfferGuard {
             file: Some(pending(999)),
@@ -1500,9 +1487,16 @@ mod tests {
     /// first pickup cannot sweep the bytes the second recipient still needs.
     #[test]
     fn send_tags_are_per_recipient() {
-        let hash = blake3::hash(b"same file");
+        let content = blake3::hash(b"same file");
+        let hash = iroh_blobs::Hash::from(content);
         let a = SecretKey::from([1u8; 32]).public();
         let b = SecretKey::from([2u8; 32]).public();
+        // The name is persisted in the blob store, so it must keep the shape it
+        // had when it was built from the blake3 hash directly.
+        assert_eq!(
+            blob_tags::send(&hash, &a),
+            format!("send/{}/{}", content.to_hex(), a.fmt_short())
+        );
         assert_ne!(blob_tags::send(&hash, &a), blob_tags::send(&hash, &b));
         // ...and stable, since the name is re-derived rather than stored: the
         // reclaim after a daemon restart has to find the same tag.

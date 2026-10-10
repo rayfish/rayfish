@@ -140,22 +140,12 @@ pub(crate) async fn ipc_join(
 }
 
 pub(crate) async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Nuke {
-            name: name.to_string(),
-            force,
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::Nuke {
+        name: name.to_string(),
+        force,
+    })
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 /// `ray kick`: remove a member, asking first when the argument names someone
@@ -194,11 +184,7 @@ pub(crate) async fn ipc_kick(network: &str, peer: &str, yes: bool) -> Result<()>
                 println!("  {}\n", style::faint("cancelled"));
                 return Ok(());
             }
-            match send_kick(network, peer, true).await? {
-                ipc::IpcMessage::Ok { message } => println!("{}", message),
-                ipc::IpcMessage::Error { message } => fail_with("error", &message),
-                other => fail_unexpected(&other),
-            }
+            print_ok_reply(send_kick(network, peer, true).await?)?;
         }
         other => fail_unexpected(&other),
     }
@@ -210,17 +196,12 @@ pub(crate) async fn ipc_kick(network: &str, peer: &str, yes: bool) -> Result<()>
 /// the confirmed request, so the roster it acts on is the one it just read
 /// rather than one cached across the prompt.
 async fn send_kick(network: &str, peer: &str, confirm: bool) -> Result<ipc::IpcMessage> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Kick {
-            network: network.to_string(),
-            peer: peer.to_string(),
-            confirm,
-        },
-    )
-    .await?;
-    ipc::recv(&mut stream).await
+    ipc_request(ipc::IpcMessage::Kick {
+        network: network.to_string(),
+        peer: peer.to_string(),
+        confirm,
+    })
+    .await
 }
 
 /// The rows a pending kick would take, one per line, primary first so the
@@ -271,21 +252,11 @@ fn prompt_yes(question: &str) -> Result<bool> {
 }
 
 pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Leave {
-            name: name.to_string(),
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::Leave {
+        name: name.to_string(),
+    })
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 /// Render a TTL in seconds back to the largest whole `Nw`/`Nd`/`Nh` unit
@@ -352,12 +323,7 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
         },
     )
     .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(ipc::recv(&mut stream).await?)
 }
 
 /// Parse a human duration (`Nh`/`Nd`/`Nw`) into seconds, enforcing a 1-hour

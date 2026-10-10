@@ -40,7 +40,7 @@ use clap_complete::{CompleteEnv, Shell};
 use crate::Cli;
 use crate::*;
 
-use ipc::{IpcMessage, NetworkStatus, NodeKey, PeerState};
+use ipc::{IpcMessage, NetworkStatus, NodeKey};
 
 use super::files::format_size;
 
@@ -395,12 +395,7 @@ fn peer_candidates(current: &OsStr, filter: PeerFilter) -> Vec<CompletionCandida
         })
         .filter_map(|peer| {
             let name = peer.hostname.clone()?;
-            let state = match peer.state {
-                PeerState::Active => "active",
-                PeerState::Idle => "idle",
-                PeerState::Offline => "offline",
-            };
-            Some((name, format!("{}, {state}", peer.ipv6)))
+            Some((name, format!("{}, {}", peer.ipv6, peer.state)))
         })
         .collect();
     // The same device is on the roster of every network it shares with us, and

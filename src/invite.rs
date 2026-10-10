@@ -13,11 +13,16 @@
 //! checksum existed still decode.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
+
+// Invite expiry uses wall-clock time, so a large backward clock adjustment on
+// the coordinator could briefly un-expire an invite (or a forward jump expire
+// one early), acceptable for a TTL credential.
+use crate::membership::now_secs;
 
 /// Length of the random invite secret, in bytes (128 bits).
 pub const SECRET_LEN: usize = 16;
@@ -76,16 +81,6 @@ pub struct InviteView {
 pub struct InviteStore {
     path: PathBuf,
     invites: Vec<Invite>,
-}
-
-/// Current Unix time in seconds. Invite expiry uses wall-clock time, so a large
-/// backward clock adjustment on the coordinator could briefly un-expire an
-/// invite (or a forward jump expire one early), acceptable for a TTL credential.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Hex blake3 of a secret: the canonical `secret_hash` form the ledger stores
@@ -290,7 +285,7 @@ impl InviteStore {
     pub fn revoke(&mut self, id: &str) -> Result<()> {
         let mut matching_idx = None;
         for (idx, invite) in self.invites.iter().enumerate() {
-            if invite.id == id || invite.id.starts_with(id) {
+            if invite.id.starts_with(id) {
                 if matching_idx.is_some() {
                     bail!("ambiguous invite id '{id}'");
                 }

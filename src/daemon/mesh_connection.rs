@@ -112,20 +112,9 @@ impl MeshConnection {
             // internet traffic, and an internet-bound packet cannot lazily
             // re-dial it (the destination is not a roster member), so a reaped
             // exit link blackholes until the next reconverge. Keep it warm.
-            let is_exit_peer = self
-                .ctx
-                .registry
-                .exit_client
-                .selection()
-                .and_then(|s| {
-                    self.ctx
-                        .peers
-                        .ipv6_for_id(&self.peer_id)
-                        .map(|v6| v6 == s.ipv6)
-                })
-                .unwrap_or(false);
+            // Checked only when on-demand, so other nodes skip the lookups.
             let sleep_for = (self.ctx.registry.on_demand
-                && !is_exit_peer
+                && !self.is_exit_peer()
                 && self
                     .ctx
                     .peers
@@ -358,6 +347,21 @@ impl MeshConnection {
                 announce_network_handles(&self.ctx.peers, &self.conn, peer_ip).await;
             }
         }
+    }
+
+    /// Whether this peer is the selected exit node.
+    fn is_exit_peer(&self) -> bool {
+        self.ctx
+            .registry
+            .exit_client
+            .selection()
+            .and_then(|s| {
+                self.ctx
+                    .peers
+                    .ipv6_for_id(&self.peer_id)
+                    .map(|v6| v6 == s.ipv6)
+            })
+            .unwrap_or(false)
     }
 
     /// Best-effort `NotSupported` nack for a control frame this build could not

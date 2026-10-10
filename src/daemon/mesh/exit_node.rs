@@ -208,9 +208,14 @@ impl NetworkRegistry {
 
     /// The roster member `id` names (see [`Member::matches_identity`]).
     pub(crate) fn roster_member(&self, network: &str, id: EndpointId) -> Option<Member> {
-        self.roster(network)
+        let handle = self.networks.get(network)?;
+        let state = handle.state.read().unwrap();
+        state
+            .members
+            .all()
             .into_iter()
             .find(|m| m.matches_identity(id))
+            .cloned()
     }
 
     /// Whether `device_key` is nullified on *any* network this node runs

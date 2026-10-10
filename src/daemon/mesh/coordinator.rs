@@ -5,8 +5,6 @@
 //! reader and coordinator/member accept handlers now live in the per-connection
 //! demux (`ProtocolRouter::drive_mesh_connection` → `AcceptHandler::handle_frame`).
 
-use std::net::Ipv6Addr;
-
 use super::super::*;
 
 /// Maximum time one serialized mesh dial may own or wait for a peer's dial gate.
@@ -608,9 +606,8 @@ pub(crate) fn sender_is_coordinator(state: &SharedNetworkState, peer: EndpointId
         .read()
         .unwrap()
         .members
-        .all()
-        .iter()
-        .any(|m| m.identity == peer && m.is_coordinator)
+        .get(&peer)
+        .is_some_and(|m| m.is_coordinator)
 }
 
 /// Pure prune decision for one member under the ephemeral policy. Never prunes
@@ -645,7 +642,6 @@ pub(crate) async fn remove_member_roster_only(
     network: &str,
     state: &SharedNetworkState,
     member_id: EndpointId,
-    member_ipv6: Ipv6Addr,
 ) {
     {
         let mut s = state.write().unwrap();
@@ -656,7 +652,7 @@ pub(crate) async fn remove_member_roster_only(
         &ctx.hostname_table,
         &ctx.reverse_table,
         network,
-        member_ipv6,
+        derive_ipv6(&member_id),
     )
     .await;
 }
@@ -776,7 +772,7 @@ pub(crate) fn spawn_stale_member_pruner(
                 continue;
             }
             for id in &removed_members {
-                remove_member_roster_only(&ctx, &network, &state, *id, derive_ipv6(id)).await;
+                remove_member_roster_only(&ctx, &network, &state, *id).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
             finalize_removal(&ctx, &network, &state, &dht_notify, &removed_members).await;

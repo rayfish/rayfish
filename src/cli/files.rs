@@ -112,44 +112,45 @@ impl DisplayOut for FilesOutput<'_> {
             print!("{}", table(&["id", "to", "size", "file", ""], rows, 2));
         }
         if !self.transfers.is_empty() {
-            let rows = self
-                .transfers
-                .iter()
-                .map(|t| {
-                    let state = format!("{:?}", t.state).to_lowercase();
-                    let action = if t.outgoing
-                        && matches!(
-                            t.state,
-                            ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
-                        ) {
-                        format!("ray files cancel-transfer {}", t.id)
-                    } else {
-                        String::new()
-                    };
-                    vec![
-                        layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
-                        layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
-                        layout::Cell::right(
-                            format!("{} / {}", format_size(t.transferred), format_size(t.size)),
-                            style::faint(&format_size(t.size)),
-                        ),
-                        layout::Cell::new(
-                            format!("{} ({state})", t.filename),
-                            style::value(&t.filename),
-                        ),
-                        layout::Cell::new(action.clone(), style::faint(&action)),
-                    ]
-                })
-                .collect();
             println!();
             println!("  {}", style::faint("transfers"));
-            print!(
-                "{}",
-                table(&["id", "peer", "progress", "file", ""], rows, 2)
-            );
+            print!("{}", transfers_table(self.transfers));
         }
         println!();
     }
+}
+
+/// Active transfers as a table: progress is `transferred / total` and the file
+/// cell carries the transfer state.
+fn transfers_table(transfers: &[ipc::TransferFileInfo]) -> String {
+    let rows = transfers
+        .iter()
+        .map(|t| {
+            let state = format!("{:?}", t.state).to_lowercase();
+            let action = if t.outgoing
+                && matches!(
+                    t.state,
+                    ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
+                ) {
+                format!("ray files cancel-transfer {}", t.id)
+            } else {
+                String::new()
+            };
+            let progress = format!("{} / {}", format_size(t.transferred), format_size(t.size));
+            let state = format!("({state})");
+            vec![
+                layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
+                layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
+                layout::Cell::right(progress.clone(), style::faint(&progress)),
+                layout::Cell::new(
+                    format!("{} {state}", t.filename),
+                    format!("{} {}", style::value(&t.filename), style::faint(&state)),
+                ),
+                layout::Cell::new(action.clone(), style::faint(&action)),
+            ]
+        })
+        .collect();
+    table(&["id", "peer", "progress", "file", ""], rows, 2)
 }
 
 /// `ray send <peer> <files...>`: one `SendFileFd` request per file. Each file
@@ -514,3 +515,28 @@ pub(crate) fn format_size(bytes: u64) -> String {
 // ---------------------------------------------------------------------------
 // Device pairing
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfers_table_shows_progress_and_state() {
+        style::set_plain(true);
+        let transfers = [ipc::TransferFileInfo {
+            id: 7,
+            outgoing: true,
+            peer: "laptop".to_string(),
+            filename: "notes.txt".to_string(),
+            size: 2048,
+            transferred: 1024,
+            state: ipc::TransferFileState::Transferring,
+            destination: None,
+        }];
+        let out = transfers_table(&transfers);
+        let row = out.lines().nth(1).expect("table has a header and one row");
+        assert!(row.contains("1 KiB / 2 KiB"), "{out}");
+        assert!(row.contains("notes.txt (transferring)"), "{out}");
+        assert!(row.contains("ray files cancel-transfer 7"), "{out}");
+    }
+}

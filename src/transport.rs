@@ -483,12 +483,12 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+const DATAGRAM_SEND_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Keep most of the backlog in FQ-CoDel, rather than the QUIC FIFO.
+/// Bound standalone queueing delay and keep FQ-CoDel's backlog in its scheduler.
 pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
     match engine {
-        QuicEngine::FqCodel => 16 * 1024,
+        QuicEngine::FqCodel => DATAGRAM_SEND_BUFFER_SIZE,
         QuicEngine::Standalone => DATAGRAM_SEND_BUFFER_SIZE,
     }
 }

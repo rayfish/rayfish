@@ -83,7 +83,7 @@ pub fn build_packet_too_big(packet: &[u8], info: &PacketInfo, mtu: u16) -> Optio
     }
     match (info.dst_ip, info.src_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let quote_len = (ip_header_len(packet, info) + 8).min(packet.len());
+            let quote_len = (info.transport_offset + 8).min(packet.len());
             let mut msg = build_icmp_message(3, 4, &packet[..quote_len]);
             // RFC 1191: the low 16 bits of the "unused" word carry the next-hop MTU.
             msg[6..8].copy_from_slice(&mtu.to_be_bytes());
@@ -125,15 +125,6 @@ fn is_icmp_error(info: &PacketInfo) -> bool {
     }
 }
 
-/// Length of the original IP header (so we can find the TCP header / how much to
-/// quote in an ICMP error).
-fn ip_header_len(packet: &[u8], info: &PacketInfo) -> usize {
-    match info.src_ip {
-        IpAddr::V4(_) => ((packet[0] & 0x0F) as usize) * 4,
-        IpAddr::V6(_) => IPV6_HEADER_LEN,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // TCP RST
 // ---------------------------------------------------------------------------
@@ -141,7 +132,9 @@ fn ip_header_len(packet: &[u8], info: &PacketInfo) -> usize {
 /// Build an IP + TCP RST segment per RFC 793's reset generation rules. The reply
 /// addresses/ports are the original's, swapped.
 fn build_tcp_rst(packet: &[u8], info: &PacketInfo) -> Option<Bytes> {
-    let ihl = ip_header_len(packet, info);
+    // IPv6 extension headers sit between the fixed header and TCP; the parser
+    // recorded where TCP really starts.
+    let ihl = info.transport_offset;
     let tcp = packet.get(ihl..)?;
     if tcp.len() < TCP_HEADER_LEN {
         return None;
@@ -212,7 +205,7 @@ fn build_icmp_unreachable(packet: &[u8], info: &PacketInfo) -> Option<Bytes> {
     match (info.dst_ip, info.src_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             // Quote the original IP header + 8 bytes (RFC 792).
-            let quote_len = (ip_header_len(packet, info) + 8).min(packet.len());
+            let quote_len = (info.transport_offset + 8).min(packet.len());
             let code = if udp { 3 } else { 13 }; // port-unreach / admin-filtered
             let mut msg = build_icmp_message(3, code, &packet[..quote_len]);
             let csum = icmpv4_checksum(&msg);
@@ -578,5 +571,32 @@ mod tests {
             sum = (sum & 0xffff) + (sum >> 16);
         }
         assert_eq!(sum as u16, 0xffff);
+    }
+    #[test]
+    fn tcp_v6_rst_reads_tcp_past_a_hop_by_hop_header() {
+        // Insert an 8-octet hop-by-hop header before TCP. The RST must take its
+        // seq from the real TCP ack field at 48 + 8, not from bytes at 40.
+        let base = tcp_v6(TCP_ACK, 2000);
+        let mut pkt = Vec::with_capacity(base.len() + 8);
+        pkt.extend_from_slice(&base[..IPV6_HEADER_LEN]);
+        pkt.extend_from_slice(&[PROTO_TCP, 0, 1, 4, 0, 0, 0, 0]); // next = TCP, PadN
+        pkt.extend_from_slice(&base[IPV6_HEADER_LEN..]);
+        pkt[4..6].copy_from_slice(&((8 + TCP_HEADER_LEN) as u16).to_be_bytes());
+        pkt[6] = 0; // hop-by-hop
+        let t = IPV6_HEADER_LEN + 8;
+        pkt[t + 8..t + 12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+
+        let info = parse_packet_info(&pkt).unwrap();
+        assert_eq!(info.transport_offset, t);
+        let reply = build_reject(&pkt, &info).unwrap();
+        let r = parse_packet_info(&reply).unwrap();
+        assert_eq!((r.src_port, r.dst_port), (8080, 44321));
+        assert_eq!(r.tcp_flags, TCP_RST);
+        let seg = &reply[IPV6_HEADER_LEN..];
+        assert_eq!(
+            u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]),
+            0xDEAD_BEEF
+        );
+        assert_eq!(u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]), 0);
     }
 }

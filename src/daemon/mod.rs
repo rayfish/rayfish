@@ -80,8 +80,8 @@ use crate::ipc::{
     NetworkRole, NetworkStatus, PeerState, PeerStatus, ipc_err,
 };
 use crate::membership::{
-    ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IdentityProvider, IrohIdentityProvider,
-    Member, MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
+    ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IrohIdentityProvider, Member, MemberList,
+    canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
@@ -739,6 +739,17 @@ struct TunTasks {
     idle_transport: JoinHandle<()>,
 }
 
+impl TunTasks {
+    /// Cancel the reader loop and abort every data-plane task.
+    fn stop(self) {
+        self.cancel.cancel();
+        self.writer.abort();
+        self.mesh.abort();
+        #[cfg(target_os = "android")]
+        self.idle_transport.abort();
+    }
+}
+
 pub struct Daemon {
     /// Recent RTT samples per peer, shared by successive status requests.
     connection_history: Mutex<mesh::diagnostics::ConnectionHistory>,
@@ -893,15 +904,9 @@ impl Daemon {
     /// join issued right after pairing (same process, no restart) carries the
     /// freshly stored cert rather than the value loaded at startup.
     pub fn current_device_cert(&self) -> Option<control::DeviceCert> {
-        // The on-disk cert is authoritative: a cleanly-absent file (`Ok(None)`,
-        // e.g. after `unpair_self` deletes it) means unpaired, so we must NOT fall
-        // back to the in-memory copy loaded at build, otherwise `is_paired()`
-        // would keep reporting paired after a self-unpair. Only a genuine read
-        // error falls back to the in-memory cert.
-        match identity::load_device_cert() {
-            Ok(cert) => cert,
-            Err(_) => self.device_cert.clone(),
-        }
+        // Same cert the registry was built with; see
+        // `NetworkRegistry::current_device_cert` for why the on-disk copy wins.
+        self.registry.current_device_cert()
     }
 
     /// Coalesced invalidations for incoming offers and transfer status. Subscribe
@@ -1070,11 +1075,7 @@ impl Daemon {
         };
         let old = self.tun_tasks.lock().unwrap().replace(new_tasks);
         if let Some(old) = old {
-            old.cancel.cancel();
-            old.writer.abort();
-            old.mesh.abort();
-            #[cfg(target_os = "android")]
-            old.idle_transport.abort();
+            old.stop();
         }
         // Connections survive mobile VPN toggles; refresh the receive limit for
         // already-connected peers as well as announcing it on future connects.
@@ -1140,11 +1141,7 @@ impl Daemon {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
             tracing::info!("detach_tun: aborting TUN writer + mesh forwarding tasks");
-            tasks.cancel.cancel();
-            tasks.writer.abort();
-            tasks.mesh.abort();
-            #[cfg(target_os = "android")]
-            tasks.idle_transport.abort();
+            tasks.stop();
         } else {
             tracing::debug!("detach_tun: no TUN attached");
         }

@@ -375,13 +375,6 @@ pub fn mark_coordinator(members: &mut MemberList, identity: &EndpointId) {
     }
 }
 
-/// Abstracts identity and address derivation so the membership system doesn't
-/// depend directly on iroh types.
-pub trait IdentityProvider: Send + Sync {
-    fn local_ipv6(&self) -> Ipv6Addr;
-    fn local_identity(&self) -> EndpointId;
-}
-
 /// Derives a stable IPv6 address from an [`EndpointId`] in the `200::/7` range.
 /// Uses blake3 to hash the identity, takes 15 bytes, and prepends `0x02`.
 /// The 120-bit address space makes collisions practically impossible.
@@ -395,7 +388,7 @@ pub fn derive_ipv6(identity: &EndpointId) -> Ipv6Addr {
     Ipv6Addr::from(octets)
 }
 
-/// [`IdentityProvider`] backed by an iroh [`EndpointId`].
+/// This node's iroh [`EndpointId`] and the mesh address derived from it.
 #[derive(Clone)]
 pub struct IrohIdentityProvider {
     endpoint_id: EndpointId,
@@ -409,14 +402,12 @@ impl IrohIdentityProvider {
             ipv6: derive_ipv6(&endpoint_id),
         }
     }
-}
 
-impl IdentityProvider for IrohIdentityProvider {
-    fn local_ipv6(&self) -> Ipv6Addr {
+    pub fn local_ipv6(&self) -> Ipv6Addr {
         self.ipv6
     }
 
-    fn local_identity(&self) -> EndpointId {
+    pub fn local_identity(&self) -> EndpointId {
         self.endpoint_id
     }
 }
@@ -476,7 +467,7 @@ impl ReusableKey {
     /// (hex `blake3(secret)`) and the entry. `created`/`ttl_secs` are Unix seconds;
     /// the raw secret is the caller's to encode into the join code and discard.
     pub fn from_secret(secret: &[u8], created: u64, ttl_secs: u64) -> (String, ReusableKey) {
-        let hash = blake3::hash(secret).to_hex().to_string();
+        let hash = crate::invite::hash_secret(secret);
         let id = hash[..8].to_string();
         (
             hash,
@@ -496,7 +487,7 @@ impl ReusableKey {
 pub fn revoke_reusable(keys: &mut BTreeMap<String, ReusableKey>, id: &str) -> Result<()> {
     let mut matching_hash = None;
     for (hash, key) in keys.iter() {
-        if key.id == id || key.id.starts_with(id) {
+        if key.id.starts_with(id) {
             if matching_hash.is_some() {
                 bail!("ambiguous reusable key id '{id}'");
             }
@@ -521,7 +512,7 @@ pub fn validate_reusable_key<'a>(
     secret: &[u8],
     now: u64,
 ) -> Option<&'a ReusableKey> {
-    let hash = blake3::hash(secret).to_hex().to_string();
+    let hash = crate::invite::hash_secret(secret);
     let key = keys.get(&hash)?;
     if key.revoked || now >= key.expires {
         return None;
@@ -531,6 +522,7 @@ pub fn validate_reusable_key<'a>(
 
 impl GroupBlob {
     /// Convenience wrapper over [`validate_reusable_key`] for a decoded blob.
+    #[cfg(test)]
     pub fn validate_reusable(&self, secret: &[u8], now: u64) -> Option<&ReusableKey> {
         validate_reusable_key(&self.reusable_keys, secret, now)
     }
