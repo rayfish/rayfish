@@ -164,9 +164,13 @@ impl ConnectService {
             config::load().ok().and_then(|c| c.default_hostname),
             req.hostname.as_deref().as_slice(),
         );
-        let name = self
+        let name = match self
             .registry
-            .direct_network_name(&my_host, req.hostname.as_deref());
+            .direct_network_name(&my_host, req.hostname.as_deref())
+        {
+            Ok(name) => name,
+            Err(e) => return ipc_err(format!("{e:#}")),
+        };
         match self
             .registry
             .create_network_inner(

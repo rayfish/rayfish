@@ -42,6 +42,19 @@ fn network_key_from_selector(selector: &str) -> Option<EndpointId> {
     })
 }
 
+/// What holds a local network name on this node. The name is also the file name
+/// of the network's config (`networks/<name>.toml`), so it stays held while only
+/// that file is left, as for a network whose restore has not landed: saving
+/// another network under it would replace that network's config, keys included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameOwner {
+    Free,
+    /// The network with this key, active or only saved.
+    Network(EndpointId),
+    /// A saved config that records no network key, so it is no network's own.
+    Unknown,
+}
+
 /// One network to (re)handshake when dialing a peer: its name and the per-network
 /// public key that signs the `MeshHello`. A peer's single connection carries every
 /// shared network, so a dial takes a slice of these.
@@ -784,7 +797,11 @@ impl NetworkRegistry {
     }
 
     /// Pick a collision-free `<me>-<peer>` name for a direct network.
-    pub(crate) fn direct_network_name(&self, my_host: &str, peer_hostname: Option<&str>) -> String {
+    pub(crate) fn direct_network_name(
+        &self,
+        my_host: &str,
+        peer_hostname: Option<&str>,
+    ) -> Result<String> {
         let peer = peer_hostname.unwrap_or("peer");
         let mut base = format!("{my_host}-{peer}");
         if base.len() > 63 {
@@ -794,9 +811,44 @@ impl NetworkRegistry {
         if !crate::hostname::is_valid_hostname(&base) {
             base = crate::network_name::generate_name();
         }
-        let taken: Vec<String> = self.networks.iter().map(|h| h.key().clone()).collect();
-        let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-        crate::hostname::resolve_collision(&base, &taken_refs)
+        self.unclaimed_network_name(&base, None)
+    }
+
+    /// What holds the local network name `name` (see [`NameOwner`]).
+    pub(crate) fn name_owner(&self, name: &str) -> Result<NameOwner> {
+        if let Some(handle) = self.networks.get(name) {
+            return Ok(NameOwner::Network(handle.network_key));
+        }
+        Ok(match config::load_network(name)? {
+            None => NameOwner::Free,
+            Some(net) => net
+                .network_public_key
+                .or_else(|| net.network_secret_key.as_ref().map(SecretKey::public))
+                .map_or(NameOwner::Unknown, NameOwner::Network),
+        })
+    }
+
+    /// A local name for a network this node names itself (a generated one, the
+    /// name a coordinator gave a joined network, a `ray connect` link): `base` if no
+    /// other network holds it, else the first free `base-1`, `base-2`, ..., the way
+    /// hostname collisions resolve. A name that network `key` already holds counts
+    /// as free, so rejoining a saved network keeps its name and its config.
+    pub(crate) fn unclaimed_network_name(
+        &self,
+        base: &str,
+        key: Option<EndpointId>,
+    ) -> Result<String> {
+        let mut candidate = base.to_string();
+        for suffix in 1u32.. {
+            match self.name_owner(&candidate)? {
+                NameOwner::Free => return Ok(candidate),
+                NameOwner::Network(owner) if Some(owner) == key => return Ok(candidate),
+                NameOwner::Network(_) | NameOwner::Unknown => {
+                    candidate = format!("{base}-{suffix}");
+                }
+            }
+        }
+        unreachable!()
     }
 
     /// Mint a new network: generate its keypair, build the initial roster, seal +
@@ -818,17 +870,22 @@ impl NetworkRegistry {
                     crate::hostname::is_valid_hostname(&n),
                     "invalid network name '{n}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
                 );
+                if self.networks.contains_key(&n) {
+                    return Ok(ipc_err(format!("network '{n}' already active")));
+                }
+                if self.name_owner(&n)? != NameOwner::Free {
+                    return Ok(ipc_err(format!(
+                        "network name '{n}' belongs to a saved network that is not active \
+                         (see `ray status`); choose another name"
+                    )));
+                }
                 n
             }
-            None => network_name::generate_name(),
+            None => self.unclaimed_network_name(&network_name::generate_name(), None)?,
         };
 
         let net_secret_key = SecretKey::generate();
         let net_public_key = net_secret_key.public();
-
-        if self.networks.contains_key(&name) {
-            return Ok(ipc_err(format!("network '{name}' already active")));
-        }
 
         let my_ip = self.transport.identity.local_ipv6();
 

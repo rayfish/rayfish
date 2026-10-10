@@ -416,10 +416,22 @@ impl NetworkRegistry {
     ) -> Result<TryJoin> {
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
-        if let Some(a) = alias
-            && self.networks.contains_key(a)
-        {
-            anyhow::bail!("already in network '{a}'");
+        // A name given with `--name` (or a restore's saved one) is used as is, so
+        // it must be free or this network's own: a restore, or a rejoin of a
+        // network whose saved config the join then updates.
+        if let Some(a) = alias {
+            match self.name_owner(a)? {
+                NameOwner::Free => {}
+                NameOwner::Network(key) if key == net_pubkey => {
+                    if self.networks.contains_key(a) {
+                        anyhow::bail!("already in network '{a}'");
+                    }
+                }
+                NameOwner::Network(_) | NameOwner::Unknown => anyhow::bail!(
+                    "network name '{a}' belongs to another network on this node; \
+                     choose another --name"
+                ),
+            }
         }
 
         // A fresh join has to be admitted by a coordinator over a mesh connection
@@ -462,7 +474,12 @@ impl NetworkRegistry {
             .name
             .clone()
             .unwrap_or_else(|| network_key[..network_key.len().min(8)].to_string());
-        let display_name_owned = alias.map(|a| a.to_string()).unwrap_or(blob_name);
+        let display_name_owned = match alias {
+            Some(a) => a.to_string(),
+            // The coordinator chose this name, and another network here may hold
+            // it: take the next free suffix rather than that network's config.
+            None => self.unclaimed_network_name(&blob_name, Some(net_pubkey))?,
+        };
         let display_name = display_name_owned.as_str();
 
         if self.networks.contains_key(display_name) {
@@ -1964,5 +1981,154 @@ mod tests {
         let peer = id(1);
         let target = select_restore_target(Some((hash, vec![peer])), None, true, &[peer]).unwrap();
         assert_eq!(target.peers, vec![peer]);
+    }
+
+    /// Points the daemon's config directory at a fresh temporary one until
+    /// dropped. Hold `config::CONFIG_ENV_LOCK` while it lives.
+    struct TempConfigDir {
+        _dir: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TempConfigDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
+            unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", dir.path()) };
+            Self {
+                _dir: dir,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TempConfigDir {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                    None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    /// A saved network that is not active, as one whose restore has not landed.
+    fn save_inactive_network(name: &str, key: &SecretKey) {
+        config::save_network(&config::NetworkConfig {
+            network_secret_key: Some(key.clone()),
+            network_public_key: Some(key.public()),
+            ..config::empty_network_config(name)
+        })
+        .unwrap();
+    }
+
+    fn saved_key(name: &str) -> Option<EndpointId> {
+        config::load_network(name)
+            .unwrap()
+            .and_then(|net| net.network_public_key)
+    }
+
+    /// A network's local name is its config's file name, so a create or join
+    /// under the name of a saved network that is not active would overwrite that
+    /// network's config, its secret key included. Both are refused instead.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_saved_network_keeps_its_name_while_inactive() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _config = TempConfigDir::new();
+        let daemon = build_headless(false).await.unwrap();
+        let saved = SecretKey::generate();
+        save_inactive_network("home", &saved);
+
+        let created = daemon
+            .registry
+            .create_network_inner(
+                GroupMode::Restricted,
+                Some("home".into()),
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&created, IpcMessage::Error { message } if message.contains("saved network")),
+            "{created:?}"
+        );
+        let other = SecretKey::generate().public();
+        let joined = daemon
+            .registry
+            .join_network_inner(
+                &other.to_string(),
+                Some("home"),
+                None,
+                None,
+                None,
+                false,
+                false,
+                true,
+            )
+            .await;
+        let error = joined
+            .err()
+            .expect("a join under another network's name is refused");
+        assert!(
+            format!("{error:#}").contains("another network"),
+            "{error:#}"
+        );
+        assert_eq!(saved_key("home"), Some(saved.public()));
+        daemon.shutdown_and_close().await;
+    }
+
+    /// A name this node picks itself takes the next free suffix instead. The
+    /// network that holds a name keeps it, so a rejoin lands on its own config.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_picked_name_skips_names_other_networks_hold() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _config = TempConfigDir::new();
+        let daemon = build_headless(false).await.unwrap();
+        let (first, second) = (SecretKey::generate(), SecretKey::generate());
+        save_inactive_network("gaming", &first);
+        save_inactive_network("gaming-1", &second);
+        config::save_network(&config::empty_network_config("lan")).unwrap();
+        let registry = &daemon.registry;
+
+        let fresh = SecretKey::generate().public();
+        assert_eq!(
+            registry
+                .unclaimed_network_name("gaming", Some(fresh))
+                .unwrap(),
+            "gaming-2"
+        );
+        assert_eq!(
+            registry.unclaimed_network_name("gaming", None).unwrap(),
+            "gaming-2"
+        );
+        assert_eq!(
+            registry
+                .unclaimed_network_name("gaming", Some(first.public()))
+                .unwrap(),
+            "gaming"
+        );
+        assert_eq!(
+            registry
+                .unclaimed_network_name("gaming", Some(second.public()))
+                .unwrap(),
+            "gaming-1"
+        );
+        // A saved config that records no key is no network's own.
+        assert_eq!(registry.name_owner("lan").unwrap(), NameOwner::Unknown);
+        assert_eq!(
+            registry.unclaimed_network_name("lan", Some(fresh)).unwrap(),
+            "lan-1"
+        );
+        assert_eq!(registry.name_owner("office").unwrap(), NameOwner::Free);
+        daemon.shutdown_and_close().await;
     }
 }

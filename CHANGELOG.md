@@ -78,6 +78,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   had gone idle, as it usually has on a phone. The device no longer stays on the
   roster holding its hostname until someone runs `ray kick`.
 
+- Creating or joining a network no longer overwrites a saved network of the same
+  name that is not active, such as one still waiting for its restore, along with
+  its keys. A `--name` that another network holds is refused, and a name Rayfish
+  picks itself gets the next free suffix, so a second `gaming` joins as
+  `gaming-1`.
+
 ## [0.5.7] - 2026-10-03
 
 ### Added
