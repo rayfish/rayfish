@@ -883,6 +883,8 @@ pub fn probe_packet(
         tcp_flags,
         icmp_type,
         icmp_id: 0,
+        // A bare IPv6 header: no extension headers precede the transport header.
+        transport_offset: 40,
     })
 }
 
@@ -3121,6 +3123,7 @@ mod tests {
         assert_eq!(syn.src_ip, IpAddr::V6(PEER_V6));
         assert_eq!(syn.dst_ip, IpAddr::V6(LOCAL_V6));
         assert_eq!((syn.protocol, syn.dst_port, syn.tcp_flags), (6, 22, SYN));
+        assert_eq!(syn.transport_offset, 40);
 
         let ping = probe(Direction::Out, Protocol::Icmp, None);
         assert_eq!(ping.src_ip, IpAddr::V6(LOCAL_V6));
