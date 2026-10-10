@@ -2272,6 +2272,115 @@ mod accept_handler_tests {
         endpoint.close().await;
     }
 
+    /// `ray firewall test` matches the identity the data path would: a paired
+    /// device's user inbound, the device itself outbound. The device is offline,
+    /// so the network-scoped rule matching at all shows that its roster stands
+    /// in for the live connection.
+    #[tokio::test]
+    async fn firewall_test_matches_the_identity_the_data_path_sees() {
+        use firewall::{Action, Direction, PeerFilter, PortRange, Protocol, RuleOrigin};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = sample_test_endpoint().await;
+        let registry = sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            FsStore::load(tmp.path()).await.unwrap(),
+            endpoint.id(),
+        );
+        let user = SecretKey::from_bytes(&[51; 32]).public();
+        let device = SecretKey::from_bytes(&[52; 32]).public();
+        registry.device_user_map.insert(device, user);
+        let state = make_network_state();
+        state.write().unwrap().members.add(Member {
+            hostname: Some("phone".into()),
+            user_identity: Some(user),
+            ..seated(device)
+        });
+        registry.networks.insert(
+            "home".into(),
+            NetworkHandle {
+                name: "home".into(),
+                network_key: state.read().unwrap().network_public_key,
+                role: NetworkRole::Coordinator,
+                state: Arc::clone(&state),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
+            },
+        );
+        let ssh_rule = |direction, action, peer, network: Option<&str>| firewall::FirewallRule {
+            direction,
+            action,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 22, end: 22 }),
+            peer: PeerFilter::Identity(peer),
+            network: network.map(str::to_string),
+            origin: RuleOrigin::Local,
+        };
+        registry.firewall.update(firewall::FirewallConfig {
+            rules: vec![
+                ssh_rule(Direction::In, Action::Allow, user, Some("home")),
+                ssh_rule(Direction::Out, Action::Deny, device, None),
+            ],
+            ..firewall::FirewallConfig::default()
+        });
+        let test = |peer: String, direction, network: Option<&'static str>| {
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .firewall_test(&peer, direction, Protocol::Tcp, Some(22), network)
+                    .await
+            }
+        };
+
+        match test(device.to_string(), Direction::In, None).await {
+            IpcMessage::FirewallTestResult {
+                peer_name,
+                identity,
+                action,
+                rule_index,
+                networks,
+                connected,
+                ..
+            } => {
+                assert_eq!(peer_name, "phone");
+                assert_eq!(identity, user.fmt_short().to_string());
+                assert_eq!((action, rule_index), (Action::Allow, Some(0)));
+                assert_eq!(networks, ["home"]);
+                assert!(!connected);
+            }
+            other => panic!("expected a result, got {other:?}"),
+        }
+        // By hostname, scoped to the network that names it.
+        match test("phone".into(), Direction::Out, Some("home")).await {
+            IpcMessage::FirewallTestResult {
+                identity,
+                action,
+                rule_index,
+                ..
+            } => {
+                assert_eq!(identity, device.fmt_short().to_string());
+                assert_eq!((action, rule_index), (Action::Deny, Some(1)));
+            }
+            other => panic!("expected a result, got {other:?}"),
+        }
+
+        for (peer, network) in [
+            ("phone".to_string(), Some("work")),
+            ("nobody".to_string(), None),
+            ("self".to_string(), None),
+        ] {
+            assert!(matches!(
+                test(peer, Direction::In, network).await,
+                IpcMessage::Error { .. }
+            ));
+        }
+        endpoint.close().await;
+    }
+
     async fn sample_member_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();

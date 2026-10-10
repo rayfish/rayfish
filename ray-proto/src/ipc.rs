@@ -137,6 +137,19 @@ pub enum IpcMessage {
         index: usize,
     },
     FirewallShow,
+    /// `ray firewall test`: how the local firewall would treat a new packet from
+    /// (`In`) or to (`Out`) `peer`, and what decided it. Nothing is sent and no
+    /// conntrack state is recorded. `peer` is resolved like `FirewallAdd`'s, and
+    /// only on `network` when one is given. `port` is `None` for ICMP. Open
+    /// read, like `FirewallShow`.
+    FirewallTest {
+        peer: String,
+        direction: Direction,
+        protocol: Protocol,
+        port: Option<u16>,
+        #[serde(default)]
+        network: Option<String>,
+    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -630,6 +643,33 @@ pub enum IpcMessage {
         #[serde(default)]
         disabled: bool,
         rules: Vec<FirewallRuleView>,
+    },
+    /// Reply to `FirewallTest`.
+    FirewallTestResult {
+        /// The peer's hostname, or its short id when it has none.
+        peer_name: String,
+        /// The identity the rules were matched against, as a short id: inbound,
+        /// a paired device's user identity; outbound, the device itself.
+        identity: String,
+        action: Action,
+        /// The rule that decided, with its index in `FirewallState::rules` (its
+        /// `ray firewall show` number). `None` when a default decided, or the
+        /// firewall is off.
+        rule_index: Option<usize>,
+        rule: Option<FirewallRuleView>,
+        /// The firewall is off (`ray firewall off`): every packet passes.
+        disabled: bool,
+        /// Denied with REJECT mode on: answered instead of dropped.
+        reject: bool,
+        /// Denied by the inbound default, which still admits return traffic of
+        /// a connection this device opened.
+        return_traffic: bool,
+        /// Networks this node shares with the peer, the ones a network-scoped
+        /// rule can match on.
+        networks: Vec<String>,
+        /// Whether the peer is connected. When it is not, `networks` comes from
+        /// the rosters: the networks it would share on connecting.
+        connected: bool,
     },
     /// Current suggested firewall rules for a network (reply to
     /// `FirewallSuggestions`).
@@ -2244,6 +2284,62 @@ mod tests {
                 assert_eq!(gamma.allows.get("alpha").map(|s| s.as_str()), Some("8080"));
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn firewall_test_roundtrips() {
+        for msg in [
+            IpcMessage::FirewallTest {
+                peer: "laptop".into(),
+                direction: Direction::In,
+                protocol: Protocol::Tcp,
+                port: Some(22),
+                network: Some("home".into()),
+            },
+            IpcMessage::FirewallTest {
+                peer: "laptop".into(),
+                direction: Direction::Out,
+                protocol: Protocol::Icmp,
+                port: None,
+                network: None,
+            },
+            IpcMessage::FirewallTestResult {
+                peer_name: "laptop".into(),
+                identity: "k3x9f2a1b0".into(),
+                action: Action::Allow,
+                rule_index: Some(2),
+                rule: Some(FirewallRuleView {
+                    direction: Direction::In,
+                    action: Action::Allow,
+                    protocol: Protocol::Tcp,
+                    port: "22".into(),
+                    peer: "any".into(),
+                    network: "home".into(),
+                    suggested_by: Some("home".into()),
+                }),
+                disabled: false,
+                reject: false,
+                return_traffic: false,
+                networks: vec!["home".into()],
+                connected: true,
+            },
+            IpcMessage::FirewallTestResult {
+                peer_name: "laptop".into(),
+                identity: "k3x9f2a1b0".into(),
+                action: Action::Deny,
+                rule_index: None,
+                rule: None,
+                disabled: false,
+                reject: true,
+                return_traffic: true,
+                networks: vec![],
+                connected: false,
+            },
+        ] {
+            let bytes = rmp_serde::to_vec_named(&msg).unwrap();
+            let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
         }
     }
 
