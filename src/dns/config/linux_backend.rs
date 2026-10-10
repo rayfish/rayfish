@@ -193,6 +193,21 @@ impl DnsConfigurator for SystemdResolvedDBus {
         .await
         .context("SetLinkDomains failed")?;
 
+        // The magic resolver answers plain UDP only, so a global
+        // `DNSOverTLS=yes` would leave every .ray lookup timing out.
+        if let Err(e) = conn
+            .call_method(
+                Some("org.freedesktop.resolve1"),
+                "/org/freedesktop/resolve1",
+                Some("org.freedesktop.resolve1.Manager"),
+                "SetLinkDNSOverTLS",
+                &(self.ifindex, "no"),
+            )
+            .await
+        {
+            tracing::warn!("SetLinkDNSOverTLS failed: {e}");
+        }
+
         tracing::info!(
             ifindex = self.ifindex,
             "configured systemd-resolved via D-Bus for .{DNS_DOMAIN}"
@@ -264,6 +279,16 @@ impl DnsConfigurator for SystemdResolvedCli {
             .await
             .context("resolvectl domain")?;
         anyhow::ensure!(status.success(), "resolvectl domain failed");
+
+        // See `SystemdResolvedDBus::apply`: the magic resolver has no DoT.
+        match Command::new("resolvectl")
+            .args(["dnsovertls", &self.tun_iface, "no"])
+            .status()
+            .await
+        {
+            Ok(s) if s.success() => {}
+            r => tracing::warn!("resolvectl dnsovertls failed: {r:?}"),
+        }
 
         tracing::info!(
             "configured systemd-resolved (CLI) for .{DNS_DOMAIN} via {}",

@@ -39,6 +39,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `.ray` names resolve on hosts with systemd-resolved `DNSOverTLS=yes`. Rayfish
+  now turns DNS over TLS off on its own interface, since Magic DNS answers plain
+  UDP only; lookups used to time out.
+
 - The macOS app reuses its VPN session for status updates and commands, avoiding
   memory growth while it stays open.
 
