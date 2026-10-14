@@ -520,7 +520,18 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
         loop {
             let pkt = tokio::select! {
                 _ = token.cancelled() => return Ok(()),
-                result = tun.read_packet() => result?,
+                result = tun.read_packet() => match result {
+                    Ok(pkt) => pkt,
+                    // The reader lost one packet and can still read. Ending the
+                    // loop here would stop all outbound traffic while the daemon
+                    // and its links still looked healthy (#237).
+                    Err(error) if error.is::<crate::tun::UnreadablePacket>() => {
+                        tracing::debug!(%error, "dropping unreadable TUN packet");
+                        stats.record_drop(DropReason::TunRead);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
                 Some((peer, connected)) = done_rx.recv() => {
                     in_flight.remove(&peer);
                     let pkts = buffered.take(&peer);

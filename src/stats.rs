@@ -52,10 +52,14 @@ pub enum DropReason {
     QueueDelay,
     /// The bounded flow scheduler exhausted its retention budget.
     QueueFull,
+    /// The TUN device delivered a packet its reader could not decode, such as a
+    /// Linux offload record needing more segments than tun-rs can split it
+    /// into. Only that packet is lost; the forwarding loop keeps reading.
+    TunRead,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 14] = [
+    const ALL: [DropReason; 15] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -70,6 +74,7 @@ impl DropReason {
         DropReason::DnsConcurrency,
         DropReason::QueueDelay,
         DropReason::QueueFull,
+        DropReason::TunRead,
     ];
 }
 
@@ -434,7 +439,8 @@ mod tests {
                 | DropReason::LazyDialConcurrency
                 | DropReason::DnsConcurrency
                 | DropReason::QueueDelay
-                | DropReason::QueueFull => 1,
+                | DropReason::QueueFull
+                | DropReason::TunRead => 1,
             }
         });
         assert_eq!(counted, DropReason::ALL.len());

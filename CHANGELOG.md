@@ -101,6 +101,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   When lost pieces filled those slots, every later split packet was dropped
   until they expired. Now the oldest unfinished packet makes room.
 
+- On Linux, outgoing mesh traffic could stop until Rayfish was restarted, while
+  `ray status` still showed peers as connected, after the TUN interface handed
+  over a large offloaded packet that Rayfish could not split ("too many GSO
+  segments"). Rayfish now drops that one packet, counts it as a `TunRead` drop,
+  and keeps forwarding.
+
 ## [0.5.7] - 2026-10-03
 
 ### Added

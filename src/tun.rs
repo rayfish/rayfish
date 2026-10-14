@@ -69,7 +69,9 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 ///
 /// Contract: an empty packet means "no packet this time, retry". End-of-stream
 /// must surface as `Err`, never as a stream of empty packets, or `run_mesh`
-/// would busy-spin.
+/// would busy-spin. A packet the device delivered but the reader could not
+/// decode surfaces as [`UnreadablePacket`], and the loop keeps reading. Any
+/// other error stops the loop.
 ///
 /// **`read_packet` MUST be cancel-safe.** `run_mesh` races it in a `select!` against
 /// dial-completion and shutdown, so the future can be dropped before it resolves.
@@ -78,6 +80,21 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 pub trait TunRead: Send + 'static {
     fn read_packet(&mut self) -> impl Future<Output = anyhow::Result<Bytes>> + Send;
 }
+
+/// A packet the device delivered that the reader could not decode, such as a
+/// Linux offload record that needs more segments than tun-rs can split it into
+/// (#237). Only that packet is lost: the next read starts clean, so the
+/// forwarding loop counts it and keeps reading.
+#[derive(Debug)]
+pub struct UnreadablePacket(pub std::io::Error);
+
+impl std::fmt::Display for UnreadablePacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unreadable TUN packet: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnreadablePacket {}
 
 /// Write side of a packet interface. Writes one IP packet to the device.
 pub trait TunWrite: Send + 'static {
@@ -789,21 +806,36 @@ impl TunRead for TunReader {
     async fn read_packet(&mut self) -> anyhow::Result<Bytes> {
         #[cfg(target_os = "macos")]
         match &mut self.inner {
-            MacTunReader::Framed(framed) => framed
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("TUN device closed"))?
-                .map(BytesMut::freeze)
-                .map_err(Into::into),
+            MacTunReader::Framed(framed) => framed_packet(framed.next().await),
             MacTunReader::Batched(reader) => reader.read_packet().await.map_err(Into::into),
         }
         #[cfg(not(target_os = "macos"))]
-        self.framed
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("TUN device closed"))?
-            .map(BytesMut::freeze)
-            .map_err(Into::into)
+        framed_packet(self.framed.next().await)
+    }
+}
+
+/// One item from a tun-rs framed reader. `None` means the device closed.
+#[cfg(not(target_os = "android"))]
+fn framed_packet(item: Option<std::io::Result<BytesMut>>) -> anyhow::Result<Bytes> {
+    let packet = item.ok_or_else(|| anyhow!("TUN device closed"))?;
+    #[cfg(target_os = "linux")]
+    let packet = packet.map_err(read_error)?;
+    #[cfg(not(target_os = "linux"))]
+    let packet = packet?;
+    Ok(packet.freeze())
+}
+
+/// Sorts a Linux framed read error. A failed read of the device carries an OS
+/// error code and stops the forwarding loop. tun-rs raises its own errors,
+/// without one, for a record it read but could not split or decode, and its
+/// next read starts clean. Other platforms keep every error fatal: their
+/// readers have not been checked for this.
+#[cfg(any(target_os = "linux", test))]
+fn read_error(error: std::io::Error) -> anyhow::Error {
+    if error.raw_os_error().is_none() {
+        UnreadablePacket(error).into()
+    } else {
+        error.into()
     }
 }
 
@@ -912,6 +944,24 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(attempts, [1500, 1280]);
+    }
+
+    /// A Linux read error with an OS error code means the device failed, so it
+    /// still stops the forwarding loop. tun-rs's own errors are about one packet
+    /// it read but could not split, which the loop drops and reads past (#237).
+    #[test]
+    fn only_device_read_errors_are_fatal() {
+        let device = super::read_error(std::io::Error::from_raw_os_error(libc::EBADF));
+        assert!(!device.is::<super::UnreadablePacket>());
+        let packet = super::read_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many GSO segments",
+        ));
+        assert!(packet.is::<super::UnreadablePacket>());
+        assert_eq!(
+            packet.to_string(),
+            "unreadable TUN packet: too many GSO segments"
+        );
     }
 
     #[cfg(not(target_os = "android"))]

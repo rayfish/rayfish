@@ -7,7 +7,7 @@ use super::*;
 use crate::config::QuicEngine;
 use crate::firewall::{Action, FirewallConfig, FirewallRule, PeerFilter, Protocol, RuleOrigin};
 use crate::membership::derive_ipv6;
-use crate::tun::{TUN_MTU, TunRead, TunWrite};
+use crate::tun::{TUN_MTU, TunRead, TunWrite, UnreadablePacket};
 use iroh::Endpoint;
 use iroh::endpoint::{QuicTransportConfig, presets};
 use smol_str::SmolStr;
@@ -20,6 +20,7 @@ const ENGINES: [QuicEngine; 2] = [QuicEngine::Standalone, QuicEngine::FqCodel];
 
 enum Input {
     Packet(Bytes),
+    Error(anyhow::Error),
     Processed(oneshot::Sender<()>),
 }
 
@@ -30,6 +31,7 @@ impl TunRead for FakeTunReader {
         loop {
             match self.0.recv().await {
                 Some(Input::Packet(packet)) => return Ok(packet),
+                Some(Input::Error(error)) => return Err(error),
                 // The loop asks for its next packet only after processing the
                 // preceding one. This acknowledges admission/drop decisions,
                 // not asynchronous QUIC delivery, without a timing assertion.
@@ -170,11 +172,18 @@ impl Harness {
     }
 
     async fn inject(&self, packet: Bytes) {
+        self.read(Input::Packet(packet)).await;
+    }
+
+    /// Fails the loop's next TUN read with `error`. Only for errors the loop
+    /// survives: it acknowledges by asking for the read after.
+    async fn inject_error(&self, error: anyhow::Error) {
+        self.read(Input::Error(error)).await;
+    }
+
+    async fn read(&self, read: Input) {
         let input = self.input.as_ref().expect("open mock TUN");
-        input
-            .send(Input::Packet(packet))
-            .await
-            .expect("inject packet");
+        input.send(read).await.expect("inject read");
         let (done, processed) = oneshot::channel();
         input
             .send(Input::Processed(done))
@@ -671,4 +680,24 @@ async fn empty_and_malformed_tun_packets_do_not_prevent_eof_termination() {
         .expect_err("EOF must be an error");
     assert_eq!(error.to_string(), "mock TUN input closed");
     h.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unreadable_tun_packet_does_not_stop_forwarding() {
+    // tun-rs fails a read like this when an offload record needs more segments
+    // than it can split it into (#237). That packet is gone, but the device is
+    // fine, so later packets must still reach their peers.
+    for engine in ENGINES {
+        let h = Harness::new(engine, 1, policy(Action::Allow, vec![])).await;
+        let unsplittable =
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many GSO segments");
+        h.inject_error(UnreadablePacket(unsplittable).into()).await;
+        assert_eq!(h.stats.drop_count(DropReason::TunRead), 1);
+        let packet = packet(6, h.local_ipv6, h.peers[0].ipv6, 50000, 443, 2, 60);
+        h.inject(packet.clone()).await;
+        h.receive_peer(0, &packet).await;
+        assert_eq!(h.stats.packets_tx.get(), 1);
+        assert_eq!(h.stats.total_drops(), 1);
+        h.shutdown().await;
+    }
 }
