@@ -45,7 +45,7 @@ use iroh::endpoint::SocketConfigurator;
 use smol_str::SmolStr;
 use socket2::{Domain, SockRef};
 
-mod dns;
+pub(crate) mod dns;
 mod policy;
 #[cfg(test)]
 use dns::PUBLIC_FALLBACK_DNS_V6;

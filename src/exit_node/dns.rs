@@ -6,7 +6,7 @@ use crate::membership::ExitFamilies;
 
 /// The IPv6 resolvers used when an IPv6-only tunnel has no configured IPv6
 /// resolver of its own.
-pub(super) const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
+pub(crate) const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
     Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
     Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
 ];
