@@ -13,6 +13,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   restarts and repeated applies reuse live invites. Recipients review with
   `ray invitations` and explicitly accept or decline before joining.
 
+### Changed
+
+- Contact records are now signed by the device they name. `ray identityof
+  <contact-id>` and contact aliases in `ray apply` only accept a signed record,
+  so a contact on 0.5.9 or older must upgrade before it resolves.
+
 ### Fixed
 
 - `ray apply --dry-run` starts the membership diff on a new line after the YAML.

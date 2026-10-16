@@ -6,7 +6,8 @@
 
 use anyhow::{Context as _, Result, ensure};
 use iroh::{
-    EndpointId, SecretKey, address_lookup::PkarrRelayClient, dns::DnsResolver, endpoint::Endpoint,
+    EndpointId, SecretKey, Signature, address_lookup::PkarrRelayClient, dns::DnsResolver,
+    endpoint::Endpoint,
 };
 use iroh_dns::pkarr::SignedPacket;
 use url::Url;
@@ -157,20 +158,44 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec
 // Contact record encoding / decoding (ray connect)
 // ---------------------------------------------------------------------------
 
+/// A contact record's claim about its holder's device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContactRecord {
+    pub endpoint: EndpointId,
+    /// The endpoint signed the contact key, proving that device holds it. The
+    /// contact key alone can name any endpoint, so only a bound record may
+    /// decide whose devices an alias covers. Records from 0.5.9 and earlier
+    /// carry no binding; they still work for dialing, where the peer checks.
+    pub bound: bool,
+}
+
+fn contact_binding_bytes(contact: EndpointId) -> Vec<u8> {
+    let mut bytes = b"rayfish/contact-binding/1\0".to_vec();
+    bytes.extend_from_slice(contact.as_bytes());
+    bytes
+}
+
 /// Encode a contact record: maps the contact key to the user's current
 /// transport EndpointId. Signed by (and published under) the contact key, so
-/// only its holder can publish it. Carries nothing else: no roster, hostname,
-/// or member identities.
+/// only its holder can publish it, and countersigned by the endpoint (`s,`), so
+/// it cannot name a device that does not hold the key. Older readers ignore
+/// the extra entry. Carries nothing else: no roster, hostname, or member
+/// identities.
 pub fn encode_contact_record(
     contact_key: &SecretKey,
-    endpoint: EndpointId,
+    endpoint_key: &SecretKey,
 ) -> Result<SignedPacket> {
-    let values = vec![RECORD_VERSION.to_string(), format!("e,{endpoint}")];
+    let binding = endpoint_key.sign(&contact_binding_bytes(contact_key.public()));
+    let values = vec![
+        RECORD_VERSION.to_string(),
+        format!("e,{}", endpoint_key.public()),
+        format!("s,{}", hex::encode(binding.to_bytes())),
+    ];
     SignedPacket::from_txt_strings(contact_key, CONTACT_RECORD_NAME, values, RECORD_TTL)
         .map_err(|e| anyhow::anyhow!("failed to build contact record: {e}"))
 }
 
-pub fn decode_contact_record(packet: &SignedPacket) -> Result<EndpointId> {
+pub fn decode_contact_record(packet: &SignedPacket, contact: EndpointId) -> Result<ContactRecord> {
     let records = packet.txt_records(CONTACT_RECORD_NAME);
     ensure!(!records.is_empty(), "no contact records found");
     ensure!(
@@ -178,14 +203,25 @@ pub fn decode_contact_record(packet: &SignedPacket) -> Result<EndpointId> {
         "unsupported record version: {}",
         records[0]
     );
-    for record in &records[1..] {
-        if let Some(id_str) = record.strip_prefix("e,") {
-            return id_str
-                .parse::<EndpointId>()
-                .context("invalid contact endpoint ID");
-        }
-    }
-    anyhow::bail!("missing contact endpoint (e,)")
+    let endpoint = records[1..]
+        .iter()
+        .find_map(|record| record.strip_prefix("e,"))
+        .context("missing contact endpoint (e,)")?
+        .parse::<EndpointId>()
+        .context("invalid contact endpoint ID")?;
+    let bound = records[1..]
+        .iter()
+        .filter_map(|record| record.strip_prefix("s,"))
+        .filter_map(|sig| <[u8; 64]>::try_from(hex::decode(sig).ok()?).ok())
+        .any(|sig| {
+            endpoint
+                .verify(
+                    &contact_binding_bytes(contact),
+                    &Signature::from_bytes(&sig),
+                )
+                .is_ok()
+        });
+    Ok(ContactRecord { endpoint, bound })
 }
 
 // ---------------------------------------------------------------------------
@@ -258,9 +294,9 @@ pub async fn resolve_network(
 pub async fn publish_contact(
     client: &PkarrRelayClient,
     contact_key: &SecretKey,
-    endpoint: EndpointId,
+    endpoint_key: &SecretKey,
 ) -> Result<()> {
-    let packet = encode_contact_record(contact_key, endpoint)?;
+    let packet = encode_contact_record(contact_key, endpoint_key)?;
     client
         .publish(&packet)
         .await
@@ -271,11 +307,11 @@ pub async fn publish_contact(
 pub async fn resolve_contact(
     client: &PkarrRelayClient,
     contact_pubkey: EndpointId,
-) -> Result<EndpointId> {
+) -> Result<ContactRecord> {
     let packet = resolve_packet(client, contact_pubkey)
         .await
         .context("failed to resolve contact record")?;
-    decode_contact_record(&packet)
+    decode_contact_record(&packet, contact_pubkey)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,11 +330,12 @@ mod tests {
     #[tokio::test]
     async fn contact_lookup_verifies_the_record_without_a_peer_connection() {
         let contact = SecretKey::from([7; 32]);
-        let endpoint_id = SecretKey::from([8; 32]).public();
-        let valid = encode_contact_record(&contact, endpoint_id)
+        let endpoint_key = SecretKey::from([8; 32]);
+        let endpoint_id = endpoint_key.public();
+        let valid = encode_contact_record(&contact, &endpoint_key)
             .unwrap()
             .to_relay_payload();
-        let forged = encode_contact_record(&SecretKey::from([9; 32]), endpoint_id)
+        let forged = encode_contact_record(&SecretKey::from([9; 32]), &endpoint_key)
             .unwrap()
             .to_relay_payload();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -336,7 +373,10 @@ mod tests {
             .unwrap();
         let client = create_pkarr_client(&endpoint, &url).unwrap();
         assert_eq!(
-            resolve_contact(&client, contact.public()).await.unwrap(),
+            resolve_contact(&client, contact.public())
+                .await
+                .unwrap()
+                .endpoint,
             endpoint_id
         );
         assert!(resolve_contact(&client, contact.public()).await.is_err());
@@ -485,10 +525,41 @@ mod tests {
     #[test]
     fn contact_record_roundtrip() {
         let contact = SecretKey::generate();
-        let endpoint = SecretKey::generate().public();
-        let packet = encode_contact_record(&contact, endpoint).unwrap();
-        let decoded = decode_contact_record(&packet).unwrap();
-        assert_eq!(decoded, endpoint);
+        let endpoint = SecretKey::generate();
+        let packet = encode_contact_record(&contact, &endpoint).unwrap();
+        let decoded = decode_contact_record(&packet, contact.public()).unwrap();
+        assert_eq!(
+            decoded,
+            ContactRecord {
+                endpoint: endpoint.public(),
+                bound: true
+            }
+        );
+    }
+
+    #[test]
+    fn contact_record_binds_only_an_endpoint_that_signed_the_contact() {
+        let contact = SecretKey::from([1; 32]);
+        let victim = SecretKey::from([2; 32]);
+        let own = SecretKey::from([3; 32]);
+        let record = |endpoint: EndpointId, signer: Option<&SecretKey>, signed: EndpointId| {
+            let mut values = vec!["v1".to_string(), format!("e,{endpoint}")];
+            if let Some(signer) = signer {
+                let sig = signer.sign(&contact_binding_bytes(signed));
+                values.push(format!("s,{}", hex::encode(sig.to_bytes())));
+            }
+            let packet =
+                SignedPacket::from_txt_strings(&contact, CONTACT_RECORD_NAME, values, 300).unwrap();
+            decode_contact_record(&packet, contact.public()).unwrap()
+        };
+        // A 0.5.9 record names an endpoint without proof.
+        assert!(!record(victim.public(), None, contact.public()).bound);
+        // The contact cannot reuse its own device's signature to claim another.
+        assert!(!record(victim.public(), Some(&own), contact.public()).bound);
+        // A device's binding to a different contact does not transfer.
+        let other = SecretKey::from([4; 32]).public();
+        assert!(!record(victim.public(), Some(&victim), other).bound);
+        assert!(record(victim.public(), Some(&victim), contact.public()).bound);
     }
 
     #[test]
@@ -498,7 +569,7 @@ mod tests {
         let values = vec!["v99".to_string(), format!("e,{endpoint}")];
         let packet =
             SignedPacket::from_txt_strings(&key, CONTACT_RECORD_NAME, values, 300).unwrap();
-        let result = decode_contact_record(&packet);
+        let result = decode_contact_record(&packet, key.public());
         assert!(result.is_err());
         assert!(
             result
@@ -514,7 +585,7 @@ mod tests {
         let values = vec!["v1".to_string()];
         let packet =
             SignedPacket::from_txt_strings(&key, CONTACT_RECORD_NAME, values, 300).unwrap();
-        let result = decode_contact_record(&packet);
+        let result = decode_contact_record(&packet, key.public());
         assert!(result.is_err());
         assert!(
             result

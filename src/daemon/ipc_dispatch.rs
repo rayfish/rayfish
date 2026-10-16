@@ -723,17 +723,22 @@ impl Daemon {
                 contact_id: self.contact_public.to_string(),
             },
             IpcMessage::ResolveContact { contact_id } => {
+                // Only a device that signed the contact key resolves: aliases
+                // built from this decide firewall rules.
                 match self.connect.resolve_invite_contact(contact_id).await {
-                    Ok(endpoint_id) => IpcMessage::ContactResolved {
-                        endpoint_id,
+                    Ok(record) if record.bound => IpcMessage::ContactResolved {
+                        endpoint_id: record.endpoint,
                         last_known: false,
                     },
-                    Err(error) => match self.connect.known_contact_endpoint(contact_id) {
+                    result => match self.connect.known_contact_endpoint(contact_id) {
                         Some(endpoint_id) => IpcMessage::ContactResolved {
                             endpoint_id,
                             last_known: true,
                         },
-                        None => ipc_err(format!("could not resolve contact: {error:#}")),
+                        None => ipc_err(match result {
+                            Ok(_) => "contact record is not signed by its device; the contact must upgrade rayfish".to_string(),
+                            Err(error) => format!("could not resolve contact: {error:#}"),
+                        }),
                     },
                 }
             }

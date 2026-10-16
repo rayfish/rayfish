@@ -306,14 +306,14 @@ pub(crate) fn spawn_network_publisher(
 /// config each cycle so a `RotateContact` takes effect without a restart.
 pub(crate) fn spawn_contact_publisher(
     client: PkarrRelayClient,
-    endpoint_id: EndpointId,
+    endpoint_key: SecretKey,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let secret = config::load().ok().and_then(|c| c.contact_secret_key);
             if let Some(secret) = secret {
-                match dht::publish_contact(&client, &secret, endpoint_id).await {
+                match dht::publish_contact(&client, &secret, &endpoint_key).await {
                     Ok(()) => {
                         tracing::debug!(contact = %secret.public().fmt_short(), "published contact record")
                     }

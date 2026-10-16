@@ -128,8 +128,10 @@ impl ConnectService {
         let pkarr =
             dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
                 .map_err(|e| format!("failed to create pkarr client: {e}"))?;
+        // Dialing may use an unbound record: the peer checks the contact itself.
         dht::resolve_contact(&pkarr, contact_pubkey)
             .await
+            .map(|record| record.endpoint)
             .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
     }
 
@@ -426,7 +428,8 @@ impl ConnectService {
             && let Ok(client) =
                 dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
         {
-            let _ = dht::publish_contact(&client, &secret, self.transport.endpoint.id()).await;
+            let _ =
+                dht::publish_contact(&client, &secret, self.transport.endpoint.secret_key()).await;
         }
         IpcMessage::ContactIdResponse {
             contact_id: secret.public().to_string(),

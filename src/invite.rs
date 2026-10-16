@@ -272,8 +272,8 @@ impl InviteStore {
         self.save()
     }
 
-    /// Retain the verified contact mapping before sending, so a lost ack still
-    /// lets a later apply recognize the recipient after it joins.
+    /// Retain the dialed endpoint before sending. It is unproven until
+    /// `mark_delivered`, so `contact_endpoint` ignores it until then.
     pub fn record_contact_endpoint(&mut self, id: &str, endpoint: EndpointId) -> Result<()> {
         let delivery = self
             .invites
@@ -300,7 +300,7 @@ impl InviteStore {
             .iter()
             .rev()
             .filter_map(|i| i.delivery.as_ref())
-            .filter(|d| d.contact_id == contact)
+            .filter(|d| d.contact_id == contact && d.delivered)
             .find_map(|d| d.endpoint)
     }
 
@@ -519,6 +519,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("net.toml");
         (InviteStore::with_path(path), dir)
+    }
+
+    #[test]
+    fn contact_endpoint_is_trusted_only_after_an_acknowledged_delivery() {
+        let (mut store, _dir) = temp_store();
+        let contact = test_id(4);
+        let invite = store.for_contact(contact, None).unwrap();
+        store
+            .record_contact_endpoint(&invite.id, test_id(6))
+            .unwrap();
+        assert_eq!(store.contact_endpoint(contact), None);
+        store.mark_delivered(&invite.id, test_id(6)).unwrap();
+        assert_eq!(store.contact_endpoint(contact), Some(test_id(6)));
     }
 
     #[test]

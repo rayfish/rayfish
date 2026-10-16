@@ -748,7 +748,11 @@ async fn build_daemon_inner(
         &daemon.transport.endpoint,
         &daemon.transport.pkarr_relay_url,
     ) {
-        spawn_contact_publisher(pkarr_client, daemon.transport.endpoint.id(), token.clone());
+        spawn_contact_publisher(
+            pkarr_client,
+            daemon.transport.endpoint.secret_key().clone(),
+            token.clone(),
+        );
     }
 
     // Device-cert revocation is now carried per-network in the signed blob's

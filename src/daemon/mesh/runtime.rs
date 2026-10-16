@@ -1103,9 +1103,9 @@ impl NetworkRegistry {
             && let Ok(client) =
                 dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
         {
-            let endpoint_id = self.transport.endpoint.id();
+            let endpoint_key = self.transport.endpoint.secret_key().clone();
             tokio::spawn(async move {
-                if let Err(e) = dht::publish_contact(&client, &secret, endpoint_id).await {
+                if let Err(e) = dht::publish_contact(&client, &secret, &endpoint_key).await {
                     tracing::warn!(error = %e, "failed to publish contact record on connect");
                 }
             });

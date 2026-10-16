@@ -163,18 +163,26 @@ impl Inbox {
 }
 
 impl ConnectService {
-    pub(super) async fn resolve_invite_contact(&self, contact: EndpointId) -> Result<EndpointId> {
+    pub(super) async fn resolve_invite_contact(
+        &self,
+        contact: EndpointId,
+    ) -> Result<dht::ContactRecord> {
         if contact == self.transport.contact_public {
-            return Ok(self.transport.endpoint.id());
+            return Ok(dht::ContactRecord {
+                endpoint: self.transport.endpoint.id(),
+                bound: true,
+            });
         }
         let client =
             dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
         tokio::time::timeout(DELIVERY_TIMEOUT, dht::resolve_contact(&client, contact)).await?
     }
 
-    /// A previous successful delivery supplies a fallback when the contact's
-    /// signed record is temporarily unavailable. Never reinterpret a contact key
-    /// itself as a device identity.
+    /// A previous acknowledged delivery supplies a fallback when the contact's
+    /// signed record is temporarily unavailable. The ack came over a connection
+    /// authenticated as that endpoint, from a daemon that checked the contact
+    /// key, so it proves the binding. Never reinterpret a contact key itself as
+    /// a device identity.
     pub(super) fn known_contact_endpoint(&self, contact: EndpointId) -> Option<EndpointId> {
         self.registry.networks.iter().find_map(|network| {
             InviteStore::load(network.key())
@@ -277,9 +285,17 @@ impl ConnectService {
         {
             return done(format!("invite {} already delivered", invite.id));
         }
-        let endpoint = self.resolve_invite_contact(contact).await.ok();
-        if let Some(endpoint) = endpoint.or_else(|| self.known_contact_endpoint(contact))
-            && self.contact_joined(network, endpoint)?
+        let record = self.resolve_invite_contact(contact).await.ok();
+        // Only a proven device counts as the contact's: an unbound record can
+        // name anyone's endpoint. Dialing an unbound one is safe, since the
+        // recipient rejects an offer for a contact key it does not hold.
+        let proven = record
+            .filter(|record| record.bound)
+            .map(|record| record.endpoint)
+            .or_else(|| self.known_contact_endpoint(contact));
+        let endpoint = record.map(|record| record.endpoint);
+        if let Some(proven) = proven
+            && self.contact_joined(network, proven)?
         {
             return done("contact already has a joined device".to_string());
         }
@@ -640,7 +656,7 @@ mod tests {
         let url = format!("http://{}/pkarr", listener.local_addr().unwrap())
             .parse()
             .unwrap();
-        let packet = dht::encode_contact_record(&contact, receiver_endpoint.id())
+        let packet = dht::encode_contact_record(&contact, receiver_endpoint.secret_key())
             .unwrap()
             .to_relay_payload();
         let discovery = tokio::spawn(async move {
