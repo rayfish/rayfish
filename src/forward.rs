@@ -913,9 +913,8 @@ pub fn spawn_peer_reader(
                         None => std::future::pending().await,
                     }
                 } => {
-                    for _ in 0..reassembly.expire(tokio::time::Instant::now()) {
-                        stats.record_drop(DropReason::ReassemblyTimeout);
-                    }
+                    reassembly.expire(tokio::time::Instant::now());
+                    reassembly.record_metrics(&stats);
                     continue;
                 }
                 result = conn.read_many_datagrams(&mut batch) => match result {
@@ -1045,9 +1044,7 @@ pub fn spawn_peer_reader(
                     }
                 }
             }
-            for _ in 0..reassembly.take_evicted() {
-                stats.record_drop(DropReason::ReassemblyLimit);
-            }
+            reassembly.record_metrics(&stats);
         }
     };
     tokio::spawn(reader.instrument(span))

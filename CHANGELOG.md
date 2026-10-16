@@ -12,6 +12,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   enrollment. Repeat the flag for multiple settings; `--enable` is an alias and
   a bare key means `on`, for example `--enable v4-bridge --set dns=partial`.
 
+### Performance
+
+- Fragment reassembly can trial larger receive windows when reordered packets
+  exceed 64 concurrent assemblies. It retains a larger window only when a bounded
+  metadata observer at the previous limit completes fewer packets and bytes,
+  and steps down again when the extra capacity is no longer useful. The shared
+  8 MiB budget, five-second timeout and fragment wire format are unchanged.
+
 ## [0.5.9] - 2026-10-15
 
 ### Added
