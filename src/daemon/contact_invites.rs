@@ -471,8 +471,11 @@ impl ConnectService {
             if matches!(reply, IpcMessage::Joined { .. } | IpcMessage::Ok { .. }) {
                 let _guard = self.inbox_lock.lock().await;
                 let mut inbox = Inbox::load()?;
-                inbox.find_mut(&invite.id)?.status = InvitationStatus::Accepted;
-                inbox.save()?;
+                // An offer that expired during the join was pruned; the join stands.
+                if let Ok(entry) = inbox.find_mut(&invite.id) {
+                    entry.status = InvitationStatus::Accepted;
+                    inbox.save()?;
+                }
             }
             Ok::<_, anyhow::Error>(reply)
         }

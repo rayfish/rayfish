@@ -422,6 +422,31 @@ pub fn merge_aliases<T: Clone + From<String>>(
     merged
 }
 
+/// Names whose expansion narrows access: deny peers and target exclusions,
+/// with groups flattened to their members. An empty expansion here widens
+/// access, so callers must not let an unknown alias reach this position.
+pub fn restricting_names(
+    fw: &DeployNetwork,
+    groups: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut add = |name: &str| match groups.get(name) {
+        Some(members) => names.extend(members.iter().cloned()),
+        None => {
+            names.insert(name.to_string());
+        }
+    };
+    for (subject, rules) in fw {
+        for term in crate::firewall::parse_excluded_peer_terms(subject)?.unwrap_or_default() {
+            add(term);
+        }
+        for peer in rules.denies.keys() {
+            add(peer);
+        }
+    }
+    Ok(names)
+}
+
 /// Expand all group/alias references in one network's firewall into a pure,
 /// hostname-keyed deploy rules ready to publish or send to controlled hosts.
 ///

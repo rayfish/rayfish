@@ -814,9 +814,15 @@ pub(crate) async fn ipc_apply(
     }))
     .await;
     let mut contact_endpoints = BTreeMap::new();
+    let mut unresolved_contacts = BTreeSet::new();
     for lookup in lookups {
-        if let (contact_id, ipc::IpcMessage::ContactResolved { endpoint_id, .. }) = lookup? {
-            contact_endpoints.insert(contact_id, endpoint_id);
+        match lookup? {
+            (contact_id, ipc::IpcMessage::ContactResolved { endpoint_id, .. }) => {
+                contact_endpoints.insert(contact_id, endpoint_id);
+            }
+            (contact_id, _) => {
+                unresolved_contacts.insert(contact_id);
+            }
         }
     }
     let mut missing_contacts = Vec::new();
@@ -862,12 +868,26 @@ pub(crate) async fn ipc_apply(
             .into_iter()
             .map(|hostname| hostname.parse())
             .collect::<Result<HashSet<ipc::MachineHostname>, _>>()?;
+        ensure_restricting_contacts_resolved(
+            net_name,
+            fw,
+            &spec.groups,
+            &spec.aliases,
+            &unresolved_contacts,
+        )?;
         let (efw, empty_aliases) =
             apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve, &current)?;
         missing_contacts.extend(contact_deliveries(net_name, &spec.aliases, &empty_aliases));
         for a in empty_aliases {
+            let reason = match spec.aliases.get(&a) {
+                Some(apply::AliasTarget::Contact {
+                    identity: None,
+                    contact_id,
+                }) if unresolved_contacts.contains(contact_id) => "contact could not be resolved",
+                _ => "has no joined devices yet",
+            };
             eprintln!(
-                "{}  {net_name}: alias '{a}' has no joined devices yet; resolves to no hosts",
+                "{}  {net_name}: alias '{a}' {reason}; resolves to no hosts",
                 style::faint("note:")
             );
         }
@@ -1114,13 +1134,17 @@ pub(crate) async fn ipc_apply(
     let has_missing_contacts = !missing_contacts.is_empty();
     let mut delivery_failures = false;
     if invite_missing {
-        for delivery in missing_contacts {
-            let request = ipc::IpcMessage::ContactInviteDeliver {
+        // Each delivery can wait out a lookup and a dial, so run them together.
+        let replies = futures::future::join_all(missing_contacts.iter().map(|delivery| {
+            ipc_request(ipc::IpcMessage::ContactInviteDeliver {
                 network: delivery.network.clone(),
                 contact_id: delivery.contact_id,
                 identity: delivery.identity,
-            };
-            match ipc_request(request).await {
+            })
+        }))
+        .await;
+        for (delivery, reply) in missing_contacts.iter().zip(replies) {
+            match reply {
                 Ok(ipc::IpcMessage::Ok { message }) => {
                     println!("  {}: {message}", delivery.network)
                 }
@@ -1548,6 +1572,30 @@ fn canonicalize_aliases(
     }).collect()
 }
 
+/// A deny or target exclusion naming an unresolved contact would otherwise
+/// expand to nothing and widen access, so it fails the apply instead.
+fn ensure_restricting_contacts_resolved(
+    network: &str,
+    fw: &apply::DeployNetwork,
+    groups: &BTreeMap<String, Vec<String>>,
+    aliases: &BTreeMap<String, apply::AliasTarget>,
+    unresolved: &BTreeSet<EndpointId>,
+) -> Result<()> {
+    for name in apply::restricting_names(fw, groups)? {
+        if let Some(apply::AliasTarget::Contact {
+            identity: None,
+            contact_id,
+        }) = aliases.get(&name)
+            && unresolved.contains(contact_id)
+        {
+            anyhow::bail!(
+                "{network}: contact alias '{name}' is used in a deny or exclusion but could not be resolved; add its `identity` or retry when the contact is online"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ContactInviteDelivery {
     network: ipc::NetworkName,
@@ -1769,6 +1817,51 @@ networks:
         let mut identity_only = spec.clone();
         identity_only.aliases.retain(|name, _| name == "old");
         assert!(contact_deliveries("n", &identity_only.aliases, &empty).is_empty());
+    }
+
+    #[test]
+    fn apply_rejects_unresolved_contacts_in_denies_and_target_exclusions() {
+        let contact = SecretKey::from([33; 32]).public();
+        let spec: apply::DeploySpec = serde_yml::from_str(&format!(
+            r#"
+aliases:
+  mallory:
+    contact_id: {contact}
+groups:
+  suspects: [mallory]
+networks:
+  denied:
+    server:
+      allows:
+        '*': tcp:22
+      denies:
+        suspects: tcp:22
+  excluded:
+    '*-mallory':
+      allows:
+        '*': tcp:22
+  granted:
+    server:
+      allows:
+        mallory: tcp:22
+"#
+        ))
+        .unwrap();
+        let unresolved = BTreeSet::from([contact]);
+        let check = |network: &str, unresolved: &BTreeSet<EndpointId>| {
+            ensure_restricting_contacts_resolved(
+                network,
+                &spec.networks[network],
+                &spec.groups,
+                &spec.aliases,
+                unresolved,
+            )
+        };
+        assert!(check("denied", &unresolved).is_err());
+        assert!(check("excluded", &unresolved).is_err());
+        // A grant to an unresolved contact fails closed, so it may proceed.
+        assert!(check("granted", &unresolved).is_ok());
+        assert!(check("denied", &BTreeSet::new()).is_ok());
     }
 
     #[test]
