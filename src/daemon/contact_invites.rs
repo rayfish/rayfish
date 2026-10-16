@@ -13,6 +13,14 @@ use std::io::ErrorKind;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_INBOX: usize = 256;
+/// Pending offers one sender may hold, so a single peer cannot fill the inbox.
+const MAX_PENDING_PER_SENDER: usize = 8;
+
+/// A queued delivery is not a failure: the sweep retries it until expiry.
+enum DeliveryOutcome {
+    Done(String),
+    Queued(String),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ReceivedInvitation {
@@ -113,7 +121,32 @@ impl Inbox {
             return Ok(false);
         }
         self.invitations.retain(|i| i.expires > now_secs());
-        anyhow::ensure!(self.invitations.len() < MAX_INBOX, "invitation inbox full");
+        let pending = || {
+            self.invitations
+                .iter()
+                .filter(|i| i.status == InvitationStatus::Pending)
+        };
+        anyhow::ensure!(
+            pending()
+                .filter(|i| i.coordinator == offer.coordinator)
+                .count()
+                < MAX_PENDING_PER_SENDER,
+            "too many pending invitations from this sender"
+        );
+        anyhow::ensure!(pending().count() < MAX_INBOX, "invitation inbox full");
+        // Answered entries only stop a retry from resurfacing; they never take
+        // pending slots, and the soonest to expire goes first when space runs out.
+        if self.invitations.len() >= 2 * MAX_INBOX
+            && let Some(oldest) = self
+                .invitations
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.status != InvitationStatus::Pending)
+                .min_by_key(|(_, i)| i.expires)
+                .map(|(index, _)| index)
+        {
+            self.invitations.remove(oldest);
+        }
         self.invitations.push(offer);
         Ok(true)
     }
@@ -171,14 +204,33 @@ impl ConnectService {
         contact: EndpointId,
         identity: Option<EndpointId>,
     ) -> IpcMessage {
-        let _delivery_guard = self.invite_delivery_lock.lock().await;
         match self
-            .deliver_contact_invite_inner(network, contact, identity, true)
+            .deliver_contact_invite_locked(network, contact, identity, true)
             .await
         {
-            Ok(message) => IpcMessage::Ok { message },
+            Ok(DeliveryOutcome::Done(message) | DeliveryOutcome::Queued(message)) => {
+                IpcMessage::Ok { message }
+            }
             Err(error) => ipc_err(error.to_string()),
         }
+    }
+
+    async fn deliver_contact_invite_locked(
+        &self,
+        network: &str,
+        contact: EndpointId,
+        identity: Option<EndpointId>,
+        mint: bool,
+    ) -> Result<DeliveryOutcome> {
+        let lock = Arc::clone(
+            &self
+                .invite_delivery_locks
+                .entry(contact)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        );
+        let _guard = lock.lock().await;
+        self.deliver_contact_invite_inner(network, contact, identity, mint)
+            .await
     }
 
     async fn deliver_contact_invite_inner(
@@ -187,14 +239,15 @@ impl ConnectService {
         contact: EndpointId,
         identity: Option<EndpointId>,
         mint: bool,
-    ) -> Result<String> {
+    ) -> Result<DeliveryOutcome> {
+        let done = |message: String| Ok(DeliveryOutcome::Done(message));
         let (network_key, lock) = self.registry.coordinator_handle(network).map_err(|_| {
             anyhow::anyhow!("contact invitation requires an active coordinator network")
         })?;
         if let Some(identity) = identity
             && self.contact_joined(network, identity)?
         {
-            return Ok("contact already has joined devices".to_string());
+            return done("contact already has joined devices".to_string());
         }
         // A retry sweep never mints: redemption, revocation or expiry may have
         // changed the ledger since the sweep selected this contact.
@@ -211,10 +264,10 @@ impl ConnectService {
         if let Some(identity) = identity
             && self.contact_joined(network, identity)?
         {
-            return Ok("contact already has joined devices".to_string());
+            return done("contact already has joined devices".to_string());
         }
         if !mint && existing.is_none() {
-            return Ok("no pending contact delivery".to_string());
+            return done("no pending contact delivery".to_string());
         }
         if let Some(invite) = &existing
             && invite
@@ -222,13 +275,13 @@ impl ConnectService {
                 .as_ref()
                 .is_some_and(|delivery| delivery.delivered)
         {
-            return Ok(format!("invite {} already delivered", invite.id));
+            return done(format!("invite {} already delivered", invite.id));
         }
         let endpoint = self.resolve_invite_contact(contact).await.ok();
         if let Some(endpoint) = endpoint.or_else(|| self.known_contact_endpoint(contact))
             && self.contact_joined(network, endpoint)?
         {
-            return Ok("contact already has a joined device".to_string());
+            return done("contact already has a joined device".to_string());
         }
         let invite = {
             let _guard = lock.lock().await;
@@ -238,19 +291,19 @@ impl ConnectService {
             } else {
                 match store.live_contact_invite(contact) {
                     Some(invite) => invite,
-                    None => return Ok("no pending contact delivery".to_string()),
+                    None => return done("no pending contact delivery".to_string()),
                 }
             }
         };
         let delivery = invite.delivery.context("contact delivery record missing")?;
         if delivery.delivered {
-            return Ok(format!("invite {} already delivered", invite.id));
+            return done(format!("invite {} already delivered", invite.id));
         }
         let Some(endpoint) = endpoint else {
-            anyhow::bail!(
+            return Ok(DeliveryOutcome::Queued(format!(
                 "contact offline or unknown; invite {} queued, daemon will retry until expiry",
                 invite.id
-            );
+            )));
         };
         {
             let _guard = lock.lock().await;
@@ -283,16 +336,16 @@ impl ConnectService {
         })
         .await;
         if !matches!(result, Ok(Ok(()))) {
-            anyhow::bail!(
+            return Ok(DeliveryOutcome::Queued(format!(
                 "private delivery failed (contact unreachable, inbox rejected, or incompatible protocol); invite {} queued, daemon will retry until expiry",
                 invite.id
-            );
+            )));
         }
         {
             let _guard = lock.lock().await;
             InviteStore::load(network)?.mark_delivered(&invite.id, endpoint)?;
         }
-        Ok(format!(
+        done(format!(
             "invite {} delivered privately; awaiting recipient acceptance",
             invite.id
         ))
@@ -319,11 +372,8 @@ impl ConnectService {
                     for contact in contacts {
                         tokio::select! {
                             _ = token.cancelled() => return,
-                            reply = async {
-                                let _guard = service.invite_delivery_lock.lock().await;
-                                service.deliver_contact_invite_inner(&network, contact, None, false).await
-                            } => {
-                                if reply.is_err() {
+                            reply = service.deliver_contact_invite_locked(&network, contact, None, false) => {
+                                if !matches!(reply, Ok(DeliveryOutcome::Done(_))) {
                                     tracing::debug!("contact invitation still queued for retry");
                                 }
                             }
@@ -388,15 +438,21 @@ impl ConnectService {
         id: &str,
         hostname: Option<MachineHostname>,
     ) -> IpcMessage {
-        let _guard = self.inbox_lock.lock().await;
+        // Joining can take longer than a sender's delivery timeout, so only the
+        // answer lock spans it; offers keep landing in the inbox meanwhile.
+        let _answer = self.answer_lock.lock().await;
         let result = async {
-            let mut inbox = Inbox::load()?;
-            let invite = inbox.find_mut(id)?;
-            anyhow::ensure!(invite.expires > now_secs(), "invitation expired");
-            anyhow::ensure!(
-                invite.status == InvitationStatus::Pending,
-                "invitation already answered"
-            );
+            let invite = {
+                let _guard = self.inbox_lock.lock().await;
+                let mut inbox = Inbox::load()?;
+                let invite = inbox.find_mut(id)?;
+                anyhow::ensure!(invite.expires > now_secs(), "invitation expired");
+                anyhow::ensure!(
+                    invite.status == InvitationStatus::Pending,
+                    "invitation already answered"
+                );
+                invite.clone()
+            };
             // Pin the join to the authenticated offer sender. Receipt never calls this.
             let reply = self
                 .registry
@@ -410,8 +466,12 @@ impl ConnectService {
                     false,
                 )
                 .await;
-            if matches!(reply, IpcMessage::Joined { .. }) {
-                invite.status = InvitationStatus::Accepted;
+            // `Ok` means a closed network queued the join; its retry loop now
+            // owns the secret, so a second accept must not start another.
+            if matches!(reply, IpcMessage::Joined { .. } | IpcMessage::Ok { .. }) {
+                let _guard = self.inbox_lock.lock().await;
+                let mut inbox = Inbox::load()?;
+                inbox.find_mut(&invite.id)?.status = InvitationStatus::Accepted;
                 inbox.save()?;
             }
             Ok::<_, anyhow::Error>(reply)
@@ -424,6 +484,7 @@ impl ConnectService {
     }
 
     pub(super) async fn decline_invitation(&self, id: &str) -> IpcMessage {
+        let _answer = self.answer_lock.lock().await;
         let _guard = self.inbox_lock.lock().await;
         let result = (|| -> Result<()> {
             let mut inbox = Inbox::load()?;
@@ -502,6 +563,31 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn inbox_limits_pending_offers_per_sender_and_answered_offers_free_slots() {
+        let offer_from = |sender: u8, n: u8| {
+            ReceivedInvitation::new(
+                NetworkName::new("sample-net".into()),
+                SecretKey::from([1; 32]).public(),
+                SecretKey::from([sender; 32]).public(),
+                InviteSecret([n; 16]),
+                now_secs() + 3600,
+            )
+        };
+        let mut inbox = Inbox::default();
+        for n in 0..MAX_PENDING_PER_SENDER as u8 {
+            assert!(inbox.receive(offer_from(2, n)).unwrap());
+        }
+        assert!(inbox.receive(offer_from(2, 100)).is_err());
+        // Another sender is unaffected by the first one's backlog.
+        assert!(inbox.receive(offer_from(3, 0)).unwrap());
+        // Declining frees the sender's pending slot without forgetting the decline.
+        inbox.invitations[0].status = InvitationStatus::Declined;
+        assert!(inbox.receive(offer_from(2, 100)).unwrap());
+        let declined = inbox.invitations[0].clone();
+        assert!(!inbox.receive(declined).unwrap());
     }
 
     #[test]
@@ -623,7 +709,7 @@ mod tests {
         let reply = sender
             .deliver_contact_invite("sample-net", contact.public(), None)
             .await;
-        assert!(matches!(reply, IpcMessage::Error { message } if message.contains("queued")));
+        assert!(matches!(reply, IpcMessage::Ok { message } if message.contains("queued")));
         let first = InviteStore::load("sample-net")
             .unwrap()
             .live_contact_invite(contact.public())
@@ -684,17 +770,20 @@ mod tests {
         let failed = sender
             .deliver_contact_invite("sample-net", contact.public(), None)
             .await;
-        assert!(matches!(failed, IpcMessage::Error { message } if message.contains("queued")));
+        assert!(matches!(failed, IpcMessage::Ok { message } if message.contains("queued")));
         assert_eq!(Inbox::load().unwrap().invitations.len(), 1);
         assert!(
             receiver.registry.networks.is_empty(),
             "receiving must not join"
         );
         // A sweep uses the saved credential, rather than minting a replacement.
-        sender
-            .deliver_contact_invite_inner("sample-net", contact.public(), None, false)
-            .await
-            .unwrap();
+        assert!(matches!(
+            sender
+                .deliver_contact_invite_inner("sample-net", contact.public(), None, false)
+                .await
+                .unwrap(),
+            DeliveryOutcome::Done(_)
+        ));
         receiver_task.await.unwrap();
         discovery.await.unwrap();
         let saved = InviteStore::load("sample-net").unwrap();

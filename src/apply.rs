@@ -72,6 +72,13 @@ pub enum AliasTarget {
     },
 }
 
+/// Stored `ray alias` entries are always identities.
+impl From<String> for AliasTarget {
+    fn from(identity: String) -> Self {
+        Self::Identity(identity)
+    }
+}
+
 impl AliasTarget {
     /// Identity aliases only resolve joined devices; they never trigger delivery.
     pub fn identity(&self) -> Option<&str> {
@@ -403,11 +410,14 @@ pub fn membership_diff(
 /// `aliases:` map. The spec wins on a name conflict. Both are already canonical
 /// (`name -> identity`); the result seeds [`expand_firewall`]. Stored aliases are
 /// node-local and never reach the blob, exactly like spec aliases.
-pub fn merge_aliases(
+pub fn merge_aliases<T: Clone + From<String>>(
     stored: &BTreeMap<String, String>,
-    spec: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut merged = stored.clone();
+    spec: &BTreeMap<String, T>,
+) -> BTreeMap<String, T> {
+    let mut merged: BTreeMap<String, T> = stored
+        .iter()
+        .map(|(k, v)| (k.clone(), T::from(v.clone())))
+        .collect();
     merged.extend(spec.iter().map(|(k, v)| (k.clone(), v.clone())));
     merged
 }
@@ -432,24 +442,9 @@ pub fn merge_aliases(
 /// Target exclusion aliases with no joined devices exclude no targets yet and
 /// return a warning. No wildcard grant is emitted, so later devices with other
 /// hostnames get no rules until reapply. Peer exclusion aliases must resolve.
-pub fn expand_firewall(
-    fw: &DeployNetwork,
-    aliases: &BTreeMap<String, String>,
-    groups: &BTreeMap<String, Vec<String>>,
-    resolve_alias: &dyn Fn(&str) -> Vec<String>,
-    current: &HashSet<MachineHostname>,
-) -> Result<(DeployNetwork, Vec<String>)> {
-    expand_firewall_with(
-        fw,
-        aliases,
-        groups,
-        &|identity: &String| resolve_alias(identity),
-        current,
-    )
-}
-
-/// Expand typed alias targets without conflating contact IDs with identities.
-pub fn expand_firewall_with<T>(
+///
+/// Alias values are generic so contact IDs never get treated as identities.
+pub fn expand_firewall<T>(
     fw: &DeployNetwork,
     aliases: &BTreeMap<String, T>,
     groups: &BTreeMap<String, Vec<String>>,
@@ -705,7 +700,7 @@ networks:
         );
         let (expanded, warnings) = expand_firewall(
             network,
-            &BTreeMap::new(),
+            &BTreeMap::<String, String>::new(),
             &spec.groups,
             &|_| Vec::new(),
             &HashSet::new(),
@@ -734,7 +729,7 @@ networks:
         .unwrap();
         let (expanded, _) = expand_firewall(
             &spec.networks["infra"],
-            &BTreeMap::new(),
+            &BTreeMap::<String, String>::new(),
             &spec.groups,
             &|_| Vec::new(),
             &HashSet::new(),
@@ -787,7 +782,7 @@ networks:
         );
         let (expanded, warnings) = expand_firewall(
             firewall,
-            &BTreeMap::new(),
+            &BTreeMap::<String, String>::new(),
             &BTreeMap::new(),
             &|_| Vec::new(),
             &HashSet::new(),
@@ -1098,7 +1093,7 @@ networks:
                         .iter()
                         .filter(|host| {
                             matches!(
-                                (identity, **host),
+                                (identity.as_str(), **host),
                                 ("identity-owner", "owner-phone")
                                     | ("identity-guest", "guest-laptop")
                             )
@@ -1320,7 +1315,7 @@ networks:
         let aliases: BTreeMap<String, String> =
             [("alice".to_string(), "id-alice".to_string())].into();
         let groups = BTreeMap::new();
-        let resolve = |id: &str| -> Vec<String> {
+        let resolve = |id: &String| -> Vec<String> {
             if id == "id-alice" {
                 vec!["alice-laptop".to_string(), "alice-phone".to_string()]
             } else {
@@ -1377,7 +1372,7 @@ networks:
             &BTreeMap::new(),
         );
         let groups = BTreeMap::new();
-        let resolve = |id: &str| -> Vec<String> {
+        let resolve = |id: &String| -> Vec<String> {
             if id == "id-alice" {
                 vec!["alice-laptop".to_string()]
             } else {
@@ -1406,7 +1401,7 @@ networks:
             vec!["alice".to_string(), "bob-server".to_string()],
         )]
         .into();
-        let resolve = |id: &str| -> Vec<String> {
+        let resolve = |id: &String| -> Vec<String> {
             if id == "id-alice" {
                 vec!["alice-laptop".to_string()]
             } else {
@@ -1437,7 +1432,7 @@ networks:
             vec!["web1".to_string(), "web2".to_string()],
         )]
         .into();
-        let resolve = |_: &str| -> Vec<String> { vec![] };
+        let resolve = |_: &String| -> Vec<String> { vec![] };
         let mut fw = DeployNetwork::new();
         fw.insert("webservers".to_string(), allows(&[("*", "tcp:80")]));
 
@@ -1461,7 +1456,7 @@ networks:
             [("alice".to_string(), "id-alice".to_string())].into();
         let groups: BTreeMap<String, Vec<String>> =
             [("admins".to_string(), vec!["alice".to_string()])].into();
-        let resolve = |id: &str| -> Vec<String> {
+        let resolve = |id: &String| -> Vec<String> {
             if id == "id-alice" {
                 vec!["alice-laptop".to_string()]
             } else {
@@ -1483,7 +1478,7 @@ networks:
     fn wildcards_pass_through_untouched() {
         let aliases = BTreeMap::new();
         let groups = BTreeMap::new();
-        let resolve = |_: &str| -> Vec<String> { vec![] };
+        let resolve = |_: &String| -> Vec<String> { vec![] };
         let mut fw = DeployNetwork::new();
         fw.insert("*".to_string(), allows(&[("*", "tcp:6969")]));
 
@@ -1498,7 +1493,7 @@ networks:
     fn unknown_name_passes_through_as_literal() {
         let aliases = BTreeMap::new();
         let groups = BTreeMap::new();
-        let resolve = |_: &str| -> Vec<String> { vec![] };
+        let resolve = |_: &String| -> Vec<String> { vec![] };
         let mut fw = DeployNetwork::new();
         fw.insert("jumpbox".to_string(), allows(&[("monitor", "tcp:9100")]));
 
@@ -1520,7 +1515,7 @@ networks:
         let aliases: BTreeMap<String, String> =
             [("ghost".to_string(), "id-ghost".to_string())].into();
         let groups = BTreeMap::new();
-        let resolve = |_: &str| -> Vec<String> { vec![] }; // never joined
+        let resolve = |_: &String| -> Vec<String> { vec![] }; // never joined
         let mut fw = DeployNetwork::new();
         fw.insert("*".to_string(), allows(&[("ghost", "tcp:22")]));
 

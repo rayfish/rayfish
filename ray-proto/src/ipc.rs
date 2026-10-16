@@ -806,6 +806,10 @@ pub enum IpcMessage {
     /// The device endpoint advertised by a contact, not its paired user identity.
     ContactResolved {
         endpoint_id: EndpointId,
+        /// The live record was unavailable; this endpoint is from an earlier
+        /// delivery and may be out of date.
+        #[serde(default)]
+        last_known: bool,
     },
     /// Reply to `ConfigGet`: `(key, value)` rows as `config::config_get` renders.
     ConfigValues {
@@ -2690,10 +2694,14 @@ mod tests {
             rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap(),
             IpcMessage::ResolveContact { contact_id: decoded } if decoded == contact_id
         ));
-        let bytes = rmp_serde::to_vec_named(&IpcMessage::ContactResolved { endpoint_id }).unwrap();
+        let bytes = rmp_serde::to_vec_named(&IpcMessage::ContactResolved {
+            endpoint_id,
+            last_known: true,
+        })
+        .unwrap();
         assert!(matches!(
             rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap(),
-            IpcMessage::ContactResolved { endpoint_id: decoded } if decoded == endpoint_id
+            IpcMessage::ContactResolved { endpoint_id: decoded, last_known: true } if decoded == endpoint_id
         ));
     }
 

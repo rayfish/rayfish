@@ -724,10 +724,16 @@ impl Daemon {
             },
             IpcMessage::ResolveContact { contact_id } => {
                 match self.connect.resolve_invite_contact(contact_id).await {
-                    Ok(endpoint_id) => IpcMessage::ContactResolved { endpoint_id },
-                    Err(_) => match self.connect.known_contact_endpoint(contact_id) {
-                        Some(endpoint_id) => IpcMessage::ContactResolved { endpoint_id },
-                        None => ipc_err("contact offline or unknown".to_string()),
+                    Ok(endpoint_id) => IpcMessage::ContactResolved {
+                        endpoint_id,
+                        last_known: false,
+                    },
+                    Err(error) => match self.connect.known_contact_endpoint(contact_id) {
+                        Some(endpoint_id) => IpcMessage::ContactResolved {
+                            endpoint_id,
+                            last_known: true,
+                        },
+                        None => ipc_err(format!("could not resolve contact: {error:#}")),
                     },
                 }
             }

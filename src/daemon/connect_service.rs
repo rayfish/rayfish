@@ -75,8 +75,11 @@ pub(crate) struct ConnectService {
     /// Whether the data plane is active, gating immediate contact republish on
     /// key rotation.
     active: Arc<AtomicBool>,
-    pub(super) invite_delivery_lock: AsyncMutex<()>,
+    /// Per-contact, so a slow sweep for one contact never blocks another's apply.
+    pub(super) invite_delivery_locks: DashMap<EndpointId, Arc<AsyncMutex<()>>>,
     pub(super) inbox_lock: AsyncMutex<()>,
+    /// Serializes accept and decline across a join without holding `inbox_lock`.
+    pub(super) answer_lock: AsyncMutex<()>,
     /// The network-owning service, for minting/joining the 2-peer direct network
     /// once a connect request is approved.
     pub(super) registry: Arc<NetworkRegistry>,
@@ -89,8 +92,9 @@ impl ConnectService {
         registry: Arc<NetworkRegistry>,
     ) -> Self {
         Self {
-            invite_delivery_lock: AsyncMutex::new(()),
+            invite_delivery_locks: DashMap::new(),
             inbox_lock: AsyncMutex::new(()),
+            answer_lock: AsyncMutex::new(()),
             pending_connects: DashMap::new(),
             approved_connects: DashMap::new(),
             outgoing_connects: DashSet::new(),

@@ -807,11 +807,15 @@ pub(crate) async fn ipc_apply(
             _ => None,
         })
         .collect();
+    // Each lookup can wait out a DHT timeout, so offline contacts resolve together.
+    let lookups = futures::future::join_all(contact_ids.into_iter().map(|contact_id| async move {
+        let reply = ipc_request(ipc::IpcMessage::ResolveContact { contact_id }).await;
+        reply.map(|reply| (contact_id, reply))
+    }))
+    .await;
     let mut contact_endpoints = BTreeMap::new();
-    for contact_id in contact_ids {
-        if let ipc::IpcMessage::ContactResolved { endpoint_id } =
-            ipc_request(ipc::IpcMessage::ResolveContact { contact_id }).await?
-        {
+    for lookup in lookups {
+        if let (contact_id, ipc::IpcMessage::ContactResolved { endpoint_id, .. }) = lookup? {
             contact_endpoints.insert(contact_id, endpoint_id);
         }
     }
@@ -836,11 +840,7 @@ pub(crate) async fn ipc_apply(
             .find(|n| &n.name == net_name)
             .map(|n| n.aliases.clone())
             .unwrap_or_default();
-        let mut net_aliases: BTreeMap<_, _> = stored_aliases
-            .into_iter()
-            .map(|(name, identity)| (name, apply::AliasTarget::Identity(identity)))
-            .collect();
-        net_aliases.extend(aliases.clone());
+        let net_aliases = apply::merge_aliases(&stored_aliases, &aliases);
         let resolve = |target: &apply::AliasTarget| -> Vec<String> {
             match target {
                 apply::AliasTarget::Identity(identity) => {
@@ -863,7 +863,7 @@ pub(crate) async fn ipc_apply(
             .map(|hostname| hostname.parse())
             .collect::<Result<HashSet<ipc::MachineHostname>, _>>()?;
         let (efw, empty_aliases) =
-            apply::expand_firewall_with(fw, &net_aliases, &spec.groups, &resolve, &current)?;
+            apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve, &current)?;
         missing_contacts.extend(contact_deliveries(net_name, &spec.aliases, &empty_aliases));
         for a in empty_aliases {
             eprintln!(
@@ -1116,7 +1116,7 @@ pub(crate) async fn ipc_apply(
     if invite_missing {
         for delivery in missing_contacts {
             let request = ipc::IpcMessage::ContactInviteDeliver {
-                network: ipc::NetworkName::new(delivery.network.clone()),
+                network: delivery.network.clone(),
                 contact_id: delivery.contact_id,
                 identity: delivery.identity,
             };
@@ -1209,7 +1209,11 @@ fn render_apply_dry_run(
     use std::fmt::Write;
     let mut output = String::new();
     writeln!(output, "{}", style::bold("Spec (expanded):"))?;
-    writeln!(output, "{}", apply::to_yaml(expanded)?)?;
+    let yaml = apply::to_yaml(expanded)?;
+    output.push_str(&yaml);
+    if !yaml.ends_with('\n') {
+        output.push('\n');
+    }
     writeln!(output, "{}", style::bold("Membership diff:"))?;
     let mut changes = 0usize;
     for (network_name, firewall) in &expanded.networks {
@@ -1462,10 +1466,18 @@ pub(crate) async fn cmd_identityof(peer: &str, hostname: Option<&str>) -> Result
         let mut stream = ipc::connect().await?;
         ipc::send(&mut stream, ipc::IpcMessage::ResolveContact { contact_id }).await?;
         return match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::ContactResolved { endpoint_id } => printout(&ContactIdentityOutput {
+            ipc::IpcMessage::ContactResolved {
+                endpoint_id,
+                last_known: false,
+            } => printout(&ContactIdentityOutput {
                 contact_id,
                 endpoint_id,
             }),
+            ipc::IpcMessage::ContactResolved {
+                last_known: true, ..
+            } => anyhow::bail!(
+                "contact is not reachable now; its last known endpoint may be out of date"
+            ),
             ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
             other => anyhow::bail!("unexpected contact lookup response: {other:?}"),
         };
@@ -1538,7 +1550,7 @@ fn canonicalize_aliases(
 
 #[derive(Debug, PartialEq, Eq)]
 struct ContactInviteDelivery {
-    network: String,
+    network: ipc::NetworkName,
     contact_id: EndpointId,
     identity: Option<EndpointId>,
 }
@@ -1558,7 +1570,7 @@ fn contact_deliveries(
             contacts
                 .entry(*contact_id)
                 .or_insert(ContactInviteDelivery {
-                    network: network.to_string(),
+                    network: ipc::NetworkName::new(network.to_string()),
                     contact_id: *contact_id,
                     identity: *identity,
                 });
@@ -1740,7 +1752,7 @@ networks:
     fn apply_identity_aliases_never_plan_delivery_and_contacts_must_be_referenced() {
         let spec = contact_spec();
         let aliases = canonicalize_aliases(&spec.aliases).unwrap();
-        let (_, empty) = apply::expand_firewall_with(
+        let (_, empty) = apply::expand_firewall(
             &spec.networks["n"],
             &aliases,
             &spec.groups,
@@ -1790,7 +1802,7 @@ networks:
     fn apply_dry_run_previews_private_delivery_and_separates_membership_heading() {
         let spec = contact_spec();
         let aliases = canonicalize_aliases(&spec.aliases).unwrap();
-        let (firewall, empty) = apply::expand_firewall_with(
+        let (firewall, empty) = apply::expand_firewall(
             &spec.networks["n"],
             &aliases,
             &spec.groups,
@@ -1821,6 +1833,7 @@ networks:
         let preview = render_apply_dry_run(&expanded, &[], &[], &[], false).unwrap();
         let heading = preview.find("Membership diff:").unwrap();
         assert!(preview[..heading].ends_with('\n'));
+        assert!(!preview[..heading].ends_with("\n\n"));
     }
 
     /// `IpcMessage` has no `PartialEq` (it carries wire types that don't want
