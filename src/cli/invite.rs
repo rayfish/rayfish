@@ -251,3 +251,74 @@ pub(crate) async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
     .await?;
     print_ok_reply(response)
 }
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct InvitationsOutput(Vec<ipc::InvitationInfo>);
+
+impl DisplayOut for InvitationsOutput {
+    fn print_human(&self) {
+        if self.0.is_empty() {
+            println!("\n  {}\n", style::faint("no invitations"));
+            return;
+        }
+        let now = rayfish::membership::now_secs();
+        let rows = self
+            .0
+            .iter()
+            .map(|invitation| {
+                let from = invitation.coordinator.fmt_short().to_string();
+                let age = format!("{}s", now.saturating_sub(invitation.received));
+                let status = invitation.status.to_string();
+                vec![
+                    layout::Cell::new(&invitation.id, style::rose(&invitation.id)),
+                    layout::Cell::new(
+                        invitation.network.as_ref(),
+                        style::value(invitation.network.as_ref()),
+                    ),
+                    layout::Cell::new(&from, style::faint(&from)),
+                    layout::Cell::new(&status, style::value(&status)),
+                    layout::Cell::right(age.clone(), style::faint(&age)),
+                ]
+            })
+            .collect();
+        println!();
+        print!(
+            "{}",
+            table(&["id", "network", "from", "status", "age"], rows, 2)
+        );
+        println!(
+            "\n  {}",
+            style::faint(
+                "join with: ray invitations accept <id>, or refuse with: ray invitations decline <id>"
+            )
+        );
+    }
+}
+
+/// `ray invitations [accept|decline]`: review private invitations and answer
+/// them. Nothing joins until the recipient accepts.
+pub(crate) async fn ipc_invitations(action: Option<InvitationAction>) -> Result<()> {
+    let request = match action {
+        None => ipc::IpcMessage::Invitations,
+        Some(InvitationAction::Accept { id, hostname }) => {
+            ipc::IpcMessage::InvitationAccept { id, hostname }
+        }
+        Some(InvitationAction::Decline { id }) => ipc::IpcMessage::InvitationDecline { id },
+    };
+    match ipc_request(request).await? {
+        ipc::IpcMessage::InvitationsResponse { invitations } => {
+            printout(&InvitationsOutput(invitations))
+        }
+        ipc::IpcMessage::Joined { name, my_ipv6, .. } => {
+            println!(
+                "  {} joined {} ({})",
+                style::green("✓"),
+                style::value(&name),
+                style::faint(&my_ipv6.to_string())
+            );
+            Ok(())
+        }
+        response => print_ok_reply(response),
+    }
+}

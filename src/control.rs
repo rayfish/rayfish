@@ -11,7 +11,9 @@ use iroh::{EndpointId, SecretKey, Signature};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
+use crate::invite::InviteCode;
 use crate::membership::{ApprovedEntry, ExitFamilies, Member};
+use ray_proto::ipc::NetworkName;
 
 /// Certificate proving a device belongs to a user identity.
 ///
@@ -98,16 +100,20 @@ pub enum PairMsg {
 }
 
 /// Messages for the `ray connect` friend-request handshake (ALPN
-/// `rayfish/connect/2`). The initiator (A) dials the recipient's (B) contact
-/// key, sends `Request`, and polls until `Approved`. Approval is recipient-only:
+/// `rayfish/connect/2`) and for invitation delivery (`rayfish/invite/1`, which
+/// carries only `InviteOffer`). The initiator (A) dials the recipient's (B) identity,
+/// sends `Request`, and polls until `Approved`. Approval is recipient-only:
 /// only B acts, A just waits.
+///
+/// Frames are positional: never remove or reorder a field, only rename.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectMsg {
     /// A → B: request a direct connection. `from_endpoint` is A's transport id
-    /// (the key B pre-approves into the minted network); `from_contact_id` is
-    /// A's own contact key (for display/dedupe on B).
+    /// (the key B pre-approves into the minted network); `from_identity` is A's
+    /// identity, display only and unverified. Older builds filled it with a
+    /// contact key in the same position.
     Request {
-        from_contact_id: EndpointId,
+        from_identity: EndpointId,
         from_endpoint: EndpointId,
         #[serde(default)]
         hostname: Option<String>,
@@ -122,6 +128,15 @@ pub enum ConnectMsg {
     },
     /// B → A: request rejected.
     Denied { reason: String },
+    /// Private invitation from a network's coordinator. Receipt only stores it;
+    /// joining needs the recipient's explicit accept. Acked with `Pending`;
+    /// a refused offer gets no reply. Sent only on `rayfish/invite/1`, which
+    /// older peers lack, so they fail the handshake rather than the decode.
+    InviteOffer {
+        /// The sender's label for the network, display only.
+        network: NetworkName,
+        code: InviteCode,
+    },
 }
 
 /// Control messages exchanged between peers over QUIC bidirectional streams.
@@ -793,10 +808,71 @@ mod tests {
     }
 
     #[test]
+    fn request_from_0_5_9_still_decodes() {
+        // The 0.5.9 shape: fields are positional, so only the name changed.
+        #[derive(Serialize)]
+        enum OldConnectMsg {
+            Request {
+                from_contact_id: EndpointId,
+                from_endpoint: EndpointId,
+                hostname: Option<String>,
+            },
+        }
+        let body = rmp_serde::to_vec(&OldConnectMsg::Request {
+            from_contact_id: test_id(1),
+            from_endpoint: test_id(2),
+            hostname: None,
+        })
+        .unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<ConnectMsg>(&body).unwrap(),
+            ConnectMsg::Request {
+                from_identity: test_id(1),
+                from_endpoint: test_id(2),
+                hostname: None,
+            }
+        );
+    }
+
+    #[test]
+    fn invite_offer_roundtrips_and_older_variants_are_unchanged() {
+        let offer = ConnectMsg::InviteOffer {
+            network: NetworkName::new("sample-net".into()),
+            code: InviteCode::encode(&test_id(1), &test_id(2), &[3; 16]),
+        };
+        let body = rmp_serde::to_vec(&offer).unwrap();
+        assert_eq!(rmp_serde::from_slice::<ConnectMsg>(&body).unwrap(), offer);
+        // Variants are encoded by name, so an existing message still decodes
+        // in a build that never heard of `InviteOffer`.
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum OldConnectMsg {
+            Request {
+                from_contact_id: EndpointId,
+                from_endpoint: EndpointId,
+                hostname: Option<String>,
+            },
+            Pending,
+            Approved {
+                room_id: EndpointId,
+                coordinator: EndpointId,
+            },
+            Denied {
+                reason: String,
+            },
+        }
+        let pending = rmp_serde::to_vec(&ConnectMsg::Pending).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<OldConnectMsg>(&pending).unwrap(),
+            OldConnectMsg::Pending
+        );
+        assert!(rmp_serde::from_slice::<OldConnectMsg>(&body).is_err());
+    }
+
+    #[test]
     fn test_roundtrip_connect_msg() {
         let msgs = vec![
             ConnectMsg::Request {
-                from_contact_id: test_id(1),
+                from_identity: test_id(1),
                 from_endpoint: test_id(2),
                 hostname: Some("laptop".to_string()),
             },

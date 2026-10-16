@@ -306,6 +306,27 @@ async fn config_row(key: NodeKey) -> Result<String> {
     }
 }
 
+/// Add or remove one peer in a peer-list setting (`file-auto-accept-peers`,
+/// `blocked`). The daemon resolves a hostname to its identity.
+pub(crate) async fn edit_peer_list(key: GlobalKey, peer: &str, remove: bool) -> Result<()> {
+    crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: NodeKey::Global(key),
+        value: crate::config::settings::peer_list_edit(peer, remove)?,
+        replace: false,
+    })
+    .await
+}
+
+/// The identities in a peer-list setting.
+pub(crate) async fn peer_list(key: GlobalKey) -> Result<Vec<String>> {
+    let row = config_row(NodeKey::Global(key)).await?;
+    Ok(row
+        .split(',')
+        .filter(|peer| !peer.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     // These subcommands change (or read) global settings the daemon owns. They
     // route through the daemon so the write lands in the config dir the daemon
@@ -315,35 +336,12 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         ..
     }) = &action
     {
-        if let crate::FilesAutoAcceptAction::Add { peer }
-        | crate::FilesAutoAcceptAction::Remove { peer } = action
-        {
-            anyhow::ensure!(
-                !peer.trim().is_empty() && !peer.contains(',') && !peer.starts_with('-'),
-                "a single peer name or identity is required"
-            );
-        }
-        let key = NodeKey::Global(GlobalKey::FileAutoAcceptPeers);
+        let key = GlobalKey::FileAutoAcceptPeers;
         return match action {
-            crate::FilesAutoAcceptAction::Add { peer } => {
-                crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
-                    key,
-                    value: peer.clone(),
-                    replace: false,
-                })
-                .await
-            }
-            crate::FilesAutoAcceptAction::Remove { peer } => {
-                crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
-                    key,
-                    value: format!("-{peer}"),
-                    replace: false,
-                })
-                .await
-            }
+            crate::FilesAutoAcceptAction::Add { peer } => edit_peer_list(key, peer, false).await,
+            crate::FilesAutoAcceptAction::Remove { peer } => edit_peer_list(key, peer, true).await,
             crate::FilesAutoAcceptAction::List => {
-                let peers = config_row(key).await?;
-                for peer in peers.split(',').filter(|peer| !peer.is_empty()) {
+                for peer in peer_list(key).await? {
                     println!("{peer}");
                 }
                 Ok(())

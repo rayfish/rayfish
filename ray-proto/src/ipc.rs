@@ -400,6 +400,24 @@ pub enum IpcMessage {
         #[serde(default)]
         reusable: bool,
     },
+    /// Deliver an invite privately to `recipient` for a network this node
+    /// coordinates (`ray apply --invite-missing`). Queued while unreachable.
+    InviteDeliver {
+        network: NetworkName,
+        recipient: EndpointId,
+    },
+    /// `ray invitations`: received private invitations, metadata only. Open
+    /// read.
+    Invitations,
+    /// `ray invitations accept <id>`: join the invitation's network.
+    InvitationAccept {
+        id: String,
+        hostname: Option<MachineHostname>,
+    },
+    /// `ray invitations decline <id>`: refuse it and block the sender.
+    InvitationDecline {
+        id: String,
+    },
     /// List invites for a network (coordinator-only).
     InviteList {
         network: String,
@@ -434,11 +452,11 @@ pub enum IpcMessage {
     AdminList {
         network: String,
     },
-    /// `ray connect <contact-id>`: request a direct 2-peer connection by the
-    /// recipient's contact id. Resolves the contact id to an endpoint, dials the
-    /// connect ALPN, and waits (recipient-only approval).
+    /// `ray connect <identity>`: request a direct 2-peer connection. Dials the
+    /// identity (or a LAN sighting) on the connect ALPN and waits for the
+    /// recipient's approval.
     Connect {
-        contact_id: String,
+        peer: String,
         hostname: Option<String>,
     },
     /// `ray connections`: list pending incoming connect requests. Open read.
@@ -448,19 +466,15 @@ pub enum IpcMessage {
     ApproveConnection {
         id: String,
     },
+    /// `ray connect deny <id>`: drop a pending connect request and block the
+    /// requester on the connect channel.
+    ConnectDeny {
+        id: String,
+    },
     /// `ray mdns scan`: list rayfish nodes seen on the LAN over mDNS. A sighting
     /// is not a relationship, so this is an open read.
     /// Reply: [`IpcMessage::LanPeersList`].
     ListLanPeers,
-    /// `ray contact id`: print this node's contact id. Open read.
-    ContactId,
-    /// Resolve a contact's signed record without dialing the peer. Open read.
-    ResolveContact {
-        contact_id: EndpointId,
-    },
-    /// `ray contact rotate`: rotate this node's contact key (old id stops
-    /// resolving once its pkarr record expires).
-    RotateContact,
     /// `ray ping <peer>`: active liveness probe. Resolves `peer`, sends `count`
     /// echo probes over the mesh connection, and returns per-probe RTTs. Open
     /// read, like `Status`.
@@ -554,10 +568,10 @@ pub enum IpcMessage {
         auto_update: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
-        /// This node's contact id (`ray connect`), shown at the top of status.
-        /// `None` if the daemon has not generated one yet.
+        /// What to share for `ray connect`: the paired user identity, or this
+        /// endpoint when unpaired. `None` from daemons that predate it.
         #[serde(default)]
-        contact_id: Option<String>,
+        identity: Option<EndpointId>,
         /// The running daemon's compiled version (`CARGO_PKG_VERSION`). The CLI
         /// compares it to its own version and hints `ray update` on a mismatch
         /// — e.g. after a self-update where the daemon never restarted onto the
@@ -768,6 +782,10 @@ pub enum IpcMessage {
         id: String,
         expires_secs: u64,
     },
+    /// Received private invitations (reply to `Invitations`).
+    InvitationsResponse {
+        invitations: Vec<InvitationInfo>,
+    },
     /// The list of invites for a network.
     InviteListResponse {
         invites: Vec<InviteInfo>,
@@ -780,14 +798,6 @@ pub enum IpcMessage {
     /// plus every identity it has granted the key to.
     AdminListResponse {
         admins: Vec<AdminInfo>,
-    },
-    /// This node's contact id (reply to `ContactId`/`RotateContact`).
-    ContactIdResponse {
-        contact_id: String,
-    },
-    /// The device endpoint advertised by a contact, not its paired user identity.
-    ContactResolved {
-        endpoint_id: EndpointId,
     },
     /// Reply to `ConfigGet`: `(key, value)` rows as `config::config_get` renders.
     ConfigValues {
@@ -1116,6 +1126,29 @@ macro_rules! string_newtype {
 pub struct NetworkName(String);
 
 string_newtype!(NetworkName, "Wraps a network name.");
+
+/// Where a received invitation stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Declined,
+}
+
+/// A received invitation, metadata only: its code never crosses IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationInfo {
+    pub id: String,
+    /// The sender's label for the network.
+    pub network: NetworkName,
+    /// The coordinator that sent it (authenticated).
+    pub coordinator: EndpointId,
+    /// Unix seconds it arrived.
+    pub received: u64,
+    pub status: InvitationStatus,
+}
 
 impl From<NetworkName> for String {
     fn from(network: NetworkName) -> Self {
@@ -2568,17 +2601,14 @@ mod tests {
     #[test]
     fn test_connect_roundtrip() {
         let req = IpcMessage::Connect {
-            contact_id: "contactabc".to_string(),
+            peer: "peerabc".to_string(),
             hostname: Some("laptop".to_string()),
         };
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcMessage::Connect {
-                contact_id,
-                hostname,
-            } => {
-                assert_eq!(contact_id, "contactabc");
+            IpcMessage::Connect { peer, hostname } => {
+                assert_eq!(peer, "peerabc");
                 assert_eq!(hostname.as_deref(), Some("laptop"));
             }
             _ => panic!("wrong variant"),
@@ -2632,35 +2662,6 @@ mod tests {
     }
 
     #[test]
-    fn test_contact_id_response_roundtrip() {
-        let resp = IpcMessage::ContactIdResponse {
-            contact_id: "abc123".to_string(),
-        };
-        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
-        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
-        match decoded {
-            IpcMessage::ContactIdResponse { contact_id } => assert_eq!(contact_id, "abc123"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn contact_lookup_roundtrip() {
-        let contact_id = iroh::SecretKey::from([7; 32]).public();
-        let endpoint_id = iroh::SecretKey::from([8; 32]).public();
-        let bytes = rmp_serde::to_vec_named(&IpcMessage::ResolveContact { contact_id }).unwrap();
-        assert!(matches!(
-            rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap(),
-            IpcMessage::ResolveContact { contact_id: decoded } if decoded == contact_id
-        ));
-        let bytes = rmp_serde::to_vec_named(&IpcMessage::ContactResolved { endpoint_id }).unwrap();
-        assert!(matches!(
-            rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap(),
-            IpcMessage::ContactResolved { endpoint_id: decoded } if decoded == endpoint_id
-        ));
-    }
-
-    #[test]
     fn test_status_response_roundtrip() {
         let ep_id = iroh::SecretKey::generate().public();
         let peer_id = iroh::SecretKey::generate().public();
@@ -2669,7 +2670,7 @@ mod tests {
             mdns_enabled: true,
             auto_update: false,
             active: true,
-            contact_id: Some("contact123".to_string()),
+            identity: Some(ep_id),
             daemon_version: "0.1.0".to_string(),
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),

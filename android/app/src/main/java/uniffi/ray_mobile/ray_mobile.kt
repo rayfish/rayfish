@@ -795,17 +795,27 @@ internal interface IntegrityCheckingUniffiLib : Library {
 
     fun uniffi_ray_mobile_checksum_method_node_accept_file_offer(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_accept_invitation(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_accept_join_request(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_backup_identity(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_block_connect_request(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_block_peer(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_cancel_send(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_cancel_transfer(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_connect_peer(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_create(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_decline_invitation(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_default_hostname(): Short
 
@@ -827,6 +837,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
 
     fun uniffi_ray_mobile_checksum_method_node_health_snapshot(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_inbound_settings(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_invite(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_is_paired(): Short
@@ -838,6 +850,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
     fun uniffi_ray_mobile_checksum_method_node_list_connect_requests(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_list_file_offers(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_list_invitations(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_list_join_requests(): Short
 
@@ -861,11 +875,15 @@ internal interface IntegrityCheckingUniffiLib : Library {
 
     fun uniffi_ray_mobile_checksum_method_node_send_file(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_send_invite(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_set_default_hostname(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_set_hostname(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_set_inbound_policy(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_set_quic_engine(): Short
 
@@ -878,6 +896,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
     fun uniffi_ray_mobile_checksum_method_node_stop(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_submit_code(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_unblock_peer(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_unpair(): Short
 
@@ -976,6 +996,12 @@ internal interface UniffiLib : Library {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    fun uniffi_ray_mobile_fn_method_node_accept_invitation(
+        `ptr`: Pointer,
+        `id`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     fun uniffi_ray_mobile_fn_method_node_accept_join_request(
         `ptr`: Pointer,
         `network`: RustBuffer.ByValue,
@@ -995,6 +1021,18 @@ internal interface UniffiLib : Library {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    fun uniffi_ray_mobile_fn_method_node_block_connect_request(
+        `ptr`: Pointer,
+        `shortId`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_block_peer(
+        `ptr`: Pointer,
+        `peer`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     fun uniffi_ray_mobile_fn_method_node_cancel_send(
         `ptr`: Pointer,
         `id`: Long,
@@ -1007,11 +1045,24 @@ internal interface UniffiLib : Library {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    fun uniffi_ray_mobile_fn_method_node_connect_peer(
+        `ptr`: Pointer,
+        `peer`: RustBuffer.ByValue,
+        `hostname`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     fun uniffi_ray_mobile_fn_method_node_create(
         `ptr`: Pointer,
         `name`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    fun uniffi_ray_mobile_fn_method_node_decline_invitation(
+        `ptr`: Pointer,
+        `id`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     fun uniffi_ray_mobile_fn_method_node_default_hostname(
         `ptr`: Pointer,
@@ -1074,6 +1125,11 @@ internal interface UniffiLib : Library {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    fun uniffi_ray_mobile_fn_method_node_inbound_settings(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     fun uniffi_ray_mobile_fn_method_node_invite(
         `ptr`: Pointer,
         `network`: RustBuffer.ByValue,
@@ -1103,6 +1159,11 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
 
     fun uniffi_ray_mobile_fn_method_node_list_file_offers(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    fun uniffi_ray_mobile_fn_method_node_list_invitations(
         `ptr`: Pointer,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -1171,6 +1232,13 @@ internal interface UniffiLib : Library {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    fun uniffi_ray_mobile_fn_method_node_send_invite(
+        `ptr`: Pointer,
+        `network`: RustBuffer.ByValue,
+        `recipient`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     fun uniffi_ray_mobile_fn_method_node_set_default_hostname(
         `ptr`: Pointer,
         `name`: RustBuffer.ByValue,
@@ -1187,6 +1255,12 @@ internal interface UniffiLib : Library {
         `ptr`: Pointer,
         `network`: RustBuffer.ByValue,
         `hostname`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_set_inbound_policy(
+        `ptr`: Pointer,
+        `policy`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1221,6 +1295,12 @@ internal interface UniffiLib : Library {
         `input`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    fun uniffi_ray_mobile_fn_method_node_unblock_peer(
+        `ptr`: Pointer,
+        `peer`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     fun uniffi_ray_mobile_fn_method_node_unpair(
         `ptr`: Pointer,
@@ -1482,6 +1562,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_accept_file_offer() != 16165.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_accept_invitation() != 55975.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_accept_join_request() != 20263.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1491,13 +1574,25 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_backup_identity() != 31710.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_block_connect_request() != 9935.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_block_peer() != 39904.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_cancel_send() != 49789.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_cancel_transfer() != 46122.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_connect_peer() != 42900.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_create() != 50208.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_decline_invitation() != 24280.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_default_hostname() != 59357.toShort()) {
@@ -1530,6 +1625,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_health_snapshot() != 25816.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_inbound_settings() != 9793.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_invite() != 59156.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1546,6 +1644,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_list_file_offers() != 4122.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_list_invitations() != 39352.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_list_join_requests() != 56409.toShort()) {
@@ -1581,6 +1682,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_send_file() != 40644.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_send_invite() != 31280.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_default_hostname() != 40200.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1588,6 +1692,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_inbound_policy() != 2409.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_quic_engine() != 39138.toShort()) {
@@ -1606,6 +1713,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_submit_code() != 26371.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_unblock_peer() != 7433.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_unpair() != 28871.toShort()) {
@@ -2309,6 +2419,11 @@ public interface NodeInterface {
     )
 
     /**
+     * Join the network an invitation names.
+     */
+    fun `acceptInvitation`(`id`: kotlin.String)
+
+    /**
      * Approve a pending join request on a network we coordinate.
      */
     fun `acceptJoinRequest`(
@@ -2334,6 +2449,16 @@ public interface NodeInterface {
     fun `backupIdentity`(`password`: kotlin.String): IdentityBackup
 
     /**
+     * Decline an incoming connect request and block the requester.
+     */
+    fun `blockConnectRequest`(`shortId`: kotlin.String)
+
+    /**
+     * Block `peer` (an identity, or a hostname this node knows).
+     */
+    fun `blockPeer`(`peer`: kotlin.String)
+
+    /**
      * Call off a queued send, by the id from [`Node::list_queued_sends`].
      * Fails if the offer has already been delivered, since there is nothing
      * left on this side to withdraw.
@@ -2346,10 +2471,21 @@ public interface NodeInterface {
     fun `cancelTransfer`(`id`: kotlin.ULong)
 
     /**
+     * Ask the user behind `peer` (an identity) for a direct connection. They
+     * must approve it before a private network is created.
+     */
+    fun `connectPeer`(
+        `peer`: kotlin.String,
+        `hostname`: kotlin.String?,
+    ): kotlin.String
+
+    /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
     fun `create`(`name`: kotlin.String?): NetworkInfo
+
+    fun `declineInvitation`(`id`: kotlin.String)
 
     /**
      * The device's default hostname (seeds every join, incl. pairing
@@ -2425,6 +2561,11 @@ public interface NodeInterface {
     fun `healthSnapshot`(): HealthSnapshot
 
     /**
+     * Who may send connect requests and invitations, and who is blocked.
+     */
+    fun `inboundSettings`(): InboundSettings
+
+    /**
      * Mint a single-use invite code for `network` (default 7d TTL), to share.
      */
     fun `invite`(`network`: kotlin.String): kotlin.String
@@ -2457,6 +2598,11 @@ public interface NodeInterface {
      * Incoming file offers waiting to be accepted or declined.
      */
     fun `listFileOffers`(): List<FileOffer>
+
+    /**
+     * Invitations coordinators delivered to this node, newest state included.
+     */
+    fun `listInvitations`(): List<Invitation>
 
     /**
      * Join requests awaiting approval on a network we coordinate.
@@ -2551,6 +2697,15 @@ public interface NodeInterface {
     )
 
     /**
+     * Deliver an invite for `network` to `recipient`'s identity. An offline
+     * recipient is not an error: the node retries until the invite expires.
+     */
+    fun `sendInvite`(
+        `network`: kotlin.String,
+        `recipient`: kotlin.String,
+    ): kotlin.String
+
+    /**
      * Set the device's default hostname. Validated with the core's hostname
      * rules; rejected names leave the stored value untouched. Config-only;
      * safe before `start`.
@@ -2578,6 +2733,8 @@ public interface NodeInterface {
         `network`: kotlin.String,
         `hostname`: kotlin.String,
     )
+
+    fun `setInboundPolicy`(`policy`: InboundPolicy)
 
     /**
      * Save the engine selection. Restart the node to apply it.
@@ -2626,6 +2783,8 @@ public interface NodeInterface {
      * `join`, which still handles both a full invite and a bare room id.
      */
     fun `submitCode`(`input`: kotlin.String): LinkAction
+
+    fun `unblockPeer`(`peer`: kotlin.String)
 
     /**
      * Unpair this device from its primary: leave every network it joined under
@@ -2782,6 +2941,17 @@ open class Node :
     }
 
     /**
+     * Join the network an invitation names.
+     */
+    @Throws(RayException::class)
+    override fun `acceptInvitation`(`id`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_accept_invitation(it, FfiConverterString.lower(`id`), _status)
+            }
+        }
+
+    /**
      * Approve a pending join request on a network we coordinate.
      */
     @Throws(RayException::class)
@@ -2835,6 +3005,28 @@ open class Node :
         )
 
     /**
+     * Decline an incoming connect request and block the requester.
+     */
+    @Throws(RayException::class)
+    override fun `blockConnectRequest`(`shortId`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_block_connect_request(it, FfiConverterString.lower(`shortId`), _status)
+            }
+        }
+
+    /**
+     * Block `peer` (an identity, or a hostname this node knows).
+     */
+    @Throws(RayException::class)
+    override fun `blockPeer`(`peer`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_block_peer(it, FfiConverterString.lower(`peer`), _status)
+            }
+        }
+
+    /**
      * Call off a queued send, by the id from [`Node::list_queued_sends`].
      * Fails if the offer has already been delivered, since there is nothing
      * left on this side to withdraw.
@@ -2859,6 +3051,28 @@ open class Node :
         }
 
     /**
+     * Ask the user behind `peer` (an identity) for a direct connection. They
+     * must approve it before a private network is created.
+     */
+    @Throws(RayException::class)
+    override fun `connectPeer`(
+        `peer`: kotlin.String,
+        `hostname`: kotlin.String?,
+    ): kotlin.String =
+        FfiConverterString.lift(
+            callWithPointer {
+                uniffiRustCallWithError(RayException) { _status ->
+                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_connect_peer(
+                        it,
+                        FfiConverterString.lower(`peer`),
+                        FfiConverterOptionalString.lower(`hostname`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
@@ -2871,6 +3085,14 @@ open class Node :
                 }
             },
         )
+
+    @Throws(RayException::class)
+    override fun `declineInvitation`(`id`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_decline_invitation(it, FfiConverterString.lower(`id`), _status)
+            }
+        }
 
     /**
      * The device's default hostname (seeds every join, incl. pairing
@@ -3029,6 +3251,19 @@ open class Node :
         )
 
     /**
+     * Who may send connect requests and invitations, and who is blocked.
+     */
+    @Throws(RayException::class)
+    override fun `inboundSettings`(): InboundSettings =
+        FfiConverterTypeInboundSettings.lift(
+            callWithPointer {
+                uniffiRustCallWithError(RayException) { _status ->
+                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_inbound_settings(it, _status)
+                }
+            },
+        )
+
+    /**
      * Mint a single-use invite code for `network` (default 7d TTL), to share.
      */
     @Throws(RayException::class)
@@ -3103,6 +3338,19 @@ open class Node :
             callWithPointer {
                 uniffiRustCallWithError(RayException) { _status ->
                     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_file_offers(it, _status)
+                }
+            },
+        )
+
+    /**
+     * Invitations coordinators delivered to this node, newest state included.
+     */
+    @Throws(RayException::class)
+    override fun `listInvitations`(): List<Invitation> =
+        FfiConverterSequenceTypeInvitation.lift(
+            callWithPointer {
+                uniffiRustCallWithError(RayException) { _status ->
+                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_invitations(it, _status)
                 }
             },
         )
@@ -3286,6 +3534,28 @@ open class Node :
     }
 
     /**
+     * Deliver an invite for `network` to `recipient`'s identity. An offline
+     * recipient is not an error: the node retries until the invite expires.
+     */
+    @Throws(RayException::class)
+    override fun `sendInvite`(
+        `network`: kotlin.String,
+        `recipient`: kotlin.String,
+    ): kotlin.String =
+        FfiConverterString.lift(
+            callWithPointer {
+                uniffiRustCallWithError(RayException) { _status ->
+                    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_send_invite(
+                        it,
+                        FfiConverterString.lower(`network`),
+                        FfiConverterString.lower(`recipient`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Set the device's default hostname. Validated with the core's hostname
      * rules; rejected names leave the stored value untouched. Config-only;
      * safe before `start`.
@@ -3339,6 +3609,18 @@ open class Node :
             )
         }
     }
+
+    @Throws(RayException::class)
+    override fun `setInboundPolicy`(`policy`: InboundPolicy) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_inbound_policy(
+                    it,
+                    FfiConverterTypeInboundPolicy.lower(`policy`),
+                    _status,
+                )
+            }
+        }
 
     /**
      * Save the engine selection. Restart the node to apply it.
@@ -3427,6 +3709,14 @@ open class Node :
                 }
             },
         )
+
+    @Throws(RayException::class)
+    override fun `unblockPeer`(`peer`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_unblock_peer(it, FfiConverterString.lower(`peer`), _status)
+            }
+        }
 
     /**
      * Unpair this device from its primary: leave every network it joined under
@@ -3782,6 +4072,89 @@ public object FfiConverterTypeIdentityBackup : FfiConverterRustBuffer<IdentityBa
 }
 
 /**
+ * The inbound policy and the identities refused outright.
+ */
+data class InboundSettings(
+    var `policy`: InboundPolicy,
+    var `blocked`: List<kotlin.String>,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeInboundSettings : FfiConverterRustBuffer<InboundSettings> {
+    override fun read(buf: ByteBuffer): InboundSettings =
+        InboundSettings(
+            FfiConverterTypeInboundPolicy.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+
+    override fun allocationSize(value: InboundSettings) =
+        (
+            FfiConverterTypeInboundPolicy.allocationSize(value.`policy`) +
+                FfiConverterSequenceString.allocationSize(value.`blocked`)
+        )
+
+    override fun write(
+        value: InboundSettings,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterTypeInboundPolicy.write(value.`policy`, buf)
+        FfiConverterSequenceString.write(value.`blocked`, buf)
+    }
+}
+
+/**
+ * An invitation a coordinator delivered to this node. The code stays in the
+ * node: accepting by `id` is all the app needs.
+ */
+data class Invitation(
+    var `id`: kotlin.String,
+    var `network`: kotlin.String,
+    var `coordinator`: kotlin.String,
+    var `receivedSecs`: kotlin.ULong,
+    var `state`: InvitationState,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeInvitation : FfiConverterRustBuffer<Invitation> {
+    override fun read(buf: ByteBuffer): Invitation =
+        Invitation(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterTypeInvitationState.read(buf),
+        )
+
+    override fun allocationSize(value: Invitation) =
+        (
+            FfiConverterString.allocationSize(value.`id`) +
+                FfiConverterString.allocationSize(value.`network`) +
+                FfiConverterString.allocationSize(value.`coordinator`) +
+                FfiConverterULong.allocationSize(value.`receivedSecs`) +
+                FfiConverterTypeInvitationState.allocationSize(value.`state`)
+        )
+
+    override fun write(
+        value: Invitation,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`id`, buf)
+        FfiConverterString.write(value.`network`, buf)
+        FfiConverterString.write(value.`coordinator`, buf)
+        FfiConverterULong.write(value.`receivedSecs`, buf)
+        FfiConverterTypeInvitationState.write(value.`state`, buf)
+    }
+}
+
+/**
  * One network this node belongs to, with its peers.
  */
 data class NetworkDetail(
@@ -4066,6 +4439,11 @@ data class Status(
     var `peers`: List<PeerInfo>,
     var `networks`: List<NetworkDetail>,
     var `pendingNetworks`: List<kotlin.String>,
+    /**
+     * The user identity peers connect to and invite: the primary device's
+     * endpoint. `None` while the node is stopped.
+     */
+    var `identity`: kotlin.String?,
 ) {
     companion object
 }
@@ -4082,6 +4460,7 @@ public object FfiConverterTypeStatus : FfiConverterRustBuffer<Status> {
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterSequenceTypeNetworkDetail.read(buf),
             FfiConverterSequenceString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
 
     override fun allocationSize(value: Status) =
@@ -4091,7 +4470,8 @@ public object FfiConverterTypeStatus : FfiConverterRustBuffer<Status> {
                 FfiConverterString.allocationSize(value.`ipv6`) +
                 FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
                 FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
-                FfiConverterSequenceString.allocationSize(value.`pendingNetworks`)
+                FfiConverterSequenceString.allocationSize(value.`pendingNetworks`) +
+                FfiConverterOptionalString.allocationSize(value.`identity`)
         )
 
     override fun write(
@@ -4104,6 +4484,7 @@ public object FfiConverterTypeStatus : FfiConverterRustBuffer<Status> {
         FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
         FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
         FfiConverterSequenceString.write(value.`pendingNetworks`, buf)
+        FfiConverterOptionalString.write(value.`identity`, buf)
     }
 }
 
@@ -4159,6 +4540,74 @@ public object FfiConverterTypeTransfer : FfiConverterRustBuffer<Transfer> {
         FfiConverterULong.write(value.`size`, buf)
         FfiConverterULong.write(value.`transferred`, buf)
         FfiConverterTypeTransferState.write(value.`state`, buf)
+    }
+}
+
+/**
+ * Which strangers may send connect requests and invitations.
+ */
+
+enum class InboundPolicy {
+    ANYONE,
+
+    /**
+     * Only peers that share a network with this node.
+     */
+    KNOWN,
+    NOBODY,
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeInboundPolicy : FfiConverterRustBuffer<InboundPolicy> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            InboundPolicy.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: InboundPolicy) = 4UL
+
+    override fun write(
+        value: InboundPolicy,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+enum class InvitationState {
+    PENDING,
+    ACCEPTED,
+    DECLINED,
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeInvitationState : FfiConverterRustBuffer<InvitationState> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            InvitationState.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: InvitationState) = 4UL
+
+    override fun write(
+        value: InvitationState,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -4807,6 +5256,34 @@ public object FfiConverterSequenceTypeFirewallRuleInfo : FfiConverterRustBuffer<
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFirewallRuleInfo.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeInvitation : FfiConverterRustBuffer<List<Invitation>> {
+    override fun read(buf: ByteBuffer): List<Invitation> {
+        val len = buf.getInt()
+        return List<Invitation>(len) {
+            FfiConverterTypeInvitation.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<Invitation>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeInvitation.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<Invitation>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeInvitation.write(it, buf)
         }
     }
 }

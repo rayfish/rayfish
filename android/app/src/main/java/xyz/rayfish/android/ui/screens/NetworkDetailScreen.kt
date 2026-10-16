@@ -40,6 +40,7 @@ fun NetworkDetailScreen(
     val scope = rememberCoroutineScope()
     var confirmLeave by rememberSaveable { mutableStateOf(false) }
     var inviteCode by remember { mutableStateOf<String?>(null) }
+    var sendingInvite by rememberSaveable { mutableStateOf(false) }
     var editing by rememberSaveable { mutableStateOf(false) }
     var hostnameInput by rememberSaveable { mutableStateOf("") }
     var firewall by remember { mutableStateOf<uniffi.ray_mobile.FirewallStateInfo?>(null) }
@@ -57,13 +58,14 @@ fun NetworkDetailScreen(
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.cd_back), tint = Rf.Muted) }
             Text(detail.name, fontFamily = Chakra, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Rf.Heading)
             Spacer(Modifier.weight(1f))
-            OverflowMenu(listOf(
+            OverflowMenu(listOfNotNull(
                 MenuItem(stringResource(R.string.menu_invite)) {
                     scope.launch {
                         try { inviteCode = withContext(Dispatchers.IO) { NodeHolder.get(context).invite(detail.name) } }
                         catch (t: Throwable) { onToast(context.getString(R.string.error_invite_failed, t.message.orEmpty())) }
                     }
                 },
+                if (detail.isCoordinator) MenuItem(stringResource(R.string.menu_send_invite)) { sendingInvite = true } else null,
                 MenuItem(stringResource(R.string.menu_leave_network), destructive = true) { confirmLeave = true },
             ))
         }
@@ -257,6 +259,15 @@ fun NetworkDetailScreen(
             },
             dismissButton = { TextButton(onClick = { showAddRule = false }) { Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra) } },
         )
+    }
+    if (sendingInvite) {
+        IdentityDialog(
+            title = stringResource(R.string.send_invite_title, detail.name),
+            body = stringResource(R.string.send_invite_body),
+            confirmLabel = stringResource(R.string.action_send),
+            onDismiss = { sendingInvite = false },
+            onToast = onToast,
+        ) { recipient -> NodeHolder.get(context).sendInvite(detail.name, recipient) }
     }
     inviteCode?.let { code -> QrCodeSheet(stringResource(R.string.invite_sheet_title), code, context) { inviteCode = null } }
 }

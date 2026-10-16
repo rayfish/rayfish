@@ -62,5 +62,5 @@ class SnapshotRefreshTest {
         } finally { scope.cancel() }
     }
 
-    private fun status(id: String) = Status(false, id, "", emptyList(), emptyList(), emptyList())
+    private fun status(id: String) = Status(false, id, "", emptyList(), emptyList(), emptyList(), null)
 }

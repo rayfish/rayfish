@@ -151,11 +151,12 @@ fn print_pending_requests(
 fn json_requested(command: &Command) -> bool {
     match command {
         Command::Status { json, .. }
+        | Command::Blocked { json }
         | Command::Invite { json, .. }
+        | Command::Invitations { json, .. }
         | Command::Requests { json, .. }
         | Command::Connect { json, .. }
         | Command::Connections { json, .. }
-        | Command::Contact { json, .. }
         | Command::Ping { json, .. }
         | Command::Netcheck { json }
         | Command::Admin { json, .. }
@@ -384,6 +385,17 @@ pub(crate) enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// Review and answer private network invitations
+    ///
+    /// Coordinators send these with `ray apply --invite-missing`. Nothing joins
+    /// until you accept; declining also blocks the sender.
+    Invitations {
+        #[command(subcommand)]
+        action: Option<InvitationAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Mint and manage invite codes (coordinator only)
     ///
     /// Codes are one-time by default; `--reusable` mints a multi-use key.
@@ -433,20 +445,21 @@ pub(crate) enum Command {
     },
     /// Request a direct link, or review incoming ones
     ///
-    /// `ray connect <contact-id>` asks that peer for a direct 2-peer network,
+    /// `ray connect <identity>` asks that peer for a direct 2-peer network,
     /// with no room id or invite code needed; they run `ray connect approve` to
-    /// accept it. With no argument, lists the requests waiting on you.
+    /// accept it. Share yours from `ray status`. With no argument, lists the
+    /// requests waiting on you.
     Connect {
         #[command(subcommand)]
         action: Option<ConnectAction>,
-        /// The peer's contact id (from their `ray contact id` / `ray status`)
-        contact_id: Option<String>,
+        /// The peer's identity (from their `ray status` or `ray identityof`)
+        peer: Option<String>,
         /// Your hostname on the resulting network (defaults to your set name)
         ///
         /// `requires` because the id is what it names a hostname *on*: without
         /// one there is nothing to dial, and the flag would be dropped in
         /// silence while the queue got listed instead.
-        #[arg(long, requires = "contact_id")]
+        #[arg(long, requires = "peer")]
         hostname: Option<String>,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
@@ -461,12 +474,25 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// Show or rotate your contact id
+    /// Refuse a peer's connect requests and invitations
     ///
-    /// Share it so others can `ray connect` you.
-    Contact {
-        #[command(subcommand)]
-        action: Option<ContactAction>,
+    /// The peer gets no reply, so it cannot tell a block from a full queue,
+    /// though it can see you are online. Blocking a paired user's identity
+    /// also covers their devices that appear in your networks. Membership of
+    /// shared networks is unaffected; `ray kick` removes a member.
+    Block {
+        /// Identity or hostname of the peer
+        #[arg(add = complete::peers())]
+        peer: String,
+    },
+    /// Let a blocked peer reach you again
+    Unblock {
+        /// Identity or hostname of the peer
+        #[arg(add = complete::peers())]
+        peer: String,
+    },
+    /// List blocked peers
+    Blocked {
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
         json: bool,
@@ -571,8 +597,8 @@ pub(crate) enum Command {
         #[arg(long)]
         dry_run: bool,
         /// Mint one-time invites for hosts the spec expects but that haven't
-        /// joined yet (hostname-bound). Without this flag, the commands are
-        /// only printed.
+        /// joined yet (hostname-bound), and privately invite aliases that have
+        /// no joined device. Without this flag, they are only listed.
         #[arg(long)]
         invite_missing: bool,
         /// Print an example spec file and exit.
@@ -587,20 +613,17 @@ pub(crate) enum Command {
         /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
     },
-    /// Print a host's or contact's identity string
+    /// Print a host's identity string
     ///
     /// The value to paste into a `ray apply` spec's `aliases:` map. Resolves to
     /// the user identity if the device is paired, else the device's transport
     /// identity. Searches all networks; different identities sharing a name
     /// are listed in a table. The older `identityof <network> <hostname>` form
-    /// limits the lookup to one network.
-    ///
-    /// A contact id resolves its signed discovery record without connecting to
-    /// the peer. This returns the advertised device identity, which may differ
-    /// from its paired user identity. Requires a running daemon.
+    /// limits the lookup to one network. The identity is also what `ray
+    /// connect` takes. Requires a running daemon.
     #[command(visible_alias = "whois")]
     Identityof {
-        /// Hostname to look up across all networks, or a contact id
+        /// Hostname to look up across all networks
         #[arg(add = complete::peers())]
         peer: String,
         /// Hostname for a scoped lookup, treating PEER as the network name
@@ -751,6 +774,23 @@ pub(crate) enum Command {
         sha256: String,
         #[arg(long)]
         parent_pid: u32,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum InvitationAction {
+    /// Join the invitation's network
+    Accept {
+        /// Invitation id, or an unambiguous prefix
+        id: String,
+        /// Your hostname on the network (defaults to your set name)
+        #[arg(long)]
+        hostname: Option<ipc::MachineHostname>,
+    },
+    /// Refuse it and block the sender
+    Decline {
+        /// Invitation id, or an unambiguous prefix
+        id: String,
     },
 }
 
@@ -944,6 +984,13 @@ pub(crate) enum ConnectAction {
         #[arg(add = complete::connect_requests())]
         id: String,
     },
+    /// Refuse a pending request and block the requester
+    #[command(visible_alias = "reject")]
+    Deny {
+        /// Hostname or short id of the requester
+        #[arg(add = complete::connect_requests())]
+        id: String,
+    },
 }
 
 /// `--help` text for a `ray config` key argument: the lead line plus the
@@ -1017,14 +1064,6 @@ pub(crate) enum DnsAction {
     Partial,
     /// Remove Rayfish's system DNS configuration
     Off,
-}
-
-#[derive(Subcommand)]
-pub(crate) enum ContactAction {
-    /// Print your contact id (default)
-    Id,
-    /// Rotate your contact key (invalidates the old contact id)
-    Rotate,
 }
 
 #[derive(Subcommand)]
@@ -1806,6 +1845,7 @@ async fn run() -> Result<()> {
             action,
             json: _,
         } => ipc_invite(&network, action).await,
+        Command::Invitations { action, json: _ } => ipc_invitations(action).await,
         Command::Requests {
             network,
             action,
@@ -1817,17 +1857,17 @@ async fn run() -> Result<()> {
         },
         Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
-        // An action is a request-queue verb, a bare contact id dials that peer,
+        // An action is a request-queue verb, a bare identity dials that peer,
         // and with neither, show the queue, the same as `ray connections` did.
         // The two together parse (the positional fills, then the subcommand
         // does) and mean nothing, so they are rejected rather than served by
         // dropping one.
         Command::Connect {
             action,
-            contact_id,
+            peer,
             hostname,
             json: _,
-        } => match (action, contact_id) {
+        } => match (action, peer) {
             (None, Some(id)) => ipc_connect(&id, hostname).await,
             (None, None) => ipc_connections(None).await,
             (Some(action), None) => ipc_connections(Some(action)).await,
@@ -1836,7 +1876,9 @@ async fn run() -> Result<()> {
             }
         },
         Command::Connections { action, json: _ } => ipc_connections(action).await,
-        Command::Contact { action, json: _ } => ipc_contact(action).await,
+        Command::Block { peer } => ipc_block(&peer).await,
+        Command::Unblock { peer } => ipc_unblock(&peer).await,
+        Command::Blocked { json: _ } => ipc_blocked().await,
         Command::Ping {
             peer,
             count,
@@ -2129,11 +2171,11 @@ mod tests {
                 Command::Identityof { peer, hostname: Some(hostname), json: true }
                     if peer == "network-a" && hostname == "build-box"
             ));
-            let contact = iroh::SecretKey::from([7; 32]).public().to_string();
-            let cli = Cli::try_parse_from(["ray", command, &contact, "--json"]).unwrap();
+            let identity = iroh::SecretKey::from([7; 32]).public().to_string();
+            let cli = Cli::try_parse_from(["ray", command, &identity, "--json"]).unwrap();
             assert!(matches!(
                 cli.command,
-                Command::Identityof { peer, hostname: None, json: true } if peer == contact
+                Command::Identityof { peer, hostname: None, json: true } if peer == identity
             ));
         }
         assert!(Cli::try_parse_from(["ray", "identityof"]).is_err());

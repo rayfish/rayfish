@@ -5,11 +5,11 @@
 #   srv-a  identity U   the initiator (`ray connect`)
 #   srv-b  identity V   the recipient (`ray connect approve`)
 #
-# Proves the full friend-request flow over real hosts + the public pkarr DHT:
-#   B publishes a contact id  ->  A `ray connect <id>`  ->  B sees + approves
+# Proves the full friend-request flow over real hosts:
+#   B shares its identity  ->  A `ray connect <identity>`  ->  B sees + approves
 #   ->  a 2-peer `[direct]` network forms  ->  A<->B reach each other (ping +
 #   ray send) and the network is tagged direct with its room id hidden.
-# Plus a negative case: connecting to an offline contact fails cleanly.
+# Plus a negative case: connecting to an identity nobody runs fails cleanly.
 #
 # Reads tests/e2e/connect/.servers (written by provision.sh). Does NOT modify
 # infra. Re-runnable (resets rayfish state on each run unless KEEP_STATE=1).
@@ -22,41 +22,23 @@ SERVERS="$DIR/.servers"
 source "$ROOT/tests/lib/common.sh"
 SR_PREFIX=/tmp/c   # temp-file prefix for send_recv
 
-# check_offline_contact <from> <to> <old-contact-id> : prove that a fresh,
-# unpublished contact id returns the expected lookup error within a deadline.
-check_offline_contact(){
-  local from="$1" to="$2" old_contact_id="$3"
-  if ! on "$to" 'ray down' >/dev/null 2>&1; then
-    fail "could not put srv-b in standby"; return 1
-  fi
-  if retry_until 10 "status_json '$to' | jq -e '.active == false' >/dev/null 2>&1"; then
-    pass "srv-b entered standby (inactive)"
-  else
-    fail "srv-b did not enter standby after ray down"; return 1
-  fi
+# The ed25519 base point: a valid identity that no rayfish node uses.
+UNKNOWN_PEER=5866666666666666666666666666666666666666666666666666666666666666
 
-  # Rotation in standby must succeed without publishing the new contact record.
-  local rotated_json new_contact_id
-  if ! rotated_json="$(on "$to" 'ray contact rotate --json' 2>/dev/null)"; then
-    fail "could not rotate srv-b's contact id"; return 1
-  fi
-  if ! new_contact_id="$(printf '%s\n' "$rotated_json" | jq -er '
-    .contact_id | select(type == "string" and test("^[A-Za-z0-9]{20,}$"))')" \
-     || [[ "$new_contact_id" == "$old_contact_id" ]]; then
-    fail "contact rotation did not return a valid new id"; return 1
-  fi
-
-  local offline_out offline_rc=0
-  offline_out="$(on "$from" "timeout --kill-after=5s 30s ray connect $new_contact_id" 2>&1 | strip)" \
-    || offline_rc=$?
-  printf '%s\n' "$offline_out" | sed 's/^/   a| /'
+# check_unknown_peer <from> <identity> : prove that connecting to an identity
+# no node answers for fails with the dial error within a deadline.
+check_unknown_peer(){
+  local from="$1" peer="$2"
+  local out rc=0
+  out="$(on "$from" "timeout --kill-after=5s 30s ray connect $peer" 2>&1 | strip)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/   a| /'
   # The CLI exits 1 for this daemon error. Timeout, SSH/IPC errors, and a
-  # successful command must fail even if their output mentions an offline peer.
-  if [[ "$offline_rc" == 1 ]] && printf '%s\n' "$offline_out" \
-      | grep -qE '^[[:space:]]*contact offline or unknown \(could not resolve contact id\)[[:space:]]*$'; then
-    pass "connect to offline/unknown contact errors cleanly"
+  # successful command must fail even if their output mentions the dial error.
+  if [[ "$rc" == 1 ]] && printf '%s\n' "$out" \
+      | grep -qE '^[[:space:]]*failed to reach peer: '; then
+    pass "connect to an unknown identity errors cleanly"
   else
-    fail "connect to offline contact did not return the expected lookup error (exit=$offline_rc)"
+    fail "connect to an unknown identity did not return the dial error (exit=$rc)"
     return 1
   fi
 }
@@ -73,25 +55,25 @@ wait_all_ssh "$A" "$B"
 seed_known_hosts "$A" "$B"
 reset_state "$A" "$B"
 deploy_all "$ROOT" "$A" "$B"
-# Ensure the VPN is active on both (TUN up + contact publisher running). After a
+# Ensure the VPN is active on both (TUN up). After a
 # `systemctl restart` the daemon boots inactive, so activate explicitly.
 activate_daemons "$A" "$B" || summary
 
 # ---------------------------------------------------------------------------
-step "2. read contact ids"
-A_CID="$(on "$A" 'ray contact id' | strip | head -1 | tr -d ' ')"
-B_CID="$(on "$B" 'ray contact id' | strip | head -1 | tr -d ' ')"
-echo "   A contact id: ${A_CID:0:16}…"
-echo "   B contact id: ${B_CID:0:16}…"
-[[ -n "$A_CID" && "${#A_CID}" -ge 20 ]] && pass "srv-a has a contact id" || fail "srv-a contact id missing/short"
-[[ -n "$B_CID" && "${#B_CID}" -ge 20 ]] && pass "srv-b has a contact id" || fail "srv-b contact id missing/short"
-# The contact id must also surface in `ray status`.
-on "$A" 'ray status' | strip | grep -qi "${A_CID:0:16}" && pass "contact id shown in ray status" \
-  || fail "contact id not shown in ray status"
+step "2. read identities"
+A_CID="$(status_json "$A" | jq -r '.identity // empty')"
+B_CID="$(status_json "$B" | jq -r '.identity // empty')"
+echo "   A identity: ${A_CID:0:16}…"
+echo "   B identity: ${B_CID:0:16}…"
+[[ -n "$A_CID" && "${#A_CID}" -ge 20 ]] && pass "srv-a has an identity" || fail "srv-a identity missing/short"
+[[ -n "$B_CID" && "${#B_CID}" -ge 20 ]] && pass "srv-b has an identity" || fail "srv-b identity missing/short"
+# The identity must also surface in `ray status`.
+on "$A" 'ray status' | strip | grep -qi "${A_CID:0:16}" && pass "identity shown in ray status" \
+  || fail "identity not shown in ray status"
 
 # ---------------------------------------------------------------------------
 step "3. srv-a requests a direct connection to srv-b"
-# B publishes its contact record to pkarr; retry until A's request is accepted.
+# Retry until A's request is accepted (B's addresses may take a moment to publish).
 CONNECT_OUT=""
 for _ in $(seq 1 8); do
   CONNECT_OUT="$(on "$A" "ray connect $B_CID --hostname laptop" 2>&1 | strip)"
@@ -119,7 +101,7 @@ if echo "$REQ" | grep -qiE "${A_CID:0:8}"; then
 else
   fail "srv-b never saw srv-a's request"
 fi
-# Approve by srv-a's full contact id (the daemon matches it as a prefix), so we
+# Approve by srv-a's full identity (the daemon matches it as a prefix), so we
 # don't have to parse the short id out of the table.
 APPROVE="$(on "$B" "ray connect approve $A_CID" 2>&1 | strip)"
 echo "$APPROVE" | sed 's/^/   b| /'
@@ -235,11 +217,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "9. negative — connecting to an offline contact fails cleanly"
-# Stop publication, then rotate the contact id so lookup cannot race a cached
-# record's TTL or reuse the already-established direct network.
-check_offline_contact "$A" "$B" "$B_CID"
-on "$B" 'ray up' >/dev/null 2>&1 || true
+step "9. negative: connecting to an unknown identity fails cleanly"
+check_unknown_peer "$A" "$UNKNOWN_PEER"
 
 # ---------------------------------------------------------------------------
 summary

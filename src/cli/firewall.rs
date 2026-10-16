@@ -807,6 +807,7 @@ pub(crate) async fn ipc_apply(
 
     // Expand groups/aliases against live status into a pure hostname-keyed spec.
     let mut expanded = apply::DeploySpec::default();
+    let mut deliveries = Vec::new();
     for (net_name, fw) in &spec.networks {
         // Seed from the network's stored `ray alias` map (already canonical), then
         // let the spec's own `aliases:` override on name conflict. Stored aliases
@@ -826,6 +827,7 @@ pub(crate) async fn ipc_apply(
             .collect::<Result<HashSet<ipc::MachineHostname>, _>>()?;
         let (efw, empty_aliases) =
             apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve, &current)?;
+        deliveries.extend(planned_deliveries(net_name, &net_aliases, &empty_aliases));
         for a in empty_aliases {
             eprintln!(
                 "{}  {net_name}: alias '{a}' has no joined devices yet; resolves to no hosts",
@@ -836,46 +838,15 @@ pub(crate) async fn ipc_apply(
     }
 
     if dry_run {
-        println!("{}", style::bold("Spec (expanded):"));
-        print!("{}", apply::to_yaml(&expanded)?);
-        println!("{}", style::bold("Membership diff:"));
-        let mut changes = 0usize;
-        for (network_name, firewall) in &expanded.networks {
-            let current: HashSet<ipc::MachineHostname> =
-                joined_hostnames(&status_networks, network_name)
-                    .into_iter()
-                    .map(|hostname| hostname.parse())
-                    .collect::<std::result::Result<_, _>>()?;
-            let status_network = status_networks
-                .iter()
-                .find(|network| network.name == *network_name);
-            let membership = membership_diff_for_apply(
-                firewall,
-                &current,
-                status_network,
+        print!(
+            "{}",
+            render_apply_dry_run(
+                &expanded,
+                &status_networks,
                 &managed_machines,
-                network_name,
-            )?;
-            for hostname in membership.joins {
-                changes += 1;
-                println!("  join   {hostname} to {network_name}");
-            }
-            let local_hostname = status_networks
-                .iter()
-                .find(|network| network.name == *network_name)
-                .and_then(|network| network.my_hostname.as_deref());
-            for hostname in membership.leaves {
-                if local_hostname == Some(hostname.as_ref()) {
-                    continue;
-                }
-                changes += 1;
-                println!("  leave  {hostname} from {network_name}");
-            }
-        }
-        if changes == 0 {
-            println!("  no membership changes");
-        }
-        println!("{}", style::faint("(dry-run; no changes applied)"));
+                if invite_missing { &deliveries } else { &[] },
+            )?
+        );
         return Ok(());
     }
 
@@ -1144,9 +1115,155 @@ pub(crate) async fn ipc_apply(
             );
         }
     }
+    let delivery_failures = if invite_missing {
+        deliver_invitations(&deliveries).await
+    } else {
+        if !deliveries.is_empty() {
+            println!(
+                "\n{} re-run with --invite-missing to invite these aliases privately.",
+                style::faint("tip:")
+            );
+        }
+        false
+    };
     anyhow::ensure!(!removal_failures, "some members could not be removed");
     anyhow::ensure!(!ssh_failures, "some SSH grants could not be applied");
+    anyhow::ensure!(!delivery_failures, "some invitations could not be queued");
     Ok(())
+}
+
+/// One private invitation planned by `ray apply --invite-missing`.
+#[derive(Debug, PartialEq, Eq)]
+struct PlannedDelivery {
+    network: ipc::NetworkName,
+    recipient: EndpointId,
+}
+
+/// Aliases with no joined device in `network`, as invitations. The values went
+/// through `canonicalize_aliases`, so one that does not parse is skipped.
+fn planned_deliveries(
+    network: &str,
+    aliases: &std::collections::BTreeMap<String, String>,
+    empty_aliases: &[String],
+) -> Vec<PlannedDelivery> {
+    let mut recipients: Vec<EndpointId> = empty_aliases
+        .iter()
+        .filter_map(|name| aliases.get(name)?.parse().ok())
+        .collect();
+    recipients.sort();
+    recipients.dedup();
+    recipients
+        .into_iter()
+        .map(|recipient| PlannedDelivery {
+            network: ipc::NetworkName::new(network.to_string()),
+            recipient,
+        })
+        .collect()
+}
+
+/// Send every planned invitation at once; each can wait out a dial. A queued
+/// delivery is success. Returns whether any request failed outright.
+async fn deliver_invitations(deliveries: &[PlannedDelivery]) -> bool {
+    if deliveries.is_empty() {
+        return false;
+    }
+    println!("\n{} Private invitations:", style::label("invite"));
+    let replies = futures::future::join_all(deliveries.iter().map(|delivery| {
+        ipc_request(ipc::IpcMessage::InviteDeliver {
+            network: delivery.network.clone(),
+            recipient: delivery.recipient,
+        })
+    }))
+    .await;
+    let mut failed = false;
+    for (delivery, reply) in deliveries.iter().zip(replies) {
+        match reply {
+            Ok(ipc::IpcMessage::Ok { message }) => {
+                println!("  {}: {message}", delivery.network)
+            }
+            Ok(ipc::IpcMessage::Error { message }) => {
+                failed = true;
+                eprintln!(
+                    "{}  {}: {}: {message}",
+                    style::red("  !"),
+                    delivery.network,
+                    delivery.recipient.fmt_short()
+                );
+            }
+            Ok(other) => {
+                failed = true;
+                eprintln!(
+                    "{}  {}: unexpected invitation response: {other:?}",
+                    style::red("  !"),
+                    delivery.network
+                );
+            }
+            Err(error) => {
+                failed = true;
+                eprintln!(
+                    "{}  {}: invitation request failed: {error}",
+                    style::red("  !"),
+                    delivery.network
+                );
+            }
+        }
+    }
+    failed
+}
+
+/// The dry-run report. Sends nothing: no join, leave, or invitation.
+fn render_apply_dry_run(
+    expanded: &apply::DeploySpec,
+    networks: &[ipc::NetworkStatus],
+    machines: &[ipc::ManagedMachineInfo],
+    deliveries: &[PlannedDelivery],
+) -> Result<String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    writeln!(out, "{}", style::bold("Spec (expanded):"))?;
+    let yaml = apply::to_yaml(expanded)?;
+    out.push_str(&yaml);
+    if !yaml.ends_with('\n') {
+        out.push('\n');
+    }
+    writeln!(out, "{}", style::bold("Membership diff:"))?;
+    let mut changes = 0usize;
+    for (network_name, firewall) in &expanded.networks {
+        let current: HashSet<ipc::MachineHostname> = joined_hostnames(networks, network_name)
+            .into_iter()
+            .map(|hostname| hostname.parse())
+            .collect::<std::result::Result<_, _>>()?;
+        let status_network = networks
+            .iter()
+            .find(|network| network.name == *network_name);
+        let membership =
+            membership_diff_for_apply(firewall, &current, status_network, machines, network_name)?;
+        for hostname in membership.joins {
+            changes += 1;
+            writeln!(out, "  join   {hostname} to {network_name}")?;
+        }
+        let local_hostname = status_network.and_then(|network| network.my_hostname.as_deref());
+        for hostname in membership.leaves {
+            if local_hostname == Some(hostname.as_ref()) {
+                continue;
+            }
+            changes += 1;
+            writeln!(out, "  leave  {hostname} from {network_name}")?;
+        }
+    }
+    for delivery in deliveries {
+        changes += 1;
+        writeln!(
+            out,
+            "  invite {} to {} (private; queued if offline)",
+            delivery.recipient, delivery.network
+        )?;
+    }
+    if changes == 0 {
+        writeln!(out, "  no membership changes")?;
+    }
+    writeln!(out, "{}", style::faint("(dry-run; no changes applied)"))?;
+    Ok(out)
 }
 
 fn managed_machine_for_hostname<'a>(
@@ -1337,33 +1454,7 @@ fn identity_matches_json(matches: &[HostIdentityMatch<'_>]) -> serde_json::Value
     }
 }
 
-#[derive(serde::Serialize)]
-struct ContactIdentityOutput {
-    contact_id: EndpointId,
-    endpoint_id: EndpointId,
-}
-
-impl DisplayOut for ContactIdentityOutput {
-    fn print_human(&self) {
-        println!("{}", self.endpoint_id);
-    }
-}
-
 pub(crate) async fn cmd_identityof(peer: &str, hostname: Option<&str>) -> Result<()> {
-    if hostname.is_none()
-        && let Ok(contact_id) = peer.parse::<EndpointId>()
-    {
-        let mut stream = ipc::connect().await?;
-        ipc::send(&mut stream, ipc::IpcMessage::ResolveContact { contact_id }).await?;
-        return match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::ContactResolved { endpoint_id } => printout(&ContactIdentityOutput {
-                contact_id,
-                endpoint_id,
-            }),
-            ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
-            other => anyhow::bail!("unexpected contact lookup response: {other:?}"),
-        };
-    }
     let (self_id, networks) = ipc_status_full().await?;
     let network = hostname.map(|_| peer);
     let matches = host_identity_matches(&networks, &self_id, hostname.unwrap_or(peer), network)?;
@@ -1543,6 +1634,75 @@ pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alias_spec() -> (apply::DeploySpec, EndpointId) {
+        let invited = iroh::SecretKey::from([51; 32]).public();
+        let spec: apply::DeploySpec = serde_yml::from_str(&format!(
+            r#"
+aliases:
+  bob: {invited}
+  alice: {invited}
+networks:
+  n:
+    server:
+      allows:
+        bob: tcp:12345
+"#
+        ))
+        .unwrap();
+        (spec, invited)
+    }
+
+    #[test]
+    fn deliveries_are_planned_only_for_empty_aliases() {
+        let (spec, invited) = alias_spec();
+        let aliases = canonicalize_aliases(&spec.aliases).unwrap();
+        let empty = vec!["bob".to_string(), "alice".to_string()];
+        assert_eq!(
+            planned_deliveries("n", &aliases, &empty),
+            [PlannedDelivery {
+                network: ipc::NetworkName::new("n".into()),
+                recipient: invited,
+            }]
+        );
+        assert!(planned_deliveries("n", &aliases, &[]).is_empty());
+        assert!(planned_deliveries("n", &aliases, &["unknown".into()]).is_empty());
+    }
+
+    #[test]
+    fn dry_run_lists_deliveries_and_sends_nothing() {
+        let (spec, invited) = alias_spec();
+        let aliases = canonicalize_aliases(&spec.aliases).unwrap();
+        let (firewall, empty) = apply::expand_firewall(
+            &spec.networks["n"],
+            &aliases,
+            &spec.groups,
+            &|_| Vec::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let mut expanded = apply::DeploySpec::default();
+        expanded.networks.insert("n".into(), firewall);
+        let deliveries = planned_deliveries("n", &aliases, &empty);
+        let preview = render_apply_dry_run(&expanded, &[], &[], &deliveries).unwrap();
+        assert!(preview.contains(&format!("invite {invited} to n")));
+        assert!(preview.contains("no changes applied"));
+        let without_flag = render_apply_dry_run(&expanded, &[], &[], &[]).unwrap();
+        assert!(!without_flag.contains("invite "));
+    }
+
+    #[test]
+    fn dry_run_has_no_blank_line_before_the_membership_heading() {
+        let (spec, _) = alias_spec();
+        let mut expanded = apply::DeploySpec::default();
+        expanded
+            .networks
+            .insert("n".into(), spec.networks["n"].clone());
+        let preview = render_apply_dry_run(&expanded, &[], &[], &[]).unwrap();
+        let heading = preview.find("Membership diff:").unwrap();
+        assert!(preview[..heading].ends_with('\n'));
+        assert!(!preview[..heading].ends_with("\n\n"));
+    }
 
     /// `IpcMessage` has no `PartialEq` (it carries wire types that don't want
     /// one), so compare the settings-key mapping as a tuple.

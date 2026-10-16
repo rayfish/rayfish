@@ -12,6 +12,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   enrollment. Repeat the flag for multiple settings; `--enable` is an alias and
   a bare key means `on`, for example `--enable v4-bridge --set dns=partial`.
 
+- `ray connect deny`, `ray block`, `ray unblock` and `ray blocked` control who
+  can send you connect requests; denying a request blocks its sender.
+  `ray config set inbound anyone|known|none` refuses strangers or everyone.
+  Refused peers get no reply, so they cannot tell a block from a full queue.
+
+- `ray apply --invite-missing` privately invites aliases that have no joined
+  device. The invitation waits in their `ray invitations` until they accept or
+  decline; nothing joins on its own. Offline recipients get it when they come
+  back, until it expires after 7 days. A recipient on an older Rayfish cannot
+  receive one, so you get the code to send them instead. Accepting an invite
+  that was revoked or has expired removes it.
+
+- The macOS and Android apps show received invitations to join or decline,
+  send an invite straight to someone's identity from a network you coordinate,
+  block a connection request's sender, and set who can reach you and who is
+  blocked. Android also shows your identity and can connect to a peer by it.
+
+### Changed
+
+- `ray connect` takes the peer's identity, shown by `ray status` and
+  `ray identityof`. Contact ids and `ray contact` are removed. A node on 0.5.9
+  cannot `ray connect` to a newer one until it upgrades.
+
 ## [0.5.9] - 2026-10-15
 
 ### Added

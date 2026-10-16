@@ -187,13 +187,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             firewall = try providerFirewall(node.firewallShow())
         case .connectPeer:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
-            message = try node.connectPeer(contactId: id, hostname: request.hostname)
+            message = try node.connectPeer(peer: id, hostname: request.hostname)
         case .approveConnection:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             try node.approveConnection(id: id)
         case .rejectConnection:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             try node.rejectConnection(id: id)
+        case .blockConnection:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
+            try node.blockConnection(id: id)
+        case .acceptInvitation:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingInvitation }
+            try node.acceptInvitation(id: id)
+        case .declineInvitation:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingInvitation }
+            try node.declineInvitation(id: id)
+        case .sendInvite:
+            guard let name = request.name, !name.isEmpty else { throw ProviderError.missingNetworkName }
+            guard let peer = request.peer, !peer.isEmpty else { throw ProviderError.missingPeer }
+            message = try node.sendInvite(network: name, recipient: peer)
+        case .setInboundPolicy:
+            guard let policy = request.inboundPolicy else { throw ProviderError.missingSetting }
+            switch policy {
+            case .anyone: try node.setInboundPolicy(policy: .anyone)
+            case .known: try node.setInboundPolicy(policy: .known)
+            case .nobody: try node.setInboundPolicy(policy: .nobody)
+            }
+        case .blockPeer:
+            guard let peer = request.peer, !peer.isEmpty else { throw ProviderError.missingPeer }
+            try node.blockPeer(peer: peer)
+        case .unblockPeer:
+            guard let peer = request.peer, !peer.isEmpty else { throw ProviderError.missingPeer }
+            try node.unblockPeer(peer: peer)
         case .acceptFile:
             guard let id = request.fileId, let directory = request.directory, !directory.isEmpty,
                   let uid = request.uid, let gid = request.gid,
@@ -283,7 +309,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     waitingSecs: request.waitingSecs
                 )
             },
-            contactId: status.requests.contactId,
+            identity: status.requests.identity,
             connectionRequests: status.requests.connectionRequests.map { request in
                 ProviderConnectionRequest(id: request.id, hostname: request.hostname, waitingSecs: request.waitingSecs)
             },
@@ -301,8 +327,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             sshRules: status.ssh.rules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) },
             fileAutoAcceptPeers: status.fileAutoAcceptPeers,
             connectionWarning: status.connectionWarning,
-            quicFqCodel: status.services.quicFqCodel
+            quicFqCodel: status.services.quicFqCodel,
+            inboundPolicy: providerPolicy(status.inbound.policy),
+            blocked: status.inbound.blocked,
+            invitations: status.inbound.invitations.filter { $0.state == .pending }.map { invitation in
+                ProviderInvitation(id: invitation.id, network: invitation.network, coordinator: invitation.coordinator)
+            }
         )
+    }
+
+    private func providerPolicy(_ policy: InboundPolicy) -> ProviderInboundPolicy {
+        switch policy {
+        case .anyone: .anyone
+        case .known: .known
+        case .nobody: .nobody
+        }
     }
 }
 
@@ -316,6 +355,7 @@ private enum ProviderError: LocalizedError {
     case missingPeer
     case missingOwner
     case missingFile
+    case missingInvitation
 
     var errorDescription: String? {
         switch self {
@@ -332,11 +372,13 @@ private enum ProviderError: LocalizedError {
         case .missingSetting:
             "A setting and its value are required"
         case .missingPeer:
-            "A peer contact ID or request ID is required"
+            "A peer identity or request ID is required"
         case .missingOwner:
             "Open the Rayfish app and reconnect to authorize your shell commands"
         case .missingFile:
             "A file and destination owned by the Rayfish user are required"
+        case .missingInvitation:
+            "An invitation ID is required"
         }
     }
 }

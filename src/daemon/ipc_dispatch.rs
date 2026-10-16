@@ -17,9 +17,8 @@ impl Daemon {
                 | IpcMessage::ExitNodeStatus { .. }
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
+                | IpcMessage::Invitations
                 | IpcMessage::Requests { .. }
-                | IpcMessage::ContactId
-                | IpcMessage::ResolveContact { .. }
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
@@ -171,6 +170,30 @@ impl Daemon {
         .await
     }
 
+    /// `ray config set <key> <value>` for an embedder, with the same live
+    /// effects as the CLI.
+    pub async fn config_set(self: &Arc<Self>, key: GlobalKey, value: &str) -> IpcMessage {
+        self.config_apply(NodeKey::Global(key), value, false, false)
+            .await
+    }
+
+    /// `ray block <peer>` and friends for an embedder: add or remove exactly
+    /// one peer in a peer-list key. Blocking drops what the peer has queued.
+    pub async fn edit_peer_list(
+        self: &Arc<Self>,
+        key: GlobalKey,
+        peer: &str,
+        remove: bool,
+    ) -> IpcMessage {
+        if !key.is_peer_list() {
+            return ipc_err(format!("{} is not a peer list", key.name()));
+        }
+        match settings::peer_list_edit(peer, remove) {
+            Ok(value) => self.config_set(key, &value).await,
+            Err(e) => ipc_err(e.to_string()),
+        }
+    }
+
     /// Apply one settings key and persist it. Serves `ray config set|unset` and
     /// every single-value command that used to carry its own IPC variant
     /// (`ray mdns`, `ray firewall on|off|reject|default`, `ray firewall ssh
@@ -193,7 +216,7 @@ impl Daemon {
     ) -> IpcMessage {
         let resolved_value;
         let value =
-            if key == NodeKey::Global(GlobalKey::FileAutoAcceptPeers) && !value.trim().is_empty() {
+            if matches!(key, NodeKey::Global(k) if k.is_peer_list()) && !value.trim().is_empty() {
                 let mut identities = Vec::new();
                 for entry in config::parse_entries(value) {
                     let (remove, name) = match entry.strip_prefix('-') {
@@ -242,7 +265,9 @@ impl Daemon {
                 | GlobalKey::QuicEngine
                 | GlobalKey::DownloadDir
                 | GlobalKey::DownloadUser
-                | GlobalKey::FileAutoAcceptPeers),
+                | GlobalKey::FileAutoAcceptPeers
+                | GlobalKey::Inbound
+                | GlobalKey::Blocked),
             ) => k,
         };
         let app_config = match save_global(key, value, replace) {
@@ -251,6 +276,9 @@ impl Daemon {
         };
         if key == GlobalKey::FileAutoAcceptPeers {
             self.files.drain_auto_acceptable().await;
+        }
+        if key == GlobalKey::Blocked {
+            self.connect.drop_blocked(&app_config.blocked).await;
         }
         IpcMessage::Ok {
             message: global_set_message(&app_config, key, reset),
@@ -698,30 +726,20 @@ impl Daemon {
                 self.registry.admin_add(&network, &identity).await
             }
             IpcMessage::AdminList { network } => self.registry.admin_list(&network),
-            IpcMessage::Connect {
-                contact_id,
-                hostname,
-            } => self.connect(&contact_id, hostname).await,
+            IpcMessage::Connect { peer, hostname } => self.connect(&peer, hostname).await,
             IpcMessage::Connections => self.list_connections(),
             IpcMessage::ApproveConnection { id } => self.approve_connection(&id).await,
-            IpcMessage::ContactId => IpcMessage::ContactIdResponse {
-                contact_id: self.contact_public.to_string(),
-            },
-            IpcMessage::ResolveContact { contact_id } => {
-                let result = async {
-                    let client = dht::create_pkarr_client(
-                        &self.transport.endpoint,
-                        &self.transport.pkarr_relay_url,
-                    )?;
-                    dht::resolve_contact(&client, contact_id).await
-                }
-                .await;
-                match result {
-                    Ok(endpoint_id) => IpcMessage::ContactResolved { endpoint_id },
-                    Err(error) => ipc_err(format!("could not resolve contact: {error:#}")),
-                }
+            IpcMessage::ConnectDeny { id } => self.connect.deny_connection(&id).await,
+            IpcMessage::Invitations => self.connect.list_invitations().await,
+            IpcMessage::InviteDeliver { network, recipient } => {
+                self.connect
+                    .deliver_invite(network.as_ref(), recipient)
+                    .await
             }
-            IpcMessage::RotateContact => self.rotate_contact().await,
+            IpcMessage::InvitationAccept { id, hostname } => {
+                self.connect.accept_invitation(&id, hostname).await
+            }
+            IpcMessage::InvitationDecline { id } => self.connect.decline_invitation(&id).await,
             IpcMessage::Ping {
                 peer,
                 count,
@@ -761,12 +779,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contact_lookup_is_an_open_read() {
-        let request = IpcMessage::ResolveContact {
-            contact_id: SecretKey::from([7; 32]).public(),
-        };
-        assert!(Daemon::is_open_read(&request));
-        assert!(Daemon::check_authorized(&request, None).is_none());
+    fn invitation_listing_is_open_but_answers_need_authorization() {
+        assert!(Daemon::is_open_read(&IpcMessage::Invitations));
+        for request in [
+            IpcMessage::InvitationAccept {
+                id: "example-id".into(),
+                hostname: None,
+            },
+            IpcMessage::InvitationDecline {
+                id: "example-id".into(),
+            },
+            IpcMessage::ConnectDeny {
+                id: "example-id".into(),
+            },
+            IpcMessage::InviteDeliver {
+                network: ipc::NetworkName::new("sample-net".into()),
+                recipient: SecretKey::from([7; 32]).public(),
+            },
+        ] {
+            assert!(!Daemon::is_open_read(&request));
+        }
     }
 
     /// Like `ray firewall show`, a test only reads the rules, so any local user

@@ -393,6 +393,34 @@ final class TunnelController: ObservableObject {
         _ = await perform(ProviderRequest(action: .rejectConnection, id: id))
     }
 
+    func blockConnection(id: String) async {
+        _ = await perform(ProviderRequest(action: .blockConnection, id: id))
+    }
+
+    func acceptInvitation(_ invitation: ProviderInvitation) async {
+        _ = await perform(ProviderRequest(action: .acceptInvitation, id: invitation.id))
+    }
+
+    func declineInvitation(_ invitation: ProviderInvitation) async {
+        _ = await perform(ProviderRequest(action: .declineInvitation, id: invitation.id))
+    }
+
+    func sendInvite(network: String, recipient: String) async -> String? {
+        await perform(ProviderRequest(action: .sendInvite, name: network, peer: recipient))?.message
+    }
+
+    func setInboundPolicy(_ policy: ProviderInboundPolicy) async {
+        _ = await perform(ProviderRequest(action: .setInboundPolicy, inboundPolicy: policy))
+    }
+
+    func blockPeer(_ peer: String) async {
+        _ = await perform(ProviderRequest(action: .blockPeer, peer: peer))
+    }
+
+    func unblockPeer(_ peer: String) async {
+        _ = await perform(ProviderRequest(action: .unblockPeer, peer: peer))
+    }
+
     func acceptFile(_ file: ProviderFile, directory: URL) async {
         guard !isLoading, !isQuitting, receivingFileIDs.insert(file.transferId).inserted else { return }
         defer { receivingFileIDs.remove(file.transferId) }

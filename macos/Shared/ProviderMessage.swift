@@ -15,6 +15,13 @@ struct ProviderRequest: Codable {
         case connectPeer
         case approveConnection
         case rejectConnection
+        case blockConnection
+        case acceptInvitation
+        case declineInvitation
+        case sendInvite
+        case setInboundPolicy
+        case blockPeer
+        case unblockPeer
         case acceptFile
         case rejectFile
         case setFileAutoAccept
@@ -44,6 +51,11 @@ struct ProviderRequest: Codable {
     var port: String? = nil
     var peer: String? = nil
     var network: String? = nil
+    var inboundPolicy: ProviderInboundPolicy? = nil
+}
+
+enum ProviderInboundPolicy: String, Codable, CaseIterable {
+    case anyone, known, nobody
 }
 
 enum ProviderSetting: String, Codable {
@@ -85,7 +97,7 @@ struct ProviderStatus: Codable, Equatable {
     var ipv6: String
     var networks: [ProviderNetwork]
     var pendingRequests: [ProviderJoinRequest]
-    var contactId: String? = nil
+    var identity: String? = nil
     var connectionRequests: [ProviderConnectionRequest] = []
     var dnsEnabled: Bool = true
     var mdnsEnabled: Bool = true
@@ -96,6 +108,16 @@ struct ProviderStatus: Codable, Equatable {
     var fileAutoAcceptPeers: [String]? = nil
     var connectionWarning: String? = nil
     var quicFqCodel: Bool? = nil
+    var inboundPolicy: ProviderInboundPolicy? = nil
+    var blocked: [String]? = nil
+    var invitations: [ProviderInvitation]? = nil
+}
+
+/// A pending invitation a coordinator delivered to this Mac.
+struct ProviderInvitation: Codable, Equatable, Identifiable {
+    var id: String
+    var network: String
+    var coordinator: String
 }
 
 struct ProviderSSHRule: Codable, Equatable, Identifiable {

@@ -17,6 +17,7 @@
 //! exported.
 
 mod alias;
+mod block;
 pub(crate) mod complete;
 mod connect;
 mod exit_node;
@@ -36,6 +37,7 @@ mod status;
 mod update;
 
 pub(crate) use alias::*;
+pub(crate) use block::*;
 pub(crate) use connect::*;
 pub(crate) use exit_node::*;
 pub(crate) use files::*;

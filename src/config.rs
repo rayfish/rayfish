@@ -47,6 +47,31 @@ impl DnsMode {
     }
 }
 
+/// Who may reach this node on the connect channel (`ray connect` requests and
+/// invitations). "Known" means sharing a network with this node.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::AsRefStr,
+    strum::EnumString,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum InboundPolicy {
+    #[default]
+    Anyone,
+    Known,
+    #[serde(rename = "none")]
+    #[strum(serialize = "none")]
+    Nobody,
+}
+
 /// Packet forwarding engine, selected when the endpoint binds. Both engines
 /// use loss-tolerant QUIC congestion control.
 #[derive(
@@ -577,12 +602,6 @@ pub struct AppConfig {
     /// back to a random generated name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_hostname: Option<String>,
-    /// Per-user "contact key" used by `ray connect`: a standing, rotatable
-    /// identity (distinct from the transport key and per-network keys) published
-    /// to pkarr so others can request a direct connection without a room id or
-    /// invite code. Lazily generated on first use via [`contact_secret`].
-    #[serde(default, with = "option_secret_key_hex")]
-    pub contact_secret_key: Option<SecretKey>,
     /// Custom iroh transport relay servers (NAT-traversal fallback).
     #[serde(default)]
     pub relay: ServerOverride,
@@ -666,6 +685,12 @@ pub struct AppConfig {
     /// Exact device identities allowed to send files without approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_auto_accept_peers: Vec<EndpointId>,
+    /// Who may send connect requests and invitations.
+    #[serde(default)]
+    pub inbound: InboundPolicy,
+    /// Refused on the connect channel. Shared networks are unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<EndpointId>,
     /// Absolute directory where auto-accepted files are written.
     /// `None` falls back to `download_user`, then the operator's ~/Downloads.
     /// Set via `ray files download-dir <path>`.
@@ -712,7 +737,6 @@ impl Default for AppConfig {
             mdns_enabled: true,
             operator_uid: None,
             default_hostname: None,
-            contact_secret_key: None,
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
@@ -729,6 +753,8 @@ impl Default for AppConfig {
             auto_update_last_target: None,
             auto_update_last_attempt: None,
             file_auto_accept_peers: Vec::new(),
+            inbound: InboundPolicy::default(),
+            blocked: Vec::new(),
             download_dir: None,
             download_user: None,
             networks: Vec::new(),
@@ -751,18 +777,6 @@ impl AppConfig {
     }
 }
 
-/// Return this node's contact key, generating and persisting it on first use.
-/// The caller is responsible for `save`-ing the config afterwards (the returned
-/// secret is also written into `config.contact_secret_key`).
-pub fn contact_secret(config: &mut AppConfig) -> SecretKey {
-    if let Some(k) = &config.contact_secret_key {
-        return k.clone();
-    }
-    let secret = SecretKey::generate();
-    config.contact_secret_key = Some(secret.clone());
-    secret
-}
-
 /// Parse the persisted revoked device keys (`revoked_devices`) into
 /// `EndpointId`s, skipping any malformed entry.
 pub fn revoked_device_ids(config: &AppConfig) -> Vec<EndpointId> {
@@ -773,21 +787,12 @@ pub fn revoked_device_ids(config: &AppConfig) -> Vec<EndpointId> {
         .collect()
 }
 
-/// Rotate this node's contact key, replacing it with a fresh one. The old
-/// contact id stops resolving once its pkarr record TTLs out. The caller must
-/// `save` the config afterwards.
-pub fn rotate_contact_secret(config: &mut AppConfig) -> SecretKey {
-    let secret = SecretKey::generate();
-    config.contact_secret_key = Some(secret.clone());
-    secret
-}
-
 // ---- Storage layout -------------------------------------------------------
 //
 // Config is sharded so a write to one network can never clobber another:
 //
 //   <config_dir>/settings.toml          globals (mdns, operator, default
-//                                        hostname, contact key), secret-bearing
+//                                        hostname), owner-only
 //   <config_dir>/networks/<name>.toml   one NetworkConfig each, secret-bearing
 //
 // All writes go through `write_atomic` (temp file in the same dir + rename), so
@@ -855,8 +860,6 @@ struct Settings {
     operator_uid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_hostname: Option<String>,
-    #[serde(default, with = "option_secret_key_hex")]
-    contact_secret_key: Option<SecretKey>,
     #[serde(default)]
     relay: ServerOverride,
     #[serde(default)]
@@ -899,6 +902,10 @@ struct Settings {
     download_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     file_auto_accept_peers: Vec<EndpointId>,
+    #[serde(default)]
+    inbound: InboundPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocked: Vec<EndpointId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download_user: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1388,6 +1395,33 @@ pub fn load() -> Result<AppConfig> {
     load_in(&dir)
 }
 
+/// The two settings the connect channel checks on every inbound dial.
+#[derive(Debug, Clone, Default)]
+pub struct InboundSettings {
+    pub inbound: InboundPolicy,
+    pub blocked: Vec<EndpointId>,
+}
+
+/// [`InboundSettings`] from `settings.toml` alone. It runs on every inbound
+/// connect dial, strangers included, so it skips the network files and the
+/// legacy migration [`load`] performs.
+pub fn load_inbound() -> Result<InboundSettings> {
+    ensure_not_in_network_update()?;
+    let path = config_dir()?.join(SETTINGS_FILE);
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !path.exists() {
+        return Ok(InboundSettings::default());
+    }
+    let contents = std::fs::read_to_string(&path).context("reading settings.toml")?;
+    let settings: Settings = toml::from_str(&contents).context("parsing settings.toml")?;
+    Ok(InboundSettings {
+        inbound: settings.inbound,
+        blocked: settings.blocked,
+    })
+}
+
 /// [`load`] for a process that only reads the daemon's config (the CLI when the
 /// daemon is down). Creates nothing and runs no migration; a config tree that
 /// isn't there, or isn't readable by this user, reads as an empty config.
@@ -1446,7 +1480,6 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         mdns_enabled: settings.mdns_enabled,
         operator_uid: settings.operator_uid,
         default_hostname: settings.default_hostname,
-        contact_secret_key: settings.contact_secret_key,
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
@@ -1463,6 +1496,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         auto_update_last_target: settings.auto_update_last_target,
         auto_update_last_attempt: settings.auto_update_last_attempt,
         file_auto_accept_peers: settings.file_auto_accept_peers,
+        inbound: settings.inbound,
+        blocked: settings.blocked,
         download_dir: settings.download_dir,
         download_user: settings.download_user,
         networks,
@@ -1512,7 +1547,7 @@ fn update_settings_in(
 fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
     let path = dir.join(SETTINGS_FILE);
     let contents = settings_toml(config)?;
-    // Secret-bearing: holds the contact key.
+    // Owner-only: it names the operator and trusted peers.
     write_atomic(&path, &contents, true)
 }
 
@@ -1523,7 +1558,6 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         mdns_enabled: config.mdns_enabled,
         operator_uid: config.operator_uid,
         default_hostname: config.default_hostname.clone(),
-        contact_secret_key: config.contact_secret_key.clone(),
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
@@ -1540,6 +1574,8 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         auto_update_last_target: config.auto_update_last_target.clone(),
         auto_update_last_attempt: config.auto_update_last_attempt,
         file_auto_accept_peers: config.file_auto_accept_peers.clone(),
+        inbound: config.inbound,
+        blocked: config.blocked.clone(),
         download_dir: config.download_dir.clone(),
         download_user: config.download_user,
         pending_joins: config.pending_joins.clone(),
@@ -2212,26 +2248,6 @@ mod tests {
     }
 
     #[test]
-    fn test_contact_secret_generate_and_persist() {
-        let mut config = AppConfig::default();
-        assert!(config.contact_secret_key.is_none());
-        let first = contact_secret(&mut config);
-        // Stable across calls once generated.
-        let second = contact_secret(&mut config);
-        assert_eq!(first.public(), second.public());
-        // Survives a serialize roundtrip.
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(
-            parsed.contact_secret_key.map(|k| k.public()),
-            Some(first.public())
-        );
-        // Rotation yields a different key.
-        let rotated = rotate_contact_secret(&mut config);
-        assert_ne!(rotated.public(), first.public());
-    }
-
-    #[test]
     fn test_direct_flag_default_false() {
         let toml_str = r#"
 [[networks]]
@@ -2365,6 +2381,20 @@ name = "test"
     }
 
     #[test]
+    fn settings_inbound_and_blocked_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = AppConfig {
+            inbound: InboundPolicy::Known,
+            blocked: vec![SecretKey::from([45; 32]).public()],
+            ..Default::default()
+        };
+        save_settings_in(tmp.path(), &cfg).unwrap();
+        let loaded = load_in(tmp.path()).unwrap();
+        assert_eq!(loaded.inbound, InboundPolicy::Known);
+        assert_eq!(loaded.blocked, cfg.blocked);
+    }
+
+    #[test]
     fn ssh_port_defaults_to_22_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(load_in(tmp.path()).unwrap().ssh_port, 22);
@@ -2479,6 +2509,28 @@ name = "test"
         .unwrap();
         let loaded = load_in(tmp.path()).expect("a settings.toml from an older build still loads");
         assert!(!loaded.mdns_enabled, "the keys we do know are still read");
+    }
+
+    /// Contact keys are gone; a settings.toml that still has one loads, and the
+    /// key is not written back.
+    #[test]
+    fn a_stale_contact_key_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(SETTINGS_FILE),
+            format!(
+                "mdns_enabled = false\ncontact_secret_key = \"{}\"\n",
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
+        let loaded = load_in(tmp.path()).expect("a settings.toml with a contact key still loads");
+        assert!(!loaded.mdns_enabled);
+        assert!(
+            !settings_toml(&loaded)
+                .unwrap()
+                .contains("contact_secret_key")
+        );
     }
 
     #[test]

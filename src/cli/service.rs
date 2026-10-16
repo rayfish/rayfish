@@ -28,7 +28,7 @@ impl FromStr for UpSetting {
         let key = key.parse::<NodeKey>()?;
         let validation = match key {
             // Peer names need the daemon's registry to resolve them.
-            NodeKey::Global(GlobalKey::FileAutoAcceptPeers) => Ok(()),
+            NodeKey::Global(key) if key.is_peer_list() => Ok(()),
             NodeKey::Global(key) => apply_global(&mut AppConfig::default(), key, value, false),
             NodeKey::Firewall(key) => apply_firewall(&mut FirewallConfig::default(), key, value),
         };

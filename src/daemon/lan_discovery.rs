@@ -3,7 +3,7 @@
 //! The mDNS discovery windows in `daemon::mdns` feed this map; it is the only
 //! place LAN sightings are kept. Two consumers read it: `ray mdns scan` (which
 //! lists it) and `ConnectService::connect` (which uses it to dial a neighbour by
-//! endpoint id, skipping the pkarr contact lookup).
+//! endpoint id, using the address it saw on the LAN).
 //!
 //! A sighting is not a relationship. Being in this map grants a peer nothing:
 //! it only means the LAN told us the peer exists and where to reach it.
@@ -197,7 +197,7 @@ mod tests {
         peers.discovered(id(1), vec![addr(41641)]);
 
         // A well-formed id that is simply not on this LAN must not resolve: the
-        // caller falls back to the pkarr contact lookup instead.
+        // caller dials it as an identity instead.
         assert_eq!(peers.resolve(&id(2).to_string(), id(9)), None);
         assert_eq!(peers.resolve("zzzz", id(9)), None);
     }

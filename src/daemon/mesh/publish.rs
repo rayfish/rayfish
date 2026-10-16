@@ -1,6 +1,5 @@
 //! DHT publishers for the mesh core: the notify-driven network-record
-//! publisher, the contact-record publisher (`ray connect`), the lazy
-//! co-coordinator publisher, and the shared snapshot-refresh + publish step.
+//! publisher, the lazy co-coordinator publisher, and the shared snapshot-refresh + publish step.
 //! Also holds the thin `Daemon` direct-connection (`ray connect`) handlers that
 //! delegate to `ConnectService`.
 
@@ -298,36 +297,6 @@ pub(crate) fn spawn_network_publisher(
     })
 }
 
-/// Publish this node's contact record (`ray connect`).
-/// Publishes the `contact_key -> current endpoint` pkarr record on a TTL/2
-/// interval (record TTL is 300s). Runs for the lifetime of the daemon (control
-/// plane), not gated by the data-plane `active` flag, so standby nodes stay
-/// reachable for `ray connect` requests. Reads `contact_secret` fresh from
-/// config each cycle so a `RotateContact` takes effect without a restart.
-pub(crate) fn spawn_contact_publisher(
-    client: PkarrRelayClient,
-    endpoint_id: EndpointId,
-    token: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let secret = config::load().ok().and_then(|c| c.contact_secret_key);
-            if let Some(secret) = secret {
-                match dht::publish_contact(&client, &secret, endpoint_id).await {
-                    Ok(()) => {
-                        tracing::debug!(contact = %secret.public().fmt_short(), "published contact record")
-                    }
-                    Err(e) => tracing::warn!(error = %e, "failed to publish contact record"),
-                }
-            }
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(150)) => {},
-            }
-        }
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnapshotPersist {
     Persisted,
@@ -605,9 +574,9 @@ pub(crate) async fn update_snapshot_and_publish(
 }
 
 impl Daemon {
-    /// `ray connect <contact-id>`: request a direct connection by contact id.
-    pub async fn connect(&self, contact_id: &str, hostname: Option<String>) -> IpcMessage {
-        self.connect.connect(contact_id, hostname).await
+    /// `ray connect <identity>`: request a direct connection to that identity.
+    pub async fn connect(&self, peer: &str, hostname: Option<String>) -> IpcMessage {
+        self.connect.connect(peer, hostname).await
     }
 
     /// `ray connect`: list pending incoming connect requests.
@@ -615,10 +584,10 @@ impl Daemon {
         self.connect.list_connections()
     }
 
-    /// Decline a pending connect request: drop it without minting a network. The
-    /// requester's retry loop eventually times out.
+    /// Decline a pending connect request: drop it without minting a network or
+    /// blocking. The requester's retry loop eventually times out.
     pub fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
-        self.connect.reject_connect(id_prefix)
+        self.connect.reject_connection(id_prefix)
     }
 
     /// `ray connect approve <id>`: approve a pending connect request, minting
@@ -627,10 +596,33 @@ impl Daemon {
         self.connect.approve_connection(id_prefix).await
     }
 
-    /// `ray contact rotate`: replace this node's contact key. The old contact id
-    /// stops resolving once its pkarr record expires (~5 min).
-    pub(crate) async fn rotate_contact(&self) -> IpcMessage {
-        self.connect.rotate_contact().await
+    /// `ray connect deny <id>`: drop a pending request and block the requester.
+    pub async fn deny_connection(&self, id_prefix: &str) -> IpcMessage {
+        self.connect.deny_connection(id_prefix).await
+    }
+
+    /// `ray invitations`: invitations received from coordinators.
+    pub async fn list_invitations(&self) -> IpcMessage {
+        self.connect.list_invitations().await
+    }
+
+    /// `ray invitations accept <id>`: join the invited network.
+    pub async fn accept_invitation(
+        &self,
+        id: &str,
+        hostname: Option<ipc::MachineHostname>,
+    ) -> IpcMessage {
+        self.connect.accept_invitation(id, hostname).await
+    }
+
+    /// `ray invitations decline <id>`.
+    pub async fn decline_invitation(&self, id: &str) -> IpcMessage {
+        self.connect.decline_invitation(id).await
+    }
+
+    /// Deliver an invite for `network` straight to `recipient`'s identity.
+    pub async fn deliver_invite(&self, network: &str, recipient: EndpointId) -> IpcMessage {
+        self.connect.deliver_invite(network, recipient).await
     }
 }
 

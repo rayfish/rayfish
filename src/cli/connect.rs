@@ -1,4 +1,4 @@
-//! CLI direct-connection, contact, ping/netcheck and admin handlers.
+//! CLI direct-connection, ping/netcheck and admin handlers.
 
 use crate::*;
 
@@ -78,26 +78,6 @@ impl DisplayOut for LanPeersOutput {
                 style::faint("link up with: ray connect <peer> (they approve it)")
             );
         }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct ContactIdOutput {
-    contact_id: String,
-    #[serde(skip)]
-    rotating: bool,
-}
-
-impl DisplayOut for ContactIdOutput {
-    fn print_human(&self) {
-        if self.rotating {
-            println!("  {} contact id rotated", style::green("✓"));
-        }
-        println!("{}", self.contact_id);
-        println!(
-            "  {}",
-            style::faint("share this so others can: ray connect <contact-id>")
-        );
     }
 }
 
@@ -267,12 +247,12 @@ impl DisplayOut for AdminsOutput {
     }
 }
 
-pub(crate) async fn ipc_connect(contact_id: &str, hostname: Option<String>) -> Result<()> {
+pub(crate) async fn ipc_connect(peer: &str, hostname: Option<String>) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
         ipc::IpcMessage::Connect {
-            contact_id: contact_id.to_string(),
+            peer: peer.to_string(),
             hostname,
         },
     )
@@ -297,6 +277,10 @@ pub(crate) async fn ipc_connections(action: Option<ConnectAction>) -> Result<()>
     match action.unwrap_or(ConnectAction::List) {
         ConnectAction::List => ipc_connections_list().await,
         ConnectAction::Approve { id } => ipc_connections_approve(&id).await,
+        ConnectAction::Deny { id } => {
+            let response = ipc_request(ipc::IpcMessage::ConnectDeny { id }).await?;
+            print_ok_reply(response)
+        }
     }
 }
 
@@ -307,7 +291,7 @@ pub(crate) async fn ipc_connections_list() -> Result<()> {
         ipc::IpcMessage::PendingRequests { requests } => print_pending_requests(
             &requests,
             "no pending connection requests",
-            "approve with: ray connect approve <name>",
+            "approve with: ray connect approve <name>, or refuse with: ray connect deny <name>",
         )?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
@@ -332,27 +316,6 @@ pub(crate) async fn ipc_lan_peers() -> Result<()> {
             printout(&LanPeersOutput {
                 mdns_enabled,
                 peers: peers.into_iter().map(LanPeerOutput::from).collect(),
-            })?;
-        }
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
-}
-
-pub(crate) async fn ipc_contact(action: Option<ContactAction>) -> Result<()> {
-    let req = match action.unwrap_or(ContactAction::Id) {
-        ContactAction::Id => ipc::IpcMessage::ContactId,
-        ContactAction::Rotate => ipc::IpcMessage::RotateContact,
-    };
-    let rotating = matches!(req, ipc::IpcMessage::RotateContact);
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::ContactIdResponse { contact_id } => {
-            printout(&ContactIdOutput {
-                contact_id,
-                rotating,
             })?;
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),

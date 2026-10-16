@@ -1183,15 +1183,18 @@ impl ManagementService {
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
-                let (network_key, coordinator, secret) =
-                    match crate::invite::decode_invite_code(invite.expose()) {
-                        Ok(decoded) => decoded,
-                        Err(error) => {
-                            return ManagementResult::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                    };
+                let crate::invite::DecodedInvite {
+                    network_key,
+                    coordinator,
+                    secret,
+                } = match crate::invite::decode_invite_code(invite.expose()) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        return ManagementResult::Error {
+                            message: error.to_string(),
+                        };
+                    }
+                };
                 match self
                     .registry
                     .join_network(

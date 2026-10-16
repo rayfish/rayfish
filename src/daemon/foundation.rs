@@ -1,8 +1,8 @@
 //! The process-lifetime network + storage foundation.
 //!
 //! Groups the handles every service needs but none owns: the shared iroh
-//! endpoint, this node's identity, the blob store, forwarding metrics, and this
-//! node's contact id. Services depend on `Arc<Transport>` (downward) instead of
+//! endpoint, this node's identity, the blob store, and forwarding metrics.
+//! Services depend on `Arc<Transport>` (downward) instead of
 //! reaching into the daemon god object. Every field is a cheap `Arc`-backed
 //! clone, so `Transport` itself is `Clone`.
 //!
@@ -26,8 +26,6 @@ pub(crate) struct Transport {
     pub(crate) blob_store: FsStore,
     /// Forwarding metrics registry (per-packet counters), shared for export.
     pub(crate) stats: Arc<ForwardMetrics>,
-    /// Public half of this node's rotatable `ray connect` contact key.
-    pub(crate) contact_public: EndpointId,
     /// Nodes seen on the LAN over mDNS. Empty when mDNS is disabled.
     pub(crate) lan_peers: Arc<LanPeers>,
     /// Bootstrap-only address hints from successful prior connections.  This is
@@ -49,7 +47,6 @@ pub(crate) struct Transport {
 /// Startup-only values bundled to keep [`Transport::new`] focused on its core
 /// endpoint, identity, store, and metrics dependencies.
 pub(crate) struct TransportBootstrap {
-    pub(crate) contact_public: EndpointId,
     pub(crate) lan_peers: Arc<LanPeers>,
     pub(crate) warm_lookup: MemoryLookup,
     pub(crate) pkarr_relay_url: Url,
@@ -68,7 +65,6 @@ impl Transport {
             identity,
             blob_store,
             stats,
-            contact_public: bootstrap.contact_public,
             lan_peers: bootstrap.lan_peers,
             warm_lookup: bootstrap.warm_lookup,
             pkarr_relay_url: bootstrap.pkarr_relay_url,

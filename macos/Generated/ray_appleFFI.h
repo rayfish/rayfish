@@ -271,6 +271,11 @@ void*_Nonnull uniffi_ray_apple_fn_constructor_node_new(RustBuffer config_dir, Ru
 void uniffi_ray_apple_fn_method_node_accept_file(void*_Nonnull ptr, uint64_t id, RustBuffer directory, uint32_t uid, uint32_t gid, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_INVITATION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_INVITATION
+void uniffi_ray_apple_fn_method_node_accept_invitation(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_ACCEPT_REQUEST
 void uniffi_ray_apple_fn_method_node_accept_request(void*_Nonnull ptr, RustBuffer network, RustBuffer id, RustCallStatus *_Nonnull out_status
@@ -286,9 +291,19 @@ void uniffi_ray_apple_fn_method_node_activate(void*_Nonnull ptr, RustCallStatus 
 void uniffi_ray_apple_fn_method_node_approve_connection(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_BLOCK_CONNECTION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_BLOCK_CONNECTION
+void uniffi_ray_apple_fn_method_node_block_connection(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_BLOCK_PEER
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_BLOCK_PEER
+void uniffi_ray_apple_fn_method_node_block_peer(void*_Nonnull ptr, RustBuffer peer, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CONNECT_PEER
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CONNECT_PEER
-RustBuffer uniffi_ray_apple_fn_method_node_connect_peer(void*_Nonnull ptr, RustBuffer contact_id, RustBuffer hostname, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_ray_apple_fn_method_node_connect_peer(void*_Nonnull ptr, RustBuffer peer, RustBuffer hostname, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_CREATE_INVITE
@@ -304,6 +319,11 @@ void uniffi_ray_apple_fn_method_node_create_network(void*_Nonnull ptr, RustBuffe
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DEACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DEACTIVATE
 void uniffi_ray_apple_fn_method_node_deactivate(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DECLINE_INVITATION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DECLINE_INVITATION
+void uniffi_ray_apple_fn_method_node_decline_invitation(void*_Nonnull ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_DENY_REQUEST
@@ -366,6 +386,11 @@ void uniffi_ray_apple_fn_method_node_reject_connection(void*_Nonnull ptr, RustBu
 void uniffi_ray_apple_fn_method_node_reject_file(void*_Nonnull ptr, uint64_t id, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SEND_INVITE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SEND_INVITE
+RustBuffer uniffi_ray_apple_fn_method_node_send_invite(void*_Nonnull ptr, RustBuffer network, RustBuffer recipient, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_FILE_AUTO_ACCEPT
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_FILE_AUTO_ACCEPT
 void uniffi_ray_apple_fn_method_node_set_file_auto_accept(void*_Nonnull ptr, RustBuffer peer, int8_t allow, uint32_t owner_uid, RustCallStatus *_Nonnull out_status
@@ -374,6 +399,11 @@ void uniffi_ray_apple_fn_method_node_set_file_auto_accept(void*_Nonnull ptr, Rus
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_HOSTNAME
 void uniffi_ray_apple_fn_method_node_set_hostname(void*_Nonnull ptr, RustBuffer network, RustBuffer hostname, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_INBOUND_POLICY
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_INBOUND_POLICY
+void uniffi_ray_apple_fn_method_node_set_inbound_policy(void*_Nonnull ptr, RustBuffer policy, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_SET_SETTING
@@ -399,6 +429,11 @@ RustBuffer uniffi_ray_apple_fn_method_node_status(void*_Nonnull ptr, RustCallSta
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_STOP
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_STOP
 void uniffi_ray_apple_fn_method_node_stop(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_UNBLOCK_PEER
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_FN_METHOD_NODE_UNBLOCK_PEER
+void uniffi_ray_apple_fn_method_node_unblock_peer(void*_Nonnull ptr, RustBuffer peer, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_RAY_APPLE_RUSTBUFFER_ALLOC
@@ -687,6 +722,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_accept_file(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_INVITATION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_INVITATION
+uint16_t uniffi_ray_apple_checksum_method_node_accept_invitation(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_ACCEPT_REQUEST
 uint16_t uniffi_ray_apple_checksum_method_node_accept_request(void
@@ -702,6 +743,18 @@ uint16_t uniffi_ray_apple_checksum_method_node_activate(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_APPROVE_CONNECTION
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_APPROVE_CONNECTION
 uint16_t uniffi_ray_apple_checksum_method_node_approve_connection(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_BLOCK_CONNECTION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_BLOCK_CONNECTION
+uint16_t uniffi_ray_apple_checksum_method_node_block_connection(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_BLOCK_PEER
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_BLOCK_PEER
+uint16_t uniffi_ray_apple_checksum_method_node_block_peer(void
 
 );
 #endif
@@ -726,6 +779,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_create_network(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DEACTIVATE
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DEACTIVATE
 uint16_t uniffi_ray_apple_checksum_method_node_deactivate(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DECLINE_INVITATION
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_DECLINE_INVITATION
+uint16_t uniffi_ray_apple_checksum_method_node_decline_invitation(void
 
 );
 #endif
@@ -801,6 +860,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_reject_file(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SEND_INVITE
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SEND_INVITE
+uint16_t uniffi_ray_apple_checksum_method_node_send_invite(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_FILE_AUTO_ACCEPT
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_FILE_AUTO_ACCEPT
 uint16_t uniffi_ray_apple_checksum_method_node_set_file_auto_accept(void
@@ -810,6 +875,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_set_file_auto_accept(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_HOSTNAME
 uint16_t uniffi_ray_apple_checksum_method_node_set_hostname(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_INBOUND_POLICY
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_SET_INBOUND_POLICY
+uint16_t uniffi_ray_apple_checksum_method_node_set_inbound_policy(void
 
 );
 #endif
@@ -840,6 +911,12 @@ uint16_t uniffi_ray_apple_checksum_method_node_status(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_STOP
 #define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_STOP
 uint16_t uniffi_ray_apple_checksum_method_node_stop(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_UNBLOCK_PEER
+#define UNIFFI_FFIDEF_UNIFFI_RAY_APPLE_CHECKSUM_METHOD_NODE_UNBLOCK_PEER
+uint16_t uniffi_ray_apple_checksum_method_node_unblock_peer(void
 
 );
 #endif

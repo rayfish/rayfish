@@ -256,12 +256,30 @@ private struct NetworksView: View {
     @State private var inviteCode: String?
     @State private var leavingNetwork: ProviderNetwork?
     @State private var renamingNetwork: ProviderNetwork?
+    @State private var sendingInvite: ProviderNetwork?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            if let status = controller.status, !status.pendingRequests.isEmpty {
+            let invitations = controller.status?.invitations ?? []
+            if let status = controller.status, !status.pendingRequests.isEmpty || !invitations.isEmpty {
                 Text("Needs attention").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
                 VStack(spacing: 0) {
+                    ForEach(invitations) { invitation in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("You are invited to join \(invitation.network)")
+                                Text("From \(invitation.coordinator)")
+                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
+                                    .lineLimit(1).truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button("Decline and block", role: .destructive) { Task { await controller.declineInvitation(invitation) } }
+                                .help("Decline and block the sender. Unblock it in Settings.")
+                            Button("Join") { Task { await controller.acceptInvitation(invitation) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .primary))
+                        }
+                        .padding(14)
+                    }
                     ForEach(status.pendingRequests) { request in
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
@@ -291,6 +309,7 @@ private struct NetworksView: View {
                     NetworkCard(
                         network: network,
                         invite: { Task { inviteCode = await controller.invite(network: network.name) } },
+                        sendInvite: { sendingInvite = network },
                         leave: { leavingNetwork = network },
                         rename: { renamingNetwork = network }
                     )
@@ -320,6 +339,7 @@ private struct NetworksView: View {
             }
         } message: { Text("This Mac will lose access to the network until it joins again.") }
         .sheet(item: $renamingNetwork) { network in RenameHostSheet(controller: controller, network: network) }
+        .sheet(item: $sendingInvite) { network in SendInviteSheet(controller: controller, network: network) }
         .sheet(item: $networkAction) { action in NetworkSheet(controller: controller, action: action) }
     }
 }
@@ -327,6 +347,7 @@ private struct NetworksView: View {
 private struct NetworkCard: View {
     let network: ProviderNetwork
     let invite: () -> Void
+    let sendInvite: () -> Void
     let leave: () -> Void
     let rename: () -> Void
 
@@ -347,7 +368,10 @@ private struct NetworkCard: View {
                         .textSelection(.enabled)
                 }
                 Spacer()
-                if network.role == "coordinator" { Button("Invite", action: invite) }
+                if network.role == "coordinator" {
+                    Button("Invite", action: invite).help("Create an invite code to share.")
+                    Button("Send invite", action: sendInvite).help("Send an invite straight to someone's identity.")
+                }
                 Button("Rename", action: rename)
                 Button("Leave", role: .destructive, action: leave)
                     .buttonStyle(RayfishButtonStyle(kind: .danger))
@@ -428,14 +452,14 @@ private struct DevicesView: View {
                     .buttonStyle(RayfishButtonStyle(kind: .primary))
                     .disabled(!controller.isConnected || controller.isLoading)
             }
-            if let contactId = controller.status?.contactId {
+            if let identity = controller.status?.identity {
                 HStack(spacing: 12) {
-                    Text("Your contact ID").foregroundColor(RayfishTheme.muted)
-                    Text(contactId).font(RayfishTheme.mono(11)).lineLimit(1).truncationMode(.middle)
+                    Text("Your identity").foregroundColor(RayfishTheme.muted)
+                    Text(identity).font(RayfishTheme.mono(11)).lineLimit(1).truncationMode(.middle)
                     Spacer()
                     Button("Copy") {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(contactId, forType: .string)
+                        NSPasteboard.general.setString(identity, forType: .string)
                     }.help("Share this ID so another peer can request a connection.")
                 }.padding(14).rayfishCard()
             }
@@ -450,7 +474,11 @@ private struct DevicesView: View {
                                     .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
                             }
                             Spacer()
-                            Button("Deny", role: .destructive) { Task { await controller.rejectConnection(id: request.id) } }
+                            Button("Block", role: .destructive) { Task { await controller.blockConnection(id: request.id) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .danger))
+                                .help("Deny and block this identity. Unblock it in Settings.")
+                            Button("Deny") { Task { await controller.rejectConnection(id: request.id) } }
+                                .help("Deny this request. The peer can ask again.")
                             Button("Approve") { Task { await controller.approveConnection(id: request.id) } }
                                 .buttonStyle(RayfishButtonStyle(kind: .primary))
                         }.padding(14)
@@ -532,16 +560,16 @@ private struct MachineRow: View {
 private struct ConnectPeerSheet: View {
     @ObservedObject var controller: TunnelController
     @Environment(\.dismiss) private var dismiss
-    @State private var contactId = ""
+    @State private var peerIdentity = ""
     @State private var hostname = ""
     @State private var message: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("Connect to a peer").font(RayfishTheme.heading(18))
-            Text("Paste their contact ID. They must approve the request before a private network is created.")
+            Text("Paste their identity. They must approve the request before a private network is created.")
                 .foregroundColor(RayfishTheme.muted)
-            TextField("Contact ID or nearby peer ID", text: $contactId)
+            TextField("Identity or nearby peer ID", text: $peerIdentity)
                 .font(RayfishTheme.mono(12))
                 .disabled(controller.isLoading || message != nil)
             TextField("This Mac's name (optional)", text: $hostname)
@@ -558,15 +586,110 @@ private struct ConnectPeerSheet: View {
                         Task {
                             let name = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
                             message = await controller.connectPeer(
-                                id: contactId.trimmingCharacters(in: .whitespacesAndNewlines),
+                                id: peerIdentity.trimmingCharacters(in: .whitespacesAndNewlines),
                                 hostname: name.isEmpty ? nil : name)
                         }
                     }.buttonStyle(RayfishButtonStyle(kind: .primary))
-                        .disabled(contactId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || controller.isLoading || !controller.isConnected)
+                        .disabled(peerIdentity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || controller.isLoading || !controller.isConnected)
                 }
             }
         }.rayfishSheet().frame(width: 480)
             .interactiveDismissDisabled(controller.isLoading)
+    }
+}
+
+private struct SendInviteSheet: View {
+    @ObservedObject var controller: TunnelController
+    let network: ProviderNetwork
+    @Environment(\.dismiss) private var dismiss
+    @State private var recipient = ""
+    @State private var message: String?
+
+    private var trimmed: String { recipient.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Invite to \(network.name)").font(RayfishTheme.heading(18))
+            Text("Paste their identity. The invite goes straight to their device, and they choose whether to join. If they are offline, Rayfish keeps trying for seven days.")
+                .foregroundColor(RayfishTheme.muted)
+            TextField("Identity", text: $recipient)
+                .font(RayfishTheme.mono(12))
+                .disabled(controller.isLoading || message != nil)
+            if let message { Text(message).foregroundColor(RayfishTheme.green) }
+            if let error = controller.error { Text(error).foregroundColor(RayfishTheme.amber) }
+            HStack {
+                if controller.isLoading { ProgressView().controlSize(.small) }
+                Spacer()
+                Button(message == nil ? "Cancel" : "Done") { dismiss() }
+                    .disabled(controller.isLoading)
+                if message == nil {
+                    Button("Send invite") {
+                        Task { message = await controller.sendInvite(network: network.name, recipient: trimmed) }
+                    }.buttonStyle(RayfishButtonStyle(kind: .primary))
+                        .disabled(trimmed.isEmpty || controller.isLoading || !controller.isConnected)
+                }
+            }
+        }.rayfishSheet().frame(width: 480)
+            .interactiveDismissDisabled(controller.isLoading)
+    }
+}
+
+private struct InboundSettingsView: View {
+    @ObservedObject var controller: TunnelController
+    @State private var blockInput = ""
+
+    private var trimmed: String { blockInput.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Who can reach you")
+                Spacer()
+                Picker("Who can reach you", selection: Binding(
+                    get: { controller.status?.inboundPolicy ?? .anyone },
+                    set: { policy in Task { await controller.setInboundPolicy(policy) } }
+                )) {
+                    Text("Anyone").tag(ProviderInboundPolicy.anyone)
+                    Text("People in my networks").tag(ProviderInboundPolicy.known)
+                    Text("Nobody").tag(ProviderInboundPolicy.nobody)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 200)
+            }
+            Text("Who may send you connection requests and network invitations. Blocked identities are always refused.")
+                .foregroundColor(RayfishTheme.muted)
+            Rectangle().fill(RayfishTheme.line).frame(height: 1)
+            Text("Blocked").font(RayfishTheme.heading(15))
+            let blocked = controller.status?.blocked ?? []
+            if blocked.isEmpty {
+                Text("Nobody is blocked.").foregroundColor(RayfishTheme.faint)
+            }
+            ForEach(blocked, id: \.self) { identity in
+                HStack {
+                    Text(identity).font(RayfishTheme.mono(11)).lineLimit(1).truncationMode(.middle)
+                        .textSelection(.enabled)
+                    Spacer()
+                    Button("Unblock") { Task { await controller.unblockPeer(identity) } }
+                }
+            }
+            HStack {
+                TextField("Identity to block", text: $blockInput).font(RayfishTheme.mono(12))
+                Button("Block") {
+                    Task {
+                        await controller.blockPeer(trimmed)
+                        if controller.error == nil { blockInput = "" }
+                    }
+                }
+                .buttonStyle(RayfishButtonStyle(kind: .danger))
+                .disabled(trimmed.isEmpty)
+            }
+            if controller.status == nil {
+                Text("Connect to view and change these settings.").foregroundColor(RayfishTheme.faint)
+            }
+        }
+        .disabled(controller.status == nil || controller.isLoading)
+        .padding(18).rayfishCard()
     }
 }
 
@@ -627,6 +750,7 @@ private struct SettingsView: View {
             }
             SSHSettingsView(controller: controller)
             FirewallSettingsView(controller: controller)
+            InboundSettingsView(controller: controller)
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     Text("VPN").font(RayfishTheme.heading(15))

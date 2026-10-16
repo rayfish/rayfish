@@ -36,10 +36,16 @@ pub const FILES_ALPN: &[u8] = b"rayfish/files/2";
 
 /// Identity-level ALPN for the `ray connect` friend-request handshake. Unlike
 /// `network_alpn`, this is not per-network: it accepts connection requests
-/// addressed to this node's contact key. The trailing `/1` is its protocol
+/// addressed to this node's identity. The trailing `/1` is its protocol
 /// version, **bump it on any breaking change to the `ConnectMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
 pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
+
+/// ALPN for delivering a private invitation (`ConnectMsg::InviteOffer`) to a
+/// user's identity. Separate from [`CONNECT_ALPN`] so a node too old to read
+/// an offer fails the handshake instead of the message: the sender can tell
+/// it apart from an offline or refusing recipient and stop retrying.
+pub const INVITE_ALPN: &[u8] = b"rayfish/invite/1";
 
 /// Fixed UDP port the endpoint binds so users can port-forward a stable, known
 /// port for guaranteed direct reachability (Tailscale-style). Unlike an ephemeral

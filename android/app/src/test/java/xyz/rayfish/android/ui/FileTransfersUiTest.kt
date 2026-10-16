@@ -63,7 +63,7 @@ class FileTransfersUiTest {
     }
 
     private fun snapshot(outgoing: Boolean, state: TransferState) = AppSnapshot(
-        status = Status(false, "device", "", emptyList(), emptyList(), emptyList()),
+        status = Status(false, "device", "", emptyList(), emptyList(), emptyList(), null),
         transfers = listOf(Transfer(1uL, outgoing, "peer", "file.txt", 100uL, 50uL, state)),
         loaded = true,
     )

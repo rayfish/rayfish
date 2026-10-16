@@ -76,6 +76,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             KeyValueRow(stringResource(R.string.label_node_id), nodeId?.let { if (it.length > 12) "${it.take(6)}…${it.takeLast(4)}" else it } ?: stringResource(R.string.dash),
                 onClick = nodeId?.let { v -> { copyToClipboard(context, context.getString(R.string.label_node_id), v); onToast(context.getString(R.string.toast_copied_node_id)) } })
         }
+        IdentityCard(status = status, onToast = onToast, onChanged = onChanged)
         SectionCard {
             SectionLabel(stringResource(R.string.label_pairing))
             val running = status?.running == true
@@ -102,6 +103,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        InboundCard(running = status?.running == true, onToast = onToast)
         QuicEngineCard(onToast = onToast, onChanged = onChanged)
         IdentityBackupCard(status = status, onToast = onToast, onChanged = onChanged)
         // Default off: standby is the normal behavior now, so disabling Rayfish

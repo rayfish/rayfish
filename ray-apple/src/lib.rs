@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use iroh::EndpointId;
 use rayfish::config;
 use rayfish::config::QuicEngine;
 use rayfish::config::settings::GlobalKey;
@@ -17,7 +18,7 @@ use rayfish::daemon::start_embedded_ipc;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
-use rayfish::ipc::{ConnectionIssue, IpcMessage, TransferFileState};
+use rayfish::ipc::{ConnectionIssue, InvitationStatus, IpcMessage, TransferFileState};
 use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
@@ -68,6 +69,7 @@ pub struct NodeStatus {
     pub services: NodeServiceStatus,
     pub connection_warning: Option<String>,
     pub file_auto_accept_peers: Vec<String>,
+    pub inbound: NodeInboundStatus,
 }
 
 #[derive(uniffi::Record)]
@@ -80,8 +82,73 @@ pub struct NodeMeshStatus {
 #[derive(uniffi::Record)]
 pub struct NodeRequestStatus {
     pub pending_requests: Vec<JoinRequest>,
-    pub contact_id: Option<String>,
+    pub identity: Option<String>,
     pub connection_requests: Vec<ConnectionRequest>,
+}
+
+/// Who may ask this node for a connection, and what coordinators sent it.
+#[derive(uniffi::Record)]
+pub struct NodeInboundStatus {
+    pub policy: InboundPolicy,
+    pub blocked: Vec<String>,
+    pub invitations: Vec<Invitation>,
+}
+
+/// Which strangers may send connect requests and invitations.
+#[derive(Clone, Copy, uniffi::Enum)]
+pub enum InboundPolicy {
+    Anyone,
+    /// Only peers that share a network with this node.
+    Known,
+    Nobody,
+}
+
+impl From<config::InboundPolicy> for InboundPolicy {
+    fn from(policy: config::InboundPolicy) -> Self {
+        match policy {
+            config::InboundPolicy::Anyone => Self::Anyone,
+            config::InboundPolicy::Known => Self::Known,
+            config::InboundPolicy::Nobody => Self::Nobody,
+        }
+    }
+}
+
+impl From<InboundPolicy> for config::InboundPolicy {
+    fn from(policy: InboundPolicy) -> Self {
+        match policy {
+            InboundPolicy::Anyone => Self::Anyone,
+            InboundPolicy::Known => Self::Known,
+            InboundPolicy::Nobody => Self::Nobody,
+        }
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum InvitationState {
+    Pending,
+    Accepted,
+    Declined,
+}
+
+impl From<InvitationStatus> for InvitationState {
+    fn from(status: InvitationStatus) -> Self {
+        match status {
+            InvitationStatus::Pending => Self::Pending,
+            InvitationStatus::Accepted => Self::Accepted,
+            InvitationStatus::Declined => Self::Declined,
+        }
+    }
+}
+
+/// An invitation a coordinator delivered to this node. The code stays in the
+/// node: accepting by `id` is all the app needs.
+#[derive(uniffi::Record)]
+pub struct Invitation {
+    pub id: String,
+    pub network: String,
+    pub coordinator: String,
+    pub received_secs: u64,
+    pub state: InvitationState,
 }
 
 #[derive(uniffi::Record)]
@@ -227,6 +294,23 @@ impl Node {
             .clone()
             .ok_or(AppleError::NotStarted)
     }
+
+    fn edit_blocked(&self, peer: &str, remove: bool) -> Result<(), AppleError> {
+        let state = self.state()?;
+        expect_ok(
+            self.runtime
+                .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove)),
+            "block list",
+        )
+    }
+
+    fn set_global(&self, key: GlobalKey, value: &str) -> Result<(), AppleError> {
+        let state = self.state()?;
+        expect_ok(
+            self.runtime.block_on(state.config_set(key, value)),
+            "setting",
+        )
+    }
 }
 
 #[uniffi::export]
@@ -308,7 +392,7 @@ impl Node {
             endpoint_id,
             active,
             networks,
-            contact_id,
+            identity,
             mdns_enabled: mdns_active,
             ..
         } = state.status()
@@ -350,10 +434,15 @@ impl Node {
         };
         let requests = NodeRequestStatus {
             pending_requests,
-            contact_id,
+            identity: identity.map(|id| id.to_string()),
             connection_requests,
         };
         let files = incoming_files(state.list_files())?;
+        let inbound = NodeInboundStatus {
+            policy: settings.inbound.into(),
+            blocked: settings.blocked.iter().map(ToString::to_string).collect(),
+            invitations: invitations(self.runtime.block_on(state.list_invitations())),
+        };
         let rules = settings
             .networks
             .iter()
@@ -451,6 +540,7 @@ impl Node {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            inbound,
         })
     }
 
@@ -629,11 +719,11 @@ impl Node {
 
     pub fn connect_peer(
         &self,
-        contact_id: String,
+        peer: String,
         hostname: Option<String>,
     ) -> Result<String, AppleError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.connect(&contact_id, hostname)) {
+        match self.runtime.block_on(state.connect(&peer, hostname)) {
             IpcMessage::Ok { message } => Ok(message),
             IpcMessage::Joined { name, .. } => Ok(format!("Connected on {name}")),
             IpcMessage::Error { message } => Err(AppleError::Network(message)),
@@ -651,6 +741,65 @@ impl Node {
 
     pub fn reject_connection(&self, id: String) -> Result<(), AppleError> {
         expect_ok(self.state()?.reject_connect(&id), "connection rejection")
+    }
+
+    /// Drop a pending connection request and block the requester.
+    pub fn block_connection(&self, id: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        expect_ok(
+            self.runtime.block_on(state.deny_connection(&id)),
+            "connection block",
+        )
+    }
+
+    pub fn accept_invitation(&self, id: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.accept_invitation(&id, None)) {
+            IpcMessage::Ok { .. } | IpcMessage::Joined { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "node returned an invalid invitation response".to_owned(),
+            )),
+        }
+    }
+
+    pub fn decline_invitation(&self, id: String) -> Result<(), AppleError> {
+        let state = self.state()?;
+        expect_ok(
+            self.runtime.block_on(state.decline_invitation(&id)),
+            "invitation",
+        )
+    }
+
+    /// Deliver an invite for `network` to `recipient`'s identity. An offline
+    /// recipient is not an error: the node retries until the invite expires.
+    pub fn send_invite(&self, network: String, recipient: String) -> Result<String, AppleError> {
+        let recipient: EndpointId = recipient.trim().parse().map_err(AppleError::network)?;
+        let state = self.state()?;
+        match self
+            .runtime
+            .block_on(state.deliver_invite(&network, recipient))
+        {
+            IpcMessage::Ok { message } => Ok(message),
+            IpcMessage::Error { message } => Err(AppleError::Network(message)),
+            _ => Err(AppleError::Network(
+                "node returned an invalid invite response".to_owned(),
+            )),
+        }
+    }
+
+    pub fn set_inbound_policy(&self, policy: InboundPolicy) -> Result<(), AppleError> {
+        let value = config::InboundPolicy::from(policy);
+        self.set_global(GlobalKey::Inbound, value.as_ref())
+    }
+
+    /// Block `peer` (an identity, or a hostname this node knows).
+    pub fn block_peer(&self, peer: String) -> Result<(), AppleError> {
+        self.edit_blocked(&peer, false)
+    }
+
+    pub fn unblock_peer(&self, peer: String) -> Result<(), AppleError> {
+        self.edit_blocked(&peer, true)
     }
 
     pub fn accept_file(
@@ -694,9 +843,11 @@ impl Node {
     pub fn join_network(&self, code: String, hostname: Option<String>) -> Result<(), AppleError> {
         let state = self.state()?;
         let (network_key, invite, coordinator) = match invite::decode_invite_code(&code) {
-            Ok((network_key, coordinator, secret)) => {
-                (network_key.to_string(), Some(secret), Some(coordinator))
-            }
+            Ok(decoded) => (
+                decoded.network_key.to_string(),
+                Some(decoded.secret),
+                Some(decoded.coordinator),
+            ),
             Err(_) => (code, None, None),
         };
         match self.runtime.block_on(state.join_network(
@@ -901,6 +1052,31 @@ fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError>
         .collect())
 }
 
+/// The invitations in a status snapshot. An unreadable inbox shows none
+/// rather than failing the whole status, which would blank the app.
+fn invitations(response: IpcMessage) -> Vec<Invitation> {
+    match response {
+        IpcMessage::InvitationsResponse { invitations } => invitations
+            .into_iter()
+            .map(|invitation| Invitation {
+                id: invitation.id,
+                network: invitation.network.into(),
+                coordinator: invitation.coordinator.to_string(),
+                received_secs: invitation.received,
+                state: invitation.status.into(),
+            })
+            .collect(),
+        IpcMessage::Error { message } => {
+            tracing::warn!(%message, "could not read invitations");
+            Vec::new()
+        }
+        _ => {
+            tracing::warn!("node returned an invalid invitations response");
+            Vec::new()
+        }
+    }
+}
+
 fn expect_ok(response: IpcMessage, operation: &str) -> Result<(), AppleError> {
     match response {
         IpcMessage::Ok { .. } => Ok(()),
@@ -916,6 +1092,14 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn unreadable_invitations_leave_the_status_usable() {
+        let failed = IpcMessage::Error {
+            message: "parsing invitations.toml".to_owned(),
+        };
+        assert!(invitations(failed).is_empty());
+    }
 
     #[test]
     fn command_results_preserve_daemon_errors_and_reject_other_responses() {
@@ -1027,7 +1211,7 @@ mod tests {
                 let before = node.status().unwrap();
                 assert!(before.mesh.networks.is_empty());
                 assert!(before.requests.connection_requests.is_empty());
-                assert!(before.requests.contact_id.is_some());
+                assert!(before.requests.identity.is_some());
                 node.set_setting(GlobalSetting::Dns, false).unwrap();
                 node.set_setting(GlobalSetting::Mdns, false).unwrap();
                 #[cfg(unix)]
@@ -1095,7 +1279,7 @@ mod tests {
                 assert!(node.status().unwrap().services.quic_fq_codel);
                 assert!(Arc::ptr_eq(&state, &node.state().unwrap()));
                 assert!(matches!(
-                    node.connect_peer("invalid contact id".into(), None),
+                    node.connect_peer("invalid identity".into(), None),
                     Err(AppleError::Network(_))
                 ));
                 assert!(node.approve_connection("missing".into()).is_err());

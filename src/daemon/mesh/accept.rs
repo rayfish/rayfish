@@ -826,8 +826,12 @@ impl CoordinatorAcceptState {
                         .into_ip()
                 } else {
                     tracing::warn!(peer = %remote_id.fmt_short(), error = %single_use_err, "invite rejected");
-                    self.deny(conn, send, format!("invite rejected: {single_use_err}"))
-                        .await;
+                    self.deny(
+                        conn,
+                        send,
+                        format!("{}: {single_use_err}", crate::invite::INVITE_REJECTED),
+                    )
+                    .await;
                     None
                 }
             }
@@ -1987,6 +1991,10 @@ impl ProtocolRouter {
             .accept(daemon::PAIR_ALPN, PairProtocol(Arc::clone(&self.files)))
             .accept(
                 transport::CONNECT_ALPN,
+                ConnectProtocol(Arc::clone(&self.connect)),
+            )
+            .accept(
+                transport::INVITE_ALPN,
                 ConnectProtocol(Arc::clone(&self.connect)),
             )
             .accept(

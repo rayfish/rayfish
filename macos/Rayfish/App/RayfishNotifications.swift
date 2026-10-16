@@ -41,6 +41,10 @@ struct RayfishNoticeTracker {
             RayfishNotice(id: prefix + "join:\(request.network):\(request.id)", title: "Network join request",
                           body: "\(request.hostname ?? request.id) wants to join \(request.network).", page: .networks)
         }
+        notices += (status.invitations ?? []).map { invitation in
+            RayfishNotice(id: prefix + "invitation:\(invitation.id)", title: "Network invitation",
+                          body: "You are invited to join \(invitation.network).", page: .networks)
+        }
         let files = status.files ?? []
         notices += files.map { file in
             let kind = file.state == .pending ? "offer" : "receive"

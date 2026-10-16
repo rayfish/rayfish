@@ -29,7 +29,7 @@ struct TunnelIPCTests {
         let decodedInventory = try JSONDecoder().decode(ProviderResponse.self, from: JSONEncoder().encode(inventory))
         precondition(decodedInventory.status == nil && decodedInventory.machines == [machine])
         let status = ProviderStatus(active: true, ipv6: "200::2", networks: [], pendingRequests: [],
-                                    contactId: "contact-id", connectionRequests: [
+                                    identity: "peer-identity", connectionRequests: [
                                         ProviderConnectionRequest(id: "request-id", hostname: "laptop", waitingSecs: 7)
                                     ], dnsEnabled: false, mdnsEnabled: false, mdnsActive: true)
         let decodedStatus = try JSONDecoder().decode(ProviderStatus.self, from: JSONEncoder().encode(status))

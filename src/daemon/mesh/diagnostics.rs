@@ -456,7 +456,7 @@ impl Daemon {
             mdns_enabled: self.mdns.enabled(),
             auto_update: self.auto_update,
             active: self.active.load(Ordering::SeqCst),
-            contact_id: Some(self.contact_public.to_string()),
+            identity: Some(self.registry.own_identity()),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             networks: statuses,
             packets_rx: self.stats.packets_rx.get(),

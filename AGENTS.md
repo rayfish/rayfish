@@ -46,7 +46,7 @@ just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 
 ## Wire protocol
 
-- ALPN negotiation is the compatibility gate for `rayfish/{mesh,files,pair,connect}/<v>`; there is no in-band version handshake.
+- ALPN negotiation is the compatibility gate for `rayfish/{mesh,files,pair,connect,invite}/<v>`; there is no in-band version handshake.
 - Network messages and `canonical_group_bytes` use msgpack arrays (`rmp_serde::to_vec`). Adding, removing, retyping, or reordering fields requires the corresponding ALPN bump in the same commit. `#[serde(default)]` only lets a new reader accept an older, shorter array; old readers reject longer arrays.
 - Never use `skip_serializing_if` on array-encoded wire structs: it shifts later fields. Reordering fields of the same type can silently swap their meaning.
 - Changing `Member` also requires a mesh ALPN bump. Its array-encoded roster travels over the shared, unversioned `iroh_blobs` ALPN.

@@ -259,6 +259,9 @@ pub(crate) use file_service::FileService;
 pub mod transfers;
 
 mod connect_service;
+mod inbound;
+mod invite_delivery;
+mod invite_inbox;
 pub(crate) use connect_service::ConnectService;
 mod management_service;
 pub(crate) use management_service::ManagementService;
@@ -753,8 +756,8 @@ impl TunTasks {
 pub struct Daemon {
     /// Recent RTT samples per peer, shared by successive status requests.
     connection_history: Mutex<mesh::diagnostics::ConnectionHistory>,
-    /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
-    /// contact id), grouped so extracted services can depend on `Arc<Transport>`
+    /// The process-lifetime foundation (endpoint, identity, blob store, metrics),
+    /// grouped so extracted services can depend on `Arc<Transport>`
     /// instead of the whole daemon. During the service-decomposition transition
     /// this holds clones of the same handles the loose fields below still use;
     /// the loose fields go away when `Daemon` is dissolved.
@@ -829,11 +832,6 @@ pub struct Daemon {
     /// Delegated machine enrollment and direct management protocol.
     management: Arc<ManagementService>,
     device_cert: Option<control::DeviceCert>,
-    /// This node's contact id (`ray connect`): the public half of the rotatable
-    /// contact key. The secret lives in config (read fresh by the publisher and
-    /// `rotate_contact` so rotation needs no restart); only the public id is
-    /// surfaced here for `ray status` / `ray contact id`.
-    contact_public: EndpointId,
     /// Whether the VPN is currently active (TUN up, networks connected) or on
     /// standby. Toggled by the `Up`/`Down` IPC commands.
     active: Arc<AtomicBool>,
@@ -1327,6 +1325,8 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
     let restart = "Restart the daemon for changes to take effect.";
     match key {
         GlobalKey::FileAutoAcceptPeers => "File auto-accept peers updated.".to_string(),
+        GlobalKey::Inbound => "Inbound policy updated.".to_string(),
+        GlobalKey::Blocked => "Block list updated.".to_string(),
         GlobalKey::Mdns => format!(
             "mDNS discovery {}.",
             if cfg.mdns_enabled {
@@ -1433,6 +1433,14 @@ mod confirmation_message_tests {
 
     #[test]
     fn global_keys_keep_the_exact_wording_their_handlers_printed() {
+        assert_eq!(
+            global_set_message(&AppConfig::default(), GlobalKey::Inbound, false),
+            "Inbound policy updated."
+        );
+        assert_eq!(
+            global_set_message(&AppConfig::default(), GlobalKey::Blocked, false),
+            "Block list updated."
+        );
         assert_eq!(
             global_set_message(&mdns(true), GlobalKey::Mdns, false),
             "mDNS discovery enabled."
@@ -2145,7 +2153,6 @@ mod accept_handler_tests {
             sample_test_endpoint().await,
             IrohIdentityProvider::new(my_id),
             blob_store.clone(),
-            my_id,
         );
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id), blob_store, registry),
@@ -2162,7 +2169,6 @@ mod accept_handler_tests {
         endpoint: Endpoint,
         identity: IrohIdentityProvider,
         blob_store: FsStore,
-        contact: EndpointId,
     ) -> Arc<NetworkRegistry> {
         let transport = Arc::new(Transport::new(
             endpoint,
@@ -2170,7 +2176,6 @@ mod accept_handler_tests {
             blob_store,
             Arc::new(ForwardMetrics::default()),
             TransportBootstrap {
-                contact_public: contact,
                 lan_peers: Arc::new(LanPeers::new()),
                 warm_lookup: iroh::address_lookup::memory::MemoryLookup::new(),
                 pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
@@ -2220,7 +2225,6 @@ mod accept_handler_tests {
             endpoint.clone(),
             IrohIdentityProvider::new(endpoint.id()),
             FsStore::load(tmp.path()).await.unwrap(),
-            endpoint.id(),
         );
         let user = SecretKey::from_bytes(&[41; 32]).public();
         let device = SecretKey::from_bytes(&[42; 32]).public();
@@ -2286,7 +2290,6 @@ mod accept_handler_tests {
             endpoint.clone(),
             IrohIdentityProvider::new(endpoint.id()),
             FsStore::load(tmp.path()).await.unwrap(),
-            endpoint.id(),
         );
         let user = SecretKey::from_bytes(&[51; 32]).public();
         let device = SecretKey::from_bytes(&[52; 32]).public();
@@ -2391,7 +2394,6 @@ mod accept_handler_tests {
             endpoint.clone(),
             IrohIdentityProvider::new(my_id),
             blob_store.clone(),
-            my_id,
         );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: sample_mesh_ctx(
@@ -2414,6 +2416,908 @@ mod accept_handler_tests {
     /// (the handler is only inspected for its variant, never driven).
     async fn sample_test_endpoint() -> Endpoint {
         Endpoint::bind(iroh::endpoint::presets::N0).await.unwrap()
+    }
+
+    // The env lock only serializes whole tests; nothing it guards changes across
+    // the awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn own_identity_is_the_cert_user_or_this_endpoint() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let me = endpoint.id();
+        assert_eq!(registry.own_identity(), me);
+        let user = SecretKey::from_bytes(&[9u8; 32]);
+        crate::identity::store_device_cert(&control::DeviceCert::create(&user, &me, 0)).unwrap();
+        assert_eq!(registry.own_identity(), user.public());
+        endpoint.close().await;
+    }
+
+    /// Serializes a test that points `RAYFISH_CONFIG_DIR` at a temp dir and
+    /// restores it on drop, even if the test panics.
+    struct TestConfigDir {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        dir: tempfile::TempDir,
+    }
+
+    impl TestConfigDir {
+        fn new() -> Self {
+            let lock = crate::config::CONFIG_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
+            unsafe {
+                std::env::set_var("RAYFISH_CONFIG_DIR", dir.path());
+            }
+            Self {
+                _lock: lock,
+                previous,
+                dir,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDir {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                    None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    fn roster_member(identity: EndpointId, user: Option<EndpointId>) -> Member {
+        Member {
+            identity,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: user,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }
+    }
+
+    /// Register a member-role network holding `members` and `approved`.
+    fn hold_network(
+        registry: &NetworkRegistry,
+        name: &str,
+        role: NetworkRole,
+        members: Vec<Member>,
+        approved: Vec<ApprovedEntry>,
+    ) -> SharedNetworkState {
+        let state = make_network_state();
+        {
+            let mut state = state.write().unwrap();
+            for member in members {
+                state.members.add(member);
+            }
+            for entry in approved {
+                state.approved.approve(entry);
+            }
+        }
+        let network_key = state.read().unwrap().network_public_key;
+        registry.networks.insert(
+            name.to_string(),
+            NetworkHandle {
+                name: name.to_string(),
+                network_key,
+                role,
+                state: Arc::clone(&state),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: vec![],
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
+            },
+        );
+        state
+    }
+
+    async fn test_registry(dir: &std::path::Path) -> (Endpoint, Arc<NetworkRegistry>) {
+        let endpoint = sample_test_endpoint().await;
+        let registry = registry_on(&endpoint, &dir.join("blobs")).await;
+        (endpoint, registry)
+    }
+
+    /// A registry over `endpoint`, its blob store at `blobs`.
+    async fn registry_on(endpoint: &Endpoint, blobs: &std::path::Path) -> Arc<NetworkRegistry> {
+        let store = FsStore::load(blobs).await.unwrap();
+        sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            store,
+        )
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn classify_marks_blocked_known_and_strangers() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let device = SecretKey::from_bytes(&[21u8; 32]).public();
+        let user = SecretKey::from_bytes(&[22u8; 32]).public();
+        let approved = SecretKey::from_bytes(&[23u8; 32]).public();
+        let primary = SecretKey::from_bytes(&[24u8; 32]);
+        let stranger = SecretKey::from_bytes(&[25u8; 32]).public();
+        hold_network(
+            &registry,
+            "sample-net",
+            NetworkRole::Member,
+            vec![roster_member(device, Some(user))],
+            vec![ApprovedEntry {
+                identity: approved,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+            }],
+        );
+        crate::identity::store_device_cert(&control::DeviceCert::create(
+            &primary,
+            &endpoint.id(),
+            0,
+        ))
+        .unwrap();
+        let mut cfg = AppConfig::default();
+        let classify = |cfg: &AppConfig, id| inbound::classify(&registry, &cfg.blocked, id);
+        assert_eq!(classify(&cfg, device), inbound::Inbound::Known);
+        assert_eq!(classify(&cfg, user), inbound::Inbound::Known);
+        assert_eq!(classify(&cfg, approved), inbound::Inbound::Known);
+        assert_eq!(classify(&cfg, primary.public()), inbound::Inbound::Known);
+        assert_eq!(classify(&cfg, stranger), inbound::Inbound::Stranger);
+        cfg.blocked = vec![stranger];
+        assert_eq!(classify(&cfg, stranger), inbound::Inbound::Blocked);
+        endpoint.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn blocking_a_user_identity_covers_its_roster_devices() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let primary = SecretKey::from_bytes(&[28u8; 32]).public();
+        let laptop = SecretKey::from_bytes(&[29u8; 32]).public();
+        let unrelated = SecretKey::from_bytes(&[36u8; 32]).public();
+        hold_network(
+            &registry,
+            "sample-net",
+            NetworkRole::Member,
+            vec![
+                roster_member(laptop, Some(primary)),
+                roster_member(unrelated, None),
+            ],
+            vec![],
+        );
+        let cfg = AppConfig {
+            blocked: vec![primary],
+            ..Default::default()
+        };
+        assert_eq!(
+            inbound::classify(&registry, &cfg.blocked, laptop),
+            inbound::Inbound::Blocked
+        );
+        assert_eq!(
+            inbound::classify(&registry, &cfg.blocked, unrelated),
+            inbound::Inbound::Known
+        );
+        endpoint.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn blocked_member_is_refused_on_connect_but_stays_known_elsewhere() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let member = SecretKey::from_bytes(&[26u8; 32]).public();
+        hold_network(
+            &registry,
+            "sample-net",
+            NetworkRole::Member,
+            vec![roster_member(member, None)],
+            vec![],
+        );
+        let cfg = AppConfig {
+            blocked: vec![member],
+            ..Default::default()
+        };
+        assert_eq!(
+            inbound::classify(&registry, &cfg.blocked, member),
+            inbound::Inbound::Blocked
+        );
+        assert!(registry.roster_standing(member).known);
+        assert!(registry.networks.get("sample-net").is_some());
+        endpoint.close().await;
+    }
+
+    /// The app Reject buttons have no way to unblock, so they only drop.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn rejecting_from_an_app_drops_without_blocking() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let connect = ConnectService::new(registry);
+        let requester = SecretKey::from_bytes(&[37u8; 32]).public();
+        connect.pending_connects.insert(
+            requester,
+            connect_service::PendingConnect {
+                from_endpoint: requester,
+                hostname: Some("tablet".to_string()),
+                requested_at: Instant::now(),
+                stranger: true,
+            },
+        );
+        let reply = connect.reject_connection("tablet");
+        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        assert!(connect.pending_connects.is_empty());
+        assert!(config::load().unwrap().blocked.is_empty());
+        endpoint.close().await;
+    }
+
+    /// `ray block <user>` covers that user's devices for what they already
+    /// queued, not only for new dials.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn blocking_a_user_drops_what_its_devices_queued() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let primary = SecretKey::from_bytes(&[42u8; 32]).public();
+        let laptop = SecretKey::from_bytes(&[43u8; 32]).public();
+        let other = SecretKey::from_bytes(&[44u8; 32]).public();
+        hold_network(
+            &registry,
+            "sample-net",
+            NetworkRole::Member,
+            vec![
+                roster_member(laptop, Some(primary)),
+                roster_member(other, None),
+            ],
+            vec![],
+        );
+        let connect = ConnectService::new(registry);
+        for requester in [laptop, other] {
+            connect.pending_connects.insert(
+                requester,
+                connect_service::PendingConnect {
+                    from_endpoint: requester,
+                    hostname: None,
+                    requested_at: Instant::now(),
+                    stranger: false,
+                },
+            );
+            assert!(
+                connect
+                    .receive_offer(
+                        requester,
+                        inbound::Inbound::Known,
+                        sample_net(),
+                        invite_from(requester)
+                    )
+                    .await
+            );
+        }
+        connect.block(primary).await.unwrap();
+        assert!(!connect.pending_connects.contains_key(&laptop));
+        assert!(connect.pending_connects.contains_key(&other));
+        let coordinators: Vec<_> = invitations_of(&connect)
+            .await
+            .into_iter()
+            .map(|i| i.coordinator)
+            .collect();
+        assert_eq!(coordinators, vec![other]);
+        endpoint.close().await;
+    }
+
+    /// A dialer admitted when it connected, then blocked while it held its
+    /// stream open, must not get its request queued.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_made_mid_dial_refuses_the_request() {
+        use iroh::address_lookup::memory::MemoryLookup;
+        let env = TestConfigDir::new();
+        let lookup = MemoryLookup::new();
+        let receiver = loopback_endpoint(MemoryLookup::new()).await;
+        let dialer = loopback_endpoint(lookup.clone()).await;
+        lookup.add_endpoint_info(receiver.addr());
+        let registry = registry_on(&receiver, &env.dir.path().join("blobs")).await;
+        let connect = Arc::new(ConnectService::new(registry));
+        let server = tokio::spawn({
+            let connect = Arc::clone(&connect);
+            let receiver = receiver.clone();
+            async move {
+                let conn = receiver.accept().await.unwrap().await.unwrap();
+                connect.accept_connect_request(conn).await;
+            }
+        });
+        let conn =
+            transport::connect_to_peer_with_alpn(&dialer, receiver.id(), transport::CONNECT_ALPN)
+                .await
+                .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        // Let the handler pass its first gate and wait on the stream.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        config::update_settings(|cfg| {
+            cfg.blocked = vec![dialer.id()];
+            Ok(())
+        })
+        .unwrap();
+        control::send_framed(
+            &mut send,
+            &control::ConnectMsg::Request {
+                from_identity: dialer.id(),
+                from_endpoint: dialer.id(),
+                hostname: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply = control::recv_framed::<control::ConnectMsg>(&mut recv).await;
+        server.await.unwrap();
+        assert!(reply.is_err(), "{reply:?}");
+        assert!(connect.pending_connects.is_empty());
+        receiver.close().await;
+        dialer.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn deny_removes_the_request_and_blocks_the_sender() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let connect = ConnectService::new(registry);
+        let requester = SecretKey::from_bytes(&[27u8; 32]).public();
+        connect.pending_connects.insert(
+            requester,
+            connect_service::PendingConnect {
+                from_endpoint: requester,
+                hostname: Some("laptop".to_string()),
+                requested_at: Instant::now(),
+                stranger: true,
+            },
+        );
+        let reply = connect.deny_connection("laptop").await;
+        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        assert!(connect.pending_connects.is_empty());
+        assert_eq!(config::load().unwrap().blocked, vec![requester]);
+        endpoint.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_uses_the_dialing_endpoint_not_the_claimed_identity() {
+        use iroh::address_lookup::memory::MemoryLookup;
+        let env = TestConfigDir::new();
+        let lookup = MemoryLookup::new();
+        let receiver = loopback_endpoint(MemoryLookup::new()).await;
+        let blocked = loopback_endpoint(lookup.clone()).await;
+        let allowed = loopback_endpoint(lookup.clone()).await;
+        lookup.add_endpoint_info(receiver.addr());
+        let registry = registry_on(&receiver, &env.dir.path().join("blobs")).await;
+        let connect = Arc::new(ConnectService::new(registry));
+        config::update_settings(|cfg| {
+            cfg.blocked = vec![blocked.id()];
+            Ok(())
+        })
+        .unwrap();
+        let server = tokio::spawn({
+            let connect = Arc::clone(&connect);
+            let receiver = receiver.clone();
+            async move {
+                for _ in 0..2 {
+                    let conn = receiver.accept().await.unwrap().await.unwrap();
+                    connect.accept_connect_request(conn).await;
+                }
+            }
+        });
+        let ask = |from: &Endpoint, claimed: EndpointId| {
+            let from = from.clone();
+            let to = receiver.id();
+            async move {
+                let conn = transport::connect_to_peer_with_alpn(&from, to, transport::CONNECT_ALPN)
+                    .await?;
+                let (mut send, mut recv) = conn.open_bi().await?;
+                control::send_framed(
+                    &mut send,
+                    &control::ConnectMsg::Request {
+                        from_identity: claimed,
+                        from_endpoint: from.id(),
+                        hostname: None,
+                    },
+                )
+                .await?;
+                control::recv_framed::<control::ConnectMsg>(&mut recv).await
+            }
+        };
+        // The blocked endpoint gets no reply bytes, whatever it claims to be.
+        let refused = ask(&blocked, allowed.id()).await;
+        // A different endpoint claiming the blocked key is judged on itself.
+        let admitted = ask(&allowed, blocked.id()).await;
+        server.await.unwrap();
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(admitted.unwrap(), control::ConnectMsg::Pending);
+        assert!(connect.pending_connects.contains_key(&allowed.id()));
+        assert!(!connect.pending_connects.contains_key(&blocked.id()));
+        for endpoint in [receiver, blocked, allowed] {
+            endpoint.close().await;
+        }
+    }
+
+    /// A connect service whose pkarr relay refuses connections, so a join fails
+    /// fast instead of reaching the public DHT.
+    async fn offline_connect_service(dir: &std::path::Path) -> (Endpoint, ConnectService) {
+        let (endpoint, mut registry) = test_registry(dir).await;
+        let mut transport = (*registry.transport).clone();
+        transport.pkarr_relay_url = "http://127.0.0.1:1/pkarr".parse().unwrap();
+        Arc::get_mut(&mut registry).unwrap().transport = Arc::new(transport);
+        let connect = ConnectService::new(registry);
+        (endpoint, connect)
+    }
+
+    fn sample_net() -> ipc::NetworkName {
+        ipc::NetworkName::new("sample-net".into())
+    }
+
+    async fn invitations_of(connect: &ConnectService) -> Vec<ipc::InvitationInfo> {
+        match connect.list_invitations().await {
+            IpcMessage::InvitationsResponse { invitations } => invitations,
+            other => panic!("expected invitations, got {other:?}"),
+        }
+    }
+
+    fn invite_from(coordinator: EndpointId) -> crate::invite::InviteCode {
+        let network = SecretKey::from_bytes(&[30u8; 32]).public();
+        crate::invite::InviteCode::encode(&network, &coordinator, &[7; 16])
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn offer_from_another_coordinator_is_refused() {
+        let env = TestConfigDir::new();
+        let (endpoint, connect) = offline_connect_service(env.dir.path()).await;
+        let sender = SecretKey::from_bytes(&[31u8; 32]).public();
+        let real_coordinator = SecretKey::from_bytes(&[32u8; 32]).public();
+        let label = ipc::NetworkName::new("sample-net".into());
+        assert!(
+            !connect
+                .receive_offer(
+                    sender,
+                    inbound::Inbound::Known,
+                    label.clone(),
+                    invite_from(real_coordinator)
+                )
+                .await
+        );
+        assert!(
+            connect
+                .receive_offer(sender, inbound::Inbound::Known, label, invite_from(sender))
+                .await
+        );
+        let invitations = invitations_of(&connect).await;
+        assert_eq!(invitations.len(), 1);
+        assert_eq!(invitations[0].coordinator, sender);
+        endpoint.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn malformed_offer_is_refused_without_echo() {
+        let env = TestConfigDir::new();
+        let (endpoint, connect) = offline_connect_service(env.dir.path()).await;
+        let sender = SecretKey::from_bytes(&[33u8; 32]).public();
+        let garbage: crate::invite::InviteCode =
+            serde_json::from_str("\"secret-looking-garbage\"").unwrap();
+        let stored = connect
+            .receive_offer(
+                sender,
+                inbound::Inbound::Stranger,
+                ipc::NetworkName::new("sample-net".into()),
+                garbage,
+            )
+            .await;
+        assert!(!stored);
+        assert!(!env.dir.path().join("invitations.toml").exists());
+        endpoint.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn decline_marks_and_blocks_the_sender() {
+        let env = TestConfigDir::new();
+        let (endpoint, connect) = offline_connect_service(env.dir.path()).await;
+        let sender = SecretKey::from_bytes(&[34u8; 32]).public();
+        assert!(
+            connect
+                .receive_offer(
+                    sender,
+                    inbound::Inbound::Known,
+                    sample_net(),
+                    invite_from(sender)
+                )
+                .await
+        );
+        let invitations = invitations_of(&connect).await;
+        let id = invitations[0].id.clone();
+        assert!(matches!(
+            connect.decline_invitation(&id).await,
+            IpcMessage::Ok { .. }
+        ));
+        assert_eq!(config::load().unwrap().blocked, vec![sender]);
+        let invitations = invitations_of(&connect).await;
+        assert_eq!(invitations[0].status, ipc::InvitationStatus::Declined);
+        assert!(matches!(
+            connect.accept_invitation(&id, None).await,
+            IpcMessage::Error { .. }
+        ));
+        endpoint.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn failed_join_leaves_the_invitation_pending() {
+        let env = TestConfigDir::new();
+        let (endpoint, connect) = offline_connect_service(env.dir.path()).await;
+        let sender = SecretKey::from_bytes(&[35u8; 32]).public();
+        assert!(
+            connect
+                .receive_offer(
+                    sender,
+                    inbound::Inbound::Known,
+                    sample_net(),
+                    invite_from(sender)
+                )
+                .await
+        );
+        let invitations = invitations_of(&connect).await;
+        let reply = connect.accept_invitation(&invitations[0].id, None).await;
+        assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+        let invitations = invitations_of(&connect).await;
+        assert_eq!(invitations[0].status, ipc::InvitationStatus::Pending);
+        endpoint.close().await;
+    }
+
+    /// A coordinator that refuses the code (revoked, used, expired) ends the
+    /// invitation; any other failed join leaves it to retry.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_rejected_invite_leaves_the_inbox() {
+        let env = TestConfigDir::new();
+        let (endpoint, connect) = offline_connect_service(env.dir.path()).await;
+        let sender = SecretKey::from_bytes(&[45u8; 32]).public();
+        assert!(
+            connect
+                .receive_offer(
+                    sender,
+                    inbound::Inbound::Known,
+                    sample_net(),
+                    invite_from(sender)
+                )
+                .await
+        );
+        let id = invitations_of(&connect).await[0].id.clone();
+        let entry = connect.invitation_entry(&id).await;
+        let unreachable = ipc_err("failed to reach the coordinator".to_string());
+        let reply = connect.settle_accept(&entry, unreachable).await;
+        assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+        assert_eq!(invitations_of(&connect).await.len(), 1);
+        let revoked = ipc_err(format!(
+            "join denied: {}: invite revoked",
+            crate::invite::INVITE_REJECTED
+        ));
+        let reply = connect.settle_accept(&entry, revoked).await;
+        assert!(
+            matches!(&reply, IpcMessage::Error { message } if message.contains("revoked or has expired")),
+            "{reply:?}"
+        );
+        assert!(invitations_of(&connect).await.is_empty());
+        endpoint.close().await;
+    }
+
+    /// A recipient that predates invite delivery shares no ALPN for it: the
+    /// sender is told to share the code, and the sweep stops dialing it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_old_recipient_is_recorded_and_not_retried() {
+        let env = TestConfigDir::new();
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let (sender, connect, _) = delivering_service(env.dir.path(), lookup.clone()).await;
+        let old = loopback_endpoint_on(
+            iroh::address_lookup::memory::MemoryLookup::new(),
+            vec![transport::CONNECT_ALPN.to_vec()],
+        )
+        .await;
+        lookup.add_endpoint_info(old.addr());
+        // Accept like an old node's router, which fails the handshake.
+        let accepting = tokio::spawn({
+            let old = old.clone();
+            async move {
+                while let Some(incoming) = old.accept().await {
+                    let _ = incoming.await;
+                }
+            }
+        });
+        let message = reply_text(connect.deliver_invite("sample-net", old.id()).await);
+        assert!(message.contains("older Rayfish"), "{message}");
+        let store = crate::invite::InviteStore::load("sample-net").unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        assert_eq!(store.list().len(), 1);
+        // A manual retry dials again (it may have upgraded) and reuses the invite.
+        let message = reply_text(connect.deliver_invite("sample-net", old.id()).await);
+        assert!(message.contains("older Rayfish"), "{message}");
+        assert_eq!(
+            crate::invite::InviteStore::load("sample-net")
+                .unwrap()
+                .list()
+                .len(),
+            1
+        );
+        sender.close().await;
+        old.close().await;
+        accepting.abort();
+    }
+
+    /// An offer is only taken on the invite ALPN, a request only on connect.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offer_on_the_connect_channel_is_refused() {
+        let env = TestConfigDir::new();
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let (receiver, inbox) = receiving_service(env.dir.path()).await;
+        let dialer = loopback_endpoint(lookup.clone()).await;
+        lookup.add_endpoint_info(receiver.addr());
+        let server = tokio::spawn({
+            let inbox = Arc::clone(&inbox);
+            let receiver = receiver.clone();
+            async move {
+                let conn = receiver.accept().await.unwrap().await.unwrap();
+                inbox.accept_connect_request(conn).await;
+            }
+        });
+        let conn =
+            transport::connect_to_peer_with_alpn(&dialer, receiver.id(), transport::CONNECT_ALPN)
+                .await
+                .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        control::send_framed(
+            &mut send,
+            &control::ConnectMsg::InviteOffer {
+                network: sample_net(),
+                code: invite_from(dialer.id()),
+            },
+        )
+        .await
+        .unwrap();
+        let reply = control::recv_framed::<control::ConnectMsg>(&mut recv).await;
+        server.await.unwrap();
+        assert!(reply.is_err(), "{reply:?}");
+        assert!(invitations_of(&inbox).await.is_empty());
+        receiver.close().await;
+        dialer.close().await;
+    }
+
+    /// A loopback-only endpoint on the connect and invite ALPNs, found through
+    /// `lookup`.
+    async fn loopback_endpoint(lookup: iroh::address_lookup::memory::MemoryLookup) -> Endpoint {
+        loopback_endpoint_on(
+            lookup,
+            vec![
+                transport::CONNECT_ALPN.to_vec(),
+                transport::INVITE_ALPN.to_vec(),
+            ],
+        )
+        .await
+    }
+
+    async fn loopback_endpoint_on(
+        lookup: iroh::address_lookup::memory::MemoryLookup,
+        alpns: Vec<Vec<u8>>,
+    ) -> Endpoint {
+        Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(alpns)
+            .address_lookup(lookup)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// A coordinator-side connect service for `sample-net`, dialing through
+    /// `lookup`. Returns the network's shared state so tests can add members.
+    async fn delivering_service(
+        dir: &std::path::Path,
+        lookup: iroh::address_lookup::memory::MemoryLookup,
+    ) -> (Endpoint, Arc<ConnectService>, SharedNetworkState) {
+        let endpoint = loopback_endpoint(lookup).await;
+        let registry = registry_on(&endpoint, &dir.join("sender-blobs")).await;
+        let state = hold_network(
+            &registry,
+            "sample-net",
+            NetworkRole::Coordinator,
+            vec![],
+            vec![],
+        );
+        let connect = Arc::new(ConnectService::new(registry));
+        (endpoint, connect, state)
+    }
+
+    async fn receiving_service(dir: &std::path::Path) -> (Endpoint, Arc<ConnectService>) {
+        let endpoint = loopback_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let registry = registry_on(&endpoint, &dir.join("receiver-blobs")).await;
+        let connect = Arc::new(ConnectService::new(registry));
+        (endpoint, connect)
+    }
+
+    fn reply_text(reply: IpcMessage) -> String {
+        match reply {
+            IpcMessage::Ok { message } => message,
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_delivery_reuses_one_invite_and_reports_queued() {
+        let env = TestConfigDir::new();
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let (sender, connect, _) = delivering_service(env.dir.path(), lookup).await;
+        // Nobody knows where this recipient is, so the dial fails.
+        let recipient = SecretKey::from_bytes(&[40u8; 32]).public();
+        for _ in 0..2 {
+            let message = reply_text(connect.deliver_invite("sample-net", recipient).await);
+            assert!(message.contains("queued"), "{message}");
+        }
+        let store = crate::invite::InviteStore::load("sample-net").unwrap();
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.pending_deliveries(), [recipient]);
+        sender.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn delivery_to_a_member_is_skipped() {
+        let env = TestConfigDir::new();
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let (sender, connect, state) = delivering_service(env.dir.path(), lookup).await;
+        let device = SecretKey::from_bytes(&[41u8; 32]).public();
+        let user = SecretKey::from_bytes(&[42u8; 32]).public();
+        state
+            .write()
+            .unwrap()
+            .members
+            .add(roster_member(device, Some(user)));
+        let message = reply_text(connect.deliver_invite("sample-net", user).await);
+        assert!(message.contains("already has a device"), "{message}");
+        assert!(
+            crate::invite::InviteStore::load("sample-net")
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+        sender.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn sweep_never_mints() {
+        let env = TestConfigDir::new();
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let (sender, connect, _) = delivering_service(env.dir.path(), lookup).await;
+        let recipient = SecretKey::from_bytes(&[43u8; 32]).public();
+        // Nothing queued: the sweep step has nothing to send.
+        assert_eq!(
+            connect
+                .deliver_locked("sample-net", recipient, invite_delivery::Mint::Never)
+                .await
+                .unwrap()
+                .into_message(),
+            "no pending delivery"
+        );
+        connect.deliver_invite("sample-net", recipient).await;
+        // Revoked after the sweep picked it: still nothing new is minted.
+        let id = crate::invite::InviteStore::load("sample-net")
+            .unwrap()
+            .list()[0]
+            .id
+            .clone();
+        crate::invite::InviteStore::load("sample-net")
+            .unwrap()
+            .revoke(&id)
+            .unwrap();
+        assert_eq!(
+            connect
+                .deliver_locked("sample-net", recipient, invite_delivery::Mint::Never)
+                .await
+                .unwrap()
+                .into_message(),
+            "no pending delivery"
+        );
+        connect.sweep_deliveries(&CancellationToken::new()).await;
+        let store = crate::invite::InviteStore::load("sample-net").unwrap();
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].status, "revoked");
+        sender.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offline_then_online_then_delivered_without_duplicates() {
+        let env = TestConfigDir::new();
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let (sender, connect, _) = delivering_service(env.dir.path(), lookup.clone()).await;
+        let (receiver, inbox) = receiving_service(env.dir.path()).await;
+        // Offline: the sender cannot find the recipient yet.
+        let message = reply_text(connect.deliver_invite("sample-net", receiver.id()).await);
+        assert!(message.contains("queued"), "{message}");
+        let first = crate::invite::InviteStore::load("sample-net")
+            .unwrap()
+            .list();
+        lookup.add_endpoint_info(receiver.addr());
+        let server = tokio::spawn({
+            let inbox = Arc::clone(&inbox);
+            let receiver = receiver.clone();
+            async move {
+                // Store the first offer, then drop the ack.
+                let conn = receiver.accept().await.unwrap().await.unwrap();
+                let remote = conn.remote_id();
+                let (_send, mut recv) = conn.accept_bi().await.unwrap();
+                let control::ConnectMsg::InviteOffer { network, code } =
+                    control::recv_framed(&mut recv).await.unwrap()
+                else {
+                    panic!("expected an offer");
+                };
+                assert!(
+                    inbox
+                        .receive_offer(remote, inbound::Inbound::Stranger, network, code)
+                        .await
+                );
+                conn.close(0u32.into(), b"lost ack");
+                // The retry goes through the real handler and is acked.
+                let conn = receiver.accept().await.unwrap().await.unwrap();
+                inbox.accept_connect_request(conn).await;
+            }
+        });
+        let message = reply_text(connect.deliver_invite("sample-net", receiver.id()).await);
+        assert!(message.contains("queued"), "{message}");
+        connect.sweep_deliveries(&CancellationToken::new()).await;
+        server.await.unwrap();
+        let store = crate::invite::InviteStore::load("sample-net").unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].id, first[0].id);
+        let invitations = invitations_of(&inbox).await;
+        assert_eq!(invitations.len(), 1);
+        assert_eq!(invitations[0].coordinator, sender.id());
+        assert_eq!(invitations[0].status, ipc::InvitationStatus::Pending);
+        sender.close().await;
+        receiver.close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn connecting_to_yourself_is_refused() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let me = endpoint.id();
+        let connect = ConnectService::new(registry);
+        assert!(connect.resolve_connect_target(&me.to_string()).is_err());
+        let user = SecretKey::from_bytes(&[9u8; 32]);
+        crate::identity::store_device_cert(&control::DeviceCert::create(&user, &me, 0)).unwrap();
+        assert!(
+            connect
+                .resolve_connect_target(&user.public().to_string())
+                .is_err()
+        );
+        let other = SecretKey::from_bytes(&[10u8; 32]).public();
+        assert_eq!(
+            connect.resolve_connect_target(&other.to_string()),
+            Ok(other)
+        );
+        endpoint.close().await;
     }
 
     mod disconnect_recovery_tests {
@@ -2465,7 +3369,6 @@ mod accept_handler_tests {
                 local.clone(),
                 IrohIdentityProvider::new(local.id()),
                 store.clone(),
-                local.id(),
             );
             let peer_ip = derive_ipv6(&remote.id());
             registry
@@ -2631,7 +3534,6 @@ mod accept_handler_tests {
             local.clone(),
             IrohIdentityProvider::new(local.id()),
             store.clone(),
-            local.id(),
         );
         let ctx = sample_mesh_ctx(IrohIdentityProvider::new(local.id()), store, registry);
         let peer_id = conn.remote_id();
@@ -2671,12 +3573,7 @@ mod accept_handler_tests {
         let conn = conn.unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let store = FsStore::load(tmp.path()).await.unwrap();
-        let registry = sample_registry(
-            local.clone(),
-            IrohIdentityProvider::new(local.id()),
-            store,
-            local.id(),
-        );
+        let registry = sample_registry(local.clone(), IrohIdentityProvider::new(local.id()), store);
         let peer_ip = derive_ipv6(&remote.id());
         registry
             .peers
@@ -2753,7 +3650,6 @@ mod accept_handler_tests {
             local.clone(),
             IrohIdentityProvider::new(local.id()),
             store.clone(),
-            local.id(),
         );
         let router = Arc::new(ProtocolRouter::new(
             BlobsProtocol::new(&store, None),
@@ -2765,11 +3661,7 @@ mod accept_handler_tests {
                 registry.device_user_map.clone(),
                 Arc::new(transfers::TransferRegistry::new()),
             )),
-            Arc::new(ConnectService::new(
-                Arc::clone(&registry.transport),
-                Arc::new(AtomicBool::new(false)),
-                Arc::clone(&registry),
-            )),
+            Arc::new(ConnectService::new(Arc::clone(&registry))),
             Arc::new(ManagementService::new(
                 Arc::clone(&registry.transport),
                 Arc::clone(&registry),
@@ -3083,7 +3975,6 @@ mod accept_handler_tests {
             coord_ep.clone(),
             IrohIdentityProvider::new(coord_id),
             blob_store.clone(),
-            coord_id,
         );
         let state = make_network_state();
         let net_pubkey = state.read().unwrap().network_public_key;
@@ -3267,7 +4158,6 @@ mod accept_handler_tests {
             coord_ep.clone(),
             IrohIdentityProvider::new(coord_id),
             coord_blobs.clone(),
-            coord_id,
         );
         let coord_state = make_network_state();
         {
@@ -3334,7 +4224,6 @@ mod accept_handler_tests {
             member_ep.clone(),
             IrohIdentityProvider::new(member_id),
             member_blobs.clone(),
-            member_id,
         );
         let member_state = make_network_state();
         {
@@ -3713,6 +4602,68 @@ mod headless_tests {
         assert_eq!(config::load().unwrap().file_auto_accept_peers, vec![second]);
         assert!(!daemon.files.should_auto_accept_file(first));
         assert!(daemon.files.should_auto_accept_file(second));
+    }
+
+    /// The app bridges block, unblock and set the inbound policy through
+    /// `config_set`, the same arm `ray block` and `ray config set` use.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedder_config_set_blocks_unblocks_and_sets_inbound() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+        let daemon = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("build_headless should not hang")
+            .expect("build_headless should succeed");
+        let peer = SecretKey::from_bytes(&[41u8; 32]).public();
+
+        let msg = daemon
+            .config_set(GlobalKey::Blocked, &peer.to_string())
+            .await;
+        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert_eq!(config::load_inbound().unwrap().blocked, vec![peer]);
+
+        let msg = daemon
+            .config_set(GlobalKey::Blocked, &format!("-{peer}"))
+            .await;
+        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert!(config::load_inbound().unwrap().blocked.is_empty());
+
+        let msg = daemon
+            .config_set(GlobalKey::Inbound, config::InboundPolicy::Known.as_ref())
+            .await;
+        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert_eq!(
+            config::load_inbound().unwrap().inbound,
+            config::InboundPolicy::Known
+        );
+
+        // One-peer edits refuse what a raw list value would treat as
+        // "clear" or "remove", so a stray comma cannot empty the list.
+        daemon
+            .config_set(GlobalKey::Blocked, &peer.to_string())
+            .await;
+        for bad in [",", " ", "-x", "a,b"] {
+            let msg = daemon.edit_peer_list(GlobalKey::Blocked, bad, false).await;
+            assert!(matches!(msg, IpcMessage::Error { .. }), "{bad:?}: {msg:?}");
+        }
+        assert_eq!(config::load_inbound().unwrap().blocked, vec![peer]);
+        let msg = daemon
+            .edit_peer_list(GlobalKey::Blocked, &peer.to_string(), true)
+            .await;
+        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert!(config::load_inbound().unwrap().blocked.is_empty());
+        let msg = daemon
+            .edit_peer_list(GlobalKey::Inbound, &peer.to_string(), false)
+            .await;
+        assert!(matches!(msg, IpcMessage::Error { .. }), "{msg:?}");
+
+        let msg = daemon.config_set(GlobalKey::Blocked, "no-such-peer").await;
+        assert!(
+            matches!(&msg, IpcMessage::Error { message } if message.contains("unknown peer")),
+            "{msg:?}"
+        );
     }
 
     /// `net_config_apply` gates on the network's presence ON DISK, not in the

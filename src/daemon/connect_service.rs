@@ -2,7 +2,7 @@
 //! unit instead of living loose inside `ProtocolRouter`.
 //!
 //! Holds the three connect maps (pending/approved/outgoing) and the
-//! `CONNECT_ALPN` accept arm. The `ProtocolRouter` accept loop holds an
+//! `CONNECT_ALPN` and `INVITE_ALPN` accept arm. The `ProtocolRouter` accept loop holds an
 //! `Arc<ConnectService>` and delegates to it; `Daemon` holds the same handle
 //! for the IPC-side connect commands (`connect`/`connections approve`/…), which
 //! mint and join networks over the core registry.
@@ -11,29 +11,34 @@ use super::*;
 
 /// Cap on the queue of unapproved incoming `ray connect` requests.
 ///
-/// The dial that fills it is unauthenticated (a stranger needs only our contact
-/// id) and every entry is keyed by an endpoint id the requester generates, so
+/// The dial that fills it is unauthenticated (a stranger needs only our
+/// identity) and every entry is keyed by an endpoint id the requester generates, so
 /// without a bound the map is memory anyone can allocate on this daemon. Same
 /// policy and same size as [`MAX_PENDING_JOINS`](super::mesh::accept::MAX_PENDING_JOINS):
 /// at the cap the oldest unanswered request makes way, on the grounds that a
 /// request nobody approved in that long is the one least likely to be waited on.
 pub(crate) const MAX_PENDING_CONNECTS: usize = 256;
 
+/// How long a dialer past the gate has to send its one message. A stream held
+/// open and idle otherwise ties up a handler task indefinitely.
+const CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A pending incoming `ray connect` request, awaiting `ray connect approve`.
-/// Keyed by the requester's transport endpoint id (not contact id) so it
-/// survives the requester rotating their contact key.
+/// Keyed by the requester's authenticated transport endpoint id.
 #[derive(Clone)]
 pub(crate) struct PendingConnect {
-    pub(crate) from_contact_id: EndpointId,
     pub(crate) from_endpoint: EndpointId,
     pub(crate) hostname: Option<String>,
     pub(crate) requested_at: Instant,
+    /// Not known when it arrived: counts toward the stranger quota.
+    pub(crate) stranger: bool,
 }
 
-/// Make room for a connect request from `incoming`: at the cap, drop the oldest
-/// queued request and return its id. A no-op (returns `None`) when `incoming` is
-/// already queued (a re-dial must not cost anyone their slot) or there is spare
-/// capacity. Mirrors `mesh::accept::evict_oldest_pending`, over a `DashMap`.
+/// Make room for a connect request from `incoming`: once the requests that
+/// `counts` selects reach `cap`, drop the oldest of them and return its id. A
+/// no-op (returns `None`) when `incoming` is already queued (a re-dial must not
+/// cost anyone their slot) or there is spare capacity. Mirrors
+/// `mesh::accept::evict_oldest_pending`, over a `DashMap`.
 ///
 /// The oldest id is bound before the removal so no map reference is alive across
 /// it: `DashMap` is sharded and holding one while mutating can deadlock.
@@ -41,12 +46,15 @@ pub(crate) fn evict_oldest_connect(
     pending: &DashMap<EndpointId, PendingConnect>,
     incoming: EndpointId,
     cap: usize,
+    counts: impl Fn(&PendingConnect) -> bool,
 ) -> Option<EndpointId> {
-    if pending.contains_key(&incoming) || pending.len() < cap {
+    if pending.contains_key(&incoming) || pending.iter().filter(|e| counts(e.value())).count() < cap
+    {
         return None;
     }
     let oldest = pending
         .iter()
+        .filter(|e| counts(e.value()))
         .min_by_key(|e| e.value().requested_at)
         .map(|e| *e.key())?;
     pending.remove(&oldest);
@@ -69,63 +77,57 @@ pub(crate) struct ConnectService {
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
     pub(crate) outgoing_connects: DashSet<EndpointId>,
-    /// Foundation handles (endpoint + contact id) for the connect handshake and
-    /// contact-record publishing.
-    transport: Arc<Transport>,
-    /// Whether the data plane is active, gating immediate contact republish on
-    /// key rotation.
-    active: Arc<AtomicBool>,
+    /// Foundation handles (endpoint, LAN sightings) for the connect handshake.
+    pub(super) transport: Arc<Transport>,
     /// The network-owning service, for minting/joining the 2-peer direct network
     /// once a connect request is approved.
-    registry: Arc<NetworkRegistry>,
+    pub(super) registry: Arc<NetworkRegistry>,
+    /// One load-modify-save of the invitation inbox at a time.
+    pub(super) inbox_lock: AsyncMutex<()>,
+    /// Spans a whole invitation accept or decline.
+    pub(super) answer_lock: AsyncMutex<()>,
+    /// One invite delivery per recipient at a time.
+    pub(super) delivery_locks: DashMap<EndpointId, Arc<AsyncMutex<()>>>,
 }
 
 impl ConnectService {
-    pub(crate) fn new(
-        transport: Arc<Transport>,
-        active: Arc<AtomicBool>,
-        registry: Arc<NetworkRegistry>,
-    ) -> Self {
+    pub(crate) fn new(registry: Arc<NetworkRegistry>) -> Self {
+        let transport = Arc::clone(&registry.transport);
         Self {
             pending_connects: DashMap::new(),
             approved_connects: DashMap::new(),
             outgoing_connects: DashSet::new(),
             transport,
-            active,
             registry,
+            inbox_lock: AsyncMutex::new(()),
+            answer_lock: AsyncMutex::new(()),
+            delivery_locks: DashMap::new(),
         }
     }
 
     /// Turn a `ray connect` argument into the peer endpoint to dial.
     ///
-    /// A LAN sighting wins over the DHT: if the argument names a neighbour from
-    /// `ray mdns scan` we already know where that peer is, so there is nothing
-    /// to look up. Otherwise the argument is a contact id and resolves through
-    /// pkarr as before. Contact ids and transport endpoint ids are distinct
-    /// keys, so the two cases cannot collide.
+    /// A LAN sighting (a prefix from `ray mdns scan`) wins. Otherwise the
+    /// argument is an identity, dialed directly: iroh's address lookup finds the
+    /// endpoint and QUIC proves who answers, so nothing is looked up here.
     ///
     /// The error is the message, not a whole `IpcMessage`: every failure here is
     /// an `ipc_err`, and the one caller is what turns it into a reply.
-    async fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, String> {
+    pub(crate) fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, String> {
         let me = self.transport.endpoint.id();
         if let Some(peer) = self.transport.lan_peers.resolve(arg, me) {
             return Ok(peer);
         }
-        let contact_pubkey = arg
+        let peer = arg
             .parse::<EndpointId>()
-            .map_err(|e| format!("invalid contact id: {e}"))?;
-        if contact_pubkey == self.transport.contact_public {
-            return Err("cannot connect to your own contact id".to_string());
+            .map_err(|e| format!("invalid identity: {e}"))?;
+        if peer == me || peer == self.registry.own_identity() {
+            return Err("cannot connect to yourself".to_string());
         }
-        let pkarr =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-                .map_err(|e| format!("failed to create pkarr client: {e}"))?;
-        dht::resolve_contact(&pkarr, contact_pubkey)
-            .await
-            .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
+        Ok(peer)
     }
 
-    /// Approve a pending `ray connect` request by hostname or contact-id prefix: mint a
+    /// Approve a pending `ray connect` request by hostname or endpoint prefix: mint a
     /// restricted 2-peer network with the requester pre-approved (idempotent if
     /// already linked; defers to the higher endpoint id on a simultaneous
     /// cross-connect). The initiator's connect-retry loop then joins it.
@@ -197,19 +199,18 @@ impl ConnectService {
         }
     }
 
-    /// `ray connect <contact-id>`: resolve the contact to an endpoint, dial it
-    /// over CONNECT_ALPN, and send a request. If approved immediately we join the
-    /// minted direct network; if pending we retry on a backoff.
+    /// `ray connect <identity>`: dial that identity over CONNECT_ALPN and send a
+    /// request. If approved immediately we join the minted direct network; if
+    /// pending we retry on a backoff.
     ///
-    /// The argument may also be the endpoint id of a neighbour from `ray mdns
-    /// scan`; that path skips the pkarr lookup entirely, so it works on a LAN
-    /// with no internet. Approval is still recipient-only either way.
+    /// The argument may also be a neighbour from `ray mdns scan`, which works on
+    /// a LAN with no internet. Approval is recipient-only either way.
     pub(crate) async fn connect(
         self: &Arc<Self>,
-        contact_id: &str,
+        peer: &str,
         hostname: Option<String>,
     ) -> IpcMessage {
-        let peer = match self.resolve_connect_target(contact_id).await {
+        let peer = match self.resolve_connect_target(peer) {
             Ok(peer) => peer,
             Err(message) => return ipc_err(message),
         };
@@ -237,10 +238,10 @@ impl ConnectService {
                 self.outgoing_connects.remove(&peer);
                 ipc_err(format!("connection denied: {reason}"))
             }
-            Ok(_) => ipc_err("unexpected response from contact".to_string()),
+            Ok(_) => ipc_err("unexpected response from peer".to_string()),
             Err(e) => {
                 self.outgoing_connects.remove(&peer);
-                ipc_err(format!("failed to reach contact: {e}"))
+                ipc_err(format!("failed to reach peer: {e}"))
             }
         }
     }
@@ -262,7 +263,7 @@ impl ConnectService {
         control::send_framed(
             &mut send,
             &control::ConnectMsg::Request {
-                from_contact_id: self.transport.contact_public,
+                from_identity: self.registry.own_identity(),
                 from_endpoint: self.transport.endpoint.id(),
                 hostname,
             },
@@ -352,7 +353,7 @@ impl ConnectService {
             .pending_connects
             .iter()
             .map(|p| ipc::PendingRequestInfo {
-                short_id: p.from_contact_id.fmt_short().to_string(),
+                short_id: p.from_endpoint.fmt_short().to_string(),
                 hostname: p.hostname.clone(),
                 waiting_secs: now.saturating_duration_since(p.requested_at).as_secs(),
             })
@@ -360,19 +361,85 @@ impl ConnectService {
         IpcMessage::PendingRequests { requests }
     }
 
-    /// Decline a pending connection request by hostname or contact-id prefix.
-    pub(crate) fn reject_connect(&self, selector: &str) -> IpcMessage {
-        let req = match self.find_pending(selector) {
-            Ok(req) => req,
-            Err(message) => return ipc_err(message),
+    /// Forget anything queued from a now-blocked identity, including the
+    /// devices a roster binds to a blocked user.
+    pub(crate) async fn drop_blocked(&self, blocked: &[EndpointId]) {
+        let is_blocked = |remote| {
+            inbound::classify(&self.registry, blocked, remote) == inbound::Inbound::Blocked
         };
-        self.pending_connects.remove(&req.from_endpoint);
+        self.pending_connects
+            .retain(|endpoint, _| !is_blocked(*endpoint));
+        self.drop_blocked_invitations(is_blocked).await;
+    }
+
+    /// Add `remote` to the block list and forget what it has queued.
+    pub(crate) async fn block(&self, remote: EndpointId) -> Result<()> {
+        // The same settings arm `ray block` writes through, so there is one
+        // rule for adding to the list.
+        let cfg = config::update_settings(|cfg| {
+            config::config_set(cfg, GlobalKey::Blocked, &remote.to_string(), false)
+        })?;
+        self.drop_blocked(&cfg.blocked).await;
+        Ok(())
+    }
+
+    /// Drop a pending request without blocking the requester. The app Reject
+    /// buttons use this: they have no way to unblock, so they must not block.
+    pub(crate) fn reject_connection(&self, selector: &str) -> IpcMessage {
+        if let Err(message) = self.take_pending(selector) {
+            return ipc_err(message);
+        }
         IpcMessage::Ok {
             message: format!("declined connection request '{selector}'"),
         }
     }
 
-    /// The pending request named by `selector` (hostname or contact-id
+    /// `ray connect deny`: drop a pending request by hostname or endpoint
+    /// prefix and block the requester, so it cannot simply ask again.
+    pub(crate) async fn deny_connection(&self, selector: &str) -> IpcMessage {
+        let req = match self.take_pending(selector) {
+            Ok(req) => req,
+            Err(message) => return ipc_err(message),
+        };
+        if let Err(e) = self.block(req.from_endpoint).await {
+            return ipc_err(format!("request dropped, but blocking failed: {e:#}"));
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "denied and blocked {} (undo with: ray unblock {})",
+                req.from_endpoint.fmt_short(),
+                req.from_endpoint
+            ),
+        }
+    }
+
+    /// The dialer's class when the inbound gate admits it right now. An
+    /// unreadable settings file must not quietly lift a block, so it refuses
+    /// everyone until it is fixed.
+    fn admitted(&self, remote: EndpointId) -> Option<inbound::Inbound> {
+        let cfg = match config::load_inbound() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(error = %e, "connect channel closed: settings unreadable");
+                return None;
+            }
+        };
+        let class = inbound::classify(&self.registry, &cfg.blocked, remote);
+        if !inbound::admits(cfg.inbound, class) {
+            tracing::debug!(peer = %remote.fmt_short(), ?class, "connect dial refused");
+            return None;
+        }
+        Some(class)
+    }
+
+    /// Remove and return the pending request named by `selector`.
+    fn take_pending(&self, selector: &str) -> Result<PendingConnect, String> {
+        let req = self.find_pending(selector)?;
+        self.pending_connects.remove(&req.from_endpoint);
+        Ok(req)
+    }
+
+    /// The pending request named by `selector` (hostname or endpoint
     /// prefix), or the error message for a miss. Requests are keyed by
     /// `from_endpoint`, so the returned request's `from_endpoint` is its key.
     fn find_pending(&self, selector: &str) -> Result<PendingConnect, String> {
@@ -380,7 +447,7 @@ impl ConnectService {
             selector,
             self.pending_connects
                 .iter()
-                .map(|request| (request.from_contact_id, request.hostname.clone())),
+                .map(|request| (request.from_endpoint, request.hostname.clone())),
         ) {
             Ok(Some(identity)) => identity,
             Ok(None) => {
@@ -396,51 +463,73 @@ impl ConnectService {
         };
         self.pending_connects
             .iter()
-            .find(|request| request.from_contact_id == identity)
+            .find(|request| request.from_endpoint == identity)
             .map(|request| request.value().clone())
             .ok_or_else(|| format!("pending connection request '{selector}' disappeared"))
-    }
-
-    /// Rotate this node's contact key and, if the data plane is active, republish
-    /// the contact record immediately so the new id resolves.
-    pub(crate) async fn rotate_contact(&self) -> IpcMessage {
-        let mut rotated = None;
-        if let Err(e) = config::update_settings(|cfg| {
-            rotated = Some(config::rotate_contact_secret(cfg));
-            Ok(())
-        }) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
-        let Some(secret) = rotated else {
-            return ipc_err("contact key rotation did not run".to_string());
-        };
-        if self.active.load(Ordering::SeqCst)
-            && let Ok(client) =
-                dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-        {
-            let _ = dht::publish_contact(&client, &secret, self.transport.endpoint.id()).await;
-        }
-        IpcMessage::ContactIdResponse {
-            contact_id: secret.public().to_string(),
-        }
     }
 
     /// `CONNECT_ALPN`: handle a `ray connect` friend request. Binds the request
     /// to the dialing identity, replies `Approved` if already accepted
     /// (idempotent), else queues it as `Pending` for `ray connect approve`.
+    /// `INVITE_ALPN`: store an invitation offer. Each channel takes only its
+    /// own message.
+    ///
+    /// The inbound gate runs first, on the authenticated `remote_id`: a blocked
+    /// or refused dialer is closed before anything is read or written.
     pub(crate) async fn accept_connect_request(&self, conn: Connection) {
         let remote_id = conn.remote_id();
+        if self.admitted(remote_id).is_none() {
+            conn.close(0u32.into(), b"");
+            return;
+        }
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
-                let request: control::ConnectMsg = match control::recv_framed(&mut recv).await {
-                    Ok(r) => r,
-                    Err(e) => {
+                let read = tokio::time::timeout(
+                    CONNECT_READ_TIMEOUT,
+                    control::recv_framed::<control::ConnectMsg>(&mut recv),
+                )
+                .await;
+                let request = match read {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
                         tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read connect request");
                         return;
                     }
+                    Err(_) => {
+                        tracing::debug!(peer = %remote_id.fmt_short(), "connect request timed out");
+                        return;
+                    }
                 };
+                // Gate again: a block or policy change made while this dialer
+                // held its stream open must apply to what it sends.
+                let Some(class) = self.admitted(remote_id) else {
+                    conn.close(0u32.into(), b"");
+                    return;
+                };
+                let stranger = class == inbound::Inbound::Stranger;
+                // Each message has its own channel: offers ride `INVITE_ALPN`
+                // and requests `CONNECT_ALPN`.
+                let invite_channel = conn.alpn() == transport::INVITE_ALPN;
+                if matches!(request, control::ConnectMsg::InviteOffer { .. }) != invite_channel {
+                    tracing::debug!(peer = %remote_id.fmt_short(), "connect message on the wrong channel");
+                    conn.close(0u32.into(), b"");
+                    return;
+                }
+                if let control::ConnectMsg::InviteOffer { network, code } = request {
+                    if !self.receive_offer(remote_id, class, network, code).await {
+                        conn.close(0u32.into(), b"");
+                        return;
+                    }
+                    if control::send_framed(&mut send, &control::ConnectMsg::Pending)
+                        .await
+                        .is_ok()
+                    {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                    }
+                    return;
+                }
                 if let control::ConnectMsg::Request {
-                    from_contact_id,
+                    from_identity,
                     from_endpoint,
                     hostname,
                 } = request
@@ -470,21 +559,30 @@ impl ConnectService {
                             coordinator,
                         }
                     } else {
+                        if stranger {
+                            evict_oldest_connect(
+                                &self.pending_connects,
+                                from_endpoint,
+                                inbound::MAX_STRANGER_CONNECTS,
+                                |p| p.stranger,
+                            );
+                        }
                         evict_oldest_connect(
                             &self.pending_connects,
                             from_endpoint,
                             MAX_PENDING_CONNECTS,
+                            |_| true,
                         );
                         self.pending_connects.insert(
                             from_endpoint,
                             PendingConnect {
-                                from_contact_id,
                                 from_endpoint,
                                 hostname,
                                 requested_at: Instant::now(),
+                                stranger,
                             },
                         );
-                        tracing::info!(from = %from_contact_id.fmt_short(), endpoint = %from_endpoint.fmt_short(), "connect request received");
+                        tracing::info!(identity = %from_identity.fmt_short(), endpoint = %from_endpoint.fmt_short(), "connect request received");
                         control::ConnectMsg::Pending
                     };
                     if let Err(e) = control::send_framed(&mut send, &reply).await {
@@ -516,10 +614,10 @@ mod pending_connect_cap_tests {
 
     fn queued_at(id: EndpointId, t: Instant) -> PendingConnect {
         PendingConnect {
-            from_contact_id: id,
             from_endpoint: id,
             hostname: None,
             requested_at: t,
+            stranger: false,
         }
     }
 
@@ -527,12 +625,12 @@ mod pending_connect_cap_tests {
     fn no_eviction_below_cap() {
         let pending = DashMap::new();
         pending.insert(eid(1), queued_at(eid(1), Instant::now()));
-        assert_eq!(evict_oldest_connect(&pending, eid(2), 4), None);
+        assert_eq!(evict_oldest_connect(&pending, eid(2), 4, |_| true), None);
         assert_eq!(pending.len(), 1);
     }
 
     /// The regression. `CONNECT_ALPN` takes a request from anyone holding our
-    /// contact id, keyed by an endpoint id the requester mints, so an unbounded
+    /// identity, keyed by an endpoint id the requester mints, so an unbounded
     /// queue was memory a stranger could allocate here without limit.
     #[test]
     fn full_queue_evicts_the_oldest() {
@@ -544,7 +642,10 @@ mod pending_connect_cap_tests {
                 queued_at(eid(s), base + Duration::from_millis(s as u64)),
             );
         }
-        assert_eq!(evict_oldest_connect(&pending, eid(99), 4), Some(eid(0)));
+        assert_eq!(
+            evict_oldest_connect(&pending, eid(99), 4, |_| true),
+            Some(eid(0))
+        );
         assert_eq!(pending.len(), 3);
         assert!(!pending.contains_key(&eid(0)));
     }
@@ -561,7 +662,7 @@ mod pending_connect_cap_tests {
                 queued_at(eid(s), base + Duration::from_millis(s as u64)),
             );
         }
-        assert_eq!(evict_oldest_connect(&pending, eid(1), 4), None);
+        assert_eq!(evict_oldest_connect(&pending, eid(1), 4, |_| true), None);
         assert_eq!(pending.len(), 4);
     }
 }

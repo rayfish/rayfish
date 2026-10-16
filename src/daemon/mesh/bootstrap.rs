@@ -131,6 +131,7 @@ fn initial_alpns() -> Vec<Vec<u8>> {
         transport::FILES_ALPN.to_vec(),
         PAIR_ALPN.to_vec(),
         transport::CONNECT_ALPN.to_vec(),
+        transport::INVITE_ALPN.to_vec(),
         crate::management::ALPN.to_vec(),
         crate::management::V2_ALPN.to_vec(),
         crate::management::LEGACY_ALPN.to_vec(),
@@ -231,7 +232,7 @@ async fn build_daemon_inner(
     forward::init_ssh_nat(my_ip, crate::forward::SSH_LISTEN_PORT);
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
-    let mut app_config = config::load()?;
+    let app_config = config::load()?;
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
     let on_demand = overrides.on_demand.unwrap_or(app_config.on_demand);
@@ -239,22 +240,6 @@ async fn build_daemon_inner(
     // transport foundation so an embedded stop/start cannot inherit a prior
     // daemon's discovery-DNS configuration.
     let pkarr_relay_url = dht::pkarr_relay_url(&app_config.discovery_dns);
-    // Lazily generate + persist this node's contact key (`ray connect`). The
-    // secret stays in config; only its public id is held in `Daemon`.
-    let mut contact_public = None;
-    match config::update_settings(|cfg| {
-        contact_public = Some(config::contact_secret(cfg).public());
-        Ok(())
-    }) {
-        Ok(cfg) => app_config = cfg,
-        Err(e) => tracing::warn!(error = %e, "failed to persist contact key"),
-    }
-    // The callback did not run if the update failed before it. Fall back to an
-    // in-memory key so the node still starts.
-    let contact_public = match contact_public {
-        Some(id) => id,
-        None => config::contact_secret(&mut app_config).public(),
-    };
     let alpns = initial_alpns();
     let use_tor = app_config
         .networks
@@ -523,7 +508,6 @@ async fn build_daemon_inner(
         blob_store.clone(),
         Arc::clone(&stats),
         TransportBootstrap {
-            contact_public,
             lan_peers,
             warm_lookup,
             pkarr_relay_url,
@@ -588,11 +572,7 @@ async fn build_daemon_inner(
         }
     });
 
-    let connect = Arc::new(ConnectService::new(
-        Arc::clone(&transport),
-        Arc::clone(&active),
-        Arc::clone(&registry),
-    ));
+    let connect = Arc::new(ConnectService::new(Arc::clone(&registry)));
     let management = Arc::new(ManagementService::new(
         Arc::clone(&transport),
         Arc::clone(&registry),
@@ -723,7 +703,6 @@ async fn build_daemon_inner(
         connect,
         management,
         device_cert,
-        contact_public,
         active: Arc::clone(&active),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
@@ -735,20 +714,13 @@ async fn build_daemon_inner(
         v4_bridge_token: Mutex::new(None),
     });
     daemon.management.bind_daemon(&daemon);
+    daemon.connect.start_invite_delivery(token.clone());
     tokio::spawn(Arc::clone(&daemon.registry).republish_destructions());
 
     tokio::spawn(Arc::clone(&daemon).run_paired_network_sync());
 
     // File auto-accept is evaluated inline by `FileService::accept_file_offer`
     // (no worker channel), so nothing to spawn here.
-
-    // --- Contact record publisher (ray connect) ---
-    if let Ok(pkarr_client) = dht::create_pkarr_client(
-        &daemon.transport.endpoint,
-        &daemon.transport.pkarr_relay_url,
-    ) {
-        spawn_contact_publisher(pkarr_client, daemon.transport.endpoint.id(), token.clone());
-    }
 
     // Device-cert revocation is now carried per-network in the signed blob's
     // nullifier set (`ray unpair`); no separate pkarr record or background

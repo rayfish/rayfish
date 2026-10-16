@@ -38,7 +38,7 @@ fn network_key_from_selector(selector: &str) -> Option<EndpointId> {
     selector.parse().ok().or_else(|| {
         crate::invite::decode_invite_code(selector)
             .ok()
-            .map(|(network_key, _, _)| network_key)
+            .map(|decoded| decoded.network_key)
     })
 }
 
@@ -84,6 +84,17 @@ pub(crate) struct CurrentSignedNetworkState {
     pub(crate) members: Vec<Member>,
     pub(crate) approved: Vec<ApprovedEntry>,
     pub(crate) key: SecretKey,
+}
+
+/// What the rosters held here say about one endpoint.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RosterStanding {
+    /// The user identity a roster binds this device to. Rosters are
+    /// coordinator-signed, so this is not the dialer's own claim.
+    pub(crate) user_identity: Option<EndpointId>,
+    /// A member (device or user identity) or approved entry somewhere, or this
+    /// device's paired primary.
+    pub(crate) known: bool,
 }
 
 pub(crate) struct NetworkRegistry {
@@ -527,6 +538,46 @@ impl NetworkRegistry {
             Ok(cert) => cert,
             Err(_) => self.device_cert.clone(),
         }
+    }
+
+    /// What the rosters held here say about `remote`, in one pass with one lock
+    /// per network. A poisoned roster lock counts as saying nothing.
+    pub(crate) fn roster_standing(&self, remote: EndpointId) -> RosterStanding {
+        let mut standing = RosterStanding::default();
+        for network in self.networks.iter() {
+            let Ok(state) = network.state.read() else {
+                continue;
+            };
+            if let Some(member) = state.members.get(&remote) {
+                standing.known = true;
+                standing.user_identity = standing.user_identity.or(member.user_identity);
+            }
+            standing.known = standing.known
+                || state
+                    .members
+                    .all()
+                    .iter()
+                    .any(|m| m.user_identity == Some(remote))
+                || state
+                    .approved
+                    .all()
+                    .iter()
+                    .any(|e| e.identity == remote || e.user_identity == Some(remote));
+        }
+        // The paired primary need not share a roster with this device yet.
+        standing.known = standing.known
+            || self
+                .current_device_cert()
+                .is_some_and(|cert| cert.user_identity == remote);
+        standing
+    }
+
+    /// What a person shares to reach this user: the paired user identity, or
+    /// this endpoint when unpaired. Also the target of `ray connect`.
+    pub(crate) fn own_identity(&self) -> EndpointId {
+        self.current_device_cert()
+            .map(|cert| cert.user_identity)
+            .unwrap_or_else(|| self.transport.endpoint.id())
     }
 
     /// Record memberships a device held before receiving our certificate.

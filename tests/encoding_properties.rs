@@ -42,8 +42,9 @@ proptest! {
         let coord = id_from_seed(coord_seed);
 
         let code = encode_invite_code(&net, &coord, &secret);
-        let (got_net, got_coord, got_secret) = decode_invite_code(&code)
-            .expect("a freshly encoded invite must decode");
+        let decoded = decode_invite_code(&code).expect("a freshly encoded invite must decode");
+        let (got_net, got_coord, got_secret) =
+            (decoded.network_key, decoded.coordinator, decoded.secret);
 
         prop_assert_eq!(got_net, net);
         prop_assert_eq!(got_coord, coord);
@@ -83,9 +84,10 @@ proptest! {
         let code = encode_invite_code(&net, &coord, &secret);
         let truncated = &code[..code.len().saturating_sub(cut)];
 
-        if let Ok((got_net, got_coord, got_secret)) = decode_invite_code(truncated) {
+        if let Ok(decoded) = decode_invite_code(truncated) {
             prop_assert!(
-                (got_net, got_coord, got_secret) != (net, coord, secret.clone()),
+                (decoded.network_key, decoded.coordinator, decoded.secret)
+                    != (net, coord, secret.clone()),
                 "a truncated code decoded back to the original invite",
             );
         }
@@ -113,8 +115,9 @@ proptest! {
 
         match decode_invite_code(&corrupted) {
             Err(_) => {}
-            Ok((got_net, got_coord, got_secret)) => prop_assert!(
-                (got_net, got_coord, got_secret) != (net, coord, secret.clone()),
+            Ok(decoded) => prop_assert!(
+                (decoded.network_key, decoded.coordinator, decoded.secret)
+                    != (net, coord, secret.clone()),
                 "a corrupted code decoded back to the original invite",
             ),
         }

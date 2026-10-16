@@ -280,7 +280,9 @@ pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 
 aliases:
   # Fill in a real identity, e.g.:
-  #   alice: <paste from `ray identityof <host>`>
+  #   alice: <paste from `ray identityof <host>` or their `ray status`>
+  # An alias with no joined device can be invited with --invite-missing;
+  # they accept or decline with `ray invitations`.
 groups:
   admins: [alice, jumpbox]   # `alice` (alias, once defined) + a literal hostname
 

@@ -233,7 +233,7 @@ struct StatusJson<'a> {
     lan_peers: Vec<StatusLanPeer<'a>>,
     auto_update: bool,
     active: bool,
-    contact_id: Option<&'a str>,
+    identity: Option<String>,
     daemon_version: &'a str,
     networks: &'a [ipc::NetworkStatus],
     inactive_networks: &'a [ipc::InactiveNetwork],
@@ -266,7 +266,7 @@ impl DisplayOut for StatusOutput<'_> {
         let mdns_enabled = self.json.mdns;
         let auto_update = self.json.auto_update;
         let active = self.json.active;
-        let contact_id = self.json.contact_id;
+        let identity = self.json.identity.as_deref();
         let daemon_version = self.json.daemon_version;
         let networks = self.json.networks;
         let inactive_networks = self.json.inactive_networks;
@@ -312,8 +312,8 @@ impl DisplayOut for StatusOutput<'_> {
         if !active {
             println!("  {}", style::faint("run `ray up` to activate"));
         }
-        if let Some(cid) = contact_id {
-            println!("  {} {}", style::label("contact"), style::rose(cid),);
+        if let Some(identity) = identity {
+            println!("  {} {}", style::label("identity"), style::rose(identity));
         }
 
         if networks.is_empty() {
@@ -443,7 +443,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
             mdns_enabled,
             auto_update,
             active,
-            contact_id,
+            identity,
             daemon_version,
             networks,
             packets_rx,
@@ -472,7 +472,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
                         .collect(),
                     auto_update,
                     active,
-                    contact_id: contact_id.as_deref(),
+                    identity: identity.map(|id| id.to_string()),
                     daemon_version: &daemon_version,
                     networks: &networks,
                     inactive_networks: &inactive_networks,
