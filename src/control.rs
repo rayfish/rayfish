@@ -11,7 +11,9 @@ use iroh::{EndpointId, SecretKey, Signature};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
+use crate::invite::InviteSecret;
 use crate::membership::{ApprovedEntry, ExitFamilies, Member};
+use ray_proto::ipc::NetworkName;
 
 /// Certificate proving a device belongs to a user identity.
 ///
@@ -98,7 +100,7 @@ pub enum PairMsg {
 }
 
 /// Messages for the `ray connect` friend-request handshake (ALPN
-/// `rayfish/connect/2`). The initiator (A) dials the recipient's (B) contact
+/// `rayfish/connect/3`). The initiator (A) dials the recipient's (B) contact
 /// key, sends `Request`, and polls until `Approved`. Approval is recipient-only:
 /// only B acts, A just waits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,8 +122,19 @@ pub enum ConnectMsg {
         room_id: EndpointId,
         coordinator: EndpointId,
     },
+    /// Private, single-use invitation. Receipt only adds it to the inbox.
+    InviteOffer {
+        network: NetworkName,
+        network_key: EndpointId,
+        recipient_contact: EndpointId,
+        secret: InviteSecret,
+        expires: u64,
+    },
+    InviteReceived,
     /// B → A: request rejected.
-    Denied { reason: String },
+    Denied {
+        reason: String,
+    },
 }
 
 /// Control messages exchanged between peers over QUIC bidirectional streams.

@@ -151,6 +151,7 @@ fn print_pending_requests(
 fn json_requested(command: &Command) -> bool {
     match command {
         Command::Status { json, .. }
+        | Command::Invitations { json, .. }
         | Command::Invite { json, .. }
         | Command::Requests { json, .. }
         | Command::Connect { json, .. }
@@ -384,6 +385,13 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// Review and answer private network invitations
+    Invitations {
+        #[command(subcommand)]
+        action: Option<InvitationAction>,
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Peers awaiting approval; admit or reject them
     ///
     /// Coordinator only, and closed networks only. With no action, lists who is
@@ -557,9 +565,8 @@ pub(crate) enum Command {
         /// Show what would change without applying it.
         #[arg(long)]
         dry_run: bool,
-        /// Mint one-time invites for hosts the spec expects but that haven't
-        /// joined yet (hostname-bound). Without this flag, the commands are
-        /// only printed.
+        /// Mint hostname-bound invites for missing hosts and privately deliver
+        /// invites to missing contact aliases (queued while offline).
         #[arg(long)]
         invite_missing: bool,
         /// Print an example spec file and exit.
@@ -739,6 +746,18 @@ pub(crate) enum Command {
         #[arg(long)]
         parent_pid: u32,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum InvitationAction {
+    /// Accept an invitation and join its network
+    Accept {
+        id: String,
+        #[arg(long)]
+        hostname: Option<ipc::MachineHostname>,
+    },
+    /// Decline an invitation
+    Decline { id: String },
 }
 
 #[derive(Subcommand)]
@@ -1792,6 +1811,7 @@ async fn run() -> Result<()> {
             action,
             json: _,
         } => ipc_invite(&network, action).await,
+        Command::Invitations { action, json: _ } => ipc_invitations(action).await,
         Command::Requests {
             network,
             action,

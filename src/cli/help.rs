@@ -48,7 +48,15 @@ const ROOT: Groups = &[
     ),
     (
         "Members & access",
-        &["invite", "requests", "kick", "admin", "alias", "identityof"],
+        &[
+            "invite",
+            "invitations",
+            "requests",
+            "kick",
+            "admin",
+            "alias",
+            "identityof",
+        ],
     ),
     (
         "Devices & links",

@@ -259,6 +259,7 @@ pub(crate) use file_service::FileService;
 pub mod transfers;
 
 mod connect_service;
+mod contact_invites;
 pub(crate) use connect_service::ConnectService;
 mod management_service;
 pub(crate) use management_service::ManagementService;
@@ -1896,7 +1897,7 @@ mod accept_handler_tests {
     use std::sync::Arc;
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
-    fn make_network_state() -> SharedNetworkState {
+    pub(super) fn make_network_state() -> SharedNetworkState {
         let net_secret = SecretKey::from_bytes(&[1u8; 32]);
         let net_pub = net_secret.public();
         Arc::new(RwLock::new(NetworkState {
@@ -2158,7 +2159,7 @@ mod accept_handler_tests {
 
     /// Throwaway [`NetworkRegistry`] for accept-handler tests: empty networks map
     /// and dummy foundation handles, none of which the constructed handlers touch.
-    fn sample_registry(
+    pub(super) fn sample_registry(
         endpoint: Endpoint,
         identity: IrohIdentityProvider,
         blob_store: FsStore,

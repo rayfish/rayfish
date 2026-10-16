@@ -12,6 +12,7 @@
 //! secret, looks it up in the ledger, and burns it. Codes minted before the
 //! checksum existed still decode.
 
+use std::fmt::{self, Debug, Formatter};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -38,8 +39,8 @@ pub enum InviteStatus {
     Revoked,
 }
 
-/// A single invite record. `secret_hash` (not the secret) is persisted, like a
-/// password hash: the raw secret only ever exists in the code handed to the joiner.
+/// A single invite record. Ordinary invites retain only a hash. Contact invites
+/// also retain a redacted secret for delivery retries in the owner-only ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
     /// Short human id: the first 8 hex chars of `blake3(secret)`.
@@ -55,6 +56,29 @@ pub struct Invite {
     /// networks). `None` = the joiner's `--hostname` claim is used as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Contact deliveries retain the secret in this owner-only ledger so retries
+    /// reuse the same credential after a restart. Debug output always redacts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<ContactDelivery>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteSecret(pub [u8; SECRET_LEN]);
+
+impl Debug for InviteSecret {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactDelivery {
+    pub contact_id: EndpointId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<EndpointId>,
+    pub secret: InviteSecret,
+    pub endpoint: Option<EndpointId>,
+    pub delivered: bool,
 }
 
 /// On-disk container (so the toml file has a stable `[[invites]]` shape).
@@ -175,6 +199,111 @@ pub fn decode_invite_code(code: &str) -> Result<(EndpointId, EndpointId, Vec<u8>
 }
 
 impl InviteStore {
+    /// Reuse the live invite for a contact, including when the prior delivery
+    /// failed or its acknowledgement was lost.
+    pub fn for_contact(
+        &mut self,
+        contact_id: EndpointId,
+        identity: Option<EndpointId>,
+    ) -> Result<Invite> {
+        if let Some(mut invite) = self.live_contact_invite(contact_id) {
+            if let Some(delivery) = invite.delivery.as_mut()
+                && delivery.identity.is_none()
+                && identity.is_some()
+            {
+                delivery.identity = identity;
+                if let Some(stored) = self
+                    .invites
+                    .iter_mut()
+                    .find(|stored| stored.id == invite.id)
+                {
+                    *stored = invite.clone();
+                }
+                self.save()?;
+            }
+            return Ok(invite);
+        }
+        let secret = generate_secret();
+        let secret_hash = hash_secret(&secret);
+        let created = now_secs();
+        let invite = Invite {
+            id: secret_hash[..8].to_string(),
+            secret_hash,
+            created,
+            expires: created.saturating_add(7 * 86400),
+            status: InviteStatus::Pending,
+            hostname: None,
+            delivery: Some(ContactDelivery {
+                contact_id,
+                identity,
+                secret: InviteSecret(secret),
+                endpoint: None,
+                delivered: false,
+            }),
+        };
+        self.invites.push(invite.clone());
+        self.save()?;
+        Ok(invite)
+    }
+
+    pub fn live_contact_invite(&self, contact_id: EndpointId) -> Option<Invite> {
+        self.invites
+            .iter()
+            .find(|invite| {
+                invite.expires > now_secs()
+                    && invite.status == InviteStatus::Pending
+                    && invite
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|d| d.contact_id == contact_id)
+            })
+            .cloned()
+    }
+
+    pub fn mark_delivered(&mut self, id: &str, endpoint: EndpointId) -> Result<()> {
+        let delivery = self
+            .invites
+            .iter_mut()
+            .find(|i| i.id == id)
+            .and_then(|i| i.delivery.as_mut())
+            .context("contact invite missing")?;
+        delivery.endpoint = Some(endpoint);
+        delivery.delivered = true;
+        self.save()
+    }
+
+    /// Retain the verified contact mapping before sending, so a lost ack still
+    /// lets a later apply recognize the recipient after it joins.
+    pub fn record_contact_endpoint(&mut self, id: &str, endpoint: EndpointId) -> Result<()> {
+        let delivery = self
+            .invites
+            .iter_mut()
+            .find(|i| i.id == id)
+            .and_then(|i| i.delivery.as_mut())
+            .context("contact invite missing")?;
+        delivery.endpoint = Some(endpoint);
+        self.save()
+    }
+
+    pub fn pending_deliveries(&self) -> Vec<EndpointId> {
+        self.invites
+            .iter()
+            .filter(|i| i.status == InviteStatus::Pending && i.expires > now_secs())
+            .filter_map(|i| i.delivery.as_ref())
+            .filter(|d| !d.delivered)
+            .map(|d| d.contact_id)
+            .collect()
+    }
+
+    pub fn contact_endpoint(&self, contact: EndpointId) -> Option<EndpointId> {
+        self.invites
+            .iter()
+            .rev()
+            .filter_map(|i| i.delivery.as_ref())
+            .filter(|d| d.contact_id == contact)
+            .find_map(|d| d.endpoint)
+    }
+
     /// Load a network's ledger, returning an empty store if the file is absent.
     pub fn load(network: &str) -> Result<Self> {
         let path = invite_path(network)?;
@@ -186,7 +315,7 @@ impl InviteStore {
             let contents = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: InviteFile =
-                toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
+                toml::from_str(&contents).map_err(|_| anyhow::anyhow!("invalid invite ledger"))?;
             file.invites
         } else {
             Vec::new()
@@ -208,9 +337,8 @@ impl InviteStore {
             invites: self.invites.clone(),
         };
         let contents = toml::to_string_pretty(&file).context("serializing invites")?;
-        // The ledger holds only hashes, never raw secrets, but it does expose
-        // invite metadata (expiry, redeemers, bound hostnames); treat it as
-        // secret-bearing (owner-only 0600), written atomically.
+        // Contact deliveries retain retry credentials, so this must remain
+        // owner-only (0600) and written atomically.
         crate::config::write_file(&self.path, contents.as_bytes(), true)
     }
 
@@ -235,6 +363,7 @@ impl InviteStore {
             expires,
             status: InviteStatus::Pending,
             hostname,
+            delivery: None,
         });
         self.save()?;
         Ok((secret, id))
@@ -319,6 +448,7 @@ impl InviteStore {
             expires,
             status: InviteStatus::Pending,
             hostname: None,
+            delivery: None,
         });
         self.save()
     }
@@ -389,6 +519,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("net.toml");
         (InviteStore::with_path(path), dir)
+    }
+
+    #[test]
+    fn contact_retry_survives_reload_and_reuses_delivered_live_invites() {
+        let (mut store, _dir) = temp_store();
+        let contact = test_id(4);
+        let first = store.for_contact(contact, Some(test_id(5))).unwrap();
+        let mut store = InviteStore::from_path(store.path.clone()).unwrap();
+        let retry = store.for_contact(contact, None).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(retry.delivery.as_ref().unwrap().identity, Some(test_id(5)));
+        assert_eq!(store.pending_deliveries(), [contact]);
+        store.mark_delivered(&first.id, test_id(6)).unwrap();
+        let mut store = InviteStore::from_path(store.path.clone()).unwrap();
+        assert_eq!(store.for_contact(contact, None).unwrap().id, first.id);
+        assert!(store.pending_deliveries().is_empty());
+        assert_eq!(store.contact_endpoint(contact), Some(test_id(6)));
+        assert_eq!(store.list().len(), 1);
+        assert!(format!("{first:?}").contains("[redacted]"));
+    }
+
+    #[test]
+    fn contact_retry_stops_on_redeem_revoke_or_expiry() {
+        let (mut store, _dir) = temp_store();
+        let contact = test_id(4);
+        let first = store.for_contact(contact, None).unwrap();
+        let secret = first.delivery.as_ref().unwrap().secret.0;
+        store.redeem(&secret, test_id(5)).unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        assert!(store.live_contact_invite(contact).is_none());
+        let second = store.for_contact(contact, None).unwrap();
+        store.revoke(&second.id).unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        let third = store.for_contact(contact, None).unwrap();
+        store.invites.last_mut().unwrap().expires = now_secs();
+        store.save().unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        let fourth = store.for_contact(contact, None).unwrap();
+        assert_ne!(third.id, fourth.id);
+        assert_eq!(
+            store
+                .list()
+                .iter()
+                .filter(|i| i.status == "pending")
+                .count(),
+            1
+        );
     }
 
     #[test]

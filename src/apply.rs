@@ -31,6 +31,7 @@ use std::iter::once;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use iroh::EndpointId;
 use ray_proto::ipc::MachineHostname;
 use ray_proto::policy::{HostSuggestions, SuggestedFirewall};
 use serde::{Deserialize, Serialize};
@@ -43,15 +44,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
-    /// Optional coordinator-defined name → identity string. An alias names a
-    /// *user* (the paired user identity, or a device's transport endpoint id for
-    /// an unpaired node), so a firewall rule referencing the alias expands to all
-    /// of that user's currently-joined device hostnames. Aliases are spec-only
-    /// and expanded client-side at apply time; they never reach the blob. An
-    /// alias only resolves for already-joined members (a user has no identity on
-    /// the mesh until a device joins/pairs).
+    /// String values name joined user/device identities. `{ contact_id: <id>, identity: <optional-id> }`
+    /// values name contact IDs and can receive invitations with --invite-missing.
     #[serde(default)]
-    pub aliases: BTreeMap<String, String>,
+    pub aliases: BTreeMap<String, AliasTarget>,
     /// Optional name → list of members (each an alias name or a literal
     /// hostname). A group is shorthand for a set of hosts that firewall rules can
     /// reference as a subject or peer; it is expanded client-side into concrete
@@ -62,6 +58,28 @@ pub struct DeploySpec {
     /// Network name to target hostname to firewall and SSH rules.
     #[serde(default)]
     pub networks: BTreeMap<String, DeployNetwork>,
+}
+
+/// Alias kinds stay distinct even though contact and identity keys share an encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum AliasTarget {
+    Identity(String),
+    Contact {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<EndpointId>,
+        contact_id: EndpointId,
+    },
+}
+
+impl AliasTarget {
+    /// Identity aliases only resolve joined devices; they never trigger delivery.
+    pub fn identity(&self) -> Option<&str> {
+        match self {
+            Self::Identity(identity) => Some(identity),
+            Self::Contact { .. } => None,
+        }
+    }
 }
 
 /// Rules for one target host. SSH grants name connecting peers and the local
@@ -281,6 +299,11 @@ pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 aliases:
   # Fill in a real identity, e.g.:
   #   alice: <paste from `ray identityof <host>`>
+  #   bob:
+  #     identity: <optional identity from `ray identityof <host>`>
+  #     contact_id: <paste from `ray contact id`>
+  # --invite-missing delivers privately to contact IDs, queued while offline.
+  # Recipients review with `ray invitations` and explicitly accept or decline.
 groups:
   admins: [alice, jumpbox]   # `alice` (alias, once defined) + a literal hostname
 
@@ -416,10 +439,27 @@ pub fn expand_firewall(
     resolve_alias: &dyn Fn(&str) -> Vec<String>,
     current: &HashSet<MachineHostname>,
 ) -> Result<(DeployNetwork, Vec<String>)> {
+    expand_firewall_with(
+        fw,
+        aliases,
+        groups,
+        &|identity: &String| resolve_alias(identity),
+        current,
+    )
+}
+
+/// Expand typed alias targets without conflating contact IDs with identities.
+pub fn expand_firewall_with<T>(
+    fw: &DeployNetwork,
+    aliases: &BTreeMap<String, T>,
+    groups: &BTreeMap<String, Vec<String>>,
+    resolve_alias: &dyn Fn(&T) -> Vec<String>,
+    current: &HashSet<MachineHostname>,
+) -> Result<(DeployNetwork, Vec<String>)> {
     let mut empty_aliases: BTreeSet<String> = BTreeSet::new();
 
     // Resolve one alias name to its joined hostnames, recording it if empty.
-    let mut resolve_one_alias = |name: &str, ident: &str| -> Vec<String> {
+    let mut resolve_one_alias = |name: &str, ident: &T| -> Vec<String> {
         let hosts = resolve_alias(ident);
         if hosts.is_empty() {
             empty_aliases.insert(name.to_string());
@@ -614,6 +654,17 @@ mod tests {
     use iroh::SecretKey;
     use ray_proto::policy::HostSuggestions;
 
+    fn identity_aliases(spec: &DeploySpec) -> BTreeMap<String, String> {
+        spec.aliases
+            .iter()
+            .filter_map(|(name, target)| {
+                target
+                    .identity()
+                    .map(|identity| (name.clone(), identity.to_string()))
+            })
+            .collect()
+    }
+
     /// Parse a spec from YAML text. The top level is a `networks:` map. Unknown
     /// fields are rejected so a typo'd key surfaces as an error instead of being
     /// silently dropped with defaults.
@@ -781,7 +832,7 @@ networks:
         .unwrap();
         let (expanded, warnings) = expand_firewall(
             &spec.networks["sample-net"],
-            &spec.aliases,
+            &identity_aliases(&spec),
             &spec.groups,
             &|identity| {
                 assert_eq!(identity, "identity-owner");
@@ -814,7 +865,7 @@ networks:
         .unwrap();
         let error = expand_firewall(
             &spec.networks["sample-net"],
-            &spec.aliases,
+            &identity_aliases(&spec),
             &spec.groups,
             &|_| Vec::new(),
             &HashSet::new(),
@@ -863,7 +914,7 @@ networks:
         .collect();
         let (expanded, warnings) = expand_firewall(
             &spec.networks["sample-net"],
-            &spec.aliases,
+            &identity_aliases(&spec),
             &spec.groups,
             &|_| vec!["owner-laptop".to_string(), "owner-phone".to_string()],
             &current,
@@ -920,7 +971,7 @@ networks:
         );
         let (expanded, _) = expand_firewall(
             network,
-            &spec.aliases,
+            &identity_aliases(&spec),
             &spec.groups,
             &|_| Vec::new(),
             &current,
@@ -954,7 +1005,7 @@ networks:
             let current = hosts.iter().map(|host| host.parse().unwrap()).collect();
             let (expanded, _) = expand_firewall(
                 &spec.networks["sample-net"],
-                &spec.aliases,
+                &identity_aliases(&spec),
                 &spec.groups,
                 &|_| Vec::new(),
                 &current,
@@ -1024,7 +1075,7 @@ networks:
         )
         .unwrap();
         let stored = [("owner".to_string(), "identity-owner".to_string())].into();
-        let aliases = merge_aliases(&stored, &spec.aliases);
+        let aliases = merge_aliases(&stored, &identity_aliases(&spec));
         let coordinator = SecretKey::from_bytes(&[1; 32]).public();
         let resolve_peer = |host: &str| (host == "coordinator").then_some(coordinator);
         let mut published = SuggestedFirewall::new();
@@ -1500,6 +1551,35 @@ networks:
     }
 
     #[test]
+    fn contact_aliases_parse_with_optional_identity_and_reject_unknown_fields() {
+        let identity = SecretKey::from([1; 32]).public();
+        let contact_id = SecretKey::from([2; 32]).public();
+        let spec = parse(&format!("aliases:\n  alice:\n    identity: {identity}\n    contact_id: {contact_id}\n  bob:\n    contact_id: {contact_id}\n")).unwrap();
+        assert_eq!(
+            spec.aliases["alice"],
+            AliasTarget::Contact {
+                identity: Some(identity),
+                contact_id
+            }
+        );
+        assert_eq!(
+            spec.aliases["bob"],
+            AliasTarget::Contact {
+                identity: None,
+                contact_id
+            }
+        );
+        assert_eq!(parse(&to_yaml(&spec).unwrap()).unwrap(), spec);
+        assert!(
+            parse(&format!(
+                "aliases:\n  alice:\n    contact_id: {contact_id}\n    typo: ignored\n"
+            ))
+            .is_err()
+        );
+        assert!(parse("aliases:\n  alice:\n    contact_id: invalid\n").is_err());
+    }
+
+    #[test]
     fn aliases_and_groups_parse() {
         let yaml = r#"
 aliases:
@@ -1514,7 +1594,7 @@ networks:
 "#;
         let spec = parse(yaml).unwrap();
         assert_eq!(
-            spec.aliases.get("alice").map(String::as_str),
+            spec.aliases.get("alice").and_then(AliasTarget::identity),
             Some("someidentitystring")
         );
         assert_eq!(spec.groups.get("admins").unwrap().len(), 2);

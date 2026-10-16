@@ -400,6 +400,21 @@ pub enum IpcMessage {
         #[serde(default)]
         reusable: bool,
     },
+    /// Queue and privately deliver an invite to a contact. Mutating, operator-only.
+    ContactInviteDeliver {
+        network: NetworkName,
+        contact_id: EndpointId,
+        identity: Option<EndpointId>,
+    },
+    /// Review received invitations without exposing their credentials. Open read.
+    Invitations,
+    InvitationAccept {
+        id: String,
+        hostname: Option<MachineHostname>,
+    },
+    InvitationDecline {
+        id: String,
+    },
     /// List invites for a network (coordinator-only).
     InviteList {
         network: String,
@@ -768,6 +783,9 @@ pub enum IpcMessage {
         id: String,
         expires_secs: u64,
     },
+    InvitationsResponse {
+        invitations: Vec<InvitationInfo>,
+    },
     /// The list of invites for a network.
     InviteListResponse {
         invites: Vec<InviteInfo>,
@@ -793,6 +811,25 @@ pub enum IpcMessage {
     ConfigValues {
         rows: Vec<(String, String)>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[strum(serialize_all = "lowercase")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Declined,
+    Expired,
+}
+
+/// Metadata only: inbox credentials never cross IPC or enter display output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationInfo {
+    pub id: String,
+    pub network: NetworkName,
+    pub coordinator: EndpointId,
+    pub expires: u64,
+    pub status: InvitationStatus,
 }
 
 /// A display-oriented view of one firewall rule, sent over IPC so the CLI can

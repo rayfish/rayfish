@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ray apply --invite-missing` privately delivers invitations to aliases with
+  `contact_id` and an optional `identity`. Offline delivery is queued across
+  restarts and repeated applies reuse live invites. Recipients review with
+  `ray invitations` and explicitly accept or decline before joining.
+
+### Fixed
+
+- `ray apply --dry-run` starts the membership diff on a new line after the YAML.
+
 ## [0.5.9] - 2026-10-15
 
 ### Added

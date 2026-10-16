@@ -1,6 +1,6 @@
 //! CLI firewall + declarative-apply handlers and their parsers/renderers.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::*;
 use firewall::Action;
@@ -796,6 +796,26 @@ pub(crate) async fn ipc_apply(
     // Validate alias identity strings CLI-side (where iroh parsing lives) and
     // canonicalize them so comparison against peer ids is format-insensitive.
     let aliases = canonicalize_aliases(&spec.aliases)?;
+    let contact_ids: BTreeSet<EndpointId> = spec
+        .aliases
+        .values()
+        .filter_map(|target| match target {
+            apply::AliasTarget::Contact {
+                contact_id,
+                identity: None,
+            } => Some(*contact_id),
+            _ => None,
+        })
+        .collect();
+    let mut contact_endpoints = BTreeMap::new();
+    for contact_id in contact_ids {
+        if let ipc::IpcMessage::ContactResolved { endpoint_id } =
+            ipc_request(ipc::IpcMessage::ResolveContact { contact_id }).await?
+        {
+            contact_endpoints.insert(contact_id, endpoint_id);
+        }
+    }
+    let mut missing_contacts = Vec::new();
 
     // Fetch live state once: status gives this node's identity, active networks,
     // per-peer identities, and joined hostnames.
@@ -816,16 +836,35 @@ pub(crate) async fn ipc_apply(
             .find(|n| &n.name == net_name)
             .map(|n| n.aliases.clone())
             .unwrap_or_default();
-        let net_aliases = apply::merge_aliases(&stored_aliases, &aliases);
-        let resolve = |identity: &str| -> Vec<String> {
-            resolve_identity_hosts(&status_networks, net_name, &self_id, identity)
+        let mut net_aliases: BTreeMap<_, _> = stored_aliases
+            .into_iter()
+            .map(|(name, identity)| (name, apply::AliasTarget::Identity(identity)))
+            .collect();
+        net_aliases.extend(aliases.clone());
+        let resolve = |target: &apply::AliasTarget| -> Vec<String> {
+            match target {
+                apply::AliasTarget::Identity(identity) => {
+                    resolve_identity_hosts(&status_networks, net_name, &self_id, identity)
+                }
+                apply::AliasTarget::Contact {
+                    identity,
+                    contact_id,
+                } => resolve_contact_hosts(
+                    &status_networks,
+                    net_name,
+                    &self_id,
+                    *identity,
+                    contact_endpoints.get(contact_id).copied(),
+                ),
+            }
         };
         let current = joined_hostnames(&status_networks, net_name)
             .into_iter()
             .map(|hostname| hostname.parse())
             .collect::<Result<HashSet<ipc::MachineHostname>, _>>()?;
         let (efw, empty_aliases) =
-            apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve, &current)?;
+            apply::expand_firewall_with(fw, &net_aliases, &spec.groups, &resolve, &current)?;
+        missing_contacts.extend(contact_deliveries(net_name, &spec.aliases, &empty_aliases));
         for a in empty_aliases {
             eprintln!(
                 "{}  {net_name}: alias '{a}' has no joined devices yet; resolves to no hosts",
@@ -836,46 +875,16 @@ pub(crate) async fn ipc_apply(
     }
 
     if dry_run {
-        println!("{}", style::bold("Spec (expanded):"));
-        print!("{}", apply::to_yaml(&expanded)?);
-        println!("{}", style::bold("Membership diff:"));
-        let mut changes = 0usize;
-        for (network_name, firewall) in &expanded.networks {
-            let current: HashSet<ipc::MachineHostname> =
-                joined_hostnames(&status_networks, network_name)
-                    .into_iter()
-                    .map(|hostname| hostname.parse())
-                    .collect::<std::result::Result<_, _>>()?;
-            let status_network = status_networks
-                .iter()
-                .find(|network| network.name == *network_name);
-            let membership = membership_diff_for_apply(
-                firewall,
-                &current,
-                status_network,
+        print!(
+            "{}",
+            render_apply_dry_run(
+                &expanded,
+                &status_networks,
                 &managed_machines,
-                network_name,
-            )?;
-            for hostname in membership.joins {
-                changes += 1;
-                println!("  join   {hostname} to {network_name}");
-            }
-            let local_hostname = status_networks
-                .iter()
-                .find(|network| network.name == *network_name)
-                .and_then(|network| network.my_hostname.as_deref());
-            for hostname in membership.leaves {
-                if local_hostname == Some(hostname.as_ref()) {
-                    continue;
-                }
-                changes += 1;
-                println!("  leave  {hostname} from {network_name}");
-            }
-        }
-        if changes == 0 {
-            println!("  no membership changes");
-        }
-        println!("{}", style::faint("(dry-run; no changes applied)"));
+                &missing_contacts,
+                invite_missing
+            )?
+        );
         return Ok(());
     }
 
@@ -1102,6 +1111,37 @@ pub(crate) async fn ipc_apply(
         }
     }
 
+    let has_missing_contacts = !missing_contacts.is_empty();
+    let mut delivery_failures = false;
+    if invite_missing {
+        for delivery in missing_contacts {
+            let request = ipc::IpcMessage::ContactInviteDeliver {
+                network: ipc::NetworkName::new(delivery.network.clone()),
+                contact_id: delivery.contact_id,
+                identity: delivery.identity,
+            };
+            match ipc_request(request).await {
+                Ok(ipc::IpcMessage::Ok { message }) => {
+                    println!("  {}: {message}", delivery.network)
+                }
+                Ok(ipc::IpcMessage::Error { message }) => {
+                    delivery_failures = true;
+                    eprintln!(
+                        "  ! {}: contact {}: {message}",
+                        delivery.network, delivery.contact_id
+                    );
+                }
+                _ => {
+                    delivery_failures = true;
+                    eprintln!(
+                        "  ! {}: contact {}: delivery request failed; re-run apply to retry",
+                        delivery.network, delivery.contact_id
+                    );
+                }
+            }
+        }
+    }
+
     // B3, report the membership gap.
     if missing_hosts.is_empty() {
         if removal_failures {
@@ -1109,6 +1149,11 @@ pub(crate) async fn ipc_apply(
                 "{} some managed removals remain unresolved",
                 style::red("  !")
             );
+        } else if has_missing_contacts {
+            println!("Some contact aliases have no joined devices; reapply after they join.");
+            if !invite_missing {
+                println!("Re-run with --invite-missing to deliver private invitations.");
+            }
         } else {
             println!("{}", style::green("All expected hosts have joined."));
         }
@@ -1144,9 +1189,70 @@ pub(crate) async fn ipc_apply(
             );
         }
     }
+    anyhow::ensure!(
+        !delivery_failures,
+        "some contact invitations could not be delivered"
+    );
     anyhow::ensure!(!removal_failures, "some members could not be removed");
     anyhow::ensure!(!ssh_failures, "some SSH grants could not be applied");
     Ok(())
+}
+
+/// Render the preview without issuing any mutating request, including invite minting.
+fn render_apply_dry_run(
+    expanded: &apply::DeploySpec,
+    networks: &[ipc::NetworkStatus],
+    machines: &[ipc::ManagedMachineInfo],
+    contacts: &[ContactInviteDelivery],
+    invite_missing: bool,
+) -> Result<String> {
+    use std::fmt::Write;
+    let mut output = String::new();
+    writeln!(output, "{}", style::bold("Spec (expanded):"))?;
+    writeln!(output, "{}", apply::to_yaml(expanded)?)?;
+    writeln!(output, "{}", style::bold("Membership diff:"))?;
+    let mut changes = 0usize;
+    for (network_name, firewall) in &expanded.networks {
+        let current: HashSet<ipc::MachineHostname> = joined_hostnames(networks, network_name)
+            .into_iter()
+            .map(|hostname| hostname.parse())
+            .collect::<std::result::Result<_, _>>()?;
+        let status_network = networks
+            .iter()
+            .find(|network| network.name == *network_name);
+        let membership =
+            membership_diff_for_apply(firewall, &current, status_network, machines, network_name)?;
+        for hostname in membership.joins {
+            changes += 1;
+            writeln!(output, "  join   {hostname} to {network_name}")?;
+        }
+        let local_hostname = networks
+            .iter()
+            .find(|network| network.name == *network_name)
+            .and_then(|network| network.my_hostname.as_deref());
+        for hostname in membership.leaves {
+            if local_hostname == Some(hostname.as_ref()) {
+                continue;
+            }
+            changes += 1;
+            writeln!(output, "  leave  {hostname} from {network_name}")?;
+        }
+    }
+    if invite_missing {
+        for delivery in contacts {
+            changes += 1;
+            writeln!(
+                output,
+                "  deliver invite privately to contact {} for {} (reuse live invite; queue if offline)",
+                delivery.contact_id, delivery.network
+            )?;
+        }
+    }
+    if changes == 0 {
+        writeln!(output, "  no membership changes")?;
+    }
+    writeln!(output, "{}", style::faint("(dry-run; no changes applied)"))?;
+    Ok(output)
 }
 
 fn managed_machine_for_hostname<'a>(
@@ -1414,19 +1520,80 @@ pub(crate) async fn ipc_status_full() -> Result<(EndpointId, Vec<ipc::NetworkSta
 /// erroring on a value that isn't a valid identity so a typo fails fast instead
 /// of silently resolving to nothing.
 fn canonicalize_aliases(
-    aliases: &std::collections::BTreeMap<String, String>,
-) -> Result<std::collections::BTreeMap<String, String>> {
-    aliases
-        .iter()
-        .map(|(name, id)| {
-            let parsed = id.parse::<iroh::EndpointId>().map_err(|_| {
-                anyhow::anyhow!(
-                    "alias '{name}' has an invalid identity '{id}' (copy it from `ray identityof <host>`)"
-                )
-            })?;
-            Ok((name.clone(), parsed.to_string()))
-        })
-        .collect()
+    aliases: &BTreeMap<String, apply::AliasTarget>,
+) -> Result<BTreeMap<String, apply::AliasTarget>> {
+    aliases.iter().map(|(name, target)| {
+        let target = match target {
+            apply::AliasTarget::Identity(id) => {
+                let identity = id.parse::<EndpointId>().map_err(|_| {
+                    anyhow::anyhow!("alias '{name}' has an invalid identity (copy it from `ray identityof <host>`)")
+                })?;
+                apply::AliasTarget::Identity(identity.to_string())
+            }
+            contact => contact.clone(),
+        };
+        Ok((name.clone(), target))
+    }).collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ContactInviteDelivery {
+    network: String,
+    contact_id: EndpointId,
+    identity: Option<EndpointId>,
+}
+
+fn contact_deliveries(
+    network: &str,
+    aliases: &BTreeMap<String, apply::AliasTarget>,
+    empty_aliases: &[String],
+) -> Vec<ContactInviteDelivery> {
+    let mut contacts = BTreeMap::new();
+    for name in empty_aliases {
+        if let Some(apply::AliasTarget::Contact {
+            identity,
+            contact_id,
+        }) = aliases.get(name)
+        {
+            contacts
+                .entry(*contact_id)
+                .or_insert(ContactInviteDelivery {
+                    network: network.to_string(),
+                    contact_id: *contact_id,
+                    identity: *identity,
+                });
+        }
+    }
+    contacts.into_values().collect()
+}
+
+fn resolve_contact_hosts(
+    networks: &[ipc::NetworkStatus],
+    network: &str,
+    self_id: &str,
+    identity: Option<EndpointId>,
+    endpoint: Option<EndpointId>,
+) -> Vec<String> {
+    let mut hosts = identity
+        .map(|id| resolve_identity_hosts(networks, network, self_id, &id.to_string()))
+        .unwrap_or_default();
+    if let Some(endpoint) = endpoint {
+        let user = networks
+            .iter()
+            .find(|n| n.name == network)
+            .and_then(|n| n.peers.iter().find(|p| p.endpoint_id == endpoint))
+            .and_then(|p| p.user_identity)
+            .unwrap_or(endpoint);
+        hosts.extend(resolve_identity_hosts(
+            networks,
+            network,
+            self_id,
+            &user.to_string(),
+        ));
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 /// Collect the hostnames currently joined for `identity` in `network`: every
@@ -1543,6 +1710,118 @@ pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::SecretKey;
+
+    fn contact_spec() -> apply::DeploySpec {
+        let identity = SecretKey::from([31; 32]).public();
+        let contact = SecretKey::from([32; 32]).public();
+        serde_yml::from_str(&format!(
+            r#"
+aliases:
+  old: {identity}
+  alice:
+    identity: {identity}
+    contact_id: {contact}
+  unused:
+    contact_id: {contact}
+groups:
+  team: [old, alice]
+networks:
+  n:
+    server:
+      allows:
+        team: tcp:12345
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn apply_identity_aliases_never_plan_delivery_and_contacts_must_be_referenced() {
+        let spec = contact_spec();
+        let aliases = canonicalize_aliases(&spec.aliases).unwrap();
+        let (_, empty) = apply::expand_firewall_with(
+            &spec.networks["n"],
+            &aliases,
+            &spec.groups,
+            &|_| vec![],
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(empty, ["alice", "old"]);
+        let deliveries = contact_deliveries("n", &spec.aliases, &empty);
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].identity.is_some());
+        assert!(contact_deliveries("n", &spec.aliases, &["old".into()]).is_empty());
+        assert!(contact_deliveries("n", &spec.aliases, &[]).is_empty());
+        let mut identity_only = spec.clone();
+        identity_only.aliases.retain(|name, _| name == "old");
+        assert!(contact_deliveries("n", &identity_only.aliases, &empty).is_empty());
+    }
+
+    #[test]
+    fn apply_contact_membership_uses_supplied_identity_even_when_contact_is_offline() {
+        let self_id = SecretKey::from([30; 32]).public().to_string();
+        let user = SecretKey::from([31; 32]).public();
+        let first = peer("laptop", Some(user));
+        let networks = [net(None, vec![first.clone(), peer("tablet", Some(user))])];
+        assert_eq!(
+            resolve_contact_hosts(&networks, "n", &self_id, Some(user), None),
+            ["laptop", "tablet"]
+        );
+        assert_eq!(
+            resolve_contact_hosts(&networks, "n", &self_id, None, Some(first.endpoint_id)),
+            ["laptop", "tablet"]
+        );
+        assert!(
+            resolve_contact_hosts(
+                &networks,
+                "other-net",
+                &self_id,
+                Some(user),
+                Some(first.endpoint_id)
+            )
+            .is_empty()
+        );
+        assert!(resolve_contact_hosts(&networks, "n", &self_id, None, None).is_empty());
+    }
+
+    #[test]
+    fn apply_dry_run_previews_private_delivery_and_separates_membership_heading() {
+        let spec = contact_spec();
+        let aliases = canonicalize_aliases(&spec.aliases).unwrap();
+        let (firewall, empty) = apply::expand_firewall_with(
+            &spec.networks["n"],
+            &aliases,
+            &spec.groups,
+            &|_| vec![],
+            &HashSet::new(),
+        )
+        .unwrap();
+        let mut expanded = apply::DeploySpec::default();
+        expanded.networks.insert("n".into(), firewall);
+        let contacts = contact_deliveries("n", &spec.aliases, &empty);
+        let preview = render_apply_dry_run(&expanded, &[], &[], &contacts, true).unwrap();
+        assert!(preview.contains("deliver invite privately to contact"));
+        assert!(preview.contains("queue if offline"));
+        assert!(preview.contains("\nMembership diff:"));
+        assert!(preview.contains("no changes applied"));
+        assert!(!preview.contains("ray join"));
+        let plain = render_apply_dry_run(&expanded, &[], &[], &contacts, false).unwrap();
+        assert!(!plain.contains("deliver invite"));
+        // A nonempty final YAML value must also end before the heading.
+        expanded
+            .networks
+            .get_mut("n")
+            .unwrap()
+            .get_mut("server")
+            .unwrap()
+            .allows
+            .insert("build-box".into(), "tcp:12345".into());
+        let preview = render_apply_dry_run(&expanded, &[], &[], &[], false).unwrap();
+        let heading = preview.find("Membership diff:").unwrap();
+        assert!(preview[..heading].ends_with('\n'));
+    }
 
     /// `IpcMessage` has no `PartialEq` (it carries wire types that don't want
     /// one), so compare the settings-key mapping as a tuple.

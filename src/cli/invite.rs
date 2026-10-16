@@ -251,3 +251,50 @@ pub(crate) async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
     .await?;
     print_ok_reply(response)
 }
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct InvitationsOutput(Vec<ipc::InvitationInfo>);
+
+impl DisplayOut for InvitationsOutput {
+    fn print_human(&self) {
+        if self.0.is_empty() {
+            println!("no received invitations");
+            return;
+        }
+        for invite in &self.0 {
+            println!(
+                "{}  {}  from {}  {}  expires {}",
+                invite.id, invite.network, invite.coordinator, invite.status, invite.expires
+            );
+        }
+        println!(
+            "Review the sender and network, then run: ray invitations accept <id> (or decline <id>)"
+        );
+    }
+}
+
+pub(crate) async fn ipc_invitations(action: Option<InvitationAction>) -> Result<()> {
+    let request = match action {
+        None => ipc::IpcMessage::Invitations,
+        Some(InvitationAction::Accept { id, hostname }) => {
+            ipc::IpcMessage::InvitationAccept { id, hostname }
+        }
+        Some(InvitationAction::Decline { id }) => ipc::IpcMessage::InvitationDecline { id },
+    };
+    match ipc_request(request).await? {
+        ipc::IpcMessage::InvitationsResponse { invitations } => {
+            printout(&InvitationsOutput(invitations))
+        }
+        ipc::IpcMessage::Joined { name, .. } => {
+            println!("joined {name}");
+            Ok(())
+        }
+        ipc::IpcMessage::Ok { message } => {
+            println!("{message}");
+            Ok(())
+        }
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        _ => anyhow::bail!("unexpected invitation response"),
+    }
+}

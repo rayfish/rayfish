@@ -71,13 +71,15 @@ pub(crate) struct ConnectService {
     pub(crate) outgoing_connects: DashSet<EndpointId>,
     /// Foundation handles (endpoint + contact id) for the connect handshake and
     /// contact-record publishing.
-    transport: Arc<Transport>,
+    pub(super) transport: Arc<Transport>,
     /// Whether the data plane is active, gating immediate contact republish on
     /// key rotation.
     active: Arc<AtomicBool>,
+    pub(super) invite_delivery_lock: AsyncMutex<()>,
+    pub(super) inbox_lock: AsyncMutex<()>,
     /// The network-owning service, for minting/joining the 2-peer direct network
     /// once a connect request is approved.
-    registry: Arc<NetworkRegistry>,
+    pub(super) registry: Arc<NetworkRegistry>,
 }
 
 impl ConnectService {
@@ -87,6 +89,8 @@ impl ConnectService {
         registry: Arc<NetworkRegistry>,
     ) -> Self {
         Self {
+            invite_delivery_lock: AsyncMutex::new(()),
+            inbox_lock: AsyncMutex::new(()),
             pending_connects: DashMap::new(),
             approved_connects: DashMap::new(),
             outgoing_connects: DashSet::new(),
@@ -439,6 +443,30 @@ impl ConnectService {
                         return;
                     }
                 };
+                if let control::ConnectMsg::InviteOffer {
+                    network,
+                    network_key,
+                    recipient_contact,
+                    secret,
+                    expires,
+                } = &request
+                {
+                    let reply = self
+                        .receive_invitation(
+                            *recipient_contact,
+                            super::contact_invites::ReceivedInvitation::new(
+                                network.clone(),
+                                *network_key,
+                                remote_id,
+                                secret.clone(),
+                                *expires,
+                            ),
+                        )
+                        .await;
+                    let _ = control::send_framed(&mut send, &reply).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                    return;
+                }
                 if let control::ConnectMsg::Request {
                     from_contact_id,
                     from_endpoint,

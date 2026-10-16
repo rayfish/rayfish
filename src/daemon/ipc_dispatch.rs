@@ -16,6 +16,7 @@ impl Daemon {
                 | IpcMessage::FirewallSshShow
                 | IpcMessage::ExitNodeStatus { .. }
                 | IpcMessage::ListFiles
+                | IpcMessage::Invitations
                 | IpcMessage::Connections
                 | IpcMessage::Requests { .. }
                 | IpcMessage::ContactId
@@ -675,6 +676,20 @@ impl Daemon {
                 value,
             } => self.net_config_apply(&network, key, &value).await,
             IpcMessage::NetConfigGet { network, key } => self.net_config_get(&network, key),
+            IpcMessage::ContactInviteDeliver {
+                network,
+                contact_id,
+                identity,
+            } => {
+                self.connect
+                    .deliver_contact_invite(network.as_ref(), contact_id, identity)
+                    .await
+            }
+            IpcMessage::Invitations => self.connect.list_invitations().await,
+            IpcMessage::InvitationAccept { id, hostname } => {
+                self.connect.accept_invitation(&id, hostname).await
+            }
+            IpcMessage::InvitationDecline { id } => self.connect.decline_invitation(&id).await,
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,
@@ -708,17 +723,12 @@ impl Daemon {
                 contact_id: self.contact_public.to_string(),
             },
             IpcMessage::ResolveContact { contact_id } => {
-                let result = async {
-                    let client = dht::create_pkarr_client(
-                        &self.transport.endpoint,
-                        &self.transport.pkarr_relay_url,
-                    )?;
-                    dht::resolve_contact(&client, contact_id).await
-                }
-                .await;
-                match result {
+                match self.connect.resolve_invite_contact(contact_id).await {
                     Ok(endpoint_id) => IpcMessage::ContactResolved { endpoint_id },
-                    Err(error) => ipc_err(format!("could not resolve contact: {error:#}")),
+                    Err(_) => match self.connect.known_contact_endpoint(contact_id) {
+                        Some(endpoint_id) => IpcMessage::ContactResolved { endpoint_id },
+                        None => ipc_err("contact offline or unknown".to_string()),
+                    },
                 }
             }
             IpcMessage::RotateContact => self.rotate_contact().await,
@@ -759,6 +769,27 @@ fn save_global(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invitation_metadata_is_open_but_delivery_and_acceptance_require_authorization() {
+        assert!(Daemon::is_open_read(&IpcMessage::Invitations));
+        for request in [
+            IpcMessage::InvitationAccept {
+                id: "example-id".into(),
+                hostname: None,
+            },
+            IpcMessage::InvitationDecline {
+                id: "example-id".into(),
+            },
+            IpcMessage::ContactInviteDeliver {
+                network: ipc::NetworkName::new("sample-net".into()),
+                contact_id: SecretKey::from([7; 32]).public(),
+                identity: None,
+            },
+        ] {
+            assert!(!Daemon::is_open_read(&request));
+        }
+    }
 
     #[test]
     fn contact_lookup_is_an_open_read() {
