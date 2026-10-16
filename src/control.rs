@@ -100,7 +100,7 @@ pub enum PairMsg {
 }
 
 /// Messages for the `ray connect` friend-request handshake (ALPN
-/// `rayfish/connect/3`). The initiator (A) dials the recipient's (B) contact
+/// `rayfish/connect/2`). The initiator (A) dials the recipient's (B) contact
 /// key, sends `Request`, and polls until `Approved`. Approval is recipient-only:
 /// only B acts, A just waits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
