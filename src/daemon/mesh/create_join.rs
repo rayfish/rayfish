@@ -452,18 +452,19 @@ impl NetworkRegistry {
         // If our own primary has nullified this device in the signed blob
         // (`ray unpair`), tear ourselves out instead of trying (and failing) to
         // join. This is the reliable teardown path when the device was offline at
-        // unpair time (so it never got `ControlMsg::Unpaired`) and the coordinator
+        // unpair time (so it never got the primary's notice) and the coordinator
         // now rejects its cert at the mesh handshake: the blob is fetched from the
         // record's seed peers, needs no mesh admission, and this runs on every
-        // startup restore + reconnect. Spawn `unpair_self` (delete the cert +
-        // leave every network) so it runs off this join path.
+        // startup restore + reconnect. Spawn the unpair (delete the cert + leave
+        // every network) so it runs off this join path; it keeps a pairing that
+        // completes first.
         if let Some(cert) = self.current_device_cert()
             && self_is_nullified(&cert, &data.members, &data.nullifiers)
         {
             tracing::warn!(network = %network_key, "this device is nullified by its primary in the signed blob; unpairing self");
             let registry = Arc::clone(self);
             tokio::spawn(async move {
-                let _ = registry.unpair_self().await;
+                registry.unpair_nullified(cert).await;
             });
             anyhow::bail!("this device has been unpaired by its primary");
         }
@@ -1622,14 +1623,16 @@ mod tests {
     }
 
     #[test]
-    fn a_v5_record_is_speakable_by_v6() {
-        assert!(mesh_version_is_speakable(Some(5), 6));
-        assert!(
-            gate_mesh_version(Some(5), 6, VersionGate::Refuse)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!mesh_version_is_speakable(Some(4), 6));
+    fn v5_and_v6_records_are_speakable_by_v7() {
+        for older in [5, 6] {
+            assert!(mesh_version_is_speakable(Some(older), 7));
+            assert!(
+                gate_mesh_version(Some(older), 7, VersionGate::Refuse)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(!mesh_version_is_speakable(Some(4), 7));
     }
 
     fn id(seed: u8) -> EndpointId {

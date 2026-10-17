@@ -50,9 +50,9 @@ pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
 /// ephemeral port (see `create_endpoint_with_alpns`).
 pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 
-/// Latest mesh wire-protocol version. The endpoint also accepts v5 so old peers
-/// can connect during the fragmentation rollout. Bump this on breaking changes;
-/// keep each supported older ALPN bound to its own wire behavior.
+/// Latest mesh wire-protocol version. The endpoint also accepts v6 and v5 so old
+/// peers can connect during the rollouts. Bump this on breaking changes; keep
+/// each supported older ALPN bound to its own wire behavior.
 ///
 /// Bumped to 2 for the single-connection-per-identity change: one mesh ALPN carries
 /// every shared network (network selection is now in-band, a `ControlFrame.net`
@@ -87,10 +87,16 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Version 6 adds fragmentation below IP so a 1280-byte IPv6 packet survives
 /// paths whose QUIC datagram budget is smaller. A v5 connection sends whole
 /// packets only; its reader cannot decode fragment framing.
-pub const MESH_PROTOCOL_VERSION: u32 = 6;
+///
+/// Version 7 tells a device which pairing an unpair notice ends
+/// (`ControlMsg::PairingRevoked`), so a notice read after the device paired
+/// again is not taken for one about the new pairing. A v6 or v5 connection
+/// carries the bare `ControlMsg::Unpaired` instead; nothing else differs from
+/// v6.
+pub const MESH_PROTOCOL_VERSION: u32 = 7;
 /// Older mesh versions this build speaks, newest first. Add a version here only
 /// after its connection-scoped wire behavior is implemented and tested.
-pub const MESH_BACKWARDS_COMPAT: &[u32] = &[5];
+pub const MESH_BACKWARDS_COMPAT: &[u32] = &[6, 5];
 /// Keep the signed network record readable by v5 clients during the rollout.
 /// Once v5 support is removed, this can advance with the mesh ALPN.
 pub const MESH_RECORD_VERSION: u32 = if MESH_BACKWARDS_COMPAT.is_empty() {
@@ -98,6 +104,7 @@ pub const MESH_RECORD_VERSION: u32 = if MESH_BACKWARDS_COMPAT.is_empty() {
 } else {
     MESH_BACKWARDS_COMPAT[MESH_BACKWARDS_COMPAT.len() - 1]
 };
+pub const MESH_V6_ALPN: &[u8] = b"rayfish/mesh/6";
 pub const MESH_V5_ALPN: &[u8] = b"rayfish/mesh/5";
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
@@ -793,48 +800,50 @@ mod tests {
         // The mesh ALPN is a single node-wide protocol id, no per-network suffix.
         let expected = format!("rayfish/mesh/{MESH_PROTOCOL_VERSION}");
         assert_eq!(mesh_alpn(), expected.as_bytes());
-        assert_eq!(mesh_alpns()[1], MESH_V5_ALPN);
+        assert_eq!(mesh_alpns()[1..], [MESH_V6_ALPN, MESH_V5_ALPN]);
     }
 
     #[tokio::test]
-    async fn mesh_dial_falls_back_to_v5() {
+    async fn mesh_dial_falls_back_to_older_versions() {
         use iroh::endpoint::presets;
         use std::time::Duration;
         use tokio::time::timeout;
 
-        let lookup = MemoryLookup::new();
-        let newer = Endpoint::builder(presets::N0)
-            .alpns(mesh_alpns())
-            .address_lookup(lookup.clone())
-            .relay_mode(RelayMode::Disabled)
-            .bind()
-            .await
-            .unwrap();
-        let older = Endpoint::builder(presets::N0)
-            .alpns(vec![MESH_V5_ALPN.to_vec()])
-            .relay_mode(RelayMode::Disabled)
-            .bind()
-            .await
-            .unwrap();
-        lookup.add_endpoint_info(older.addr());
-        let preferred = mesh_alpn();
-        let dial = connect_to_peer_with_alpn(&newer, older.id(), &preferred);
-        let accept = async {
-            loop {
-                let incoming = older.accept().await.unwrap();
-                if let Ok(conn) = incoming.await {
-                    return conn;
-                }
-            }
-        };
-        let (dialed, accepted) =
-            timeout(Duration::from_secs(5), async { tokio::join!(dial, accept) })
+        for version in [MESH_V6_ALPN, MESH_V5_ALPN] {
+            let lookup = MemoryLookup::new();
+            let newer = Endpoint::builder(presets::N0)
+                .alpns(mesh_alpns())
+                .address_lookup(lookup.clone())
+                .relay_mode(RelayMode::Disabled)
+                .bind()
                 .await
                 .unwrap();
-        assert_eq!(dialed.unwrap().alpn(), MESH_V5_ALPN);
-        assert_eq!(accepted.alpn(), MESH_V5_ALPN);
-        newer.close().await;
-        older.close().await;
+            let older = Endpoint::builder(presets::N0)
+                .alpns(vec![version.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap();
+            lookup.add_endpoint_info(older.addr());
+            let preferred = mesh_alpn();
+            let dial = connect_to_peer_with_alpn(&newer, older.id(), &preferred);
+            let accept = async {
+                loop {
+                    let incoming = older.accept().await.unwrap();
+                    if let Ok(conn) = incoming.await {
+                        return conn;
+                    }
+                }
+            };
+            let (dialed, accepted) =
+                timeout(Duration::from_secs(5), async { tokio::join!(dial, accept) })
+                    .await
+                    .unwrap();
+            assert_eq!(dialed.unwrap().alpn(), version);
+            assert_eq!(accepted.alpn(), version);
+            newer.close().await;
+            older.close().await;
+        }
     }
 
     #[test]

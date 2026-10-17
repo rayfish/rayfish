@@ -205,6 +205,22 @@ pub(crate) struct NetworkRegistry {
     /// The cost of a missed nudge is one tick of staleness, which is what the
     /// poll was for anyway.
     pub(crate) poll_nudge: Arc<Notify>,
+    /// Wakes [`Self::run_unpair_requests`] when this device saves an unpair, or
+    /// finds the primary of one reachable.
+    pub(crate) unpair_nudge: Arc<Notify>,
+    /// Held while this device pairs or unpairs itself, and across each attempt
+    /// at its saved unpairs, so none of them sees another half done: a request
+    /// sent while a pairing with its primary completes would revoke that
+    /// pairing, and a pairing must not start before an unpair's cleanup ends.
+    pub(crate) unpair_lock: AsyncMutex<()>,
+    /// Wakes [`Self::run_unpair_notices`] when `ray unpair` saves a device to
+    /// tell.
+    pub(crate) notice_nudge: Arc<Notify>,
+    /// Held across each revocation of a device and each re-authorization of a
+    /// device that paired again, so neither runs in the middle of the other: a
+    /// revocation still under way when the device pairs again would put back
+    /// the nullifiers the re-authorization clears.
+    pub(crate) revocation_lock: AsyncMutex<()>,
 }
 
 /// One saved network the restore supervisor found missing from the live map,
@@ -252,7 +268,7 @@ pub(crate) fn missing_networks(
         .collect()
 }
 
-fn networks_joined_with_certificate(
+pub(crate) fn networks_joined_with_certificate(
     saved: &[config::NetworkConfig],
     primary: EndpointId,
 ) -> Vec<String> {
@@ -312,6 +328,10 @@ impl NetworkRegistry {
             restore_errors: Arc::new(DashMap::new()),
             restore_nudge: Arc::new(Notify::new()),
             poll_nudge: Arc::new(Notify::new()),
+            unpair_nudge: Arc::new(Notify::new()),
+            unpair_lock: AsyncMutex::new(()),
+            notice_nudge: Arc::new(Notify::new()),
+            revocation_lock: AsyncMutex::new(()),
         }
     }
 
@@ -557,15 +577,14 @@ impl NetworkRegistry {
         Ok(())
     }
 
-    /// Unpair *this* device from its primary, locally: leave only networks whose
-    /// first join used this primary's certificate, then delete the stored cert.
-    /// Called by the phone's unpair control, the IPC path, and the device-side
-    /// `ControlMsg::Unpaired` / self-nullify handlers (was the `self_unpair_tx`
-    /// hand-off to the daemon loop). A device with no cert (a primary) is a no-op.
-    pub(crate) async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
-        let Some(cert) = self.current_device_cert() else {
-            return ipc_err("this device is not paired to a primary".to_string());
-        };
+    /// The local cleanup of an unpair from `cert`'s primary: leave only networks
+    /// whose first join used that primary's certificate, then delete the stored
+    /// cert. Part of [`Self::unpair_self`], which saves the unpair first and
+    /// makes this cleanup durable before it asks the primary to record it.
+    pub(crate) async fn leave_certificate_networks(
+        self: &Arc<Self>,
+        cert: &control::DeviceCert,
+    ) -> IpcMessage {
         let cfg = match config::load() {
             Ok(cfg) => cfg,
             Err(error) => return ipc_err(format!("could not read saved networks: {error}")),
@@ -702,9 +721,9 @@ impl NetworkRegistry {
     /// Send `LeaveNetwork` to the peer at `ip`, dialing it first when no link is up.
     ///
     /// A named, boxed future rather than an `async fn`: the dial spawns the new
-    /// link's control loop, and an `Unpaired` arriving on that loop leaves networks
-    /// through here again (`unpair_self`), so the loop's future type would
-    /// otherwise contain itself.
+    /// link's control loop, and an unpair notice arriving on that loop leaves
+    /// networks through here again (`unpair_self`), so the loop's future type
+    /// would otherwise contain itself.
     fn deliver_leave(
         self: &Arc<Self>,
         ip: Ipv6Addr,
@@ -721,7 +740,7 @@ impl NetworkRegistry {
                 .peers
                 .conn_for_ip(&ip)
                 .context("the link closed before the leave was sent")?;
-            send_leave(&conn, net_pubkey).await
+            send_confirmed(&conn, Some(net_pubkey), &ControlMsg::LeaveNetwork).await
         })
     }
 
@@ -1477,9 +1496,11 @@ impl NetworkRegistry {
     /// it from the durable `revoked_devices` seed and from every coordinated
     /// network's blob nullifier set, republishing so the device's fresh cert is
     /// honored mesh wide again. Non-coordinated networks clear on their own
-    /// coordinator's next reseal. Best-effort; a persist/publish failure is
-    /// logged, not surfaced.
+    /// coordinator's next reseal. Waits for a revocation under way, which an
+    /// unpair the device asked for before this pairing can still be. Best-effort;
+    /// a persist/publish failure is logged, not surfaced.
     pub(crate) async fn reauth_device(self: &Arc<Self>, device: EndpointId) {
+        let _revoking = self.revocation_lock.lock().await;
         // Drop from the durable nullifier seed so a later reseal won't re-add it.
         let hex = device.to_string();
         // No-op when the device was not in the seed: `update_settings` skips the

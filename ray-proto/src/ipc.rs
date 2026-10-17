@@ -323,9 +323,10 @@ pub enum IpcMessage {
         password: Option<String>,
     },
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
-    /// Publishes a signed revocation record, drops the device locally, severs it
-    /// from networks this node coordinates, and best-effort signals the device to
-    /// wipe its own cert. Reply: [`IpcMessage::Ok`] / [`IpcMessage::Error`].
+    /// Saves the revocation, nullifies the device's cert in the signed blob of
+    /// every network this node coordinates and severs it there, then tells the
+    /// device to wipe its own cert until it confirms. Reply: [`IpcMessage::Ok`] /
+    /// [`IpcMessage::Error`].
     Unpair {
         /// Device identifier: hostname, mesh IP, short id, or full endpoint id.
         device: String,

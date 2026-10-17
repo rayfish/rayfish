@@ -7,8 +7,9 @@ use iroh_dns::pkarr::SignedPacket;
 use super::super::*;
 use crate::dht::destruction;
 
+// `pub(super)`: the unpair tests share its local discovery relay.
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 impl NetworkRegistry {
     pub(crate) async fn forget_destroyed_key(&self, packet: &SignedPacket) -> Result<()> {

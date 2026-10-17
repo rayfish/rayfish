@@ -19,14 +19,22 @@ struct NetworkToNullify {
     independent: bool,
 }
 
-fn revoke_certificate_from_roster(members: &mut MemberList, target: EndpointId, independent: bool) {
+/// Drop `target`'s certificate from the roster: the whole entry when it joined
+/// with the certificate, only the binding when it was a member before pairing.
+/// Returns whether the roster changed.
+fn revoke_certificate_from_roster(
+    members: &mut MemberList,
+    target: EndpointId,
+    independent: bool,
+) -> bool {
     if independent {
-        if let Some(member) = members.get_mut(&target) {
-            member.user_identity = None;
-            member.device_cert = None;
-        }
+        members.get_mut(&target).is_some_and(|member| {
+            let user = member.user_identity.take();
+            let cert = member.device_cert.take();
+            user.is_some() || cert.is_some()
+        })
     } else {
-        members.remove(&target);
+        members.remove(&target).is_some()
     }
 }
 
@@ -273,26 +281,21 @@ impl NetworkRegistry {
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after in-band leave");
     }
 
-    /// Nullify a paired secondary device across every network we coordinate: add
-    /// its key to the signed blob's nullifier set, drop certificate-joined roster
-    /// entries, republish, and sever those links; persist the key in `revoked_devices`
-    /// (the durable nullifier seed that survives a restart). Shared by `ray unpair
-    /// <device>` (primary-initiated) and the `ControlMsg::RequestUnpair` handler (a
-    /// secondary asking its primary to revoke it). Returns the device's display
-    /// name, or an error string if `target` is not one of our paired devices, so a
-    /// stranger's request is rejected. Only a network-key holder writes nullifiers,
-    /// so on a network we don't coordinate this is a no-op for that network.
+    /// Nullify a paired secondary device (see [`Self::revoke_device_locked`])
+    /// once the rosters confirm it is one: for `ray unpair <device>`, and for the
+    /// legacy `ControlMsg::RequestUnpair` of a device too old to send
+    /// `PairMsg::UnpairRequest`. Returns the device's display name, or an error
+    /// string if `target` is not one of our paired devices, so a stranger's
+    /// request is rejected. `notify` saves, with the revocation, that the device
+    /// has yet to be told, naming its latest pairing (`pending_unpair_notices`).
     pub(crate) async fn nullify_device(
         self: &Arc<Self>,
         target: EndpointId,
+        notify: bool,
     ) -> Result<String, String> {
         let own_user = self.transport.endpoint.id();
-        // Confirm the target is one of our paired devices, grab a display name, and
-        // snapshot each network's handles (cloning the Arc state) so the DashMap
-        // guards drop before any await.
         let mut display = target.fmt_short().to_string();
         let mut is_paired = false;
-        let mut nets = Vec::new();
         for entry in self.networks.iter() {
             let s = entry.value().state.read().unwrap();
             if let Some(m) = s.members.get(&target)
@@ -303,10 +306,49 @@ impl NetworkRegistry {
                     display = h.clone();
                 }
             }
-            if s.network_secret_key.is_none() {
+        }
+        if !is_paired {
+            return Err(format!(
+                "'{}' is not one of your paired devices (see `ray pair list`)",
+                target.fmt_short()
+            ));
+        }
+        let _revoking = self.revocation_lock.lock().await;
+        self.revoke_device_locked(target, |cfg| {
+            if notify {
+                super::unpair::save_unpair_notice(cfg, target);
+            }
+        })
+        .await?;
+        Ok(display)
+    }
+
+    /// Revoke `target`'s device certificate. Its key is saved in
+    /// `revoked_devices` first, the durable nullifier seed that survives a
+    /// restart, in the same write as whatever `also` changes. Then, on every
+    /// network we coordinate, the key joins the signed blob's nullifier set, the
+    /// certificate-joined roster entries go, and the network is republished and
+    /// its links to the device severed. Only a network-key holder writes
+    /// nullifiers, so a network we don't coordinate is left alone.
+    ///
+    /// The caller has established that `target` is our paired device: from the
+    /// rosters, or from the certificate in a `PairMsg::UnpairRequest`, which can
+    /// arrive after the device has left them. Safe to repeat: a network that
+    /// already nullifies the device is not republished. The caller holds
+    /// [`Self::revocation_lock`], which keeps a re-authorization of the device
+    /// from running in the middle.
+    pub(crate) async fn revoke_device_locked(
+        self: &Arc<Self>,
+        target: EndpointId,
+        also: impl FnOnce(&mut config::AppConfig),
+    ) -> Result<(), String> {
+        // Snapshot each coordinated network's handles (cloning the Arc state) so
+        // the DashMap guards drop before any await.
+        let mut nets = Vec::new();
+        for entry in self.networks.iter() {
+            if entry.state.read().unwrap().network_secret_key.is_none() {
                 continue;
             }
-            drop(s);
             let name = entry.key().clone();
             let state = Arc::clone(&entry.value().state);
             let dht_notify = entry.value().dht_notify.clone();
@@ -321,12 +363,6 @@ impl NetworkRegistry {
                 independent,
             });
         }
-        if !is_paired {
-            return Err(format!(
-                "'{}' is not one of your paired devices (see `ray pair list`)",
-                target.fmt_short()
-            ));
-        }
 
         // Persist the nullifier seed so it survives a restart and is unioned into
         // every coordinated network's blob at seal time.
@@ -335,6 +371,7 @@ impl NetworkRegistry {
             if !cfg.revoked_devices.contains(&hex) {
                 cfg.revoked_devices.push(hex);
             }
+            also(cfg);
             Ok(())
         }) {
             return Err(format!("failed to persist nullifier: {e}"));
@@ -344,11 +381,16 @@ impl NetworkRegistry {
         // Nullify on every network we coordinate (add to the signed blob's
         // nullifier set + drop it from the roster), republish, and sever links.
         for net in nets {
-            {
+            let changed = {
                 let mut state = net.state.write().unwrap();
-                state.nullifiers.insert(target);
-                revoke_certificate_from_roster(&mut state.members, target, net.independent);
-                state.approved.remove(&target);
+                let nullified = state.nullifiers.insert(target);
+                let revoked =
+                    revoke_certificate_from_roster(&mut state.members, target, net.independent);
+                let unapproved = state.approved.remove(&target).is_some();
+                nullified || revoked || unapproved
+            };
+            if !changed {
+                continue;
             }
             if !net.independent {
                 dns::remove_hostname_by_ip(
@@ -377,7 +419,7 @@ impl NetworkRegistry {
         }
 
         tracing::info!(device = %target.fmt_short(), "nullified device");
-        Ok(display)
+        Ok(())
     }
 
     /// Dial a peer once (no backoff) over the mesh ALPN, send `MeshHello` on every

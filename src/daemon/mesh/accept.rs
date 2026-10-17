@@ -164,6 +164,7 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         | ControlMsg::Ping { .. }
         | ControlMsg::Pong { .. }
         | ControlMsg::Unpaired
+        | ControlMsg::PairingRevoked { .. }
         | ControlMsg::CertRefresh { .. }
         | ControlMsg::RequestUnpair
         | ControlMsg::NotSupported { .. }
@@ -1985,6 +1986,7 @@ impl ProtocolRouter {
                 FilesProtocol(Arc::clone(&self.files)),
             )
             .accept(daemon::PAIR_ALPN, PairProtocol(Arc::clone(&self.files)))
+            .accept(daemon::PAIR_V2_ALPN, PairProtocol(Arc::clone(&self.files)))
             .accept(
                 transport::CONNECT_ALPN,
                 ConnectProtocol(Arc::clone(&self.connect)),

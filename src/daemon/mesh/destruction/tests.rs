@@ -29,11 +29,12 @@ impl Drop for ConfigDir {
 }
 
 /// A local discovery relay. Requests go through the real pkarr client and its
-/// signature verification; no production discovery service is used.
-struct Relay {
-    url: Url,
+/// signature verification; no production discovery service is used. Shared
+/// with the unpair tests.
+pub(in crate::daemon::mesh) struct Relay {
+    pub(in crate::daemon::mesh) url: Url,
     records: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    fail: Arc<AtomicBool>,
+    pub(in crate::daemon::mesh) fail: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
@@ -44,7 +45,7 @@ impl Drop for Relay {
 }
 
 impl Relay {
-    async fn start() -> Self {
+    pub(in crate::daemon::mesh) async fn start() -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let records = Arc::new(RwLock::new(HashMap::new()));

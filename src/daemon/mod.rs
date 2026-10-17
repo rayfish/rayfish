@@ -293,10 +293,27 @@ use mdns::MdnsDiscovery;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
+/// ALPN for the device-pairing protocol. The trailing number is its protocol
 /// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-const PAIR_ALPN: &[u8] = b"rayfish/pair/2";
+/// Version 3 adds the unpair exchange (`PairMsg::UnpairRequest`).
+const PAIR_ALPN: &[u8] = b"rayfish/pair/3";
+
+/// The previous pairing protocol version, still served and offered so pairing
+/// and the network list keep working between builds. A connection that
+/// negotiates it is refused the version 3 messages, and it tells a device that
+/// its primary cannot record an unpair yet.
+const PAIR_V2_ALPN: &[u8] = b"rayfish/pair/2";
+
+/// Dial `addr` for the pairing protocol, offering version 2 as well so that a
+/// primary on an older build still answers. The caller checks the negotiated
+/// ALPN before sending a version 3 message.
+async fn connect_pair(endpoint: &Endpoint, addr: iroh::EndpointAddr) -> Result<Connection> {
+    let options =
+        iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![PAIR_V2_ALPN.to_vec()]);
+    let connecting = endpoint.connect_with_opts(addr, PAIR_ALPN, options).await?;
+    Ok(connecting.await?)
+}
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
@@ -334,7 +351,7 @@ pub(crate) struct MeshCtx {
     /// keeps disconnect handling serial (one check-then-act at a time).
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     /// The network-owning service. Control readers reach it through the ctx to
-    /// run network ops directly (e.g. `unpair_self` on a `ControlMsg::Unpaired` or
+    /// run network ops directly (e.g. the unpair a primary's notice asks for, or
     /// a self-nullify during reconverge) instead of signalling the daemon loop.
     registry: Arc<NetworkRegistry>,
 }
@@ -1749,18 +1766,23 @@ async fn open_and_send(conn: &Connection, net: Option<EndpointId>, msg: &Control
     control::send_msg(&mut send, net, msg).await
 }
 
-/// Send `ControlMsg::LeaveNetwork` on a fresh stream and wait until the peer has
-/// acknowledged all of it. `ray leave` tears the network down right after, which
-/// closes every link sharing no other network, and a close discards whatever is
-/// still unsent (the same wait as `send_welcome`).
-async fn send_leave(conn: &Connection, net_pubkey: EndpointId) -> Result<()> {
+/// Send one control message on a fresh stream and wait until the peer has
+/// acknowledged all of it. For a sender about to close the link: `ray leave`
+/// tears the network down right after, which closes every link sharing no other
+/// network, and a close discards whatever is still unsent (the same wait as
+/// `send_welcome`).
+async fn send_confirmed(
+    conn: &Connection,
+    net: Option<EndpointId>,
+    msg: &ControlMsg,
+) -> Result<()> {
     let (mut send, _recv) = conn.open_bi().await.context("open control stream")?;
-    control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::LeaveNetwork).await?;
+    control::send_msg(&mut send, net, msg).await?;
     // A reader that took the frame but not the FIN stops the stream with code 0.
-    if let Some(code) = send.stopped().await.context("await leave delivery")?
+    if let Some(code) = send.stopped().await.context("await delivery")?
         && code != VarInt::from_u32(0)
     {
-        anyhow::bail!("peer stopped the leave stream: {code}");
+        anyhow::bail!("peer stopped the stream: {code}");
     }
     Ok(())
 }

@@ -22,6 +22,7 @@ use iroh::{EndpointId, SecretKey};
 use ray_proto::ipc::{MachineHostname, UnixTimestampSecs};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::control::DeviceCert;
 use crate::management::EnrollmentReceipt;
 use crate::membership::GroupMode;
 
@@ -147,7 +148,7 @@ pub(crate) mod destruction;
 mod write;
 
 pub use write::{restrict_perms, write_file};
-use write::{sync_file_and_parent, write_atomic};
+use write::{sync_dir, sync_file_and_parent, write_atomic};
 
 /// Info about a member in a saved network config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,6 +533,46 @@ pub struct PendingJoinEntry {
     pub name: Option<String>,
 }
 
+/// An unpair of this device from its primary that has not finished. See
+/// [`AppConfig::pending_unpairs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingUnpair {
+    /// The certificate given up. Kept after the stored copy is deleted: the
+    /// primary checks the request against it.
+    pub cert: DeviceCert,
+    pub phase: UnpairPhase,
+}
+
+/// How far a [`PendingUnpair`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnpairPhase {
+    /// The local cleanup has not finished: networks joined with the
+    /// certificate, and the stored certificate itself, may remain.
+    Cleanup,
+    /// The cleanup is saved. The primary has not yet confirmed that it
+    /// recorded the revocation.
+    Request,
+}
+
+/// A device `ray unpair` revoked that has yet to confirm its cleanup. See
+/// [`AppConfig::pending_unpair_notices`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingUnpairNotice {
+    pub device: EndpointId,
+    /// The generation of the pairing revoked, which the notice names.
+    pub generation: u64,
+}
+
+/// The latest pairing a primary made with a device. See
+/// [`AppConfig::device_generations`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceGeneration {
+    pub device: EndpointId,
+    /// The generation its certificate is signed at.
+    pub generation: u64,
+}
+
 /// A controller this machine has explicitly authorized to issue management
 /// requests. Authority is bound to the controller's transport endpoint id,
 /// which iroh authenticates during the QUIC handshake.
@@ -686,17 +727,45 @@ pub struct AppConfig {
     /// admission. See [`PendingJoinEntry`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_joins: Vec<PendingJoinEntry>,
-    /// Legacy device-cert generation counter (pre-nullifier revocation). No longer
-    /// used for revocation decisions; kept only so old `settings.toml` files parse.
+    /// The generation certificates carried before pairings were numbered, left
+    /// from an earlier revocation scheme and normally `0`. A device paired
+    /// before then still holds it, so it counts as that device's generation
+    /// until the device pairs again. Nothing raises it now.
     #[serde(default)]
     pub cert_generation: u64,
-    /// Device keys this user has nullified via `ray unpair` (hex `EndpointId`). The
+    /// The generation of the latest pairing this primary made with each device,
+    /// which its certificate is signed at. A pairing is saved here one above
+    /// the device's last (or above `cert_generation`) before the device gets
+    /// the certificate, so a notice or request about an earlier pairing of it
+    /// is told apart from the current one. Kept after an unpair, so a later
+    /// pairing still numbers above it. See `daemon::mesh::unpair`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_generations: Vec<DeviceGeneration>,
+    /// Device keys this user has nullified (hex `EndpointId`), by `ray unpair` or
+    /// at a paired device's own request (`PairMsg::UnpairRequest`). The
     /// coordinator's durable nullifier seed: it survives a restart and is unioned
     /// into every coordinated network's signed blob (`GroupBlob.nullifiers`) at seal
     /// time, so a listed device's cert is rejected mesh-wide. A device is removed
     /// here when it re-pairs (re-auth). See `Daemon::unpair`/`reauth_device`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_devices: Vec<String>,
+    /// This device's unpairs from a primary that have not finished, each saved
+    /// before any of its work so that a restart resumes it. An entry holds the
+    /// certificate given up and how far the unpair got: the local cleanup first,
+    /// then the request asking the primary to record the revocation. It is
+    /// complete, and removed, only once the primary confirms the revocation is
+    /// saved (`PairMsg::UnpairRecorded`), or once a new pairing with that primary
+    /// is saved, which cancels it. See `daemon::mesh::unpair`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_unpairs: Vec<PendingUnpair>,
+    /// Devices `ray unpair` revoked that have not yet confirmed their cleanup,
+    /// each with the generation of the pairing revoked. Saved with the
+    /// revocation, before the device is told (`ControlMsg::PairingRevoked`).
+    /// The notice is repeated, after a restart too, until the device confirms
+    /// by asking this primary to record its unpair (`PairMsg::UnpairRequest`),
+    /// or until it pairs here again. See `daemon::mesh::unpair`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_unpair_notices: Vec<PendingUnpairNotice>,
     /// Remote controllers authorized by this machine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controllers: Vec<ControllerGrant>,
@@ -739,7 +808,10 @@ impl Default for AppConfig {
             networks: Vec::new(),
             pending_joins: Vec::new(),
             cert_generation: 0,
+            device_generations: Vec::new(),
             revoked_devices: Vec::new(),
+            pending_unpairs: Vec::new(),
+            pending_unpair_notices: Vec::new(),
             controllers: Vec::new(),
             managed_machines: Vec::new(),
             forgotten_machines: Vec::new(),
@@ -911,7 +983,13 @@ struct Settings {
     #[serde(default)]
     cert_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    device_generations: Vec<DeviceGeneration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     revoked_devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_unpairs: Vec<PendingUnpair>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_unpair_notices: Vec<PendingUnpairNotice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     controllers: Vec<ControllerGrant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1049,9 +1127,28 @@ fn resolve_override(embedder: Option<PathBuf>, env: Option<OsString>) -> Option<
         .or_else(|| config_dir_override(env))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A config tree for this thread alone, ahead of both overrides. The other
+    /// two are process-wide, so a test running two daemons at once gives each a
+    /// runtime whose threads set this to its own tree.
+    static THREAD_CONFIG_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point this thread's config reads at `dir`. See [`THREAD_CONFIG_DIR`].
+#[cfg(test)]
+pub(crate) fn set_thread_config_dir(dir: PathBuf) {
+    THREAD_CONFIG_DIR.with(|cell| *cell.borrow_mut() = Some(dir));
+}
+
 /// The override in effect: the embedder's [`set_config_dir_override`] first,
 /// then `RAYFISH_CONFIG_DIR`. `None` means the platform default applies.
 fn effective_override() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = THREAD_CONFIG_DIR.with(|cell| cell.borrow().clone()) {
+        return Some(dir);
+    }
     resolve_override(
         CONFIG_DIR_OVERRIDE
             .read()
@@ -1656,7 +1753,10 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         networks,
         pending_joins: settings.pending_joins,
         cert_generation: settings.cert_generation,
+        device_generations: settings.device_generations,
         revoked_devices: settings.revoked_devices,
+        pending_unpairs: settings.pending_unpairs,
+        pending_unpair_notices: settings.pending_unpair_notices,
         controllers: settings.controllers,
         managed_machines: settings.managed_machines,
         forgotten_machines: settings.forgotten_machines,
@@ -1732,7 +1832,10 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         download_user: config.download_user,
         pending_joins: config.pending_joins.clone(),
         cert_generation: config.cert_generation,
+        device_generations: config.device_generations.clone(),
         revoked_devices: config.revoked_devices.clone(),
+        pending_unpairs: config.pending_unpairs.clone(),
+        pending_unpair_notices: config.pending_unpair_notices.clone(),
         controllers: config.controllers.clone(),
         managed_machines: config.managed_machines.clone(),
         forgotten_machines: config.forgotten_machines.clone(),
@@ -1931,6 +2034,18 @@ pub fn delete_network(name: &str) -> Result<bool> {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     delete_network_unlocked(&dir, name)
+}
+
+/// Make the deletions made so far in the config tree durable, which removing a
+/// file is not until its directory is synced. An unpair confirms its cleanup
+/// only once the networks and certificate it deleted stay deleted.
+pub fn sync_deletions() -> Result<()> {
+    let dir = config_dir()?;
+    let networks = dir.join(NETWORKS_SUBDIR);
+    if networks.is_dir() {
+        sync_dir(&networks)?;
+    }
+    sync_dir(&dir)
 }
 
 /// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.

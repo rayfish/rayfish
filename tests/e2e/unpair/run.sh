@@ -8,16 +8,15 @@
 #
 # Proves the full unpair flow over real hosts + the public pkarr DHT:
 #   A pairs B  ->  B joins A's closed network  ->  A `ray unpair srv-b`
-#   ->  A bumps its cert generation and publishes the new floor (_rayfish_certgen),
-#       drops B from the roster, and severs it
-#   ->  C prunes B on reconverge (cross-node propagation of the floor)
-#   ->  B can no longer re-join (its cert is below the floor)
-#   ->  B's device cert is wiped best-effort.
+#   ->  A saves B's key as revoked, adds it to the network's nullifier set in the
+#       signed blob, drops B from the roster, and severs it
+#   ->  C prunes B on reconverge (cross-node propagation of the nullifier)
+#   ->  B can no longer re-join (its cert is nullified)
+#   ->  B's device cert is wiped once A's notice reaches it.
 #
-# NOTE: the keeper-refresh path (a *kept* device auto-re-issued a fresh cert at
-# the new generation) needs a second device paired into U — add an srv-d host and
-# assert it keeps working after the unpair, incl. one refreshed on reconnect after
-# being offline during the bump. Not exercised by this 3-host topology.
+# NOTE: revocation is per device, so a second device paired into U keeps working
+# after srv-b is unpaired. Checking that needs another host (add an srv-d). Not
+# exercised by this 3-host topology.
 #
 # Reads .servers (written by provision.sh). Does NOT modify infra.
 # Re-runnable: pairing/join steps tolerate "already done".
@@ -99,8 +98,8 @@ fi
 # ---------------------------------------------------------------------------
 step "4. srv-a unpairs srv-b"
 # A secondary cannot unpair (primary-only guard). Assert this *before* srv-a
-# unpairs srv-b below: that unpair best-effort tells srv-b to wipe its own cert,
-# after which srv-b is no longer a secondary and the guard would no longer apply.
+# unpairs srv-b below: that unpair tells srv-b to wipe its own cert, after which
+# srv-b is no longer a secondary and the guard would no longer apply.
 SEC="$(on "$B" 'ray unpair srv-a' 2>&1 | strip || true)"
 echo "$SEC" | grep -qi 'only your primary device can unpair' \
   && pass "secondary refused to unpair (primary-only)" \
@@ -115,8 +114,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "5. floor propagates: srv-c drops srv-b"
-# Give the floor record time to publish + srv-c's poller/reconverge to run.
+step "5. nullifier propagates: srv-c drops srv-b"
+# Give the republished blob time to publish + srv-c's poller/reconverge to run.
 DROPPED=0
 for _ in $(seq 1 12); do
   LOSS="$(ping_loss "$C" "$B_IP")"
@@ -148,12 +147,13 @@ done
   || fail "srv-b re-joined despite revocation"
 
 # ---------------------------------------------------------------------------
-step "7. best-effort wipe: srv-b's device cert deleted"
-# The primary sends ControlMsg::Unpaired over a shared link; a cooperative,
-# online device deletes its own cert. (Best-effort — may not fire if the link
-# was already severed first, so this is informational, not a hard failure.)
+step "7. srv-b's device cert deleted"
+# The primary saved that srv-b has yet to be told, and sends it
+# ControlMsg::PairingRevoked, dialing it, until srv-b confirms its cleanup; srv-b
+# deletes its own cert when told. Checked once here, so a notice still in flight
+# is a note, not a hard failure.
 if on "$B" 'test -f /etc/rayfish/device_cert'; then
-  echo "   note: srv-b still has a device_cert on disk (wipe is best-effort)"
+  echo "   note: srv-b still has a device_cert on disk (the notice may still be in flight)"
 else
   pass "srv-b's device cert was wiped"
 fi

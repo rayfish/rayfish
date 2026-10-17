@@ -25,6 +25,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and never lowers one the host set higher.
 - On systemd-resolved, Rayfish is chosen only when `/etc/resolv.conf` points at
   the resolved stub and resolved is running; otherwise it writes resolv.conf.
+- The mesh protocol is now version 7, so that a device is told which pairing
+  an unpair ends. Peers on versions 6 and 5 still connect.
 
 ### Fixed
 
@@ -140,6 +142,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Leaving a network could close a peer connection that a concurrent reconnect
   had just reused for another network.
+
+- Unpairing no longer depends on the device and its primary being connected at
+  that moment, which on-demand mode makes rare. A device that unpairs itself,
+  such as a phone in the Android app, keeps asking its primary to revoke it,
+  across restarts, until the primary confirms that the revocation is saved.
+  `ray unpair <device>` keeps telling the device to delete its certificate until
+  the device confirms, so a device that was offline gets the message later. An
+  unpair interrupted by a restart is finished at the next start. A missed
+  message used to leave the device's certificate unrevoked, or still on the
+  device. A device paired again keeps the new pairing when a message about the
+  earlier one arrives late. A primary on an older release gets the earlier
+  one-shot request.
 
 - Turning mDNS discovery off while a window was opening could leave the mDNS
   sockets open and still answering lookups.

@@ -145,6 +145,7 @@ fn initial_alpns() -> Vec<Vec<u8>> {
         iroh_blobs::protocol::ALPN.to_vec(),
         transport::FILES_ALPN.to_vec(),
         PAIR_ALPN.to_vec(),
+        PAIR_V2_ALPN.to_vec(),
         transport::CONNECT_ALPN.to_vec(),
         crate::management::ALPN.to_vec(),
         crate::management::V2_ALPN.to_vec(),
@@ -236,6 +237,9 @@ async fn build_daemon_inner(
     // --- Identity (persistent transport key + optional device certificate) ---
     let key = identity::load_or_create()?;
     let public_key = key.public();
+    // Before the device cert is read or any network restored, so that an unpair
+    // a restart interrupted leaves neither behind.
+    super::unpair::finish_interrupted_unpair();
     let device_cert = identity::load_device_cert()?;
     if let Some(ref cert) = device_cert {
         tracing::info!(user = %cert.user_identity.fmt_short(), "loaded device certificate");
@@ -638,6 +642,11 @@ async fn build_daemon_inner(
                 .await;
         });
     }
+    // Drive the unpairs this device saved, and the devices `ray unpair` still
+    // has to tell, until the other side confirms. Spawned here, so the mobile
+    // embedder gets them too.
+    tokio::spawn(Arc::clone(&registry).run_unpair_requests());
+    tokio::spawn(Arc::clone(&registry).run_unpair_notices());
 
     // Idle teardown is per-connection now: each `MeshConnection` closes itself when
     // it goes idle (see its run loop), gated on `on_demand` + the peer advertising
@@ -693,7 +702,7 @@ async fn build_daemon_inner(
     // drop, so the Daemon owns it for the process lifetime and shuts it down on exit.
     let router = protocol_router.build_router(transport.endpoint.clone());
     // The router sorts its ALPN map. Restore our preference order so peers that
-    // offer multiple management versions negotiate the newest one.
+    // offer several management or pairing versions negotiate the newest one.
     transport.endpoint.set_alpns(initial_alpns());
     management.start_announcements(token.clone());
 
