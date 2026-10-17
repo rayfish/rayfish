@@ -1,0 +1,93 @@
+name: Rayfish
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+    SUPPORTS_MACCATALYST: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    SWIFT_VERSION: "5.0"
+    ARCHS: arm64
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/Generated"
+    SWIFT_INCLUDE_PATHS:
+      - "$(SRCROOT)/Generated"
+    OTHER_SWIFT_FLAGS:
+      - "-Xcc"
+      - "-fmodule-map-file=$(SRCROOT)/Generated/ray_mobileFFI.modulemap"
+    RUST_LIB_iphonesimulator: "$(SRCROOT)/../target/aarch64-apple-ios-sim/release/libray_mobile.a"
+    RUST_LIB_iphoneos: "$(SRCROOT)/../target/aarch64-apple-ios/release/libray_mobile.a"
+    OTHER_LDFLAGS:
+      - "$(RUST_LIB_$(PLATFORM_NAME))"
+      - "-framework"
+      - "SystemConfiguration"
+      - "-framework"
+      - "Security"
+      - "-lresolv"
+targets:
+  Rayfish:
+    type: application
+    platform: iOS
+    sources:
+      - path: Rayfish
+      - path: Shared
+      - path: Generated
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.ios
+        PRODUCT_NAME: Rayfish
+        INFOPLIST_FILE: Support/App-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Support/App.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: RayfishTunnel
+        embed: true
+  RayfishTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: RayfishTunnel
+      - path: Shared
+      - path: Generated
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.ios.tunnel
+        PRODUCT_NAME: RayfishTunnel
+        INFOPLIST_FILE: Support/Tunnel-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Support/Tunnel.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+    dependencies:
+      - sdk: NetworkExtension.framework
+    preBuildScripts:
+      - name: Build the Rust core
+        script: '"$SRCROOT/build-rust.sh"'
+        basedOnDependencyAnalysis: false
+  RayfishUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.rayfish.ios.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Rayfish
+        OTHER_LDFLAGS: []
+        OTHER_SWIFT_FLAGS: []
+    dependencies:
+      - target: Rayfish
+schemes:
+  Rayfish:
+    build:
+      targets:
+        Rayfish: all
+    test:
+      targets:
+        - RayfishUITests

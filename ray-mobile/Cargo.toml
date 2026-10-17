@@ -3,7 +3,7 @@ name = "ray-mobile"
 version = "0.1.4"
 edition = "2024"
 rust-version = "1.91"
-description = "Android UniFFI wrapper around the rayfish mesh core"
+description = "Android and iOS UniFFI wrapper around the rayfish mesh core"
 license = "MPL-2.0"
 publish = false
 
@@ -12,7 +12,9 @@ name = "ray_mobile"
 # `cdylib` is the Android JNI artifact (`libray_mobile.so`); `lib` lets the
 # host build produce a normal library for UniFFI library-mode bindgen and lets
 # the `uniffi-bindgen` bin resolve.
-crate-type = ["cdylib", "lib"]
+# `staticlib` is the iOS artifact (`libray_mobile.a`), linked into the app and
+# its packet tunnel extension.
+crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
 # The mesh core, without the desktop-only surface (ssh/1password/tun device).
@@ -47,6 +49,9 @@ tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 ndk-context = "0.1"
 rustls-platform-verifier = "0.7"
 jni = "0.22"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+tracing-oslog = "0.3"
 
 [[bin]]
 # Library-mode bindgen entry point: `cargo run -p ray-mobile --bin uniffi-bindgen

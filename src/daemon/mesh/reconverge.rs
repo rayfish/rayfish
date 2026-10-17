@@ -9,7 +9,7 @@ use url::Url;
 use super::super::*;
 
 /// How often a node re-resolves the signed record when nothing triggers it.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const GROUP_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The same poll on a battery-powered node, where every tick is a radio wakeup
@@ -22,7 +22,7 @@ const GROUP_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// Keyed on the platform, not on `on_demand`: that is a desktop config key
 /// (`GlobalKey::OnDemand`) a wired node can set for its own reasons, and a
 /// 15-minute-stale roster is not what it asked for by setting it.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 const GROUP_POLL_INTERVAL_BATTERY: Duration = Duration::from_secs(15 * 60);
 
 /// Materialize this node's suggested firewall rules for `network` from the
@@ -706,9 +706,9 @@ pub(crate) fn spawn_group_poller(
         // at-start resolve (catching a blob that changed while we were offline or
         // mid-restart) and then settles into its cadence. Without this the first
         // re-check was a full interval after boot.
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let period = GROUP_POLL_INTERVAL_BATTERY;
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let period = GROUP_POLL_INTERVAL;
         let mut tick = tokio::time::interval(period);
         let nudge = Arc::clone(&registry.poll_nudge);

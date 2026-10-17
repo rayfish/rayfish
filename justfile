@@ -48,6 +48,25 @@ macos:
     xcodegen generate --spec macos/project.yml --project macos
     open macos/Rayfish.xcodeproj
 
+# Regenerate the iOS Swift bindings from ray-mobile. Never hand-edit ios/Generated.
+ios-bindings:
+    cargo -q build -p ray-mobile --lib
+    cargo -q run -p ray-mobile --bin uniffi-bindgen -- generate --library target/debug/libray_mobile.{{lib_ext}} --language swift --out-dir ios/Generated --no-format
+    perl -0pi -e 's/[ \t]+$//mg; s/\n*\z/\n/' ios/Generated/*
+
+# Build the iOS app for the simulator and run its UI walkthrough there. The
+# node runs in the app process; packet tunnels need a device.
+ios-sim device="iPhone 17 Pro":
+    xcodegen generate --spec ios/project.yml --project ios
+    xcodebuild -project ios/Rayfish.xcodeproj -scheme Rayfish -sdk iphonesimulator \
+        -destination 'platform=iOS Simulator,name={{device}}' -derivedDataPath target/ios-derived \
+        CODE_SIGNING_ALLOWED=NO test
+
+# Generate and open the iOS project for a signed device build.
+ios:
+    xcodegen generate --spec ios/project.yml --project ios
+    open ios/Rayfish.xcodeproj
+
 # Test macOS legacy-service detection and migration without touching launchd.
 macos-test:
     mkdir -p target/macos-tests

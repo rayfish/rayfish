@@ -883,6 +883,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
 
     fun uniffi_ray_mobile_checksum_method_node_up(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_up_packet_tunnel(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_wake_peer(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_watch_files(): Short
@@ -1230,6 +1232,11 @@ internal interface UniffiLib : Library {
     fun uniffi_ray_mobile_fn_method_node_up(
         `ptr`: Pointer,
         `tunFd`: Int,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_up_packet_tunnel(
+        `ptr`: Pointer,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1612,6 +1619,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_up() != 62370.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_up_packet_tunnel() != 32890.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_wake_peer() != 45813.toShort()) {
@@ -2643,6 +2653,15 @@ public interface NodeInterface {
     fun `up`(`tunFd`: kotlin.Int)
 
     /**
+     * Bring the data plane up over the utun interface of the iOS
+     * `NEPacketTunnelProvider` this process hosts. Call it once the provider's
+     * network settings are applied, so the interface exists. NetworkExtension
+     * owns the routes and DNS, so unlike Android's [`Node::up`] this configures
+     * nothing on the host. Requires [`Node::start`] first.
+     */
+    fun `upPacketTunnel`()
+
+    /**
      * Dial an idle peer to check it is really reachable before sending to it,
      * and leave the link up so the file offer lands on an awake device. Returns
      * false when the peer did not answer; the caller can still send, the offer
@@ -3452,6 +3471,21 @@ open class Node :
         callWithPointer {
             uniffiRustCallWithError(RayException) { _status ->
                 UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_up(it, FfiConverterInt.lower(`tunFd`), _status)
+            }
+        }
+
+    /**
+     * Bring the data plane up over the utun interface of the iOS
+     * `NEPacketTunnelProvider` this process hosts. Call it once the provider's
+     * network settings are applied, so the interface exists. NetworkExtension
+     * owns the routes and DNS, so unlike Android's [`Node::up`] this configures
+     * nothing on the host. Requires [`Node::start`] first.
+     */
+    @Throws(RayException::class)
+    override fun `upPacketTunnel`() =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_up_packet_tunnel(it, _status)
             }
         }
 

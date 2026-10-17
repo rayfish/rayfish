@@ -700,7 +700,7 @@ async fn build_daemon_inner(
     // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
     // stops the export); built here from the local handles so it can be a plain
     // owned field. `None` if it failed to bind.
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let metrics_server = spawn_metrics_server(
         Arc::clone(&stats),
         peers.clone(),
@@ -711,7 +711,7 @@ async fn build_daemon_inner(
     // A phone has no Prometheus scraper and no way to reach one, and the server
     // brings a 60s per-peer sampling loop with it (`PeerMetrics::spawn_collector`):
     // a wakeup a minute, forever, for an endpoint nobody reads.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let metrics_server: Option<MetricsServer> = None;
 
     let auto_update = app_config.auto_update;
@@ -780,8 +780,8 @@ async fn build_daemon_inner(
 /// Register rayfish counters, per-peer gauges, and iroh endpoint metrics, then
 /// start the Prometheus HTTP endpoint on `127.0.0.1:9090`. The returned guard
 /// must be kept alive for the process lifetime; `None` means metrics export is
-/// disabled. Not built on Android: see the call site.
-#[cfg(not(target_os = "android"))]
+/// disabled. Not built on Android or iOS: see the call site.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn spawn_metrics_server(
     stats: Arc<ForwardMetrics>,
     peers: PeerTable,

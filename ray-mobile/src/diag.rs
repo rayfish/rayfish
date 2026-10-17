@@ -197,9 +197,15 @@ mod android_log {
 pub fn install() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rayfish=debug"));
-    let _ = tracing_subscriber::registry()
-        .with(DiagLayer.with_filter(filter))
-        .try_init();
+    let registry = tracing_subscriber::registry().with(DiagLayer.with_filter(filter));
+    // iOS has no logcat: send the core's events to unified logging too, so they
+    // show in Console beside the Swift app and tunnel logs.
+    #[cfg(target_os = "ios")]
+    let registry = registry.with(
+        tracing_oslog::OsLogger::new("xyz.rayfish.ios", "core")
+            .with_filter(EnvFilter::new("info,rayfish=debug")),
+    );
+    let _ = registry.try_init();
 }
 
 pub fn warn_count() -> u64 {

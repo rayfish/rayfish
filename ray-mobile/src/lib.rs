@@ -581,7 +581,12 @@ impl Node {
         // is undefined behaviour once the runtime's threads are up, and it also
         // let one test redirect another's config reads mid-test.
         config::set_config_dir_override(PathBuf::from(&config_dir));
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        // An iOS packet tunnel is killed past roughly 50 MB. Every worker brings
+        // its own stack and allocator caches, and the mesh needs few of them.
+        #[cfg(target_os = "ios")]
+        builder.worker_threads(2).max_blocking_threads(8);
+        let runtime = builder
             .enable_all()
             .build()
             .expect("failed to build tokio runtime");
@@ -1304,16 +1309,41 @@ impl Node {
         }
     }
 
+    /// Bring the data plane up over the utun interface of the iOS
+    /// `NEPacketTunnelProvider` this process hosts. Call it once the provider's
+    /// network settings are applied, so the interface exists. NetworkExtension
+    /// owns the routes and DNS, so unlike Android's [`Node::up`] this configures
+    /// nothing on the host. Requires [`Node::start`] first.
+    pub fn up_packet_tunnel(&self) -> Result<(), RayError> {
+        #[cfg(not(target_os = "ios"))]
+        {
+            Err(RayError::Network(
+                "the packet tunnel data plane is only supported on iOS".to_owned(),
+            ))
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let state = self.state()?;
+            // Opening the async utun registers it with the reactor, and this runs
+            // on a provider thread outside the runtime.
+            let _guard = self.runtime.enter();
+            let (reader, writer) = rayfish::tun::open_packet_tunnel().map_err(RayError::network)?;
+            self.runtime
+                .block_on(state.attach_external_tun(reader, writer));
+            Ok(())
+        }
+    }
+
     /// Tear the data plane down (stop the forward loop, close the fds) while
     /// keeping the control plane connected. Requires [`Node::start`] first.
     pub fn down(&self) -> Result<(), RayError> {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             Err(RayError::Network(
-                "VpnService data plane is only supported on Android".to_owned(),
+                "the mobile data plane is only supported on Android and iOS".to_owned(),
             ))
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let state = self.state()?;
             state.detach_tun();
