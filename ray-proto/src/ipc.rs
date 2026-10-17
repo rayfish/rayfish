@@ -72,6 +72,13 @@ pub enum IpcMessage {
     Leave {
         name: String,
     },
+    /// Rename a saved network on this node only (`ray rename`). Like a join
+    /// alias, the name is local: peers and the signed blob keep their own.
+    /// Mutating (root/operator).
+    RenameNetwork {
+        network: String,
+        new_name: String,
+    },
     Nuke {
         name: String,
         force: bool,

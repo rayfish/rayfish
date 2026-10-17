@@ -41,6 +41,7 @@ const ROOT: Groups = &[
             "leave",
             "nuke",
             "status",
+            "rename",
             "hostname",
             "ephemeral",
             "dns",

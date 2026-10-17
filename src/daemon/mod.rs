@@ -263,7 +263,9 @@ pub(crate) use mesh_connection::MeshConnection;
 
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
-pub(crate) use network_registry::{DialTarget, NameOwner, NetworkRegistry, missing_networks};
+pub(crate) use network_registry::{
+    DialTarget, NameOwner, NetworkRegistry, finish_interrupted_rename, missing_networks,
+};
 
 #[cfg(target_os = "android")]
 mod idle_transport;

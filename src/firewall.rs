@@ -317,6 +317,27 @@ impl Default for FirewallConfig {
     }
 }
 
+impl FirewallConfig {
+    /// Follow a network renamed on this node from `from` to `to`: rules scoped
+    /// to it and rules installed from its suggestions name it by its local name,
+    /// and without this a scoped rule would stop matching while the suggested
+    /// ones were never replaced again. Returns whether any rule named it.
+    pub fn rename_network(&mut self, from: &str, to: &str) -> bool {
+        let mut renamed = false;
+        for rule in &mut self.rules {
+            if rule.network.as_deref() == Some(from) {
+                rule.network = Some(to.to_string());
+                renamed = true;
+            }
+            if matches!(&rule.origin, RuleOrigin::Network(n) if n == from) {
+                rule.origin = RuleOrigin::Network(to.to_string());
+                renamed = true;
+            }
+        }
+        renamed
+    }
+}
+
 /// How long an idle TCP flow stays "established" (return traffic still allowed).
 const TCP_FLOW_TIMEOUT: Duration = Duration::from_secs(300);
 /// UDP is connectionless: use a short window so return traffic for a recent
@@ -670,6 +691,17 @@ impl SharedFirewall {
         config.rules.extend(new_rules);
         self.update(config.clone());
         config
+    }
+
+    /// [`FirewallConfig::rename_network`] on the live rules. Returns the updated
+    /// config for persistence, or `None` when no rule names the network.
+    pub fn rename_network(&self, from: &str, to: &str) -> Option<FirewallConfig> {
+        let mut config = (*self.get_config()).clone();
+        if !config.rename_network(from, to) {
+            return None;
+        }
+        self.update(config.clone());
+        Some(config)
     }
 
     /// Install or remove the auto-seeded SSH passthrough rule
@@ -2892,6 +2924,45 @@ mod tests {
         assert_eq!(prod.len(), 1);
         assert_eq!(prod[0].action, Action::Deny);
         assert_eq!(prod[0].peer, PeerFilter::Any);
+    }
+
+    /// A network renamed on this node keeps its rules: the ones scoped to it
+    /// and the ones installed from its suggestions follow the new name, while
+    /// local rules and other networks' rules stay as they were.
+    #[test]
+    fn renaming_a_network_moves_its_rules_to_the_new_name() {
+        let rule = |network: Option<&str>, origin: RuleOrigin| FirewallRule {
+            direction: Direction::In,
+            action: Action::Deny,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 22, end: 22 }),
+            peer: PeerFilter::Any,
+            network: network.map(str::to_string),
+            origin,
+        };
+        let suggested = |net: &str| RuleOrigin::Network(net.to_string());
+        let fw = SharedFirewall::new(FirewallConfig {
+            rules: vec![
+                rule(Some("home"), RuleOrigin::Local),
+                rule(Some("home"), suggested("home")),
+                rule(None, suggested("home")),
+                rule(Some("work"), suggested("work")),
+                rule(None, RuleOrigin::Local),
+            ],
+            ..FirewallConfig::default()
+        });
+
+        let renamed = fw.rename_network("home", "lab").unwrap();
+        let expected = vec![
+            rule(Some("lab"), RuleOrigin::Local),
+            rule(Some("lab"), suggested("lab")),
+            rule(None, suggested("lab")),
+            rule(Some("work"), suggested("work")),
+            rule(None, RuleOrigin::Local),
+        ];
+        assert_eq!(renamed.rules, expected);
+        assert_eq!(fw.get_config().rules, expected);
+        assert!(fw.rename_network("home", "office").is_none());
     }
 
     #[test]

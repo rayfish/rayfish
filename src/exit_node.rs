@@ -406,7 +406,7 @@ impl Ipv6Prefix {
 }
 
 /// Who may route out through us on one network.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Allow {
     /// `ray exit-node allow <net> '*'`: any member of the network.
     any: bool,
@@ -515,6 +515,19 @@ impl ExitServer {
             nets.insert(SmolStr::new(name), allow);
         }
         self.nets.store(Arc::new(nets));
+    }
+
+    /// Follow a network renamed on this node: its allow-list is now consulted
+    /// under `to`. Leaves the policy alone when the network offers no exit,
+    /// including on standby, when nothing is loaded.
+    pub fn rename_network(&self, from: &str, to: &str) {
+        self.nets.rcu(|nets| {
+            let mut nets = HashMap::clone(nets);
+            if let Some(allow) = nets.remove(from) {
+                nets.insert(SmolStr::new(to), allow);
+            }
+            nets
+        });
     }
 
     /// Drop all exit offers (data plane going to standby). Pair with
@@ -764,6 +777,18 @@ impl ExitClient {
     /// Set (or with `None`, clear) the exit selection.
     pub fn set(&self, selection: Option<ExitSelection>) {
         self.inner.store(selection.map(Arc::new));
+    }
+
+    /// Follow a network renamed on this node: a selection on `from` now tags its
+    /// traffic with, and routes it on, `to`.
+    pub fn rename_network(&self, from: &str, to: &str) {
+        self.inner.rcu(|selection| match selection {
+            Some(s) if s.network == from => Some(Arc::new(ExitSelection {
+                network: SmolStr::new(to),
+                ..ExitSelection::clone(s)
+            })),
+            other => other.clone(),
+        });
     }
 }
 

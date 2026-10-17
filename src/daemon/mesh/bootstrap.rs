@@ -232,6 +232,9 @@ async fn build_daemon_inner(
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
+    // Then finish a `ray rename` a crash interrupted, before anything reads the
+    // saved networks or the firewall rules by name.
+    finish_interrupted_rename();
 
     // --- Identity (persistent transport key + optional device certificate) ---
     let key = identity::load_or_create()?;

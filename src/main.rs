@@ -592,6 +592,18 @@ pub(crate) enum Command {
         /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
     },
+    /// Rename a network on this machine only
+    ///
+    /// The name is what `ray` commands and Magic DNS use for the network here:
+    /// its hosts resolve as `<host>.<new-name>.ray` afterwards. Other members keep
+    /// their own name for it. A live network reconnects under the new name.
+    Rename {
+        /// Network name
+        #[arg(add = complete::networks())]
+        network: String,
+        /// New name (e.g. "lab" → alice.lab.ray)
+        new_name: String,
+    },
     /// Print a host's or contact's identity string
     ///
     /// The value to paste into a `ray apply` spec's `aliases:` map. Resolves to
@@ -1877,6 +1889,7 @@ async fn run() -> Result<()> {
             example,
         } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
+        Command::Rename { network, new_name } => ipc_rename(&network, &new_name).await,
         Command::Identityof { peer, hostname, .. } => {
             cmd_identityof(&peer, hostname.as_deref()).await
         }

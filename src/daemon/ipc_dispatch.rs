@@ -441,6 +441,15 @@ impl Daemon {
                 .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
+            IpcMessage::RenameNetwork { network, new_name } => {
+                let resp = self.registry.rename_network(&network, &new_name).await;
+                // The live SSH allow-lists are filed under the network's name.
+                #[cfg(feature = "desktop")]
+                if matches!(resp, IpcMessage::Ok { .. }) {
+                    self.rebuild_ssh_authz();
+                }
+                resp
+            }
             IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
             IpcMessage::Kick {
                 network,

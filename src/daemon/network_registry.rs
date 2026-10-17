@@ -30,9 +30,53 @@ const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// hold up `ray leave`.
 const LEAVE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long `ray rename` waits for a coordinator network to come back under its
+/// new name before replying. Restoring one is local, so this is only a bound;
+/// past it the restore carries on in the background.
+const RENAME_RESTORE_WAIT: Duration = Duration::from_secs(10);
+
 /// Keep the persisted hint set small and bounded.  A hint is only a speed-up;
 /// the endpoint id in the QUIC certificate remains the authentication boundary.
 const MAX_WARM_ENDPOINT_HINTS: usize = 64;
+
+/// Finish a `ray rename` that a crash interrupted, from the intent it saved
+/// before anything moved ([`config::rename_network`]): move the network's file
+/// and the name inside it if either is left, and point the firewall rules that
+/// name the network at its new name. Runs at startup before anything reads the
+/// saved networks or the firewall, so no network is restored under a name its
+/// file no longer has. The rest of what a rename moves is runtime state, built
+/// from the config afterwards.
+pub(crate) fn finish_interrupted_rename() {
+    let intent = match config::rename_intent() {
+        Ok(Some(intent)) => intent,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not read an unfinished network rename");
+            return;
+        }
+    };
+    let finished = config::finish_rename(&intent).and_then(|net| {
+        if net.is_some() {
+            let mut rules = firewall::load_firewall()?;
+            if rules.rename_network(&intent.from, &intent.to) {
+                firewall::save_firewall(&rules)?;
+            }
+        }
+        config::clear_rename_intent().map(|()| net.is_some())
+    });
+    let (from, to) = (intent.from.as_str(), intent.to.as_str());
+    match finished {
+        Ok(true) => tracing::info!(from, to, "finished an interrupted network rename"),
+        Ok(false) => tracing::warn!(
+            from,
+            to,
+            "dropped an interrupted network rename: the network is gone, or another one is saved under the new name"
+        ),
+        Err(e) => {
+            tracing::warn!(from, to, error = %format!("{e:#}"), "could not finish an interrupted network rename")
+        }
+    }
+}
 
 fn network_key_from_selector(selector: &str) -> Option<EndpointId> {
     selector.parse().ok().or_else(|| {
@@ -599,6 +643,14 @@ impl NetworkRegistry {
     /// static, so (unlike the old `refresh_alpns`) only the search domains need
     /// updating here.
     pub(crate) async fn teardown_network_runtime(&self, name: &str) -> bool {
+        self.teardown_network_runtime_closing(name, forward::LEAVE_CODE, b"leave")
+            .await
+    }
+
+    /// [`Self::teardown_network_runtime`], closing the links it leaves unused with
+    /// `code`. The leave code tells a coordinator we left; a network restarted
+    /// under a new name ([`Self::rename_network`]) has not.
+    async fn teardown_network_runtime_closing(&self, name: &str, code: u32, reason: &[u8]) -> bool {
         let Some(handle) = self.networks.remove(name).map(|(_, v)| v) else {
             return false;
         };
@@ -609,10 +661,11 @@ impl NetworkRegistry {
 
         // Drop this network from every peer's routing. A peer left sharing no
         // network at all is fully disconnected, so close its now-unused link with
-        // the leave code (the peer treats it as intentional and stops reconnecting);
-        // a peer we still share another network with keeps its connection.
+        // `code` (on the leave code the peer treats it as intentional and stops
+        // reconnecting); a peer we still share another network with keeps its
+        // connection.
         for (_ip, conn) in self.peers.remove_by_network(name) {
-            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
+            conn.close(VarInt::from_u32(code), reason);
         }
         self.dns.clear_network(name).await;
         self.route_map.remove_network(name);
@@ -744,6 +797,163 @@ impl NetworkRegistry {
             }
         };
         was_active || removed_from_config
+    }
+
+    /// Rename a network on this node only (`ray rename`). The name is local: it
+    /// is the config's file name, the Magic DNS zone (`<host>.<name>.ray`) and
+    /// the key every runtime structure files the network under. Peers know the
+    /// network by its key, and the signed blob carries its own name
+    /// (`group_name`), so neither notices.
+    ///
+    /// A live network is restarted under the new name, as a daemon restart
+    /// would bring it back, rather than rekeyed in place, which would mean
+    /// finding every structure and task that holds the name. Its links close with
+    /// the idle code: a peer lets an idle link go without reconnecting, and a
+    /// coordinator does not take it for a departure the way it takes the leave
+    /// code, so nobody prunes us. What the restart does not rebuild is moved to
+    /// the new name instead ([`Self::follow_rename`]); the daemon rebuilds its
+    /// SSH allow-lists itself.
+    ///
+    /// The config moves under a saved intent ([`config::rename_network`]), which
+    /// is cleared only once the firewall rules are saved under the new name as
+    /// well, so a rename a crash interrupts is finished at the next start
+    /// ([`finish_interrupted_rename`]).
+    pub(crate) async fn rename_network(self: &Arc<Self>, from: &str, to: &str) -> IpcMessage {
+        if !crate::hostname::is_valid_hostname(to) {
+            return ipc_err(format!(
+                "invalid network name '{to}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+            ));
+        }
+        if from == to {
+            return ipc_err(format!("network '{from}' already has that name"));
+        }
+        match config::load_network(from) {
+            Ok(Some(_)) => {}
+            Ok(None) => return ipc_err(format!("network '{from}' not found")),
+            Err(e) => return ipc_err(format!("{e:#}")),
+        }
+        match self.name_owner(to) {
+            Ok(NameOwner::Free) => {}
+            Ok(_) => {
+                return ipc_err(format!(
+                    "network name '{to}' belongs to another network on this node; choose another name"
+                ));
+            }
+            Err(e) => return ipc_err(format!("{e:#}")),
+        }
+        // `config::rename_network` refuses this too, but only after the network
+        // has been taken down for it.
+        match config::rename_intent() {
+            Ok(None) => {}
+            Ok(Some(pending)) => {
+                return ipc_err(format!(
+                    "renaming network '{}' to '{}' has not finished; restart the daemon to finish it",
+                    pending.from, pending.to
+                ));
+            }
+            Err(e) => return ipc_err(format!("{e:#}")),
+        }
+        // Holding the restore guard keeps the supervisor from restoring the old
+        // name while the network moves. A restore already under way would bring
+        // the network up under the old name after the move, so wait for it.
+        if !self.restoring.insert(from.to_string()) {
+            return ipc_err(format!(
+                "network '{from}' is still being restored; try again once it is up"
+            ));
+        }
+        self.teardown_network_runtime_closing(from, forward::IDLE_CODE, b"rename")
+            .await;
+        let renamed = config::rename_network(from, to);
+        self.restoring.remove(from);
+        let net = match renamed {
+            Ok(Some(net)) => net,
+            // Left meanwhile, so there is nothing to bring back.
+            Ok(None) => return ipc_err(format!("network '{from}' not found")),
+            Err(e) => {
+                // Restore what is saved now rather than at the supervisor's next
+                // tick. Before the intent was saved nothing moved, so that is the
+                // network under its old name. After, the rename is committed and
+                // the next start finishes it; until then a file the move left
+                // holding its old name loads under neither name, so no restore
+                // brings the network back half-renamed.
+                self.nudge_restore();
+                let committed = config::rename_intent()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|pending| pending.from == from && pending.to == to);
+                return ipc_err(if committed {
+                    format!(
+                        "renaming network '{from}' to '{to}' did not finish ({e:#}); it finishes when the daemon next starts"
+                    )
+                } else {
+                    format!("{e:#}")
+                });
+            }
+        };
+        let warning = self.follow_rename(from, to);
+        self.restore_errors.remove(from);
+        let coordinator = net.network_secret_key.is_some();
+        let restore = if coordinator {
+            self.spawn_coordinator_restore(&net)
+        } else {
+            self.spawn_member_restore(&net)
+        };
+        if let Some(restore) = restore {
+            // The exit-node state moved with the name. Once the network is back,
+            // rerun the daemon's exit reconcile too, which resolves an exit
+            // selection against the restored roster; a member's restore carries
+            // on after this replies.
+            let exit_configured = !net.exit_allow.is_empty() || net.exit_node_use.is_some();
+            let reapply = exit_configured.then(|| Arc::clone(&self.exit_reapply));
+            let restored = tokio::spawn(async move {
+                let _ = restore.await;
+                if let Some(reapply) = reapply {
+                    reapply.notify_one();
+                }
+            });
+            if coordinator {
+                // Local and quick, so `ray status` right after shows the new name.
+                let _ = tokio::time::timeout(RENAME_RESTORE_WAIT, restored).await;
+            }
+        }
+        tracing::info!(from, to, "renamed network");
+        let mut message = format!("renamed network '{from}' to '{to}'");
+        if let Some(warning) = warning {
+            message.push_str(&format!("\nwarning: {warning}"));
+        }
+        IpcMessage::Ok { message }
+    }
+
+    /// Carry over to a network's new name what this node keeps under its name
+    /// across the network's restart: the firewall rules scoped to it or installed
+    /// from its suggestions, the exit-node policy and selection a gateway or full
+    /// tunnel runs on, and the peers pruned from it. Then save the firewall rules
+    /// and clear the rename's intent. Returns a warning when either could not be
+    /// saved; the intent then stays, so the next start finishes saving the rules
+    /// ([`finish_interrupted_rename`]).
+    fn follow_rename(&self, from: &str, to: &str) -> Option<String> {
+        let rules = self.firewall.rename_network(from, to);
+        self.exit_server.rename_network(from, to);
+        self.exit_client.rename_network(from, to);
+        let pruned: Vec<EndpointId> = self
+            .pruned_peers
+            .iter()
+            .filter(|entry| entry.0 == from)
+            .map(|entry| entry.1)
+            .collect();
+        for peer in pruned {
+            self.pruned_peers.remove(&(from.to_string(), peer));
+            self.pruned_peers.insert((to.to_string(), peer));
+        }
+        let saved = rules
+            .map_or(Ok(()), |rules| firewall::save_firewall(&rules))
+            .and_then(|()| config::clear_rename_intent());
+        saved.err().map(|e| {
+            tracing::warn!(from, to, error = %format!("{e:#}"), "failed to save renamed network");
+            format!(
+                "could not save the rename in full ({e:#}); it finishes when the daemon next starts"
+            )
+        })
     }
 
     /// Look up an active network we coordinate, returning its public key and

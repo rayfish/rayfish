@@ -2141,4 +2141,36 @@ mod tests {
         );
         daemon.shutdown_and_close().await;
     }
+
+    /// `ray rename` refuses an invalid name, a name another saved network holds,
+    /// the network's own name and a network it does not know, and moves nothing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rename_refuses_names_it_cannot_take() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _config = TempConfigDir::new();
+        let daemon = build_headless(false).await.unwrap();
+        let (home, lab) = (SecretKey::generate(), SecretKey::generate());
+        save_inactive_network("home", &home);
+        save_inactive_network("lab", &lab);
+
+        for (from, to, refusal) in [
+            ("home", "lab", "belongs to another network"),
+            ("home", "Lab", "invalid network name"),
+            ("home", "home", "already has that name"),
+            ("office", "work", "not found"),
+        ] {
+            let reply = daemon.registry.rename_network(from, to).await;
+            assert!(
+                matches!(&reply, IpcMessage::Error { message } if message.contains(refusal)),
+                "{from} -> {to}: {reply:?}"
+            );
+        }
+        assert_eq!(saved_key("home"), Some(home.public()));
+        assert_eq!(saved_key("lab"), Some(lab.public()));
+        assert!(config::load_network("work").unwrap().is_none());
+        daemon.shutdown_and_close().await;
+    }
 }

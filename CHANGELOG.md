@@ -93,6 +93,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--direction out` checks traffic to the peer, `--network` looks the peer up on
   one network, and `--json` prints the verdict for scripts.
 
+- `ray rename <network> <new-name>` renames a network on this machine only. Its
+  hosts then resolve as `<host>.<new-name>.ray`, and its firewall rules, SSH
+  access and exit-node settings follow the new name. Other members keep their
+  own name for it. A live network briefly reconnects under the new name.
+
 ### Changed
 
 - Updated peer connections to iroh 1.3 with upstream connection setup and

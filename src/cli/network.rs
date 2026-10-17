@@ -259,6 +259,15 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     print_ok_reply(response)
 }
 
+pub(crate) async fn ipc_rename(network: &str, new_name: &str) -> Result<()> {
+    let response = ipc_request(ipc::IpcMessage::RenameNetwork {
+        network: network.to_string(),
+        new_name: new_name.to_string(),
+    })
+    .await?;
+    print_ok_reply(response)
+}
+
 /// Render a TTL in seconds back to the largest whole `Nw`/`Nd`/`Nh` unit
 /// (falling back to seconds), for display in `ray ephemeral show` and status.
 pub(crate) fn format_ttl(secs: u64) -> String {

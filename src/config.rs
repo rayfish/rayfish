@@ -147,7 +147,7 @@ pub(crate) mod destruction;
 mod write;
 
 pub use write::{restrict_perms, write_file};
-use write::{sync_file_and_parent, write_atomic};
+use write::{sync_dir, sync_file_and_parent, write_atomic};
 
 /// Info about a member in a saved network config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1944,6 +1944,157 @@ fn delete_network_unlocked(dir: &Path, name: &str) -> Result<bool> {
     }
 }
 
+/// A `ray rename` in progress, saved before the network's file moves. See
+/// [`rename_network`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameIntent {
+    pub from: String,
+    pub to: String,
+}
+
+const RENAME_INTENT_FILE: &str = "rename-intent.toml";
+
+/// Save a network's config under a new local name: `networks/<from>.toml`
+/// becomes `networks/<to>.toml`, and the name inside it follows. Returns the
+/// renamed config, or `None` when no network is saved as `from`, and refuses a
+/// `to` that is taken.
+///
+/// The move and the rewrite after it are two steps, and between them the file
+/// lists the network under a name it cannot be loaded by, so neither name
+/// restores it. A [`RenameIntent`] is saved first, and from then on the rename
+/// is committed: a start that finds the intent completes it with
+/// [`finish_rename`] before restoring any network. The intent also covers what
+/// the caller renames after this returns (the firewall rules that name the
+/// network), so the caller clears it with [`clear_rename_intent`] once those
+/// are saved too. While it stands, another rename is refused.
+///
+/// The file is moved, not copied and then deleted: a crash between a copy and
+/// the delete would leave the network saved twice, under two names that would
+/// both restore it.
+pub fn rename_network(from: &str, to: &str) -> Result<Option<NetworkConfig>> {
+    rename_network_in(&config_dir()?, from, to)
+}
+
+fn rename_network_in(dir: &Path, from: &str, to: &str) -> Result<Option<NetworkConfig>> {
+    ensure_not_in_network_update()?;
+    validate_net_name(to)?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pending) = load_rename_intent(dir)? {
+        anyhow::bail!(
+            "renaming network {:?} to {:?} has not finished; restart the daemon to finish it",
+            pending.from,
+            pending.to
+        );
+    }
+    let Some(net) = load_network_unlocked(dir, from)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        net.name == from,
+        "network config {from:?} contains mismatched name {:?}",
+        net.name
+    );
+    let target = dir.join(NETWORKS_SUBDIR).join(format!("{to}.toml"));
+    anyhow::ensure!(!target.exists(), "a network is already saved as {to:?}");
+    let intent = RenameIntent {
+        from: from.to_string(),
+        to: to.to_string(),
+    };
+    let contents = toml::to_string(&intent).context("serializing rename intent")?;
+    write_atomic(&dir.join(RENAME_INTENT_FILE), &contents, false)?;
+    finish_rename_unlocked(dir, &intent)
+}
+
+/// The rename that has not finished, if one is saved.
+pub fn rename_intent() -> Result<Option<RenameIntent>> {
+    ensure_not_in_network_update()?;
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_rename_intent(&dir)
+}
+
+fn load_rename_intent(dir: &Path) -> Result<Option<RenameIntent>> {
+    let path = dir.join(RENAME_INTENT_FILE);
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(Some(
+        toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?,
+    ))
+}
+
+/// Complete the config half of a saved rename: move the network's file if it
+/// has not moved yet, then rewrite the name inside it if that is still the old
+/// one. Safe to repeat. Returns the renamed config, or `None` when there is
+/// nothing to rename: the network is gone, or another file was saved under the
+/// new name by hand, which the daemon itself never does while the intent stands.
+pub fn finish_rename(intent: &RenameIntent) -> Result<Option<NetworkConfig>> {
+    finish_rename_in(&config_dir()?, intent)
+}
+
+fn finish_rename_in(dir: &Path, intent: &RenameIntent) -> Result<Option<NetworkConfig>> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    finish_rename_unlocked(dir, intent)
+}
+
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn finish_rename_unlocked(dir: &Path, intent: &RenameIntent) -> Result<Option<NetworkConfig>> {
+    let RenameIntent { from, to } = intent;
+    validate_net_name(from)?;
+    validate_net_name(to)?;
+    let ndir = dir.join(NETWORKS_SUBDIR);
+    let source = ndir.join(format!("{from}.toml"));
+    let target = ndir.join(format!("{to}.toml"));
+    if source.exists() {
+        if target.exists() {
+            return Ok(None);
+        }
+        std::fs::rename(&source, &target)
+            .with_context(|| format!("renaming network config {from:?} to {to:?}"))?;
+        sync_dir(&ndir)?;
+    }
+    let Some(mut net) = load_network_unlocked(dir, to)? else {
+        return Ok(None);
+    };
+    if net.name != *to {
+        anyhow::ensure!(
+            net.name == *from,
+            "network config {to:?} contains mismatched name {:?}",
+            net.name
+        );
+        net.name = to.clone();
+        save_network_unlocked(dir, &net)?;
+    }
+    Ok(Some(net))
+}
+
+/// Forget a rename once everything that names the network follows it.
+pub fn clear_rename_intent() -> Result<()> {
+    clear_rename_intent_in(&config_dir()?)
+}
+
+fn clear_rename_intent_in(dir: &Path) -> Result<()> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = dir.join(RENAME_INTENT_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 /// Add or update a network in the config. If a network with the same name
 /// already exists, it is replaced.
 pub fn upsert_network(config: &mut AppConfig, network: NetworkConfig) {
@@ -2613,6 +2764,174 @@ name = "test"
         let after = load_in(dir).unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].name, "genesis");
+    }
+
+    /// A rename moves the whole config, keys and node-local settings included,
+    /// and leaves nothing saved under the old name.
+    #[test]
+    fn rename_moves_a_network_to_its_new_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut home = net("homelab");
+        home.aliases.insert("alice".into(), "id-alice".into());
+        save_network_unlocked(dir, &home).unwrap();
+
+        let renamed = rename_network_in(dir, "homelab", "lab").unwrap().unwrap();
+        assert!(load_network_unlocked(dir, "homelab").unwrap().is_none());
+        let lab = load_network_unlocked(dir, "lab").unwrap().unwrap();
+        let expected = NetworkConfig {
+            name: "lab".into(),
+            ..home
+        };
+        for config in [&renamed, &lab] {
+            assert_eq!(
+                ::toml::to_string(config).unwrap(),
+                ::toml::to_string(&expected).unwrap()
+            );
+        }
+        // The name inside the file moved too, so updates under the new name work.
+        assert!(update_network_in(dir, "lab", |_| Ok(())).unwrap().is_some());
+        assert_eq!(load_in(dir).unwrap().networks.len(), 1);
+        // The intent outlives the move, for the caller's firewall rules.
+        assert_eq!(
+            load_rename_intent(dir).unwrap(),
+            Some(RenameIntent {
+                from: "homelab".into(),
+                to: "lab".into(),
+            })
+        );
+        clear_rename_intent_in(dir).unwrap();
+        assert!(load_rename_intent(dir).unwrap().is_none());
+        assert!(
+            rename_network_in(dir, "homelab", "office")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A crash part-way through a rename leaves one of three states, and the
+    /// saved intent finishes each. Between the move and the rewrite, the network
+    /// is listed under a name that cannot load it, so nothing could restore it.
+    #[test]
+    fn an_interrupted_rename_is_finished_from_its_intent() {
+        let intent = RenameIntent {
+            from: "homelab".into(),
+            to: "lab".into(),
+        };
+        for crash in ["before the move", "before the rewrite", "after the rewrite"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            let home = net("homelab");
+            save_network_unlocked(dir, &home).unwrap();
+            write_atomic(
+                &dir.join(RENAME_INTENT_FILE),
+                &::toml::to_string(&intent).unwrap(),
+                false,
+            )
+            .unwrap();
+            match crash {
+                "before the rewrite" => {
+                    let ndir = dir.join(NETWORKS_SUBDIR);
+                    std::fs::rename(ndir.join("homelab.toml"), ndir.join("lab.toml")).unwrap();
+                    let listed = load_in(dir).unwrap().networks;
+                    assert_eq!(listed[0].name, "homelab");
+                    assert!(load_network_unlocked(dir, "homelab").unwrap().is_none());
+                }
+                "after the rewrite" => {
+                    finish_rename_unlocked(dir, &intent).unwrap();
+                }
+                _ => {}
+            }
+
+            let lab = finish_rename_in(dir, &intent).unwrap().unwrap();
+            assert_eq!(lab.name, "lab", "{crash}");
+            let listed = load_in(dir).unwrap().networks;
+            assert_eq!(listed.len(), 1, "{crash}");
+            assert_eq!(listed[0].name, "lab", "{crash}");
+            let expected = NetworkConfig {
+                name: "lab".into(),
+                ..home
+            };
+            assert_eq!(
+                ::toml::to_string(&load_network_unlocked(dir, "lab").unwrap().unwrap()).unwrap(),
+                ::toml::to_string(&expected).unwrap(),
+                "{crash}"
+            );
+            // Finishing again changes nothing.
+            assert_eq!(
+                finish_rename_in(dir, &intent).unwrap().map(|net| net.name),
+                Some("lab".into()),
+                "{crash}"
+            );
+        }
+    }
+
+    /// Nothing is renamed over a network saved under the new name meanwhile, which
+    /// the daemon never does while the intent stands but a hand edit can, and a
+    /// network that is gone has nothing left to finish.
+    #[test]
+    fn an_interrupted_rename_never_replaces_another_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let intent = RenameIntent {
+            from: "homelab".into(),
+            to: "lab".into(),
+        };
+        let (homelab, lab) = (net("homelab"), net("lab"));
+        save_network_unlocked(dir, &homelab).unwrap();
+        save_network_unlocked(dir, &lab).unwrap();
+        assert!(finish_rename_in(dir, &intent).unwrap().is_none());
+        for kept in [&homelab, &lab] {
+            let saved = load_network_unlocked(dir, &kept.name).unwrap().unwrap();
+            assert_eq!(
+                ::toml::to_string(&saved).unwrap(),
+                ::toml::to_string(kept).unwrap()
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(finish_rename_in(tmp.path(), &intent).unwrap().is_none());
+    }
+
+    /// A rename that has not finished blocks the next one: its intent is the only
+    /// record of what is left to do.
+    #[test]
+    fn a_rename_waits_for_an_unfinished_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+        save_network_unlocked(dir, &net("office")).unwrap();
+        rename_network_in(dir, "homelab", "lab").unwrap().unwrap();
+
+        let refused = rename_network_in(dir, "office", "work").unwrap_err();
+        assert!(
+            refused.to_string().contains("has not finished"),
+            "{refused:#}"
+        );
+        assert!(load_network_unlocked(dir, "office").unwrap().is_some());
+        assert!(load_network_unlocked(dir, "work").unwrap().is_none());
+    }
+
+    /// A rename never replaces the config of a network already saved under the
+    /// new name, whose secret key would go with it.
+    #[test]
+    fn rename_refuses_a_name_another_network_is_saved_under() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (homelab, genesis) = (net("homelab"), net("genesis"));
+        save_network_unlocked(dir, &homelab).unwrap();
+        save_network_unlocked(dir, &genesis).unwrap();
+
+        assert!(rename_network_in(dir, "homelab", "genesis").is_err());
+        for kept in [&homelab, &genesis] {
+            let saved = load_network_unlocked(dir, &kept.name).unwrap().unwrap();
+            assert_eq!(
+                ::toml::to_string(&saved).unwrap(),
+                ::toml::to_string(kept).unwrap()
+            );
+        }
+        // Refused before anything was committed.
+        assert!(load_rename_intent(dir).unwrap().is_none());
     }
 
     #[test]
