@@ -1,6 +1,0 @@
-Target dependency graph (3 targets)
-Target 'Rayfish' in project 'Rayfish'
-➜ Explicit dependency on target 'RayfishTunnelExtension' in project 'Rayfish'
-➜ Explicit dependency on target 'Sparkle' in project 'Sparkle'
-Target 'Sparkle' in project 'Sparkle' (no dependencies)
-Target 'RayfishTunnelExtension' in project 'Rayfish' (no dependencies)
