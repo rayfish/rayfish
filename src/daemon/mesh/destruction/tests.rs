@@ -308,7 +308,13 @@ async fn rename_moves_live_state_filed_under_the_name() {
     .unwrap()
     .unwrap();
     // As `ray up` loads them, then a full tunnel through a peer on the network.
-    assert!(daemon.registry.reload_exit_state().is_none());
+    assert!(
+        daemon
+            .registry
+            .reload_exit_state()
+            .expect("exit state reloads from the config just written")
+            .is_none()
+    );
     #[cfg(feature = "desktop")]
     daemon.rebuild_ssh_authz();
     daemon

@@ -9,10 +9,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use iroh::dns::{DnsResolver, NameserverConfig};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
-    dns::{DnsResolver, NameserverConfig},
     endpoint::Connection,
     endpoint::presets,
     endpoint::{BindOpts, Builder, DirectAddrFilter, QuicTransportConfig, SocketConfigurator},
@@ -26,6 +27,11 @@ mod congestion;
 
 use congestion::LossTolerantConfig;
 use std::sync::Arc;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod dns;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod dns_socket;
 
 /// ALPN for the file-transfer protocol. The trailing `/1` is its protocol
 /// version, **bump it (`/2`, …) on any breaking change to the file wire
@@ -114,6 +120,8 @@ pub const MESH_V5_ALPN: &[u8] = b"rayfish/mesh/5";
 /// understand [`forward::IDLE_CODE`](crate::forward::IDLE_CODE): we simply never
 /// idle-close a connection whose peer did not advertise `FEATURE_IDLE_CLOSE`.
 pub const FEATURE_IDLE_CLOSE: u64 = 1 << 0;
+/// IPv4 exit datagrams use a local client address and gateway NAT leases.
+pub const FEATURE_EXIT_IPV4: u64 = 1 << 1;
 
 /// The preferred mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,
 /// a peer holds one QUIC connection carrying all networks we share.
@@ -138,7 +146,8 @@ pub fn mesh_alpns() -> Vec<Vec<u8>> {
 /// the mesh or the names on it goes here. An operator who names their own
 /// upstreams with `replace` gets exactly those instead (see
 /// [`control_plane_nameservers`]).
-const PUBLIC_FALLBACK_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
+pub(crate) const PUBLIC_FALLBACK_DNS: [Ipv4Addr; 2] =
+    [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
 
 /// At most this many nameservers are handed to the endpoint, so a host with a
 /// long resolv.conf doesn't turn every lookup into a fan-out.
@@ -324,6 +333,11 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
     // Empty means we had no way to read the host's resolvers (Android reads them
     // over JNI, and its own resolver honours the device's Private DNS), so leave
     // iroh's default in place there.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if !nameservers.is_empty() {
+        builder = builder.dns_resolver(dns::resolver(nameservers)?);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if !nameservers.is_empty() {
         builder = builder.dns_resolver(
             DnsResolver::builder()

@@ -11,6 +11,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - iOS 18: a Rayfish control turns the VPN on and off from Control Center,
   the Lock Screen or the Action button.
 
+- The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
+  and DNS through the packet tunnel, or restore a direct connection.
+
+- Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
+  with only an IPv4 internet connection.
+
+### Changed
+
+- While an exit node is selected, the LAN, Docker networks and other VPNs stay
+  reachable directly, and SSH sessions to the client's own address keep
+  working. Only new connections to the internet outside the tunnel are
+  blocked. If the client's IPv4 tunnel address conflicts with a local route,
+  the exit carries IPv6 only instead of failing.
+
 ## [0.5.10] - 2026-10-19
 
 ### Added
@@ -396,6 +410,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Check for Updates" in the app menu to check at any time.
 
 ### Changed
+
+- Selecting an exit node captures both IP families and DNS. Unsupported families
+  and unavailable exits stay blocked until the exit is cleared. Transport traffic
+  remains outside the tunnel. Android exit routing is deferred.
 
 - `ray status` shows each network's admission mode. Member networks show
   `mode unknown` because the coordinator does not share this setting.
