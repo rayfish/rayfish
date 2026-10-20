@@ -10,9 +10,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use anyhow::{Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use iroh::dns::{DnsProtocol, DnsResolver};
+use iroh::dns::{DnsResolver, NameserverConfig};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::Connection,
     endpoint::presets,
@@ -20,13 +20,12 @@ use iroh::{
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-use crate::config::{AppConfig, QuicCongestion, ServerOverride};
+use crate::config::{AppConfig, QuicEngine, ServerOverride};
 use crate::exit_node::{LoopPrevention, is_transitable};
 
 mod congestion;
 
-use congestion::controller_factory;
-#[cfg(feature = "tor")]
+use congestion::LossTolerantConfig;
 use std::sync::Arc;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -43,10 +42,16 @@ pub const FILES_ALPN: &[u8] = b"rayfish/files/2";
 
 /// Identity-level ALPN for the `ray connect` friend-request handshake. Unlike
 /// `network_alpn`, this is not per-network: it accepts connection requests
-/// addressed to this node's contact key. The trailing `/1` is its protocol
+/// addressed to this node's identity. The trailing `/1` is its protocol
 /// version, **bump it on any breaking change to the `ConnectMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
 pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
+
+/// ALPN for delivering a private invitation (`ConnectMsg::InviteOffer`) to a
+/// user's identity. Separate from [`CONNECT_ALPN`] so a node too old to read
+/// an offer fails the handshake instead of the message: the sender can tell
+/// it apart from an offline or refusing recipient and stop retrying.
+pub const INVITE_ALPN: &[u8] = b"rayfish/invite/1";
 
 /// Fixed UDP port the endpoint binds so users can port-forward a stable, known
 /// port for guaranteed direct reachability (Tailscale-style). Unlike an ephemeral
@@ -141,7 +146,8 @@ pub fn mesh_alpns() -> Vec<Vec<u8>> {
 /// the mesh or the names on it goes here. An operator who names their own
 /// upstreams with `replace` gets exactly those instead (see
 /// [`control_plane_nameservers`]).
-const PUBLIC_FALLBACK_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
+pub(crate) const PUBLIC_FALLBACK_DNS: [Ipv4Addr; 2] =
+    [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
 
 /// At most this many nameservers are handed to the endpoint, so a host with a
 /// long resolv.conf doesn't turn every lookup into a fan-out.
@@ -169,7 +175,8 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) 
     if system.is_none() && o.servers.is_empty() {
         return Vec::new();
     }
-    let mut out: Vec<Ipv4Addr> = crate::config::resolve_upstreams(o, system.unwrap_or_default())
+    let system = system.unwrap_or_default().into_iter().map(IpAddr::V4);
+    let mut out: Vec<Ipv4Addr> = crate::config::resolve_upstreams(o, system.collect())
         .into_iter()
         .filter_map(|ip| match ip {
             IpAddr::V4(ip) => Some(ip),
@@ -222,7 +229,7 @@ pub async fn create_endpoint_with_alpns(
         discovery: &settings.discovery_dns,
         nameservers: &nameservers,
         warm_lookup: &warm_lookup,
-        quic_congestion: settings.quic_congestion,
+        quic_engine: settings.quic_engine,
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -255,7 +262,7 @@ struct BindConfig<'a> {
     discovery: &'a ServerOverride,
     nameservers: &'a [Ipv4Addr],
     warm_lookup: &'a MemoryLookup,
-    quic_congestion: QuicCongestion,
+    quic_engine: QuicEngine,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -278,7 +285,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         discovery,
         nameservers,
         warm_lookup,
-        quic_congestion,
+        quic_engine,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -305,9 +312,8 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
         //     small send limit. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
-        // The congestion controller is the `quic-congestion` setting, noq's
-        // Cubic by default (see `transport::congestion`).
-        .transport_config(quic_transport_config(quic_congestion))
+        // Both forwarding engines use loss-tolerant congestion control.
+        .transport_config(quic_transport_config(quic_engine))
         // Drop overlay addresses from the gathered direct-address candidates, so a
         // mesh IP bound on the TUN is never stored, published, or offered as a
         // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
@@ -322,7 +328,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
     // with it, and a resolv.conf that already points at our magic IP (a restart
     // before the revert, a crash) makes the control plane wait on the data plane
     // it exists to bring up. Not setting `with_system_defaults` is deliberate:
-    // hickory then never reads the file, so neither can come back.
+    // the resolver never reads the file, so neither can come back.
     //
     // Empty means we had no way to read the host's resolvers (Android reads them
     // over JNI, and its own resolver honours the device's Private DNS), so leave
@@ -335,10 +341,10 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
     if !nameservers.is_empty() {
         builder = builder.dns_resolver(
             DnsResolver::builder()
-                .with_nameservers(
+                .add_nameserver_configs(
                     nameservers
                         .iter()
-                        .map(|ip| (SocketAddr::from((*ip, 53u16)), DnsProtocol::Udp)),
+                        .map(|ip| NameserverConfig::udp(IpAddr::V4(*ip))),
                 )
                 .build(),
         );
@@ -498,7 +504,15 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+const DATAGRAM_SEND_BUFFER_SIZE: usize = 16 * 1024;
+
+/// Bound standalone queueing delay and keep FQ-CoDel's backlog in its scheduler.
+pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
+    match engine {
+        QuicEngine::FqCodel => DATAGRAM_SEND_BUFFER_SIZE,
+        QuicEngine::Standalone => DATAGRAM_SEND_BUFFER_SIZE,
+    }
+}
 
 /// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one QUIC
 /// connection carrying DATAGRAM frames per peer, plus reliable control streams).
@@ -506,13 +520,10 @@ pub(crate) const DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
-fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
-    tracing::info!(congestion_controller = cc.as_ref(), "QUIC transport config");
-    let builder = match controller_factory(cc) {
-        Some(factory) => QuicTransportConfig::builder().congestion_controller_factory(factory),
-        None => QuicTransportConfig::builder(),
-    };
-    builder
+pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
+    tracing::info!(engine = engine.as_ref(), "QUIC transport config");
+    QuicTransportConfig::builder()
+        .congestion_controller_factory(Arc::new(LossTolerantConfig::default()))
         // There are no competing data streams of equal priority, so disable
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.
@@ -523,7 +534,7 @@ fn quic_transport_config(cc: QuicCongestion) -> QuicTransportConfig {
         // Keep the unreliable datagram queue small. When it fills, noQ discards
         // older datagrams rather than making the forwarding path wait and add
         // latency behind stale traffic.
-        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE)
+        .datagram_send_buffer_size(datagram_send_buffer_size(engine))
         .build()
 }
 
@@ -544,6 +555,14 @@ pub fn build_relay_mode(o: &ServerOverride) -> Result<Option<RelayMode>> {
         parsed.extend(RelayMode::Default.relay_map().urls::<Vec<RelayUrl>>());
     }
     Ok(Some(RelayMode::custom(parsed)))
+}
+
+/// The relays an endpoint built from `o` starts with: the override, or the N0
+/// preset's default when unset. Phones drop these while idle and restore them
+/// on wake.
+pub fn configured_relay_map(o: &ServerOverride) -> Result<RelayMap> {
+    let mode = build_relay_mode(o)?.unwrap_or_else(iroh::endpoint::default_relay_mode);
+    Ok(mode.relay_map())
 }
 
 /// Apply a discovery-DNS override to the endpoint builder. Each configured URL

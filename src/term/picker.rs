@@ -33,7 +33,8 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    fn is_empty(&self) -> bool {
+    /// Whether the user decided nothing (quit with every rule undecided).
+    pub fn is_empty(&self) -> bool {
         self.accept.is_empty() && self.deny.is_empty()
     }
 }
@@ -120,8 +121,6 @@ pub fn run(network: &str, rules: &[FirewallRuleView]) -> Result<Option<Resolutio
                     Decision::Undecided => {}
                 }
             }
-            // An all-undecided quit is a no-op, but still a valid (empty) result.
-            let _ = res.is_empty();
             Ok(Some(res))
         }
     }
@@ -144,7 +143,7 @@ fn render(
             Decision::Deny => ("✗", style::cross()),
             Decision::Undecided => (" ", " ".to_string()),
         };
-        let port = if r.port == "*" { "*" } else { &r.port };
+        let port = r.port.as_str();
         let sugg = r
             .suggested_by
             .as_ref()

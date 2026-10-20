@@ -39,7 +39,8 @@ pub enum Verdict {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum Manager {
     Ufw,
     Firewalld,
@@ -48,15 +49,6 @@ pub enum Manager {
 }
 
 impl Manager {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Manager::Ufw => "ufw",
-            Manager::Firewalld => "firewalld",
-            Manager::Iptables => "iptables",
-            Manager::Nftables => "nftables",
-        }
-    }
-
     /// The command that opens `port` for inbound TCP on `tun` only. Mesh SSH
     /// binds the overlay's IPv6 address, so `ip6tables` is the only raw ruleset
     /// that can drop the connection. ufw and firewalld apply to both families
@@ -89,7 +81,7 @@ impl Verdict {
                 "{} is blocking inbound TCP port {port} on the mesh interface, which is where \
                  mesh SSH actually listens (mesh `:22` is mapped to {port} internally, so an \
                  \"allow 22\" rule does not cover it). Connections will hang until you run:\n  {fix}",
-                manager.as_str(),
+                <&str>::from(manager),
             )),
             _ => None,
         }
@@ -125,22 +117,51 @@ fn check_inbound_tcp_with(
     // silently discards.
     let manager = detect_manager(run);
 
-    if let Some(rules) = run(&["ip6tables", "-S"])
-        && let Some(blocked) = iptables_blocks_port(&rules, tun, port)
-    {
-        return verdict(blocked, manager.unwrap_or(Manager::Iptables), tun, port);
+    // Both ladders, and a block from either one wins. They are not alternatives:
+    // on an iptables-nft host `ip6tables -S` shows only its own (often empty,
+    // ACCEPT) table, while a native `inet filter` with `policy drop` sits beside
+    // it and drops the connection all the same. Stopping at the first answer
+    // reported that host clear, including right after `ensure_inbound_tcp` added
+    // an ip6tables rule that could not help.
+    let ip6 = run(&["ip6tables", "-S"]).and_then(|rules| iptables_blocks_port(&rules, tun, port));
+    // `nft list ruleset` prints every family at once; the `inet` tables both
+    // distros and we generate cover v4 and v6 together. Tables the ip6tables
+    // pass already read are left out so the same rules are not judged twice.
+    let nft = run(&["nft", "list", "ruleset"])
+        .and_then(|ruleset| nft_blocks_port(&native_v6_tables(&ruleset, ip6.is_some()), tun, port));
+    match (ip6, nft) {
+        (Some(true), _) => verdict(true, manager.unwrap_or(Manager::Iptables), tun, port),
+        (_, Some(true)) => verdict(true, manager.unwrap_or(Manager::Nftables), tun, port),
+        (Some(false), _) | (_, Some(false)) => Verdict::Clear,
+        (None, None) => Verdict::Unknown,
     }
+}
 
-    // `nft list ruleset` prints every family at once, and the `inet` tables both
-    // distros and we generate cover v4 and v6 together, so this rung needs no
-    // family split.
-    if let Some(ruleset) = run(&["nft", "list", "ruleset"])
-        && let Some(blocked) = nft_blocks_port(&ruleset, tun, port)
-    {
-        return verdict(blocked, manager.unwrap_or(Manager::Nftables), tun, port);
+/// The tables of an `nft list ruleset` dump that can drop an IPv6 connection
+/// and are not someone else's view of iptables: `ip` (IPv4-only) tables are
+/// dropped, and so, when `skip_iptables_nft`, are tables iptables-nft owns (it
+/// names its base chains `INPUT`/`FORWARD`/`OUTPUT`; native rulesets do not).
+#[cfg(target_os = "linux")]
+fn native_v6_tables(ruleset: &str, skip_iptables_nft: bool) -> String {
+    let mut out = String::new();
+    let mut block = String::new();
+    for line in ruleset.lines() {
+        block.push_str(line);
+        block.push('\n');
+        // A table closes on a `}` in column 0; everything nested is indented.
+        if line.starts_with('}') {
+            let header = block.lines().next().unwrap_or_default();
+            let v4_only = header.starts_with("table ip ");
+            let iptables_nft = ["chain INPUT {", "chain FORWARD {", "chain OUTPUT {"]
+                .iter()
+                .any(|c| block.contains(c));
+            if !v4_only && !(skip_iptables_nft && iptables_nft) {
+                out.push_str(&block);
+            }
+            block.clear();
+        }
     }
-
-    Verdict::Unknown
+    out
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -204,7 +225,7 @@ fn ensure_inbound_tcp_with(
     };
     if !installed {
         tracing::warn!(
-            manager = manager.as_str(),
+            manager = <&str>::from(manager),
             "could not add the mesh SSH firewall rule"
         );
         return before;
@@ -212,7 +233,7 @@ fn ensure_inbound_tcp_with(
     match check_inbound_tcp_with(tun, port, run) {
         Verdict::Clear => {
             tracing::info!(
-                manager = manager.as_str(),
+                manager = <&str>::from(manager),
                 interface = tun,
                 port,
                 "allowed mesh SSH through the host firewall"
@@ -239,7 +260,7 @@ fn verdict(blocked: bool, manager: Manager, tun: &str, port: u16) -> Verdict {
 
 /// Which front-end owns the ruleset, if we can tell.
 #[cfg(target_os = "linux")]
-fn detect_manager(run: &mut impl FnMut(&[&str]) -> Option<String>) -> Option<Manager> {
+pub(crate) fn detect_manager(run: &mut impl FnMut(&[&str]) -> Option<String>) -> Option<Manager> {
     if run(&["ufw", "status"]).is_some_and(|s| s.contains("Status: active")) {
         return Some(Manager::Ufw);
     }
@@ -250,7 +271,7 @@ fn detect_manager(run: &mut impl FnMut(&[&str]) -> Option<String>) -> Option<Man
 }
 
 #[cfg(target_os = "linux")]
-fn run(argv: &[&str]) -> Option<String> {
+pub(crate) fn run(argv: &[&str]) -> Option<String> {
     let out = Command::new(argv[0]).args(&argv[1..]).output().ok()?;
     if !out.status.success() {
         return None;
@@ -342,6 +363,7 @@ mod tests {
         firewalld_active: bool,
         raw_rule_exists: bool,
         rules: Option<&'static str>,
+        nft: Option<&'static str>,
         after_write: Option<&'static str>,
         fail_write: bool,
         writes: usize,
@@ -354,6 +376,7 @@ mod tests {
                 firewalld_active: false,
                 raw_rule_exists: false,
                 rules: Some(BLOCKED_TEST_RULES),
+                nft: None,
                 after_write: Some(ALLOWED_TEST_RULES),
                 fail_write: false,
                 writes: 0,
@@ -364,7 +387,7 @@ mod tests {
             match args {
                 ["ufw", "status"] => self.ufw_status.map(str::to_owned),
                 ["firewall-cmd", "--state"] => self.firewalld_active.then(|| "running".into()),
-                ["nft", "list", "ruleset"] => None,
+                ["nft", "list", "ruleset"] => self.nft.map(str::to_owned),
                 ["ip6tables", "-S"] => self.rules.map(str::to_owned),
                 ["ip6tables", "-w", "5", "-C", ..] => {
                     assert_eq!(args, Self::raw_args("-C"));
@@ -504,6 +527,71 @@ mod tests {
             verdict(true, Manager::Iptables, "mesh-test", 4242)
         );
         assert_eq!(firewall.writes, 1);
+    }
+
+    /// iptables-nft beside a native ruleset: `ip6tables -S` shows its own empty
+    /// ACCEPT table, and the native `inet filter` drops the connection anyway.
+    const NATIVE_INET_DROP: &str = "\
+table ip6 filter {
+\tchain INPUT {
+\t\ttype filter hook input priority filter; policy accept;
+\t}
+}
+table inet filter {
+\tchain input {
+\t\ttype filter hook input priority filter; policy drop;
+\t\ttcp dport 22 accept
+\t}
+}
+";
+
+    #[test]
+    fn a_native_nft_drop_is_seen_past_an_accepting_ip6tables() {
+        let mut firewall = TestFirewall::blocked();
+        firewall.ufw_status = None;
+        firewall.rules = Some("-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n");
+        firewall.nft = Some(NATIVE_INET_DROP);
+        assert_eq!(
+            check_inbound_tcp_with("mesh-test", 4242, &mut |a| firewall.run(a)),
+            verdict(true, Manager::Nftables, "mesh-test", 4242)
+        );
+        // Nothing is written to a ruleset we do not manage, and the warning stays.
+        assert_eq!(
+            firewall.ensure(),
+            verdict(true, Manager::Nftables, "mesh-test", 4242)
+        );
+        assert_eq!(firewall.writes, 0);
+    }
+
+    #[test]
+    fn an_ip6tables_rule_does_not_hide_a_native_drop_after_ensure() {
+        let mut firewall = TestFirewall::blocked();
+        firewall.ufw_status = None;
+        firewall.nft = Some(NATIVE_INET_DROP);
+        assert_eq!(
+            firewall.ensure(),
+            verdict(true, Manager::Nftables, "mesh-test", 4242),
+            "the ip6tables rule went in but the native table still drops"
+        );
+        assert_eq!(firewall.writes, 1);
+    }
+
+    #[test]
+    fn iptables_nft_and_v4_tables_are_not_judged_twice() {
+        // ip6tables already said this port is allowed; its nft rendering (whose
+        // rule text the nft parser does not recognise) and an IPv4 table must not
+        // overrule that.
+        let mut firewall = TestFirewall::blocked();
+        firewall.ufw_status = None;
+        firewall.rules = Some(ALLOWED_TEST_RULES);
+        firewall.nft = Some(
+            "table ip6 filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n\
+             table ip filter {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n",
+        );
+        assert_eq!(
+            check_inbound_tcp_with("mesh-test", 4242, &mut |a| firewall.run(a)),
+            Verdict::Clear
+        );
     }
 
     // The ruleset from the host that prompted this module: ufw active, default

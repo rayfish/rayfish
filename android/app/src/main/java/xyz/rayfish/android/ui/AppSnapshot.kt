@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
+import uniffi.ray_mobile.Invitation
+import uniffi.ray_mobile.InvitationState
 import uniffi.ray_mobile.NetworkConnState
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.QueuedSend
@@ -33,6 +35,7 @@ data class AppSnapshot(
     val files: List<FileOffer> = emptyList(),
     val connects: List<PendingRequest> = emptyList(),
     val joins: List<Pair<String, PendingRequest>> = emptyList(),
+    val invitations: List<Invitation> = emptyList(),
     val queued: List<QueuedSend> = emptyList(),
     val transfers: List<Transfer> = emptyList(),
     val savingTransfers: Set<ULong> = emptySet(),
@@ -97,6 +100,9 @@ private fun readSnapshot(context: Context, previous: AppSnapshot): AppSnapshot {
     return AppSnapshot(
         status = status, controlPlaneRunning = true, files = files, joins = joins,
         connects = read(previous.connects) { node.listConnectRequests() },
+        invitations = read(previous.invitations) {
+            node.listInvitations().filter { it.state == InvitationState.PENDING }
+        },
         queued = read(previous.queued) { node.listQueuedSends() },
         transfers = transfers,
         savingTransfers = transfers.filter {

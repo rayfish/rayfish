@@ -30,6 +30,7 @@ import xyz.rayfish.android.R
 import xyz.rayfish.android.isActive
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
+import xyz.rayfish.android.ui.userMessage
 
 @Composable
 fun NetworkDetailScreen(
@@ -40,6 +41,7 @@ fun NetworkDetailScreen(
     val scope = rememberCoroutineScope()
     var confirmLeave by rememberSaveable { mutableStateOf(false) }
     var inviteCode by remember { mutableStateOf<String?>(null) }
+    var sendingInvite by rememberSaveable { mutableStateOf(false) }
     var editing by rememberSaveable { mutableStateOf(false) }
     var hostnameInput by rememberSaveable { mutableStateOf("") }
     var firewall by remember { mutableStateOf<uniffi.ray_mobile.FirewallStateInfo?>(null) }
@@ -57,13 +59,14 @@ fun NetworkDetailScreen(
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.cd_back), tint = Rf.Muted) }
             Text(detail.name, fontFamily = Chakra, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Rf.Heading)
             Spacer(Modifier.weight(1f))
-            OverflowMenu(listOf(
+            OverflowMenu(listOfNotNull(
                 MenuItem(stringResource(R.string.menu_invite)) {
                     scope.launch {
                         try { inviteCode = withContext(Dispatchers.IO) { NodeHolder.get(context).invite(detail.name) } }
-                        catch (t: Throwable) { onToast(context.getString(R.string.error_invite_failed, t.message.orEmpty())) }
+                        catch (t: Throwable) { onToast(context.getString(R.string.error_invite_failed, t.userMessage)) }
                     }
                 },
+                if (detail.isCoordinator) MenuItem(stringResource(R.string.menu_send_invite)) { sendingInvite = true } else null,
                 MenuItem(stringResource(R.string.menu_leave_network), destructive = true) { confirmLeave = true },
             ))
         }
@@ -125,7 +128,7 @@ fun NetworkDetailScreen(
                                 try {
                                     withContext(Dispatchers.IO) { NodeHolder.get(context).firewallSetDefaultInbound(next) }
                                     reloadFirewall(); onToast(context.getString(R.string.toast_inbound_default, next))
-                                } catch (t: Throwable) { onToast(context.getString(R.string.error_failed, t.message.orEmpty())) }
+                                } catch (t: Throwable) { onToast(context.getString(R.string.error_failed, t.userMessage)) }
                             }
                         },
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
@@ -161,7 +164,7 @@ fun NetworkDetailScreen(
                                 try {
                                     withContext(Dispatchers.IO) { NodeHolder.get(context).firewallRemove(globalIndex.toUInt()) }
                                     reloadFirewall(); onToast(context.getString(R.string.toast_rule_removed))
-                                } catch (t: Throwable) { onToast(context.getString(R.string.error_remove_failed, t.message.orEmpty())) }
+                                } catch (t: Throwable) { onToast(context.getString(R.string.error_remove_failed, t.userMessage)) }
                             }
                         }) { Text(stringResource(R.string.action_remove), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Rose400) }
                     }
@@ -185,7 +188,7 @@ fun NetworkDetailScreen(
                     confirmLeave = false
                     scope.launch {
                         try { withContext(Dispatchers.IO) { NodeHolder.get(context).leave(detail.name) }; onToast(context.getString(R.string.toast_left, detail.name)); onLeft() }
-                        catch (t: Throwable) { onToast(context.getString(R.string.error_leave_failed, t.message.orEmpty())) }
+                        catch (t: Throwable) { onToast(context.getString(R.string.error_leave_failed, t.userMessage)) }
                     }
                 }) { Text(stringResource(R.string.action_leave), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
@@ -205,7 +208,7 @@ fun NetworkDetailScreen(
                         try {
                             withContext(Dispatchers.IO) { NodeHolder.get(context).setHostname(detail.name, h) }
                             onToast(context.getString(R.string.toast_hostname_set)); onChanged(); editing = false
-                        } catch (t: Throwable) { onToast(context.getString(R.string.error_invalid_hostname, t.message.orEmpty())) }
+                        } catch (t: Throwable) { onToast(context.getString(R.string.error_invalid_hostname, t.userMessage)) }
                     }
                 }) { Text(stringResource(R.string.action_save), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
@@ -251,12 +254,21 @@ fun NetworkDetailScreen(
                                 )
                             }
                             reloadFirewall(); onToast(context.getString(R.string.toast_rule_added)); showAddRule = false
-                        } catch (t: Throwable) { onToast(context.getString(R.string.error_add_failed, t.message.orEmpty())) }
+                        } catch (t: Throwable) { onToast(context.getString(R.string.error_add_failed, t.userMessage)) }
                     }
                 }) { Text(stringResource(R.string.action_add_rule), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = { TextButton(onClick = { showAddRule = false }) { Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra) } },
         )
+    }
+    if (sendingInvite) {
+        IdentityDialog(
+            title = stringResource(R.string.send_invite_title, detail.name),
+            body = stringResource(R.string.send_invite_body),
+            confirmLabel = stringResource(R.string.action_send),
+            onDismiss = { sendingInvite = false },
+            onToast = onToast,
+        ) { recipient -> NodeHolder.get(context).sendInvite(detail.name, recipient) }
     }
     inviteCode?.let { code -> QrCodeSheet(stringResource(R.string.invite_sheet_title), code, context) { inviteCode = null } }
 }

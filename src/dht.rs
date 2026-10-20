@@ -23,8 +23,8 @@ pub(crate) mod destruction;
 /// stopped resolving the relay's own name) would otherwise leave `ray join`
 /// hanging with nothing on screen.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Bound publication too: snapshot commits wait behind an in-flight publish so
-/// an older record cannot land after a newer recovery pointer.
+/// Bound publication too, so a blackholed relay cannot hold a publisher or an
+/// admission waiting on its record forever.
 const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Resolve the pkarr relay URL for one daemon from its startup configuration.
@@ -38,11 +38,6 @@ pub fn pkarr_relay_url(o: &crate::config::ServerOverride) -> Url {
         .and_then(|url| url.parse().ok())
         .unwrap_or_else(|| Url::parse(PKARR_RELAY_URL).expect("constant relay URL is valid"))
 }
-
-/// pkarr record name for a user's contact key (`ray connect`). Published under
-/// the contact key, it maps the contact id to the user's current transport
-/// EndpointId so a peer can dial them without knowing the transport id.
-const CONTACT_RECORD_NAME: &str = "_rayfish_contact";
 
 // ---------------------------------------------------------------------------
 // Pkarr client
@@ -154,41 +149,6 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec
 }
 
 // ---------------------------------------------------------------------------
-// Contact record encoding / decoding (ray connect)
-// ---------------------------------------------------------------------------
-
-/// Encode a contact record: maps the contact key to the user's current
-/// transport EndpointId. Signed by (and published under) the contact key, so
-/// only its holder can publish it. Carries nothing else: no roster, hostname,
-/// or member identities.
-pub fn encode_contact_record(
-    contact_key: &SecretKey,
-    endpoint: EndpointId,
-) -> Result<SignedPacket> {
-    let values = vec![RECORD_VERSION.to_string(), format!("e,{endpoint}")];
-    SignedPacket::from_txt_strings(contact_key, CONTACT_RECORD_NAME, values, RECORD_TTL)
-        .map_err(|e| anyhow::anyhow!("failed to build contact record: {e}"))
-}
-
-pub fn decode_contact_record(packet: &SignedPacket) -> Result<EndpointId> {
-    let records = packet.txt_records(CONTACT_RECORD_NAME);
-    ensure!(!records.is_empty(), "no contact records found");
-    ensure!(
-        records[0] == RECORD_VERSION,
-        "unsupported record version: {}",
-        records[0]
-    );
-    for record in &records[1..] {
-        if let Some(id_str) = record.strip_prefix("e,") {
-            return id_str
-                .parse::<EndpointId>()
-                .context("invalid contact endpoint ID");
-        }
-    }
-    anyhow::bail!("missing contact endpoint (e,)")
-}
-
-// ---------------------------------------------------------------------------
 // Publish / resolve
 // ---------------------------------------------------------------------------
 
@@ -199,8 +159,20 @@ pub async fn publish_network(
     seed_peers: &[EndpointId],
 ) -> Result<Vec<u8>> {
     let packet = encode_network_record(key, blob_hash, seed_peers)?;
-    match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(&packet)).await {
-        Ok(Ok(())) => Ok(packet.as_bytes().to_vec()),
+    publish_record(client, &packet).await?;
+    Ok(packet.as_bytes().to_vec())
+}
+
+/// Publish a network record built earlier by [`encode_network_record`].
+///
+/// Callers that order their records against local state sign the packet while
+/// they hold that state's lock and publish it after releasing the lock. The
+/// packet's timestamp is taken at signing, and the relay keeps the most recent
+/// one, so a record signed earlier cannot replace a later one even when its
+/// publish finishes last.
+pub async fn publish_record(client: &PkarrRelayClient, packet: &SignedPacket) -> Result<()> {
+    match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(packet)).await {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(anyhow::anyhow!("failed to publish network record: {e:#}")),
         Err(_) => Err(anyhow::anyhow!(
             "timed out publishing network record after {}s",
@@ -254,30 +226,6 @@ pub async fn resolve_network(
     decode_network_record(&packet)
 }
 
-/// Publish this user's contact record (`contact_key -> current endpoint`).
-pub async fn publish_contact(
-    client: &PkarrRelayClient,
-    contact_key: &SecretKey,
-    endpoint: EndpointId,
-) -> Result<()> {
-    let packet = encode_contact_record(contact_key, endpoint)?;
-    client
-        .publish(&packet)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to publish contact record: {e:#}"))
-}
-
-/// Resolve a contact id to the holder's current transport EndpointId.
-pub async fn resolve_contact(
-    client: &PkarrRelayClient,
-    contact_pubkey: EndpointId,
-) -> Result<EndpointId> {
-    let packet = resolve_packet(client, contact_pubkey)
-        .await
-        .context("failed to resolve contact record")?;
-    decode_contact_record(&packet)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -292,18 +240,19 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn contact_lookup_verifies_the_record_without_a_peer_connection() {
-        let contact = SecretKey::from([7; 32]);
-        let endpoint_id = SecretKey::from([8; 32]).public();
-        let valid = encode_contact_record(&contact, endpoint_id)
+    async fn network_lookup_verifies_the_record_without_a_peer_connection() {
+        let network = SecretKey::from([7; 32]);
+        let hash = blake3::hash(b"blob");
+        let seed = SecretKey::from([8; 32]).public();
+        let valid = encode_network_record(&network, &hash, &[seed])
             .unwrap()
             .to_relay_payload();
-        let forged = encode_contact_record(&SecretKey::from([9; 32]), endpoint_id)
+        let forged = encode_network_record(&SecretKey::from([9; 32]), &hash, &[seed])
             .unwrap()
             .to_relay_payload();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let url = Url::parse(&format!("http://{}/pkarr", listener.local_addr().unwrap())).unwrap();
-        let path = format!("GET /pkarr/{} HTTP/1.1\r\n", contact.public().to_z32());
+        let path = format!("GET /pkarr/{} HTTP/1.1\r\n", network.public().to_z32());
         let server = tokio::spawn(async move {
             for (status, payload) in [
                 ("200 OK", valid),
@@ -336,11 +285,12 @@ mod tests {
             .unwrap();
         let client = create_pkarr_client(&endpoint, &url).unwrap();
         assert_eq!(
-            resolve_contact(&client, contact.public()).await.unwrap(),
-            endpoint_id
+            decode_network_record(&resolve_packet(&client, network.public()).await.unwrap())
+                .unwrap(),
+            (hash, vec![seed])
         );
-        assert!(resolve_contact(&client, contact.public()).await.is_err());
-        assert!(resolve_contact(&client, contact.public()).await.is_err());
+        assert!(resolve_packet(&client, network.public()).await.is_err());
+        assert!(resolve_packet(&client, network.public()).await.is_err());
         server.await.unwrap();
         endpoint.close().await;
     }
@@ -480,48 +430,6 @@ mod tests {
         let packet = SignedPacket::from_txt_strings(&key, "_other", values, 300).unwrap();
         let result = decode_network_record(&packet);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn contact_record_roundtrip() {
-        let contact = SecretKey::generate();
-        let endpoint = SecretKey::generate().public();
-        let packet = encode_contact_record(&contact, endpoint).unwrap();
-        let decoded = decode_contact_record(&packet).unwrap();
-        assert_eq!(decoded, endpoint);
-    }
-
-    #[test]
-    fn contact_record_rejects_unknown_version() {
-        let key = SecretKey::generate();
-        let endpoint = SecretKey::generate().public();
-        let values = vec!["v99".to_string(), format!("e,{endpoint}")];
-        let packet =
-            SignedPacket::from_txt_strings(&key, CONTACT_RECORD_NAME, values, 300).unwrap();
-        let result = decode_contact_record(&packet);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported record version")
-        );
-    }
-
-    #[test]
-    fn contact_record_rejects_missing_endpoint() {
-        let key = SecretKey::generate();
-        let values = vec!["v1".to_string()];
-        let packet =
-            SignedPacket::from_txt_strings(&key, CONTACT_RECORD_NAME, values, 300).unwrap();
-        let result = decode_contact_record(&packet);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("missing contact endpoint")
-        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -396,8 +396,8 @@ impl DnsConfigurator for MacosDynamicStoreDns {
         Ok(())
     }
 
-    fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
-        self.captured.clone()
+    fn captured_upstreams(&self) -> Vec<IpAddr> {
+        self.captured.iter().copied().map(IpAddr::V4).collect()
     }
 
     async fn revert(&self) -> Result<()> {

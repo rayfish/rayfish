@@ -97,6 +97,17 @@ jobs:
       - name: Install build tools
         run: brew install xcodegen just create-dmg
 
+      - name: Load published release notes
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p target/macos-release
+          printf '## [%s]\n\n' "${RELEASE_TAG#v}" > target/macos-release/CHANGELOG.md
+          gh release view "$RELEASE_TAG" --json body --jq .body >> target/macos-release/CHANGELOG.md
+
       - name: Import signing certificate and profiles
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}

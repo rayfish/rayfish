@@ -10,7 +10,6 @@ use rayfish::config::{AppConfig, ServerOverride};
 use rayfish::exit_node::{
     ExitServer, disable, install_client_routing, ipv4, teardown_client_routing,
 };
-use rayfish::membership::ExitFamilies;
 use rayfish::tun::{self, TunRead, TunWrite};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -118,7 +117,7 @@ while True:
         server.offers_v4() && !server.offers_v6(),
         "IPv4-only gateway capability"
     );
-    install_client_routing(&client_name, ExitFamilies::V4)?;
+    install_client_routing(&client_name)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect("8.8.8.8:9000").await?;
     socket.send(b"example payload").await?;
@@ -184,8 +183,8 @@ while True:
     );
     answer.await??;
 
-    // Reapply with a gateway that lost its uplinks: both families stay captured.
-    install_client_routing(&client_name, ExitFamilies::Neither)?;
+    // Reapplying keeps both families captured.
+    install_client_routing(&client_name)?;
     for family in ["-4", "-6"] {
         let rules = Command::new("ip").args([family, "rule", "show"]).output()?;
         anyhow::ensure!(
@@ -258,7 +257,7 @@ while True:
         "transport DNS bypass"
     );
     endpoint.close().await;
-    install_client_routing(&client_name, ExitFamilies::V4)?;
+    install_client_routing(&client_name)?;
 
     // A route overlapping the lease pool turns off IPv4 transit, not the gateway.
     run(&["ip", "route", "add", "198.18.0.0/15", "dev", "uplink"])?;

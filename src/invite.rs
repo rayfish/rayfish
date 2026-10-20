@@ -12,12 +12,18 @@
 //! secret, looks it up in the ledger, and burns it. Codes minted before the
 //! checksum existed still decode.
 
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::fmt::{self, Debug, Formatter};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
+
+// Invite expiry uses wall-clock time, so a large backward clock adjustment on
+// the coordinator could briefly un-expire an invite (or a forward jump expire
+// one early), acceptable for a TTL credential.
+use crate::membership::now_secs;
 
 /// Length of the random invite secret, in bytes (128 bits).
 pub const SECRET_LEN: usize = 16;
@@ -34,7 +40,8 @@ pub enum InviteStatus {
 }
 
 /// A single invite record. `secret_hash` (not the secret) is persisted, like a
-/// password hash: the raw secret only ever exists in the code handed to the joiner.
+/// password hash: the raw secret only ever exists in the code handed to the
+/// joiner, except for a private delivery, which keeps its code for retries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
     /// Short human id: the first 8 hex chars of `blake3(secret)`.
@@ -50,7 +57,73 @@ pub struct Invite {
     /// networks). `None` = the joiner's `--hostname` claim is used as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Set for an invite delivered privately (`ray apply --invite-missing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
 }
+
+impl Invite {
+    /// A pending invite for `secret`, identified by its hash.
+    fn new(
+        secret: &[u8],
+        ttl: Duration,
+        hostname: Option<String>,
+        delivery: Option<Delivery>,
+    ) -> Self {
+        let secret_hash = hash_secret(secret);
+        let created = now_secs();
+        Self {
+            id: secret_hash[..8].to_string(),
+            secret_hash,
+            created,
+            expires: created.saturating_add(ttl.as_secs()),
+            status: InviteStatus::Pending,
+            hostname,
+            delivery,
+        }
+    }
+
+    /// Still redeemable: pending and not yet expired.
+    fn is_live(&self, now: u64) -> bool {
+        self.status == InviteStatus::Pending && self.expires > now
+    }
+}
+
+/// A private delivery. The code is kept so retries reuse one credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delivery {
+    pub recipient: EndpointId,
+    pub code: InviteCode,
+    /// The recipient's daemon acknowledged storing the offer.
+    pub delivered: bool,
+    /// The recipient runs a Rayfish too old to receive offers. The sweep
+    /// skips it; a manual delivery tries again in case it has upgraded.
+    #[serde(default)]
+    pub unsupported: bool,
+}
+
+/// How a coordinator's join denial starts when the presented invite is
+/// unknown, used, revoked or expired. A recipient reads it to drop a dead
+/// invitation, so the wording is shared, not repeated. 0.5.9 sends it too.
+pub const INVITE_REJECTED: &str = "invite rejected";
+
+/// Why [`InviteStore::redeem`] refused an invite it holds. 0.5.9 words them
+/// the same.
+const INVITE_USED: &str = "invite already used";
+const INVITE_REVOKED: &str = "invite revoked";
+const INVITE_EXPIRED: &str = "invite expired";
+
+/// Whether a join error is a coordinator refusing, for good, an invite it
+/// holds. An unknown invite does not count: a co-coordinator that never saw
+/// it says so too, as does a coordinator that could not read its ledger.
+pub fn is_dead_invite(message: &str) -> bool {
+    [INVITE_USED, INVITE_REVOKED, INVITE_EXPIRED]
+        .iter()
+        .any(|reason| message.contains(&format!("{INVITE_REJECTED}: {reason}")))
+}
+
+/// How long a privately delivered invite stays redeemable.
+pub const DELIVERY_TTL: Duration = Duration::from_secs(7 * 86400);
 
 /// On-disk container (so the toml file has a stable `[[invites]]` shape).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -78,16 +151,6 @@ pub struct InviteStore {
     invites: Vec<Invite>,
 }
 
-/// Current Unix time in seconds. Invite expiry uses wall-clock time, so a large
-/// backward clock adjustment on the coordinator could briefly un-expire an
-/// invite (or a forward jump expire one early), acceptable for a TTL credential.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Hex blake3 of a secret: the canonical `secret_hash` form the ledger stores
 /// and the form gossiped to co-coordinators (as UTF-8 bytes on the wire).
 pub(crate) fn hash_secret(secret: &[u8]) -> String {
@@ -101,8 +164,14 @@ pub fn generate_secret() -> [u8; SECRET_LEN] {
 
 /// Path to a network's invite ledger: `<config_dir>/invites/<network>.toml`.
 pub fn invite_path(network: &str) -> Result<PathBuf> {
-    let dir = crate::config::config_dir()?.join("invites");
-    Ok(dir.join(format!("{network}.toml")))
+    Ok(ledger_path_in(&crate::config::config_dir()?, network))
+}
+
+/// Where the config directory `dir` keeps a network's invite ledger: under the
+/// network's local name, so renaming the network moves it
+/// (`config::rename_network`).
+pub(crate) fn ledger_path_in(dir: &Path, network: &str) -> PathBuf {
+    dir.join("invites").join(format!("{network}.toml"))
 }
 
 /// Payload of an invite code, before the checksum: two keys and the secret.
@@ -143,14 +212,77 @@ pub fn encode_invite_code(
     bs58::encode(&bytes).into_string()
 }
 
+/// Longest code accepted from a peer or a file. A checksummed code is about
+/// 115 base58 characters; base58 decoding grows with the square of the
+/// length, so anything longer is refused before it is decoded.
+const MAX_CODE_LEN: usize = 120;
+
+/// An encoded invite code. A credential: `Debug` never prints it.
+/// Deserializing bounds its length and refuses whitespace, since it also
+/// arrives from peers.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct InviteCode(String);
+
+impl<'de> Deserialize<'de> for InviteCode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let code = String::deserialize(deserializer)?;
+        if code.len() > MAX_CODE_LEN || code.chars().any(char::is_whitespace) {
+            return Err(serde::de::Error::custom("malformed invite code"));
+        }
+        Ok(Self(code))
+    }
+}
+
+/// [`decode_invite_code`]'s result, with names instead of positions.
+pub struct DecodedInvite {
+    pub network_key: EndpointId,
+    pub coordinator: EndpointId,
+    pub secret: Vec<u8>,
+}
+
+impl Debug for DecodedInvite {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodedInvite")
+            .field("network_key", &self.network_key)
+            .field("coordinator", &self.coordinator)
+            .field("secret", &"[redacted]")
+            .finish()
+    }
+}
+
+impl InviteCode {
+    pub fn encode(network_key: &EndpointId, coordinator: &EndpointId, secret: &[u8]) -> Self {
+        Self(encode_invite_code(network_key, coordinator, secret))
+    }
+
+    pub fn decode(&self) -> Result<DecodedInvite> {
+        decode_invite_code(&self.0)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Debug for InviteCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("InviteCode([redacted])")
+    }
+}
+
 /// Decode an invite code into `(network_pubkey, coordinator, secret)`.
 ///
 /// Accepts both the checksummed form and the older unchecksummed one, so codes
 /// minted before the checksum existed (and codes minted by a peer still on an
 /// older build) keep working. A code carrying a checksum must have a correct
 /// one.
-pub fn decode_invite_code(code: &str) -> Result<(EndpointId, EndpointId, Vec<u8>)> {
-    let bytes = bs58::decode(code.trim())
+pub fn decode_invite_code(code: &str) -> Result<DecodedInvite> {
+    let code = code.trim();
+    // Base58 decoding grows with the square of the length, and codes also
+    // arrive from peers, so the length is checked before anything decodes.
+    anyhow::ensure!(code.len() <= MAX_CODE_LEN, "invalid invite code: too long");
+    let bytes = bs58::decode(code)
         .into_vec()
         .map_err(|e| anyhow::anyhow!("invalid invite code: {e}"))?;
 
@@ -176,7 +308,11 @@ pub fn decode_invite_code(code: &str) -> Result<(EndpointId, EndpointId, Vec<u8>
         .map_err(|e| anyhow::anyhow!("invalid network key in invite: {e}"))?;
     let coordinator = EndpointId::from_bytes(&coord)
         .map_err(|e| anyhow::anyhow!("invalid coordinator key in invite: {e}"))?;
-    Ok((network_pubkey, coordinator, secret))
+    Ok(DecodedInvite {
+        network_key: network_pubkey,
+        coordinator,
+        secret,
+    })
 }
 
 impl InviteStore {
@@ -213,9 +349,9 @@ impl InviteStore {
             invites: self.invites.clone(),
         };
         let contents = toml::to_string_pretty(&file).context("serializing invites")?;
-        // The ledger holds only hashes, never raw secrets, but it does expose
-        // invite metadata (expiry, redeemers, bound hostnames); treat it as
-        // secret-bearing (owner-only 0600), written atomically.
+        // Private deliveries keep their code for retries, and the rest exposes
+        // invite metadata (expiry, redeemers, bound hostnames), so this stays
+        // owner-only (0600) and atomic.
         crate::config::write_file(&self.path, contents.as_bytes(), true)
     }
 
@@ -229,20 +365,85 @@ impl InviteStore {
         hostname: Option<String>,
     ) -> Result<([u8; SECRET_LEN], String)> {
         let secret = generate_secret();
-        let secret_hash = hash_secret(&secret);
-        let id = secret_hash[..8].to_string();
-        let created = now_secs();
-        let expires = created.saturating_add(ttl.as_secs());
-        self.invites.push(Invite {
-            id: id.clone(),
-            secret_hash,
-            created,
-            expires,
-            status: InviteStatus::Pending,
-            hostname,
-        });
+        let invite = Invite::new(&secret, ttl, hostname, None);
+        let id = invite.id.clone();
+        self.invites.push(invite);
         self.save()?;
         Ok((secret, id))
+    }
+
+    /// The live (pending, unexpired) private delivery for `recipient`.
+    pub fn live_delivery(&self, recipient: EndpointId) -> Option<Invite> {
+        let now = now_secs();
+        self.invites
+            .iter()
+            .find(|invite| {
+                invite.is_live(now)
+                    && invite
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|d| d.recipient == recipient)
+            })
+            .cloned()
+    }
+
+    /// Reuse the live delivery for `recipient`, or mint one whose code names
+    /// `network_key` and `coordinator`. Repeated applies and lost acks
+    /// therefore share one credential.
+    pub fn delivery_for(
+        &mut self,
+        recipient: EndpointId,
+        network_key: EndpointId,
+        coordinator: EndpointId,
+    ) -> Result<Invite> {
+        if let Some(invite) = self.live_delivery(recipient) {
+            return Ok(invite);
+        }
+        let secret = generate_secret();
+        let delivery = Delivery {
+            recipient,
+            code: InviteCode::encode(&network_key, &coordinator, &secret),
+            delivered: false,
+            unsupported: false,
+        };
+        let invite = Invite::new(&secret, DELIVERY_TTL, None, Some(delivery));
+        self.invites.push(invite.clone());
+        self.save()?;
+        Ok(invite)
+    }
+
+    pub fn mark_delivered(&mut self, id: &str) -> Result<()> {
+        let delivery = self.delivery_mut(id)?;
+        delivery.delivered = true;
+        delivery.unsupported = false;
+        self.save()
+    }
+
+    /// Record that the recipient cannot receive offers, so the sweep stops.
+    pub fn mark_unsupported(&mut self, id: &str) -> Result<()> {
+        self.delivery_mut(id)?.unsupported = true;
+        self.save()
+    }
+
+    fn delivery_mut(&mut self, id: &str) -> Result<&mut Delivery> {
+        self.invites
+            .iter_mut()
+            .find(|i| i.id == id)
+            .and_then(|i| i.delivery.as_mut())
+            .context("delivery invite missing")
+    }
+
+    /// Recipients with a live delivery that has not been acknowledged yet
+    /// and that can receive one.
+    pub fn pending_deliveries(&self) -> Vec<EndpointId> {
+        let now = now_secs();
+        self.invites
+            .iter()
+            .filter(|i| i.is_live(now))
+            .filter_map(|i| i.delivery.as_ref())
+            .filter(|d| !d.delivered && !d.unsupported)
+            .map(|d| d.recipient)
+            .collect()
     }
 
     /// Verify a presented secret and burn it (single-use). Errors if the secret is
@@ -258,11 +459,11 @@ impl InviteStore {
             .context("invalid invite")?;
         match &invite.status {
             InviteStatus::Pending => {}
-            InviteStatus::Redeemed { .. } => bail!("invite already used"),
-            InviteStatus::Revoked => bail!("invite revoked"),
+            InviteStatus::Redeemed { .. } => bail!(INVITE_USED),
+            InviteStatus::Revoked => bail!(INVITE_REVOKED),
         }
         if now >= invite.expires {
-            bail!("invite expired");
+            bail!(INVITE_EXPIRED);
         }
         let hostname = invite.hostname.clone();
         invite.status = InviteStatus::Redeemed { by, at: now };
@@ -290,7 +491,7 @@ impl InviteStore {
     pub fn revoke(&mut self, id: &str) -> Result<()> {
         let mut matching_idx = None;
         for (idx, invite) in self.invites.iter().enumerate() {
-            if invite.id == id || invite.id.starts_with(id) {
+            if invite.id.starts_with(id) {
                 if matching_idx.is_some() {
                     bail!("ambiguous invite id '{id}'");
                 }
@@ -324,6 +525,7 @@ impl InviteStore {
             expires,
             status: InviteStatus::Pending,
             hostname: None,
+            delivery: None,
         });
         self.save()
     }
@@ -397,15 +599,98 @@ mod tests {
     }
 
     #[test]
+    fn delivery_reuses_the_live_invite_across_reloads() {
+        let (mut store, _dir) = temp_store();
+        let (recipient, net, coord) = (test_id(4), test_id(5), test_id(6));
+        let first = store.delivery_for(recipient, net, coord).unwrap();
+        let mut store = InviteStore::from_path(store.path.clone()).unwrap();
+        let again = store.delivery_for(recipient, net, coord).unwrap();
+        assert_eq!(first, again);
+        assert_eq!(store.pending_deliveries(), [recipient]);
+        let code = first.delivery.as_ref().unwrap().code.decode().unwrap();
+        assert_eq!((code.network_key, code.coordinator), (net, coord));
+        assert_eq!(hash_secret(&code.secret), first.secret_hash);
+        store.mark_delivered(&first.id).unwrap();
+        let store = InviteStore::from_path(store.path.clone()).unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        assert_eq!(store.list().len(), 1);
+        assert!(!format!("{first:?}").contains(first.delivery.unwrap().code.as_str()));
+    }
+
+    #[test]
+    fn redeem_revoke_and_expiry_stop_retries() {
+        let (mut store, _dir) = temp_store();
+        let (recipient, net, coord) = (test_id(4), test_id(5), test_id(6));
+        let first = store.delivery_for(recipient, net, coord).unwrap();
+        let secret = first
+            .delivery
+            .as_ref()
+            .unwrap()
+            .code
+            .decode()
+            .unwrap()
+            .secret;
+        store.redeem(&secret, test_id(7)).unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        assert!(store.live_delivery(recipient).is_none());
+        let second = store.delivery_for(recipient, net, coord).unwrap();
+        assert_ne!(second.id, first.id);
+        store.revoke(&second.id).unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        let third = store.delivery_for(recipient, net, coord).unwrap();
+        store.invites.last_mut().unwrap().expires = now_secs();
+        store.save().unwrap();
+        assert!(store.pending_deliveries().is_empty());
+        assert!(store.live_delivery(recipient).is_none());
+        assert_ne!(
+            store.delivery_for(recipient, net, coord).unwrap().id,
+            third.id
+        );
+    }
+
+    /// Base58 decoding grows with the square of the length, so a peer-supplied
+    /// code must be bounded before anything decodes it.
+    #[test]
+    fn oversized_or_padded_codes_are_refused_when_deserialized() {
+        let valid = InviteCode::encode(&test_id(1), &test_id(2), &generate_secret());
+        let json = |s: &str| serde_json::to_string(s).unwrap();
+        assert!(serde_json::from_str::<InviteCode>(&json(valid.as_str())).is_ok());
+        assert!(serde_json::from_str::<InviteCode>(&json(&"1".repeat(65_000))).is_err());
+        assert!(decode_invite_code(&"1".repeat(65_000)).is_err());
+        assert!(
+            serde_json::from_str::<InviteCode>(&json(&format!(" {}", valid.as_str()))).is_err()
+        );
+        let offer = crate::control::ConnectMsg::InviteOffer {
+            network: ray_proto::ipc::NetworkName::new("sample-net".into()),
+            code: InviteCode("1".repeat(65_000)),
+        };
+        let body = rmp_serde::to_vec(&offer).unwrap();
+        assert!(rmp_serde::from_slice::<crate::control::ConnectMsg>(&body).is_err());
+    }
+
+    #[test]
+    fn invite_code_debug_is_redacted_and_decodes_with_names() {
+        let (net, coord) = (test_id(1), test_id(2));
+        let secret = generate_secret();
+        let code = InviteCode::encode(&net, &coord, &secret);
+        assert!(!format!("{code:?}").contains(code.as_str()));
+        let decoded = code.decode().unwrap();
+        assert_eq!(decoded.network_key, net);
+        assert_eq!(decoded.coordinator, coord);
+        assert_eq!(decoded.secret, secret);
+        assert!(InviteCode("not a code".into()).decode().is_err());
+    }
+
+    #[test]
     fn code_roundtrip() {
         let net = test_id(1);
         let coord = test_id(2);
         let secret = generate_secret();
         let code = encode_invite_code(&net, &coord, &secret);
-        let (dn, dc, ds) = decode_invite_code(&code).unwrap();
-        assert_eq!(dn, net);
-        assert_eq!(dc, coord);
-        assert_eq!(ds, secret.to_vec());
+        let decoded = decode_invite_code(&code).unwrap();
+        assert_eq!(decoded.network_key, net);
+        assert_eq!(decoded.coordinator, coord);
+        assert_eq!(decoded.secret, secret.to_vec());
     }
 
     #[test]
@@ -426,10 +711,10 @@ mod tests {
         bytes.extend_from_slice(&secret);
         let legacy = bs58::encode(&bytes).into_string();
 
-        let (dn, dc, ds) = decode_invite_code(&legacy).unwrap();
-        assert_eq!(dn, net);
-        assert_eq!(dc, coord);
-        assert_eq!(ds, secret.to_vec());
+        let decoded = decode_invite_code(&legacy).unwrap();
+        assert_eq!(decoded.network_key, net);
+        assert_eq!(decoded.coordinator, coord);
+        assert_eq!(decoded.secret, secret.to_vec());
     }
 
     #[test]
@@ -494,6 +779,27 @@ mod tests {
         let (secret, _id) = store.mint(Duration::from_secs(0), None).unwrap();
         let err = store.redeem(&secret, test_id(9)).unwrap_err();
         assert!(err.to_string().contains("expired"));
+    }
+
+    /// The denial a coordinator builds from `redeem`, as a joiner reads it.
+    fn denial(err: anyhow::Error) -> String {
+        format!("join denied: {INVITE_REJECTED}: {err}")
+    }
+
+    #[test]
+    fn only_a_definite_refusal_marks_an_invite_dead() {
+        let (mut store, _dir) = temp_store();
+        let (used, _) = store.mint(Duration::from_secs(3600), None).unwrap();
+        store.redeem(&used, test_id(9)).unwrap();
+        let (revoked, id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        store.revoke(&id).unwrap();
+        let (expired, _) = store.mint(Duration::from_secs(0), None).unwrap();
+        for secret in [used, revoked, expired] {
+            let err = store.redeem(&secret, test_id(10)).unwrap_err();
+            assert!(is_dead_invite(&denial(err)));
+        }
+        let unknown = store.redeem(&generate_secret(), test_id(10)).unwrap_err();
+        assert!(!is_dead_invite(&denial(unknown)));
     }
 
     #[test]

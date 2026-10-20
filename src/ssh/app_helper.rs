@@ -39,8 +39,8 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Config, LOGIN_GRACE, Origin, SSH_LISTEN_PORT, SshHandler, UserPolicy, disable_nagle, serve,
-    server_config,
+    Config, LOGIN_GRACE, Origin, SSH_LISTEN_PORT, SshHandler, UserPolicy, disable_nagle, local,
+    serve, server_config,
 };
 #[cfg(target_os = "macos")]
 use super::{SshAuthz, auth_banner, load_host_key, resolve_user_policy_with_hostnames};
@@ -49,7 +49,7 @@ use crate::daemon::NetworkRegistry;
 
 #[cfg(target_os = "macos")]
 const SOCKET: &str = "/var/run/com.rayfish.app.ssh.sock";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const MAX_FRAME: usize = 64 * 1024;
 const MAX_SESSIONS: usize = 128;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,7 +66,7 @@ enum Service {
     // Sent only after authenticating the root helper. Discovery stays in the
     // provider to preserve its app-group fallback key, without touching the
     // standalone daemon's state. Never include this message in diagnostics.
-    Ssh { host_key: Vec<u8> },
+    Ssh { host_key: Vec<u8>, mesh_port: u16 },
     V4Bridge { ssh_port: u16 },
 }
 
@@ -78,6 +78,7 @@ struct Ready {
 #[derive(Serialize, Deserialize)]
 struct Authorize {
     client: SocketAddr,
+    local_uid: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -176,6 +177,7 @@ async fn authorize_connections(
                 .to_openssh(LineEnding::LF)?
                 .as_bytes()
                 .to_vec(),
+            mesh_port: crate::forward::ssh_port(),
         },
     )
     .await?;
@@ -183,7 +185,7 @@ async fn authorize_connections(
     tracing::info!(%address, "macOS app SSH helper ready");
     loop {
         let request: Authorize = receive(&mut control).await?;
-        let grant = grant_for(request.client, address, registry, authz);
+        let grant = grant_for(request, address, registry, authz);
         timeout(CONTROL_TIMEOUT, send(&mut control, &grant)).await??;
     }
 }
@@ -242,17 +244,22 @@ async fn bridge_connections(address: Ipv6Addr) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn grant_for(
-    client: SocketAddr,
+    request: Authorize,
     local: Ipv6Addr,
     registry: &NetworkRegistry,
     authz: &SshAuthz,
 ) -> Option<Grant> {
+    let client = request.client;
     let IpAddr::V6(source) = client.ip() else {
         return None;
     };
-    // Local connections do not carry a mesh identity proof.
     if source == local {
-        return None;
+        return Some(Grant {
+            user: registry.transport.identity.local_identity(),
+            policy: UserPolicy::local(request.local_uid?),
+            banner: None,
+            mesh_port: crate::forward::ssh_port(),
+        });
     }
     let peer = registry.peers.identity_for_ip(&source)?;
     let user = registry.device_user_map.resolve(&peer);
@@ -313,11 +320,21 @@ async fn serve_control(mut control: UnixStream) -> Result<()> {
     let hello: Hello = timeout(CONTROL_TIMEOUT, receive(&mut control)).await??;
     validate_hello(&hello)?;
     match hello.service {
-        Service::Ssh { host_key } => {
+        Service::Ssh {
+            host_key,
+            mesh_port,
+        } => {
             // Identity-authorized sessions must not share a listener.
             let tcp = TcpListener::bind((hello.address, SSH_LISTEN_PORT)).await?;
             let config = Arc::new(server_config(PrivateKey::from_openssh(&host_key)?));
-            run_listener(control, tcp, config).await
+            let local_listener = match local::bind_retry(hello.address, mesh_port).await {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    tracing::warn!(%error, "mesh SSH: cannot bind self-SSH port; a host sshd may already own it");
+                    None
+                }
+            };
+            run_listener(control, tcp, local_listener, config).await
         }
         Service::V4Bridge { ssh_port } => {
             let token = CancellationToken::new();
@@ -348,6 +365,7 @@ impl Drop for Hangup {
 async fn run_listener(
     mut control: UnixStream,
     listener: TcpListener,
+    local_listener: Option<TcpListener>,
     config: Arc<Config>,
 ) -> Result<()> {
     timeout(
@@ -367,10 +385,12 @@ async fn run_listener(
                 bail!("SSH helper control connection closed or sent unexpected data");
             }
             _ = sessions.join_next(), if !sessions.is_empty() => continue,
-            accepted = listener.accept(), if sessions.len() < MAX_SESSIONS => accepted?,
+            accepted = local::accept(&listener, local_listener.as_ref()), if sessions.len() < MAX_SESSIONS => accepted?,
         };
+        let server = stream.local_addr()?;
+        let local_uid = local::uid(client, server).await;
         let grant: Option<Grant> = timeout(CONTROL_TIMEOUT, async {
-            send(&mut control, &Authorize { client }).await?;
+            send(&mut control, &Authorize { client, local_uid }).await?;
             receive(&mut control).await
         })
         .await??;
@@ -554,7 +574,8 @@ mod tests {
                     version: VERSION,
                     address,
                     service: Service::Ssh {
-                        host_key: Vec::new()
+                        host_key: Vec::new(),
+                        mesh_port: 22,
                     },
                 })
                 .is_err()
@@ -566,7 +587,8 @@ mod tests {
                 version: VERSION,
                 address,
                 service: Service::Ssh {
-                    host_key: Vec::new()
+                    host_key: Vec::new(),
+                    mesh_port: 22,
                 },
             })
             .is_ok()
@@ -576,7 +598,8 @@ mod tests {
                 version: VERSION + 1,
                 address,
                 service: Service::Ssh {
-                    host_key: Vec::new()
+                    host_key: Vec::new(),
+                    mesh_port: 22,
                 },
             })
             .is_err()
@@ -635,7 +658,7 @@ mod tests {
         let tcp = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await?;
         let address = tcp.local_addr()?;
         let (control, mut provider) = UnixStream::pair()?;
-        let task = tokio::spawn(run_listener(control, tcp, test_config()?));
+        let task = tokio::spawn(run_listener(control, tcp, None, test_config()?));
         let _: Ready = receive(&mut provider).await?;
         let mut client = TcpStream::connect(address).await?;
         let request: Authorize = receive(&mut provider).await?;
@@ -654,7 +677,7 @@ mod tests {
         let tcp = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await?;
         let address = tcp.local_addr()?;
         let (control, mut provider) = UnixStream::pair()?;
-        let task = tokio::spawn(run_listener(control, tcp, test_config()?));
+        let task = tokio::spawn(run_listener(control, tcp, None, test_config()?));
         let _: Ready = receive(&mut provider).await?;
         let mut client = TcpStream::connect(address).await?;
         let _: Authorize = receive(&mut provider).await?;
@@ -685,7 +708,7 @@ mod tests {
         let tcp = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await?;
         let address = tcp.local_addr()?;
         let (control, mut provider) = UnixStream::pair()?;
-        let server = tokio::spawn(run_listener(control, tcp, test_config()?));
+        let server = tokio::spawn(run_listener(control, tcp, None, test_config()?));
         let _: Ready = receive(&mut provider).await?;
         let client = tokio::spawn(async move {
             let mut connection =

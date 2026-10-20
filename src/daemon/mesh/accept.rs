@@ -646,13 +646,7 @@ impl CoordinatorAcceptState {
         // detect whether this is a genuine change for this member.
         let (final_hostname, changed) = {
             let s = self.state.read().unwrap();
-            let taken: Vec<String> = s
-                .members
-                .all()
-                .iter()
-                .filter(|m| m.identity != remote_id)
-                .filter_map(|m| m.hostname.clone())
-                .collect();
+            let taken = s.taken_hostnames(remote_id);
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
             let old = s
@@ -759,10 +753,8 @@ impl CoordinatorAcceptState {
     ) -> Option<Ipv6Addr> {
         let redeemed = {
             let _guard = self.invite_lock.lock().await;
-            match crate::invite::InviteStore::load(&self.network_name) {
-                Ok(mut store) => store.redeem(&secret, remote_id),
-                Err(e) => Err(e),
-            }
+            crate::invite::InviteStore::load(&self.network_name)
+                .and_then(|mut store| store.redeem(&secret, remote_id))
         };
         match redeemed {
             Ok(invite_hostname) => {
@@ -834,8 +826,12 @@ impl CoordinatorAcceptState {
                         .into_ip()
                 } else {
                     tracing::warn!(peer = %remote_id.fmt_short(), error = %single_use_err, "invite rejected");
-                    self.deny(conn, send, format!("invite rejected: {single_use_err}"))
-                        .await;
+                    self.deny(
+                        conn,
+                        send,
+                        format!("{}: {single_use_err}", crate::invite::INVITE_REJECTED),
+                    )
+                    .await;
                     None
                 }
             }
@@ -974,7 +970,7 @@ impl CoordinatorAcceptState {
             &mut send,
             net_pubkey,
             &ControlMsg::Welcome {
-                members: members.clone(),
+                members,
                 approved,
                 direct_key,
                 direct_record,
@@ -1101,20 +1097,37 @@ impl CoordinatorAcceptState {
                 return AdmissionCommit::PendingDurability;
             }
         }
+        // Sign the record for this generation while still holding the commit
+        // lock, so its timestamp orders it after every earlier commit, then
+        // release the lock before the relay round trip. Other joins to this
+        // network commit while this one waits on the relay; the relay keeps the
+        // most recent record whichever publish lands last.
         let target = {
             let s = self.state.read().unwrap();
             s.network_secret_key.clone().zip(s.converged_hash)
         };
-        let published_record = match target {
-            Some((key, hash)) => {
+        let own_id = self.ctx.registry.transport.endpoint.id();
+        let signed = target.and_then(|(key, hash)| {
+            dht::encode_network_record(&key, &hash, &[own_id])
+                .ok()
+                .map(|packet| (hash, packet))
+        });
+        drop(commit_guard);
+        let published = match &signed {
+            Some((hash, packet)) => {
                 self.ctx
                     .registry
-                    .publish_group_hash(&self.network_name, &key, hash)
+                    .publish_signed_group_record(
+                        &self.network_name,
+                        *hash,
+                        packet,
+                        &snapshot_commit,
+                    )
                     .await
             }
-            None => None,
+            None => false,
         };
-        if published_record.is_none() {
+        if !published {
             // The complete generation and unpublished pointer are already
             // durable. Keep the admission live and let the tracked publisher
             // retry. This also conservatively covers a successful DHT write whose
@@ -1126,20 +1139,10 @@ impl CoordinatorAcceptState {
                 "admission publication was not confirmed; retaining its durable pending generation"
             );
         }
-        let direct_record_published = grant_direct && published_record.is_some();
-        let direct_record = if grant_direct {
-            published_record.clone().or_else(|| {
-                let s = self.state.read().unwrap();
-                let key = s.network_secret_key.as_ref()?;
-                let hash = s.converged_hash?;
-                dht::encode_network_record(key, &hash, &[self.ctx.registry.transport.endpoint.id()])
-                    .ok()
-                    .map(|packet| packet.as_bytes().to_vec())
-            })
-        } else {
-            None
-        };
-        drop(commit_guard);
+        let direct_record_published = grant_direct && published;
+        let direct_record = grant_direct
+            .then(|| signed.map(|(_, packet)| packet.as_bytes().to_vec()))
+            .flatten();
         AdmissionCommit::Committed {
             direct_record,
             direct_record_published,
@@ -1160,15 +1163,7 @@ impl CoordinatorAcceptState {
     ) -> Result<Admission, String> {
         let peer_ip = crate::membership::derive_ipv6(&remote_id);
         let final_hostname = if let Some(desired) = hostname {
-            let taken = {
-                let s = self.state.read().unwrap();
-                s.members
-                    .all()
-                    .iter()
-                    .filter(|m| m.identity != remote_id)
-                    .filter_map(|m| m.hostname.clone())
-                    .collect::<Vec<String>>()
-            };
+            let taken = self.state.read().unwrap().taken_hostnames(remote_id);
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             match crate::hostname::admission_hostname(&desired, &taken_refs, authoritative) {
                 Ok(name) => Some(name),
@@ -1669,10 +1664,9 @@ impl MemberAcceptState {
             }
             (previous_key, previous_coordinator)
         };
-        // The promoted roster must be recoverable before this node can author a
-        // record. In particular, do not let the lazy publisher race ahead of the
-        // blob-store write and recovery-pointer update.
-        if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await {
+        // Undo the promotion above in live state. Called at most once, on
+        // whichever durability step fails first.
+        let restore_authority = move || {
             let (previous_key, previous_coordinator) = previous_authority;
             let mut s = self.state.write().unwrap();
             s.network_secret_key = previous_key;
@@ -1680,6 +1674,12 @@ impl MemberAcceptState {
                 m.is_coordinator = previous_coordinator;
             }
             s.refresh_snapshot();
+        };
+        // The promoted roster must be recoverable before this node can author a
+        // record. In particular, do not let the lazy publisher race ahead of the
+        // blob-store write and recovery-pointer update.
+        if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await {
+            restore_authority();
             tracing::warn!(
                 network = %self.network_name,
                 "promoted roster was not durably committed; rolled back admin grant"
@@ -1701,15 +1701,7 @@ impl MemberAcceptState {
             }
         };
         if !key_saved {
-            let (previous_key, previous_coordinator) = previous_authority;
-            {
-                let mut s = self.state.write().unwrap();
-                s.network_secret_key = previous_key;
-                if let Some(m) = s.members.get_mut(&self.my_identity) {
-                    m.is_coordinator = previous_coordinator;
-                }
-                s.refresh_snapshot();
-            }
+            restore_authority();
             commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await;
             return;
         }
@@ -1757,10 +1749,10 @@ impl AcceptHandler {
 
     /// The local name of the network this handler serves. Used by the demux to map
     /// a peer's announced network pubkey back to our local decode-table name.
-    pub(crate) fn network_name(&self) -> Option<String> {
+    pub(crate) fn network_name(&self) -> &str {
         match self {
-            AcceptHandler::Coordinator(s) => Some(s.network_name.clone()),
-            AcceptHandler::Member(s) => Some(s.network_name.clone()),
+            AcceptHandler::Coordinator(s) => &s.network_name,
+            AcceptHandler::Member(s) => &s.network_name,
         }
     }
 
@@ -1805,9 +1797,7 @@ impl AcceptHandler {
                 exit_families,
             } => {
                 let registry = Arc::clone(self.registry());
-                let Some(network) = self.network_name() else {
-                    return true;
-                };
+                let network = self.network_name().to_owned();
                 tokio::spawn(async move {
                     registry
                         .record_exit_offer(&network, peer_id, enabled, exit_families)
@@ -2008,6 +1998,10 @@ impl ProtocolRouter {
             .accept(daemon::PAIR_ALPN, PairProtocol(Arc::clone(&self.files)))
             .accept(
                 transport::CONNECT_ALPN,
+                ConnectProtocol(Arc::clone(&self.connect)),
+            )
+            .accept(
+                transport::INVITE_ALPN,
                 ConnectProtocol(Arc::clone(&self.connect)),
             )
             .accept(

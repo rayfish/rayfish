@@ -40,7 +40,12 @@ pub fn default_hostname(configured: Option<String>, taken: &[&str]) -> String {
 /// This machine's own name, in a form Magic DNS can carry, or `None` when the
 /// OS has nothing worth using.
 pub fn system_hostname() -> Option<String> {
-    mesh_form(&raw_system_hostname()?)
+    host_label_form(&raw_system_hostname()?)
+}
+
+/// An OS hostname may be a full FQDN; only the machine's own label matters.
+fn host_label_form(raw: &str) -> Option<String> {
+    mesh_form(raw.split('.').next().unwrap_or(raw))
 }
 
 /// Read the OS hostname. `None` when the call fails or the name is not UTF-8;
@@ -61,22 +66,37 @@ fn raw_system_hostname() -> Option<String> {
 /// Windows has no `gethostname` outside Winsock (which would need the stack
 /// started), so this reads the same name from `COMPUTERNAME`. `hostname()`
 /// would be the DNS form; the NetBIOS name is closer to what the other
-/// platforms return, and [`mesh_form`] keeps only the first label anyway.
+/// platforms return, and [`system_hostname`] keeps only the first label anyway.
 #[cfg(windows)]
 fn raw_system_hostname() -> Option<String> {
     std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty())
 }
 
-/// Fold an OS hostname into a mesh one, or `None` if nothing usable is left.
+/// Fold a device name into a mesh hostname, or `None` if nothing usable is left.
 ///
-/// An OS hostname is allowed to be things a mesh hostname is not: uppercase, a
-/// full FQDN, or (on macOS) a sentence with spaces and an apostrophe in it. So
-/// only the first label is kept, it is lowercased, and every other character
-/// becomes a hyphen: `Alice's MacBook.local` -> `alice-s-macbook`.
-fn mesh_form(raw: &str) -> Option<String> {
-    let label = raw.split('.').next().unwrap_or(raw).to_ascii_lowercase();
+/// A device name is allowed to be things a mesh hostname is not: uppercase, or
+/// (on macOS and phones) a sentence with spaces and an apostrophe in it. So it
+/// is lowercased, a possessive `'s` is dropped, and every other character
+/// becomes a hyphen: `Alice's MacBook` -> `alice-macbook`. Dots are no
+/// different, so `J.R.'s Pixel` keeps its owner.
+pub fn mesh_form(raw: &str) -> Option<String> {
+    let label = raw.to_ascii_lowercase();
     let mut name = String::with_capacity(label.len());
-    for c in label.chars() {
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        // Phones and Macs name themselves `Alice's iPhone`, often with a curly
+        // apostrophe. The `s` would otherwise survive as `alice-s-iphone`.
+        if matches!(c, '\'' | '\u{2019}') {
+            let mut ahead = chars.clone();
+            if ahead.next() == Some('s')
+                && ahead
+                    .next()
+                    .is_none_or(|next| !next.is_ascii_alphanumeric())
+            {
+                chars.next();
+                continue;
+            }
+        }
         match c.is_ascii_lowercase() || c.is_ascii_digit() {
             true => name.push(c),
             // Runs collapse, or `My  Box` would come out as `my--box`.
@@ -157,12 +177,27 @@ mod tests {
     #[test]
     fn an_os_hostname_is_folded_into_a_mesh_one() {
         assert_eq!(mesh_form("build-box"), Some("build-box".to_string()));
-        // Only the first label, and lowercased.
-        assert_eq!(mesh_form("Build.example.com"), Some("build".to_string()));
+        // Only the first label of an OS hostname.
+        assert_eq!(
+            host_label_form("Build.example.com"),
+            Some("build".to_string())
+        );
+        assert_eq!(mesh_form("Build"), Some("build".to_string()));
         // macOS lets a hostname be a sentence.
         assert_eq!(
-            mesh_form("Alice's MacBook Pro.local"),
-            Some("alice-s-macbook-pro".to_string())
+            mesh_form("Alice's MacBook Pro"),
+            Some("alice-macbook-pro".to_string())
+        );
+        // A dot in a device name is part of the name, not a domain.
+        assert_eq!(mesh_form("J.R.'s Pixel"), Some("j-r-pixel".to_string()));
+        assert_eq!(
+            mesh_form("Alice\u{2019}s iPhone"),
+            Some("alice-iphone".to_string())
+        );
+        assert_eq!(mesh_form("Chris'"), Some("chris".to_string()));
+        assert_eq!(
+            mesh_form("Rock'sand box"),
+            Some("rock-sand-box".to_string())
         );
         // Runs of junk collapse to one hyphen, and the edges are trimmed.
         assert_eq!(mesh_form("__my  box__"), Some("my-box".to_string()));
@@ -176,12 +211,12 @@ mod tests {
     fn a_hostname_no_machine_owns_is_refused() {
         // Placeholders half the fleet would share.
         assert_eq!(mesh_form("localhost"), None);
-        assert_eq!(mesh_form("localhost.localdomain"), None);
+        assert_eq!(host_label_form("localhost.localdomain"), None);
         assert_eq!(mesh_form("Unknown"), None);
         // Nothing usable left after folding.
         assert_eq!(mesh_form(""), None);
         assert_eq!(mesh_form("???"), None);
-        assert_eq!(mesh_form(".config"), None);
+        assert_eq!(host_label_form(".config"), None);
     }
 
     #[test]

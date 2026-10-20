@@ -57,13 +57,9 @@ pub struct TransferInfo {
 
 struct Entry {
     info: TransferInfo,
-    /// Outgoing only: the blob the peer will pull, used to match provider events.
-    hash: Option<Hash>,
-    /// Outgoing only: the peer this offer was sent to. A provider event must match
-    /// both this and `hash` to complete the entry, so a pull by a different peer
-    /// (another recipient of the same file, or anyone else who learned the hash)
-    /// can never complete it.
-    peer_id: Option<EndpointId>,
+    /// Outgoing only: the blob and the peer it was offered to, used to match
+    /// provider events.
+    send: Option<SendKey>,
     /// When the transfer reached a terminal state, for TTL expiry.
     finished_at: Option<Instant>,
     /// Outgoing only: how a `Failed` entry got there. Only a pull that was
@@ -72,6 +68,17 @@ struct Entry {
     /// message itself failed) has nothing to retry, because the peer never
     /// even knew about it.
     failure: Option<FailureKind>,
+}
+
+/// Which provider events belong to an outgoing entry. An event must match both
+/// fields to touch the entry, so a pull by a different peer (another recipient
+/// of the same file, or anyone else who learned the hash) can never complete it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendKey {
+    /// The blob the peer will pull.
+    hash: Hash,
+    /// The peer this offer was sent to.
+    peer: EndpointId,
 }
 
 /// How an outgoing entry reached `Failed`. Only set on the send side: a
@@ -88,11 +95,17 @@ enum FailureKind {
     Abort,
 }
 
-#[derive(Default)]
 pub struct TransferRegistry {
     entries: Mutex<HashMap<u64, Entry>>,
     next_id: AtomicU64,
     changes: tokio::sync::watch::Sender<()>,
+}
+
+/// Ids start at 1, so `Default` goes through `new` rather than deriving a zero.
+impl Default for TransferRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TransferRegistry {
@@ -139,8 +152,7 @@ impl TransferRegistry {
                     state: TransferState::Offered,
                     destination: None,
                 },
-                hash: Some(hash),
-                peer_id: Some(peer),
+                send: Some(SendKey { hash, peer }),
                 finished_at: None,
                 failure: None,
             },
@@ -165,8 +177,7 @@ impl TransferRegistry {
                     state: TransferState::Transferring,
                     destination: None,
                 },
-                hash: None,
-                peer_id: None,
+                send: None,
                 finished_at: None,
                 failure: None,
             },
@@ -215,10 +226,7 @@ impl TransferRegistry {
     /// peer. Touches only the still-`Offered` entry, never a moving transfer.
     pub fn fail_offer_by(&self, hash: Hash, peer: EndpointId) {
         if let Some(e) = self.entries.lock().unwrap().values_mut().find(|e| {
-            e.info.outgoing
-                && e.hash == Some(hash)
-                && e.peer_id == Some(peer)
-                && e.info.state == TransferState::Offered
+            e.send == Some(SendKey { hash, peer }) && e.info.state == TransferState::Offered
         }) {
             finish_entry(e, false, Some(FailureKind::Offer));
             self.changed();
@@ -238,8 +246,7 @@ impl TransferRegistry {
         {
             return None;
         }
-        let hash = entry.hash?;
-        let peer = entry.peer_id?;
+        let SendKey { hash, peer } = entry.send?;
         finish_entry(entry, false, Some(FailureKind::Offer));
         self.changed();
         Some((hash, peer))
@@ -375,7 +382,7 @@ fn oldest_live_outgoing(
 ) -> Option<u64> {
     entries
         .values()
-        .filter(|e| e.hash == Some(hash) && e.peer_id == Some(peer) && e.finished_at.is_none())
+        .filter(|e| e.send == Some(SendKey { hash, peer }) && e.finished_at.is_none())
         .map(|e| e.info.id)
         .min()
 }
@@ -396,8 +403,7 @@ fn oldest_revivable_outgoing(
     entries
         .values()
         .filter(|e| {
-            e.hash == Some(hash)
-                && e.peer_id == Some(peer)
+            e.send == Some(SendKey { hash, peer })
                 && e.info.state == TransferState::Failed
                 && e.failure == Some(FailureKind::Abort)
                 && e.finished_at

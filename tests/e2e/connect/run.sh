@@ -5,11 +5,11 @@
 #   srv-a  identity U   the initiator (`ray connect`)
 #   srv-b  identity V   the recipient (`ray connect approve`)
 #
-# Proves the full friend-request flow over real hosts + the public pkarr DHT:
-#   B publishes a contact id  ->  A `ray connect <id>`  ->  B sees + approves
+# Proves the full friend-request flow over real hosts:
+#   B shares its identity  ->  A `ray connect <identity>`  ->  B sees + approves
 #   ->  a 2-peer `[direct]` network forms  ->  A<->B reach each other (ping +
 #   ray send) and the network is tagged direct with its room id hidden.
-# Plus a negative case: connecting to an offline contact fails cleanly.
+# Plus a negative case: connecting to an identity nobody runs fails cleanly.
 #
 # Reads tests/e2e/connect/.servers (written by provision.sh). Does NOT modify
 # infra. Re-runnable (resets rayfish state on each run unless KEEP_STATE=1).
@@ -21,6 +21,27 @@ SERVERS="$DIR/.servers"
 # shellcheck source=../../lib/common.sh
 source "$ROOT/tests/lib/common.sh"
 SR_PREFIX=/tmp/c   # temp-file prefix for send_recv
+
+# The ed25519 base point: a valid identity that no rayfish node uses.
+UNKNOWN_PEER=5866666666666666666666666666666666666666666666666666666666666666
+
+# check_unknown_peer <from> <identity> : prove that connecting to an identity
+# no node answers for fails with the dial error within a deadline.
+check_unknown_peer(){
+  local from="$1" peer="$2"
+  local out rc=0
+  out="$(on "$from" "timeout --kill-after=5s 30s ray connect $peer" 2>&1 | strip)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/   a| /'
+  # The CLI exits 1 for this daemon error. Timeout, SSH/IPC errors, and a
+  # successful command must fail even if their output mentions the dial error.
+  if [[ "$rc" == 1 ]] && printf '%s\n' "$out" \
+      | grep -qE '^[[:space:]]*failed to reach peer: '; then
+    pass "connect to an unknown identity errors cleanly"
+  else
+    fail "connect to an unknown identity did not return the dial error (exit=$rc)"
+    return 1
+  fi
+}
 
 [[ -f "$SERVERS" ]] || { echo "No $SERVERS — run $DIR/provision.sh first"; exit 1; }
 
@@ -34,32 +55,30 @@ wait_all_ssh "$A" "$B"
 seed_known_hosts "$A" "$B"
 reset_state "$A" "$B"
 deploy_all "$ROOT" "$A" "$B"
-# Ensure the VPN is active on both (TUN up + contact publisher running). After a
+# Ensure the VPN is active on both (TUN up). After a
 # `systemctl restart` the daemon boots inactive, so activate explicitly.
-for h in "$A" "$B"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
-wait_daemons "$A" "$B"
+activate_daemons "$A" "$B" || summary
 
 # ---------------------------------------------------------------------------
-step "2. read contact ids"
-A_CID="$(on "$A" 'ray contact id' | strip | head -1 | tr -d ' ')"
-B_CID="$(on "$B" 'ray contact id' | strip | head -1 | tr -d ' ')"
-echo "   A contact id: ${A_CID:0:16}…"
-echo "   B contact id: ${B_CID:0:16}…"
-[[ -n "$A_CID" && "${#A_CID}" -ge 20 ]] && pass "srv-a has a contact id" || fail "srv-a contact id missing/short"
-[[ -n "$B_CID" && "${#B_CID}" -ge 20 ]] && pass "srv-b has a contact id" || fail "srv-b contact id missing/short"
-# The contact id must also surface in `ray status`.
-on "$A" 'ray status' | strip | grep -qi "${A_CID:0:16}" && pass "contact id shown in ray status" \
-  || fail "contact id not shown in ray status"
+step "2. read identities"
+A_CID="$(status_json "$A" | jq -r '.identity // empty')"
+B_CID="$(status_json "$B" | jq -r '.identity // empty')"
+echo "   A identity: ${A_CID:0:16}…"
+echo "   B identity: ${B_CID:0:16}…"
+[[ -n "$A_CID" && "${#A_CID}" -ge 20 ]] && pass "srv-a has an identity" || fail "srv-a identity missing/short"
+[[ -n "$B_CID" && "${#B_CID}" -ge 20 ]] && pass "srv-b has an identity" || fail "srv-b identity missing/short"
+# The identity must also surface in `ray status`.
+on "$A" 'ray status' | strip | grep -qi "${A_CID:0:16}" && pass "identity shown in ray status" \
+  || fail "identity not shown in ray status"
 
 # ---------------------------------------------------------------------------
 step "3. srv-a requests a direct connection to srv-b"
-# Give B's contact record time to propagate on the public pkarr DHT.
-sleep 8
+# Retry until A's request is accepted (B's addresses may take a moment to publish).
 CONNECT_OUT=""
-for _ in $(seq 1 6); do
+for _ in $(seq 1 8); do
   CONNECT_OUT="$(on "$A" "ray connect $B_CID --hostname laptop" 2>&1 | strip)"
   echo "$CONNECT_OUT" | grep -qiE 'waiting for approval|connected' && break
-  sleep 8
+  sleep 5
 done
 echo "$CONNECT_OUT" | sed 's/^/   a| /'
 if echo "$CONNECT_OUT" | grep -qiE 'waiting for approval|connected'; then
@@ -82,7 +101,7 @@ if echo "$REQ" | grep -qiE "${A_CID:0:8}"; then
 else
   fail "srv-b never saw srv-a's request"
 fi
-# Approve by srv-a's full contact id (the daemon matches it as a prefix), so we
+# Approve by srv-a's full identity (the daemon matches it as a prefix), so we
 # don't have to parse the short id out of the table.
 APPROVE="$(on "$B" "ray connect approve $A_CID" 2>&1 | strip)"
 echo "$APPROVE" | sed 's/^/   b| /'
@@ -116,9 +135,6 @@ step "5b. both peers are coordinators of the direct network"
 NET_A="$(status_json "$A" | jq -r '(.networks // [])[] | select((.role|ascii_downcase)=="direct") | .name' | head -1)"
 NET_B="$(status_json "$B" | jq -r '(.networks // [])[] | select((.role|ascii_downcase)=="direct") | .name' | head -1)"
 echo "   net-a=$NET_A  net-b=$NET_B"
-holds_key(){  # <ip> <net> : exit 0 if this node holds the network key
-  on "$1" "ray admin $2 list --json" 2>/dev/null | jq -e 'any(.[]; .self == true)' >/dev/null 2>&1
-}
 if [[ -n "$NET_A" ]] && retry_until 30 "holds_key '$A' '$NET_A'"; then
   pass "srv-a holds the network key (co-coordinator)"
 else
@@ -132,7 +148,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "6. reachability — ping over the TUN (both directions)"
-A_IP="$(own_ip "$SA")"; B_IP="$(own_ip "$SB")"
+A_IP="$(my_ip "$A" "$NET_A")"; B_IP="$(my_ip "$B" "$NET_B")"
 echo "   A_IP=$A_IP  B_IP=$B_IP"
 if [[ -n "$A_IP" && -n "$B_IP" && "$A_IP" != "$B_IP" ]]; then
   pass "two distinct VPN IPs (srv-a=$A_IP srv-b=$B_IP)"
@@ -146,10 +162,8 @@ fi
 # ---------------------------------------------------------------------------
 step "7. data transfer — ray send / ray files accept (both directions)"
 # `ray send` resolves the destination by hostname (or short id), not by IP.
-# Each side's peer row (● / ○) carries the *other* node's `<host>.<net>.ray`
-# name; peer_host (common.sh) takes its first label as the peer hostname.
-PEER_OF_A="$(peer_host "$SA")"   # srv-b's hostname, as seen from srv-a
-PEER_OF_B="$(peer_host "$SB")"   # srv-a's hostname, as seen from srv-b
+PEER_OF_A="$(status_json "$A" | jq -r --arg n "$NET_A" '(.networks // []) | map(select(.name == $n)) | .[0].peers[0].hostname // empty')"
+PEER_OF_B="$(status_json "$B" | jq -r --arg n "$NET_B" '(.networks // []) | map(select(.name == $n)) | .[0].peers[0].hostname // empty')"
 echo "   peer-of-a=$PEER_OF_A  peer-of-b=$PEER_OF_B"
 # send_recv comes from common.sh (SR_PREFIX=/tmp/c set above).
 [[ -n "$PEER_OF_A" ]] && send_recv "$A" "$B" "$PEER_OF_A" "ray send srv-a -> srv-b" || fail "could not resolve srv-b hostname"
@@ -163,11 +177,19 @@ step "8. firewall — removing the seeded allow-icmp rule denies inbound ICMP"
 # confirm srv-a -> srv-b ping breaks, then re-add it and confirm it recovers.
 if [[ -n "$A_IP" && -n "$B_IP" ]]; then
   on "$B" 'ray firewall remove 0' 2>&1 | strip | sed 's/^/   b| /'
-  BLOCKED="$(ping_loss "$A" "$B_IP")"
-  if [[ "${BLOCKED:-0}" == "100" ]]; then pass "removing the seeded allow-icmp rule blocks ICMP (100% loss)"; else fail "ICMP not blocked after removing seed rule (loss=${BLOCKED:-?}%)"; fi
+  if retry_until 15 "[[ \"\$(ping_loss '$A' '$B_IP')\" == '100' ]]"; then
+    pass "removing the seeded allow-icmp rule blocks ICMP (100% loss)"
+  else
+    BLOCKED="$(ping_loss "$A" "$B_IP")"
+    fail "ICMP not blocked after removing seed rule (loss=${BLOCKED:-?}%)"
+  fi
   on "$B" 'ray firewall add in allow -p icmp' 2>&1 | strip | sed 's/^/   b| /'
-  RECOVERED="$(ping_loss "$A" "$B_IP")"
-  if [[ "${RECOVERED:-100}" == "0" ]]; then pass "re-adding allow-icmp restores ICMP (0% loss)"; else fail "ICMP did not recover after re-adding allow rule (loss=${RECOVERED:-?}%)"; fi
+  if retry_until 15 "[[ \"\$(ping_loss '$A' '$B_IP')\" == '0' ]]"; then
+    pass "re-adding allow-icmp restores ICMP (0% loss)"
+  else
+    RECOVERED="$(ping_loss "$A" "$B_IP")"
+    fail "ICMP did not recover after re-adding allow rule (loss=${RECOVERED:-?}%)"
+  fi
 else
   fail "could not determine IPs for firewall test"
 fi
@@ -195,24 +217,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "9. negative — connecting to an offline contact fails cleanly"
-# Put srv-b on standby so its contact record stops being published / endpoint
-# is unreachable. A fresh connect from A to B's (now stale) contact id should
-# error, not hang.
-on "$B" 'ray down' >/dev/null 2>&1 || true
-sleep 3
-# Rotate B's contact id so A's lookup of the NEW id can't resolve at all
-# (deterministic "offline/unknown" rather than racing the TTL).
-NEW_B_CID="$(on "$B" 'ray contact rotate' 2>/dev/null | strip | grep -oE '[A-Za-z0-9]{20,}' | head -1)"
-sleep 3
-OFFLINE_OUT="$(on "$A" "ray connect ${NEW_B_CID:-$B_CID}" 2>&1 | strip)"
-echo "$OFFLINE_OUT" | sed 's/^/   a| /'
-if echo "$OFFLINE_OUT" | grep -qiE 'offline|unknown|could not resolve|failed'; then
-  pass "connect to offline/unknown contact errors cleanly"
-else
-  fail "connect to offline contact did not produce a clean error"
-fi
-on "$B" 'ray up' >/dev/null 2>&1 || true
+step "9. negative: connecting to an unknown identity fails cleanly"
+check_unknown_peer "$A" "$UNKNOWN_PEER"
 
 # ---------------------------------------------------------------------------
 summary

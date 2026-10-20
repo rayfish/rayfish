@@ -1,0 +1,3 @@
+# Swift: the app and the packet tunnel exchange these records as JSON.
+[bindings.swift]
+generate_codable_conformance = true

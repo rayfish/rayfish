@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
@@ -254,26 +256,15 @@ object NodeHolder {
         return id
     }
 
-    /** Seed the device's default hostname from the Android model on first run,
-     * so pairing auto-joins all use one consistent name. Idempotent: no-op once
-     * a name is set. Runs on the caller's (IO) context; touches config only. */
+    /** Seed the device's default hostname from the name set in Settings on
+     * first run (`Alice's Pixel` becomes `alice-pixel`), falling back to the
+     * model, so pairing auto-joins all use one consistent name. Idempotent:
+     * no-op once a name is set. Runs on the caller's (IO) context; touches
+     * config only. */
     fun seedDeviceName(context: Context) {
-        val node = get(context)
-        val current = runCatching { node.defaultHostname() }.getOrDefault("")
-        if (current.isNotBlank()) return
-        val seed = sanitizeHostname(android.os.Build.MODEL ?: "")
-        runCatching { node.setDefaultHostname(seed) }
-    }
-
-    /** Lowercase, keep [a-z0-9-], collapse/trim hyphens, cap 63, fall back to
-     * "phone". Matches the core's is_valid_hostname rules. */
-    private fun sanitizeHostname(raw: String): String {
-        var s = raw.lowercase()
-            .replace(Regex("[^a-z0-9-]"), "-")
-            .replace(Regex("-+"), "-")
-            .trim('-')
-        if (s.length > 63) s = s.substring(0, 63).trim('-')
-        return s.ifEmpty { "phone" }
+        val name = Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
+            ?.takeIf { it.isNotBlank() } ?: Build.MODEL.orEmpty()
+        runCatching { get(context).seedDefaultHostname(name) }
     }
 
     /**

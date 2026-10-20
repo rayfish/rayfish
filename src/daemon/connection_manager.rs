@@ -100,9 +100,9 @@ impl ConnectionManager {
             tracing::error!("mesh dispatch not set; dropping connection");
             return;
         };
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if !pre_registered && mesh.ctx.registry.transport.is_suspended() {
-            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"android idle");
+            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
             return;
         }
         MeshConnection::new(
@@ -131,10 +131,8 @@ impl ConnectionManager {
         // Map network pubkey → local network name via the registry.
         let mut table: Vec<(u16, SmolStr)> = Vec::new();
         for e in entries {
-            if let Some(h) = self.handlers.get(&e.network)
-                && let Some(name) = h.network_name()
-            {
-                table.push((e.handle, SmolStr::new(name)));
+            if let Some(h) = self.handlers.get(&e.network) {
+                table.push((e.handle, SmolStr::new(h.network_name())));
             }
         }
         mesh.ctx.peers.set_inbound_handles(&ipv6, conn, &table);

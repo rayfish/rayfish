@@ -99,7 +99,7 @@ struct Assembly {
     covered: [u64; MAX_PACKET.div_ceil(64)],
     received: usize,
     deadline: Instant,
-    _budget: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 /// One per authenticated QUIC connection. No allocation before the caller
@@ -108,6 +108,7 @@ struct Assembly {
 pub(super) struct Reassembler {
     pending: HashMap<AssemblyKey, Assembly>,
     budget: Arc<Semaphore>,
+    evicted: usize,
 }
 
 impl Default for Reassembler {
@@ -116,6 +117,7 @@ impl Default for Reassembler {
         Self {
             pending: HashMap::new(),
             budget: Arc::clone(BUDGET.get_or_init(|| Arc::new(Semaphore::new(GLOBAL_BUDGET)))),
+            evicted: 0,
         }
     }
 }
@@ -129,6 +131,36 @@ impl Reassembler {
         let before = self.pending.len();
         self.pending.retain(|_, p| now < p.deadline);
         before - self.pending.len()
+    }
+
+    /// Incomplete packets dropped to make room since the last call. The caller
+    /// counts each as [`DropReason::ReassemblyLimit`].
+    pub(super) fn take_evicted(&mut self) -> usize {
+        std::mem::take(&mut self.evicted)
+    }
+
+    /// Room for one more incomplete packet. At either limit, this connection's
+    /// oldest incomplete packet gives up its room. A lost fragment strands the
+    /// rest of its packet until the timeout, so refusing new packets instead
+    /// would drop every fragmented packet for that long once enough fragments
+    /// were lost. Fragments are sent back to back, so the oldest packet is the
+    /// least likely to complete. Only this connection's room is reused, so a
+    /// peer cannot evict another peer's packets.
+    fn reserve(&mut self) -> Result<OwnedSemaphorePermit, DropReason> {
+        if self.pending.len() < MAX_PENDING
+            && let Ok(permit) =
+                Arc::clone(&self.budget).try_acquire_many_owned(ASSEMBLY_COST as u32)
+        {
+            return Ok(permit);
+        }
+        let oldest = self
+            .pending
+            .iter()
+            .min_by_key(|(_, part)| part.deadline)
+            .map(|(key, _)| *key)
+            .ok_or(DropReason::ReassemblyLimit)?;
+        self.evicted += 1;
+        Ok(self.pending.remove(&oldest).unwrap().permit)
     }
 
     /// The datagram still includes its validated network handle. Whole packets
@@ -169,12 +201,7 @@ impl Reassembler {
             return Err(DropReason::ReassemblyTimeout);
         }
         if !self.pending.contains_key(&key) {
-            if self.pending.len() >= MAX_PENDING {
-                return Err(DropReason::ReassemblyLimit);
-            }
-            let permit = Arc::clone(&self.budget)
-                .try_acquire_many_owned(ASSEMBLY_COST as u32)
-                .map_err(|_| DropReason::ReassemblyLimit)?;
+            let permit = self.reserve()?;
             self.pending.insert(
                 key,
                 Assembly {
@@ -182,7 +209,7 @@ impl Reassembler {
                     covered: [0; MAX_PACKET.div_ceil(64)],
                     received: 0,
                     deadline: now + TIMEOUT,
-                    _budget: permit,
+                    permit,
                 },
             );
         }
@@ -221,6 +248,7 @@ mod tests {
         Reassembler {
             pending: HashMap::new(),
             budget: Arc::new(Semaphore::new(slots * ASSEMBLY_COST)),
+            evicted: 0,
         }
     }
 
@@ -329,6 +357,44 @@ mod tests {
     }
 
     #[test]
+    fn lost_fragments_do_not_block_later_packets() {
+        // Every fourth packet loses its tail, stranding its head until the
+        // timeout. Well within it the stranded packets outnumber the slots, and
+        // every packet that arrives whole must still be delivered.
+        let p = packet(1280);
+        let mut receiver = receiver(MAX_PENDING);
+        let start = Instant::now();
+        let mut stranded = Vec::new();
+        for n in 0..8 * MAX_PENDING {
+            let now = start + Duration::from_millis(n as u64);
+            let encoded = encode(1, &p, 1162).unwrap();
+            let [head, tail] = encoded.datagrams() else {
+                panic!("expected two fragments")
+            };
+            assert_eq!(receiver.accept(head.clone(), now), Ok(None));
+            if n % 4 == 3 {
+                stranded.push(tail.clone());
+                continue;
+            }
+            assert_eq!(
+                receiver.accept(tail.clone(), now).unwrap().as_deref(),
+                Some(p.as_slice())
+            );
+        }
+        // The newest stranded packets keep their room; the oldest made way.
+        assert_eq!(receiver.pending.len(), MAX_PENDING);
+        assert_eq!(receiver.take_evicted(), stranded.len() - MAX_PENDING);
+        assert_eq!(receiver.take_evicted(), 0);
+        let late = start + Duration::from_millis(8 * MAX_PENDING as u64);
+        let newest = stranded.last().unwrap().clone();
+        assert_eq!(
+            receiver.accept(newest, late).unwrap().as_deref(),
+            Some(p.as_slice())
+        );
+        assert_eq!(receiver.accept(stranded[0].clone(), late), Ok(None));
+    }
+
+    #[test]
     fn rejects_conflicting_overlap_and_length_and_releases_memory() {
         let encoded = encode(1, &packet(1280), 1162).unwrap();
         let first = encoded.datagrams()[0].clone();
@@ -361,6 +427,7 @@ mod tests {
         let mut other_connection = Reassembler {
             pending: HashMap::new(),
             budget: Arc::new(Semaphore::new(ASSEMBLY_COST)),
+            evicted: 0,
         };
         assert_eq!(
             other_connection
@@ -379,31 +446,38 @@ mod tests {
     #[test]
     fn reassembly_limits_are_shared_and_released_on_disconnect() {
         let now = Instant::now();
+        let head = || encode(1, &packet(1280), 1162).unwrap().datagrams()[0].clone();
         let mut a = receiver(MAX_PENDING + 1);
         let budget = Arc::clone(&a.budget);
         for _ in 0..MAX_PENDING {
-            let encoded = encode(1, &packet(1280), 1162).unwrap();
-            a.accept(encoded.datagrams()[0].clone(), now).unwrap();
+            a.accept(head(), now).unwrap();
         }
-        let extra = encode(1, &packet(1280), 1162).unwrap();
-        assert_eq!(
-            a.accept(extra.datagrams()[0].clone(), now),
-            Err(DropReason::ReassemblyLimit)
-        );
-        let mut b = Reassembler {
+        // At its own limit, a connection reuses its oldest packet's room.
+        assert_eq!(a.accept(head(), now), Ok(None));
+        assert_eq!(a.take_evicted(), 1);
+        assert_eq!(budget.available_permits(), ASSEMBLY_COST);
+        let shared = || Reassembler {
             pending: HashMap::new(),
             budget: Arc::clone(&budget),
+            evicted: 0,
         };
-        b.accept(extra.datagrams()[0].clone(), now).unwrap();
-        let extra2 = encode(1, &packet(1280), 1162).unwrap();
+        let mut b = shared();
+        b.accept(head(), now).unwrap();
+        // It does the same once the shared budget is spent, but a connection
+        // with no packets of its own cannot take another connection's room.
+        assert_eq!(b.accept(head(), now), Ok(None));
+        assert_eq!(b.take_evicted(), 1);
+        let mut c = shared();
+        let extra = head();
         assert_eq!(
-            b.accept(extra2.datagrams()[0].clone(), now),
+            c.accept(extra.clone(), now),
             Err(DropReason::ReassemblyLimit)
         );
         drop(a);
         assert_eq!(budget.available_permits(), MAX_PENDING * ASSEMBLY_COST);
-        b.accept(extra2.datagrams()[0].clone(), now).unwrap();
+        c.accept(extra, now).unwrap();
         drop(b);
+        drop(c);
         assert_eq!(
             budget.available_permits(),
             (MAX_PENDING + 1) * ASSEMBLY_COST

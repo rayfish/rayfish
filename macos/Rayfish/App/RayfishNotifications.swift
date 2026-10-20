@@ -12,6 +12,11 @@ struct RayfishNotice: Equatable {
     var body: String
     var page: RayfishPage
     var destination: String? = nil
+    var invitation: String? = nil
+}
+
+enum InvitationResponse {
+    case join, decline
 }
 
 struct RayfishNoticeChanges {
@@ -40,6 +45,11 @@ struct RayfishNoticeTracker {
         notices += status.pendingRequests.map { request in
             RayfishNotice(id: prefix + "join:\(request.network):\(request.id)", title: "Network join request",
                           body: "\(request.hostname ?? request.id) wants to join \(request.network).", page: .networks)
+        }
+        notices += (status.invitations ?? []).map { invitation in
+            RayfishNotice(id: prefix + "invitation:\(invitation.id)", title: "Network invitation",
+                          body: "You are invited to join \(invitation.network).", page: .networks,
+                          invitation: invitation.id)
         }
         let files = status.files ?? []
         notices += files.map { file in
@@ -83,6 +93,7 @@ final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
     var onOpen: ((RayfishPage) -> Void)?
     var onRevealFile: ((URL) -> Void)?
     var onRestartUpdate: (() -> Void)?
+    var onInvitation: ((String, InvitationResponse) -> Void)?
     private var tracker = RayfishNoticeTracker()
     private var deliveryTask: Task<Void, Never>?
     private var authorizationReady = false
@@ -92,8 +103,13 @@ final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         let restart = UNNotificationAction(identifier: "rayfish.restart-update", title: "Restart and Update")
+        let join = UNNotificationAction(identifier: "rayfish.invitation-join", title: "Join")
+        let decline = UNNotificationAction(identifier: "rayfish.invitation-decline", title: "Decline and Block",
+                                           options: [.destructive])
         center.setNotificationCategories([
-            UNNotificationCategory(identifier: "rayfish.update", actions: [restart], intentIdentifiers: [], options: [])
+            UNNotificationCategory(identifier: "rayfish.update", actions: [restart], intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: "rayfish.invitation", actions: [join, decline], intentIdentifiers: [],
+                                   options: [])
         ])
     }
 
@@ -149,6 +165,10 @@ final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
                 if let destination = notice.destination {
                     content.userInfo["destination"] = destination
                 }
+                if let invitation = notice.invitation {
+                    content.categoryIdentifier = "rayfish.invitation"
+                    content.userInfo["invitation"] = invitation
+                }
                 do {
                     try await center.add(UNNotificationRequest(identifier: notice.id, content: content, trigger: nil))
                 } catch {
@@ -173,12 +193,17 @@ final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
         let page = (response.notification.request.content.userInfo["page"] as? String)
             .flatMap(RayfishPage.init(rawValue:)) ?? .networks
         let destination = response.notification.request.content.userInfo["destination"] as? String
+        let invitation = response.notification.request.content.userInfo["invitation"] as? String
         Task { @MainActor in
             if isUpdate {
                 if response.actionIdentifier == UNNotificationDefaultActionIdentifier
                     || response.actionIdentifier == "rayfish.restart-update" {
                     self.onRestartUpdate?()
                 }
+            } else if let invitation, response.actionIdentifier == "rayfish.invitation-join" {
+                self.onInvitation?(invitation, .join)
+            } else if let invitation, response.actionIdentifier == "rayfish.invitation-decline" {
+                self.onInvitation?(invitation, .decline)
             } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
                 if let destination, FileManager.default.fileExists(atPath: destination) {
                     self.onRevealFile?(URL(fileURLWithPath: destination))

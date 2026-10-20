@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+#[cfg(target_os = "ios")]
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
@@ -197,9 +199,16 @@ mod android_log {
 pub fn install() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rayfish=debug"));
-    let _ = tracing_subscriber::registry()
-        .with(DiagLayer.with_filter(filter))
-        .try_init();
+    let registry = tracing_subscriber::registry().with(DiagLayer.with_filter(filter));
+    // iOS has no logcat: send the core's events to unified logging too, so they
+    // show in Console beside the Swift app and tunnel logs. Info only: the debug
+    // lines are already in the diagnostics buffer, and formatting each one a
+    // second time costs the tunnel's small CPU budget.
+    #[cfg(target_os = "ios")]
+    let registry = registry.with(
+        tracing_oslog::OsLogger::new("xyz.rayfish.ios", "core").with_filter(LevelFilter::INFO),
+    );
+    let _ = registry.try_init();
 }
 
 pub fn warn_count() -> u64 {

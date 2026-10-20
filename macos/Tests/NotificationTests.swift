@@ -57,6 +57,18 @@ struct NotificationTests {
         precondition(tracker.update(status).added.count == 1)
         print("PASS: network scopes, automatic receives, resolved requests and reconnects are tracked")
 
+        var inviteTracker = RayfishNoticeTracker()
+        var invited = ProviderStatus(active: true, ipv6: "200::1", networks: [], pendingRequests: [],
+                                     invitations: [ProviderInvitation(id: "inv1", network: "box", coordinator: "host")])
+        let offered = inviteTracker.update(invited)
+        precondition(offered.added.count == 1 && offered.added[0].title == "Network invitation")
+        precondition(offered.added[0].page == .networks && offered.added[0].invitation == "inv1")
+        precondition(offered.added[0].body.contains("box"))
+        precondition(inviteTracker.update(invited).added.isEmpty)
+        invited.invitations = []
+        precondition(inviteTracker.update(invited).removed == [offered.added[0].id])
+        print("PASS: invitations notify once, carry their id for Join and Decline, and clear when answered")
+
         let encoded = try JSONEncoder().encode(status)
         let decoded = try JSONDecoder().decode(ProviderStatus.self, from: encoded)
         precondition(decoded == status)

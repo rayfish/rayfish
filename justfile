@@ -48,6 +48,30 @@ macos:
     xcodegen generate --spec macos/project.yml --project macos
     open macos/Rayfish.xcodeproj
 
+# Regenerate the iOS Swift bindings from ray-mobile. Never hand-edit ios/Generated.
+ios-bindings:
+    cargo -q build -p ray-mobile --lib
+    cargo -q run -p ray-mobile --bin uniffi-bindgen -- generate --library target/debug/libray_mobile.{{lib_ext}} --language swift --out-dir ios/Generated --no-format
+    perl -0pi -e 's/[ \t]+$//mg; s/\n*\z/\n/' ios/Generated/*
+
+# Build the iOS app for the simulator and run its UI walkthrough there. The
+# node runs in the app process; packet tunnels need a device.
+ios-sim device="iPhone 17 Pro":
+    xcodegen generate --spec ios/project.yml --project ios
+    xcodebuild -project ios/Rayfish.xcodeproj -scheme Rayfish -sdk iphonesimulator \
+        -destination 'platform=iOS Simulator,name={{device}}' -derivedDataPath target/ios-derived \
+        CODE_SIGNING_ALLOWED=NO RAYFISH_GIT_SHA=$(git rev-parse --short HEAD) test
+
+# Generate and open the iOS project for a signed device build.
+ios:
+    xcodegen generate --spec ios/project.yml --project ios
+    open ios/Rayfish.xcodeproj
+
+# Build, install, and launch on a connected iPhone. Optional device ID or name.
+[positional-arguments]
+ios-run device="":
+    bash ios/run-device.sh "$1"
+
 # Test macOS legacy-service detection and migration without touching launchd.
 macos-test:
     mkdir -p target/macos-tests
@@ -57,7 +81,7 @@ macos-test:
 # Exercise concurrent provider messages, send failures, and request timeouts.
 macos-ipc-test:
     mkdir -p target/macos-tests
-    xcrun swiftc -parse-as-library macos/Shared/TunnelIPC.swift macos/Shared/ProviderMessage.swift macos/Tests/TunnelIPCTests.swift -o target/macos-tests/tunnel-ipc-tests
+    xcrun swiftc -parse-as-library macos/Shared/TunnelIPC.swift macos/Shared/ProviderReply.swift macos/Shared/ProviderMessage.swift macos/Tests/TunnelIPCTests.swift -o target/macos-tests/tunnel-ipc-tests
     target/macos-tests/tunnel-ipc-tests
 
 # Test live menu updates and closing the dashboard without touching the VPN.
@@ -69,7 +93,7 @@ macos-ui-test:
 # Check notification deduplication and tunnel ownership without the installed VPN.
 macos-notification-test:
     mkdir -p target/macos-tests
-    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Shared/TunnelIPC.swift macos/Rayfish/App/RayfishNotifications.swift macos/Tests/NotificationTests.swift -o target/macos-tests/notification-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Shared/TunnelIPC.swift macos/Shared/ProviderReply.swift macos/Rayfish/App/RayfishNotifications.swift macos/Tests/NotificationTests.swift -o target/macos-tests/notification-tests
     target/macos-tests/notification-tests
 
 # Build a locally testable app with automatic Apple Development signing.

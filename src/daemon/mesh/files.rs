@@ -315,6 +315,12 @@ impl Daemon {
     /// connection, asking it to wipe its own cert. Never blocks unpair on success
     /// the authoritative revocation is the signed pkarr record.
     async fn send_unpaired_notice(&self, target: EndpointId) {
+        self.send_control_once(target, &ControlMsg::Unpaired).await;
+    }
+
+    /// Best-effort `msg` to `target` over the first shared live mesh connection
+    /// found. Stops after that one attempt whether or not the send succeeded.
+    async fn send_control_once(&self, target: EndpointId, msg: &ControlMsg) {
         for entry in self.registry.networks.iter() {
             let net = entry.key().clone();
             for (pid, _ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
@@ -322,7 +328,7 @@ impl Daemon {
                     continue;
                 }
                 if let Ok((mut send, _recv)) = conn.open_bi().await {
-                    let _ = control::send_msg(&mut send, None, &ControlMsg::Unpaired).await;
+                    let _ = control::send_msg(&mut send, None, msg).await;
                     let _ = send.finish();
                 }
                 return;
@@ -340,20 +346,8 @@ impl Daemon {
         let Some(cert) = self.registry.current_device_cert() else {
             return;
         };
-        let primary = cert.user_identity;
-        for entry in self.registry.networks.iter() {
-            let net = entry.key().clone();
-            for (pid, _ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
-                if pid != primary {
-                    continue;
-                }
-                if let Ok((mut send, _recv)) = conn.open_bi().await {
-                    let _ = control::send_msg(&mut send, None, &ControlMsg::RequestUnpair).await;
-                    let _ = send.finish();
-                }
-                return;
-            }
-        }
+        self.send_control_once(cert.user_identity, &ControlMsg::RequestUnpair)
+            .await;
     }
 
     /// Unpair *this* device from its primary. First asks the primary to write the

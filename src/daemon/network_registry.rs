@@ -13,6 +13,8 @@
 
 use super::*;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use futures::future::BoxFuture;
+use iroh_dns::pkarr::SignedPacket;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -23,16 +25,92 @@ use tokio::sync::Notify;
 /// the peer is marked unreachable until a later packet retries the dial.
 const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on delivering a `ray leave` before the network is torn down: a
+/// dial ([`LAZY_DIAL_TIMEOUT`]) plus its acknowledgement, with room to spare. A
+/// leave is attempted once, so this is how long an unreachable coordinator can
+/// hold up `ray leave`.
+const LEAVE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long `ray rename` waits for a coordinator network to come back under its
+/// new name before replying. Restoring one is local, so this is only a bound;
+/// past it the restore carries on in the background.
+const RENAME_RESTORE_WAIT: Duration = Duration::from_secs(10);
+
 /// Keep the persisted hint set small and bounded.  A hint is only a speed-up;
 /// the endpoint id in the QUIC certificate remains the authentication boundary.
 const MAX_WARM_ENDPOINT_HINTS: usize = 64;
+
+/// Finish a `ray rename` that a crash interrupted, from the intent it saved
+/// before anything moved ([`config::rename_network`]): move the network's file
+/// and the name inside it if either is left, and point the firewall rules that
+/// name the network at its new name. Runs at startup before anything reads the
+/// saved networks or the firewall, so no network is restored under a name its
+/// file no longer has. The rest of what a rename moves is runtime state, built
+/// from the config afterwards.
+pub(crate) fn finish_interrupted_rename() {
+    let intent = match config::rename_intent() {
+        Ok(Some(intent)) => intent,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not read an unfinished network rename");
+            return;
+        }
+    };
+    let finished = config::finish_rename(&intent).and_then(|net| {
+        if net.is_some() {
+            let mut rules = firewall::load_firewall()?;
+            if rules.rename_network(&intent.from, &intent.to) {
+                firewall::save_firewall(&rules)?;
+            }
+        }
+        config::clear_rename_intent().map(|()| net.is_some())
+    });
+    let (from, to) = (intent.from.as_str(), intent.to.as_str());
+    match finished {
+        Ok(true) => tracing::info!(from, to, "finished an interrupted network rename"),
+        Ok(false) => tracing::warn!(
+            from,
+            to,
+            "dropped an interrupted network rename: the network is gone, or another one is saved under the new name"
+        ),
+        Err(e) => {
+            tracing::warn!(from, to, error = %format!("{e:#}"), "could not finish an interrupted network rename")
+        }
+    }
+}
 
 fn network_key_from_selector(selector: &str) -> Option<EndpointId> {
     selector.parse().ok().or_else(|| {
         crate::invite::decode_invite_code(selector)
             .ok()
-            .map(|(network_key, _, _)| network_key)
+            .map(|decoded| decoded.network_key)
     })
+}
+
+/// What holds a local network name on this node. The name is also the file name
+/// of the network's config (`networks/<name>.toml`), so it stays held while only
+/// that file is left, as for a network whose restore has not landed: saving
+/// another network under it would replace that network's config, keys included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameOwner {
+    Free,
+    /// The network with this key, active or only saved.
+    Network(EndpointId),
+    /// A saved config that records no network key, so it is no network's own.
+    Unknown,
+}
+
+/// `base` with `-{suffix}` appended, cut short so the result is still a valid
+/// name (`hostname::is_valid_hostname`): at most 63 characters, and no hyphen left
+/// at the cut to run into the suffix's own.
+fn suffixed_name(base: &str, suffix: u32) -> String {
+    const MAX_LEN: usize = 63;
+    let tail = format!("-{suffix}");
+    let stem: String = base
+        .chars()
+        .take(MAX_LEN.saturating_sub(tail.len()))
+        .collect();
+    format!("{}{tail}", stem.trim_end_matches('-'))
 }
 
 /// One network to (re)handshake when dialing a peer: its name and the per-network
@@ -53,6 +131,17 @@ pub(crate) struct CurrentSignedNetworkState {
     pub(crate) key: SecretKey,
 }
 
+/// What the rosters held here say about one endpoint.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RosterStanding {
+    /// The user identity a roster binds this device to. Rosters are
+    /// coordinator-signed, so this is not the dialer's own claim.
+    pub(crate) user_identity: Option<EndpointId>,
+    /// A member (device or user identity) or approved entry somewhere, or this
+    /// device's paired primary.
+    pub(crate) known: bool,
+}
+
 pub(crate) struct NetworkRegistry {
     /// Per-network runtime handles, keyed by network name. Shared with
     /// `Daemon` during the transition (same `Arc`), so a method can move to
@@ -66,11 +155,10 @@ pub(crate) struct NetworkRegistry {
     pub(crate) transport: Arc<Transport>,
     /// Live peer routing table, for severing / notifying peers on roster change.
     pub(crate) peers: PeerTable,
-    /// Serializes outbound mesh handshakes to one peer until the first caller
-    /// registers its connection. Pairing can join several networks at once;
-    /// checking the peer table without this gate lets every join dial before any
+    /// Shares outbound mesh dials per peer. Pairing joins several networks at
+    /// once; checking the peer table alone would let every join dial before any
     /// of them has installed the shared connection.
-    mesh_dial_locks: DashMap<EndpointId, Arc<AsyncMutex<()>>>,
+    mesh_dialer: MeshDialer,
     /// The per-peer connection driver, so the registry can (re-)register a
     /// network's accept handler (coordinator promotion) or unregister it on
     /// teardown directly.
@@ -146,9 +234,11 @@ pub(crate) struct NetworkRegistry {
     /// fires while the data plane is down (boot, standby) from withdrawing an
     /// offer that `activate()` is about to re-advertise.
     pub(crate) exit_sync_enabled: AtomicBool,
-    /// Networks whose restore is already running, so a sweep never starts a
-    /// second one for the same network. Removed when the restore finishes,
-    /// however it finishes.
+    /// Networks that a create or restore is bringing up right now, each held by
+    /// a [`RegistrationClaim`]. A sweep skips them: a create saves the config
+    /// before its handle is registered, and a restore started in that gap would
+    /// run a second coordinator state for the same network. See
+    /// [`NetworkRegistry::claim_registration`].
     pub(crate) restoring: Arc<DashSet<String>>,
     /// Why each saved-but-unregistered network's last restore attempt failed,
     /// keyed by network name. `ray status` reports it beside the network so a
@@ -204,6 +294,19 @@ fn peer_selector_for_network<'a>(network: &str, selector: &'a str) -> Option<&'a
 /// testable without a running daemon, which is the part worth pinning down: the
 /// sweep runs on a timer and on peer traffic, so starting a duplicate restore
 /// (or skipping a genuinely dead network) is the failure mode that matters.
+/// A network name held in [`NetworkRegistry::restoring`] while one path brings
+/// that network up. Dropping it releases the name, however that path ends.
+pub(crate) struct RegistrationClaim {
+    claims: Arc<DashSet<String>>,
+    name: String,
+}
+
+impl Drop for RegistrationClaim {
+    fn drop(&mut self) {
+        self.claims.remove(&self.name);
+    }
+}
+
 pub(crate) fn missing_networks(
     saved: &[config::NetworkConfig],
     is_live: impl Fn(&str) -> bool,
@@ -253,7 +356,7 @@ impl NetworkRegistry {
             networks,
             transport,
             peers,
-            mesh_dial_locks: DashMap::new(),
+            mesh_dialer: MeshDialer::default(),
             conn,
             dns,
             tun_name,
@@ -282,12 +385,23 @@ impl NetworkRegistry {
         }
     }
 
-    pub(crate) fn mesh_dial_lock(&self, peer: EndpointId) -> Arc<AsyncMutex<()>> {
-        let entry = self
-            .mesh_dial_locks
-            .entry(peer)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())));
-        Arc::clone(entry.value())
+    /// Claim `name` for the one create or restore that may register it, or
+    /// `None` while another holds it.
+    pub(crate) fn claim_registration(&self, name: &str) -> Option<RegistrationClaim> {
+        self.restoring
+            .insert(name.to_string())
+            .then(|| RegistrationClaim {
+                claims: Arc::clone(&self.restoring),
+                name: name.to_string(),
+            })
+    }
+
+    /// A live mesh connection to `peer`, registered or freshly dialed, sharing
+    /// any dial to it already in flight. See [`MeshDialer`].
+    pub(crate) async fn connect_mesh_peer(&self, peer: EndpointId) -> Result<DialedPeer> {
+        self.mesh_dialer
+            .connect(&self.transport.endpoint, &self.peers, peer)
+            .await
     }
 
     /// Resolve a destination mesh IP to a roster member the on-demand forwarding
@@ -304,7 +418,7 @@ impl NetworkRegistry {
 
     /// Resume mesh activity without touching the TUN/DNS plane. The relay stays
     /// connected in idle mode so file offers can still arrive.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) async fn wake_transport(&self) {
         // Avoid an atomic read-modify-write for every packet while mesh links
         // are already active.
@@ -313,26 +427,30 @@ impl NetworkRegistry {
         }
         if self.transport.mark_awake() {
             tracing::info!("resuming idle mesh links");
+            self.transport.sync_relays().await;
             self.transport.endpoint.network_change().await;
             self.poll_nudge.notify_waiters();
             tracing::info!("mesh links resumed after idle");
         }
     }
 
-    /// Close mesh connections while keeping the relay, endpoint, TUN and DNS
-    /// alive so file offers can still arrive.
+    /// Go outgoing-only: close mesh connections and drop the relay, keeping
+    /// the endpoint, TUN and DNS alive. Every unsolicited packet wakes a
+    /// sleeping phone, and the relay alone pings every 15-20 seconds, so an
+    /// idle phone is unreachable until it sends something itself.
     /// Disconnect handling sees the suspended flag and must not start retries.
-    #[cfg(target_os = "android")]
-    pub(crate) fn suspend_mesh_links(&self) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub(crate) async fn suspend_mesh_links(&self) {
         if !self.transport.mark_suspended() {
             return;
         }
         tracing::info!("suspending idle mesh links");
         for (ip, conn) in self.peers.all_connections() {
-            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"android idle");
+            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
             self.peers.remove(&ip);
         }
-        tracing::info!("mesh links suspended after idle timeout");
+        self.transport.sync_relays().await;
+        tracing::info!("mesh links and relay suspended after idle timeout");
     }
 
     /// The raw on-demand dial mechanism: connect to `target` across every shared
@@ -341,7 +459,7 @@ impl NetworkRegistry {
     /// established (the caller then flushes any buffered packets). The forwarding
     /// loop owns the buffering/dedup and calls this from a spawned task.
     pub(crate) async fn dial_target(self: &Arc<Self>, target: &peers::RouteTarget) -> bool {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         self.wake_transport().await;
         let targets: Vec<DialTarget> = target
             .networks
@@ -496,6 +614,46 @@ impl NetworkRegistry {
         }
     }
 
+    /// What the rosters held here say about `remote`, in one pass with one lock
+    /// per network. A poisoned roster lock counts as saying nothing.
+    pub(crate) fn roster_standing(&self, remote: EndpointId) -> RosterStanding {
+        let mut standing = RosterStanding::default();
+        for network in self.networks.iter() {
+            let Ok(state) = network.state.read() else {
+                continue;
+            };
+            if let Some(member) = state.members.get(&remote) {
+                standing.known = true;
+                standing.user_identity = standing.user_identity.or(member.user_identity);
+            }
+            standing.known = standing.known
+                || state
+                    .members
+                    .all()
+                    .iter()
+                    .any(|m| m.user_identity == Some(remote))
+                || state
+                    .approved
+                    .all()
+                    .iter()
+                    .any(|e| e.identity == remote || e.user_identity == Some(remote));
+        }
+        // The paired primary need not share a roster with this device yet.
+        standing.known = standing.known
+            || self
+                .current_device_cert()
+                .is_some_and(|cert| cert.user_identity == remote);
+        standing
+    }
+
+    /// What a person shares to reach this user: the paired user identity, or
+    /// this endpoint when unpaired. Also the target of `ray connect`.
+    pub(crate) fn own_identity(&self) -> EndpointId {
+        self.current_device_cert()
+            .map(|cert| cert.user_identity)
+            .unwrap_or_else(|| self.transport.endpoint.id())
+    }
+
     /// Record memberships a device held before receiving our certificate.
     /// A later certificate revocation must not turn those into paired joins.
     pub(crate) fn remember_independent_paired_device(&self, device: EndpointId) -> Result<()> {
@@ -529,7 +687,7 @@ impl NetworkRegistry {
     /// Called by the phone's unpair control, the IPC path, and the device-side
     /// `ControlMsg::Unpaired` / self-nullify handlers (was the `self_unpair_tx`
     /// hand-off to the daemon loop). A device with no cert (a primary) is a no-op.
-    pub(crate) async fn unpair_self(&self) -> IpcMessage {
+    pub(crate) async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
         let Some(cert) = self.current_device_cert() else {
             return ipc_err("this device is not paired to a primary".to_string());
         };
@@ -566,6 +724,14 @@ impl NetworkRegistry {
     /// static, so (unlike the old `refresh_alpns`) only the search domains need
     /// updating here.
     pub(crate) async fn teardown_network_runtime(&self, name: &str) -> bool {
+        self.teardown_network_runtime_closing(name, forward::LEAVE_CODE, b"leave")
+            .await
+    }
+
+    /// [`Self::teardown_network_runtime`], closing the links it leaves unused with
+    /// `code`. The leave code tells a coordinator we left; a network restarted
+    /// under a new name ([`Self::rename_network`]) has not.
+    async fn teardown_network_runtime_closing(&self, name: &str, code: u32, reason: &[u8]) -> bool {
         let Some(handle) = self.networks.remove(name).map(|(_, v)| v) else {
             return false;
         };
@@ -576,10 +742,11 @@ impl NetworkRegistry {
 
         // Drop this network from every peer's routing. A peer left sharing no
         // network at all is fully disconnected, so close its now-unused link with
-        // the leave code (the peer treats it as intentional and stops reconnecting);
-        // a peer we still share another network with keeps its connection.
+        // `code` (on the leave code the peer treats it as intentional and stops
+        // reconnecting); a peer we still share another network with keeps its
+        // connection.
         for (_ip, conn) in self.peers.remove_by_network(name) {
-            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
+            conn.close(VarInt::from_u32(code), reason);
         }
         self.dns.clear_network(name).await;
         self.route_map.remove_network(name);
@@ -605,15 +772,15 @@ impl NetworkRegistry {
     /// carries every network two peers share: closing it would sever the peer on
     /// networks we are *not* leaving (and, on a peer that coordinates one of them,
     /// get us pruned from a network we never left). A coordinator that receives the
-    /// message prunes us from that one network's roster and republishes.
+    /// message prunes us from that one network's roster and republishes, so
+    /// [`Self::announce_leave`] dials any coordinator no live link reaches.
     /// `teardown_network_runtime` then closes only the links left sharing no
     /// network at all.
-    pub(crate) async fn leave_network(&self, name: &str) -> IpcMessage {
-        // Send the in-band leave while the peer entries still list this network
-        // (before teardown drops them). Best-effort: a peer that misses it converges
-        // from the coordinator's republish, or ages us out as an offline member.
+    pub(crate) async fn leave_network(self: &Arc<Self>, name: &str) -> IpcMessage {
+        // Announce the leave while the peer entries still list this network
+        // (before teardown drops them), and let it land before tearing down.
         if let Some(net_pubkey) = self.networks.get(name).map(|h| h.network_key) {
-            broadcast_control_msg(&self.peers, net_pubkey, name, &ControlMsg::LeaveNetwork).await;
+            self.announce_leave(name, net_pubkey).await;
         }
 
         if self.remove_network_locally(name).await {
@@ -624,6 +791,72 @@ impl NetworkRegistry {
         } else {
             ipc_err(format!("network '{}' not found", name))
         }
+    }
+
+    /// Deliver `ControlMsg::LeaveNetwork` to every peer sharing `name` over a live
+    /// link, and to every coordinator without one, dialing it first. Waits, at most
+    /// [`LEAVE_DELIVERY_TIMEOUT`], until each has acknowledged the message.
+    ///
+    /// Only a coordinator prunes the roster, and nothing ages out a member that
+    /// left without being heard: the roster keeps it, holding its hostname, until
+    /// a `ray kick`. An on-demand node's link to its coordinator is usually
+    /// idle-closed by the time it leaves, so the live links alone are not enough.
+    /// Ordinary members need no dial: the coordinator's republish and `MemberSync`
+    /// reach them, dialing idle ones in turn.
+    async fn announce_leave(self: &Arc<Self>, name: &str, net_pubkey: EndpointId) {
+        let live = self.peers.peers_for_network_with_conn(name);
+        let reached: HashSet<EndpointId> = live.iter().map(|(id, _, _)| *id).collect();
+        let absent = leave_recipients(
+            &self.roster(name),
+            self.transport.identity.local_identity(),
+            &reached,
+        );
+        let deliveries = live
+            .into_iter()
+            .map(|(_, ip, _)| ip)
+            .chain(absent)
+            .map(|ip| async move { (ip, self.deliver_leave(ip, net_pubkey).await) });
+        match tokio::time::timeout(
+            LEAVE_DELIVERY_TIMEOUT,
+            futures::future::join_all(deliveries),
+        )
+        .await
+        {
+            Ok(results) => {
+                for (ip, result) in results {
+                    if let Err(e) = result {
+                        tracing::warn!(network = %name, peer_ip = %ip, error = %format!("{e:#}"), "failed to deliver leave");
+                    }
+                }
+            }
+            Err(_) => tracing::warn!(network = %name, "timed out delivering leave"),
+        }
+    }
+
+    /// Send `LeaveNetwork` to the peer at `ip`, dialing it first when no link is up.
+    ///
+    /// A named, boxed future rather than an `async fn`: the dial spawns the new
+    /// link's control loop, and an `Unpaired` arriving on that loop leaves networks
+    /// through here again (`unpair_self`), so the loop's future type would
+    /// otherwise contain itself.
+    fn deliver_leave(
+        self: &Arc<Self>,
+        ip: Ipv6Addr,
+        net_pubkey: EndpointId,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if self.peers.conn_for_ip(&ip).is_none() {
+                let target = self
+                    .resolve_route(IpAddr::V6(ip))
+                    .context("no route to the peer")?;
+                anyhow::ensure!(self.dial_target(&target).await, "could not dial the peer");
+            }
+            let conn = self
+                .peers
+                .conn_for_ip(&ip)
+                .context("the link closed before the leave was sent")?;
+            send_leave(&conn, net_pubkey).await
+        })
     }
 
     /// Tear down and forget a network after its signed roster confirms that this
@@ -645,6 +878,177 @@ impl NetworkRegistry {
             }
         };
         was_active || removed_from_config
+    }
+
+    /// Rename a network on this node only (`ray rename`). The name is local: it
+    /// is the config's file name, the Magic DNS zone (`<host>.<name>.ray`) and
+    /// the key every runtime structure files the network under. Peers know the
+    /// network by its key, and the signed blob carries its own name
+    /// (`group_name`), so neither notices.
+    ///
+    /// A live network is restarted under the new name, as a daemon restart
+    /// would bring it back, rather than rekeyed in place, which would mean
+    /// finding every structure and task that holds the name. Its links close with
+    /// the idle code: a peer lets an idle link go without reconnecting, and a
+    /// coordinator does not take it for a departure the way it takes the leave
+    /// code, so nobody prunes us. What the restart does not rebuild is moved to
+    /// the new name instead ([`Self::follow_rename`]); the daemon rebuilds its
+    /// SSH allow-lists itself.
+    ///
+    /// The config and the invite ledger move under a saved intent
+    /// ([`config::rename_network`]), which is cleared only once the firewall
+    /// rules are saved under the new name as well, so a rename a crash
+    /// interrupts is finished at the next start ([`finish_interrupted_rename`]).
+    pub(crate) async fn rename_network(self: &Arc<Self>, from: &str, to: &str) -> IpcMessage {
+        if !crate::hostname::is_valid_hostname(to) {
+            return ipc_err(format!(
+                "invalid network name '{to}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+            ));
+        }
+        if from == to {
+            return ipc_err(format!("network '{from}' already has that name"));
+        }
+        match config::load_network(from) {
+            Ok(Some(_)) => {}
+            Ok(None) => return ipc_err(format!("network '{from}' not found")),
+            Err(e) => return ipc_err(format!("{e:#}")),
+        }
+        match self.name_owner(to) {
+            Ok(NameOwner::Free) => {}
+            Ok(_) => {
+                return ipc_err(format!(
+                    "network name '{to}' belongs to another network on this node; choose another name"
+                ));
+            }
+            Err(e) => return ipc_err(format!("{e:#}")),
+        }
+        // `config::rename_network` refuses this too, but only after the network
+        // has been taken down for it.
+        match config::rename_intent() {
+            Ok(None) => {}
+            Ok(Some(pending)) => {
+                return ipc_err(format!(
+                    "renaming network '{}' to '{}' has not finished; restart the daemon to finish it",
+                    pending.from, pending.to
+                ));
+            }
+            Err(e) => return ipc_err(format!("{e:#}")),
+        }
+        // Holding the restore guard keeps the supervisor from restoring the old
+        // name while the network moves. A restore already under way would bring
+        // the network up under the old name after the move, so wait for it.
+        let Some(claim) = self.claim_registration(from) else {
+            return ipc_err(format!(
+                "network '{from}' is still being restored; try again once it is up"
+            ));
+        };
+        // The network's invite ledger moves with the name. Its invites are
+        // redeemed and delivered under its invite lock, so hold that across the
+        // move: a write already under way would otherwise land under the old
+        // name, where nothing reads it.
+        let invite_lock = self
+            .networks
+            .get(from)
+            .map(|handle| Arc::clone(&handle.invite_lock));
+        self.teardown_network_runtime_closing(from, forward::IDLE_CODE, b"rename")
+            .await;
+        let renamed = {
+            let _invites = match &invite_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            config::rename_network(from, to)
+        };
+        drop(claim);
+        let net = match renamed {
+            Ok(Some(net)) => net,
+            // Left meanwhile, so there is nothing to bring back.
+            Ok(None) => return ipc_err(format!("network '{from}' not found")),
+            Err(e) => {
+                // Restore what is saved now rather than at the supervisor's next
+                // tick. Before the intent was saved nothing moved, so that is the
+                // network under its old name. After, the rename is committed and
+                // the next start finishes it; until then a file the move left
+                // holding its old name loads under neither name, so no restore
+                // brings the network back half-renamed.
+                self.nudge_restore();
+                let committed = config::rename_intent()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|pending| pending.from == from && pending.to == to);
+                return ipc_err(if committed {
+                    format!(
+                        "renaming network '{from}' to '{to}' did not finish ({e:#}); it finishes when the daemon next starts"
+                    )
+                } else {
+                    format!("{e:#}")
+                });
+            }
+        };
+        let warning = self.follow_rename(from, to);
+        self.restore_errors.remove(from);
+        let coordinator = net.network_secret_key.is_some();
+        let restore = if coordinator {
+            self.spawn_coordinator_restore(&net)
+        } else {
+            self.spawn_member_restore(&net)
+        };
+        if let Some(restore) = restore {
+            // The exit-node state moved with the name. Once the network is back,
+            // rerun the daemon's exit reconcile too, which resolves an exit
+            // selection against the restored roster; a member's restore carries
+            // on after this replies.
+            let exit_configured = !net.exit_allow.is_empty() || net.exit_node_use.is_some();
+            let reapply = exit_configured.then(|| Arc::clone(&self.exit_reapply));
+            let restored = tokio::spawn(async move {
+                let _ = restore.await;
+                if let Some(reapply) = reapply {
+                    reapply.notify_one();
+                }
+            });
+            if coordinator {
+                // Local and quick, so `ray status` right after shows the new name.
+                let _ = tokio::time::timeout(RENAME_RESTORE_WAIT, restored).await;
+            }
+        }
+        tracing::info!(from, to, "renamed network");
+        let mut message = format!("renamed network '{from}' to '{to}'");
+        if let Some(warning) = warning {
+            message.push_str(&format!("\nwarning: {warning}"));
+        }
+        IpcMessage::Ok { message }
+    }
+
+    /// Carry over to a network's new name what this node keeps under its name
+    /// across the network's restart: the firewall rules scoped to it or installed
+    /// from its suggestions, the exit-node policy and selection a gateway or full
+    /// tunnel runs on, and the peers pruned from it. Then save the firewall rules
+    /// and clear the rename's intent. Returns a warning when either could not be
+    /// saved; the intent then stays, so the next start finishes saving the rules
+    /// ([`finish_interrupted_rename`]).
+    fn follow_rename(&self, from: &str, to: &str) -> Option<String> {
+        let rules = self.firewall.rename_network(from, to);
+        self.exit_server.rename_network(from, to);
+        self.exit_client.rename_network(from, to);
+        let pruned: Vec<EndpointId> = self
+            .pruned_peers
+            .iter()
+            .filter(|entry| entry.0 == from)
+            .map(|entry| entry.1)
+            .collect();
+        for peer in pruned {
+            self.pruned_peers.remove(&(from.to_string(), peer));
+            self.pruned_peers.insert((to.to_string(), peer));
+        }
+        let saved = rules
+            .map_or(Ok(()), |rules| firewall::save_firewall(&rules))
+            .and_then(|()| config::clear_rename_intent());
+        saved.err().map(|e| {
+            tracing::warn!(from, to, error = %format!("{e:#}"), "failed to save renamed network");
+            format!(
+                "could not save the rename in full ({e:#}); it finishes when the daemon next starts"
+            )
+        })
     }
 
     /// Look up an active network we coordinate, returning its public key and
@@ -683,8 +1087,7 @@ impl NetworkRegistry {
     pub(crate) fn network_shared_with(&self, peer: &EndpointId) -> Option<String> {
         self.networks.iter().find_map(|h| {
             let s = h.state.read().ok()?;
-            let has = s.members.all().iter().any(|m| &m.identity == peer);
-            has.then(|| h.key().clone())
+            s.members.is_member(peer).then(|| h.key().clone())
         })
     }
 
@@ -706,14 +1109,17 @@ impl NetworkRegistry {
                 return None;
             }
             let s = h.state.read().ok()?;
-            let has = s.members.all().iter().any(|m| &m.identity == peer)
-                || s.approved.all().iter().any(|a| &a.identity == peer);
+            let has = s.members.is_member(peer) || s.approved.is_approved(peer);
             has.then(|| h.key().clone())
         })
     }
 
     /// Pick a collision-free `<me>-<peer>` name for a direct network.
-    pub(crate) fn direct_network_name(&self, my_host: &str, peer_hostname: Option<&str>) -> String {
+    pub(crate) fn direct_network_name(
+        &self,
+        my_host: &str,
+        peer_hostname: Option<&str>,
+    ) -> Result<String> {
         let peer = peer_hostname.unwrap_or("peer");
         let mut base = format!("{my_host}-{peer}");
         if base.len() > 63 {
@@ -723,9 +1129,44 @@ impl NetworkRegistry {
         if !crate::hostname::is_valid_hostname(&base) {
             base = crate::network_name::generate_name();
         }
-        let taken: Vec<String> = self.networks.iter().map(|h| h.key().clone()).collect();
-        let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-        crate::hostname::resolve_collision(&base, &taken_refs)
+        self.unclaimed_network_name(&base, None)
+    }
+
+    /// What holds the local network name `name` (see [`NameOwner`]).
+    pub(crate) fn name_owner(&self, name: &str) -> Result<NameOwner> {
+        if let Some(handle) = self.networks.get(name) {
+            return Ok(NameOwner::Network(handle.network_key));
+        }
+        Ok(match config::load_network(name)? {
+            None => NameOwner::Free,
+            Some(net) => net
+                .network_public_key
+                .or_else(|| net.network_secret_key.as_ref().map(SecretKey::public))
+                .map_or(NameOwner::Unknown, NameOwner::Network),
+        })
+    }
+
+    /// A local name for a network this node names itself (a generated one, the
+    /// name a coordinator gave a joined network, a `ray connect` link): `base` if no
+    /// other network holds it, else the first free `base-1`, `base-2`, ..., the way
+    /// hostname collisions resolve. A name that network `key` already holds counts
+    /// as free, so rejoining a saved network keeps its name and its config.
+    pub(crate) fn unclaimed_network_name(
+        &self,
+        base: &str,
+        key: Option<EndpointId>,
+    ) -> Result<String> {
+        let mut candidate = base.to_string();
+        for suffix in 1u32.. {
+            match self.name_owner(&candidate)? {
+                NameOwner::Free => return Ok(candidate),
+                NameOwner::Network(owner) if Some(owner) == key => return Ok(candidate),
+                NameOwner::Network(_) | NameOwner::Unknown => {
+                    candidate = suffixed_name(base, suffix);
+                }
+            }
+        }
+        unreachable!()
     }
 
     /// Mint a new network: generate its keypair, build the initial roster, seal +
@@ -747,17 +1188,30 @@ impl NetworkRegistry {
                     crate::hostname::is_valid_hostname(&n),
                     "invalid network name '{n}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
                 );
+                if self.networks.contains_key(&n) {
+                    return Ok(ipc_err(format!("network '{n}' already active")));
+                }
+                if self.name_owner(&n)? != NameOwner::Free {
+                    return Ok(ipc_err(format!(
+                        "network name '{n}' belongs to a saved network that is not active \
+                         (see `ray status`); choose another name"
+                    )));
+                }
                 n
             }
-            None => network_name::generate_name(),
+            None => self.unclaimed_network_name(&network_name::generate_name(), None)?,
+        };
+        // Held until the handle is registered. The config is saved first and the
+        // record publish in between can take seconds; a restore sweep in that
+        // gap would see a saved network that is not live and restore a second
+        // coordinator state for it, whose publisher then republishes its stale
+        // roster over every admission this one makes.
+        let Some(_registration) = self.claim_registration(&name) else {
+            return Ok(ipc_err(format!("network '{name}' is already being set up")));
         };
 
         let net_secret_key = SecretKey::generate();
         let net_public_key = net_secret_key.public();
-
-        if self.networks.contains_key(&name) {
-            return Ok(ipc_err(format!("network '{name}' already active")));
-        }
 
         let my_ip = self.transport.identity.local_ipv6();
 
@@ -826,7 +1280,12 @@ impl NetworkRegistry {
         )
         .await;
         let initial_record = self
-            .publish_group_hash(&name, &net_secret_key, last_group_hash)
+            .publish_group_hash(
+                &name,
+                &net_secret_key,
+                last_group_hash,
+                &net_state.snapshot_commit,
+            )
             .await;
 
         let cancel = self.shutdown_token.child_token();
@@ -965,29 +1424,55 @@ impl NetworkRegistry {
         Ok(snap.hash)
     }
 
+    /// Sign and publish the record for `blob_hash`, then mark it published.
+    /// Returns the record's bytes once both happened.
     pub(crate) async fn publish_group_hash(
         &self,
         network: &str,
         net_secret_key: &SecretKey,
         blob_hash: blake3::Hash,
+        commit: &AsyncMutex<()>,
     ) -> Option<Vec<u8>> {
-        let Ok(pkarr_client) =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-        else {
-            return None;
-        };
-        match dht::publish_network(
-            &pkarr_client,
+        let packet = match dht::encode_network_record(
             net_secret_key,
             &blob_hash,
             &[self.transport.endpoint.id()],
-        )
-        .await
-        {
-            Ok(packet) => mark_group_hash_published(network, blob_hash).then_some(packet),
+        ) {
+            Ok(packet) => packet,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to build network record");
+                return None;
+            }
+        };
+        self.publish_signed_group_record(network, blob_hash, &packet, commit)
+            .await
+            .then(|| packet.as_bytes().to_vec())
+    }
+
+    /// Publish a record already signed under `commit` and mark it published.
+    /// Returns whether both happened; failures are logged here.
+    pub(crate) async fn publish_signed_group_record(
+        &self,
+        network: &str,
+        hash: blake3::Hash,
+        packet: &SignedPacket,
+        commit: &AsyncMutex<()>,
+    ) -> bool {
+        let client = match dht::create_pkarr_client(
+            &self.transport.endpoint,
+            &self.transport.pkarr_relay_url,
+        ) {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to build pkarr client for network record");
+                return false;
+            }
+        };
+        match publish_signed_record(&client, commit, network, hash, packet).await {
+            Ok(marked) => marked,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to publish network record");
-                None
+                false
             }
         }
     }
@@ -1233,7 +1718,7 @@ impl NetworkRegistry {
                 .value()
                 .state
                 .read()
-                .map(|s| s.members.all().iter().any(|m| m.identity == identity))
+                .map(|s| s.members.is_member(&identity))
                 .unwrap_or(false);
             if is_member {
                 return true;
@@ -1287,14 +1772,18 @@ impl NetworkRegistry {
         key: SecretKey,
         pkarr_client: PkarrRelayClient,
     ) -> bool {
-        let parts = {
+        let state;
+        let invite_lock;
+        let notify;
+        let network_key;
+        {
             let Some(mut handle) = self.networks.get_mut(network) else {
                 return false;
             };
             if !should_promote(handle.role.clone()) {
                 return false;
             }
-            let notify = Arc::new(Notify::new());
+            notify = Arc::new(Notify::new());
             let publisher = spawn_network_publisher(
                 pkarr_client,
                 key,
@@ -1308,22 +1797,17 @@ impl NetworkRegistry {
             handle.tasks.push(publisher);
             handle.dht_notify = Some(Arc::clone(&notify));
             handle.role = NetworkRole::Coordinator;
-            (
-                Arc::clone(&handle.state),
-                Arc::clone(&handle.invite_lock),
-                notify,
-                handle.network_key,
-            )
-        }; // DashMap ref dropped before connection-handler registration.
-        self.conn.register(
-            parts.3,
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                ctx: ctx.clone(),
-                network_name: network.to_string(),
-                state: parts.0,
-                dht_notify: Some(parts.2),
-                invite_lock: parts.1,
-            })),
+            state = Arc::clone(&handle.state);
+            invite_lock = Arc::clone(&handle.invite_lock);
+            network_key = handle.network_key;
+        } // DashMap ref dropped before connection-handler registration.
+        self.register_coordinator_handler(
+            ctx,
+            network,
+            state,
+            invite_lock,
+            Some(notify),
+            network_key,
         );
         tracing::info!(
             network,
@@ -1500,5 +1984,28 @@ mod tests {
     fn nothing_to_do_when_every_saved_network_is_live() {
         let saved = vec![net("homelab"), coordinator_net("field")];
         assert!(missing_networks(&saved, |_| true, |_| false).is_empty());
+    }
+
+    /// A suffix must not push a name past the 63-character limit: the candidate
+    /// is looked up by its config file name, which rejects a longer one, so the
+    /// search would fail instead of finding a free name.
+    #[test]
+    fn a_suffixed_name_stays_a_valid_name() {
+        assert_eq!(suffixed_name("gaming", 1), "gaming-1");
+        let longest = "a".repeat(63);
+        for (suffix, want) in [
+            (1, format!("{}-1", "a".repeat(61))),
+            (10, format!("{}-10", "a".repeat(60))),
+        ] {
+            let name = suffixed_name(&longest, suffix);
+            assert_eq!(name, want);
+            assert!(crate::hostname::is_valid_hostname(&name), "{name}");
+        }
+        // A cut that ends on a hyphen drops it rather than doubling it.
+        let hyphen_at_cut = format!("{}-bb", "a".repeat(60));
+        assert_eq!(
+            suffixed_name(&hyphen_at_cut, 1),
+            format!("{}-1", "a".repeat(60))
+        );
     }
 }

@@ -69,40 +69,22 @@ async fn alias_set(network: &str, key: &str, alias: &str) -> Result<()> {
         }
     };
 
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::AliasSet {
-            network: network.to_string(),
-            identity,
-            alias: alias.to_string(),
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::AliasSet {
+        network: network.to_string(),
+        identity,
+        alias: alias.to_string(),
+    })
     .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 async fn alias_remove(network: &str, alias: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::AliasRemove {
-            network: network.to_string(),
-            alias: alias.to_string(),
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::AliasRemove {
+        network: network.to_string(),
+        alias: alias.to_string(),
+    })
     .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 async fn alias_list(network: &str) -> Result<()> {

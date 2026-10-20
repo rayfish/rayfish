@@ -15,23 +15,16 @@ impl NetworkRegistry {
         };
         let (net_pubkey, net_secret_key) = match self.networks.get(network) {
             Some(h) => {
-                let key = {
-                    let s = h.state.read().unwrap();
-                    s.network_secret_key.clone()
-                };
-                if key.is_none() {
+                let Some(key) = h.state.read().unwrap().network_secret_key.clone() else {
                     return ipc_err(
                         "only a coordinator (network key holder) can grant admin".to_string(),
                     );
-                }
+                };
                 (h.network_key, key)
             }
             None => {
                 return ipc_err(format!("network '{network}' not active"));
             }
-        };
-        let Some(net_secret_key) = net_secret_key else {
-            return ipc_err("network key not available".to_string());
         };
 
         // The target must be a member of this network. Send the grant over the

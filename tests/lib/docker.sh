@@ -195,37 +195,83 @@ do_provision(){
 }
 
 do_teardown(){
-  [[ -f "$SERVERS" ]] || { echo "No $SERVERS — nothing to tear down."; exit 0; }
-
-  local marker; marker="$(servers_backend "$SERVERS")"
-  if [[ "$marker" != "docker" ]]; then
-    echo "Refusing: $SERVERS is a cloud fleet (region ${marker:-unknown}), not docker." >&2
-    echo "Tear it down with: E2E_BACKEND=digitalocean tests/e2e.sh <scenario> teardown" >&2
-    exit 1
+  local failed=0
+  if [[ -f "$SERVERS" ]]; then
+    local marker; marker="$(servers_backend "$SERVERS")"
+    if [[ "$marker" != "docker" ]]; then
+      echo "Refusing: $SERVERS is a cloud fleet (region ${marker:-unknown}), not docker." >&2
+      echo "Tear it down with: E2E_BACKEND=digitalocean tests/e2e.sh <scenario> teardown" >&2
+      return 1
+    fi
   fi
 
-  local failed=0 id ip label z
-  while read -r id ip label z; do
-    [[ -n "$id" ]] || continue
-    echo ">> removing $label  name=$id  ip=$ip"
-    docker rm -f "$id" >/dev/null 2>&1 || { echo "   (removal failed for $id)"; failed=1; }
-  done < "$SERVERS"
+  # A retry can find containers already removed by a partially successful
+  # teardown. Only a successful list query establishes that they are absent.
+  local all_containers
+  if all_containers="$(docker ps -a --format '{{.Names}}' 2>&1)"; then
+    if [[ -f "$SERVERS" ]]; then
+      local id ip label z
+      while read -r id ip label z; do
+        [[ -n "$id" ]] || continue
+        if grep -qxF -- "$id" <<< "$all_containers"; then
+          echo ">> removing $label  name=$id  ip=$ip"
+          docker rm -f "$id" >/dev/null 2>&1 || { echo "   (removal failed for $id)" >&2; failed=1; }
+        fi
+      done < "$SERVERS"
 
-  if [[ "$failed" == 0 ]]; then
-    rm -f "$SERVERS"
-    echo "Removed $SERVERS."
+      if [[ "$failed" == 0 ]]; then
+        if rm -f "$SERVERS"; then
+          echo "Removed $SERVERS."
+        else
+          echo "Failed to remove $SERVERS." >&2
+          failed=1
+        fi
+      else
+        echo "Left $SERVERS in place: some containers could not be removed." >&2
+      fi
+    elif [[ ${#NAMES[@]} -gt 0 ]]; then
+      local name
+      for name in "${NAMES[@]}"; do
+        if grep -qxF -- "$name" <<< "$all_containers"; then
+          echo ">> removing name=$name (fallback without .servers)"
+          docker rm -f "$name" >/dev/null 2>&1 || { echo "   (removal failed for $name)" >&2; failed=1; }
+        fi
+      done
+    else
+      echo "No $SERVERS — nothing to tear down."
+    fi
   else
-    echo "Left $SERVERS in place: some containers could not be removed." >&2
+    echo "Failed to query Docker for containers (API unavailable?)." >&2
+    failed=1
   fi
 
   # Drop the bridge once the last fleet is gone.
-  if docker network inspect "$DOCKER_NET" >/dev/null 2>&1; then
-    local attached
-    attached="$(docker network inspect -f '{{len .Containers}}' "$DOCKER_NET" 2>/dev/null || echo 1)"
-    if [[ "$attached" == "0" ]]; then
-      docker network rm "$DOCKER_NET" >/dev/null 2>&1 && echo "Removed network $DOCKER_NET."
+  # Use docker network ls to verify the API is reachable; do not treat
+  # a failed inspect as proof that the network is absent.
+  local all_networks
+  if all_networks="$(docker network ls --format '{{.Name}}' 2>&1)"; then
+    if echo "$all_networks" | grep -qxF "$DOCKER_NET"; then
+      local attached
+      if attached="$(docker network inspect -f '{{len .Containers}}' "$DOCKER_NET" 2>/dev/null)" && [[ -n "$attached" ]]; then
+        if [[ "$attached" == "0" ]]; then
+          if docker network rm "$DOCKER_NET" >/dev/null 2>&1; then
+            echo "Removed network $DOCKER_NET."
+          else
+            echo "Failed to remove network $DOCKER_NET." >&2
+            failed=1
+          fi
+        fi
+      else
+        echo "Failed to inspect containers on network $DOCKER_NET." >&2
+        failed=1
+      fi
     fi
+  else
+    echo "Failed to query Docker for networks (API unavailable?)." >&2
+    failed=1
   fi
+
+  return "$failed"
 }
 
 case "${DOCKER_ACTION:-}" in

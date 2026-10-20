@@ -92,7 +92,7 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                 ContextCompat.startForegroundService(context, intent)
             }
             model.refresh()
-        } catch (t: Throwable) { snackbar.showSnackbar(context.getString(R.string.error_failed_to_start, t.message.orEmpty())) }
+        } catch (t: Throwable) { snackbar.showSnackbar(context.getString(R.string.error_failed_to_start, t.userMessage)) }
         finally { restoringTunnel = false }
     }
     LaunchedEffect(lifecycleOwner) {
@@ -120,7 +120,7 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                 val action = withContext(Dispatchers.IO) { NodeHolder.get(context).handleLink(uri) }
                 model.refresh()
                 toast(context.messageForLinkAction(action, R.string.toast_paired))
-            } catch (t: Throwable) { toast(context.getString(R.string.error_link_failed, t.message.orEmpty())) }
+            } catch (t: Throwable) { toast(context.getString(R.string.error_link_failed, t.userMessage)) }
         }
     }
     LaunchedEffect(initialLinkUri) {

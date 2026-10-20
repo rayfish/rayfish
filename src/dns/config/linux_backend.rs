@@ -4,6 +4,49 @@ use super::*;
 // Linux: search domains
 // ---------------------------------------------------------------------------
 
+/// The `(domain, routing_only)` list resolved gets for our link.
+///
+/// Each domain goes in once. resolved keys its per-link list by name and a
+/// repeat overwrites the flag of the first, so the old `~ray` followed by a
+/// plain `ray` search entry left no routing-only domain at all.
+///
+/// When `ray` is a search domain (short names on), it is sent as a plain search
+/// domain: resolved routes on search domains too, so `.ray` still comes to us,
+/// and a bare name still gets `.ray` appended. When it is not, `~ray` is sent
+/// routing-only. Tailscale makes the same choice for a domain that is both. The
+/// cost is that a link with no routing-only domain is one resolved would make a
+/// default DNS route on its own, which is why `apply` also turns DefaultRoute
+/// off explicitly.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn resolved_link_domains(search: &[SearchDomain]) -> Vec<(String, bool)> {
+    let root = SearchDomain::root();
+    let mut domains = Vec::with_capacity(search.len() + 1);
+    if !search.contains(&root) {
+        domains.push((root.to_string(), true));
+    }
+    // A selected exit takes every lookup, so the link becomes the default DNS route.
+    if crate::exit_node::full_tunnel_active() {
+        domains.push((".".to_owned(), true));
+    }
+    for d in search {
+        let entry = (d.to_string(), false);
+        if !domains.contains(&entry) {
+            domains.push(entry);
+        }
+    }
+    domains
+}
+
+/// [`resolved_link_domains`] spelled the way `resolvectl domain` takes it, a
+/// `~` prefix marking a routing-only domain.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn resolvectl_domain_args(search: &[SearchDomain]) -> Vec<String> {
+    resolved_link_domains(search)
+        .into_iter()
+        .map(|(d, route_only)| if route_only { format!("~{d}") } else { d })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 pub(super) async fn set_search_domains_linux(
     rayfish_domains: &[SearchDomain],
@@ -15,25 +58,12 @@ pub(super) async fn set_search_domains_linux(
     if let Some(idx) = ifindex
         && let Ok(conn) = Connection::system().await
     {
-        // `.ray` is the only routing domain (~ray); bare network names are not
+        // `.ray` is the only routing domain; bare network names are not
         // registered, so a network named `dev` never captures `*.dev`.
-        let mut domains: Vec<(String, bool)> = vec![(DNS_DOMAIN.to_string(), true)];
-        if crate::exit_node::full_tunnel_active() {
-            domains.push((".".to_owned(), true));
-        }
-        for d in rayfish_domains {
-            domains.push((d.to_string(), false));
-        }
-        let reply = conn
-            .call_method(
-                Some("org.freedesktop.resolve1"),
-                "/org/freedesktop/resolve1",
-                Some("org.freedesktop.resolve1.Manager"),
-                "SetLinkDomains",
-                &(idx as i32, &domains),
-            )
-            .await;
+        let domains = resolved_link_domains(rayfish_domains);
+        let reply = resolved_call(&conn, "SetLinkDomains", &(idx as i32, &domains)).await;
         if reply.is_ok() {
+            resolved_best_effort(&conn, "FlushCaches", &()).await;
             return Ok(());
         }
     }
@@ -46,18 +76,180 @@ pub(super) async fn set_search_domains_linux(
         .is_ok_and(|o| o.status.success())
     {
         let mut args = vec!["domain".to_string(), tun_name.to_string()];
-        args.push(format!("~{DNS_DOMAIN}"));
-        if crate::exit_node::full_tunnel_active() {
-            args.push("~.".to_owned());
-        }
-        args.extend(rayfish_domains.iter().map(SearchDomain::to_string));
+        args.extend(resolvectl_domain_args(rayfish_domains));
         let status = Command::new("resolvectl")
             .args(&args)
             .status()
             .context("resolvectl domain")?;
         anyhow::ensure!(status.success(), "resolvectl domain failed");
+        resolvectl_best_effort(&["flush-caches"]).await;
     }
     Ok(())
+}
+
+/// Drop everything resolved holds for our link: servers, domains, and the
+/// per-link settings `apply` made. Used on the way down, where an empty search
+/// list has to mean no `.ray` routing either, which `SetLinkDomains` with our
+/// list cannot say (it always carries `.ray`).
+#[cfg(target_os = "linux")]
+pub(super) async fn revert_resolved_link(tun_name: &str) {
+    let Some(idx) = linux::get_ifindex(tun_name) else {
+        return; // the link is gone, and resolved forgot it with it
+    };
+    if let Ok(conn) = Connection::system().await
+        && resolved_call(&conn, "RevertLink", &(idx as i32,))
+            .await
+            .is_ok()
+    {
+        return;
+    }
+    resolvectl_best_effort(&["revert", tun_name]).await;
+}
+
+#[cfg(target_os = "linux")]
+const RESOLVED_BUS: &str = "org.freedesktop.resolve1";
+#[cfg(target_os = "linux")]
+const RESOLVED_PATH: &str = "/org/freedesktop/resolve1";
+#[cfg(target_os = "linux")]
+const RESOLVED_MANAGER: &str = "org.freedesktop.resolve1.Manager";
+
+/// Call one of resolved's manager methods.
+#[cfg(target_os = "linux")]
+async fn resolved_call<B>(conn: &Connection, method: &str, body: &B) -> zbus::Result<()>
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
+    conn.call_method(
+        Some(RESOLVED_BUS),
+        RESOLVED_PATH,
+        Some(RESOLVED_MANAGER),
+        method,
+        body,
+    )
+    .await
+    .map(drop)
+}
+
+/// Call a resolved manager method whose failure should not fail the apply.
+///
+/// These are the per-link settings that make the link behave, not the ones
+/// that make `.ray` reach us, so a resolved that refuses one still resolves our
+/// names. An old systemd that lacks the method entirely (DefaultRoute arrived
+/// in 240) is expected and only logged at debug.
+#[cfg(target_os = "linux")]
+async fn resolved_best_effort<B>(conn: &Connection, method: &str, body: &B)
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
+    match resolved_call(conn, method, body).await {
+        Ok(_) => {}
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            tracing::debug!("systemd-resolved has no {method}; skipping it");
+        }
+        Err(e) => tracing::warn!("{method} failed: {e}"),
+    }
+}
+
+/// The `resolvectl` counterpart of [`resolved_best_effort`].
+#[cfg(target_os = "linux")]
+async fn resolvectl_best_effort(args: &[&str]) {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    match Command::new("resolvectl")
+        .args(args)
+        .stdout(Stdio::null())
+        .status()
+        .await
+    {
+        Ok(s) if s.success() => {}
+        r => tracing::warn!("resolvectl {} failed: {r:?}", args.join(" ")),
+    }
+}
+
+/// The per-link settings both resolved backends apply after the servers and
+/// domains, as `(D-Bus method, resolvectl verb, value)`.
+///
+/// DefaultRoute off keeps the link from becoming a default DNS route: with
+/// `ray` sent as a plain search domain (see [`resolved_link_domains`]) the link
+/// has no routing-only domain, and resolved would otherwise send every name on
+/// the host to us. DNSSEC, LLMNR and mDNS are off because the magic resolver
+/// signs nothing and has no neighbours to multicast to; a global `DNSSEC=yes`
+/// would fail every `.ray` answer. DNS over TLS is off because the magic
+/// resolver answers plain UDP only.
+#[cfg(target_os = "linux")]
+const RESOLVED_LINK_SETTINGS: [LinkSetting; 5] = [
+    LinkSetting {
+        method: "SetLinkDefaultRoute",
+        verb: "default-route",
+        value: LinkValue::Bool(false),
+    },
+    LinkSetting {
+        method: "SetLinkDNSOverTLS",
+        verb: "dnsovertls",
+        value: LinkValue::Str("no"),
+    },
+    LinkSetting {
+        method: "SetLinkDNSSEC",
+        verb: "dnssec",
+        value: LinkValue::Str("no"),
+    },
+    LinkSetting {
+        method: "SetLinkLLMNR",
+        verb: "llmnr",
+        value: LinkValue::Str("no"),
+    },
+    LinkSetting {
+        method: "SetLinkMulticastDNS",
+        verb: "mdns",
+        value: LinkValue::Str("no"),
+    },
+];
+
+#[cfg(target_os = "linux")]
+struct LinkSetting {
+    method: &'static str,
+    verb: &'static str,
+    value: LinkValue,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum LinkValue {
+    Bool(bool),
+    Str(&'static str),
+}
+
+#[cfg(target_os = "linux")]
+impl LinkValue {
+    fn cli(self) -> &'static str {
+        match self {
+            Self::Bool(true) => "true",
+            Self::Bool(false) => "false",
+            Self::Str(s) => s,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn apply_link_settings_dbus(conn: &Connection, ifindex: i32) {
+    for s in &RESOLVED_LINK_SETTINGS {
+        match s.value {
+            LinkValue::Bool(b) => resolved_best_effort(conn, s.method, &(ifindex, b)).await,
+            LinkValue::Str(v) => resolved_best_effort(conn, s.method, &(ifindex, v)).await,
+        }
+    }
+    resolved_best_effort(conn, "FlushCaches", &()).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn apply_link_settings_cli(tun: &str) {
+    for s in &RESOLVED_LINK_SETTINGS {
+        resolvectl_best_effort(&[s.verb, tun, s.value.cli()]).await;
+    }
+    resolvectl_best_effort(&["flush-caches"]).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,24 +282,32 @@ pub(super) const RESOLVED_STUB_IPS: [Ipv4Addr; 2] =
 /// ship it enabled while leaving a static `/etc/resolv.conf` full of upstream
 /// servers (`resolvectl status` calls this `resolv.conf mode: foreign`). There
 /// glibc talks to the upstreams directly and every split-DNS domain we register
-/// is dead on arrival. Two ways in, either is enough:
-///   - `/etc/resolv.conf` names a stub listener, so the normal DNS path lands on
-///     resolved;
-///   - `/etc/nsswitch.conf` lists the `resolve` module, so glibc calls resolved
-///     over D-Bus before it ever reads resolv.conf.
+/// is dead on arrival. So the decision follows who owns `/etc/resolv.conf`, as
+/// Tailscale's does: it names a stub listener, or links to resolved's stub file.
+/// A link to resolved's uplink file (`/run/systemd/resolve/resolv.conf`) does
+/// not count, since that file lists the upstreams themselves.
+///
+/// `nsswitch.conf` listing `resolve` is deliberately not enough. On such a host
+/// with a foreign resolv.conf, resolved reads that file for its own servers, so
+/// writing it directly reaches glibc through resolved as well as every program
+/// that reads the file itself; registering on the link would reach only glibc.
+///
+/// And it has to be running: a stub address with no resolved behind it is a
+/// leftover, and choosing resolved there fails every apply (the resolvconf shim
+/// included) instead of falling through to writing the file.
 #[cfg(target_os = "linux")]
 pub(super) async fn resolved_is_in_resolution_path() -> bool {
-    let resolv = tokio::fs::read_to_string("/etc/resolv.conf")
-        .await
-        .unwrap_or_default();
-    if resolv_conf_points_at_resolved(&resolv) {
-        return true;
-    }
+    let path = Path::new("/etc/resolv.conf");
+    let resolv = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let link = tokio::fs::read_link(path).await.ok();
+    resolv_conf_owned_by_resolved(&resolv, link.as_deref()) && resolved_reachable().await
+}
 
-    let nsswitch = tokio::fs::read_to_string("/etc/nsswitch.conf")
-        .await
-        .unwrap_or_default();
-    nsswitch_uses_resolve(&nsswitch)
+/// The pure half of [`resolved_is_in_resolution_path`]: `link` is the target of
+/// `/etc/resolv.conf` when it is a symlink.
+#[cfg(target_os = "linux")]
+pub(super) fn resolv_conf_owned_by_resolved(contents: &str, link: Option<&Path>) -> bool {
+    resolv_conf_points_at_resolved(contents) || link.is_some_and(links_to_resolved_stub)
 }
 
 #[cfg(target_os = "linux")]
@@ -117,13 +317,29 @@ pub(super) fn resolv_conf_points_at_resolved(contents: &str) -> bool {
         .any(|ip| RESOLVED_STUB_IPS.contains(ip))
 }
 
+/// `/run/systemd/resolve/stub-resolv.conf`, absolute or relative (the usual
+/// `../run/...`). resolved owns the directory and only the stub file routes
+/// lookups through it.
 #[cfg(target_os = "linux")]
-pub(super) fn nsswitch_uses_resolve(contents: &str) -> bool {
-    contents
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter_map(|l| l.strip_prefix("hosts:"))
-        .any(|l| l.split_whitespace().any(|m| m == "resolve"))
+fn links_to_resolved_stub(target: &Path) -> bool {
+    target.ends_with("run/systemd/resolve/stub-resolv.conf")
+}
+
+/// resolved answers on the system bus.
+#[cfg(target_os = "linux")]
+async fn resolved_reachable() -> bool {
+    let Ok(conn) = Connection::system().await else {
+        return false;
+    };
+    conn.call_method(
+        Some(RESOLVED_BUS),
+        RESOLVED_PATH,
+        Some("org.freedesktop.DBus.Peer"),
+        "Ping",
+        &(),
+    )
+    .await
+    .is_ok()
 }
 
 /// Whether the `resolvconf` binary is systemd's compatibility symlink to
@@ -145,21 +361,9 @@ pub(super) struct SystemdResolvedDBus {
 #[cfg(target_os = "linux")]
 pub(super) async fn try_systemd_resolved_dbus(tun_name: &str) -> Option<SystemdResolvedDBus> {
     let ifindex = linux::get_ifindex(tun_name)? as i32;
-    let conn = Connection::system().await.ok()?;
-    // Check that resolved is available on the bus
-    let reply = conn
-        .call_method(
-            Some("org.freedesktop.resolve1"),
-            "/org/freedesktop/resolve1",
-            Some("org.freedesktop.DBus.Peer"),
-            "Ping",
-            &(),
-        )
-        .await;
-    if reply.is_err() {
-        return None;
-    }
-    Some(SystemdResolvedDBus { ifindex })
+    resolved_reachable()
+        .await
+        .then_some(SystemdResolvedDBus { ifindex })
 }
 
 #[cfg(target_os = "linux")]
@@ -177,30 +381,20 @@ impl DnsConfigurator for SystemdResolvedDBus {
             IpAddr::V4(v4) => vec![(2i32, v4.octets().to_vec())],
             IpAddr::V6(v6) => vec![(10i32, v6.octets().to_vec())],
         };
-        conn.call_method(
-            Some("org.freedesktop.resolve1"),
-            "/org/freedesktop/resolve1",
-            Some("org.freedesktop.resolve1.Manager"),
-            "SetLinkDNS",
-            &(self.ifindex, &dns_addrs),
-        )
-        .await
-        .context("SetLinkDNS failed")?;
+        resolved_call(&conn, "SetLinkDNS", &(self.ifindex, &dns_addrs))
+            .await
+            .context("SetLinkDNS failed")?;
 
         // SetLinkDomains(ifindex, [(domain, routing_only)])
         let mut domains: Vec<(&str, bool)> = vec![(DNS_DOMAIN, true)];
         if crate::exit_node::full_tunnel_active() {
             domains.push((".", true));
         }
-        conn.call_method(
-            Some("org.freedesktop.resolve1"),
-            "/org/freedesktop/resolve1",
-            Some("org.freedesktop.resolve1.Manager"),
-            "SetLinkDomains",
-            &(self.ifindex, &domains),
-        )
-        .await
-        .context("SetLinkDomains failed")?;
+        resolved_call(&conn, "SetLinkDomains", &(self.ifindex, &domains))
+            .await
+            .context("SetLinkDomains failed")?;
+
+        apply_link_settings_dbus(&conn, self.ifindex).await;
 
         tracing::info!(
             ifindex = self.ifindex,
@@ -211,15 +405,7 @@ impl DnsConfigurator for SystemdResolvedDBus {
 
     async fn revert(&self) -> Result<()> {
         if let Ok(conn) = Connection::system().await {
-            let _ = conn
-                .call_method(
-                    Some("org.freedesktop.resolve1"),
-                    "/org/freedesktop/resolve1",
-                    Some("org.freedesktop.resolve1.Manager"),
-                    "RevertLink",
-                    &(self.ifindex,),
-                )
-                .await;
+            let _ = resolved_call(&conn, "RevertLink", &(self.ifindex,)).await;
         }
         tracing::info!("reverted systemd-resolved D-Bus configuration");
         Ok(())
@@ -275,6 +461,8 @@ impl DnsConfigurator for SystemdResolvedCli {
             .context("resolvectl domain")?;
         anyhow::ensure!(status.success(), "resolvectl domain failed");
 
+        apply_link_settings_cli(&self.tun_iface).await;
+
         tracing::info!(
             "configured systemd-resolved (CLI) for .{DNS_DOMAIN} via {}",
             self.tun_iface
@@ -302,10 +490,39 @@ impl DnsConfigurator for SystemdResolvedCli {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
+#[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub(super) enum ResolvconfVariant {
     Debian,
     Openresolv,
 }
+
+#[cfg(target_os = "linux")]
+impl ResolvconfVariant {
+    /// Tell the two apart by what `--version` prints. Anything that does not
+    /// name openresolv, a failed run included, reads as Debian.
+    fn from_version_output(stdout: &[u8], stderr: &[u8]) -> Self {
+        let says_openresolv = |out: &[u8]| String::from_utf8_lossy(out).contains("openresolv");
+        if says_openresolv(stdout) || says_openresolv(stderr) {
+            Self::Openresolv
+        } else {
+            Self::Debian
+        }
+    }
+
+    /// The record our stanza is registered under. Debian's resolvconf wants
+    /// `<interface>.<program>`; openresolv takes the bare interface.
+    fn record(&self) -> &'static str {
+        match self {
+            Self::Debian => "tun-rayfish.inet",
+            Self::Openresolv => "tun-rayfish",
+        }
+    }
+}
+
+/// The places a real `resolvconf` is installed.
+#[cfg(target_os = "linux")]
+const RESOLVCONF_PATHS: [&str; 2] = ["/sbin/resolvconf", "/usr/sbin/resolvconf"];
 
 #[cfg(target_os = "linux")]
 pub(super) struct Resolvconf {
@@ -317,20 +534,11 @@ pub(super) struct Resolvconf {
 #[cfg(target_os = "linux")]
 pub(super) fn try_resolvconf() -> Option<Resolvconf> {
     use std::process::Command;
-    let paths = ["/sbin/resolvconf", "/usr/sbin/resolvconf"];
-    if !paths.iter().any(|p| Path::new(p).exists()) {
+    if !RESOLVCONF_PATHS.iter().any(|p| Path::new(p).exists()) {
         return None;
     }
     let variant = match Command::new("resolvconf").arg("--version").output() {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stdout.contains("openresolv") || stderr.contains("openresolv") {
-                ResolvconfVariant::Openresolv
-            } else {
-                ResolvconfVariant::Debian
-            }
-        }
+        Ok(output) => ResolvconfVariant::from_version_output(&output.stdout, &output.stderr),
         Err(_) => ResolvconfVariant::Debian,
     };
     Some(Resolvconf {
@@ -342,10 +550,7 @@ pub(super) fn try_resolvconf() -> Option<Resolvconf> {
 #[cfg(target_os = "linux")]
 impl Resolvconf {
     fn iface_name(&self) -> &str {
-        match self.variant {
-            ResolvconfVariant::Debian => "tun-rayfish.inet",
-            ResolvconfVariant::Openresolv => "tun-rayfish",
-        }
+        self.variant.record()
     }
 
     /// (Re-)register our stanza with the current search domains. resolvconf
@@ -417,12 +622,8 @@ impl Resolvconf {
 impl DnsConfigurator for Resolvconf {
     async fn apply(&self) -> Result<()> {
         self.register().await?;
-        let variant_name = match self.variant {
-            ResolvconfVariant::Debian => "debian",
-            ResolvconfVariant::Openresolv => "openresolv",
-        };
         tracing::info!(
-            variant = variant_name,
+            variant = <&str>::from(&self.variant),
             "configured resolvconf for .{DNS_DOMAIN}"
         );
         Ok(())
@@ -458,27 +659,44 @@ impl DnsConfigurator for Resolvconf {
 
 // Pure helpers, NOT cfg-gated so their unit tests run on macOS (the dev host).
 
-/// Extract IPv4 `nameserver` entries from resolv.conf contents, excluding our
-/// own magic IP (so we never capture ourselves as an upstream → no forward loop).
+/// Extract the `nameserver` entries from resolv.conf contents, either family,
+/// excluding our own magic addresses (so we never capture ourselves as an
+/// upstream, which would be a forward loop).
 ///
 /// `resolv.conf(5)` separates the keyword from its value by any run of spaces or
 /// tabs, and plenty of generators emit a tab. Splitting on whitespace rather
 /// than matching `"nameserver "` matters more than it looks: missing an entry
 /// here doesn't degrade anything, it silently leaves the forwarder with nothing
-/// to forward to.
+/// to forward to. A scoped link-local entry (`fe80::1%eth0`) does not parse and
+/// is skipped: the forwarder cannot name the interface.
 // This and the resolv.conf helpers below serve the Linux direct-write fallback
 // and their own tests, and nothing else: no other platform writes resolv.conf.
 #[cfg(any(target_os = "linux", test))]
-pub(super) fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
+pub(super) fn parse_resolv_nameserver_ips(contents: &str) -> Vec<IpAddr> {
     contents
         .lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
             (f.next()? == "nameserver").then(|| f.next())?
         })
-        // IPv6 nameservers parse as None and are skipped: the forwarder is v4-only.
-        .filter_map(|s| s.parse::<Ipv4Addr>().ok())
-        .filter(|ip| *ip != crate::dns::MAGIC_DNS_V4)
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .filter(|ip| {
+            *ip != IpAddr::V4(crate::dns::MAGIC_DNS_V4)
+                && *ip != IpAddr::V6(crate::dns::MAGIC_DNS_V6)
+        })
+        .collect()
+}
+
+/// The IPv4 half of [`parse_resolv_nameserver_ips`]: what the overlay checks
+/// and the daemon's own lookups read.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
+    parse_resolv_nameserver_ips(contents)
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
         .collect()
 }
 
@@ -536,7 +754,7 @@ pub(super) const MAX_NAMESERVERS: usize = 3;
 /// on the box takes. All of them are written, not just the first, because the
 /// second and third are what the stub tries next.
 #[cfg(any(target_os = "linux", test))]
-pub(super) fn render_direct_resolv_conf(search: &[SearchDomain], fallbacks: &[Ipv4Addr]) -> String {
+pub(super) fn render_direct_resolv_conf(search: &[SearchDomain], fallbacks: &[IpAddr]) -> String {
     render_direct_resolv_conf_with(resolver_addr(), search, fallbacks)
 }
 
@@ -546,7 +764,7 @@ pub(super) fn render_direct_resolv_conf(search: &[SearchDomain], fallbacks: &[Ip
 pub(super) fn render_direct_resolv_conf_with(
     resolver: IpAddr,
     search: &[SearchDomain],
-    fallbacks: &[Ipv4Addr],
+    fallbacks: &[IpAddr],
 ) -> String {
     let mut s = String::from(HEADER_COMMENT);
     s.push_str(&format!("nameserver {resolver}\n"));
@@ -621,7 +839,7 @@ pub(super) fn reassert_decision(current: &str, merged_with: Option<Ipv4Addr>) ->
 #[cfg(target_os = "linux")]
 pub(super) async fn reassert_resolv_conf(
     search: &ArcSwap<Vec<SearchDomain>>,
-    fallbacks: &[Ipv4Addr],
+    fallbacks: &[IpAddr],
     merged_with: Option<Ipv4Addr>,
 ) -> Result<Reassert> {
     let path = Path::new("/etc/resolv.conf");
@@ -629,9 +847,11 @@ pub(super) async fn reassert_resolv_conf(
     let decision = reassert_decision(&current, merged_with);
     if decision == Reassert::Rewrite {
         tracing::warn!("/etc/resolv.conf was overwritten; re-asserting rayfish DNS");
-        tokio::fs::write(path, render_direct_resolv_conf(&search.load(), fallbacks))
-            .await
-            .context("re-asserting /etc/resolv.conf")?;
+        write_resolv_file(
+            path,
+            render_direct_resolv_conf(&search.load(), fallbacks).as_bytes(),
+        )
+        .context("re-asserting /etc/resolv.conf")?;
     }
     Ok(decision)
 }
@@ -652,7 +872,7 @@ pub(super) async fn reassert_resolv_conf(
 #[cfg(target_os = "linux")]
 pub async fn run_resolv_reassert(
     search: SearchDomains,
-    fallbacks: Vec<Ipv4Addr>,
+    fallbacks: Vec<IpAddr>,
     token: tokio_util::sync::CancellationToken,
 ) -> Option<Recapture> {
     use futures::StreamExt;
@@ -661,10 +881,10 @@ pub async fn run_resolv_reassert(
     // An overlay address among the servers we render is exactly "we are sharing
     // the file with that VPN". Derived rather than stored: what matters is which
     // address the host's DNS now depends on, not which VPN wrote the file.
-    let merged_with = fallbacks
-        .iter()
-        .copied()
-        .find(|ip| crate::membership::is_cgnat_range(*ip));
+    let merged_with = fallbacks.iter().find_map(|ip| match ip {
+        IpAddr::V4(v4) if crate::membership::is_cgnat_range(*v4) => Some(*v4),
+        _ => None,
+    });
     // Consecutive liveness failures for `merged_with`. Two, so one lost packet
     // or a restart does not hand the file back.
     let mut shared_misses = 0u32;
@@ -677,7 +897,9 @@ pub async fn run_resolv_reassert(
     // Watch the parent directory, not the file: NetworkManager/resolvconf
     // replace resolv.conf via atomic rename, which a file-level watch stops
     // seeing after the first swap (the watched inode is gone). A directory
-    // watch catches the create/rename of a fresh `resolv.conf`.
+    // watch catches the create/rename of a fresh `resolv.conf`. It also sees
+    // every change to the file we hold, because that is a regular file in /etc
+    // even on a host where it was a symlink into /run (see `resolv_file`).
     let stream = (|| {
         use inotify::{Inotify, WatchMask};
         let inotify = Inotify::init()?;
@@ -822,7 +1044,7 @@ pub(super) const REASSERT_TICK: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 pub(super) async fn pass(
     search: &ArcSwap<Vec<SearchDomain>>,
-    fallbacks: &[Ipv4Addr],
+    fallbacks: &[IpAddr],
     merged_with: Option<Ipv4Addr>,
 ) -> Option<Recapture> {
     match reassert_resolv_conf(search, fallbacks, merged_with).await {
@@ -868,21 +1090,37 @@ pub(super) fn nm_present() -> bool {
 }
 
 /// Ask NetworkManager to reload its configuration so a conf.d change takes effect.
+///
+/// Through NetworkManager's own `Reload` method rather than the service manager:
+/// this is NM's configuration, not a service we manage, and the D-Bus call works
+/// the same under every init. `nmcli` is the fallback for an NM too old to have
+/// the method (it arrived in 1.22).
 #[cfg(target_os = "linux")]
 pub(super) async fn nm_reload() {
     use tokio::process::Command;
-    if Command::new("nmcli")
-        .args(["general", "reload"])
-        .status()
-        .await
-        .is_ok_and(|s| s.success())
+
+    if let Ok(conn) = Connection::system().await
+        && conn
+            .call_method(
+                Some("org.freedesktop.NetworkManager"),
+                "/org/freedesktop/NetworkManager",
+                Some("org.freedesktop.NetworkManager"),
+                "Reload",
+                &(0u32,),
+            )
+            .await
+            .is_ok()
     {
         return;
     }
-    let _ = Command::new("systemctl")
-        .args(["reload", "NetworkManager"])
+    let reloaded = Command::new("nmcli")
+        .args(["general", "reload"])
         .status()
-        .await;
+        .await
+        .is_ok_and(|s| s.success());
+    if !reloaded {
+        tracing::warn!("could not ask NetworkManager to reload its DNS configuration");
+    }
 }
 
 /// Install the `dns=none` drop-in and reload NM (no-op if NM isn't present, or
@@ -953,7 +1191,7 @@ pub(super) fn backup_path(original: &Path) -> PathBuf {
 #[cfg(target_os = "linux")]
 pub(super) async fn backup_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
-    if backup.exists() {
+    if exists_no_follow(&backup) {
         return Ok(());
     }
     let Ok(current) = tokio::fs::read_to_string(path).await else {
@@ -963,12 +1201,9 @@ pub(super) async fn backup_file(path: &Path) -> Result<()> {
         tracing::info!("not backing up /etc/resolv.conf: it is one we wrote");
         return Ok(());
     }
-    // `copy`, not a write of `current`: it carries the original's mode across,
-    // and the restore copies it straight back.
-    tokio::fs::copy(path, &backup)
-        .await
-        .map(|_| ())
-        .with_context(|| format!("backing up {}", path.display()))
+    // Not a write of `current`: this carries the original's mode across, and a
+    // symlink is saved as the link itself (see `resolv_file`).
+    backup_resolv_file(path, &backup).with_context(|| format!("backing up {}", path.display()))
 }
 
 #[cfg(target_os = "linux")]
@@ -984,11 +1219,10 @@ pub(super) async fn restore_file(path: &Path) -> Result<()> {
     {
         let stripped = strip_our_resolv_entries(&current);
         if stripped != current {
-            tokio::fs::write(path, &stripped)
-                .await
+            write_resolv_file(path, stripped.as_bytes())
                 .with_context(|| format!("removing our entries from {}", path.display()))?;
         }
-        if backup.exists() {
+        if exists_no_follow(&backup) {
             tokio::fs::remove_file(&backup).await?;
         }
         tracing::info!(
@@ -997,11 +1231,9 @@ pub(super) async fn restore_file(path: &Path) -> Result<()> {
         );
         return Ok(());
     }
-    if backup.exists() {
-        tokio::fs::copy(&backup, path)
-            .await
+    if exists_no_follow(&backup) {
+        restore_resolv_backup(&backup, path)
             .with_context(|| format!("restoring {}", path.display()))?;
-        tokio::fs::remove_file(&backup).await?;
         return Ok(());
     }
     // No backup (it was lost, or apply() never made one). Deleting the file was
@@ -1022,8 +1254,7 @@ pub(super) async fn restore_file(path: &Path) -> Result<()> {
         );
         return Ok(());
     }
-    tokio::fs::write(path, strip_our_resolv_entries(&current))
-        .await
+    write_resolv_file(path, strip_our_resolv_entries(&current).as_bytes())
         .with_context(|| format!("restoring {}", path.display()))?;
     tracing::warn!(
         path = %path.display(),
@@ -1081,10 +1312,11 @@ pub(super) fn strip_our_resolv_entries(contents: &str) -> String {
 }
 
 /// Synchronous emergency restore of the direct-mode DNS artifacts, safe to call
-/// from the panic hook just before `abort()`. Undoes exactly what
-/// [`DirectResolvConf`] installs: copies the backed-up `/etc/resolv.conf` back
-/// (so it stops pointing at our now-dead resolver) and removes the `dns=none`
-/// NetworkManager drop-in (so NM resumes owning DNS). No async, best-effort.
+/// from the panic hook just before `abort()`, and from `ray daemon --cleanup`
+/// after the daemon has exited. Undoes exactly what [`DirectResolvConf`]
+/// installs: puts the backed-up `/etc/resolv.conf` back (so it stops pointing at
+/// our now-dead resolver) and removes the `dns=none` NetworkManager drop-in,
+/// reloading NM so it resumes owning DNS. No async, best-effort.
 ///
 /// This is the safety net the user asked for: with NM quieting, a panic that
 /// left `dns=none` in place **and** resolv.conf pointing at 100.100.100.53 would
@@ -1095,27 +1327,111 @@ pub(super) fn strip_our_resolv_entries(contents: &str) -> String {
 pub fn emergency_restore_resolv_conf() {
     let path = Path::new("/etc/resolv.conf");
     let backup = backup_path(path);
-    // Same rule as [`restore_file`], and it matters more here: the file we would
-    // copy over is one we merged into another VPN's, and the process is about to
-    // abort, so nothing will be along to notice we took their DNS down with
-    // ours. Subtract our lines instead and leave the backup alone.
-    match std::fs::read_to_string(path) {
-        Ok(current) if other_overlay_resolver(&current).is_some() => {
-            let _ = std::fs::write(path, strip_our_resolv_entries(&current));
+    // Same rule as the startup path in `restore_stale_backups`. It matters more
+    // here: after a hard kill NetworkManager may have rewritten the file, and a
+    // file we merged into another VPN's must lose only our lines, since nothing
+    // will be along afterwards to notice we took their DNS down with ours.
+    let current = std::fs::read_to_string(path).ok();
+    match stale_backup_action(current.as_deref()) {
+        StaleBackup::StripOurs(_) => {
+            let current = current.unwrap_or_default();
+            let stripped = strip_our_resolv_entries(&current);
+            if stripped != current {
+                let _ = write_resolv_file(path, stripped.as_bytes());
+            }
             let _ = std::fs::remove_file(&backup);
         }
-        _ if backup.exists() => {
-            let _ = std::fs::copy(&backup, path);
+        StaleBackup::Restore if exists_no_follow(&backup) => {
+            let _ = restore_resolv_backup(&backup, path);
+        }
+        StaleBackup::Discard if exists_no_follow(&backup) => {
             let _ = std::fs::remove_file(&backup);
         }
-        _ => {}
+        StaleBackup::Restore | StaleBackup::Discard => {}
     }
     // Remove our NM drop-in, but only if it carries our marker (never an
-    // operator's own NM config).
+    // operator's own NM config). NM keeps `dns=none` until it rereads conf.d.
     if let Ok(c) = std::fs::read_to_string(NM_DROPIN)
         && resolv_conf_is_ours(&c)
+        && std::fs::remove_file(NM_DROPIN).is_ok()
     {
-        let _ = std::fs::remove_file(NM_DROPIN);
+        nm_reload_blocking();
+    }
+}
+
+/// Withdraw our resolvconf stanza after a daemon that died without its own
+/// revert, for the panic hook and `ray daemon --cleanup`. Without it the
+/// merged `/etc/resolv.conf` keeps naming a resolver that no longer answers.
+/// Skipped when there is no real resolvconf (systemd's `resolvectl` shim
+/// forgets the link with the interface). Deleting a record that was never
+/// added is a no-op for both variants, so this is safe when nothing was set
+/// up. Bounded and warn-only.
+#[cfg(target_os = "linux")]
+pub fn emergency_withdraw_resolvconf() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    if !RESOLVCONF_PATHS.iter().any(|p| Path::new(p).exists()) || resolvconf_is_resolved_shim() {
+        return;
+    }
+    let variant = Command::new("resolvconf")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            crate::child::wait_bounded(&mut child, TIMEOUT).ok()?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_end(&mut stdout);
+            }
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_end(&mut stderr);
+            }
+            Some(ResolvconfVariant::from_version_output(&stdout, &stderr))
+        })
+        .unwrap_or(ResolvconfVariant::Debian);
+    // openresolv reports a record it does not have as an error unless told
+    // not to; Debian's has no such flag and ignores a missing one anyway.
+    let args: &[&str] = match variant {
+        ResolvconfVariant::Openresolv => &["-f", "-d", variant.record()],
+        ResolvconfVariant::Debian => &["-d", variant.record()],
+    };
+    let result = Command::new("resolvconf")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut child| crate::child::wait_bounded(&mut child, TIMEOUT));
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(%status, "resolvconf -d failed; our stanza may remain"),
+        Err(error) => tracing::warn!(%error, "could not run resolvconf -d; our stanza may remain"),
+    }
+}
+
+/// [`nm_reload`] for a caller with no async runtime to use, such as the panic
+/// hook, or a synchronous one such as the startup sweep. Only the `nmcli`
+/// path, since the D-Bus client here is async, and bounded so a hung NM cannot
+/// stall the abort.
+#[cfg(target_os = "linux")]
+pub(super) fn nm_reload_blocking() {
+    use std::process::{Command, Stdio};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    if let Ok(mut child) = Command::new("nmcli")
+        .args(["general", "reload"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        let _ = crate::child::wait_bounded(&mut child, TIMEOUT);
     }
 }
 
@@ -1124,7 +1440,10 @@ pub(super) struct DirectResolvConf {
     /// Swapped rather than owned so [`Self::apply`] can narrow it: quieting
     /// NetworkManager can kill a server that answered at capture time, and both
     /// the file we render and the forwarder we seed read this afterwards.
-    captured_upstreams: Arc<ArcSwap<Vec<Ipv4Addr>>>,
+    ///
+    /// Both families, IPv4 first and each in the file's order: this is also
+    /// the list rendered after ours (see [`DnsConfigurator::fallback_upstreams`]).
+    captured_upstreams: Arc<ArcSwap<Vec<IpAddr>>>,
     /// The search domains the file already had. Kept separately from the live
     /// list so a later join/leave re-merges against the host's own domains
     /// instead of accumulating ours on top of the previous render.
@@ -1212,6 +1531,30 @@ pub(super) fn first_nameserver(contents: &str) -> Option<IpAddr> {
     })
 }
 
+/// The search domains a resolv.conf names, from its `search` and `domain`
+/// lines, minus our own.
+///
+/// Split on whitespace for the same reason as [`parse_resolv_nameservers`]:
+/// `search\tlan` is as valid as `search lan`.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn parse_resolv_search(contents: &str) -> Vec<SearchDomain> {
+    contents
+        .lines()
+        .flat_map(|l| {
+            let mut f = l.split_whitespace();
+            let keyword = f.next();
+            matches!(keyword, Some("search" | "domain"))
+                .then_some(f)
+                .into_iter()
+                .flatten()
+        })
+        .map(SearchDomain::from_host)
+        // Ours are re-derived from the joined networks on every refresh;
+        // keeping the ones this file already names would outlive a leave.
+        .filter(|d| !d.is_ours())
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 impl DirectResolvConf {
     /// Read the current resolv.conf to capture upstreams + existing search
@@ -1228,23 +1571,13 @@ impl DirectResolvConf {
         let contents = tokio::fs::read_to_string("/etc/resolv.conf")
             .await
             .unwrap_or_default();
-        let search: Vec<SearchDomain> = contents
-            .lines()
-            .filter_map(|l| {
-                l.trim()
-                    .strip_prefix("search ")
-                    .or_else(|| l.trim().strip_prefix("domain "))
-            })
-            .flat_map(|s| s.split_whitespace().map(SearchDomain::from_host))
-            // Ours are re-derived from the joined networks on every refresh;
-            // keeping the ones this file already names would outlive a leave.
-            .filter(|d| !d.is_ours())
-            .collect();
+        let search = parse_resolv_search(&contents);
 
-        let captured = parse_resolv_nameservers(&contents);
+        let mut captured = parse_resolv_nameserver_ips(&contents);
+        captured.sort_by_key(IpAddr::is_ipv6);
         let live = crate::dns::resolver::live_upstreams(&captured).await;
         if live.len() != captured.len() {
-            let dead: Vec<_> = captured.iter().filter(|ip| !live.contains(ip)).collect();
+            let dead: Vec<&IpAddr> = captured.iter().filter(|ip| !live.contains(ip)).collect();
             tracing::warn!(
                 ?dead,
                 "resolv.conf names DNS servers that do not answer; ignoring them"
@@ -1261,10 +1594,10 @@ impl DirectResolvConf {
         }
     }
 
-    /// The upstream written into resolv.conf as the second nameserver, so the
-    /// host keeps resolving if our resolver stops answering.
-    fn fallbacks(&self) -> Vec<Ipv4Addr> {
-        self.captured_upstreams.load().as_ref().clone()
+    /// Whether `upstreams` or the operator's own leave the forwarder anywhere
+    /// to send queries.
+    fn can_forward(&self, upstreams: &[IpAddr]) -> bool {
+        !upstreams.is_empty() || self.operator_upstreams
     }
 }
 
@@ -1353,7 +1686,7 @@ pub(super) enum NmQuietOutcome {
     /// still give the forwarder somewhere to go. Not a black hole, so the
     /// takeover stands; the dead entries are named because they stay in the
     /// file we are about to write and cost a timeout each.
-    Degraded(Vec<Ipv4Addr>),
+    Degraded(Vec<IpAddr>),
     /// Nothing we captured answers any more and the operator named nothing.
     /// Taking the file over now would own DNS for the host with no way to
     /// resolve anything outside `.ray`.
@@ -1374,8 +1707,8 @@ pub(super) enum NmQuietOutcome {
 /// either way.
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn nm_quiet_outcome(
-    before: &[Ipv4Addr],
-    after: &[Ipv4Addr],
+    before: &[IpAddr],
+    after: &[IpAddr],
     operator_upstreams: bool,
 ) -> NmQuietOutcome {
     if after.len() == before.len() {
@@ -1404,7 +1737,7 @@ impl DnsConfigurator for DirectResolvConf {
         // working DNS and no Magic DNS is the better failure. Bail before
         // touching anything so there is nothing to undo.
         anyhow::ensure!(
-            !self.captured_upstreams.load().is_empty() || self.operator_upstreams,
+            self.can_forward(&self.captured_upstreams.load()),
             "no working DNS server found in /etc/resolv.conf, so taking it over would leave \
              this host unable to resolve anything; set `dns_upstreams` in the config to \
              name one explicitly"
@@ -1452,16 +1785,16 @@ impl DnsConfigurator for DirectResolvConf {
         // presents exactly the evidence an NM forwarder does: everything answered
         // then, nothing answers now. Attributing that to the quiet is what latched
         // Magic DNS off for the daemon's lifetime on a passing blip.
-        let captured = self.captured_upstreams.load().as_ref().clone();
+        let captured = self.captured_upstreams.load_full();
         let before = crate::dns::resolver::live_upstreams(&captured).await;
         anyhow::ensure!(
-            !before.is_empty() || self.operator_upstreams,
+            self.can_forward(&before),
             "no DNS server named in /etc/resolv.conf is answering right now, so taking it \
              over would leave this host unable to resolve anything; this is a plain retry, \
              not a verdict about NetworkManager"
         );
         // Keep what the probe just learned, for the same reason the `Degraded`
-        // arm below does: this set is what `fallbacks` renders into the file and
+        // arm below does: this set is what `fallback_upstreams` renders into the file and
         // what `adopt_configurator` seeds the forwarder with, and a server that
         // has stopped answering costs a full lookup timeout in either.
         if before.len() != captured.len() {
@@ -1480,7 +1813,7 @@ impl DnsConfigurator for DirectResolvConf {
             NmQuietOutcome::Proceed => {
                 NM_ABORTS.store(0, AtomicOrdering::Relaxed);
             }
-            // Narrowed, not just reported: this set is what `fallbacks` renders
+            // Narrowed, not just reported: this set is what `fallback_upstreams` renders
             // into the file and what `adopt_configurator` seeds the forwarder
             // with, and a dead server in either costs a full lookup timeout per
             // off-mesh name. The capture in `new` probed for exactly this reason;
@@ -1531,12 +1864,26 @@ impl DnsConfigurator for DirectResolvConf {
                 }
             }
         }
-        let new_content = render_direct_resolv_conf(&self.search.load(), &self.fallbacks());
-        tokio::fs::write(path, new_content)
-            .await
-            .context("writing /etc/resolv.conf")?;
+        let new_content =
+            render_direct_resolv_conf(&self.search.load(), &self.fallback_upstreams());
+        if let Err(e) = write_resolv_file(path, new_content.as_bytes()) {
+            // The file is still the host's (the write renames into place, so a
+            // failure leaves it as it was), but NetworkManager is quieted and a
+            // backup is waiting to be restored over it. Undo both, or the host
+            // keeps a frozen file nobody regenerates while the retry loop runs.
+            let backup = backup_path(path);
+            let still_theirs = tokio::fs::read_to_string(path)
+                .await
+                .map(|c| !resolv_conf_is_ours(&c))
+                .unwrap_or(true);
+            if still_theirs && exists_no_follow(&backup) {
+                let _ = tokio::fs::remove_file(&backup).await;
+            }
+            nm_quiet_remove().await;
+            return Err(anyhow::Error::new(e).context("writing /etc/resolv.conf"));
+        }
         tracing::info!(
-            upstreams = ?self.captured_upstreams.load(),
+            upstreams = ?self.fallback_upstreams(),
             "configured /etc/resolv.conf directly (fallback); verified upstream resolvers"
         );
         Ok(())
@@ -1555,7 +1902,7 @@ impl DnsConfigurator for DirectResolvConf {
         "direct-resolv.conf"
     }
 
-    fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
+    fn captured_upstreams(&self) -> Vec<IpAddr> {
         self.captured_upstreams.load().as_ref().clone()
     }
 
@@ -1577,11 +1924,10 @@ impl DnsConfigurator for DirectResolvConf {
         if !resolv_conf_is_ours(&current) {
             return Ok(());
         }
-        tokio::fs::write(
+        write_resolv_file(
             path,
-            render_direct_resolv_conf(&self.search.load(), &self.fallbacks()),
+            render_direct_resolv_conf(&self.search.load(), &self.fallback_upstreams()).as_bytes(),
         )
-        .await
         .context("writing search domains to /etc/resolv.conf")
     }
 
@@ -1589,11 +1935,30 @@ impl DnsConfigurator for DirectResolvConf {
         Some(Arc::clone(&self.search))
     }
 
-    fn fallback_upstreams(&self) -> Vec<Ipv4Addr> {
-        self.captured_upstreams.load().as_ref().clone()
+    /// The upstreams written into resolv.conf after ours, so the host keeps
+    /// resolving if our resolver stops answering: the captured ones.
+    fn fallback_upstreams(&self) -> Vec<IpAddr> {
+        self.captured_upstreams()
     }
 
     fn shared_resolver(&self) -> Option<Ipv4Addr> {
         self.foreign_resolver
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::ResolvconfVariant;
+
+    /// The record a crash cleanup deletes must be the one `apply` added, for
+    /// whichever resolvconf is installed.
+    #[test]
+    fn resolvconf_variant_and_record_follow_the_version_banner() {
+        let openresolv = ResolvconfVariant::from_version_output(b"openresolv 3.13.2\n", b"");
+        assert_eq!(openresolv.record(), "tun-rayfish");
+        let debian = ResolvconfVariant::from_version_output(b"Debian resolvconf 1.91\n", b"");
+        assert_eq!(debian.record(), "tun-rayfish.inet");
+        let failed = ResolvconfVariant::from_version_output(b"", b"unknown option\n");
+        assert_eq!(failed.record(), "tun-rayfish.inet");
     }
 }

@@ -68,11 +68,15 @@ fn gateway_unverified(m: &Member) -> bool {
 /// because it is the only one that is not a wait: down and not-yet-in-the-roster
 /// both heal on their own, while a gateway that cannot carry our family stays
 /// that way until something changes on one of the two hosts.
+///
+/// `v4_refused` is the gateway's own announcement saying it cannot translate
+/// IPv4, which a roster claim from an older build does not reveal.
 fn selection_problem(
     install_error: Option<&str>,
     selection_resolved: bool,
     data_plane_up: bool,
     member: Option<&Member>,
+    v4_refused: bool,
 ) -> Option<String> {
     // Installation failures take precedence over roster state.
     if let Some(e) = install_error {
@@ -83,7 +87,13 @@ fn selection_problem(
             None => Some(
                 "the selected exit is missing from the roster; traffic remains blocked".to_string(),
             ),
-            Some(member) => gateway_family_refusal(member, &display_name(member)),
+            Some(member) => gateway_family_refusal(member, &display_name(member)).or_else(|| {
+                (v4_refused && member.exit_families.carries_v4()).then(|| {
+                    "the gateway does not support IPv4 exit translation; IPv4 stays blocked \
+                     until it is upgraded"
+                        .to_string()
+                })
+            }),
         };
     }
     if !data_plane_up {
@@ -182,9 +192,14 @@ impl NetworkRegistry {
 
     /// The roster member `id` names (see [`Member::matches_identity`]).
     pub(crate) fn roster_member(&self, network: &str, id: EndpointId) -> Option<Member> {
-        self.roster(network)
+        let handle = self.networks.get(network)?;
+        let state = handle.state.read().unwrap();
+        state
+            .members
+            .all()
             .into_iter()
             .find(|m| m.matches_identity(id))
+            .cloned()
     }
 
     /// Whether `device_key` is nullified on *any* network this node runs
@@ -274,8 +289,8 @@ impl NetworkRegistry {
                 // claim leaves behind. Say so once, here, rather than let a dead
                 // tunnel be the first news of it.
                 unverified = member.as_ref().is_some_and(gateway_unverified);
-                if self
-                    .roster_member(network, id)
+                if member
+                    .as_ref()
                     .is_some_and(|m| m.exit_families.carries_v4())
                     && self.peers.exit_ipv4_support(&derive_ipv6(&id)) == Some(false)
                 {
@@ -486,10 +501,10 @@ impl NetworkRegistry {
             .exit_client
             .selection()
             .is_some_and(|s| s.network == network);
-        let member = selected
-            .parse::<EndpointId>()
-            .ok()
-            .and_then(|id| self.roster_member(network, id));
+        let id = selected.parse::<EndpointId>().ok();
+        let member = id.and_then(|id| self.roster_member(network, id));
+        let v4_refused =
+            id.is_some_and(|id| self.peers.exit_ipv4_support(&derive_ipv6(&id)) == Some(false));
         // The install error belongs to the network whose selection was installed,
         // and there is only ever one: a single default route means a single
         // tunnel. Reporting it against every configured network would blame this
@@ -503,6 +518,7 @@ impl NetworkRegistry {
             resolved,
             self.exit_sync_enabled.load(Ordering::Relaxed),
             member.as_ref(),
+            v4_refused,
         )
     }
 
@@ -914,7 +930,15 @@ mod tests {
         use ExitFamilies::{Dual, V4};
 
         // A resolved IPv4 gateway is usable.
-        assert!(selection_problem(None, true, true, Some(&gateway(true, V4))).is_none());
+        assert!(selection_problem(None, true, true, Some(&gateway(true, V4)), false).is_none());
+
+        // An older gateway's roster claim carries IPv4, its announcement says it
+        // cannot translate it.
+        let why = selection_problem(None, true, true, Some(&gateway(true, Dual)), true)
+            .expect("a gateway refusing IPv4 must be reported");
+        assert!(why.contains("IPv4 exit translation"), "{why}");
+        let v6_only = gateway(true, ExitFamilies::V6);
+        assert!(selection_problem(None, true, true, Some(&v6_only), true).is_none());
 
         // The selected peer alone does not prove the routes were installed.
         let why = selection_problem(
@@ -922,17 +946,18 @@ mod tests {
             true,
             true,
             Some(&gateway(true, Dual)),
+            false,
         )
         .expect("a failed install must be reported");
         assert!(why.contains("operation not permitted"), "{why}");
 
         // Down is a wait, and says which command ends it.
-        let why = selection_problem(None, false, false, Some(&gateway(true, Dual)))
+        let why = selection_problem(None, false, false, Some(&gateway(true, Dual)), false)
             .expect("a selection cannot be in effect while the data plane is down");
         assert!(why.contains("ray up"), "{why}");
 
         // Not on the roster yet is the other wait.
-        let why = selection_problem(None, false, true, None).expect("no peer, no tunnel");
+        let why = selection_problem(None, false, true, None, false).expect("no peer, no tunnel");
         assert!(why.contains("roster"), "{why}");
 
         // The one that is not a wait: the reason the tunnel came down is the same
@@ -942,6 +967,7 @@ mod tests {
             false,
             true,
             Some(&gateway(true, ExitFamilies::Neither)),
+            false,
         )
         .expect("a gateway with neither family is unusable");
         assert!(why.contains("cannot carry IPv4 or IPv6"), "{why}");
@@ -965,7 +991,7 @@ mod tests {
 
     #[test]
     fn active_selection_reports_missing_or_unusable_gateway() {
-        let missing = super::selection_problem(None, true, true, None)
+        let missing = super::selection_problem(None, true, true, None, false)
             .expect("a missing gateway must be reported");
         assert!(missing.contains("traffic remains blocked"));
         let unusable = super::selection_problem(
@@ -973,6 +999,7 @@ mod tests {
             true,
             true,
             Some(&gateway(true, ExitFamilies::Neither)),
+            false,
         )
         .expect("an unusable gateway must be reported");
         assert!(unusable.contains("cannot carry IPv4 or IPv6"));

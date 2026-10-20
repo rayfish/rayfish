@@ -5,13 +5,12 @@
 //! printing, no root checks, no service restart - those belong to the callers
 //! (the CLI in `src/cli/update.rs`, the daemon task in `src/daemon`).
 
-#[cfg(windows)]
-use std::io::{Read, Write};
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-#[cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -824,7 +823,8 @@ pub async fn run_msi_update_helper(
 
 /// Download the release asset, verify it against the (already-fetched)
 /// checksum, and atomically swap it in for the running binary. Stages the new
-/// binary in a temp file, marks it executable, then `self_replace`s (handles the
+/// binary in a fresh file beside the executable, re-checks what landed on disk,
+/// then hands it to `self_replace` (handles the
 /// "can't overwrite a running executable" problem via rename). Does NOT restart
 /// any service and prints nothing: callers own presentation and restart.
 pub async fn download_and_swap(
@@ -851,17 +851,75 @@ pub async fn download_and_swap(
         );
     }
 
-    let tmp = std::env::temp_dir().join(format!("{asset}.new"));
-    std::fs::write(&tmp, &bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .context("failed to set executable permissions on the downloaded binary")?;
-    }
-    self_replace::self_replace(&tmp).context("failed to replace the running binary")?;
-    let _ = std::fs::remove_file(&tmp);
+    let exe = std::env::current_exe().context("failed to determine current executable path")?;
+    let staged = StagedBinary::create(&exe, asset, &bytes, expected)?;
+    self_replace::self_replace(staged.path()).context("failed to replace the running binary")?;
     Ok(())
+}
+
+/// A downloaded binary staged next to the executable it replaces. The file is
+/// created fresh under a random name (never reusing or following an existing
+/// path, which a shared temp dir would let another user plant), and removed
+/// when this guard drops, on success and on every error path.
+struct StagedBinary {
+    path: PathBuf,
+}
+
+impl StagedBinary {
+    fn create(exe: &Path, asset: &str, bytes: &[u8], expected: &str) -> Result<Self> {
+        // self_replace renames over the symlink target, so stage beside it.
+        let target = match std::fs::symlink_metadata(exe) {
+            Ok(meta) if meta.file_type().is_symlink() => std::fs::read_link(exe)
+                .with_context(|| format!("failed to resolve {}", exe.display()))?,
+            _ => exe.to_path_buf(),
+        };
+        let dir = target
+            .parent()
+            .context("executable has no parent directory")?;
+        let nonce = hex::encode(rand::random::<[u8; 16]>());
+        let staged = Self {
+            path: dir.join(format!(".{asset}.{nonce}.new")),
+        };
+        staged.write(bytes, expected)?;
+        Ok(staged)
+    }
+
+    fn write(&self, bytes: &[u8], expected: &str) -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o700).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&self.path)
+            .with_context(|| format!("failed to create {}", self.path.display()))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .context("failed to rewind the staged binary")?;
+        let mut written = Vec::with_capacity(bytes.len());
+        file.read_to_end(&mut written)
+            .context("failed to read back the staged binary")?;
+        let actual = sha256_hex(&written);
+        anyhow::ensure!(
+            actual == expected,
+            "staged binary checksum mismatch\n  expected: {expected}\n  got:      {actual}"
+        );
+        Ok(())
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedBinary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Whether the auto-updater should attempt `target` now, given the last target
@@ -929,6 +987,42 @@ pub fn trigger_detached_restart() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_binary_is_private_verified_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir is creatable in tests");
+        let exe = dir.path().join("ray");
+        let bytes = b"new binary";
+        let staged = StagedBinary::create(&exe, "ray-linux", bytes, &sha256_hex(bytes))
+            .expect("staging a matching binary succeeds");
+        let path = staged.path().to_path_buf();
+        assert_eq!(path.parent(), Some(dir.path()));
+        let mode = std::fs::metadata(&path)
+            .expect("staged file exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(
+            std::fs::read(&path).expect("staged file is readable"),
+            bytes
+        );
+        drop(staged);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn staged_binary_rejects_a_checksum_mismatch_and_cleans_up() {
+        let dir = tempfile::tempdir().expect("tempdir is creatable in tests");
+        let exe = dir.path().join("ray");
+        assert!(StagedBinary::create(&exe, "ray-linux", b"bytes", "00").is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("tempdir is listable")
+            .collect();
+        assert!(left.is_empty());
+    }
 
     #[test]
     fn attempts_a_fresh_target() {

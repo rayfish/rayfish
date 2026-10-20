@@ -64,7 +64,7 @@ if [[ -n "${RELEASE_TAG:-}" ]]; then
     [[ -x "$sign_update" ]] || { echo 'Sparkle sign_update is missing.' >&2; exit 1; }
     python3 "$source_root/scripts/write-macos-appcast.py" \
         --sign-update "$sign_update" --key "$signing_key" --app "$app" --dmg "$dmg" \
-        --changelog "$source_root/CHANGELOG.md" \
+        --changelog "$output/CHANGELOG.md" \
         --tag "$RELEASE_TAG" --arch "$MACOS_ARCH" \
         --output "$output/dist/Rayfish-appcast-$MACOS_ARCH.xml"
 fi

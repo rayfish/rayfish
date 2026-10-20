@@ -9,6 +9,7 @@
 #   firewall      3-peer suggested-firewall + rule matrix (tests/e2e/firewall)
 #   closed-net    3-peer admission + lifecycle commands (tests/e2e/closed-net)
 #   apply         3-peer declarative `ray apply` deploy       (tests/e2e/apply)
+#   invites       3-peer private invites + inbound gate      (tests/e2e/invites)
 #   dns           2-peer Magic DNS resolution + resolv.conf takeover (tests/e2e/dns)
 #   ssh           2-peer mesh SSH (`ray firewall ssh`) allow/deny matrix (tests/e2e/ssh)
 #   operator      2-peer unprivileged-client authority (`ray set-operator`) (tests/e2e/operator)
@@ -40,7 +41,8 @@
 # provision/teardown/assert bodies live in tests/lib/ and are sourced here.
 #
 # Env overrides: REGION/SIZE/IMAGE/DO_SSH_KEYS (droplet provision); E2E_DOCKER_*
-# (docker provision, see tests/lib/docker.sh); SSH_KEY, KEEP_STATE (run).
+# (docker provision, see tests/lib/docker.sh); SSH_KEY, KEEP_STATE (run);
+# E2E_AUTO_TEARDOWN (auto-teardown after run; Docker also dumps failure diagnostics).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -49,7 +51,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # variable would silently drop back to digitalocean halfway through.
 export E2E_BACKEND="${E2E_BACKEND:-digitalocean}"
 
-usage(){ sed -n '2,37p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+usage(){ sed -n '2,38p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
 # Scenarios the docker backend cannot run faithfully (see tests/e2e/README.md).
 DOCKER_UNSUPPORTED=(exit-node reliability bench)
@@ -79,6 +81,9 @@ scenario_meta(){
                  LABELS=(srv-a srv-b srv-c) ;;
     apply)       DIR="$ROOT/tests/e2e/apply"
                  NAMES=(rayfish-apply-a rayfish-apply-b rayfish-apply-c)
+                 LABELS=(srv-a srv-b srv-c) ;;
+    invites)     DIR="$ROOT/tests/e2e/invites"
+                 NAMES=(rayfish-invites-a rayfish-invites-b rayfish-invites-c)
                  LABELS=(srv-a srv-b srv-c) ;;
     dns)         DIR="$ROOT/tests/e2e/dns"
                  NAMES=(rayfish-dns-a rayfish-dns-b)
@@ -122,14 +127,18 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 # dispatcher per scenario (provision-if-needed + run, then teardown). Prints a
 # pass/fail summary and exits non-zero if any scenario failed.
 if [[ "$scenario" == all ]]; then
-  all_scenarios=(device-cert connect firewall closed-net apply dns ssh operator v4bridge reliability restore-offline unpair churn exit-node)
+  all_scenarios=(device-cert connect firewall closed-net apply invites dns ssh operator v4bridge reliability restore-offline unpair churn exit-node)
   passed=(); failed=(); skipped=()
   hint="check 'doctl compute droplet list'"
   [[ "$E2E_BACKEND" == "docker" ]] && hint="check 'docker ps -a'"
   for s in "${all_scenarios[@]}"; do
     if ! docker_supports "$s"; then skipped+=("$s"); continue; fi
     echo "==================== $s ===================="
-    if bash "$0" "$s" run; then passed+=("$s"); else failed+=("$s"); fi
+    if bash "$0" "$s" run; then
+      passed+=("$s")
+    else
+      failed+=("$s")
+    fi
     # Always tear the fleet down, pass or fail, before the next scenario.
     bash "$0" "$s" teardown || echo ">> warning: teardown failed for $s ($hint)"
   done
@@ -169,24 +178,99 @@ provision(){
   fi
 }
 
+teardown(){
+  if [[ "$E2E_BACKEND" == "docker" ]]; then
+    DOCKER_ACTION=teardown
+    # shellcheck source=lib/docker.sh
+    source "$ROOT/tests/lib/docker.sh"      # consumes SERVERS/NAMES
+  else
+    # shellcheck source=lib/teardown.sh
+    source "$ROOT/tests/lib/teardown.sh"    # consumes SERVERS
+  fi
+}
+
+dump_diagnostics(){
+  local scn="${1:-$scenario}"
+  echo "==================== DIAGNOSTICS: $scn ===================="
+  if [[ "$E2E_BACKEND" == "docker" ]]; then
+    echo "--- Docker containers ---"
+    # Connection timeouts do not bound a connected SSH session or Docker RPC.
+    # Diagnostics must finish so an unresponsive node cannot prevent teardown.
+    timeout --kill-after=2s 10s docker ps -a --filter "network=${E2E_DOCKER_NET:-rayfish-e2e}" 2>&1 || true
+    if [[ -f "$SERVERS" ]]; then
+      local id ip label z
+      while read -r id ip label z; do
+        [[ -n "$id" ]] || continue
+        echo "--- Host: $label ($id, $ip) ---"
+        echo "  [ray status]"
+        timeout --kill-after=2s 10s ssh -n -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no \
+          -i "${SSH_KEY:-$HOME/.ssh/id_ed25519}" "root@$ip" 'ray status' 2>&1 || true
+        echo "  [journalctl -u rayfish]"
+        timeout --kill-after=2s 10s docker exec "$id" journalctl -u rayfish -n 50 --no-pager 2>&1 || true
+      done < "$SERVERS"
+    fi
+  fi
+  echo "=========================================================="
+}
+
 case "$action" in
   provision)
     provision ;;
   teardown)
-    if [[ "$E2E_BACKEND" == "docker" ]]; then
-      DOCKER_ACTION=teardown
-      # shellcheck source=lib/docker.sh
-      source "$ROOT/tests/lib/docker.sh"      # consumes SERVERS
-    else
-      # shellcheck source=lib/teardown.sh
-      source "$ROOT/tests/lib/teardown.sh"    # consumes SERVERS
-    fi ;;
+    ( teardown ) ;;
   run)
-    if [[ "$E2E_BACKEND" == "docker" || ! -f "$SERVERS" ]]; then
-      [[ -f "$SERVERS" ]] || echo ">> no $SERVERS yet — provisioning first"
-      provision
-    fi
-    exec bash "$DIR/run.sh" ;;
+    if [[ "${E2E_AUTO_TEARDOWN:-0}" == "1" ]]; then
+      # Guarded lifecycle: provisioning + scenario run + diagnostics + teardown.
+      # Provisioning runs in a subshell with `set -e` isolated from conditional
+      # contexts (which suppress errexit in Bash), while allowing the parent
+      # to capture the exit status without exiting.
+      run_status=0
+      if [[ "$E2E_BACKEND" == "docker" || ! -f "$SERVERS" ]]; then
+        [[ -f "$SERVERS" ]] || echo ">> no $SERVERS yet — provisioning first"
+        set +e
+        (
+          set -e
+          provision
+        )
+        run_status=$?
+        set -e
+      fi
+      if [[ $run_status -eq 0 ]]; then
+        set +e
+        bash "$DIR/run.sh"
+        run_status=$?
+        set -e
+      fi
+      if [[ $run_status -ne 0 ]]; then
+        echo ">> Scenario $scenario failed (exit code $run_status)."
+        dump_diagnostics "$scenario" || true
+      fi
+      echo ">> Auto-teardown for $scenario (E2E_AUTO_TEARDOWN=1)..."
+      teardown_status=0
+      set +e
+      (
+        set -e
+        teardown
+      )
+      teardown_status=$?
+      set -e
+      if [[ $teardown_status -ne 0 ]]; then
+        echo ">> Teardown failed for $scenario (exit code $teardown_status)." >&2
+      fi
+      if [[ $run_status -ne 0 ]]; then
+        exit "$run_status"
+      elif [[ $teardown_status -ne 0 ]]; then
+        exit "$teardown_status"
+      else
+        exit 0
+      fi
+    else
+      if [[ "$E2E_BACKEND" == "docker" || ! -f "$SERVERS" ]]; then
+        [[ -f "$SERVERS" ]] || echo ">> no $SERVERS yet — provisioning first"
+        provision
+      fi
+      exec bash "$DIR/run.sh"
+    fi ;;
   *)
     echo "unknown action: $action" >&2; usage 1 ;;
 esac

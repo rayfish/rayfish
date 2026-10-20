@@ -32,6 +32,7 @@ import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.qr.QrImage
 import xyz.rayfish.android.ui.qr.rememberQrScanner
 import xyz.rayfish.android.ui.theme.*
+import xyz.rayfish.android.ui.userMessage
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -47,7 +48,7 @@ fun NetworksScreen(
     fun <T> run(block: suspend () -> T, ok: (T) -> Unit, errRes: Int) {
         scope.launch {
             try { val r = withContext(Dispatchers.IO) { block() }; ok(r); onChanged() }
-            catch (t: Throwable) { onToast(context.getString(errRes, t.message.orEmpty())) }
+            catch (t: Throwable) { onToast(context.getString(errRes, t.userMessage)) }
         }
     }
 

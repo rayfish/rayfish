@@ -1,8 +1,9 @@
 //! DHT publishers for the mesh core: the notify-driven network-record
-//! publisher, the contact-record publisher (`ray connect`), the lazy
-//! co-coordinator publisher, and the shared snapshot-refresh + publish step.
+//! publisher, the lazy co-coordinator publisher, and the shared snapshot-refresh + publish step.
 //! Also holds the thin `Daemon` direct-connection (`ray connect`) handlers that
 //! delegate to `ConnectService`.
+
+use iroh_dns::pkarr::SignedPacket;
 
 use super::super::*;
 
@@ -226,8 +227,13 @@ pub(crate) fn spawn_network_publisher(
                     registry.schedule_destruction(&network_name, packet);
                     break;
                 }
+                // Decide and sign under the commit lock, publish after releasing
+                // it. The relay round trip can take seconds, and admissions and
+                // reconverges on this network queue on the same lock. Signing
+                // under it keeps record timestamps in commit order, so the relay
+                // never keeps an older generation over a newer one.
                 let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
-                let _commit = commit.lock().await;
+                let commit_guard = commit.lock().await;
                 if token.is_cancelled() {
                     break;
                 }
@@ -241,6 +247,7 @@ pub(crate) fn spawn_network_publisher(
                     }
                 }
 
+                let mut prepared = None;
                 if persistence_ready
                     && let Some(hash) = configured_group_hash(&network_name)
                     && attempt_is_due(hash, last_publish, retry, Instant::now())
@@ -252,35 +259,37 @@ pub(crate) fn spawn_network_publisher(
                             .map(|(id, _)| id)
                             .collect();
                         seed_peers.push(endpoint_id);
-                        seed_peers.sort_by_key(|id| id.to_string());
+                        seed_peers.sort();
                         seed_peers.dedup();
-
-                        match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers)
-                            .await
-                        {
-                            Ok(_) => {
-                                if mark_group_hash_published(&network_name, hash) {
-                                    tracing::info!(
-                                        peers = seed_peers.len(),
-                                        "published network record"
-                                    );
-                                    last_publish = Some((hash, Instant::now()));
-                                    retry = None;
-                                } else {
-                                    retry = Some((
-                                        hash,
-                                        Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL,
-                                    ));
-                                }
-                            }
+                        match dht::encode_network_record(&net_secret_key, &hash, &seed_peers) {
+                            Ok(packet) => prepared = Some((hash, packet, seed_peers.len())),
                             Err(e) => {
-                                tracing::warn!(error = %e, "failed to publish network record");
+                                tracing::warn!(error = %e, "failed to build network record");
                                 retry =
                                     Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
                             }
                         }
                     } else {
                         retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                    }
+                }
+                drop(commit_guard);
+
+                if let Some((hash, packet, seed_count)) = prepared {
+                    match publish_signed_record(&client, &commit, &network_name, hash, &packet)
+                        .await
+                    {
+                        Ok(true) => {
+                            tracing::info!(peers = seed_count, "published network record");
+                            last_publish = Some((hash, Instant::now()));
+                            retry = None;
+                        }
+                        outcome => {
+                            if let Err(e) = outcome {
+                                tracing::warn!(error = %e, "failed to publish network record");
+                            }
+                            retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        }
                     }
                 }
             }
@@ -293,36 +302,6 @@ pub(crate) fn spawn_network_publisher(
                 _ = token.cancelled() => break,
                 _ = notify.notified() => {},
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {},
-            }
-        }
-    })
-}
-
-/// Publish this node's contact record (`ray connect`).
-/// Publishes the `contact_key -> current endpoint` pkarr record on a TTL/2
-/// interval (record TTL is 300s). Runs for the lifetime of the daemon (control
-/// plane), not gated by the data-plane `active` flag, so standby nodes stay
-/// reachable for `ray connect` requests. Reads `contact_secret` fresh from
-/// config each cycle so a `RotateContact` takes effect without a restart.
-pub(crate) fn spawn_contact_publisher(
-    client: PkarrRelayClient,
-    endpoint_id: EndpointId,
-    token: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let secret = config::load().ok().and_then(|c| c.contact_secret_key);
-            if let Some(secret) = secret {
-                match dht::publish_contact(&client, &secret, endpoint_id).await {
-                    Ok(()) => {
-                        tracing::debug!(contact = %secret.public().fmt_short(), "published contact record")
-                    }
-                    Err(e) => tracing::warn!(error = %e, "failed to publish contact record"),
-                }
-            }
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(150)) => {},
             }
         }
     })
@@ -352,30 +331,45 @@ fn persist_current_snapshot_hash(
     if !current {
         return SnapshotPersist::Superseded;
     }
+    if write_group_hash_pointer(state, network, hash, false) {
+        SnapshotPersist::Persisted
+    } else {
+        SnapshotPersist::Failed
+    }
+}
+
+/// Write the recovery pointer for `hash` and settle its durability marker:
+/// confirmed on success, pending on any failure.
+fn write_group_hash_pointer(
+    state: &SharedNetworkState,
+    network: &str,
+    hash: blake3::Hash,
+    published: bool,
+) -> bool {
     match config::update_network(network, |net| {
         net.last_group_hash = Some(hash);
-        net.last_group_hash_published = false;
+        net.last_group_hash_published = published;
         Ok(())
     }) {
         Ok(Some(_)) => {
             confirm_current_group_hash_durable(state, hash);
-            SnapshotPersist::Persisted
+            true
         }
         Ok(None) => {
-            mark_group_hash_durability_pending(state, hash, false);
+            mark_group_hash_durability_pending(state, hash, published);
             tracing::warn!(
                 network,
                 "failed to persist group snapshot hash: network was deleted"
             );
-            SnapshotPersist::Failed
+            false
         }
         Err(e) => {
             // Atomic rename may have installed this exact generation before the
             // parent-directory sync failed. Treat every such error as ambiguous
             // until an exact retry completes its durability barrier.
-            mark_group_hash_durability_pending(state, hash, false);
+            mark_group_hash_durability_pending(state, hash, published);
             tracing::warn!(network, error = %e, "failed to persist complete group snapshot hash");
-            SnapshotPersist::Failed
+            false
         }
     }
 }
@@ -438,29 +432,24 @@ pub(crate) async fn persist_group_hash_locked(
             return false;
         }
     }
-    match config::update_network(network, |net| {
-        net.last_group_hash = Some(hash);
-        net.last_group_hash_published = published;
-        Ok(())
-    }) {
-        Ok(Some(_)) => {
-            confirm_current_group_hash_durable(state, hash);
-            true
-        }
-        Ok(None) => {
-            mark_group_hash_durability_pending(state, hash, published);
-            tracing::warn!(
-                network,
-                "failed to persist group snapshot hash: network was deleted"
-            );
-            false
-        }
-        Err(e) => {
-            mark_group_hash_durability_pending(state, hash, published);
-            tracing::warn!(network, error = %e, "failed to persist complete group snapshot hash");
-            false
-        }
-    }
+    write_group_hash_pointer(state, network, hash, published)
+}
+
+/// Publish a record signed under `commit`, then mark its generation published
+/// if it is still the recovery pointer. No lock is held across the relay call.
+/// The mark takes `commit` again because it compares against the pointer, and
+/// a commit may have moved it while the publish was in flight. `Ok(false)`
+/// means it did, and a newer record is owed.
+pub(crate) async fn publish_signed_record(
+    client: &PkarrRelayClient,
+    commit: &AsyncMutex<()>,
+    network: &str,
+    hash: blake3::Hash,
+    packet: &SignedPacket,
+) -> Result<bool> {
+    dht::publish_record(client, packet).await?;
+    let _commit = commit.lock().await;
+    Ok(mark_group_hash_published(network, hash))
 }
 
 pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash) -> bool {
@@ -612,9 +601,9 @@ pub(crate) async fn update_snapshot_and_publish(
 }
 
 impl Daemon {
-    /// `ray connect <contact-id>`: request a direct connection by contact id.
-    pub async fn connect(&self, contact_id: &str, hostname: Option<String>) -> IpcMessage {
-        self.connect.connect(contact_id, hostname).await
+    /// `ray connect <identity>`: request a direct connection to that identity.
+    pub async fn connect(&self, peer: &str, hostname: Option<String>) -> IpcMessage {
+        self.connect.connect(peer, hostname).await
     }
 
     /// `ray connect`: list pending incoming connect requests.
@@ -622,10 +611,10 @@ impl Daemon {
         self.connect.list_connections()
     }
 
-    /// Decline a pending connect request: drop it without minting a network. The
-    /// requester's retry loop eventually times out.
+    /// Decline a pending connect request: drop it without minting a network or
+    /// blocking. The requester's retry loop eventually times out.
     pub fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
-        self.connect.reject_connect(id_prefix)
+        self.connect.reject_connection(id_prefix)
     }
 
     /// `ray connect approve <id>`: approve a pending connect request, minting
@@ -634,10 +623,33 @@ impl Daemon {
         self.connect.approve_connection(id_prefix).await
     }
 
-    /// `ray contact rotate`: replace this node's contact key. The old contact id
-    /// stops resolving once its pkarr record expires (~5 min).
-    pub(crate) async fn rotate_contact(&self) -> IpcMessage {
-        self.connect.rotate_contact().await
+    /// `ray connect deny <id>`: drop a pending request and block the requester.
+    pub async fn deny_connection(&self, id_prefix: &str) -> IpcMessage {
+        self.connect.deny_connection(id_prefix).await
+    }
+
+    /// `ray invitations`: invitations received from coordinators.
+    pub async fn list_invitations(&self) -> IpcMessage {
+        self.connect.list_invitations().await
+    }
+
+    /// `ray invitations accept <id>`: join the invited network.
+    pub async fn accept_invitation(
+        &self,
+        id: &str,
+        hostname: Option<ipc::MachineHostname>,
+    ) -> IpcMessage {
+        self.connect.accept_invitation(id, hostname).await
+    }
+
+    /// `ray invitations decline <id>`.
+    pub async fn decline_invitation(&self, id: &str) -> IpcMessage {
+        self.connect.decline_invitation(id).await
+    }
+
+    /// Deliver an invite for `network` straight to `recipient`'s identity.
+    pub async fn deliver_invite(&self, network: &str, recipient: EndpointId) -> IpcMessage {
+        self.connect.deliver_invite(network, recipient).await
     }
 }
 

@@ -64,8 +64,9 @@ pub const MAGIC_DNS_V6: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0x53)
 pub type HostnameEntry = Ipv6Addr;
 pub type HostnameTable = Arc<RwLock<HashMap<String, HashMap<String, HostnameEntry>>>>;
 
-/// Reverse lookup: IP → (hostname, network).
-pub type ReverseLookupTable = Arc<DashMap<IpAddr, (String, String)>>;
+/// Reverse lookup: mesh IPv6 to (hostname, network). IPv6 alone, for the same
+/// reason [`HostnameEntry`] is: the roster holds no other address.
+pub type ReverseLookupTable = Arc<DashMap<Ipv6Addr, (String, String)>>;
 
 pub fn new_hostname_table() -> HostnameTable {
     Arc::new(RwLock::new(HashMap::new()))
@@ -88,10 +89,7 @@ pub async fn update_hostname(
         let hosts = t.entry(network.to_string()).or_default();
         hosts.insert(hostname.to_string(), ipv6);
     }
-    reverse.insert(
-        IpAddr::V6(ipv6),
-        (hostname.to_string(), network.to_string()),
-    );
+    reverse.insert(ipv6, (hostname.to_string(), network.to_string()));
 }
 
 /// Remove a hostname by IP address from both tables.
@@ -105,7 +103,7 @@ pub async fn remove_hostname_by_ip(
     if let Some(hosts) = t.get_mut(network) {
         hosts.retain(|_, v6| {
             if *v6 == ipv6 {
-                reverse.remove(&IpAddr::V6(ipv6));
+                reverse.remove(&ipv6);
                 false
             } else {
                 true
@@ -128,13 +126,13 @@ pub async fn sync_network_hostnames(
     // Drop reverse entries for the network's previous set before rebuilding.
     if let Some(old) = t.get(network) {
         for v6 in old.values() {
-            reverse.remove(&IpAddr::V6(*v6));
+            reverse.remove(v6);
         }
     }
     let mut hosts = HashMap::with_capacity(entries.len());
     for (name, v6) in entries {
         hosts.insert(name.clone(), *v6);
-        reverse.insert(IpAddr::V6(*v6), (name.clone(), network.to_string()));
+        reverse.insert(*v6, (name.clone(), network.to_string()));
     }
     t.insert(network.to_string(), hosts);
 }
@@ -144,7 +142,7 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
     let mut t = table.write().await;
     if let Some(hosts) = t.remove(network) {
         for (_, ipv6) in hosts {
-            reverse.remove(&IpAddr::V6(ipv6));
+            reverse.remove(&ipv6);
         }
     }
 }
@@ -265,7 +263,14 @@ async fn handle_ptr_query(
     name: &str,
     reverse: &ReverseLookupTable,
 ) -> Option<Vec<u8>> {
-    let ip = parse_ptr_name(name)?;
+    // An IPv4 PTR is never ours: the roster holds no IPv4, and `100.64.0.0/10`
+    // belongs to whichever VPN we are sharing the host with, so answering an
+    // authoritative NXDOMAIN would break reverse lookups for its nodes. Only
+    // reachable when we are the system-wide resolver; with split DNS,
+    // `in-addr.arpa` is not routed to us at all.
+    let IpAddr::V6(ip) = parse_ptr_name(name)? else {
+        return None;
+    };
 
     if let Some(entry) = reverse.get(&ip) {
         let (hostname, network) = entry.value();
@@ -274,21 +279,10 @@ async fn handle_ptr_query(
         return Some(make_ptr_response(packet, &packet.questions[0].qname, &fqdn));
     }
 
-    // If IP is in our range but not found, NXDOMAIN. `100.64.0.0/10` is not ours
-    // to speak for: it belongs to whichever VPN we are sharing the host with, and
-    // answering an authoritative NXDOMAIN would break reverse lookups for its
-    // nodes. Only reachable when we are the system-wide resolver; with split DNS,
-    // `in-addr.arpa` is not routed to us at all.
-    match ip {
-        IpAddr::V4(_) => {}
-        IpAddr::V6(v6) => {
-            let segments = v6.segments();
-            // 200::/7
-            if (segments[0] & 0xFE00) == 0x0200 {
-                tracing::info!(ip = %ip, "DNS PTR NXDOMAIN (our range)");
-                return Some(make_nxdomain(packet));
-            }
-        }
+    // In our range (200::/7) but not found: NXDOMAIN.
+    if (ip.segments()[0] & 0xFE00) == 0x0200 {
+        tracing::info!(ip = %ip, "DNS PTR NXDOMAIN (our range)");
+        return Some(make_nxdomain(packet));
     }
 
     // A PTR for an address outside our ranges: not ours, let it go upstream.
@@ -379,77 +373,70 @@ fn finalize_response(response: &mut Packet, query: &Packet) {
     }
 }
 
-fn make_aaaa_response(query: &Packet, qname: &Name, ip: Ipv6Addr) -> Vec<u8> {
+/// An authoritative reply to `query` carrying its question, with no records yet.
+fn reply_to<'a>(query: &Packet<'a>) -> Packet<'a> {
     let mut response = Packet::new_reply(query.id());
     response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
     response.questions = query.questions.clone();
-    response.answers.push(ResourceRecord::new(
-        qname.clone(),
-        CLASS::IN,
-        60,
+    response
+}
+
+fn build(mut response: Packet, query: &Packet) -> Vec<u8> {
+    finalize_response(&mut response, query);
+    response.build_bytes_vec().unwrap_or_default()
+}
+
+/// A reply whose single answer is `rdata` for `qname`.
+fn make_answer<'a>(query: &Packet<'a>, qname: &Name<'a>, rdata: RData<'a>) -> Vec<u8> {
+    let mut response = reply_to(query);
+    response
+        .answers
+        .push(ResourceRecord::new(qname.clone(), CLASS::IN, 60, rdata));
+    build(response, query)
+}
+
+fn make_aaaa_response(query: &Packet, qname: &Name, ip: Ipv6Addr) -> Vec<u8> {
+    make_answer(
+        query,
+        qname,
         RData::AAAA(AAAA {
             address: u128::from(ip),
         }),
-    ));
-    finalize_response(&mut response, query);
-    response.build_bytes_vec().unwrap_or_default()
+    )
 }
 
 fn make_ptr_response(query: &Packet, qname: &Name, hostname: &str) -> Vec<u8> {
-    let mut response = Packet::new_reply(query.id());
-    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
-    response.questions = query.questions.clone();
-    response.answers.push(ResourceRecord::new(
-        qname.clone(),
-        CLASS::IN,
-        60,
+    make_answer(
+        query,
+        qname,
         RData::PTR(simple_dns::rdata::PTR(Name::new_unchecked(hostname))),
-    ));
-    finalize_response(&mut response, query);
-    response.build_bytes_vec().unwrap_or_default()
+    )
 }
 
 fn make_soa_response(query: &Packet, qname: &Name) -> Vec<u8> {
-    let mut response = Packet::new_reply(query.id());
-    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
-    response.questions = query.questions.clone();
-    response.answers.push(ResourceRecord::new(
-        qname.clone(),
+    make_answer(query, qname, RData::SOA(pi_soa()))
+}
+
+/// A negative answer: the zone's SOA in the authority section, and `rcode`
+/// saying whether the name is missing (NXDOMAIN) or just the type (NODATA).
+fn make_negative(query: &Packet, rcode: RCODE) -> Vec<u8> {
+    let mut response = reply_to(query);
+    *response.rcode_mut() = rcode;
+    response.name_servers.push(ResourceRecord::new(
+        Name::new_unchecked(DNS_DOMAIN),
         CLASS::IN,
         60,
         RData::SOA(pi_soa()),
     ));
-    finalize_response(&mut response, query);
-    response.build_bytes_vec().unwrap_or_default()
+    build(response, query)
 }
 
 fn make_nxdomain(query: &Packet) -> Vec<u8> {
-    let mut response = Packet::new_reply(query.id());
-    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
-    response.questions = query.questions.clone();
-    *response.rcode_mut() = RCODE::NameError;
-    response.name_servers.push(ResourceRecord::new(
-        Name::new_unchecked(DNS_DOMAIN),
-        CLASS::IN,
-        60,
-        RData::SOA(pi_soa()),
-    ));
-    finalize_response(&mut response, query);
-    response.build_bytes_vec().unwrap_or_default()
+    make_negative(query, RCODE::NameError)
 }
 
 fn make_nodata(query: &Packet) -> Vec<u8> {
-    let mut response = Packet::new_reply(query.id());
-    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
-    response.questions = query.questions.clone();
-    response.name_servers.push(ResourceRecord::new(
-        Name::new_unchecked(DNS_DOMAIN),
-        CLASS::IN,
-        60,
-        RData::SOA(pi_soa()),
-    ));
-    finalize_response(&mut response, query);
-    response.build_bytes_vec().unwrap_or_default()
+    make_negative(query, RCODE::NoError)
 }
 
 #[cfg(test)]
@@ -499,7 +486,7 @@ mod tests {
             Some(v6(1))
         );
         assert_eq!(
-            reverse.get(&IpAddr::V6(v6(1))).map(|e| e.0.clone()),
+            reverse.get(&v6(1)).map(|e| e.0.clone()),
             Some("alice".to_string())
         );
 
@@ -512,9 +499,9 @@ mod tests {
         // Old name and departed peer no longer resolve; reverse is rebuilt.
         assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, None);
         assert_eq!(resolve_name("bob.net.ray", SUFFIX, &table).await, None);
-        assert_eq!(reverse.get(&IpAddr::V6(v6(2))).map(|e| e.0.clone()), None);
+        assert_eq!(reverse.get(&v6(2)).map(|e| e.0.clone()), None);
         assert_eq!(
-            reverse.get(&IpAddr::V6(v6(1))).map(|e| e.0.clone()),
+            reverse.get(&v6(1)).map(|e| e.0.clone()),
             Some("laptop".to_string())
         );
     }
@@ -690,9 +677,6 @@ mod tests {
         .expect("the roster holds the name");
         let resp = Packet::parse(&bytes).expect("parse response");
         assert_eq!(resp.answers.len(), 1);
-
-        // Nothing claims an IPv4 reverse entry for a peer that has no IPv4.
-        assert!(!reverse.iter().any(|e| e.key().is_ipv4()));
     }
 
     /// The decline contract: `handle_query` returns `None` for anything the
@@ -837,7 +821,7 @@ mod tests {
         assert_eq!(result, Some(v6));
 
         // Reverse lookup works
-        let rev6 = reverse.get(&IpAddr::V6(v6)).map(|e| e.value().clone());
+        let rev6 = reverse.get(&v6).map(|e| e.value().clone());
         assert_eq!(rev6, Some(("alice".to_string(), "gaming".to_string())));
     }
 }

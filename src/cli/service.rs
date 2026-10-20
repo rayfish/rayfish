@@ -1,12 +1,44 @@
 //! CLI service-management handlers: up, install, start/stop/restart, operator.
 
 use crate::*;
+use ipc::{GlobalKey, NodeKey};
+use rayfish::config::AppConfig;
+use rayfish::config::settings::{apply_firewall, apply_global};
+use rayfish::firewall::FirewallConfig;
 #[cfg(target_os = "linux")]
 use rayfish::init_system::InitSystem;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::Command;
+use std::str::FromStr;
+
+/// A validated assignment using the same keys and values as `ray config set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpSetting {
+    key: NodeKey,
+    value: String,
+}
+
+impl FromStr for UpSetting {
+    type Err = String;
+
+    fn from_str(assignment: &str) -> Result<Self, Self::Err> {
+        let (key, value) = assignment.split_once('=').unwrap_or((assignment, "on"));
+        let key = key.parse::<NodeKey>()?;
+        let validation = match key {
+            // Peer names need the daemon's registry to resolve them.
+            NodeKey::Global(key) if key.is_peer_list() => Ok(()),
+            NodeKey::Global(key) => apply_global(&mut AppConfig::default(), key, value, false),
+            NodeKey::Firewall(key) => apply_firewall(&mut FirewallConfig::default(), key, value),
+        };
+        validation.map_err(|error| format!("{key}: {error}"))?;
+        Ok(Self {
+            key,
+            value: value.to_owned(),
+        })
+    }
+}
 
 /// Create the `rayfish` system group if it doesn't already exist (Linux).
 /// Best-effort: the daemon's config writer falls back to `root:root` ownership
@@ -96,7 +128,23 @@ pub(crate) async fn cmd_up(
     hostname: Option<String>,
     controller: Option<ipc::EnrollmentTicket>,
     enable_ssh: bool,
+    mut settings: Vec<UpSetting>,
 ) -> Result<()> {
+    if enable_ssh {
+        anyhow::ensure!(
+            !settings
+                .iter()
+                .any(|s| s.key == NodeKey::Global(GlobalKey::Ssh)),
+            "use either --enable-ssh or --set ssh, not both"
+        );
+        settings.insert(
+            0,
+            UpSetting {
+                key: NodeKey::Global(GlobalKey::Ssh),
+                value: "on".to_owned(),
+            },
+        );
+    }
     #[cfg(windows)]
     let mut operator_claim = WindowsOperatorClaim::begin()?;
     if let Ok(mut stream) = ipc::connect().await {
@@ -109,20 +157,11 @@ pub(crate) async fn cmd_up(
                 #[cfg(windows)]
                 operator_claim.commit();
                 println!("{message}");
-                if enable_ssh {
-                    ipc_firewall(FirewallAction::Ssh {
-                        action: SshAction::On,
-                    })
-                    .await?;
-                }
-                if let Some(ticket) = controller {
-                    ipc_enroll_controller(&ticket).await?;
-                }
             }
             ipc::IpcMessage::Error { message } => fail_with("error", &message),
             other => fail_unexpected(&other),
         }
-        return Ok(());
+        return finish_up(settings, controller).await;
     }
 
     #[cfg(windows)]
@@ -138,9 +177,18 @@ pub(crate) async fn cmd_up(
         std::process::exit(1);
     }
     install_and_start_service(hostname).await?;
-    if enable_ssh {
-        ipc_firewall(FirewallAction::Ssh {
-            action: SshAction::On,
+    finish_up(settings, controller).await
+}
+
+async fn finish_up(
+    settings: Vec<UpSetting>,
+    controller: Option<ipc::EnrollmentTicket>,
+) -> Result<()> {
+    for setting in settings {
+        ipc_mutate(ipc::IpcMessage::ConfigSet {
+            key: setting.key,
+            value: setting.value,
+            replace: false,
         })
         .await?;
     }
@@ -187,7 +235,7 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
             println!(
                 "note: {} does not restart the daemon if it exits; \
                  use `sudo ray start` to bring it back.",
-                init.label()
+                init
             );
         }
     }
@@ -490,6 +538,43 @@ pub(crate) async fn cmd_start() -> Result<()> {
             eprintln!("rayfish service was started but the daemon never became reachable.");
             print_daemon_log_tail();
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod up_setting_tests {
+    use super::*;
+
+    #[test]
+    fn assignments_preserve_values_and_default_bare_keys_to_on() {
+        for (assignment, expected) in [
+            ("v4-bridge", "on"),
+            ("v4-bridge=off", "off"),
+            ("dns=partial", "partial"),
+            ("download-dir=", ""),
+            (
+                "relay=https://relay.example/?option=value",
+                "https://relay.example/?option=value",
+            ),
+            ("file-auto-accept-peers=build-box", "build-box"),
+        ] {
+            let setting: UpSetting = assignment.parse().unwrap();
+            assert_eq!(setting.key.name(), assignment.split('=').next().unwrap());
+            assert_eq!(setting.value, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn enable_ssh_conflict_is_rejected_before_any_ipc() {
+        for assignment in ["ssh=on", "ssh=off"] {
+            let error = cmd_up(None, None, true, vec![assignment.parse().unwrap()])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "use either --enable-ssh or --set ssh, not both"
+            );
         }
     }
 }

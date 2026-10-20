@@ -4,38 +4,35 @@
 //! protocol crate is self-contained. `ray` re-exports them at their original paths,
 //! so the daemon's logic is untouched.
 
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
 
 /// Controls who can approve new members joining the network.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(
+    serialize_all = "lowercase",
+    parse_err_ty = String,
+    parse_err_fn = unknown_group_mode
+)]
 pub enum GroupMode {
     Open,
     #[default]
     Restricted,
 }
 
-impl fmt::Display for GroupMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GroupMode::Open => write!(f, "open"),
-            GroupMode::Restricted => write!(f, "restricted"),
-        }
-    }
-}
-
-impl std::str::FromStr for GroupMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "open" => Ok(GroupMode::Open),
-            "restricted" => Ok(GroupMode::Restricted),
-            other => Err(format!("unknown group mode: {other}")),
-        }
-    }
+fn unknown_group_mode(s: &str) -> String {
+    format!("unknown group mode: {s}")
 }
 
 /// Per-network transport preference (relay/direct vs. Tor).
@@ -44,4 +41,19 @@ pub enum TransportMode {
     #[default]
     Default,
     Tor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_mode_names_round_trip() {
+        assert_eq!(GroupMode::Open.to_string(), "open");
+        assert_eq!("restricted".parse(), Ok(GroupMode::Restricted));
+        assert_eq!(
+            "closed".parse::<GroupMode>(),
+            Err("unknown group mode: closed".to_string())
+        );
+    }
 }

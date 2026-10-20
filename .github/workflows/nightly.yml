@@ -2,9 +2,9 @@ name: Nightly
 
 # Rolling pre-release built from every push to master. Moves the `nightly` tag
 # to the new commit, recreates the `nightly` pre-release, and overwrites its
-# Linux, macOS, and Windows CLI assets plus Android app artifacts. Desktop
-# installers stay on the stable release workflow. `ray update --nightly`
-# compares binary checksums.
+# Linux, macOS, and Windows CLI and daemon binaries. Apps (Android, iOS, the
+# macOS app) and desktop installers ship only with versioned releases.
+# `ray update --nightly` compares binary checksums.
 on:
   push:
     branches:
@@ -230,96 +230,3 @@ jobs:
           files: |
             ray-windows-aarch64.exe
             ray-windows-aarch64.exe.sha256
-
-  android:
-    needs: roll-tag
-    # 24.04 (glibc 2.39): the prebuilt cargo-ndk from install-action is linked
-    # against glibc 2.39 and won't load on 22.04 (glibc 2.35). Safe here because
-    # this job's output is Android-target (bionic .so + APK), so the host glibc
-    # never becomes an end-user floor the way it does for the desktop binaries.
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android, x86_64-linux-android
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "release-android"
-          cache-on-failure: true
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-          # Caches ~/.gradle/caches + ~/.gradle/wrapper (keyed on the Gradle
-          # build files) so downloaded dependencies survive between runs.
-          cache: gradle
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # The default also requests the retired `tools` package.
-          packages: platform-tools
-
-      # The NDK is ~1GB; cache it so we download it once per version instead of
-      # on every run. sdkmanager below is a no-op on a cache hit.
-      - name: Cache Android NDK
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
-          key: android-ndk-27.2.12479018
-
-      # Prebuilt binary via install-action instead of `cargo install`, which
-      # would compile cargo-ndk from source on every run.
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-ndk
-
-      - name: Install NDK
-        run: |
-          sdkmanager "ndk;27.2.12479018" "build-tools;35.0.0"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
-
-      # Gradle's cargoNdkBuild task only rebuilds the .so; the Kotlin bindings
-      # are generated here so the checked-in copy can never drift from the APK.
-      - name: Generate UniFFI bindings
-        run: |
-          cargo build -p ray-mobile
-          cargo run -p ray-mobile --bin uniffi-bindgen -- generate \
-            --library target/debug/libray_mobile.so \
-            --language kotlin \
-            --out-dir android/app/src/main/java \
-            --no-format
-          sh scripts/format-generated-kotlin.sh
-
-      - name: Build and verify signed APK
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: bash scripts/build-android-release.sh
-
-      - name: Package APK
-        run: |
-          cp android/app/build/outputs/apk/release/app-release.apk rayfish-android.apk
-          sha256sum rayfish-android.apk > rayfish-android.apk.sha256
-
-      - name: Upload nightly assets
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: nightly
-          files: |
-            rayfish-android.apk
-            rayfish-android.apk.sha256

@@ -19,6 +19,7 @@
 #   - real apply publishes the expanded suggestions, the coordinator materializes
 #     its own, and the resolved allow actually opens the port over the TUN
 #   - --prune drops an out-of-band suggestion the spec doesn't mention
+#   - --invite-missing delivers an alias's invite privately; accepting joins
 #
 # Reads tests/e2e/apply/.servers (written by provision). Does NOT modify infra.
 # Re-runnable (resets rayfish state each run unless KEEP_STATE=1).
@@ -174,6 +175,33 @@ else
 fi
 [[ "$(sugg_tcp_allow "$A" 22)" -ge 2 ]] \
   && pass "--prune kept the spec's tcp:22 suggestions" || fail "--prune wrongly dropped the spec's own rules"
+
+# ---------------------------------------------------------------------------
+step "8. --invite-missing delivers an alias's invite privately"
+# carol = srv-c's user. In a new network she has no device yet, so apply sends
+# the invite to her identity instead of printing a code.
+NET2=lab
+C_IDENT="$(on "$A" "ray identityof $NET srv-c" | strip | tr -d '[:space:]')"
+[[ -n "$C_IDENT" ]] && pass "identityof srv-c printed an identity" || { fail "identityof srv-c printed nothing"; summary; }
+on "$A" "printf 'aliases:\n  carol: %s\nnetworks:\n  $NET2:\n    carol: {}\n' '$C_IDENT' > /tmp/spec3.yaml"
+APPLY8="$(on "$A" "ray apply /tmp/spec3.yaml --invite-missing" 2>&1 | strip)"
+echo "$APPLY8" | sed 's/^/   a| /'
+echo "$APPLY8" | grep -q 'delivered; awaiting the recipient' \
+  && pass "invite delivered to carol's identity" || fail "invite not delivered"
+inv_id(){ on "$C" "ray invitations --json" 2>/dev/null \
+  | jq -r --arg n "$NET2" '.[] | select(.network == $n and .status == "pending") | .id' | head -1; }
+INV="$(inv_id)"
+[[ -n "$INV" ]] && pass "srv-c has a pending invitation to $NET2" || { fail "no invitation on srv-c"; summary; }
+on "$C" "ray invitations accept $INV --hostname srv-c" 2>&1 | strip | sed 's/^/   c| /'
+if retry_until 120 "[[ \"\$(peer_online '$A' srv-c '$NET2')\" == 1 ]]"; then
+  pass "srv-c joined $NET2 after accepting"
+else
+  fail "srv-c did not join $NET2"
+fi
+[[ -z "$(inv_id)" ]] && pass "accepted invitation left the pending list" || fail "invitation still pending after accept"
+APPLY8B="$(on "$A" "ray apply /tmp/spec3.yaml --invite-missing" 2>&1 | strip)"
+! echo "$APPLY8B" | grep -q 'delivered; awaiting' \
+  && pass "re-apply sends nothing once carol has joined" || fail "re-apply delivered again"
 
 # ---------------------------------------------------------------------------
 summary

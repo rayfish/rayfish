@@ -55,7 +55,14 @@ class SendService : Service() {
             return START_NOT_STICKY
         }
 
-        startForegroundNotification(uris.size, peerName)
+        if (!startForegroundNotification(uris.size, peerName)) {
+            // Refused by the system (on Android 15+ usually the dataSync daily
+            // quota). A send outside the foreground would be killed partway,
+            // so report it failed instead of crashing on the refusal.
+            runCatching { notifyFailure(peerName, uris.size) }
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
 
         // Blocking work (stage + FFI send) off the main thread. sendFile is a
         // synchronous FFI call. One thread per start command; stop this startId
@@ -235,8 +242,25 @@ class SendService : Service() {
         return extra ?: emptyList()
     }
 
-    private fun startForegroundNotification(count: Int, peerName: String) {
-        postOngoing(count, peerName, null)
+    /** False when the system refuses to let the service go foreground. That
+     * throws ForegroundServiceStartNotAllowedException, an IllegalStateException
+     * caught by its base type because the class only exists from API 31. */
+    private fun startForegroundNotification(count: Int, peerName: String): Boolean =
+        try {
+            postOngoing(count, peerName, null)
+            true
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "could not go foreground", e)
+            false
+        }
+
+    /** Called on Android 15+ when the dataSync time limit runs out while this
+     * service is foreground. The service must stop within a few seconds or the
+     * system crashes the app. A running batch keeps going on its own thread. */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w(TAG, "foreground time limit reached, stopping")
+        stopForegroundCompat()
+        stopSelf()
     }
 
     /** Update the ongoing notification's status line.

@@ -311,14 +311,14 @@ fn bench_firewall(c: &mut Criterion) {
     group.bench_function("parse_eval_out_allow", |b| {
         b.iter(|| {
             let info = firewall::parse_packet_info(black_box(&packet)).unwrap();
-            black_box(allow_all.evaluate_packet(Direction::Out, &info, &peer, Some(net)))
+            black_box(allow_all.evaluate_packet(Direction::Out, &info, &peer, |name| name == net))
         });
     });
 
     group.bench_function("parse_eval_in_whitelist", |b| {
         b.iter(|| {
             let info = firewall::parse_packet_info(black_box(&packet)).unwrap();
-            black_box(whitelist.evaluate_packet(Direction::In, &info, &peer, Some(net)))
+            black_box(whitelist.evaluate_packet(Direction::In, &info, &peer, |name| name == net))
         });
     });
 

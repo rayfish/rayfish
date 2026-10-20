@@ -151,11 +151,12 @@ fn print_pending_requests(
 fn json_requested(command: &Command) -> bool {
     match command {
         Command::Status { json, .. }
+        | Command::Blocked { json }
         | Command::Invite { json, .. }
+        | Command::Invitations { json, .. }
         | Command::Requests { json, .. }
         | Command::Connect { json, .. }
         | Command::Connections { json, .. }
-        | Command::Contact { json, .. }
         | Command::Ping { json, .. }
         | Command::Netcheck { json }
         | Command::Admin { json, .. }
@@ -307,7 +308,12 @@ pub(crate) enum Command {
     },
     /// Run the daemon in the foreground (invoked by the system service)
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        /// Undo DNS and exit-node changes a dead daemon left behind, then exit
+        /// (run by the service manager after the daemon stops)
+        #[arg(long)]
+        cleanup: bool,
+    },
     /// Serve macOS app SSH sessions (started only by launchd).
     #[cfg(all(target_os = "macos", feature = "macos-app"))]
     #[command(hide = true)]
@@ -321,6 +327,19 @@ pub(crate) enum Command {
         /// Enable and persist mesh SSH when bringing the node up
         #[arg(long)]
         enable_ssh: bool,
+        /// Persist a setting after startup (repeatable; a bare key means on)
+        #[arg(
+            long = "set",
+            visible_alias = "enable",
+            value_name = "KEY[=VALUE]",
+            long_help = key_long_help(
+                "Persist a setting after startup. Repeat for multiple settings; a bare key means on.\n\
+                 Uses the same values and restart requirements as `ray config set`.\n\
+                 Settings are applied in order; a failure leaves earlier settings applied."
+            ),
+            add = complete::node_settings_keys()
+        )]
+        settings: Vec<UpSetting>,
         /// Enroll this machine with a controller after bringing the daemon up.
         #[arg(long)]
         controller: Option<ipc::EnrollmentTicket>,
@@ -371,6 +390,17 @@ pub(crate) enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// Review and answer private network invitations
+    ///
+    /// Coordinators send these with `ray apply --invite-missing`. Nothing joins
+    /// until you accept; declining also blocks the sender.
+    Invitations {
+        #[command(subcommand)]
+        action: Option<InvitationAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Mint and manage invite codes (coordinator only)
     ///
     /// Codes are one-time by default; `--reusable` mints a multi-use key.
@@ -420,20 +450,21 @@ pub(crate) enum Command {
     },
     /// Request a direct link, or review incoming ones
     ///
-    /// `ray connect <contact-id>` asks that peer for a direct 2-peer network,
+    /// `ray connect <identity>` asks that peer for a direct 2-peer network,
     /// with no room id or invite code needed; they run `ray connect approve` to
-    /// accept it. With no argument, lists the requests waiting on you.
+    /// accept it. Share yours from `ray status`. With no argument, lists the
+    /// requests waiting on you.
     Connect {
         #[command(subcommand)]
         action: Option<ConnectAction>,
-        /// The peer's contact id (from their `ray contact id` / `ray status`)
-        contact_id: Option<String>,
+        /// The peer's identity (from their `ray status` or `ray identityof`)
+        peer: Option<String>,
         /// Your hostname on the resulting network (defaults to your set name)
         ///
         /// `requires` because the id is what it names a hostname *on*: without
         /// one there is nothing to dial, and the flag would be dropped in
         /// silence while the queue got listed instead.
-        #[arg(long, requires = "contact_id")]
+        #[arg(long, requires = "peer")]
         hostname: Option<String>,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
@@ -448,12 +479,25 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// Show or rotate your contact id
+    /// Refuse a peer's connect requests and invitations
     ///
-    /// Share it so others can `ray connect` you.
-    Contact {
-        #[command(subcommand)]
-        action: Option<ContactAction>,
+    /// The peer gets no reply, so it cannot tell a block from a full queue,
+    /// though it can see you are online. Blocking a paired user's identity
+    /// also covers their devices that appear in your networks. Membership of
+    /// shared networks is unaffected; `ray kick` removes a member.
+    Block {
+        /// Identity or hostname of the peer
+        #[arg(add = complete::peers())]
+        peer: String,
+    },
+    /// Let a blocked peer reach you again
+    Unblock {
+        /// Identity or hostname of the peer
+        #[arg(add = complete::peers())]
+        peer: String,
+    },
+    /// List blocked peers
+    Blocked {
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
         json: bool,
@@ -558,8 +602,8 @@ pub(crate) enum Command {
         #[arg(long)]
         dry_run: bool,
         /// Mint one-time invites for hosts the spec expects but that haven't
-        /// joined yet (hostname-bound). Without this flag, the commands are
-        /// only printed.
+        /// joined yet (hostname-bound), and privately invite aliases that have
+        /// no joined device. Without this flag, they are only listed.
         #[arg(long)]
         invite_missing: bool,
         /// Print an example spec file and exit.
@@ -574,20 +618,29 @@ pub(crate) enum Command {
         /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
     },
-    /// Print a host's or contact's identity string
+    /// Rename a network on this machine only
+    ///
+    /// The name is what `ray` commands and Magic DNS use for the network here:
+    /// its hosts resolve as `<host>.<new-name>.ray` afterwards. Other members keep
+    /// their own name for it. A live network reconnects under the new name.
+    Rename {
+        /// Network name
+        #[arg(add = complete::networks())]
+        network: String,
+        /// New name (e.g. "lab" → alice.lab.ray)
+        new_name: String,
+    },
+    /// Print a host's identity string
     ///
     /// The value to paste into a `ray apply` spec's `aliases:` map. Resolves to
     /// the user identity if the device is paired, else the device's transport
     /// identity. Searches all networks; different identities sharing a name
     /// are listed in a table. The older `identityof <network> <hostname>` form
-    /// limits the lookup to one network.
-    ///
-    /// A contact id resolves its signed discovery record without connecting to
-    /// the peer. This returns the advertised device identity, which may differ
-    /// from its paired user identity. Requires a running daemon.
+    /// limits the lookup to one network. The identity is also what `ray
+    /// connect` takes. Requires a running daemon.
     #[command(visible_alias = "whois")]
     Identityof {
-        /// Hostname to look up across all networks, or a contact id
+        /// Hostname to look up across all networks
         #[arg(add = complete::peers())]
         peer: String,
         /// Hostname for a scoped lookup, treating PEER as the network name
@@ -738,6 +791,23 @@ pub(crate) enum Command {
         sha256: String,
         #[arg(long)]
         parent_pid: u32,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum InvitationAction {
+    /// Join the invitation's network
+    Accept {
+        /// Invitation id, or an unambiguous prefix
+        id: String,
+        /// Your hostname on the network (defaults to your set name)
+        #[arg(long)]
+        hostname: Option<ipc::MachineHostname>,
+    },
+    /// Refuse it and block the sender
+    Decline {
+        /// Invitation id, or an unambiguous prefix
+        id: String,
     },
 }
 
@@ -931,6 +1001,13 @@ pub(crate) enum ConnectAction {
         #[arg(add = complete::connect_requests())]
         id: String,
     },
+    /// Refuse a pending request and block the requester
+    #[command(visible_alias = "reject")]
+    Deny {
+        /// Hostname or short id of the requester
+        #[arg(add = complete::connect_requests())]
+        id: String,
+    },
 }
 
 /// `--help` text for a `ray config` key argument: the lead line plus the
@@ -981,7 +1058,8 @@ pub(crate) enum ConfigAction {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum MdnsAction {
     /// Enable mDNS local peer discovery
     On,
@@ -994,7 +1072,8 @@ pub(crate) enum MdnsAction {
     Scan,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum DnsAction {
     /// Configure the system resolver for .ray names
     On,
@@ -1002,14 +1081,6 @@ pub(crate) enum DnsAction {
     Partial,
     /// Remove Rayfish's system DNS configuration
     Off,
-}
-
-#[derive(Subcommand)]
-pub(crate) enum ContactAction {
-    /// Print your contact id (default)
-    Id,
-    /// Rotate your contact key (invalidates the old contact id)
-    Rotate,
 }
 
 #[derive(Subcommand)]
@@ -1054,6 +1125,25 @@ pub(crate) enum FirewallAction {
     /// Show current firewall rules
     #[command(visible_aliases = ["ls", "list"])]
     Show,
+    /// Check whether the firewall would let a packet through
+    ///
+    /// Runs the rules and defaults the data path enforces against one packet
+    /// and names what decides it, without sending anything: by default a new
+    /// packet from the peer, with `--direction out` one to it.
+    Test {
+        /// Peer: hostname, mesh IP, short id, endpoint id, or user identity
+        #[arg(add = complete::peers())]
+        peer: String,
+        /// Packet to check: tcp:<port>, udp:<port>, or icmp
+        #[arg(value_name = "PROTO[:PORT]")]
+        spec: String,
+        /// Direction: in (from the peer) or out (to the peer)
+        #[arg(long, default_value = "in", add = complete::words(&["in", "out"]))]
+        direction: String,
+        /// Look the peer up on this network only
+        #[arg(long, add = complete::networks())]
+        network: Option<String>,
+    },
     /// Set the inbound default policy (allow or deny)
     ///
     /// `deny` (the secure built-in default) blocks unsolicited inbound TCP/UDP;
@@ -1298,17 +1388,20 @@ pub(crate) enum FilesAction {
         /// Transfer ID (from 'ray files')
         id: u64,
     },
-    /// Auto-accept offers from your own devices (on|off)
+    /// Auto-accept files from trusted peers or your own devices
     ///
-    /// Per network, and only for your own paired devices. `on` also drains any
-    /// already-queued offers from them; `off` stops future auto-accept.
+    /// Use add/remove/list for exact peers, or <network> on|off for your own
+    /// paired devices. Enabling also accepts already-pending offers.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     AutoAccept {
-        /// Network name
-        #[arg(add = complete::networks())]
-        network: String,
+        #[command(subcommand)]
+        action: Option<FilesAutoAcceptAction>,
+        /// Network name (own devices only)
+        #[arg(required = true, add = complete::networks())]
+        network: Option<String>,
         /// `on` or `off`
-        #[arg(add = complete::words(&ON_OFF))]
-        state: String,
+        #[arg(required = true, add = complete::words(&ON_OFF))]
+        state: Option<String>,
     },
     /// Set the directory auto-accepted files are written to
     ///
@@ -1336,14 +1429,64 @@ pub(crate) enum FilesAction {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum FilesAutoAcceptAction {
+    /// Trust this exact peer to send files without approval
+    Add {
+        #[arg(add = complete::peers())]
+        peer: String,
+    },
+    /// Remove this peer from the trusted senders
+    Remove {
+        #[arg(add = complete::peers())]
+        peer: String,
+    },
+    /// List trusted sender identities
+    #[command(visible_alias = "ls")]
+    List,
+}
+
 fn check_root() {
-    #[cfg(windows)]
-    return;
     #[cfg(unix)]
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("rayfish requires root privileges to create TUN devices. Run with sudo.");
+    {
+        if uzers::get_effective_uid() == 0 || has_cap_net_admin() {
+            return;
+        }
+        eprintln!(
+            "rayfish needs root or CAP_NET_ADMIN to create TUN devices. Run with sudo, or use the systemd unit (which grants CAP_NET_ADMIN to a dynamic user)."
+        );
         std::process::exit(1);
     }
+}
+
+/// Whether this process holds CAP_NET_ADMIN — i.e. it is running under a
+/// unit like the bundled `rayfish.service`, which drops full root but keeps
+/// the network-administration capability the daemon needs for TUN, routes
+/// and DNS. Linux only; elsewhere this is always false.
+#[cfg(target_os = "linux")]
+fn has_cap_net_admin() -> bool {
+    const CAP_NET_ADMIN: u32 = 12;
+    // Read the effective capability set from /proc instead of calling
+    // capget(2): libc does not expose the __user_cap_* structs portably.
+    // CapEff uses one bit per capability, index 12 = CAP_NET_ADMIN.
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    let Some(hex) = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:").map(str::trim))
+    else {
+        return false;
+    };
+    let Ok(effective) = u64::from_str_radix(hex, 16) else {
+        return false;
+    };
+    effective & (1 << CAP_NET_ADMIN) != 0
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn has_cap_net_admin() -> bool {
+    false
 }
 
 /// Guards that must outlive the process: the file appender's `WorkerGuard`
@@ -1540,22 +1683,31 @@ fn install_panic_hook() {
             eprintln!("failed to write panic log: {e}");
         }
 
-        // Hand DNS back to the OS before we abort: restore the backed-up
-        // resolv.conf and drop the NetworkManager `dns=none` snippet, so a crash
-        // can't leave the host pointing at our dead resolver (it would otherwise
-        // blackhole all DNS until the service restarts). Synchronous, best-effort.
-        rayfish::dns::config::emergency_restore_resolv_conf();
-
-        // Remove the exit-node kernel state: the forwarding/NAT (restoring the
-        // sysctls) so a crash cannot leave the host an open router.
-        rayfish::exit_node::disable();
-        // Keep the client firewall across a crash so traffic cannot fall back to direct egress.
+        // Hand DNS back to the OS and remove the exit-node kernel state before
+        // we abort, so a crash leaves neither a dead resolver nor an open router.
+        rayfish::daemon::restore_host_state();
 
         // Print the standard panic message to stderr (journal), then fail fast so
         // the service manager restarts the daemon cleanly.
         default_hook(info);
         std::process::abort();
     }));
+}
+
+/// `ray daemon --cleanup`: the service manager's post-stop hook.
+fn cmd_daemon_cleanup() -> Result<()> {
+    #[cfg(unix)]
+    {
+        match daemon::cleanup_after_exit()? {
+            daemon::CleanupOutcome::Cleaned => tracing::info!("post-stop cleanup done"),
+            daemon::CleanupOutcome::DaemonRunning => {
+                tracing::info!("a rayfish daemon is running; leaving its state alone")
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("ray daemon --cleanup is not used on this platform")
 }
 
 /// Append a panic record to `<log_dir>/panic.log`. Best-effort durability in case
@@ -1616,7 +1768,7 @@ async fn run() -> Result<()> {
         return rayfish::ssh::app_helper::run().await;
     }
     // Keep the appender guard alive for the whole process so file logs flush.
-    let _log_guard = init_tracing(matches!(cli.command, Command::Daemon));
+    let _log_guard = init_tracing(matches!(cli.command, Command::Daemon { .. }));
 
     match cli.command {
         Command::Leave { name, delegate } => match delegate {
@@ -1684,7 +1836,11 @@ async fn run() -> Result<()> {
         } => ipc_status(machines, with_ips).await,
         Command::Report => ipc_report().await,
         Command::Logs { since, follow } => ipc_logs(since, follow).await,
-        Command::Daemon => {
+        Command::Daemon { cleanup: true } => {
+            check_root();
+            cmd_daemon_cleanup()
+        }
+        Command::Daemon { cleanup: false } => {
             check_root();
             install_panic_hook();
             #[cfg(windows)]
@@ -1701,8 +1857,9 @@ async fn run() -> Result<()> {
         Command::Up {
             hostname,
             enable_ssh,
+            settings,
             controller,
-        } => cmd_up(hostname, controller, enable_ssh).await,
+        } => cmd_up(hostname, controller, enable_ssh, settings).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
@@ -1717,6 +1874,7 @@ async fn run() -> Result<()> {
             action,
             json: _,
         } => ipc_invite(&network, action).await,
+        Command::Invitations { action, json: _ } => ipc_invitations(action).await,
         Command::Requests {
             network,
             action,
@@ -1728,17 +1886,17 @@ async fn run() -> Result<()> {
         },
         Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
-        // An action is a request-queue verb, a bare contact id dials that peer,
+        // An action is a request-queue verb, a bare identity dials that peer,
         // and with neither, show the queue, the same as `ray connections` did.
         // The two together parse (the positional fills, then the subcommand
         // does) and mean nothing, so they are rejected rather than served by
         // dropping one.
         Command::Connect {
             action,
-            contact_id,
+            peer,
             hostname,
             json: _,
-        } => match (action, contact_id) {
+        } => match (action, peer) {
             (None, Some(id)) => ipc_connect(&id, hostname).await,
             (None, None) => ipc_connections(None).await,
             (Some(action), None) => ipc_connections(Some(action)).await,
@@ -1747,7 +1905,9 @@ async fn run() -> Result<()> {
             }
         },
         Command::Connections { action, json: _ } => ipc_connections(action).await,
-        Command::Contact { action, json: _ } => ipc_contact(action).await,
+        Command::Block { peer } => ipc_block(&peer).await,
+        Command::Unblock { peer } => ipc_unblock(&peer).await,
+        Command::Blocked { json: _ } => ipc_blocked().await,
         Command::Ping {
             peer,
             count,
@@ -1771,6 +1931,7 @@ async fn run() -> Result<()> {
             example,
         } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
+        Command::Rename { network, new_name } => ipc_rename(&network, &new_name).await,
         Command::Identityof { peer, hostname, .. } => {
             cmd_identityof(&peer, hostname.as_deref()).await
         }
@@ -1832,25 +1993,18 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
         .await
         .context("rayfish daemon is not running; start it with: sudo ray up")?;
     ipc::send(&mut stream, msg).await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(ipc::recv(&mut stream).await?)
 }
 
 /// `ray mdns on|off|scan`. The two toggles are the `mdns` settings key under
 /// another name; `scan` is a read and goes its own way.
 async fn cmd_mdns(action: MdnsAction) -> Result<()> {
-    let state = match action {
-        MdnsAction::On => "on",
-        MdnsAction::Off => "off",
-        MdnsAction::Scan => return ipc_lan_peers().await,
-    };
+    if matches!(action, MdnsAction::Scan) {
+        return ipc_lan_peers().await;
+    }
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
-        value: state.to_string(),
+        value: action.to_string(),
         replace: false,
     })
     .await
@@ -1858,14 +2012,9 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
 
 /// `ray dns on|off`: apply or remove Magic DNS without changing the data plane.
 async fn cmd_dns(action: DnsAction) -> Result<()> {
-    let state = match action {
-        DnsAction::On => "on",
-        DnsAction::Partial => "partial",
-        DnsAction::Off => "off",
-    };
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Dns),
-        value: state.to_string(),
+        value: action.to_string(),
         replace: false,
     })
     .await
@@ -1949,9 +2098,7 @@ async fn cmd_config(action: Option<ConfigAction>) -> Result<()> {
     }
 }
 
-/// Resolve a user-typed key to the one the wire carries. `ray config` is the
-/// only command that takes a key as free text; every other caller names its key
-/// as a constant, so this is the single place a typo can enter.
+/// Resolve a `ray config` key to the one the wire carries.
 ///
 /// Reported here rather than by the daemon, with the registry's own wording:
 /// the key type makes an unknown key unrepresentable on the wire, so without
@@ -2023,16 +2170,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
         let uid = uid_for_user(user).ok_or_else(|| {
             anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)")
         })?;
-        let mut stream = ipc::connect()
-            .await
-            .context("rayfish daemon is not running; start it with: sudo ray up")?;
-        ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
-        match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => fail_with("error", &message),
-            other => fail_unexpected(&other),
-        }
-        Ok(())
+        ipc_mutate(ipc::IpcMessage::SetOperator { uid }).await
     }
 }
 
@@ -2063,14 +2201,49 @@ mod tests {
                 Command::Identityof { peer, hostname: Some(hostname), json: true }
                     if peer == "network-a" && hostname == "build-box"
             ));
-            let contact = iroh::SecretKey::from([7; 32]).public().to_string();
-            let cli = Cli::try_parse_from(["ray", command, &contact, "--json"]).unwrap();
+            let identity = iroh::SecretKey::from([7; 32]).public().to_string();
+            let cli = Cli::try_parse_from(["ray", command, &identity, "--json"]).unwrap();
             assert!(matches!(
                 cli.command,
-                Command::Identityof { peer, hostname: None, json: true } if peer == contact
+                Command::Identityof { peer, hostname: None, json: true } if peer == identity
             ));
         }
         assert!(Cli::try_parse_from(["ray", "identityof"]).is_err());
+    }
+
+    #[test]
+    fn file_auto_accept_supports_peers_and_legacy_network_toggle() {
+        for operation in ["add", "remove"] {
+            let cli = Cli::try_parse_from(["ray", "files", "auto-accept", operation, "build-box"])
+                .unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Files {
+                    action: Some(FilesAction::AutoAccept {
+                        action: Some(_),
+                        ..
+                    }),
+                    ..
+                }
+            ));
+        }
+        for operation in ["list", "ls"] {
+            assert!(Cli::try_parse_from(["ray", "files", "auto-accept", operation]).is_ok());
+        }
+        for state in ["on", "off"] {
+            let cli =
+                Cli::try_parse_from(["ray", "files", "auto-accept", "network-a", state]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Files { action: Some(FilesAction::AutoAccept { action: None, network: Some(network), state: Some(_), }), .. } if network == "network-a")
+            );
+        }
+        for args in [
+            vec!["ray", "files", "auto-accept"],
+            vec!["ray", "files", "auto-accept", "add"],
+            vec!["ray", "files", "auto-accept", "network-a"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
@@ -2153,6 +2326,75 @@ mod tests {
                 ..
             } if ticket == expected
         ));
+    }
+
+    #[test]
+    fn up_settings_combine_with_controller_and_hostname() {
+        let controller = iroh::EndpointAddr::from(iroh::SecretKey::generate().public());
+        let ticket = ipc::EnrollmentTicket::new(controller, [7; 32]);
+        let encoded = ticket.to_string();
+        let cli = Cli::try_parse_from([
+            "ray",
+            "up",
+            "--controller",
+            &encoded,
+            "--hostname",
+            "build-box",
+            "--enable",
+            "v4-bridge",
+            "--set",
+            "dns=partial",
+            "--enable",
+            "firewall.reject",
+            "--set",
+            "dns=off",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Up {
+                controller,
+                hostname,
+                settings,
+                ..
+            } => {
+                assert_eq!(controller, Some(ticket));
+                assert_eq!(hostname.as_deref(), Some("build-box"));
+                let expected: Vec<UpSetting> = [
+                    "v4-bridge=on",
+                    "dns=partial",
+                    "firewall.reject=on",
+                    "dns=off",
+                ]
+                .into_iter()
+                .map(|s| s.parse().unwrap())
+                .collect();
+                assert_eq!(settings, expected);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn up_rejects_invalid_settings_before_contacting_the_daemon() {
+        for flag in ["--set", "--enable"] {
+            for assignment in [
+                "unknown-key=on",
+                "net.auto-accept-files=on",
+                "dns=invalid",
+                "v4-bridge=maybe",
+                "ssh-port=0",
+                "download-dir=relative",
+                "firewall.default-in=invalid",
+                "quic-engine",
+                "=on",
+            ] {
+                assert!(
+                    Cli::try_parse_from(["ray", "up", flag, assignment]).is_err(),
+                    "{flag} {assignment}"
+                );
+            }
+            assert!(Cli::try_parse_from(["ray", "up", flag]).is_err());
+        }
     }
 
     #[test]

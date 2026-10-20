@@ -379,7 +379,7 @@ impl Ipv6Prefix {
 }
 
 /// Who may route out through us on one network.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Allow {
     /// `ray exit-node allow <net> '*'`: any member of the network.
     any: bool,
@@ -445,13 +445,15 @@ impl ExitServer {
         self.nets.load().contains_key(network)
     }
 
-    /// Whether an exit node we offer can carry IPv6. Read at the same moment as
-    /// [`is_offering`](Self::is_offering) when publishing the roster claim, so the
-    /// two never disagree about what this host does.
+    /// Whether an exit node we offer can carry IPv4: an IPv4 uplink and a
+    /// translation pool the kernel accepted.
     pub fn offers_v4(&self) -> bool {
         self.v4_uplink.load(Ordering::Relaxed) && self.v4_pool.load(Ordering::Relaxed)
     }
 
+    /// Whether an exit node we offer can carry IPv6. Read at the same moment as
+    /// [`is_offering`](Self::is_offering) when publishing the roster claim, so the
+    /// two never disagree about what this host does.
     pub fn offers_v6(&self) -> bool {
         self.v6_uplink.load(Ordering::Relaxed)
     }
@@ -497,10 +499,41 @@ impl ExitServer {
         self.nets.store(Arc::new(nets));
     }
 
+    /// Follow a network renamed on this node: its allow-list is now consulted
+    /// under `to`. Leaves the policy alone when the network offers no exit,
+    /// including on standby, when nothing is loaded.
+    pub fn rename_network(&self, from: &str, to: &str) {
+        self.nets.rcu(|nets| {
+            let mut nets = HashMap::clone(nets);
+            if let Some(allow) = nets.remove(from) {
+                nets.insert(SmolStr::new(to), allow);
+            }
+            nets
+        });
+    }
+
     /// Drop all exit offers (data plane going to standby). Pair with
     /// [`apply_os`](Self::apply_os) to take the kernel state down with them.
     pub fn clear(&self) {
         self.nets.store(Arc::default());
+    }
+
+    /// Re-read the host's addresses and on-link prefixes that transit is refused
+    /// to. Runs on every reconcile and on the daemon's periodic kernel check, so a
+    /// new lease or interface is covered within one tick instead of at the next
+    /// `ray up`. Spawns a process; callers keep it off the async runtime.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    pub fn refresh_host_interfaces(&self) {
+        let host = host_interfaces();
+        if **self.self_addrs.load() != host.addrs {
+            self.set_self_addrs(host.addrs);
+        }
+        if **self.on_link.load() != host.on_link {
+            self.set_on_link(host.on_link);
+        }
+        if **self.on_link_v4.load() != host.on_link_v4 {
+            self.on_link_v4.store(Arc::new(host.on_link_v4));
+        }
     }
 
     /// Reconcile the kernel forwarding/NAT with the current offer state: install it
@@ -516,17 +549,14 @@ impl ExitServer {
     pub fn apply_os(&self, tun_name: &str) -> Option<String> {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         if self.is_active() {
-            let host = host_interfaces();
-            self.set_self_addrs(host.addrs);
-            self.set_on_link(host.on_link);
-            self.on_link_v4.store(Arc::new(host.on_link_v4));
+            self.refresh_host_interfaces();
             // Re-read rather than cache: an uplink gains or loses IPv6 with a
             // lease or a link change, and the claim we publish has to follow.
             self.v6_uplink.store(has_v6_uplink(), Ordering::Relaxed);
             self.v4_uplink.store(has_v4_uplink(), Ordering::Relaxed);
             let enabled = crate::config::config_dir().and_then(|dir| {
                 self.ipv4.initialize(dir.join("exit-ipv4-leases.json"))?;
-                enable(tun_name)
+                enable(tun_name, self.v4_uplink.load(Ordering::Relaxed))
             });
             match enabled {
                 Ok(v4_pool) => self.v4_pool.store(v4_pool, Ordering::Relaxed),
@@ -744,18 +774,6 @@ impl ExitClient {
         self.inner.load().is_some()
     }
 
-    /// Whether a datagram from sender `peer_user` is our own exit-node return
-    /// traffic (the sender is our chosen exit peer). Deliberately not scoped to
-    /// the arrival network: the gateway tags replies with whatever shared network
-    /// its generic route picks, which need not be the network we selected the
-    /// exit on. The sender identity is what the exemption trusts.
-    pub fn is_return_traffic(&self, peer_user: &EndpointId) -> bool {
-        self.inner
-            .load()
-            .as_ref()
-            .is_some_and(|s| &s.peer_user == peer_user)
-    }
-
     /// Whether return traffic arriving from a peer whose verified mesh address is
     /// `peer_v6` is our own exit-node return traffic. The sender's address is
     /// derived by the reader from our own roster (so it cannot be forged), which
@@ -773,6 +791,18 @@ impl ExitClient {
     pub fn set(&self, selection: Option<ExitSelection>) {
         self.inner.store(selection.map(Arc::new));
     }
+
+    /// Follow a network renamed on this node: a selection on `from` now tags its
+    /// traffic with, and routes it on, `to`.
+    pub fn rename_network(&self, from: &str, to: &str) {
+        self.inner.rcu(|selection| match selection {
+            Some(s) if s.network == from => Some(Arc::new(ExitSelection {
+                network: SmolStr::new(to),
+                ..ExitSelection::clone(s)
+            })),
+            other => other.clone(),
+        });
+    }
 }
 
 /// Select DNS upstreams reachable through the exit. Explicit replacements stay
@@ -780,7 +810,7 @@ impl ExitClient {
 pub fn tunnel_upstreams(
     carries: ExitFamilies,
     configured: &crate::config::ServerOverride,
-) -> Option<Vec<SocketAddr>> {
+) -> Vec<SocketAddr> {
     dns::tunnel_upstreams(carries, configured)
 }
 
@@ -809,6 +839,24 @@ impl Default for ExitContext {
 // Kernel state, shared across the platforms that implement a gateway
 // ---------------------------------------------------------------------------
 
+/// Ranges that never reach the internet, so a client guard that blocks them
+/// protects nothing: RFC 1918, CGNAT (Tailscale), loopback, link-local,
+/// multicast and broadcast, and their IPv6 counterparts. Selecting an exit keeps
+/// these reachable directly.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const NON_INTERNET_V4: [&str; 8] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/3",
+];
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const NON_INTERNET_V6: [&str; 4] = ["::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
+
 /// The overlay source range a gateway masquerades when forwarding out its uplink.
 /// One family, because the overlay only ever carries one.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -832,6 +880,12 @@ const V6_FORWARD: &str = "net.inet6.ip6.forwarding";
 ///
 /// Present-but-empty fields mean "we could not read the original, so do not touch
 /// it on the way out". `pf_token` is BSD-only (see [`pf_enable`]).
+///
+/// `extra` holds further sysctls to put back after `v4`/`v6`, in order: on Linux the
+/// per-interface IPv6 `forwarding` values (writing `all` overwrites every one of
+/// them) and any `accept_ra` we raised. Each is its own `sysctl:<path>=<value>` line,
+/// which an older build reading the file skips, and a file an older build wrote
+/// simply has none.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 #[derive(Default)]
 struct Snapshot {
@@ -839,6 +893,15 @@ struct Snapshot {
     v6: String,
     pf_token: Option<String>,
     tun_name: Option<String>,
+    extra: Vec<SavedSysctl>,
+}
+
+/// One sysctl value to restore on teardown.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SavedSysctl {
+    path: String,
+    value: String,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -850,6 +913,18 @@ impl Snapshot {
             return snap;
         };
         for line in body.lines() {
+            // Split on the last `=`: values are numbers or a pf token, while an
+            // interface name inside a `sysctl:` path may itself contain one.
+            if let Some((path, value)) = line
+                .strip_prefix("sysctl:")
+                .and_then(|rest| rest.rsplit_once('='))
+            {
+                snap.extra.push(SavedSysctl {
+                    path: path.to_string(),
+                    value: value.to_string(),
+                });
+                continue;
+            }
             match line.split_once('=') {
                 Some(("tun", v)) => snap.tun_name = Some(v.to_owned()),
                 Some(("v4", v)) => snap.v4 = v.to_string(),
@@ -869,15 +944,24 @@ impl Snapshot {
         if let Some(token) = &self.pf_token {
             body.push_str(&format!("pf_token={token}\n"));
         }
+        for saved in &self.extra {
+            body.push_str(&format!("sysctl:{}={}\n", saved.path, saved.value));
+        }
         crate::config::write_file(path, body.as_bytes(), false)
     }
 
     /// Put the forwarding sysctls back, skipping any we never managed to read.
+    /// `extra` goes last, because writing `all/forwarding` resets every
+    /// interface's own value and those have to land on top of it. An interface
+    /// that has gone away since fails its write, which is ignored.
     fn restore_sysctls(&self) {
         for (name, value) in [(V4_FORWARD, &self.v4), (V6_FORWARD, &self.v6)] {
             if !value.is_empty() {
                 let _ = write_sysctl(name, value);
             }
+        }
+        for saved in &self.extra {
+            let _ = write_sysctl(&saved.path, &saved.value);
         }
     }
 }
@@ -892,11 +976,16 @@ fn snapshot_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+mod forward_fw;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 use linux::*;
 #[cfg(target_os = "linux")]
-pub use linux::{disable, install_client_routing, teardown_client_routing};
+pub use linux::{
+    KernelCheck, check_kernel_state, disable, install_client_routing, reassert_forward_firewall,
+    teardown_client_routing,
+};
 
 #[cfg(target_os = "macos")]
 mod pf_client;
@@ -1291,6 +1380,284 @@ mod tests {
         }
     }
 
+    /// The client marks are OR'd in under a mask, only for traffic to this host,
+    /// and the reply mark only goes onto packets nobody else marked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_client_marks_never_clobber_another_tools_bits() {
+        let script = client_nft_script("tun-rayfish", &GuardExceptions::default());
+        assert!(
+            script.contains("fib daddr type local ct mark set ct mark | 0x7261"),
+            "{script}"
+        );
+        assert!(
+            script.contains("fib daddr type local meta mark set meta mark | 0x7261"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "meta mark == 0 ct mark & 0x7261 == 0x7261 meta mark set meta mark | 0x7261"
+            ),
+            "{script}"
+        );
+        assert!(
+            !script.contains("mark set 0x"),
+            "no bare assignment: {script}"
+        );
+    }
+
+    /// The guard only refuses new flows leaving outside the tunnel: replies,
+    /// marked traffic, mid-flow TCP and the excepted ranges all pass first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_client_guard_only_drops_new_flows_to_the_internet() {
+        let local = GuardExceptions {
+            v4: strs(&["10.0.0.0/8", "172.17.0.0/16"]),
+            v6: strs(&["fc00::/7"]),
+        };
+        let script = client_nft_script("tun-rayfish", &local);
+        let guard = script
+            .split("chain guard {")
+            .nth(1)
+            .and_then(|rest| rest.split("chain guard_output").next())
+            .expect("the script has a guard chain");
+        let order = [
+            "oifname { \"lo\", \"tun-rayfish\" } return",
+            "ct direction reply return",
+            "ip daddr { 10.0.0.0/8, 172.17.0.0/16 } return",
+            "ip6 daddr { fc00::/7 } return",
+            "tcp flags & (syn | ack) != syn return",
+            "ct state new drop",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|rule| {
+                guard
+                    .find(rule)
+                    .unwrap_or_else(|| panic!("{rule}: {guard}"))
+            })
+            .collect();
+        assert!(positions.is_sorted(), "{guard}");
+        assert_eq!(script.matches("policy drop").count(), 0, "{script}");
+        assert_eq!(script.matches("jump guard").count(), 2, "{script}");
+    }
+
+    /// The macOS guard blocks only new flows on the uplinks, after letting the
+    /// non-internet ranges through, and has nothing to block without an uplink.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_pf_guard_blocks_new_flows_on_the_uplinks_only() {
+        assert!(pf_client::guard_rules(&[]).is_empty());
+        let rules = pf_client::guard_rules(&strs(&["en0", "en1"]));
+        let pass = rules.find("pass out quick inet to { 0.0.0.0/8, 10.0.0.0/8");
+        let block = rules.find("block drop out quick on { en0 en1 } proto tcp flags S/SA");
+        assert!(pass.is_some() && block.is_some() && pass < block, "{rules}");
+        assert!(!rules.contains("block drop out quick all"), "{rules}");
+    }
+
+    /// Routes in `main` and other tables become guard exceptions; our own TUN,
+    /// our own table, `default` and typed routes do not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn routed_prefixes_skip_defaults_and_our_own_routes() {
+        let show = "\
+default via 192.0.2.1 dev eth0 proto dhcp metric 100
+192.0.2.0/24 dev eth0 proto kernel scope link src 192.0.2.10
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1
+100.64.0.0/10 dev tailscale0 table 52
+default dev tun-rayfish table 29793
+198.51.100.0/24 dev tun-rayfish scope link
+203.0.113.7 dev wg0 scope link
+local 192.0.2.10 dev eth0 table local proto kernel scope host src 192.0.2.10
+unreachable default metric 4294967295 table 29793
+\tnexthop via 192.0.2.1 dev eth0 weight 1
+";
+        assert_eq!(
+            parse_routed_prefixes(show, "tun-rayfish"),
+            strs(&[
+                "192.0.2.0/24",
+                "172.17.0.0/16",
+                "100.64.0.0/10",
+                "203.0.113.7/32"
+            ])
+        );
+    }
+
+    /// nft refuses a set with overlapping intervals, so covered prefixes and
+    /// duplicates go, and the two families never cover each other.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn merged_prefixes_do_not_overlap() {
+        assert_eq!(
+            merge_prefixes(strs(&[
+                "10.0.0.0/8",
+                "10.1.0.0/16",
+                "192.168.1.0/24",
+                "192.168.1.0/24",
+                "0.0.0.0/8",
+                "::/8",
+                "fc00::/7",
+                "fd00::/8",
+            ])),
+            strs(&[
+                "10.0.0.0/8",
+                "192.168.1.0/24",
+                "0.0.0.0/8",
+                "::/8",
+                "fc00::/7"
+            ])
+        );
+    }
+
+    /// The bypass rule matches the mark under its mask, add and del alike, and the
+    /// batch carries one command per line without the family.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_bypass_rule_is_masked_and_batched() {
+        assert_eq!(
+            bypass_rule_args("add"),
+            strs(&[
+                "rule",
+                "add",
+                "fwmark",
+                "0x7261/0x7261",
+                "table",
+                "main",
+                "pref",
+                PREF_BYPASS
+            ])
+        );
+        assert_eq!(bypass_rule_args("del")[1], "del");
+        assert_eq!(
+            batch_script(&[bypass_rule_args("add"), strs(&["rule", "del", "pref", "1"])]),
+            "rule add fwmark 0x7261/0x7261 table main pref 100\nrule del pref 1\n"
+        );
+    }
+
+    /// A JSON dump answers for itself; without one, the plain listing does,
+    /// so an `nft` without JSON support does not read every table as gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_table_check_without_json_falls_back_to_listing_it() {
+        let json = r#"{"nftables":[{"table":{"family":"inet","name":"rayfish-exit"}}]}"#;
+        let never = || panic!("a readable dump needs no second run");
+        assert!(nft_table_exists_with(Some(json), "rayfish-exit", never));
+        assert!(!nft_table_exists_with(Some(json), "other", never));
+        for unreadable in [None, Some(""), Some("JSON support not compiled-in")] {
+            assert!(nft_table_exists_with(unreadable, "rayfish-exit", || true));
+            assert!(!nft_table_exists_with(unreadable, "rayfish-exit", || false));
+        }
+    }
+
+    /// The gateway clamps the MSS of SYNs crossing the TUN in both directions,
+    /// and the chain that does it filters nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_server_nft_ruleset_clamps_mss_on_the_tun() {
+        let rules = server_nft_ruleset("tun-rayfish");
+        assert!(
+            rules.contains("type filter hook forward priority mangle; policy accept;"),
+            "{rules}"
+        );
+        for dir in ["iifname", "oifname"] {
+            assert!(
+                rules.contains(&format!(
+                    "{dir} \"tun-rayfish\" tcp flags & (syn | rst) == syn \
+                     tcp option maxseg size > 1220 tcp option maxseg size set 1220"
+                )),
+                "{rules}"
+            );
+        }
+        assert!(!rules.contains(" drop"), "{rules}");
+        assert!(!rules.contains("rt mtu"), "{rules}");
+    }
+
+    /// The periodic check sees a full rule set as intact, and a missing piece or
+    /// an older build's unmasked bypass as broken.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_rules_are_checked_for_every_piece() {
+        let full = "\
+0:\tfrom all lookup local
+99:\tfrom 2001:db8::5 lookup main
+100:\tfrom all fwmark 0x7261/0x7261 lookup main
+101:\tfrom all lookup main suppress_prefixlength 0
+102:\tfrom all lookup 29793
+32766:\tfrom all lookup main
+";
+        assert!(client_rules_present(full));
+        assert!(!client_rules_present(
+            &full.replace("0x7261/0x7261", "0x7261")
+        ));
+        assert!(!client_rules_present(&full.replace("102:", "103:")));
+        assert!(!client_rules_present(&full.replace(
+            "101:\tfrom all lookup main suppress_prefixlength 0\n",
+            ""
+        )));
+    }
+
+    /// Only real interfaces at `accept_ra=1` are raised: not the templates, not
+    /// loopback, not our TUN, not one already at 0 or 2, and not one that was
+    /// already forwarding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accept_ra_is_raised_only_where_forwarding_would_silence_it() {
+        let current: Vec<(String, String)> = [
+            ("all", "1"),
+            ("default", "1"),
+            ("lo", "1"),
+            ("tun-rayfish", "1"),
+            ("eth0", "1"),
+            ("eth1", "0"),
+            ("wlan0", "2"),
+            ("enp3s0", "1"),
+        ]
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(
+            ra_interfaces_to_raise(&current, "tun-rayfish", &[]),
+            ["eth0", "enp3s0"]
+        );
+        // An interface that was forwarding on its own already ignored RAs.
+        assert_eq!(
+            ra_interfaces_to_raise(&current, "tun-rayfish", &["enp3s0".to_string()]),
+            ["eth0"]
+        );
+    }
+
+    /// The snapshot keeps its extra sysctls in order and still reads a file an
+    /// older build wrote, which has none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_snapshot_round_trips_extra_sysctls_and_reads_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exit-forward.snapshot");
+        fs::write(&path, "v4=0\nv6=0\n").unwrap();
+        let old = Snapshot::load(&path);
+        assert_eq!((old.v4.as_str(), old.v6.as_str()), ("0", "0"));
+        assert!(old.extra.is_empty());
+
+        let saved = |path: &str, value: &str| SavedSysctl {
+            path: path.to_string(),
+            value: value.to_string(),
+        };
+        let snap = Snapshot {
+            v4: "0".into(),
+            v6: "0".into(),
+            pf_token: None,
+            tun_name: None,
+            extra: vec![
+                saved("net/ipv6/conf/eth0/forwarding", "1"),
+                saved("net/ipv6/conf/odd=name/accept_ra", "1"),
+            ],
+        };
+        snap.save(&path).unwrap();
+        let back = Snapshot::load(&path);
+        assert_eq!(back.extra, snap.extra);
+        assert_eq!(back.v6, "0");
+    }
+
     /// The Linux twin of the above, and the same argument: `nft_load` never runs in
     /// CI either, so the ruleset text is pinned rather than exercised.
     #[cfg(target_os = "linux")]
@@ -1353,19 +1720,17 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         // Both families, or IPv4 alone: the captured upstreams already ride it.
         assert!(
             tunnel_upstreams(Dual, &ServerOverride::default())
-                .unwrap()
                 .iter()
                 .all(SocketAddr::is_ipv4)
         );
         assert!(
             tunnel_upstreams(V4, &ServerOverride::default())
-                .unwrap()
                 .iter()
                 .all(SocketAddr::is_ipv4)
         );
 
         // Nothing configured: the public fallback pair, on port 53.
-        let got = tunnel_upstreams(V6, &ServerOverride::default()).unwrap();
+        let got = tunnel_upstreams(V6, &ServerOverride::default());
         assert_eq!(
             got,
             PUBLIC_FALLBACK_DNS_V6
@@ -1379,7 +1744,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             servers: strs(&["2001:4860:4860::8844", "192.168.1.1"]),
             replace: false,
         };
-        let got = tunnel_upstreams(V6, &augment).unwrap();
+        let got = tunnel_upstreams(V6, &augment);
         assert_eq!(got[0], "[2001:4860:4860::8844]:53".parse().unwrap());
         assert_eq!(got.len(), 1 + PUBLIC_FALLBACK_DNS_V6.len());
 
@@ -1389,7 +1754,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(V6, &replace).unwrap(),
+            tunnel_upstreams(V6, &replace),
             vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
         );
 
@@ -1400,7 +1765,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(V6, &v4_only).unwrap(),
+            tunnel_upstreams(V6, &v4_only),
             vec!["192.168.1.1:53".parse::<SocketAddr>().unwrap()],
             "an explicit --replace list is not silently swapped for public resolvers"
         );
@@ -1411,7 +1776,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             servers: strs(&["192.168.1.1", "9.9.9.9"]),
             replace: false,
         };
-        let got = tunnel_upstreams(V4, &lan).unwrap();
+        let got = tunnel_upstreams(V4, &lan);
         assert_eq!(got[0], "9.9.9.9:53".parse().unwrap());
         assert!(!got.contains(&"192.168.1.1:53".parse().unwrap()));
         let lan_replace = ServerOverride {
@@ -1419,7 +1784,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             ..lan
         };
         assert_eq!(
-            tunnel_upstreams(V4, &lan_replace).unwrap(),
+            tunnel_upstreams(V4, &lan_replace),
             vec!["9.9.9.9:53".parse::<SocketAddr>().unwrap()]
         );
 
@@ -1430,7 +1795,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(V6, &mixed).unwrap(),
+            tunnel_upstreams(V6, &mixed),
             vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
         );
 
@@ -1441,7 +1806,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(V6, &junk).unwrap().len(),
+            tunnel_upstreams(V6, &junk).len(),
             PUBLIC_FALLBACK_DNS_V6.len()
         );
     }

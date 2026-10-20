@@ -46,7 +46,7 @@ just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 
 ## Wire protocol
 
-- ALPN negotiation is the compatibility gate for `rayfish/{mesh,files,pair,connect}/<v>`; there is no in-band version handshake.
+- ALPN negotiation is the compatibility gate for `rayfish/{mesh,files,pair,connect,invite}/<v>`; there is no in-band version handshake.
 - Network messages and `canonical_group_bytes` use msgpack arrays (`rmp_serde::to_vec`). Adding, removing, retyping, or reordering fields requires the corresponding ALPN bump in the same commit. `#[serde(default)]` only lets a new reader accept an older, shorter array; old readers reject longer arrays.
 - Never use `skip_serializing_if` on array-encoded wire structs: it shifts later fields. Reordering fields of the same type can silently swap their meaning.
 - Changing `Member` also requires a mesh ALPN bump. Its array-encoded roster travels over the shared, unversioned `iroh_blobs` ALPN.
@@ -80,3 +80,4 @@ just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 - Conventional commit subjects (`feat`/`fix`/`docs`/...) so git-cliff can generate the changelog.
 - Any user-visible change gets an `[Unreleased]` CHANGELOG entry (`Added`/`Changed`/`Fixed`/`Security`/`Performance`, in that order), written from the user's view. Skip internal churn.
 - Keep `docs/` untracked. It holds local plans and specifications.
+- Deploy the apps (Android, macOS, iOS) only for a patch or minor release, cut with a `v*` tag. No app builds in nightlies, and no uploads to TestFlight, the App Store, the Play Store, or a GitHub release from master pushes or PRs. The `nightly` pre-release carries only the `ray` CLI and daemon binaries, for `ray update --nightly`.

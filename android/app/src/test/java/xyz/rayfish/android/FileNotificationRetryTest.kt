@@ -62,6 +62,26 @@ class FileNotificationRetryTest {
         notifications.cancelAll()
     }
 
+    @Test fun interruptedReceiveOffersRetryUsingTheSameOffer() {
+        OfferNotifier.poll(context) { listOf(offer) }
+        OfferNotifier.markActedOn(context, offer.id)
+        OfferNotifier.markFailed(context, offer.id)
+        OfferNotifier.poll(context) { listOf(offer) }
+
+        val notification = notifications.activeNotifications
+            .single { it.id == OfferNotifier.notifId(offer.id) }.notification
+        assertEquals(context.getString(R.string.action_retry), notification.actions[0].title.toString())
+        assertEquals(
+            context.getString(R.string.notif_offer_retry_text, offer.from, formatSize(offer.size)),
+            notification.extras.getString(Notification.EXTRA_TEXT),
+        )
+        assertTrue(offer.id in OfferNotifier.retryable.value)
+
+        OfferNotifier.poll(context) { emptyList() }
+        assertFalse(offer.id in OfferNotifier.retryable.value)
+        assertTrue(notifications.activeNotifications.none { it.id == OfferNotifier.notifId(offer.id) })
+    }
+
     @Test fun failedOfferPostRetriesWithoutAnotherEventThenReturnsToIdle() {
         val executor = ScheduledThreadPoolExecutor(1)
         val attempts = AtomicInteger()

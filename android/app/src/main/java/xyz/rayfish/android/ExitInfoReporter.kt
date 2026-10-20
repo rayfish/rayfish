@@ -137,13 +137,23 @@ object ExitInfoReporter {
         // held open.
         val trace = readTrace(record)
 
-        Sentry.withScope { scope ->
-            scope.level = SentryLevel.WARNING
+        // For a signaled exit the status is the signal number, the only thing
+        // that tells an OEM SIGKILL apart from anything else when the
+        // description is empty.
+        val status = record.status.toString()
+
+        // The scope goes to the capture, not through `Sentry.withScope`. See
+        // Telemetry.capture: under withScope none of this reached the event, so
+        // every exit landed in one issue at info level, grouped by the startup
+        // thread's stack instead of by reason.
+        Sentry.captureMessage("app exit: $reason ($grouping)", SentryLevel.WARNING) { scope ->
             scope.setTag("install_id", NodeHolder.installId(context))
             scope.setTag("exit_reason", reason)
-            scope.setFingerprint(listOf("app-exit", reason, grouping))
+            scope.setTag("exit_status", status)
+            scope.setFingerprint(listOf("app-exit", reason, status, grouping))
             scope.setContexts("app_exit", mapOf(
                 "reason" to reason,
+                "status" to record.status,
                 "description" to description,
                 "importance" to importanceName(record.importance),
                 "pss_kb" to record.pss,
@@ -153,7 +163,6 @@ object ExitInfoReporter {
             if (trace != null) {
                 scope.addAttachment(Attachment(trace, "app-exit-trace.txt", "text/plain"))
             }
-            Sentry.captureMessage("app exit: $reason ($grouping)")
         }
         Log.i(TAG, "reported previous app exit: $reason ($grouping), trace=${trace?.size ?: 0}B")
     }

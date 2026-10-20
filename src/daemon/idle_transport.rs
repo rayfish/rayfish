@@ -1,8 +1,8 @@
-//! Android-only idle suspension for the mesh transport.
+//! Idle suspension for the mesh transport on phones (Android and iOS).
 //!
 //! The VPN service, TUN interface, and DNS path remain alive. This task only
-//! watches outgoing TUN activity and closes mesh links after a quiet period.
-//! The iroh endpoint and relay stay reachable for file offers.
+//! watches outgoing TUN activity and, after a quiet period, closes mesh links
+//! and drops the relay. The phone wakes for its own traffic, not for others'.
 
 use std::sync::Arc;
 use std::sync::atomic;
@@ -38,7 +38,7 @@ pub(crate) fn spawn(
                     if current == observed {
                         unchanged_checks += 1;
                         if unchanged_checks * CHECK.as_secs() >= IDLE.as_secs() {
-                            registry.suspend_mesh_links();
+                            registry.suspend_mesh_links().await;
                         }
                     } else {
                         observed = current;

@@ -38,6 +38,7 @@ final class TunnelController: ObservableObject {
         }
     }
     @Published var isLoading = false
+    @Published private(set) var receivingFileIDs: Set<UInt64> = []
     @Published var activity: String?
     @Published private(set) var launchAtLoginEnabled = false
     @Published private(set) var connectionStatus: NEVPNStatus = .disconnected {
@@ -92,7 +93,9 @@ final class TunnelController: ObservableObject {
         // Closing a window does not stop status updates for the menu bar.
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 3_000_000_000) }
+                let isReceiving = self?.receivingFileIDs.isEmpty == false
+                    || self?.status?.files?.contains(where: { $0.state == .transferring }) == true
+                do { try await Task.sleep(nanoseconds: isReceiving ? 1_000_000_000 : 3_000_000_000) }
                 catch { return }
                 await self?.refresh()
             }
@@ -394,9 +397,51 @@ final class TunnelController: ObservableObject {
         _ = await perform(ProviderRequest(action: .rejectConnection, id: id))
     }
 
+    func blockConnection(id: String) async {
+        _ = await perform(ProviderRequest(action: .blockConnection, id: id))
+    }
+
+    func acceptInvitation(id: String) async {
+        _ = await perform(ProviderRequest(action: .acceptInvitation, id: id))
+    }
+
+    func declineInvitation(id: String) async {
+        _ = await perform(ProviderRequest(action: .declineInvitation, id: id))
+    }
+
+    func sendInvite(network: String, recipient: String) async -> String? {
+        await perform(ProviderRequest(action: .sendInvite, name: network, peer: recipient))?.message
+    }
+
+    func setInboundPolicy(_ policy: ProviderInboundPolicy) async {
+        _ = await perform(ProviderRequest(action: .setInboundPolicy, inboundPolicy: policy))
+    }
+
+    func blockPeer(_ peer: String) async {
+        _ = await perform(ProviderRequest(action: .blockPeer, peer: peer))
+    }
+
+    func unblockPeer(_ peer: String) async {
+        _ = await perform(ProviderRequest(action: .unblockPeer, peer: peer))
+    }
+
     func acceptFile(_ file: ProviderFile, directory: URL) async {
-        _ = await perform(ProviderRequest(action: .acceptFile, fileId: file.transferId,
-                                         directory: directory.path, uid: getuid(), gid: getgid()))
+        guard !isLoading, !isQuitting, receivingFileIDs.insert(file.transferId).inserted else { return }
+        defer { receivingFileIDs.remove(file.transferId) }
+        error = nil
+        do {
+            // A receive waits for the entire download. Keep status polling active.
+            let response = try await TunnelIPC.request(ProviderRequest(action: .acceptFile, fileId: file.transferId,
+                                                                      directory: directory.path, uid: getuid(), gid: getgid()))
+            guard isConnected, !isQuitting else { return }
+            status = response.status
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    func setFileAutoAccept(peer: String, allow: Bool) async -> Bool {
+        await perform(ProviderRequest(action: .setFileAutoAccept, enabled: allow, peer: peer)) != nil
     }
 
     func rejectFile(_ file: ProviderFile) async {

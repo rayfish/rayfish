@@ -19,6 +19,7 @@ pub fn new_authz() -> SshAuthz {
     derive(serde::Serialize, serde::Deserialize)
 )]
 pub(super) struct UserPolicy {
+    local_uid: Option<u32>,
     matched: bool,
     any: bool,
     nonroot: bool,
@@ -26,6 +27,14 @@ pub(super) struct UserPolicy {
 }
 
 impl UserPolicy {
+    pub(super) fn local(uid: u32) -> Self {
+        Self {
+            local_uid: Some(uid),
+            matched: true,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn add(&mut self, users: &[String]) {
         self.matched = true;
         if users.iter().any(|user| user == "*") {
@@ -42,6 +51,9 @@ impl UserPolicy {
     }
 
     pub(super) fn permits(&self, name: &str, uid: u32) -> bool {
+        if let Some(local_uid) = self.local_uid {
+            return local_uid == 0 || local_uid == uid;
+        }
         self.any || self.users.contains(name) || (self.nonroot && uid != 0)
     }
 }
@@ -105,6 +117,20 @@ pub(super) fn resolve_user_policy_with_hostnames(
 mod tests {
     use super::*;
     use iroh::SecretKey;
+
+    #[test]
+    fn local_login_is_limited_to_the_socket_owner() {
+        let mut policy = UserPolicy::local(1000);
+        assert!(policy.authorized());
+        assert!(policy.permits("user", 1000));
+        assert!(policy.permits("alias", 1000));
+        assert!(!policy.permits("other", 1001));
+        assert!(!policy.permits("root", 0));
+        policy.add(&["*".to_string()]);
+        assert!(!policy.permits("root", 0));
+        assert!(UserPolicy::local(0).permits("root", 0));
+        assert!(UserPolicy::local(0).permits("user", 1000));
+    }
 
     #[test]
     fn hostname_grant_resolves_at_login_time() {

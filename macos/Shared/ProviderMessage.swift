@@ -15,8 +15,16 @@ struct ProviderRequest: Codable {
         case connectPeer
         case approveConnection
         case rejectConnection
+        case blockConnection
+        case acceptInvitation
+        case declineInvitation
+        case sendInvite
+        case setInboundPolicy
+        case blockPeer
+        case unblockPeer
         case acceptFile
         case rejectFile
+        case setFileAutoAccept
         case setSSHRule
         case firewallShow
         case firewallAdd
@@ -44,10 +52,15 @@ struct ProviderRequest: Codable {
     var port: String? = nil
     var peer: String? = nil
     var network: String? = nil
+    var inboundPolicy: ProviderInboundPolicy? = nil
+}
+
+enum ProviderInboundPolicy: String, Codable, CaseIterable {
+    case anyone, known, nobody
 }
 
 enum ProviderSetting: String, Codable {
-    case dns, mdns, ssh, quicLossTolerant
+    case dns, mdns, ssh, quicFqCodel
 }
 
 struct ProviderResponse: Codable {
@@ -85,7 +98,7 @@ struct ProviderStatus: Codable, Equatable {
     var ipv6: String
     var networks: [ProviderNetwork]
     var pendingRequests: [ProviderJoinRequest]
-    var contactId: String? = nil
+    var identity: String? = nil
     var connectionRequests: [ProviderConnectionRequest] = []
     var dnsEnabled: Bool = true
     var mdnsEnabled: Bool = true
@@ -93,8 +106,12 @@ struct ProviderStatus: Codable, Equatable {
     var files: [ProviderFile]? = nil
     var sshEnabled: Bool? = nil
     var sshRules: [ProviderSSHRule]? = nil
+    var fileAutoAcceptPeers: [String]? = nil
     var connectionWarning: String? = nil
-    var quicLossTolerant: Bool? = nil
+    var quicFqCodel: Bool? = nil
+    var inboundPolicy: ProviderInboundPolicy? = nil
+    var blocked: [String]? = nil
+    var invitations: [ProviderInvitation]? = nil
     var exitNodes: [ProviderExitNodeNetwork] = []
 
     var exitSelected: Bool { exitNodes.contains { $0.using != nil } }
@@ -106,6 +123,13 @@ struct ProviderExitNodeNetwork: Codable, Equatable {
     var available: [String]
     var refused: [String]
     var problem: String?
+}
+
+/// A pending invitation a coordinator delivered to this Mac.
+struct ProviderInvitation: Codable, Equatable, Identifiable {
+    var id: String
+    var network: String
+    var coordinator: String
 }
 
 struct ProviderSSHRule: Codable, Equatable, Identifiable {

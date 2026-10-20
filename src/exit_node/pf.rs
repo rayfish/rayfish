@@ -50,10 +50,12 @@ pub(super) const ANCHOR_REF: &str = if cfg!(target_os = "macos") {
 /// As on Linux, this does not open the forward path: a host whose pf ruleset blocks
 /// forwarding has to be told to permit it on its own terms.
 ///
-/// Returns whether the IPv4 lease pool is routed. A route that overlaps it
-/// leaves IPv4 transit off and IPv6 working.
+/// IPv4 transit needs an IPv4 uplink (`v4_uplink`) and the lease pool routed to
+/// the TUN; a route that overlaps the pool leaves it off and IPv6 working. Without
+/// both, IPv4 forwarding keeps its original value, as on Linux. Returns whether
+/// IPv4 transit is on.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(super) fn enable(tun_name: &str) -> Result<bool> {
+pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
     let path = snapshot_path().context("no config dir to snapshot the forwarding sysctls into")?;
     let mut snap = if path.exists() {
         Snapshot::load(&path)
@@ -63,22 +65,30 @@ pub(super) fn enable(tun_name: &str) -> Result<bool> {
             v6: read_sysctl(V6_FORWARD),
             pf_token: None,
             tun_name: Some(tun_name.to_owned()),
+            extra: Vec::new(),
         };
         snap.save(&path)?;
         snap
     };
-    let v4_pool = match ensure_ipv4_space(tun_name, ipv4::AddressSpace::Gateway) {
-        Ok(()) => {
-            bsd_route_pool(tun_name, true)?;
-            true
+    let v4_pool = v4_uplink
+        && match ensure_ipv4_space(tun_name, ipv4::AddressSpace::Gateway) {
+            Ok(()) => {
+                bsd_route_pool(tun_name, true)?;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%error, "IPv4 exit transit disabled");
+                false
+            }
+        };
+    if v4_pool {
+        write_sysctl(V4_FORWARD, "1")?;
+    } else {
+        let _ = bsd_route_pool(tun_name, false);
+        if !snap.v4.is_empty() {
+            let _ = write_sysctl(V4_FORWARD, &snap.v4);
         }
-        Err(error) => {
-            tracing::warn!(%error, "IPv4 exit transit disabled");
-            let _ = bsd_route_pool(tun_name, false);
-            false
-        }
-    };
-    write_sysctl(V4_FORWARD, "1")?;
+    }
     write_sysctl(V6_FORWARD, "1")?;
 
     // Enable pf before loading the anchor (an unloaded ruleset has no anchors to
@@ -291,7 +301,7 @@ pub(super) fn physical_default_route(family: &str) -> Option<PhysicalDefaultRout
             return None;
         }
         let interface = *fields.get(index)?;
-        if interface.starts_with("utun") {
+        if is_tunnel_iface(interface) {
             return None;
         }
         Some(PhysicalDefaultRoute {

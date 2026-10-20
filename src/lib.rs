@@ -59,6 +59,8 @@ pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
 
 pub mod apply;
 pub mod audit;
+#[cfg(target_os = "linux")]
+pub(crate) mod child;
 pub mod config;
 pub mod control;
 pub mod daemon;
@@ -99,6 +101,8 @@ pub mod onepassword;
 pub mod peers;
 pub mod ratelimit;
 pub mod reject;
+#[cfg(target_os = "linux")]
+pub mod rlimit;
 pub mod shutdown;
 #[cfg(feature = "desktop")]
 #[cfg(unix)]
@@ -107,6 +111,8 @@ pub mod ssh;
 #[path = "ssh_windows.rs"]
 pub mod ssh;
 pub mod stats;
+#[cfg(target_os = "linux")]
+pub(crate) mod sysctl;
 pub mod term;
 pub mod transport;
 pub mod tun;

@@ -42,6 +42,17 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/refs");
     println!("cargo:rerun-if-changed=.git/packed-refs");
 
+    // `embedded_tun`: the platform (Android `VpnService`, iOS NetworkExtension)
+    // owns the packet interface, its routes and DNS, and hands the daemon a
+    // descriptor. The desktop TUN, route and DNS paths never run there.
+    println!("cargo:rustc-check-cfg=cfg(embedded_tun)");
+    if matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("android" | "ios")
+    ) {
+        println!("cargo:rustc-cfg=embedded_tun");
+    }
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // `-bins` so this lands on `ray.exe` and not on the test harnesses,
         // which get their stacks from the threads libtest spawns them on.

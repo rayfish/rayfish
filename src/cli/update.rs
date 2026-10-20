@@ -585,7 +585,7 @@ pub(crate) fn cmd_uninstall_service() -> Result<()> {
                 if init == InitSystem::Systemd {
                     run_cmd("systemctl", &["daemon-reload"]);
                 }
-                println!("Removed {} service.", init.label());
+                println!("Removed {} service.", init);
             }
             None => println!("Service not installed."),
         }

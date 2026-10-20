@@ -8,25 +8,11 @@ use iroh::EndpointId;
 
 use crate::*;
 
-trait DisplayTerminal {
-    type Output: fmt::Display;
-
-    fn display_terminal(self) -> Self::Output;
-}
-
 struct ManagedMachineStateOutput(ipc::ManagedMachineState);
-
-impl DisplayTerminal for ipc::ManagedMachineState {
-    type Output = ManagedMachineStateOutput;
-
-    fn display_terminal(self) -> Self::Output {
-        ManagedMachineStateOutput(self)
-    }
-}
 
 impl fmt::Display for ManagedMachineStateOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = self.0.as_str();
+        let value = <&str>::from(self.0);
         match self.0 {
             ipc::ManagedMachineState::Online => style::green_display(value).fmt(f),
             ipc::ManagedMachineState::Offline | ipc::ManagedMachineState::Unknown => {
@@ -87,6 +73,17 @@ pub(crate) fn fail_unexpected(reply: &impl std::fmt::Debug) -> ! {
         Some("the CLI and the daemon are probably different versions: sudo ray restart"),
     );
     std::process::exit(1);
+}
+
+/// Print the message of a daemon `Ok` reply, ending the command through
+/// [`fail_with`] or [`fail_unexpected`] for anything else.
+pub(crate) fn print_ok_reply(response: ipc::IpcMessage) -> Result<()> {
+    match response {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
+    }
+    Ok(())
 }
 
 /// The same complaint as [`fail_unexpected`] as a string, for the two callers
@@ -236,7 +233,7 @@ struct StatusJson<'a> {
     lan_peers: Vec<StatusLanPeer<'a>>,
     auto_update: bool,
     active: bool,
-    contact_id: Option<&'a str>,
+    identity: Option<String>,
     daemon_version: &'a str,
     networks: &'a [ipc::NetworkStatus],
     inactive_networks: &'a [ipc::InactiveNetwork],
@@ -269,7 +266,7 @@ impl DisplayOut for StatusOutput<'_> {
         let mdns_enabled = self.json.mdns;
         let auto_update = self.json.auto_update;
         let active = self.json.active;
-        let contact_id = self.json.contact_id;
+        let identity = self.json.identity.as_deref();
         let daemon_version = self.json.daemon_version;
         let networks = self.json.networks;
         let inactive_networks = self.json.inactive_networks;
@@ -315,8 +312,8 @@ impl DisplayOut for StatusOutput<'_> {
         if !active {
             println!("  {}", style::faint("run `ray up` to activate"));
         }
-        if let Some(cid) = contact_id {
-            println!("  {} {}", style::label("contact"), style::rose(cid),);
+        if let Some(identity) = identity {
+            println!("  {} {}", style::label("identity"), style::rose(identity));
         }
 
         if networks.is_empty() {
@@ -357,7 +354,7 @@ impl DisplayOut for StatusOutput<'_> {
             println!("  {}", style::faint("managed machines:"));
             for machine in managed_machines {
                 let short_id = machine.identity.fmt_short().to_string();
-                let state = machine.state.display_terminal();
+                let state = ManagedMachineStateOutput(machine.state);
                 println!(
                     "    {}  {}  {}",
                     style::value(machine.hostname.as_ref()),
@@ -446,7 +443,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
             mdns_enabled,
             auto_update,
             active,
-            contact_id,
+            identity,
             daemon_version,
             networks,
             packets_rx,
@@ -475,7 +472,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
                         .collect(),
                     auto_update,
                     active,
-                    contact_id: contact_id.as_deref(),
+                    identity: identity.map(|id| id.to_string()),
                     daemon_version: &daemon_version,
                     networks: &networks,
                     inactive_networks: &inactive_networks,
@@ -1198,15 +1195,7 @@ fn print_pending_summary(
 /// connections) while leaving the daemon process running so `ray up` can
 /// reactivate it without root.
 pub(crate) async fn ipc_down() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::Down).await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(ipc_request(ipc::IpcMessage::Down).await?)
 }
 
 /// Base repository for `ray report`. Swap this for a managed upload endpoint
@@ -1270,22 +1259,12 @@ pub(crate) fn open_url(url: &str) -> bool {
 }
 
 pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::SetHostname {
-            network: network.to_string(),
-            hostname: hostname.to_string(),
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::SetHostname {
+        network: network.to_string(),
+        hostname: hostname.to_string(),
+    })
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 #[cfg(test)]

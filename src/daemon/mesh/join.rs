@@ -37,37 +37,43 @@ struct DirectAdmissionRecord {
     published: bool,
 }
 
+/// A verified direct-network (`ray connect`) co-coordinator grant: the network
+/// secret key together with the exact signed admission record it is bound to.
+/// A Welcome carries both or neither, so they travel as one value.
+struct DirectAdmission {
+    key: [u8; 32],
+    record: DirectAdmissionRecord,
+}
+
 fn verify_direct_admission(
     direct_key: Option<[u8; 32]>,
     direct_record: Option<Vec<u8>>,
     direct_record_published: bool,
     net_pubkey: EndpointId,
-) -> Result<(Option<[u8; 32]>, Option<DirectAdmissionRecord>)> {
-    if let Some(key) = direct_key {
-        anyhow::ensure!(
-            admin_grant_key_valid(key, net_pubkey),
-            "direct-network key in Welcome does not match network public key"
-        );
-    }
-    let direct_record = match (direct_key.as_ref(), direct_record) {
-        (Some(_), Some(bytes)) => {
-            let packet = dht::verify_network_record(&bytes, net_pubkey)
-                .context("verify direct-network admission record")?;
-            let (hash, seeds) = dht::decode_network_record(&packet)
-                .context("decode direct-network admission record")?;
-            Some(DirectAdmissionRecord {
-                hash,
-                seeds,
-                timestamp: packet.timestamp().as_micros(),
-                published: direct_record_published,
-            })
-        }
-        (Some(_), None) => {
-            anyhow::bail!("direct-network Welcome omitted its signed admission record")
-        }
-        (None, _) => None,
+) -> Result<Option<DirectAdmission>> {
+    let Some(key) = direct_key else {
+        return Ok(None);
     };
-    Ok((direct_key, direct_record))
+    anyhow::ensure!(
+        admin_grant_key_valid(key, net_pubkey),
+        "direct-network key in Welcome does not match network public key"
+    );
+    let Some(bytes) = direct_record else {
+        anyhow::bail!("direct-network Welcome omitted its signed admission record")
+    };
+    let packet = dht::verify_network_record(&bytes, net_pubkey)
+        .context("verify direct-network admission record")?;
+    let (hash, seeds) =
+        dht::decode_network_record(&packet).context("decode direct-network admission record")?;
+    Ok(Some(DirectAdmission {
+        key,
+        record: DirectAdmissionRecord {
+            hash,
+            seeds,
+            timestamp: packet.timestamp().as_micros(),
+            published: direct_record_published,
+        },
+    }))
 }
 
 /// Result of [`perform_join_handshake`]: the admitted roster, or a closed-network
@@ -78,13 +84,12 @@ enum HandshakeOutcome {
         /// but every signed field travels together so a later promotion cannot
         /// publish a lossy projection.
         blob: Box<crate::membership::GroupBlob>,
-        /// The per-network secret key, present only when we were admitted onto a
-        /// `direct` (`ray connect`) network as a co-coordinator. Already verified
-        /// against the network pubkey (`admin_grant_key_valid`); adopting it makes
-        /// this node a key-holder so `finalize_join` registers it as a coordinator.
-        direct_key: Option<[u8; 32]>,
-        /// Exact signed admission record paired with `direct_key`.
-        direct_record: Option<DirectAdmissionRecord>,
+        /// The per-network secret key and its exact signed admission record,
+        /// present only when we were admitted onto a `direct` (`ray connect`)
+        /// network as a co-coordinator. The key is already verified against the
+        /// network pubkey (`admin_grant_key_valid`); adopting it makes this node
+        /// a key-holder so `finalize_join` registers it as a coordinator.
+        direct: Option<DirectAdmission>,
         /// Author timestamp of the signed record this roster came from, when it
         /// came from one. Seeds `NetworkState::last_record_timestamp` so the
         /// replay floor is set from the first roster the node adopts rather than
@@ -118,6 +123,10 @@ pub(crate) struct JoinParams {
     /// Fresh join (send `JoinRequest` first) vs reconnect/restore (coordinator
     /// speaks first).
     pub(crate) initial: bool,
+    /// Present when the connection came from a dial that is not registered yet.
+    /// Held until this join registers it, so other joins to the same peer keep
+    /// finding and reusing it (see [`MeshDialer`]).
+    pub(crate) dial_claim: Option<DialClaim>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,7 +134,6 @@ pub(crate) async fn join_mesh_shared(
     initial_conn: Connection,
     ep: &Endpoint,
     network_name: &str,
-    alpn: &[u8],
     ctx: MeshCtx,
     params: JoinParams,
     token: CancellationToken,
@@ -159,6 +167,7 @@ pub(crate) async fn join_mesh_shared(
         auto_accept_firewall,
         auto_accept_files,
         initial,
+        dial_claim,
     } = params;
     let my_identity = identity.local_identity();
     let join_certificate_issuer = if initial
@@ -173,73 +182,62 @@ pub(crate) async fn join_mesh_shared(
         None
     };
 
-    let (mut admitted_blob, direct_key, direct_record, mut record_ts) =
-        match perform_join_handshake(
-            &initial_conn,
-            ep,
-            &registry.transport.pkarr_relay_url,
-            network_name,
-            &blob_store,
-            &peers,
-            net_pubkey,
-            my_identity,
-            initial,
-            invite_secret,
-            &my_hostname,
-            &device_cert,
-            &group_blob,
-        )
-        .await?
-        {
-            HandshakeOutcome::Admitted {
-                blob,
-                direct_key,
-                direct_record,
-                record_ts,
-            } => (
-                *blob,
-                direct_key.map(SecretKey::from),
-                direct_record,
-                record_ts,
-            ),
-            HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
-        };
+    let (mut admitted_blob, direct, mut record_ts) = match perform_join_handshake(
+        &initial_conn,
+        ep,
+        &registry.transport.pkarr_relay_url,
+        network_name,
+        &blob_store,
+        &peers,
+        net_pubkey,
+        my_identity,
+        initial,
+        invite_secret,
+        &my_hostname,
+        &device_cert,
+        &group_blob,
+    )
+    .await?
+    {
+        HandshakeOutcome::Admitted {
+            blob,
+            direct,
+            record_ts,
+        } => (*blob, direct, record_ts),
+        HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
+    };
 
     // A direct join adopts coordinator authority. Welcome binds the key to the
     // exact network-key-signed admission record, so fetch that generation rather
     // than racing a second DHT resolve that could return either its predecessor
     // or a later publication.
-    let (exact_group_hash, exact_hash_published) = if let Some(record) = direct_record {
-        anyhow::ensure!(
-            direct_key.is_some(),
-            "direct admission record arrived without a coordinator key"
-        );
-        let data = fetch_verified_blob(
-            ep,
-            &blob_store,
-            &peers,
-            record.hash,
-            network_name,
-            &record.seeds,
-        )
-        .await
-        .context("fetch admitted direct-network roster")?;
-        anyhow::ensure!(
-            data.members
-                .iter()
-                .any(|member| member.identity == my_identity && member.is_coordinator),
-            "signed direct-network roster does not contain this node's coordinator admission"
-        );
-        admitted_blob = data;
-        record_ts = Some(record.timestamp);
-        (Some(record.hash), Some(record.published))
-    } else {
-        anyhow::ensure!(
-            direct_key.is_none(),
-            "direct-network coordinator key arrived without its exact signed admission record"
-        );
-        (None, None)
-    };
+    let direct_key = direct
+        .as_ref()
+        .map(|admission| SecretKey::from(admission.key));
+    let (exact_group_hash, exact_hash_published) =
+        if let Some(DirectAdmission { record, .. }) = direct {
+            let data = fetch_verified_blob(
+                ep,
+                &blob_store,
+                &peers,
+                record.hash,
+                network_name,
+                &record.seeds,
+            )
+            .await
+            .context("fetch admitted direct-network roster")?;
+            anyhow::ensure!(
+                data.members
+                    .iter()
+                    .any(|member| member.identity == my_identity && member.is_coordinator),
+                "signed direct-network roster does not contain this node's coordinator admission"
+            );
+            admitted_blob = data;
+            record_ts = Some(record.timestamp);
+            (Some(record.hash), Some(record.published))
+        } else {
+            (None, None)
+        };
     let crate::membership::GroupBlob {
         members,
         approved,
@@ -292,7 +290,6 @@ pub(crate) async fn join_mesh_shared(
         ep.clone(),
         my_identity,
         net_pubkey,
-        alpn.to_vec(),
         device_cert.clone(),
     );
 
@@ -326,8 +323,8 @@ pub(crate) async fn join_mesh_shared(
         network_name,
     )
     .await;
+    drop(dial_claim);
     connect_to_roster_peers(
-        ep,
         &members,
         network_name,
         net_pubkey,
@@ -351,7 +348,7 @@ pub(crate) async fn join_mesh_shared(
 /// connection (which owns the data reader), and announce our handle table so it
 /// can decode our tagged datagrams. Shared by the coordinator connection and each
 /// roster peer.
-async fn register_dialed_peer(
+pub(crate) async fn register_dialed_peer(
     ctx: &MeshCtx,
     router: &Arc<ProtocolRouter>,
     conn: Connection,
@@ -494,13 +491,36 @@ async fn build_member_state(
     Arc::new(std::sync::RwLock::new(ns))
 }
 
+/// Finish a roster peer's hello exchange before registering its local route.
+/// An already-seated member closes the reply stream without a body, while a
+/// peer that still knows us as approved sends a Welcome before registering us.
+/// Dropping the receive half early stops that Welcome and leaves the two ends
+/// disagreeing about whether the connection carries this network. Consume the
+/// optional reply through FIN, without applying its unsigned roster contents.
+pub(crate) async fn send_mesh_hello(
+    conn: &Connection,
+    network_key: EndpointId,
+    hello: &ControlMsg,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        control::send_msg(&mut send, Some(network_key), hello).await?;
+        // Same maximum body size as the framed control reader, plus its prefix.
+        recv.read_to_end(65_536 + 4)
+            .await
+            .context("read mesh hello reply")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("timeout awaiting mesh hello completion")?
+}
+
 /// Dial every other roster member (skipping ourselves and the already-connected
 /// coordinator), send each a `MeshHello` over the single mesh ALPN, and register
 /// it as a peer (route + data reader + control demux). A member that's offline is
-/// logged and skipped; a stream-open/send failure aborts the join.
+/// logged and skipped, as is a peer whose hello exchange fails.
 #[allow(clippy::too_many_arguments)]
 async fn connect_to_roster_peers(
-    ep: &Endpoint,
     members: &[crate::membership::Member],
     network_name: &str,
     net_pubkey: EndpointId,
@@ -515,37 +535,26 @@ async fn connect_to_roster_peers(
         if member.identity == my_identity || member.identity == skip_id {
             continue;
         }
-        // Another network may be establishing this same peer right now. Skip
-        // this eager dial if its handshake owns the gate; the supervisor will
-        // attach this network after that connection is registered.
-        let dial_lock = registry.mesh_dial_lock(member.identity);
-        let Ok(_dial_guard) = dial_lock.try_lock() else {
-            continue;
-        };
-        let peer_ip = derive_ipv6(&member.identity);
-        let connected = if let Some(conn) = ctx
-            .peers
-            .conn_for_ip(&peer_ip)
-            .filter(|conn| conn.close_reason().is_none())
-        {
-            Ok(conn)
-        } else {
-            transport::connect_to_peer_with_alpn(ep, member.identity, &transport::mesh_alpn()).await
-        };
-        match connected {
-            Ok(conn) => {
-                let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(
-                    &mut send,
-                    Some(net_pubkey),
+        // Another network may be establishing this same peer right now; its
+        // dial is shared rather than repeated, and this hello rides it.
+        match registry.connect_mesh_peer(member.identity).await {
+            Ok(DialedPeer { conn, claim }) => {
+                if let Err(error) = send_mesh_hello(
+                    &conn,
+                    net_pubkey,
                     &ControlMsg::MeshHello {
                         identity: my_identity,
                         hostname: outgoing_hostname(network_name),
                         device_cert: device_cert.clone(),
                     },
                 )
-                .await?;
+                .await
+                {
+                    tracing::warn!(peer = %member.identity.fmt_short(), error = %error, "mesh peer hello did not complete");
+                    continue;
+                }
                 register_dialed_peer(ctx, router, conn, member.identity, network_name).await;
+                drop(claim);
                 tracing::info!(peer_ip = %derive_ipv6(&member.identity), "connected to mesh peer");
             }
             Err(e) => {
@@ -609,7 +618,7 @@ async fn perform_join_handshake(
                 direct_record_published,
             } => {
                 tracing::info!(network = %network_name, "welcomed to network");
-                let (direct_key, direct_record) = verify_direct_admission(
+                let direct = verify_direct_admission(
                     direct_key,
                     direct_record,
                     direct_record_published,
@@ -620,8 +629,7 @@ async fn perform_join_handshake(
                 blob.approved = approved;
                 Ok(HandshakeOutcome::Admitted {
                     blob: Box::new(blob),
-                    direct_key,
-                    direct_record,
+                    direct,
                     // A fresh join takes its roster from the coordinator's
                     // Welcome, not from a record, so there is no floor to set.
                     record_ts: None,
@@ -657,7 +665,7 @@ async fn perform_join_handshake(
             .await
             .context("timeout awaiting reconnect response")??;
         drop(recv);
-        let (welcome_members, welcome_approved, direct_key, direct_record) = match response {
+        let (welcome_members, welcome_approved, direct) = match response {
             ControlMsg::Welcome {
                 members,
                 approved,
@@ -665,24 +673,23 @@ async fn perform_join_handshake(
                 direct_record,
                 direct_record_published,
             } => {
-                let (direct_key, direct_record) = verify_direct_admission(
+                let direct = verify_direct_admission(
                     direct_key,
                     direct_record,
                     direct_record_published,
                     net_pubkey,
                 )?;
-                (members, approved, direct_key, direct_record)
+                (members, approved, direct)
             }
             other => anyhow::bail!("expected Welcome after reconnect hello, got {other:?}"),
         };
-        if direct_key.is_some() {
+        if direct.is_some() {
             let mut blob = fallback_blob.clone();
             blob.members = welcome_members;
             blob.approved = welcome_approved;
             return Ok(HandshakeOutcome::Admitted {
                 blob: Box::new(blob),
-                direct_key,
-                direct_record,
+                direct,
                 record_ts: None,
             });
         }
@@ -712,8 +719,7 @@ async fn perform_join_handshake(
         // cold path, never re-granted here.
         Ok(HandshakeOutcome::Admitted {
             blob: Box::new(blob),
-            direct_key: None,
-            direct_record: None,
+            direct: None,
             record_ts,
         })
     }
@@ -735,7 +741,6 @@ fn spawn_reconverge_worker(
     endpoint_w: Endpoint,
     my_identity_w: EndpointId,
     net_pubkey_w: EndpointId,
-    alpn_w: Vec<u8>,
     device_cert_w: Option<control::DeviceCert>,
 ) {
     tokio::spawn(async move {
@@ -779,12 +784,141 @@ fn spawn_reconverge_worker(
                 &network_name,
                 &live_state,
                 my_identity_w,
-                &alpn_w,
                 &device_cert_w,
             )
             .await;
         }
     });
+}
+
+#[cfg(test)]
+mod mesh_hello_reply_tests {
+    use super::*;
+    use iroh::RelayMode;
+    use iroh::endpoint::{SendStream, presets};
+
+    async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let alpn = transport::mesh_alpn();
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let accepting = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let outgoing = client.connect(server.addr(), &alpn).await.unwrap();
+        let incoming = accepting.await.unwrap();
+        (server, client, incoming, outgoing)
+    }
+
+    async fn receive_hello(conn: &Connection, network_key: EndpointId) -> SendStream {
+        let (send, mut recv) = conn.accept_bi().await.unwrap();
+        let control::FrameRead::Frame(frame) = control::recv_frame(&mut recv).await.unwrap() else {
+            panic!("expected a known hello frame");
+        };
+        assert_eq!(frame.net, Some(network_key));
+        assert!(matches!(frame.msg, ControlMsg::MeshHello { .. }));
+        send
+    }
+
+    fn hello(identity: EndpointId) -> ControlMsg {
+        ControlMsg::MeshHello {
+            identity,
+            hostname: None,
+            device_cert: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_member_welcome_is_delivered_before_registering_the_route() {
+        let (server, client, incoming, outgoing) = connected_pair().await;
+        let network_key = SecretKey::generate().public();
+        let client_id = client.id();
+        let peers = PeerTable::new();
+        let registered = peers.clone();
+        let replying = tokio::spawn(async move {
+            let mut send = receive_hello(&incoming, network_key).await;
+            // Admission can persist a roster before replying. The receive half
+            // must survive this delay instead of stopping the eventual Welcome.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            control::send_msg(
+                &mut send,
+                Some(network_key),
+                &ControlMsg::Welcome {
+                    members: Vec::new(),
+                    approved: Vec::new(),
+                    direct_key: None,
+                    direct_record: None,
+                    direct_record_published: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), send.stopped())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                None,
+                "the hello reader must consume the reply through FIN"
+            );
+            registered.add(derive_ipv6(&client_id), incoming, client_id, "mesh");
+        });
+        send_mesh_hello(&outgoing, network_key, &hello(client_id))
+            .await
+            .unwrap();
+        replying.await.unwrap();
+        assert!(peers.conn_for_ip(&derive_ipv6(&client_id)).is_some());
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn known_member_without_a_welcome_completes_the_hello() {
+        let (server, client, incoming, outgoing) = connected_pair().await;
+        let network_key = SecretKey::generate().public();
+        let replying = tokio::spawn(async move {
+            let send = receive_hello(&incoming, network_key).await;
+            // The known-member handler sends no body; dropping its SendStream
+            // finishes that half, which is a valid completion of the hello.
+            drop(send);
+            incoming
+        });
+        send_mesh_hello(&outgoing, network_key, &hello(client.id()))
+            .await
+            .unwrap();
+        let _incoming = replying.await.unwrap();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn reset_reply_does_not_complete_the_hello() {
+        let (server, client, incoming, outgoing) = connected_pair().await;
+        let network_key = SecretKey::generate().public();
+        let replying = tokio::spawn(async move {
+            let mut send = receive_hello(&incoming, network_key).await;
+            send.reset(VarInt::from_u32(42)).unwrap();
+            incoming
+        });
+        assert!(
+            send_mesh_hello(&outgoing, network_key, &hello(client.id()))
+                .await
+                .is_err()
+        );
+        let _incoming = replying.await.unwrap();
+        client.close().await;
+        server.close().await;
+    }
 }
 
 #[cfg(test)]
@@ -823,12 +957,14 @@ mod persist_config_tests {
             .as_bytes()
             .to_vec();
 
-        let (granted, record) =
-            verify_direct_admission(Some(key.to_bytes()), Some(packet), true, key.public())
-                .unwrap();
-        let record = record.unwrap();
+        let DirectAdmission {
+            key: granted,
+            record,
+        } = verify_direct_admission(Some(key.to_bytes()), Some(packet), true, key.public())
+            .unwrap()
+            .expect("a key with its record is a direct admission");
 
-        assert_eq!(granted, Some(key.to_bytes()));
+        assert_eq!(granted, key.to_bytes());
         assert_eq!(record.hash, hash);
         assert_eq!(record.seeds, vec![id(3)]);
         assert!(record.published);

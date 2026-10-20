@@ -134,20 +134,11 @@ pub(crate) async fn ipc_pair_list() -> Result<()> {
 }
 
 pub(crate) async fn ipc_unpair(device: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Unpair {
-            device: device.to_string(),
-        },
-    )
+    let response = ipc_request(ipc::IpcMessage::Unpair {
+        device: device.to_string(),
+    })
     .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    print_ok_reply(response)
 }
 
 /// Produce the encrypted `enc1…` backup blob for the local identity, prompting
@@ -230,18 +221,8 @@ pub(crate) async fn cmd_pair_restore(
     } else {
         Some(rpassword::prompt_password("Enter backup password: ")?)
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::RestoreIdentity { backup, password },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => fail_unexpected(&other),
-    }
-    Ok(())
+    let response = ipc_request(ipc::IpcMessage::RestoreIdentity { backup, password }).await?;
+    print_ok_reply(response)
 }
 
 // ---------------------------------------------------------------------------

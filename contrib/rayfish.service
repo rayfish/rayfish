@@ -1,13 +1,19 @@
 [Unit]
 Description=rayfish P2P mesh VPN
-After=network-online.target
+# Ordered after the network managers so that at shutdown rayfish stops, and
+# hands DNS back, while they are still running.
+After=network-pre.target network-online.target NetworkManager.service systemd-resolved.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ray daemon
+# Undo DNS and exit-node changes when the daemon died without its own teardown.
+# The leading "-" keeps a failed cleanup from failing the unit.
+ExecStopPost=-/usr/local/bin/ray daemon --cleanup
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

@@ -125,12 +125,39 @@ deploy_all(){
   done
 }
 
-# wait_daemons <ip...> : give daemons a moment to settle, then confirm `ray status` responds.
+# daemon_ready <ip> : require an IPC-backed status response. `ray status` exits
+# successfully even when the daemon is absent and prints its config fallback.
+# Standby daemons are ready too: .active must be boolean, not necessarily true.
+daemon_ready(){
+  local json
+  json="$(status_json "$1")" || return 1
+  echo "$json" | jq -e 'type == "object" and (.active | type == "boolean")' >/dev/null 2>&1
+}
+
+# wait_daemons <ip...> : poll until IPC responds on each host.
 wait_daemons(){
-  sleep 5
   local ip
   for ip in "$@"; do
-    if on "$ip" 'ray status' >/dev/null 2>&1; then pass "daemon up on $ip"; else fail "daemon not responding on $ip"; fi
+    if retry_until 30 "daemon_ready '$ip'"; then pass "daemon up on $ip"; else fail "daemon not responding on $ip"; fi
+  done
+}
+
+# activate_daemons <ip...> : wait for IPC before `ray up`, then verify activation.
+# Type=simple service starts return before the daemon's IPC socket is ready.
+activate_daemons(){
+  local ip
+  for ip in "$@"; do
+    if ! retry_until 60 "daemon_ready '$ip'"; then
+      fail "daemon not responding on $ip"; return 1
+    fi
+    if ! on "$ip" 'ray up'; then
+      fail "could not activate daemon on $ip"; return 1
+    fi
+    if retry_until 30 "status_json '$ip' | jq -e '.active == true' >/dev/null 2>&1"; then
+      pass "daemon active on $ip"
+    else
+      fail "daemon did not become active on $ip"; return 1
+    fi
   done
 }
 
@@ -142,7 +169,8 @@ wait_daemons(){
 # ---------------------------------------------------------------------------
 
 # status_json <ip> : echo `ray status --json` from a host (raw JSON).
-status_json(){ on "$1" 'ray status --json' 2>/dev/null; }
+# A stuck daemon response must not prevent retry_until from making progress.
+status_json(){ on "$1" 'timeout --kill-after=2s 10s ray status --json' 2>/dev/null; }
 
 # my_ip <ip> [net] : this node's own mesh IPv6, for the named network or the
 # first if omitted. Fatal when absent, for the same reason as `own_ip`.
@@ -179,6 +207,69 @@ peer_online(){
   echo "${r:-0}"
 }
 
+# peer_has_no_connection <ip> <peer-hostname> [net] : exit 0 iff the node returns
+# valid status JSON, has the named network (or first network if omitted), includes
+# <peer-hostname> in its roster, and that peer has .connection == null.
+# This proves "no live connection", not "peer daemon stopped" — PeerState::Idle
+# also has connection:null. Callers that need proof of daemon stop must verify
+# that independently (e.g. systemctl is-active on the peer).
+# Returns non-zero on SSH/status failure, malformed JSON, absent network, absent peer,
+# or peer with a live connection.
+peer_has_no_connection(){
+  local json
+  json="$(status_json "$1")" || return 1
+  echo "$json" | jq -e --arg h "$2" --arg n "${3:-}" '
+    type == "object"
+    and (.networks // null) != null
+    and (
+      (.networks // [])
+      | (if $n == "" then . else map(select(.name == $n)) end)
+      | [ .[].peers[] | select((.hostname // "") == $h) ] | .[0]
+      | (. != null and .connection == null)
+    )' >/dev/null 2>&1
+}
+
+# peer_in_roster <ip> <peer-hostname> [net] : exit 0 iff the node returns valid
+# status JSON, has the named network, and includes <peer-hostname> in its peers roster.
+# Returns non-zero on query failure or if the peer is not in the roster.
+peer_in_roster(){
+  local json
+  json="$(status_json "$1")" || return 1
+  echo "$json" | jq -e --arg h "$2" --arg n "${3:-}" '
+    type == "object"
+    and (
+      (.networks // [])
+      | (if $n == "" then . else map(select(.name == $n)) end)
+      | (length > 0)
+    )
+    and (
+      (.networks // [])
+      | (if $n == "" then . else map(select(.name == $n)) end)
+      | any(.[].peers[]; (.hostname // "") == $h)
+    )' >/dev/null 2>&1
+}
+
+# peer_absent <ip> <peer-hostname> [net] : exit 0 iff the node returns valid
+# status JSON, has the named network, and <peer-hostname> is NOT in its peers roster.
+# Returns non-zero on query failure, missing network, or if the peer is present.
+peer_absent(){
+  local json
+  json="$(status_json "$1")" || return 1
+  echo "$json" | jq -e --arg h "$2" --arg n "${3:-}" '
+    type == "object"
+    and (.networks // null) != null
+    and (
+      (.networks // [])
+      | (if $n == "" then . else map(select(.name == $n)) end)
+      | (length > 0)
+    )
+    and (
+      (.networks // [])
+      | (if $n == "" then . else map(select(.name == $n)) end)
+      | all(.[].peers[]; (.hostname // "") != $h)
+    )' >/dev/null 2>&1
+}
+
 # net_role <ip> <net> : the node's role on a network (lowercased:
 # coordinator/member/direct). Empty if the node isn't on that network.
 net_role(){
@@ -191,6 +282,20 @@ net_role(){
 has_net(){
   [[ -n "$(status_json "$1" | jq -r --arg n "$2" \
     '(.networks // []) | map(select(.name == $n)) | .[0].name // empty')" ]]
+}
+
+# net_absent <ip> <net> : prove absence only after a successful status query.
+net_absent(){
+  local json
+  json="$(status_json "$1")" || return 1
+  echo "$json" | jq -e --arg n "$2" '
+    type == "object" and (.networks | type == "array")
+    and all(.networks[]; .name != $n)' >/dev/null 2>&1
+}
+
+# holds_key <ip> <net> : exit 0 if this node holds the network key (admin/coordinator).
+holds_key(){
+  on "$1" "ray admin $2 list --json" 2>/dev/null | jq -e 'any(.[]; .self == true)' >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -232,11 +337,18 @@ wait_roster(){
 # ---------------------------------------------------------------------------
 
 # tcp_probe <from-ip> <dst-vpn-ip> <port> : echo OPEN if a TCP SYN handshake
-# completes, CLOSED otherwise. A pure connect (no payload), so conntrack on the
-# sender isn't a factor.
+# completes, CLOSED on refusal/timeout, ERROR if the probe cannot execute.
+# A pure connect (no payload), so conntrack on the sender isn't a factor.
 tcp_probe(){
-  on "$1" "timeout 5 bash -c 'exec 3<>/dev/tcp/$2/$3' && echo OPEN || echo CLOSED" \
-    2>/dev/null | strip | tr -d '[:space:]'
+  local result
+  if ! result="$(on "$1" "if timeout 5 bash -c 'exec 3<>/dev/tcp/$2/$3'; then echo OPEN; else rc=\$?; case \$rc in 1|124) echo CLOSED ;; *) echo ERROR; exit 1 ;; esac; fi" 2>/dev/null)"; then
+    echo ERROR; return 1
+  fi
+  result="$(echo "$result" | strip | tr -d '[:space:]')"
+  case "$result" in
+    OPEN|CLOSED) echo "$result" ;;
+    *) echo ERROR; return 1 ;;
+  esac
 }
 
 # start_tcp_listener <ip> <port> / stop_tcp_listener <ip> <port> : a detached
@@ -250,28 +362,118 @@ tcp_probe(){
 # so these probes stay about the packet path. The bridge has its own scenario
 # (tests/e2e/v4bridge), which is where a `0.0.0.0` listener belongs.
 start_tcp_listener(){
-  on "$1" "setsid python3 -m http.server $2 --bind :: >/tmp/lst_$2.log 2>&1 </dev/null & sleep 1" \
-    >/dev/null 2>&1 || true
+  local ip="$1" port="$2" state end
+  stop_tcp_listener "$ip" "$port"
+  if on "$ip" "setsid python3 -c 'import http.server, os, socket; open(\"/tmp/lst_pid_$port\",\"w\").write(str(os.getpid())); http.server.ThreadingHTTPServer.address_family=socket.AF_INET6; server=http.server.ThreadingHTTPServer((\"::\",$port),http.server.SimpleHTTPRequestHandler); open(\"/tmp/lst_ready_$port\",\"w\").write(\"1\"); server.serve_forever()' >/tmp/lst_$port.log 2>&1 </dev/null &" >/dev/null 2>&1; then
+    end=$((SECONDS + 5))
+    while (( SECONDS < end )); do
+      if ! state="$(on "$ip" "if [ -f /tmp/lst_ready_$port ] && kill -0 \$(cat /tmp/lst_pid_$port) 2>/dev/null; then echo READY; elif [ -f /tmp/lst_pid_$port ] && ! kill -0 \$(cat /tmp/lst_pid_$port) 2>/dev/null; then echo ERROR; else echo WAIT; fi" 2>/dev/null)"; then break; fi
+      state="$(echo "$state" | tr -d '[:space:]')"
+      [[ "$state" == READY ]] && return 0
+      [[ "$state" == WAIT ]] || break
+      sleep 0.1
+    done
+  fi
+  stop_tcp_listener "$ip" "$port"
+  fail "TCP listener did not bind on $ip:$port"
+  return 1
 }
-stop_tcp_listener(){ on "$1" "pkill -f 'http.server $2'" >/dev/null 2>&1 || true; }
+stop_tcp_listener(){
+  on "$1" "[ -f /tmp/lst_pid_$2 ] && kill \$(cat /tmp/lst_pid_$2) 2>/dev/null || true; rm -f /tmp/lst_ready_$2 /tmp/lst_pid_$2" >/dev/null 2>&1 || true
+}
+
+# _cleanup_udp_receiver <dst-pub-ip> <port> : kill any running UDP test receiver
+# on the host and remove all marker/pid files.
+_cleanup_udp_receiver(){
+  on "$1" "[ -f /tmp/udp_pid_$2 ] && kill \$(cat /tmp/udp_pid_$2) 2>/dev/null || true; rm -f /tmp/udp_ready_$2 /tmp/udp_got_$2 /tmp/udp_error_$2 /tmp/udp_pid_$2" >/dev/null 2>&1 || true
+}
 
 # udp_probe <from-pub-ip> <dst-pub-ip> <dst-vpn-ip> <port> : echo OPEN if a UDP
 # datagram sent from <from-pub-ip> to <dst-vpn-ip> reaches a listener on the
-# destination, CLOSED otherwise. Both hosts are reached over SSH by their PUBLIC
-# ips (the test runner can't route the VPN range); the datagram itself is
-# addressed to <dst-vpn-ip> so it rides the TUN and is subject to the firewall.
-# A one-shot python receiver on the destination drops a marker on first packet.
+# destination, CLOSED if bounded observation confirms the datagram was denied,
+# or ERROR if listener setup, datagram dispatch, or observation fails.
+# Both hosts are reached over SSH by their PUBLIC ips (the test runner can't
+# route the VPN range); the datagram itself is addressed to <dst-vpn-ip> so it
+# rides the TUN and is subject to the firewall.
+# A one-shot python receiver on the destination drops a readiness marker on successful
+# IPv6 socket bind, and a received marker on first packet. It self-times out
+# after 60s so an interrupted runner cannot leave recvfrom blocked forever.
 udp_probe(){
   local from_pub="$1" dst_pub="$2" dst_vpn="$3" port="$4"
   # AF_INET6 on both ends: <dst-vpn-ip> is a mesh address and there is no other
   # family to fall back to, so an AF_INET socket here never sees the datagram.
-  on "$dst_pub" "rm -f /tmp/udp_got_$port; setsid python3 -c 'import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(8); s.bind((\"::\",$port));
+  if ! on "$dst_pub" "[ -f /tmp/udp_pid_$port ] && kill \$(cat /tmp/udp_pid_$port) 2>/dev/null || true; rm -f /tmp/udp_ready_$port /tmp/udp_got_$port /tmp/udp_error_$port /tmp/udp_pid_$port; setsid python3 -c 'import socket, os, sys; open(\"/tmp/udp_pid_$port\",\"w\").write(str(os.getpid()));
+try:
+ s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(60); s.bind((\"::\",$port)); open(\"/tmp/udp_ready_$port\",\"w\").write(\"1\")
+except Exception: sys.exit(1)
 try:
  s.recvfrom(64); open(\"/tmp/udp_got_$port\",\"w\").write(\"1\")
-except Exception: pass' >/dev/null 2>&1 </dev/null & sleep 1" >/dev/null 2>&1 || true
-  on "$from_pub" "python3 -c 'import socket; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst_vpn\",$port))'" >/dev/null 2>&1 || true
-  sleep 2
-  on "$dst_pub" "[ -f /tmp/udp_got_$port ] && echo OPEN || echo CLOSED" 2>/dev/null | strip | tr -d '[:space:]'
+except Exception: open(\"/tmp/udp_error_$port\",\"w\").write(\"1\"); sys.exit(1)' >/dev/null 2>&1 </dev/null &" >/dev/null 2>&1; then
+    _cleanup_udp_receiver "$dst_pub" "$port"
+    echo "ERROR"
+    return 1
+  fi
+
+  local ready=0
+  local end_ready=$((SECONDS + 5))
+  while (( SECONDS < end_ready )); do
+    local r_stat
+    if ! r_stat="$(on "$dst_pub" "[ -f /tmp/udp_ready_$port ] && echo READY || echo WAIT" 2>/dev/null)"; then
+      _cleanup_udp_receiver "$dst_pub" "$port"
+      echo "ERROR"
+      return 1
+    fi
+    r_stat="$(echo "$r_stat" | tr -d '[:space:]')"
+    if [[ "$r_stat" == "READY" ]]; then
+      ready=1
+      break
+    elif [[ "$r_stat" != "WAIT" ]]; then
+      _cleanup_udp_receiver "$dst_pub" "$port"
+      echo "ERROR"
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  if [[ $ready -eq 0 ]]; then
+    _cleanup_udp_receiver "$dst_pub" "$port"
+    echo "ERROR"
+    return 1
+  fi
+
+  if ! on "$from_pub" "python3 -c 'import socket; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst_vpn\",$port))'" >/dev/null 2>&1; then
+    _cleanup_udp_receiver "$dst_pub" "$port"
+    echo "ERROR"
+    return 1
+  fi
+
+  local res=CLOSED
+  local end=$((SECONDS + 6))
+  while (( SECONDS < end )); do
+    local obs
+    # A dead/broken receiver cannot prove that the firewall denied the packet.
+    # Its 60s self-timeout bounds leaks after runner interruption while leaving
+    # ample time for readiness, dispatch, and this observation window.
+    if ! obs="$(on "$dst_pub" "if [ -f /tmp/udp_got_$port ]; then echo GOT; elif [ ! -f /tmp/udp_error_$port ] && kill -0 \$(cat /tmp/udp_pid_$port) 2>/dev/null; then echo WAIT; else echo ERROR; fi" 2>/dev/null)"; then
+      _cleanup_udp_receiver "$dst_pub" "$port"
+      echo "ERROR"
+      return 1
+    fi
+    obs="$(echo "$obs" | tr -d '[:space:]')"
+    if [[ "$obs" == "GOT" ]]; then
+      res=OPEN
+      break
+    elif [[ "$obs" == "WAIT" ]]; then
+      sleep 0.5
+    else
+      _cleanup_udp_receiver "$dst_pub" "$port"
+      echo "ERROR"
+      return 1
+    fi
+  done
+
+  _cleanup_udp_receiver "$dst_pub" "$port"
+  echo "$res"
 }
 
 # fw_allows / fw_denies <from-pub-ip> <dst-vpn-ip> <port> <label> [proto] [dst-pub-ip] :
@@ -281,12 +483,24 @@ except Exception: pass' >/dev/null 2>&1 </dev/null & sleep 1" >/dev/null 2>&1 ||
 fw_allows(){
   local proto="${5:-tcp}" dst_pub="${6:-}" r
   if [[ "$proto" == udp ]]; then r="$(udp_probe "$1" "$dst_pub" "$2" "$3")"; else r="$(tcp_probe "$1" "$2" "$3")"; fi
-  [[ "$r" == OPEN ]] && pass "$4 ($proto:$3 open)" || fail "$4 (expected OPEN on $proto:$3, got '$r')"
+  if [[ "$r" == ERROR ]]; then
+    fail "$4 ($proto probe failed on $3)"
+  elif [[ "$r" == OPEN ]]; then
+    pass "$4 ($proto:$3 open)"
+  else
+    fail "$4 (expected OPEN on $proto:$3, got '$r')"
+  fi
 }
 fw_denies(){
   local proto="${5:-tcp}" dst_pub="${6:-}" r
   if [[ "$proto" == udp ]]; then r="$(udp_probe "$1" "$dst_pub" "$2" "$3")"; else r="$(tcp_probe "$1" "$2" "$3")"; fi
-  [[ "$r" == CLOSED ]] && pass "$4 ($proto:$3 denied)" || fail "$4 (expected CLOSED on $proto:$3, got '$r')"
+  if [[ "$r" == ERROR ]]; then
+    fail "$4 ($proto probe failed on $3)"
+  elif [[ "$r" == CLOSED ]]; then
+    pass "$4 ($proto:$3 denied)"
+  else
+    fail "$4 (expected CLOSED on $proto:$3, got '$r')"
+  fi
 }
 
 # fw_pending_count <ip> <net> : number of suggested rules queued for review on a
@@ -324,6 +538,15 @@ mint_reusable(){
 request_id(){
   on "$1" "ray requests $2 --json" 2>/dev/null \
     | jq -r --arg h "$3" 'map(select((.hostname // "") == $h)) | .[0].id // empty'
+}
+
+# request_cleared <coord-ip> <net> <hostname> : exit 0 iff `ray requests <net> --json`
+# succeeds and outputs a valid array that does NOT contain <hostname>.
+# Returns non-zero if the query fails, JSON is malformed, or <hostname> is still queued.
+request_cleared(){
+  local json
+  json="$(on "$1" "ray requests $2 --json" 2>/dev/null)" || return 1
+  echo "$json" | jq -e --arg h "$3" 'type == "array" and all(.[]; (.hostname // "") != $h)' >/dev/null 2>&1
 }
 
 # peer_endpoint <ip> <peer-hostname> [net] : a peer's full endpoint id as seen by

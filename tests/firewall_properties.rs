@@ -18,8 +18,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use common::{assert_info_eq, packet_spec};
 use proptest::prelude::*;
 use rayfish::firewall::{
-    Action, Direction, FirewallConfig, FirewallRule, PacketInfo, PeerFilter, PortRange, Protocol,
-    RuleOrigin, SharedFirewall, parse_packet_info,
+    Action, DecidedBy, Direction, FirewallConfig, FirewallRule, PacketInfo, PeerFilter, PortRange,
+    Protocol, RuleOrigin, SharedFirewall, parse_packet_info,
 };
 
 use iroh::EndpointId;
@@ -255,7 +255,7 @@ fn verdict(
     peer: &EndpointId,
     network: Option<&str>,
 ) -> Action {
-    SharedFirewall::new(config).evaluate_packet(direction, info, peer, network)
+    SharedFirewall::new(config).evaluate_packet(direction, info, peer, |name| Some(name) == network)
 }
 
 /// Whether `rule` selects this packet, determined by observation rather than
@@ -396,6 +396,52 @@ proptest! {
         }
     }
 
+    /// `ray firewall test` cannot drift from enforcement: `explain` reaches the
+    /// verdict `evaluate_packet` does for a new packet (a fresh instance, so no
+    /// flow to return on), and the rule it names is the first that selects the
+    /// packet, at its index in the config.
+    #[test]
+    fn explain_agrees_with_enforcement(
+        config in config_strategy(),
+        disabled in any::<bool>(),
+        reject in any::<bool>(),
+        spec in packet_spec(),
+        direction in direction_strategy(),
+        seed in 0u8..4,
+        network in network_strategy(),
+    ) {
+        let config = FirewallConfig { disabled, reject, ..config };
+        let info = spec.expected();
+        let peer = test_id(seed);
+        let net = network.as_deref();
+
+        let explained = SharedFirewall::new(config.clone())
+            .explain(direction, &info, &peer, |name| Some(name) == net);
+        prop_assert_eq!(
+            explained.action,
+            verdict(config.clone(), direction, &info, &peer, net),
+        );
+        prop_assert_eq!(explained.reject, reject && explained.action == Action::Deny);
+        match &explained.decided_by {
+            DecidedBy::Disabled => prop_assert!(disabled),
+            DecidedBy::Default => {
+                prop_assert!(!disabled);
+                for rule in &config.rules {
+                    prop_assert!(!rule_matches(rule, direction, &info, &peer, net));
+                }
+            }
+            DecidedBy::Rule { index, rule } => {
+                prop_assert!(!disabled);
+                prop_assert_eq!(rule, &config.rules[*index]);
+                prop_assert!(rule_matches(rule, direction, &info, &peer, net));
+                for earlier in &config.rules[..*index] {
+                    prop_assert!(!rule_matches(earlier, direction, &info, &peer, net));
+                }
+                prop_assert!(!explained.return_traffic);
+            }
+        }
+    }
+
     /// Conntrack admits the return packet of a flow this device opened, even
     /// under the default inbound deny: the reply's source is the destination
     /// we sent to, and vice versa.
@@ -410,7 +456,7 @@ proptest! {
         let fw = SharedFirewall::new(FirewallConfig::default());
         let peer = test_id(seed);
 
-        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, |_| false), Action::Allow);
 
         let reply = PacketInfo {
             src_ip: out.dst_ip,
@@ -419,7 +465,7 @@ proptest! {
             dst_port: out.src_port,
             ..out
         };
-        prop_assert_eq!(fw.evaluate_packet(Direction::In, &reply, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::In, &reply, &peer, |_| false), Action::Allow);
     }
 
     /// Conntrack admits *only* that flow. An inbound packet that differs in
@@ -437,7 +483,7 @@ proptest! {
 
         let fw = SharedFirewall::new(FirewallConfig::default());
         let peer = test_id(seed);
-        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, |_| false), Action::Allow);
 
         // Same flow except for the peer's port: a different connection.
         let unrelated = PacketInfo {
@@ -448,7 +494,7 @@ proptest! {
             ..out
         };
         prop_assert_eq!(
-            fw.evaluate_packet(Direction::In, &unrelated, &peer, None),
+            fw.evaluate_packet(Direction::In, &unrelated, &peer, |_| false),
             Action::Deny,
         );
     }
@@ -476,7 +522,7 @@ proptest! {
         let fw = SharedFirewall::new(config);
         let peer = test_id(seed);
 
-        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, None), Action::Allow);
+        prop_assert_eq!(fw.evaluate_packet(Direction::Out, &out, &peer, |_| false), Action::Allow);
 
         let inbound_request = PacketInfo {
             src_ip: out.dst_ip,
@@ -484,7 +530,7 @@ proptest! {
             ..out
         };
         prop_assert_eq!(
-            fw.evaluate_packet(Direction::In, &inbound_request, &peer, None),
+            fw.evaluate_packet(Direction::In, &inbound_request, &peer, |_| false),
             Action::Deny,
         );
     }

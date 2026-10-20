@@ -134,10 +134,10 @@ pub trait DnsConfigurator: Send + Sync {
     async fn apply(&self) -> Result<()>;
     async fn revert(&self) -> Result<()>;
     fn name(&self) -> &'static str;
-    /// Return the upstream DNS servers captured from the system before rayfish
-    /// overwrote resolv.conf. Used by the resolver forwarder (Task 11).
-    /// Default: empty (all other configurators use split-DNS and don't capture).
-    fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
+    /// Return the upstream DNS servers, of either family, captured from the
+    /// system before rayfish overwrote resolv.conf. Seeds the resolver's
+    /// forwarder. Default: empty (split-DNS configurators don't capture).
+    fn captured_upstreams(&self) -> Vec<IpAddr> {
         Vec::new()
     }
     /// Install the OS search domains for the currently joined networks.
@@ -166,7 +166,7 @@ pub trait DnsConfigurator: Send + Sync {
     /// stub has somewhere to go when we decline. Threaded into the re-assert
     /// loop so a trample-repair rewrites the same file we installed.
     /// Default: empty (split-DNS backends don't write the file).
-    fn fallback_upstreams(&self) -> Vec<Ipv4Addr> {
+    fn fallback_upstreams(&self) -> Vec<IpAddr> {
         Vec::new()
     }
     /// The other mesh's resolver, when this backend is sharing
@@ -226,8 +226,8 @@ pub async fn detect_and_configure(
         if !resolved_in_path {
             tracing::info!(
                 "systemd-resolved is not in this host's resolution path \
-                 (/etc/resolv.conf does not point at the stub and nsswitch.conf has no \
-                 `resolve`); configuring /etc/resolv.conf directly instead"
+                 (/etc/resolv.conf does not point at its stub, or it is not running); \
+                 configuring /etc/resolv.conf directly instead"
             );
         }
 
@@ -300,39 +300,103 @@ pub fn restore_stale_backups() {
     {
         let path = PathBuf::from("/etc/resolv.conf");
         let backup = backup_path(&path);
-        if backup.exists() {
+        if exists_no_follow(&backup) {
             // A hard kill skips the panic hook, so the file left behind can be
             // one we merged into another VPN's. Copying the backup over it would
             // undo their DNS as well as ours; subtract our lines instead. Same
             // rule as `restore_file`, arrived at from the other direction.
-            let current = std::fs::read_to_string(&path).unwrap_or_default();
-            if let Some(ip) = other_overlay_resolver(&current) {
-                tracing::info!(
-                    resolver = %ip,
-                    "stale DNS backup, but another VPN's resolver is in the live file; \
-                     removing only our entries"
-                );
-                let _ = std::fs::write(&path, strip_our_resolv_entries(&current));
-            } else {
-                tracing::info!(path = %path.display(), "restoring stale DNS backup from previous crash");
-                if let Err(e) = std::fs::copy(&backup, &path) {
-                    tracing::warn!(error = %e, "failed to restore DNS backup");
+            //
+            // The backup goes only once it is no longer needed: a restore that
+            // failed (a read-only bind mount, a full disk) keeps it for the
+            // next start or the panic hook to try again, rather than losing
+            // the host's own file for good.
+            let current = std::fs::read_to_string(&path).ok();
+            let done = match stale_backup_action(current.as_deref()) {
+                StaleBackup::StripOurs(ip) => {
+                    tracing::info!(
+                        resolver = %ip,
+                        "stale DNS backup, but another VPN's resolver is in the live file; \
+                         removing only our entries"
+                    );
+                    let current = current.unwrap_or_default();
+                    match write_resolv_file(&path, strip_our_resolv_entries(&current).as_bytes()) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to remove our DNS entries; keeping the backup");
+                            false
+                        }
+                    }
                 }
+                StaleBackup::Restore => {
+                    tracing::info!(path = %path.display(), "restoring stale DNS backup from previous crash");
+                    match restore_resolv_backup(&backup, &path) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to restore DNS backup; keeping it");
+                            false
+                        }
+                    }
+                }
+                StaleBackup::Discard => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "stale DNS backup, but something else has rewritten the live file since; \
+                         discarding the backup and leaving the file alone"
+                    );
+                    true
+                }
+            };
+            if done {
+                let _ = std::fs::remove_file(&backup);
             }
-            let _ = std::fs::remove_file(&backup);
         }
         // Drop a stale `dns=none` NM snippet left by a hard kill (a panic would
         // have cleaned it via emergency_restore_resolv_conf). Marker-guarded so
         // we never touch an operator's own NM config. If we're about to
         // re-activate, apply() reinstalls it; if we boot into standby, this stops
         // NM staying quieted while the VPN is down.
+        // NM keeps `dns=none` until it rereads conf.d, so reload it, bounded,
+        // the same way the panic hook does.
         if std::fs::read_to_string(NM_DROPIN)
             .map(|c| resolv_conf_is_ours(&c))
             .unwrap_or(false)
         {
             tracing::info!("removing stale NetworkManager dns=none drop-in from previous crash");
-            let _ = std::fs::remove_file(NM_DROPIN);
+            if std::fs::remove_file(NM_DROPIN).is_ok() {
+                nm_reload_blocking();
+            }
         }
+    }
+}
+
+/// What a stale direct-mode backup found at startup is for.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum StaleBackup {
+    /// The live file is one we merged into another VPN's: subtract our lines.
+    StripOurs(Ipv4Addr),
+    /// The live file is ours, or gone: put the host's back.
+    Restore,
+    /// Something else wrote the file after we did (NetworkManager, DHCP, the
+    /// operator). It is newer than our backup, so the backup is dropped.
+    Discard,
+}
+
+/// Decide what to do with a stale backup given the live `/etc/resolv.conf`
+/// (`None` when it is missing). Same rule Tailscale's direct manager follows:
+/// only overwrite a file that is still ours.
+#[cfg(any(target_os = "linux", test))]
+fn stale_backup_action(current: Option<&str>) -> StaleBackup {
+    let Some(current) = current else {
+        return StaleBackup::Restore;
+    };
+    if let Some(ip) = other_overlay_resolver(current) {
+        return StaleBackup::StripOurs(ip);
+    }
+    if resolv_conf_is_ours(current) {
+        StaleBackup::Restore
+    } else {
+        StaleBackup::Discard
     }
 }
 
@@ -371,7 +435,14 @@ pub async fn clear_search_domains(tun_name: &str) {
         let _ = tun_name;
         macos::remove_dns_config();
     }
-    #[cfg(not(target_os = "macos"))]
+    // Linux clears the same way, for the same reason: the set path always
+    // carries `~ray`, so an empty list sent through it re-registered `.ray` on
+    // the link right after the backend's revert dropped it. Reverting the link
+    // is what "no domains" means to resolved, and it is a no-op on a host where
+    // resolved never held it.
+    #[cfg(target_os = "linux")]
+    revert_resolved_link(tun_name).await;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     if let Err(e) = set_manager_search_domains(&[], tun_name).await {
         tracing::warn!(error = %e, "failed to clear search domains");
     }
@@ -483,28 +554,40 @@ pub fn remove_dns_config() {
 
 mod linux_backend;
 #[cfg(target_os = "linux")]
+mod resolv_file;
+#[cfg(target_os = "linux")]
 pub(crate) use linux_backend::nm_quiet_remove;
 pub(crate) use linux_backend::system_nameservers;
 #[cfg(any(target_os = "linux", test))]
 use linux_backend::*;
 #[cfg(target_os = "linux")]
-pub use linux_backend::{Recapture, emergency_restore_resolv_conf, run_resolv_reassert};
+pub use linux_backend::{
+    Recapture, emergency_restore_resolv_conf, emergency_withdraw_resolvconf, run_resolv_reassert,
+};
+#[cfg(target_os = "linux")]
+use resolv_file::{backup_resolv_file, exists_no_follow, restore_resolv_backup, write_resolv_file};
 
 /// No-op on non-Linux: only the direct `/etc/resolv.conf` takeover has artifacts
 /// to restore.
 #[cfg(not(target_os = "linux"))]
 pub fn emergency_restore_resolv_conf() {}
 
+/// No-op off Linux: no other platform registers a resolvconf stanza that a
+/// crash can leave behind (FreeBSD's goes through local_unbound).
+#[cfg(not(target_os = "linux"))]
+pub fn emergency_withdraw_resolvconf() {}
+
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        MAX_NAMESERVERS, NmQuietOutcome, Reassert, SearchDomain, first_nameserver,
+        MAX_NAMESERVERS, NmQuietOutcome, Reassert, SearchDomain, StaleBackup, first_nameserver,
         foreign_mesh_resolver, join_domains, merge_search_domains, nm_dns_none_dropin,
-        nm_quiet_outcome, other_overlay_resolver, parse_resolv_nameservers, reassert_decision,
-        render_direct_resolv_conf, render_direct_resolv_conf_with, resolv_conf_is_ours,
-        search_domains_for, strip_our_resolv_entries,
+        nm_quiet_outcome, other_overlay_resolver, parse_resolv_nameservers, parse_resolv_search,
+        reassert_decision, render_direct_resolv_conf, render_direct_resolv_conf_with,
+        resolv_conf_is_ours, resolvectl_domain_args, resolved_link_domains, search_domains_for,
+        stale_backup_action, strip_our_resolv_entries,
     };
 
     /// Domains as the host had them, i.e. read back from its own config.
@@ -516,7 +599,7 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
     #[cfg(target_os = "linux")]
-    use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved};
+    use super::{resolv_conf_owned_by_resolved, resolv_conf_points_at_resolved};
 
     /// Windows is handed only the search domains and has to recover the bare
     /// network names from them, for the NRPT namespaces. The two lists must not
@@ -545,6 +628,49 @@ mod tests {
         assert!(names(&host(&["corp", "other.example.com"])).is_empty());
         // A deeper name under `.ray` is not a network either.
         assert!(names(&host(&["box.homelab.ray"])).is_empty());
+    }
+
+    /// resolved keys a link's domains by name, so sending `ray` twice (once
+    /// routing-only, once as a search domain) let the second flag win and left
+    /// the link with no routing-only domain. Each domain goes in once.
+    #[test]
+    fn resolved_link_domains_never_repeat_ray() {
+        let with_short_names = resolved_link_domains(&search_domains_for(&networks(&["homelab"])));
+        assert_eq!(
+            with_short_names,
+            vec![
+                ("homelab.ray".to_string(), false),
+                ("ray".to_string(), false)
+            ]
+        );
+        // Short names off: `.ray` still has to route to us, routing-only.
+        assert_eq!(resolved_link_domains(&[]), vec![("ray".to_string(), true)]);
+        assert_eq!(
+            resolvectl_domain_args(&search_domains_for(&networks(&["homelab"]))),
+            ["homelab.ray", "ray"]
+        );
+        assert_eq!(resolvectl_domain_args(&[]), ["~ray"]);
+    }
+
+    /// A backup is only restored over a file that is still ours. Anything else
+    /// wrote the live file after the crash, so it is newer than the backup.
+    #[test]
+    fn stale_backup_only_replaces_our_own_file() {
+        let ours = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 9.9.9.9\n";
+        assert_eq!(stale_backup_action(Some(ours)), StaleBackup::Restore);
+        assert_eq!(stale_backup_action(None), StaleBackup::Restore);
+        assert_eq!(
+            stale_backup_action(Some(
+                "# Generated by NetworkManager\nnameserver 192.168.1.1\n"
+            )),
+            StaleBackup::Discard
+        );
+        let merged =
+            "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 100.100.100.100\n";
+        assert_eq!(
+            stale_backup_action(Some(merged)),
+            StaleBackup::StripOurs(Ipv4Addr::new(100, 100, 100, 100))
+        );
     }
 
     #[test]
@@ -753,8 +879,8 @@ mod tests {
     /// owns DNS for the machine with nothing behind us.
     #[test]
     fn quieting_networkmanager_can_invalidate_the_capture_that_allowed_the_takeover() {
-        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
-        let router = "192.168.1.1".parse::<Ipv4Addr>().unwrap();
+        let nm = "127.0.0.1".parse::<IpAddr>().unwrap();
+        let router = "192.168.1.1".parse::<IpAddr>().unwrap();
 
         // The regression: NM's dnsmasq was the only thing we captured, and
         // quieting NM killed it. Refuse, rather than install the black hole.
@@ -796,7 +922,7 @@ mod tests {
         assert_eq!(nm_quiet_outcome(&[], &[], false), NmQuietOutcome::Proceed);
         // And the abort still fires when something *was* answering and stopped,
         // which is the case it exists for.
-        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
+        let nm = "127.0.0.1".parse::<IpAddr>().unwrap();
         assert_eq!(nm_quiet_outcome(&[nm], &[], false), NmQuietOutcome::Abort);
     }
 
@@ -805,9 +931,9 @@ mod tests {
     /// costs a full lookup timeout on every off-mesh name.
     #[test]
     fn a_degraded_verdict_names_exactly_the_servers_that_died() {
-        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
-        let router = "192.168.1.1".parse::<Ipv4Addr>().unwrap();
-        let public = "9.9.9.9".parse::<Ipv4Addr>().unwrap();
+        let nm = "127.0.0.1".parse::<IpAddr>().unwrap();
+        let router = "192.168.1.1".parse::<IpAddr>().unwrap();
+        let public = "9.9.9.9".parse::<IpAddr>().unwrap();
         // What survives is `after`, so the caller can store it directly; what is
         // reported is the complement, so the operator can see what it cost.
         assert_eq!(
@@ -834,10 +960,8 @@ mod tests {
 
     #[test]
     fn parse_resolv_nameservers_extracts_ipv4_excluding_magic() {
-        // Both magic addresses are dropped, by different mechanisms: the v6 one
-        // fails the `Ipv4Addr` parse, the v4 one is filtered by name. Only the
-        // second is a rule this function has to carry, so it has to be present or
-        // the filter could be deleted with every test still passing.
+        // Both magic addresses are dropped by name, so each has to be present
+        // or its filter could be deleted with every test still passing.
         let c = "# Generated by NetworkManager\nsearch home\nnameserver 192.168.1.1\n\
                  nameserver 100.100.100.53\nnameserver 8.8.8.8\nnameserver 200::53\n";
         assert_eq!(
@@ -929,7 +1053,7 @@ mod tests {
         // asks it: registering `.ray` on the tun link there resolves nothing.
         let c = "nameserver 108.61.10.10\nnameserver 9.9.9.9\nnameserver 2001:19f0:300:1704::6\n";
         assert!(!resolv_conf_points_at_resolved(c));
-        assert!(!nsswitch_uses_resolve("hosts:          files dns\n"));
+        assert!(!resolv_conf_owned_by_resolved(c, None));
     }
 
     #[test]
@@ -941,17 +1065,28 @@ mod tests {
         assert!(resolv_conf_points_at_resolved("nameserver 127.0.0.54\n"));
     }
 
+    /// A symlink to resolved's stub file counts even when the file cannot be
+    /// read; one to its uplink file does not, since that lists the upstreams
+    /// glibc then asks directly.
     #[test]
     #[cfg(target_os = "linux")]
-    fn nsswitch_resolve_module_counts_as_reaching_resolved() {
-        // glibc calls resolved over D-Bus here, so resolv.conf never matters.
-        assert!(nsswitch_uses_resolve(
-            "passwd: files\nhosts: mymachines resolve [!UNAVAIL=return] files dns\n"
+    fn a_link_to_the_stub_file_counts_as_reaching_resolved() {
+        use std::path::Path;
+        let stub = Path::new("../run/systemd/resolve/stub-resolv.conf");
+        assert!(resolv_conf_owned_by_resolved("", Some(stub)));
+        assert!(resolv_conf_owned_by_resolved(
+            "",
+            Some(Path::new("/run/systemd/resolve/stub-resolv.conf"))
         ));
-        // A commented-out line is not configuration, and `resolve` has to be a
-        // whole module name rather than a substring of another one.
-        assert!(!nsswitch_uses_resolve("# hosts: resolve files\n"));
-        assert!(!nsswitch_uses_resolve("hosts: files resolvectl dns\n"));
+        let uplink = Path::new("/run/systemd/resolve/resolv.conf");
+        assert!(!resolv_conf_owned_by_resolved(
+            "nameserver 192.0.2.1\n",
+            Some(uplink)
+        ));
+        assert!(!resolv_conf_owned_by_resolved(
+            "",
+            Some(Path::new("/run/NetworkManager/resolv.conf"))
+        ));
     }
 
     #[test]
@@ -976,7 +1111,7 @@ mod tests {
     /// everything else, so dropping one drops what the stub tries next.
     #[test]
     fn render_direct_resolv_conf_carries_every_server_up_to_maxns() {
-        let servers: Vec<Ipv4Addr> = ["100.100.100.100", "192.168.1.1", "9.9.9.9"]
+        let servers: Vec<IpAddr> = ["100.100.100.100", "192.168.1.1", "9.9.9.9"]
             .iter()
             .map(|s| s.parse().unwrap())
             .collect();
@@ -1002,6 +1137,30 @@ mod tests {
                 "8.8.8.8".parse::<Ipv4Addr>().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn parse_resolv_search_accepts_any_whitespace_and_drops_ours() {
+        let c = "search\tlan corp.example\ndomain   home\nsearch homelab.ray ray\n# search nope\nsearchx bad\n";
+        assert_eq!(
+            join_domains(&parse_resolv_search(c)),
+            "lan corp.example home"
+        );
+    }
+
+    /// IPv6 servers are upstreams too: dropping them left an IPv6-only host
+    /// with nothing to forward to and a rendered file without its servers.
+    #[test]
+    fn ipv6_nameservers_are_captured_and_rendered() {
+        use super::parse_resolv_nameserver_ips;
+        let c = "nameserver 192.168.1.1\nnameserver 2001:db8::53\nnameserver 200::53\n\
+                 nameserver fe80::1%eth0\n";
+        assert_eq!(
+            parse_resolv_nameserver_ips(c),
+            ["192.168.1.1", "2001:db8::53"].map(|ip| ip.parse::<IpAddr>().unwrap())
+        );
+        let out = render_direct_resolv_conf(&[], &["2001:db8::53".parse().unwrap()]);
+        assert!(out.contains("nameserver 200::53\nnameserver 2001:db8::53\n"));
     }
 
     #[test]
@@ -1225,6 +1384,6 @@ mod tests {
             upstreams: vec!["192.168.1.1".parse().unwrap()],
         };
         assert_eq!(dns.name(), "windows-powershell-dns");
-        assert_eq!(dns.captured_upstreams(), dns.upstreams);
+        assert_eq!(dns.captured_upstreams(), [IpAddr::V4(dns.upstreams[0])]);
     }
 }

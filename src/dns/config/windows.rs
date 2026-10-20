@@ -56,8 +56,8 @@ impl DnsConfigurator for WindowsDns {
         "windows-powershell-dns"
     }
 
-    fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
-        self.upstreams.clone()
+    fn captured_upstreams(&self) -> Vec<IpAddr> {
+        self.upstreams.iter().copied().map(IpAddr::V4).collect()
     }
 }
 

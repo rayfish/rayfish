@@ -33,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Test release version hook
+        run: python3 tests/test-release-versions.py
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -61,6 +64,105 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  docker-e2e:
+    runs-on: ubuntu-24.04
+    env:
+      E2E_BACKEND: docker
+      E2E_AUTO_TEARDOWN: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test E2E harness
+        run: bash tests/test-e2e-harness.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-docker-e2e-x86_64"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Install just and cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cross
+
+      - name: Set up TUN device
+        run: sudo modprobe tun
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
+
+      - name: Build E2E node Docker image
+        run: |
+          for attempt in 1 2 3; do
+            if docker build -t rayfish-e2e-node tests/docker; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: "E2E: closed-net"
+        run: bash tests/e2e.sh closed-net run
+
+      - name: "E2E: firewall"
+        if: ${{ !cancelled() }}
+        run: bash tests/e2e.sh firewall run
+
+      - name: "E2E: connect"
+        if: ${{ !cancelled() }}
+        run: bash tests/e2e.sh connect run
+
+      - name: "E2E: invites"
+        if: ${{ !cancelled() }}
+        run: bash tests/e2e.sh invites run
+
+      - name: Teardown remaining E2E containers
+        if: always()
+        run: |
+          for s in closed-net firewall connect invites; do
+            bash tests/e2e.sh "$s" teardown || true
+          done
+          docker network rm rayfish-e2e 2>/dev/null || true
+          leaked=0
+          if all_containers="$(docker ps -a --format '{{.Names}}')"; then
+            for c in rayfish-closednet-a rayfish-closednet-b rayfish-closednet-c \
+                     rayfish-fw-a rayfish-fw-b rayfish-fw-c \
+                     rayfish-connect-a rayfish-connect-b \
+                     rayfish-invites-a rayfish-invites-b rayfish-invites-c; do
+              if echo "$all_containers" | grep -qxF "$c"; then
+                echo "::error::Container $c remains after fallback teardown" >&2
+                leaked=1
+              fi
+            done
+          else
+            echo "::error::Cannot query Docker containers (API unavailable?)" >&2
+            leaked=1
+          fi
+          if all_networks="$(docker network ls --format '{{.Name}}')"; then
+            if echo "$all_networks" | grep -qxF "rayfish-e2e"; then
+              echo "::error::Docker network rayfish-e2e remains after fallback teardown" >&2
+              leaked=1
+            fi
+          else
+            echo "::error::Cannot query Docker networks (API unavailable?)" >&2
+            leaked=1
+          fi
+          if [[ $leaked -ne 0 ]]; then
+            echo "Fallback cleanup failed: lingering containers or network detected." >&2
+            exit 1
+          fi
+
 
   # Same gap the Android job closes, for the other platform whose code no Linux
   # build compiles: the TUN/route/DNS backends are per-OS `cfg` branches, and
@@ -108,7 +210,7 @@ jobs:
             --out-dir macos/Generated \
             --no-format
           sed -i '' 's/[[:space:]]*$//' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
-          perl -0pi -e 's/\n+\z/\n/' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
+          perl -0pi -e 's/\n*\z/\n/' macos/Generated/ray_apple.swift macos/Generated/ray_appleFFI.h macos/Generated/ray_appleFFI.modulemap
           git diff --exit-code macos/Generated
 
       - name: Build packet tunnel extension
@@ -116,6 +218,14 @@ jobs:
           xcodebuild -quiet -project macos/Rayfish.xcodeproj
           -target RayfishTunnelExtension -configuration Debug
           ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
+      # The iOS half of ray-mobile is `#[cfg(target_os = "ios")]` code that no
+      # host build compiles.
+      - name: Check iOS core and bindings
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo clippy -p ray-mobile --lib --target aarch64-apple-ios --locked -- -D warnings
+          just ios-bindings
+          git diff --exit-code ios/Generated
 
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and

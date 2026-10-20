@@ -21,6 +21,7 @@ import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import xyz.rayfish.android.ui.userMessage
 
 /**
  * The pick a file, type the password, swap the key sequence, shared by the two
@@ -74,7 +75,7 @@ fun IdentityRestoreDialogs(
             } catch (e: RayException.NodeRunning) {
                 onToast(context.getString(R.string.toast_restore_need_off))
             } catch (t: Throwable) {
-                onToast(context.getString(R.string.error_restore_failed, t.message.orEmpty()))
+                onToast(context.getString(R.string.error_restore_failed, t.userMessage))
             }
             finish()
             if (wasStarted) runCatching { NodeHolder.ensureStarted(context) }

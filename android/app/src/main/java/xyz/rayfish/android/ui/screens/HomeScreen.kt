@@ -37,6 +37,7 @@ import xyz.rayfish.android.isActive
 import xyz.rayfish.android.ui.AppSnapshot
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
+import xyz.rayfish.android.ui.userMessage
 
 @Composable
 fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Unit, onOpenNetworks: () -> Unit = {}, onRefresh: () -> Unit = {}) {
@@ -44,6 +45,7 @@ fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Un
     val files = snapshot.files
     val connects = snapshot.connects
     val joins = snapshot.joins
+    val invitations = snapshot.invitations
     val queued = snapshot.queued
     val transfers = snapshot.transfers
     val context = LocalContext.current
@@ -127,19 +129,20 @@ fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Un
     fun act(onFailure: () -> Unit = {}, block: suspend () -> Unit) {
         scope.launch {
             try { withContext(Dispatchers.IO) { block() }; onRefresh() }
-            catch (t: Throwable) { onFailure(); if (t is CancellationException) throw t; onToast(context.getString(R.string.error_failed, t.message.orEmpty())) }
+            catch (t: Throwable) { onFailure(); if (t is CancellationException) throw t; onToast(context.getString(R.string.error_failed, t.userMessage)) }
         }
     }
     // The foreground service owns downloads, including their move to Downloads.
     // Observing its state keeps Save disabled across tab changes and recreation.
     val accepting by ReceiveService.accepting.collectAsStateWithLifecycle()
+    val retryable by OfferNotifier.retryable.collectAsStateWithLifecycle()
     fun acceptFile(f: FileOffer) {
         if (!ReceiveService.startAccept(context, f)) {
             onToast(context.getString(R.string.error_receive_start))
         }
     }
 
-    val hasRequests = connects.isNotEmpty() || joins.isNotEmpty()
+    val hasRequests = connects.isNotEmpty() || joins.isNotEmpty() || invitations.isNotEmpty()
     val hasFiles = files.isNotEmpty() || accepting.isNotEmpty() || queued.isNotEmpty() || transfers.isNotEmpty()
 
     Column(
@@ -171,7 +174,9 @@ fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Un
                         NotifRow(
                             title = f.filename,
                             subtitle = stringResource(R.string.home_file_from, formatSize(f.size), f.from),
-                            acceptLabel = stringResource(R.string.action_save), onAccept = { acceptFile(f) },
+                            acceptLabel = stringResource(
+                                if (f.id in retryable) R.string.action_retry else R.string.action_save,
+                            ), onAccept = { acceptFile(f) },
                             onReject = {
                                 OfferNotifier.markActedOn(context, f.id)
                                 act(onFailure = { OfferNotifier.clearActedOn(f.id) }) {
@@ -208,6 +213,16 @@ fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Un
                             subtitle = stringResource(R.string.home_connect_request, c.shortId, c.waitingSecs.toInt()),
                             acceptLabel = stringResource(R.string.action_accept), onAccept = { act { NodeHolder.get(context).approveConnectRequest(c.shortId) } },
                             onReject = { act { NodeHolder.get(context).rejectConnectRequest(c.shortId) } },
+                            onBlock = { act { NodeHolder.get(context).blockConnectRequest(c.shortId) } },
+                        )
+                    }
+                    invitations.forEach { i ->
+                        NotifRow(
+                            title = stringResource(R.string.home_invitation_title, i.network),
+                            subtitle = stringResource(R.string.home_invitation_from, i.coordinator.take(10)),
+                            acceptLabel = stringResource(R.string.action_join), onAccept = { act { NodeHolder.get(context).acceptInvitation(i.id) } },
+                            onReject = { act { NodeHolder.get(context).declineInvitation(i.id) } },
+                            rejectLabel = stringResource(R.string.action_decline_block),
                         )
                     }
                     joins.forEach { (net, j) ->
@@ -225,7 +240,7 @@ fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Un
 }
 
 @Composable
-private fun NotifRow(title: String, subtitle: String, acceptLabel: String, onAccept: () -> Unit, onReject: () -> Unit) {
+private fun NotifRow(title: String, subtitle: String, acceptLabel: String, onAccept: () -> Unit, onReject: () -> Unit, onBlock: (() -> Unit)? = null, rejectLabel: String = stringResource(R.string.action_decline)) {
     Column {
         Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Rf.Heading, maxLines = 1)
         Text(subtitle, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Muted)
@@ -234,7 +249,12 @@ private fun NotifRow(title: String, subtitle: String, acceptLabel: String, onAcc
                 Text(acceptLabel, color = Rf.Emerald, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             }
             TextButton(onClick = onReject, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
-                Text(stringResource(R.string.action_decline), color = Rf.Rose400, fontFamily = Chakra, fontSize = 14.sp)
+                Text(rejectLabel, color = Rf.Rose400, fontFamily = Chakra, fontSize = 14.sp)
+            }
+            if (onBlock != null) {
+                TextButton(onClick = onBlock, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+                    Text(stringResource(R.string.action_block), color = Rf.Rose400, fontFamily = Chakra, fontSize = 14.sp)
+                }
             }
         }
     }
@@ -310,7 +330,7 @@ private fun HomePreview() {
         HomeScreen(
             snapshot = AppSnapshot(status = Status(
                 true, "7f3ac2e1", "200::7f3a",
-                peers = emptyList(), networks = emptyList(), pendingNetworks = emptyList(),
+                peers = emptyList(), networks = emptyList(), pendingNetworks = emptyList(), identity = null,
             )),
             starting = false, onToast = {},
         )

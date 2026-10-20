@@ -41,6 +41,7 @@ const ROOT: Groups = &[
             "leave",
             "nuke",
             "status",
+            "rename",
             "hostname",
             "ephemeral",
             "dns",
@@ -48,18 +49,22 @@ const ROOT: Groups = &[
     ),
     (
         "Members & access",
-        &["invite", "requests", "kick", "admin", "alias", "identityof"],
+        &[
+            "invite",
+            "invitations",
+            "requests",
+            "kick",
+            "block",
+            "unblock",
+            "blocked",
+            "admin",
+            "alias",
+            "identityof",
+        ],
     ),
     (
         "Devices & links",
-        &[
-            "connect",
-            "contact",
-            "pair",
-            "unpair",
-            "machines",
-            "controller",
-        ],
+        &["connect", "pair", "unpair", "machines", "controller"],
     ),
     ("Files", &["send", "files"]),
     ("Policy", &["firewall", "ssh", "exit-node", "apply"]),
@@ -98,7 +103,7 @@ const ROOT: Groups = &[
 /// edit, switches that change how they are enforced, the coordinator-suggestion
 /// queue, and the SSH server that rides the same policy.
 const FIREWALL: Groups = &[
-    ("Rules", &["show", "add", "remove"]),
+    ("Rules", &["show", "add", "remove", "test"]),
     ("Mode", &["on", "off", "default", "reject"]),
     (
         "Coordinator suggestions",
@@ -440,12 +445,13 @@ mod tests {
     #[test]
     fn json_parses_after_a_nested_action() {
         for line in [
-            ["ray", "firewall", "show", "--json"],
-            ["ray", "pair", "list", "--json"],
-            ["ray", "exit-node", "status", "--json"],
+            vec!["ray", "firewall", "show", "--json"],
+            vec!["ray", "pair", "list", "--json"],
+            vec!["ray", "exit-node", "status", "--json"],
+            vec!["ray", "firewall", "test", "laptop", "tcp:22", "--json"],
         ] {
             assert!(
-                command().try_get_matches_from(line).is_ok(),
+                command().try_get_matches_from(line.clone()).is_ok(),
                 "`{}` should parse",
                 line.join(" ")
             );
@@ -482,7 +488,7 @@ mod tests {
             vec!["ray", "requests", "net", "accept", "abc123"],
             vec!["ray", "requests", "net", "deny", "abc123"],
             vec!["ray", "connect"],
-            vec!["ray", "connect", "somecontactid"],
+            vec!["ray", "connect", "someidentity"],
             vec!["ray", "connect", "approve", "abc123"],
             vec!["ray", "connect", "accept", "abc123"],
             vec!["ray", "config", "set", "auto-update", "on"],

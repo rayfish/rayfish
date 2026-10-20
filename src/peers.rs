@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
@@ -10,7 +10,10 @@ use iroh::EndpointId;
 use iroh::endpoint::{Connection, VarInt};
 use smol_str::SmolStr;
 
+use crate::AsyncMutex;
 use crate::audit::AuditLog;
+use crate::config::QuicEngine;
+use crate::forward::fq_codel::Sender as FqSender;
 use crate::membership;
 
 mod device_user_map;
@@ -82,6 +85,7 @@ pub struct PeerTable {
     version_incompatible: Arc<DashSet<EndpointId>>,
     /// Actual local TUN limit, shared with readers across TUN reattachments.
     local_mtu: Arc<AtomicU16>,
+    engine: QuicEngine,
 }
 
 /// A single peer's identity, its one shared connection, and the network-handle
@@ -109,6 +113,7 @@ pub struct PeerEntry {
 
 struct ActiveConnection {
     conn: Connection,
+    scheduler: Option<Arc<OnceLock<FqSender>>>,
     /// Identical at both ends of this TLS session, unlike `stable_id()` which
     /// only identifies a local connection object. Both peers keep the connection
     /// with the lowest ID, regardless of initiator or registration order.
@@ -129,18 +134,39 @@ struct ActiveConnection {
     supports_idle_close: Arc<AtomicBool>,
     receive_mtu: Arc<AtomicU16>,
     exit_ipv4: Arc<AtomicU8>,
+    /// Held from snapshotting `out_handles` until the `NetworkHandles` stream
+    /// is open. The peer replaces its whole decode table per announcement, in
+    /// stream order, so an older snapshot must never open its stream after a
+    /// newer one.
+    announce: Arc<AsyncMutex<()>>,
+}
+
+/// `exit_ipv4` values: the peer's announcement has not arrived yet, or it said
+/// it cannot, or can, translate IPv4 exit traffic.
+const EXIT_IPV4_UNKNOWN: u8 = 0;
+const EXIT_IPV4_REFUSED: u8 = 1;
+const EXIT_IPV4_SUPPORTED: u8 = 2;
+
+fn decode_exit_ipv4(state: &AtomicU8) -> Option<bool> {
+    match state.load(Ordering::Relaxed) {
+        EXIT_IPV4_REFUSED => Some(false),
+        EXIT_IPV4_SUPPORTED => Some(true),
+        _ => None,
+    }
 }
 
 impl ActiveConnection {
-    fn new(conn: Connection) -> Self {
+    fn new(conn: Connection, engine: QuicEngine) -> Self {
         Self {
+            scheduler: (engine == QuicEngine::FqCodel).then(|| Arc::new(OnceLock::new())),
             selection_id: connection_selection_id(&conn),
             conn,
             in_handles: HashMap::new(),
             last_active: Arc::new(AtomicU64::new(now_ms())),
             supports_idle_close: Arc::new(AtomicBool::new(false)),
             receive_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
-            exit_ipv4: Arc::new(AtomicU8::new(0)),
+            exit_ipv4: Arc::new(AtomicU8::new(EXIT_IPV4_UNKNOWN)),
+            announce: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -159,13 +185,23 @@ fn connection_selection_id(conn: &Connection) -> [u8; 32] {
     id
 }
 
+/// Where to send a `NetworkHandles` announcement. See
+/// [`PeerTable::announce_target`].
+pub(crate) struct AnnounceTarget {
+    pub(crate) conn: Connection,
+    pub(crate) lock: Arc<AsyncMutex<()>>,
+}
+
 /// Result of a routing lookup: the connection to send over, the peer identity,
-/// the network the packet is attributed to (firewall context), and the outbound
+/// the network used to tag the packet, and the outbound
 /// handle to tag the datagram with.
 pub struct PeerRoute {
     pub conn: Connection,
+    pub(crate) scheduler: Option<Arc<OnceLock<FqSender>>>,
     pub endpoint_id: EndpointId,
-    /// The network the outbound packet is attributed to (firewall context). A
+    /// The peer's mesh address, so per-packet membership checks need no rehash.
+    pub(crate) ipv6: Ipv6Addr,
+    /// The network used for the outbound transport handle. A
     /// multi-homed peer has one IP, so an IP packet carries no network by itself;
     /// this is the deterministic pick (lexically-smallest shared network).
     pub network: SmolStr,
@@ -179,8 +215,12 @@ pub struct PeerRoute {
 }
 
 impl PeerRoute {
-    pub fn supports_exit_ipv4(&self) -> bool {
-        self.exit_ipv4.load(Ordering::Relaxed) == 2
+    /// Whether the peer said it cannot carry IPv4 exit traffic. A peer whose
+    /// announcement has not arrived yet is not refusing: the first packets of a
+    /// lazy dial are flushed before it lands, and an older gateway drops IPv4 on
+    /// its own.
+    pub fn refuses_exit_ipv4(&self) -> bool {
+        decode_exit_ipv4(&self.exit_ipv4) == Some(false)
     }
 
     /// The peer's advertised IP packet limit; conservative until it announces.
@@ -188,9 +228,23 @@ impl PeerRoute {
         self.receive_mtu.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn activity_clock(&self) -> ActivityClock {
+        ActivityClock(Arc::clone(&self.last_active))
+    }
+
     /// Record that traffic just went out on this connection (resets its idle timer).
     pub fn note_activity(&self) {
         self.last_active.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+/// A connection's shared last-activity clock, for senders outside the route.
+pub(crate) struct ActivityClock(Arc<AtomicU64>);
+
+impl ActivityClock {
+    /// Record that traffic just went out on this connection.
+    pub(crate) fn touch(&self) {
+        self.0.store(now_ms(), Ordering::Relaxed);
     }
 }
 
@@ -206,13 +260,18 @@ fn next_free_handle(used: &HashMap<SmolStr, u16>) -> u16 {
 }
 
 impl PeerEntry {
-    fn new(endpoint_id: EndpointId, conn: Connection, network: SmolStr) -> Self {
+    fn new(
+        endpoint_id: EndpointId,
+        conn: Connection,
+        network: SmolStr,
+        engine: QuicEngine,
+    ) -> Self {
         let mut out_handles = HashMap::new();
         out_handles.insert(network, 1);
         Self {
             endpoint_id,
             out_handles,
-            active: ActiveConnection::new(conn),
+            active: ActiveConnection::new(conn, engine),
         }
     }
 
@@ -222,7 +281,7 @@ impl PeerEntry {
     /// The lowest TLS session ID wins. Both ends rank every physical connection
     /// identically even when concurrent handshakes register in opposite orders.
     /// A closed connection never wins over a live replacement.
-    fn install_connection(&mut self, conn: &Connection) -> bool {
+    fn install_connection(&mut self, conn: &Connection, engine: QuicEngine) -> bool {
         if self.active.matches(conn) {
             self.active.last_active.store(now_ms(), Ordering::Relaxed);
             return false;
@@ -236,7 +295,10 @@ impl PeerEntry {
             );
             return false;
         }
-        let old = std::mem::replace(&mut self.active, ActiveConnection::new(conn.clone()));
+        let old = std::mem::replace(
+            &mut self.active,
+            ActiveConnection::new(conn.clone(), engine),
+        );
         old.conn.close(
             VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
             b"replaced",
@@ -245,7 +307,7 @@ impl PeerEntry {
     }
 
     /// Picks the network a packet to this peer is attributed to (the lexically
-    /// smallest one both ends still share) so routing/firewall context is stable
+    /// smallest one both ends still share) so transport tagging is stable
     /// across lookups, and returns the connection + that network's outbound
     /// handle.
     ///
@@ -262,7 +324,7 @@ impl PeerEntry {
     ///
     /// Falls back to the plain pick when the peer has announced nothing yet (its
     /// `NetworkHandles` is still in flight), which is where every peer starts.
-    fn route(&self) -> Option<PeerRoute> {
+    fn route(&self, ip: Ipv6Addr) -> Option<PeerRoute> {
         // With one shared network there is nothing to choose between: the filter
         // below could only keep it or fall back to it, so the common case pays
         // nothing per packet for a guard that exists for multi-network peers.
@@ -282,15 +344,22 @@ impl PeerEntry {
                 .clone()
         };
         let handle = self.out_handles.get(&network).copied().unwrap_or(0);
-        Some(PeerRoute {
+        Some(self.route_to(ip, network, handle))
+    }
+
+    /// The route over the current connection, tagged for `network` with `handle`.
+    fn route_to(&self, ip: Ipv6Addr, network: SmolStr, handle: u16) -> PeerRoute {
+        PeerRoute {
             conn: self.active.conn.clone(),
+            scheduler: self.active.scheduler.clone(),
             endpoint_id: self.endpoint_id,
+            ipv6: ip,
             network,
             handle,
             receive_mtu: Arc::clone(&self.active.receive_mtu),
             exit_ipv4: Arc::clone(&self.active.exit_ipv4),
             last_active: Arc::clone(&self.active.last_active),
-        })
+        }
     }
 }
 
@@ -308,6 +377,7 @@ impl PeerTable {
             audit: None,
             version_incompatible: Arc::new(DashSet::default()),
             local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            engine: QuicEngine::Standalone,
         }
     }
 
@@ -316,11 +386,35 @@ impl PeerTable {
     /// to every per-network task (clones share the same audit handle).
     pub fn with_audit(audit: Arc<AuditLog>) -> Self {
         Self {
-            peers: Arc::new(FastDashMap::default()),
             audit: Some(audit),
-            version_incompatible: Arc::new(DashSet::default()),
-            local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            ..Self::new()
         }
+    }
+
+    /// Selected at boot together with the endpoint transport configuration.
+    pub(crate) fn with_engine(mut self, engine: QuicEngine) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// Bytes waiting to leave on `conn`: QUIC's datagram send buffer plus any
+    /// FQ-CoDel backlog for the peer's current connection.
+    pub(crate) fn queued_bytes(&self, conn: &Connection) -> usize {
+        let quic = crate::transport::datagram_send_buffer_size(self.engine)
+            .saturating_sub(conn.datagram_send_buffer_space());
+        let scheduled = self
+            .peers
+            .get(&membership::derive_ipv6(&conn.remote_id()))
+            .filter(|e| e.active.matches(conn))
+            .and_then(|e| {
+                e.active
+                    .scheduler
+                    .as_ref()?
+                    .get()
+                    .map(FqSender::queued_bytes)
+            })
+            .unwrap_or(0);
+        quic + scheduled
     }
 
     /// Receive limit advertised to peers and enforced before TUN delivery.
@@ -412,7 +506,7 @@ impl PeerTable {
                 Entry::Occupied(mut o) => {
                     let e = o.get_mut();
                     first_ever = false;
-                    conn_changed = e.install_connection(&conn);
+                    conn_changed = e.install_connection(&conn, self.engine);
                     e.endpoint_id = endpoint_id;
                     if !e.out_handles.contains_key(&net) {
                         let h = next_free_handle(&e.out_handles);
@@ -422,7 +516,12 @@ impl PeerTable {
                 Entry::Vacant(v) => {
                     first_ever = true;
                     conn_changed = true;
-                    v.insert(PeerEntry::new(endpoint_id, conn.clone(), net.clone()));
+                    v.insert(PeerEntry::new(
+                        endpoint_id,
+                        conn.clone(),
+                        net.clone(),
+                        self.engine,
+                    ));
                 }
             }
         }
@@ -450,19 +549,19 @@ impl PeerTable {
 
     pub fn note_exit_ipv4_support(&self, peer: &EndpointId, conn: &Connection, supported: bool) {
         self.update_current(&membership::derive_ipv6(peer), conn, |entry| {
-            entry
-                .active
-                .exit_ipv4
-                .store(if supported { 2 } else { 1 }, Ordering::Relaxed);
+            entry.active.exit_ipv4.store(
+                if supported {
+                    EXIT_IPV4_SUPPORTED
+                } else {
+                    EXIT_IPV4_REFUSED
+                },
+                Ordering::Relaxed,
+            );
         });
     }
 
     pub fn exit_ipv4_support(&self, ip: &Ipv6Addr) -> Option<bool> {
-        match self.peers.get(ip)?.active.exit_ipv4.load(Ordering::Relaxed) {
-            1 => Some(false),
-            2 => Some(true),
-            _ => None,
-        }
+        decode_exit_ipv4(&self.peers.get(ip)?.active.exit_ipv4)
     }
 
     /// Record whether `peer_id` advertised idle-close support in its `MeshHello`
@@ -557,7 +656,7 @@ impl PeerTable {
     /// with that address shares a live connection with us. This is the outbound
     /// hot path's lookup.
     pub fn lookup_v6(&self, ip: &Ipv6Addr) -> Option<PeerRoute> {
-        self.peers.get(ip).and_then(|e| e.route())
+        self.peers.get(ip).and_then(|e| e.route(*ip))
     }
 
     /// Route to the peer holding mesh IPv6 `ip`, pinned to a specific `network`
@@ -567,24 +666,14 @@ impl PeerTable {
     /// allow-list permits us. `None` if the peer isn't connected on `network`.
     pub fn route_on_network(&self, ip: &Ipv6Addr, network: &str) -> Option<PeerRoute> {
         let e = self.peers.get(ip)?;
-        if !e.out_handles.contains_key(network) {
-            return None;
-        }
-        let handle = e.out_handles.get(network).copied().unwrap_or(0);
-        Some(PeerRoute {
-            conn: e.active.conn.clone(),
-            endpoint_id: e.endpoint_id,
-            network: SmolStr::new(network),
-            handle,
-            receive_mtu: Arc::clone(&e.active.receive_mtu),
-            exit_ipv4: Arc::clone(&e.active.exit_ipv4),
-            last_active: Arc::clone(&e.active.last_active),
-        })
+        let handle = *e.out_handles.get(network)?;
+        Some(e.route_to(*ip, SmolStr::new(network), handle))
     }
 
     /// Resolve the network an inbound datagram belongs to from the peer's mesh
     /// IPv6 and the `u16` handle the peer stamped on it (looked up in the peer's
     /// announced inbound table). `None` if the peer or handle is unknown.
+    #[cfg(test)]
     pub fn inbound_network_v6(&self, ip: &Ipv6Addr, handle: u16) -> Option<SmolStr> {
         self.peers
             .get(ip)
@@ -640,6 +729,15 @@ impl PeerTable {
             .get(ip)
             .map(|e| e.out_handles.iter().map(|(n, h)| (n.clone(), *h)).collect())
             .unwrap_or_default()
+    }
+
+    /// The selected connection to `ip` and the lock that orders our handle
+    /// announcements on it.
+    pub(crate) fn announce_target(&self, ip: &Ipv6Addr) -> Option<AnnounceTarget> {
+        self.peers.get(ip).map(|e| AnnounceTarget {
+            conn: e.active.conn.clone(),
+            lock: Arc::clone(&e.active.announce),
+        })
     }
 
     /// The `u16` handle we stamp on datagrams to `ip` for `network`, if assigned.
@@ -771,20 +869,16 @@ impl PeerTable {
     /// peer's connection **iff** this removed its last shared network (so the
     /// caller can close the now-unused connection); `None` otherwise.
     pub fn remove_peer_from_network(&self, ip: &Ipv6Addr, network: &str) -> Option<Connection> {
-        let mut last_conn = None;
-        let mut dropped_id = None;
-        if let Some(mut e) = self.peers.get_mut(ip) {
+        // One locked pass: a separate check and removal would let a concurrent
+        // `add` keep the entry while its connection is still handed back to close.
+        let (_, entry) = self.peers.remove_if_mut(ip, |_, e| {
             e.out_handles.remove(network);
-            if e.out_handles.is_empty() {
-                last_conn = Some(e.active.conn.clone());
-                dropped_id = Some(e.endpoint_id);
-            }
+            e.out_handles.is_empty()
+        })?;
+        if let Some(audit) = &self.audit {
+            audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
         }
-        self.peers.remove_if(ip, |_, e| e.out_handles.is_empty());
-        if let (Some(endpoint_id), Some(audit)) = (dropped_id, &self.audit) {
-            audit.log_disconnect(*ip, &endpoint_id.to_string());
-        }
-        last_conn
+        Some(entry.active.conn)
     }
 
     /// Drop the peer identified by its transport `peer_id` from `network`. Used by
@@ -799,36 +893,6 @@ impl PeerTable {
         network: &str,
     ) -> Option<Connection> {
         self.remove_peer_from_network(&membership::derive_ipv6(peer_id), network)
-    }
-
-    /// Connection-aware variant of [`remove_peer_from_network`]: drops the
-    /// peer's membership in `network` only if the connection currently stored is
-    /// the same one identified by `stable_id`. Returns the connection iff this
-    /// removed the peer's last shared network (same contract as
-    /// [`remove_peer_from_network`]); `None` if it did not act (stale connection)
-    /// or other networks remain.
-    ///
-    /// This guards the ABA race described on [`forward::DisconnectEvent`]: a
-    /// stale connection's delayed disconnect must not evict the fresh connection
-    /// that already replaced it in the table after a peer re-dialed.
-    pub fn remove_peer_from_network_if(
-        &self,
-        ip: &Ipv6Addr,
-        network: &str,
-        stable_id: usize,
-    ) -> Option<Connection> {
-        // Read-and-compare in its own statement so the DashMap read guard is
-        // dropped before remove_peer_from_network takes a write guard on the
-        // same shard.
-        let matches = self
-            .peers
-            .get(ip)
-            .map(|e| e.out_handles.contains_key(network) && e.active.conn.stable_id() == stable_id)
-            .unwrap_or(false);
-        if !matches {
-            return None;
-        }
-        self.remove_peer_from_network(ip, network)
     }
 
     /// True if the stored connection for the peer at `ip` is the one identified

@@ -1,30 +1,52 @@
 //! IPv4 exit traffic uses a local client address and gateway-owned NAT leases.
 //!
 //! Leases belong to authenticated mesh identities and networks, not packet
-//! source addresses. They are persisted and never reused: kernel conntrack can
-//! outlive both a peer connection and the daemon. The mesh itself stays IPv6-only.
+//! source addresses. They are persisted, and an address is only handed to a new
+//! owner after its old one has left it idle for [`LEASE_IDLE_EXPIRY`]: kernel
+//! conntrack can outlive both a peer connection and the daemon, and an entry still
+//! pointing at the address must not deliver to someone else. The mesh itself
+//! stays IPv6-only.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
+use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::task::JoinError;
 
+use crate::forward::csum_replace2;
+use crate::membership::now_secs;
 use crate::peers::FastDashMap;
+use crate::reject::icmpv4_checksum as checksum;
 
 pub const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 0, 2);
 pub const SERVER_PREFIX: &str = "198.19.0.0/16";
+/// [`SERVER_PREFIX`] as a network address and mask.
+const SERVER_NET: u32 = u32::from_be_bytes([198, 19, 0, 0]);
+const SERVER_MASK: u32 = u32::MAX << (32 - 16);
 const MAX_LEASES: usize = 65534;
 
+/// How long a lease has to go unused before its address can go to another
+/// owner. Well past the kernel's default established-TCP conntrack timeout of
+/// five days, so no masqueraded flow still maps to it.
+const LEASE_IDLE_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// A lease loaded from disk counts as used at least this recently. Its stored
+/// stamp is from the last allocation that saved the file, so it can be far older
+/// than its real last use; this keeps a restart from freeing an address whose
+/// flows are still open.
+const RESTART_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 pub fn is_server_addr(ip: Ipv4Addr) -> bool {
-    ip.octets()[..2] == [198, 19]
+    u32::from(ip) & SERVER_MASK == SERVER_NET
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -55,16 +77,31 @@ pub enum Error {
     Packet,
 }
 
+/// One address of the pool, as the lease file stores it: index `i` of the file
+/// is the address `198.19.0.1 + i`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Slot {
+    lease: Lease,
+    /// Unix seconds.
+    last_used: u64,
+}
+
 #[derive(Default)]
 struct Allocation {
     path: Option<PathBuf>,
-    leases: Vec<Lease>,
+    slots: Vec<Slot>,
+}
+
+/// A live lease: its address and when its owner last sent through it.
+struct Leased {
+    addr: Ipv4Addr,
+    last_used: AtomicU64,
 }
 
 #[derive(Clone, Default)]
 pub struct Nat {
     allocation: Arc<Mutex<Allocation>>,
-    outbound: Arc<FastDashMap<Lease, Ipv4Addr>>,
+    outbound: Arc<FastDashMap<Lease, Leased>>,
     inbound: Arc<FastDashMap<Ipv4Addr, Lease>>,
 }
 
@@ -75,46 +112,95 @@ impl Nat {
         if allocation.path.is_some() {
             return Ok(());
         }
-        let leases: Vec<Lease> = match fs::read(&path) {
+        let slots: Vec<Slot> = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        let mut unique = HashMap::new();
-        if leases.len() > MAX_LEASES {
+        if slots.len() > MAX_LEASES {
             return Err(Error::InvalidLeases);
         }
-        for (index, lease) in leases.iter().enumerate() {
-            if unique.insert(lease.clone(), address(index)).is_some() {
+        let floor = now_secs().saturating_sub((LEASE_IDLE_EXPIRY - RESTART_GRACE).as_secs());
+        for (index, slot) in slots.iter().enumerate() {
+            let leased = Leased {
+                addr: address(index),
+                last_used: AtomicU64::new(slot.last_used.max(floor)),
+            };
+            if self.outbound.insert(slot.lease.clone(), leased).is_some() {
+                self.outbound.clear();
+                self.inbound.clear();
                 return Err(Error::InvalidLeases);
             }
+            self.inbound.insert(address(index), slot.lease.clone());
         }
-        for (lease, addr) in unique {
-            self.inbound.insert(addr, lease.clone());
-            self.outbound.insert(lease, addr);
-        }
-        allocation.leases = leases;
+        allocation.slots = slots;
         allocation.path = Some(path);
         Ok(())
     }
 
     fn allocate(&self, lease: Lease) -> Result<Ipv4Addr, Error> {
         let mut allocation = self.allocation.lock().map_err(|_| Error::Poisoned)?;
-        if let Some(addr) = self.outbound.get(&lease) {
-            return Ok(*addr);
+        if let Some(leased) = self.outbound.get(&lease) {
+            return Ok(leased.addr);
         }
-        let path = allocation.path.as_ref().ok_or(Error::Uninitialized)?;
-        if allocation.leases.len() >= MAX_LEASES {
-            return Err(Error::Exhausted);
+        let path = allocation.path.clone().ok_or(Error::Uninitialized)?;
+        let now = now_secs();
+        // Bring the stored stamps up to date first: the file is only written
+        // here, so this is also what a restart reads back.
+        for slot in &mut allocation.slots {
+            if let Some(leased) = self.outbound.get(&slot.lease) {
+                slot.last_used = leased.last_used.load(Ordering::Relaxed);
+            }
         }
-        let addr = address(allocation.leases.len());
-        let mut leases = allocation.leases.clone();
-        leases.push(lease.clone());
-        crate::config::write_file(path, &serde_json::to_vec(&leases)?, false)
-            .map_err(|e| Error::Save(e.to_string()))?;
-        allocation.leases = leases;
+        let expired = allocation
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| now.saturating_sub(slot.last_used) >= LEASE_IDLE_EXPIRY.as_secs())
+            .min_by_key(|(_, slot)| slot.last_used)
+            .map(|(index, _)| index);
+        let index = match expired {
+            Some(index) => index,
+            None if allocation.slots.len() < MAX_LEASES => allocation.slots.len(),
+            None => return Err(Error::Exhausted),
+        };
+        let fresh = Slot {
+            lease: lease.clone(),
+            last_used: now,
+        };
+        let previous = if index < allocation.slots.len() {
+            Some(mem::replace(&mut allocation.slots[index], fresh))
+        } else {
+            allocation.slots.push(fresh);
+            None
+        };
+        let saved = serde_json::to_vec(&allocation.slots)
+            .map_err(Error::from)
+            .and_then(|bytes| {
+                crate::config::write_file(&path, &bytes, false)
+                    .map_err(|e| Error::Save(e.to_string()))
+            });
+        if let Err(error) = saved {
+            match previous {
+                Some(previous) => allocation.slots[index] = previous,
+                None => {
+                    allocation.slots.pop();
+                }
+            }
+            return Err(error);
+        }
+        let addr = address(index);
+        if let Some(previous) = previous {
+            self.outbound.remove(&previous.lease);
+        }
         self.inbound.insert(addr, lease.clone());
-        self.outbound.insert(lease, addr);
+        self.outbound.insert(
+            lease,
+            Leased {
+                addr,
+                last_used: AtomicU64::new(now),
+            },
+        );
         Ok(addr)
     }
 
@@ -130,7 +216,10 @@ impl Nat {
         network: SmolStr,
     ) -> Result<Bytes, Error> {
         let lease = Lease { peer, network };
-        let cached = self.outbound.get(&lease).map(|entry| *entry);
+        let cached = self.outbound.get(&lease).map(|leased| {
+            leased.last_used.store(now_secs(), Ordering::Relaxed);
+            leased.addr
+        });
         let addr = match cached {
             Some(addr) => addr,
             None => {
@@ -143,15 +232,18 @@ impl Nat {
 }
 
 fn address(index: usize) -> Ipv4Addr {
-    Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 19, 0, 1)) + index as u32)
+    Ipv4Addr::from(SERVER_NET + 1 + index as u32)
 }
 
 /// Rewrite matching addresses, including the original packet quoted by an ICMP
 /// error. Incremental transport checksums also work on a truncated ICMP quote.
 pub fn rewrite(packet: Bytes, old: Ipv4Addr, new: Ipv4Addr) -> Result<Bytes, Error> {
-    let mut bytes = packet.to_vec();
+    // A packet nobody else holds is rewritten in place.
+    let mut bytes = packet
+        .try_into_mut()
+        .unwrap_or_else(|shared| BytesMut::from(&shared[..]));
     rewrite_inner(&mut bytes, old.octets(), new.octets(), false)?;
-    Ok(Bytes::from(bytes))
+    Ok(bytes.freeze())
 }
 
 fn rewrite_inner(p: &mut [u8], old: [u8; 4], new: [u8; 4], quoted: bool) -> Result<(), Error> {
@@ -209,28 +301,13 @@ fn replace_checksum(p: &mut [u8], off: usize, old: u16, new: u16, udp: bool) {
     if udp && check == 0 {
         return;
     }
-    let mut sum = u32::from(!check) + u32::from(!old) + u32::from(new);
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let updated = !(sum as u16);
+    let updated = csum_replace2(check, old, new);
     let updated = if udp && updated == 0 {
         u16::MAX
     } else {
         updated
     };
     p[off..off + 2].copy_from_slice(&updated.to_be_bytes());
-}
-
-fn checksum(p: &[u8]) -> u16 {
-    let mut sum: u32 = p
-        .chunks(2)
-        .map(|word| u32::from(word[0]) * 256 + u32::from(*word.get(1).unwrap_or(&0)))
-        .sum();
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
 }
 
 /// Defaults and split defaults do not claim local address space. Specific
@@ -263,10 +340,7 @@ pub fn conflicts_with_route(cidr: &str, space: AddressSpace) -> bool {
     let client = u32::from(CLIENT_ADDR);
     match space {
         AddressSpace::Client => first <= client && client <= last,
-        AddressSpace::Gateway => {
-            first <= u32::from(Ipv4Addr::new(198, 19, 255, 255))
-                && last >= u32::from(Ipv4Addr::new(198, 19, 0, 0))
-        }
+        AddressSpace::Gateway => first <= SERVER_NET | !SERVER_MASK && last >= SERVER_NET,
     }
 }
 
@@ -306,6 +380,16 @@ mod tests {
         pseudo.extend(((p.len() - 20) as u16).to_be_bytes());
         pseudo.extend_from_slice(&p[20..]);
         checksum(&pseudo)
+    }
+
+    /// The numeric pool and the string the firewall and route code use agree.
+    #[test]
+    fn the_server_pool_matches_its_prefix() {
+        let (net, len) = SERVER_PREFIX.split_once('/').unwrap();
+        assert_eq!(Ipv4Addr::from(SERVER_NET), net.parse::<Ipv4Addr>().unwrap());
+        assert_eq!(SERVER_MASK.leading_ones(), len.parse::<u32>().unwrap());
+        assert!(is_server_addr(address(0)) && is_server_addr(address(MAX_LEASES - 1)));
+        assert!(!is_server_addr(Ipv4Addr::new(198, 18, 255, 255)));
     }
 
     #[test]
@@ -440,13 +524,60 @@ mod tests {
         let path = dir.path().join("leases.json");
         fs::write(&path, b"invalid").unwrap();
         assert!(nat.initialize(path.clone()).is_err());
+        let slot = Slot {
+            lease: lease.clone(),
+            last_used: 0,
+        };
         fs::write(
             &path,
-            serde_json::to_vec(&vec![lease.clone(), lease.clone()]).unwrap(),
+            serde_json::to_vec(&vec![slot.clone(), slot]).unwrap(),
         )
         .unwrap();
         assert!(matches!(nat.initialize(path), Err(Error::InvalidLeases)));
         assert!(nat.return_lease(address(0)).is_none());
+    }
+
+    /// An address idle past the expiry goes to the next new owner, and only
+    /// then; a restart does not make a recently used lease look idle.
+    #[test]
+    fn idle_leases_are_reclaimed_after_the_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.json");
+        let lease = |peer: &str| Lease {
+            peer: peer.parse().unwrap(),
+            network: "example".into(),
+        };
+        let long_ago = now_secs() - LEASE_IDLE_EXPIRY.as_secs() - 60;
+        let slots = vec![
+            Slot {
+                lease: lease("200::1"),
+                last_used: long_ago,
+            },
+            Slot {
+                lease: lease("200::2"),
+                last_used: now_secs(),
+            },
+        ];
+        fs::write(&path, serde_json::to_vec(&slots).unwrap()).unwrap();
+
+        // Loaded leases get the restart grace, so nothing is free yet.
+        let nat = Nat::default();
+        nat.initialize(path.clone()).unwrap();
+        assert_eq!(nat.allocate(lease("200::3")).unwrap(), address(2));
+
+        // Once the stale one has been idle past the expiry, its address moves.
+        nat.outbound
+            .get(&lease("200::1"))
+            .unwrap()
+            .last_used
+            .store(long_ago, Ordering::Relaxed);
+        assert_eq!(nat.allocate(lease("200::4")).unwrap(), address(0));
+        assert_eq!(nat.return_lease(address(0)).unwrap(), lease("200::4"));
+        assert!(nat.outbound.get(&lease("200::1")).is_none());
+        // The move is on disk.
+        let restarted = Nat::default();
+        restarted.initialize(path).unwrap();
+        assert_eq!(restarted.return_lease(address(0)).unwrap(), lease("200::4"));
     }
 
     #[test]

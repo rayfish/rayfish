@@ -7,6 +7,11 @@
 
 #[cfg(target_os = "macos")]
 mod apple;
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{overlay_route_warnings, spawn_repair_watcher};
 
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
@@ -14,16 +19,16 @@ mod apple;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::membership::ExitFamilies;
 use std::future::Future;
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "android"))]
 use std::io::Error as IoError;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::mem::{size_of, zeroed};
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
 
 #[cfg(not(target_os = "android"))]
 use std::net::Ipv6Addr;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -50,17 +55,19 @@ use bytes::BytesMut;
 use futures::SinkExt;
 #[cfg(not(target_os = "android"))]
 use futures::StreamExt;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use libc::{
     AF_SYSTEM, CTLIOCGINFO, F_DUPFD_CLOEXEC, c_char, ctl_info, fcntl, getpeername, ioctl, sockaddr,
     sockaddr_ctl, socklen_t,
 };
+#[cfg(not(target_os = "android"))]
+use tun_rs::AsyncDevice;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tun_rs::DeviceBuilder;
 #[cfg(target_os = "linux")]
 use tun_rs::async_framed::DeviceFramedWrite;
 #[cfg(not(target_os = "android"))]
 use tun_rs::async_framed::{BytesCodec, DeviceFramedRead};
-#[cfg(not(target_os = "android"))]
-use tun_rs::{AsyncDevice, DeviceBuilder};
 
 /// Read side of a packet interface. Returns one owned IP packet. Abstracts the
 /// concrete TUN device so the forwarding loop can run over any packet source:
@@ -69,7 +76,9 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 ///
 /// Contract: an empty packet means "no packet this time, retry". End-of-stream
 /// must surface as `Err`, never as a stream of empty packets, or `run_mesh`
-/// would busy-spin.
+/// would busy-spin. A packet the device delivered but the reader could not
+/// decode surfaces as [`UnreadablePacket`], and the loop keeps reading. Any
+/// other error stops the loop.
 ///
 /// **`read_packet` MUST be cancel-safe.** `run_mesh` races it in a `select!` against
 /// dial-completion and shutdown, so the future can be dropped before it resolves.
@@ -78,6 +87,21 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 pub trait TunRead: Send + 'static {
     fn read_packet(&mut self) -> impl Future<Output = anyhow::Result<Bytes>> + Send;
 }
+
+/// A packet the device delivered that the reader could not decode, such as a
+/// Linux offload record that needs more segments than tun-rs can split it into
+/// (#237). Only that packet is lost: the next read starts clean, so the
+/// forwarding loop counts it and keeps reading.
+#[derive(Debug)]
+pub struct UnreadablePacket(pub std::io::Error);
+
+impl std::fmt::Display for UnreadablePacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unreadable TUN packet: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnreadablePacket {}
 
 /// Write side of a packet interface. Writes one IP packet to the device.
 pub trait TunWrite: Send + 'static {
@@ -126,15 +150,32 @@ pub const TUN_MTU: u16 = 1500;
 /// IPv6's minimum link MTU, used when the device rejects the preferred MTU.
 pub const MIN_TUN_MTU: u16 = 1280;
 
-#[cfg(not(target_os = "android"))]
-fn configure_mtu(mut set: impl FnMut(u16) -> std::io::Result<()>) -> Result<u16> {
-    match set(TUN_MTU) {
-        Ok(()) => Ok(TUN_MTU),
-        Err(error) => {
+/// The MTU a desktop TUN is created with. Linux uses IPv6's minimum, as
+/// Tailscale does: a 1500-byte packet never fits one QUIC datagram (about
+/// 1420 bytes on a 1500-byte path once discovery has run, about 1170 before),
+/// so at 1500 every full-sized packet went out as two mesh fragments, doubling
+/// the packet rate and the chance of losing it. 1280 fits one datagram on any
+/// ordinary path after discovery; mesh fragmentation still covers the rest.
+///
+/// Nothing on the wire changes. Each side announces the size it accepts and
+/// the other clamps to it, and [`TUN_MTU`] stays the largest packet the mesh
+/// carries, so a peer at 1500 and one at 1280 interoperate. Other platforms
+/// keep 1500 until their packet interfaces are moved together.
+#[cfg(target_os = "linux")]
+const PREFERRED_TUN_MTU: u16 = MIN_TUN_MTU;
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
+const PREFERRED_TUN_MTU: u16 = TUN_MTU;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn configure_mtu(preferred: u16, mut set: impl FnMut(u16) -> Result<(), IoError>) -> Result<u16> {
+    match set(preferred) {
+        Ok(()) => Ok(preferred),
+        Err(error) if preferred > MIN_TUN_MTU => {
             tracing::warn!(%error, mtu = MIN_TUN_MTU, "TUN rejected preferred MTU; trying fallback");
             set(MIN_TUN_MTU).context("set fallback TUN MTU to 1280")?;
             Ok(MIN_TUN_MTU)
         }
+        Err(error) => Err(error).context("set TUN MTU to 1280"),
     }
 }
 
@@ -183,19 +224,22 @@ enum MacTunWriter {
 ///
 /// No IPv4 is assigned at all. `100.64.0.0/10` belongs to whatever other VPN
 /// shares the host, and the overlay carries no IPv4 to put there.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
-    // `ipv6(v6, 128)` assigns just our own address (a /128, no connected route)
-    // cross-platform. `enable(true)` brings the link up at creation (as the old
-    // `.up()` did); `set_link_up` and the peer-range route helpers still run
-    // later on activate. No IPv4 is assigned at all: the overlay is IPv6-only,
-    // and `100.64.0.0/10` belongs to whatever else may be sharing the host.
+    // `ipv6(v6, 128)` assigns just our own address (a /128, no connected route).
+    // `enable(true)` brings the link up at creation (as the old `.up()` did);
+    // `set_link_up` and the peer-range route helpers still run later on
+    // activate. Linux does the same two steps over netlink. No IPv4 is assigned
+    // at all: the overlay is IPv6-only, and `100.64.0.0/10` belongs to whatever
+    // else may be sharing the host.
     // Create at IPv6's minimum first so a rejected preferred MTU cannot prevent
     // device creation. Upgrade separately: only MTU errors trigger fallback.
-    let builder = DeviceBuilder::new()
-        .ipv6(v6, 128)
-        .mtu(MIN_TUN_MTU)
-        .enable(true);
+    let builder = DeviceBuilder::new().mtu(MIN_TUN_MTU);
+    // Linux creates the device bare and configures it in `configure_linux_tun`:
+    // its per-device IPv6 settings have to be in place before the address
+    // goes on and the link comes up.
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder.ipv6(v6, 128).enable(true);
     #[cfg(target_os = "linux")]
     let builder = builder.name(LINUX_TUN_NAME).offload(true);
     #[cfg(target_os = "windows")]
@@ -204,8 +248,13 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
         .name(WINDOWS_TUN_NAME)
         .description("Rayfish")
         .wintun_file(wintun_library_path().to_string_lossy().into_owned());
+    #[cfg(target_os = "linux")]
+    let device = builder.build_async().map_err(linux_create_error)?;
+    #[cfg(not(target_os = "linux"))]
     let device = builder.build_async().context("create tun-rs device")?;
-    let mtu = configure_mtu(|mtu| {
+    #[cfg(target_os = "linux")]
+    configure_linux_tun(&device.name().context("read TUN device name")?, v6).await?;
+    let mtu = configure_mtu(PREFERRED_TUN_MTU, |mtu| {
         device.set_mtu(mtu)?;
         #[cfg(target_os = "windows")]
         device.set_mtu_v6(mtu)?;
@@ -264,9 +313,13 @@ fn split_device(device: AsyncDevice, mtu: u16) -> (TunReader, TunWriter) {
 /// Opens the utun interface owned by `NEPacketTunnelProvider` without routing
 /// packets through Swift. The provider keeps its descriptor; Rayfish owns a
 /// duplicate that is closed when the attached data plane stops.
-#[cfg(target_os = "macos")]
+///
+/// Only macOS takes the batched `sendmsg_x`/`recvmsg_x` path: those are private
+/// symbols, and App Store review rejects iOS apps that look them up.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn open_packet_tunnel() -> Result<(TunReader, TunWriter)> {
     let fd = packet_tunnel_fd()?;
+    #[cfg(target_os = "macos")]
     if apple::is_available() {
         let (reader, writer) = apple::split(fd).context("enable batched packet tunnel I/O")?;
         return Ok((
@@ -285,7 +338,7 @@ pub fn open_packet_tunnel() -> Result<(TunReader, TunWriter)> {
     Ok(split_device(device, TUN_MTU))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn packet_tunnel_fd() -> Result<OwnedFd> {
     const MAX_FD: RawFd = 1024;
     const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
@@ -353,6 +406,108 @@ fn packet_tunnel_fd() -> Result<OwnedFd> {
 #[cfg(target_os = "linux")]
 const LINUX_TUN_NAME: &str = "rayfish%d";
 
+/// Explains a failed Linux TUN creation. Opening `/dev/net/tun` and claiming an
+/// interface are the steps that fail in a container or under a service unit
+/// without the capability, and the bare errno says neither.
+#[cfg(target_os = "linux")]
+fn linux_create_error(error: IoError) -> anyhow::Error {
+    let hint = match error.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ENODEV) | Some(libc::ENXIO) => Some(
+            "/dev/net/tun is missing: load the tun module (modprobe tun), or in a \
+             container pass the device in (--device /dev/net/tun)",
+        ),
+        Some(libc::EPERM) | Some(libc::EACCES) => Some(
+            "creating a TUN device needs CAP_NET_ADMIN and access to /dev/net/tun \
+             (in a container: --cap-add NET_ADMIN --device /dev/net/tun)",
+        ),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => anyhow::Error::new(error).context(hint),
+        None => anyhow::Error::new(error).context("create tun-rs device"),
+    }
+}
+
+/// Explains a failed IPv6 address assignment. The kernel answers EACCES when
+/// IPv6 is disabled on the device and EAFNOSUPPORT when it is disabled at boot,
+/// and the first reads exactly like a missing capability.
+#[cfg(any(target_os = "linux", test))]
+fn ipv6_disabled_hint(errno: Option<i32>) -> Option<&'static str> {
+    matches!(errno, Some(libc::EACCES) | Some(libc::EAFNOSUPPORT)).then_some(
+        "IPv6 is disabled on this host (net.ipv6.conf.*.disable_ipv6 or ipv6.disable=1); \
+         the mesh is IPv6-only and cannot run without it",
+    )
+}
+
+/// The OS error code inside a netlink failure, if the kernel sent one.
+#[cfg(target_os = "linux")]
+fn netlink_errno(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<rtnetlink::Error>() {
+            Some(rtnetlink::Error::NetlinkError(message)) => message.to_io().raw_os_error(),
+            _ => None,
+        })
+}
+
+/// Per-device IPv6 settings for the TUN, written under
+/// `/proc/sys/net/ipv6/conf/<tun>/`. All but `disable_ipv6` are best-effort.
+///
+/// - `keep_addr_on_down = 1`: Linux otherwise flushes the global address when
+///   anything takes the link down, and nothing outside `ray up` puts it back.
+/// - `addr_gen_mode = 1`: no link-local address. The mesh never uses one, and
+///   without it the kernel sends no router solicitations into the tunnel.
+/// - `router_solicitations = 0`: the same, for kernels that ignore the above.
+#[cfg(target_os = "linux")]
+const LINUX_TUN_IPV6_CONF: [(&str, &str); 3] = [
+    ("keep_addr_on_down", "1"),
+    ("addr_gen_mode", "1"),
+    ("router_solicitations", "0"),
+];
+
+#[cfg(target_os = "linux")]
+fn set_tun_ipv6_conf(tun_name: &str) {
+    use crate::sysctl::{ipv6_conf, read_sysctl, write_sysctl};
+
+    let disable = ipv6_conf(tun_name, "disable_ipv6");
+    let current = read_sysctl(&disable);
+    if !current.is_empty() && current != "0" {
+        match write_sysctl(&disable, "0") {
+            Ok(()) => tracing::info!(tun = %tun_name, "enabled IPv6 on the TUN device"),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), tun = %tun_name, "cannot enable IPv6 on the TUN device")
+            }
+        }
+    }
+    for (key, value) in LINUX_TUN_IPV6_CONF {
+        if let Err(error) = write_sysctl(&ipv6_conf(tun_name, key), value) {
+            tracing::warn!(error = %format!("{error:#}"), tun = %tun_name, key, value, "cannot set TUN IPv6 sysctl");
+        }
+    }
+}
+
+/// Configures a freshly created Linux TUN: IPv6 settings first, then our `/128`,
+/// then link-up. The settings must precede link-up, since the link-local
+/// address is generated the moment the link comes up.
+///
+/// A host may disable IPv6 for new interfaces by default. The overlay is
+/// IPv6-only, so this turns it back on for our own device alone and leaves the
+/// host's other interfaces as they are.
+#[cfg(target_os = "linux")]
+async fn configure_linux_tun(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
+    let name = tun_name.to_owned();
+    tokio::task::spawn_blocking(move || set_tun_ipv6_conf(&name))
+        .await
+        .context("TUN IPv6 settings task")?;
+    if let Err(error) = ensure_ipv6_addr(tun_name, v6).await {
+        return Err(match ipv6_disabled_hint(netlink_errno(&error)) {
+            Some(hint) => error.context(hint),
+            None => error,
+        });
+    }
+    set_link_up(tun_name).await
+}
+
 /// Wintun adapter name. Fixed rather than generated, so a restart reattaches to
 /// the adapter this daemon created instead of leaving a second one behind.
 #[cfg(target_os = "windows")]
@@ -414,6 +569,30 @@ fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> Str
     )
 }
 
+/// The overlay range, `200::/7`, as the netlink route the TUN carries.
+#[cfg(target_os = "linux")]
+const OVERLAY: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0);
+#[cfg(target_os = "linux")]
+const OVERLAY_LEN: u8 = 7;
+
+/// The interface index of `tun_name`.
+#[cfg(target_os = "linux")]
+async fn tun_link_index(handle: &rtnetlink::Handle, tun_name: &str) -> Result<u32> {
+    use futures::TryStreamExt;
+
+    Ok(handle
+        .link()
+        .get()
+        .match_name(tun_name.to_owned())
+        .execute()
+        .try_next()
+        .await
+        .context("query TUN link")?
+        .with_context(|| format!("TUN link {tun_name} not found"))?
+        .header
+        .index)
+}
+
 /// Run `f` with a netlink handle and the interface index of `tun_name`.
 ///
 /// Every netlink call below needs the same preamble (open a socket, spawn the
@@ -421,28 +600,16 @@ fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> Str
 /// every path out, success or error. Doing it here keeps each caller down to the
 /// one call it actually makes.
 #[cfg(target_os = "linux")]
-async fn with_tun_link<F, Fut>(tun_name: &str, f: F) -> Result<()>
+async fn with_tun_link<T, F, Fut>(tun_name: &str, f: F) -> Result<T>
 where
     F: FnOnce(rtnetlink::Handle, u32) -> Fut,
-    Fut: Future<Output = Result<()>>,
+    Fut: Future<Output = Result<T>>,
 {
-    use futures::TryStreamExt;
-
     let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
     let conn = tokio::spawn(connection);
 
     let result = async {
-        let index = handle
-            .link()
-            .get()
-            .match_name(tun_name.to_owned())
-            .execute()
-            .try_next()
-            .await
-            .context("query TUN link")?
-            .with_context(|| format!("TUN link {tun_name} not found"))?
-            .header
-            .index;
+        let index = tun_link_index(&handle, tun_name).await?;
         f(handle.clone(), index).await
     }
     .await;
@@ -484,7 +651,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 
     with_tun_link(tun_name, async |handle, index| {
         let route = RouteMessageBuilder::<Ipv6Addr>::new()
-            .destination_prefix(Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0), 7)
+            .destination_prefix(OVERLAY, OVERLAY_LEN)
             .output_interface(index)
             .build();
         handle
@@ -570,10 +737,20 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
 
 /// Capture both families, including any family the selected exit cannot carry.
 /// The caller installs loop prevention and direct-egress protection first.
+///
+/// A host that already routes the client IPv4 address elsewhere keeps IPv4 out
+/// of the tunnel, where the client guard holds it, and still sends IPv6 through
+/// the exit, as on Linux.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_default_via_tun(tun_name: &str, _carries: ExitFamilies) -> Result<()> {
-    crate::exit_node::configure_client_ipv4(tun_name, true)?;
-    for step in split_default_plan(ExitFamilies::Dual, tun_name) {
+pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
+    let families = match crate::exit_node::configure_client_ipv4(tun_name, true) {
+        Ok(()) => ExitFamilies::Dual,
+        Err(error) => {
+            tracing::warn!(%error, "IPv4 is not tunnelled through the exit node");
+            ExitFamilies::V6
+        }
+    };
+    for step in split_default_plan(families, tun_name) {
         let _ = Command::new("route").args(&step.delete).status();
         let Some(add) = &step.add else { continue };
         let status = Command::new("route")
@@ -689,7 +866,7 @@ pub async fn route_self_loopback(_v6: Ipv6Addr) -> Result<()> {
 }
 
 /// Bring the TUN interface administratively up (used when activating the VPN).
-#[cfg(not(target_os = "android"))]
+#[cfg(not(embedded_tun))]
 pub async fn set_link_up(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, true).await
 }
@@ -697,12 +874,12 @@ pub async fn set_link_up(tun_name: &str) -> Result<()> {
 /// Bring the TUN interface administratively down (standby). The underlying file
 /// descriptor stays open, so the device can be brought back up without
 /// recreating it.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(embedded_tun))]
 pub async fn set_link_down(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, false).await
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(embedded_tun))]
 async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     {
@@ -780,21 +957,36 @@ impl TunRead for TunReader {
     async fn read_packet(&mut self) -> anyhow::Result<Bytes> {
         #[cfg(target_os = "macos")]
         match &mut self.inner {
-            MacTunReader::Framed(framed) => framed
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("TUN device closed"))?
-                .map(BytesMut::freeze)
-                .map_err(Into::into),
+            MacTunReader::Framed(framed) => framed_packet(framed.next().await),
             MacTunReader::Batched(reader) => reader.read_packet().await.map_err(Into::into),
         }
         #[cfg(not(target_os = "macos"))]
-        self.framed
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("TUN device closed"))?
-            .map(BytesMut::freeze)
-            .map_err(Into::into)
+        framed_packet(self.framed.next().await)
+    }
+}
+
+/// One item from a tun-rs framed reader. `None` means the device closed.
+#[cfg(not(target_os = "android"))]
+fn framed_packet(item: Option<std::io::Result<BytesMut>>) -> anyhow::Result<Bytes> {
+    let packet = item.ok_or_else(|| anyhow!("TUN device closed"))?;
+    #[cfg(target_os = "linux")]
+    let packet = packet.map_err(read_error)?;
+    #[cfg(not(target_os = "linux"))]
+    let packet = packet?;
+    Ok(packet.freeze())
+}
+
+/// Sorts a Linux framed read error. A failed read of the device carries an OS
+/// error code and stops the forwarding loop. tun-rs raises its own errors,
+/// without one, for a record it read but could not split or decode, and its
+/// next read starts clean. Other platforms keep every error fatal: their
+/// readers have not been checked for this.
+#[cfg(any(target_os = "linux", test))]
+fn read_error(error: std::io::Error) -> anyhow::Error {
+    if error.raw_os_error().is_none() {
+        UnreadablePacket(error).into()
+    } else {
+        error.into()
     }
 }
 
@@ -880,7 +1072,7 @@ mod tests {
     #[test]
     fn preferred_mtu_rejection_retries_at_ipv6_minimum() {
         let mut attempts = Vec::new();
-        let mtu = super::configure_mtu(|mtu| {
+        let mtu = super::configure_mtu(super::TUN_MTU, |mtu| {
             attempts.push(mtu);
             if mtu > 1280 {
                 Err(std::io::ErrorKind::InvalidInput.into())
@@ -897,7 +1089,7 @@ mod tests {
     #[test]
     fn mtu_setup_does_not_hide_a_failed_fallback() {
         let mut attempts = Vec::new();
-        let result = super::configure_mtu(|mtu| {
+        let result = super::configure_mtu(super::TUN_MTU, |mtu| {
             attempts.push(mtu);
             Err(std::io::ErrorKind::PermissionDenied.into())
         });
@@ -905,11 +1097,68 @@ mod tests {
         assert_eq!(attempts, [1500, 1280]);
     }
 
+    /// A Linux read error with an OS error code means the device failed, so it
+    /// still stops the forwarding loop. tun-rs's own errors are about one packet
+    /// it read but could not split, which the loop drops and reads past (#237).
+    #[test]
+    fn only_device_read_errors_are_fatal() {
+        let device = super::read_error(std::io::Error::from_raw_os_error(libc::EBADF));
+        assert!(!device.is::<super::UnreadablePacket>());
+        let packet = super::read_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many GSO segments",
+        ));
+        assert!(packet.is::<super::UnreadablePacket>());
+        assert_eq!(
+            packet.to_string(),
+            "unreadable TUN packet: too many GSO segments"
+        );
+    }
+
+    /// EACCES from an address add is the kernel saying IPv6 is disabled, not
+    /// that the daemon lacks a capability, and the error has to say so.
+    #[test]
+    fn a_refused_ipv6_address_names_disabled_ipv6() {
+        for errno in [libc::EACCES, libc::EAFNOSUPPORT] {
+            let hint = super::ipv6_disabled_hint(Some(errno)).expect("explained");
+            assert!(hint.contains("IPv6 is disabled"), "{hint}");
+        }
+        assert_eq!(super::ipv6_disabled_hint(Some(libc::EEXIST)), None);
+        assert_eq!(super::ipv6_disabled_hint(None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_tun_open_names_the_device_or_the_capability() {
+        use super::IoError;
+
+        let missing = super::linux_create_error(IoError::from_raw_os_error(libc::ENOENT));
+        assert!(format!("{missing:#}").contains("/dev/net/tun is missing"));
+        let denied = super::linux_create_error(IoError::from_raw_os_error(libc::EPERM));
+        assert!(format!("{denied:#}").contains("CAP_NET_ADMIN"));
+        let other = super::linux_create_error(IoError::from_raw_os_error(libc::EBUSY));
+        assert!(format!("{other:#}").starts_with("create tun-rs device"));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_minimum_preferred_mtu_is_set_once() {
+        use std::io::ErrorKind;
+
+        let mut attempts = Vec::new();
+        let result = super::configure_mtu(super::MIN_TUN_MTU, |mtu| {
+            attempts.push(mtu);
+            Err(ErrorKind::PermissionDenied.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, [1280]);
+    }
+
     #[cfg(not(target_os = "android"))]
     #[test]
     fn supported_preferred_mtu_needs_no_retry() {
         let mut attempts = Vec::new();
-        let mtu = super::configure_mtu(|mtu| {
+        let mtu = super::configure_mtu(super::TUN_MTU, |mtu| {
             attempts.push(mtu);
             Ok(())
         })

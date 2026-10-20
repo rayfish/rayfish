@@ -8,6 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.drawable.Icon
 import io.sentry.android.core.SentryLogcatAdapter as Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import uniffi.ray_mobile.FileOffer
 
 /**
@@ -52,6 +55,22 @@ object OfferNotifier {
     // action the user just took.
     private val acted = java.util.Collections.synchronizedSet(HashSet<ULong>())
 
+    private val failedOffers = MutableStateFlow<Set<ULong>>(emptySet())
+    val retryable = failedOffers.asStateFlow()
+
+    /** A failed receive is pending again in the core. Restore its notification. */
+    fun markFailed(context: Context, id: ULong) {
+        synchronized(this) {
+            failedOffers.update { it + id }
+            acted.remove(id)
+            posted.remove(id)
+            runCatching {
+                context.getSystemService(NotificationManager::class.java).cancel(notifId(id))
+            }
+        }
+        FileStatusMonitor.request()
+    }
+
     @Volatile private var channelName: String? = null
     private var cancelledStaleOnStart = false
 
@@ -80,6 +99,8 @@ object OfferNotifier {
             }
 
             val offers = listOffers()
+            val offerIds = offers.mapTo(HashSet()) { it.id }
+            failedOffers.update { it.intersect(offerIds) }
             val autoAccepting = NodeHolder.isAutoAcceptOwnDevices(context)
             // The same filter HomeScreen applies to its rows: an own-device offer
             // is FileAutoAccept's to take (and TransferNotifier's to report) until
@@ -158,6 +179,7 @@ object OfferNotifier {
             }
             posted.clear()
             acted.clear()
+            failedOffers.value = emptySet()
             cancelledStaleOnStart = false
         }
     }
@@ -166,7 +188,11 @@ object OfferNotifier {
 
     private fun post(context: Context, f: FileOffer) {
         ensureChannel(context)
-        val text = context.getString(R.string.notif_offer_text, f.from, formatSize(f.size))
+        val retry = f.id in failedOffers.value
+        val text = context.getString(
+            if (retry) R.string.notif_offer_retry_text else R.string.notif_offer_text,
+            f.from, formatSize(f.size),
+        )
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setContentTitle(f.filename)
             .setContentText(text)
@@ -188,7 +214,8 @@ object OfferNotifier {
             .setAutoCancel(true)
             .addAction(
                 action(
-                    context, f, ReceiveService.ACTION_ACCEPT, context.getString(R.string.action_save),
+                    context, f, ReceiveService.ACTION_ACCEPT,
+                    context.getString(if (retry) R.string.action_retry else R.string.action_save),
                     android.R.drawable.stat_sys_download,
                 ),
             )

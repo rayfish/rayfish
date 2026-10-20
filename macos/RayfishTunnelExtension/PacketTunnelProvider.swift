@@ -29,8 +29,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             try node.start(ownerUid: owner)
             try node.prepareExitNode()
             let status = try node.status()
+            let exitSelected = status.exitNodes.contains { $0.using != nil }
             let settings = networkSettings(address: status.mesh.ipv6, dnsEnabled: status.services.dnsEnabled,
-                                           exitSelected: status.exitNodes.contains { $0.using != nil })
+                                           exitSelected: exitSelected)
             setTunnelNetworkSettings(settings) { [weak self] error in
                 if let error {
                     node.stop()
@@ -47,7 +48,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     try node.activate()
                     self.node = node
                     self.appliedDNS = status.services.dnsEnabled
-                    self.appliedExit = status.exitNodes.contains { $0.using != nil }
+                    self.appliedExit = exitSelected
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
                 } catch {
@@ -91,15 +92,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let node else { throw ProviderError.notStarted }
             let previousDNS = appliedDNS
             let previousExit = appliedExit
-            let previousSelection = try node.status().exitNodes.first { $0.using != nil }
-            let stagedExit = request.action == .selectExitNode && request.peer != nil && !appliedExit
+            let selecting = request.action == .selectExitNode
+            let previousSelection = selecting ? try node.status().exitNodes.first { $0.using != nil } : nil
+            let stagedExit = selecting && request.peer != nil && !appliedExit
+            // Drop the capture routes before the core unpins and rebinds the
+            // underlay, so its new sockets never route back into the tunnel.
+            let releasedExit = selecting && request.peer == nil && appliedExit
+                && previousSelection?.network == request.network
+            if releasedExit {
+                try await applyExitRoutes(false, node: node)
+            }
             if stagedExit {
                 try node.prepareExitTransport()
                 do {
-                    let status = try node.status()
-                    try await setTunnelNetworkSettings(networkSettings(address: status.mesh.ipv6,
-                        dnsEnabled: status.services.dnsEnabled, exitSelected: true))
-                    appliedExit = true
+                    try await applyExitRoutes(true, node: node)
                 } catch {
                     try? node.prepareExitNode()
                     throw error
@@ -111,21 +117,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } catch {
                 if stagedExit, let network = request.network,
                    (try? node.selectExitNode(network: network, peer: nil)) != nil {
-                    let status = try node.status()
-                    try await setTunnelNetworkSettings(networkSettings(address: status.mesh.ipv6,
-                        dnsEnabled: status.services.dnsEnabled, exitSelected: false))
-                    appliedExit = false
+                    try await applyExitRoutes(false, node: node)
+                }
+                if releasedExit {
+                    try await applyExitRoutes(true, node: node)
                 }
                 throw error
             }
             guard self.node === node else { throw ProviderError.notStarted }
             if let status = response.status,
-               appliedDNS != status.dnsEnabled || appliedExit != status.exitNodes.contains(where: { $0.using != nil }) {
+               appliedDNS != status.dnsEnabled || appliedExit != status.exitSelected {
                 do {
                     try await setTunnelNetworkSettings(networkSettings(address: status.ipv6, dnsEnabled: status.dnsEnabled,
-                        exitSelected: status.exitNodes.contains { $0.using != nil }))
+                        exitSelected: status.exitSelected))
                     appliedDNS = status.dnsEnabled
-                    appliedExit = status.exitNodes.contains { $0.using != nil }
+                    appliedExit = status.exitSelected
                 } catch {
                     if request.action == .setSetting, request.setting == .dns, let previousDNS {
                         try node.setSetting(key: .dns, enabled: previousDNS)
@@ -144,6 +150,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let response = ProviderResponse(success: false, error: error.localizedDescription, status: nil, inviteCode: nil)
             completionHandler?(try? JSONEncoder().encode(response))
         }
+    }
+
+    /// Apply the tunnel settings with or without the exit capture routes.
+    @MainActor
+    private func applyExitRoutes(_ exitSelected: Bool, node: Node) async throws {
+        let status = try node.status()
+        try await setTunnelNetworkSettings(networkSettings(address: status.mesh.ipv6,
+            dnsEnabled: status.services.dnsEnabled, exitSelected: exitSelected))
+        appliedExit = exitSelected
     }
 
     private func networkSettings(address: String, dnsEnabled: Bool, exitSelected: Bool) -> NEPacketTunnelNetworkSettings {
@@ -202,9 +217,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             case .dns: key = .dns
             case .mdns: key = .mdns
             case .ssh: key = .ssh
-            case .quicLossTolerant: key = .quicLossTolerant
+            case .quicFqCodel: key = .quicFqCodel
             }
             try node.setSetting(key: key, enabled: enabled)
+        case .setFileAutoAccept:
+            guard let peer = request.peer, !peer.isEmpty, let allow = request.enabled else {
+                throw ProviderError.missingSetting
+            }
+            guard let owner = TunnelOwner.uid(in: (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration) else {
+                throw ProviderError.missingOwner
+            }
+            try node.setFileAutoAccept(peer: peer, allow: allow, ownerUid: owner)
         case .setSSHRule:
             guard let network = request.name, let peer = request.id,
                   let users = request.users, let allow = request.enabled else { throw ProviderError.missingSetting }
@@ -227,13 +250,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             firewall = try providerFirewall(node.firewallShow())
         case .connectPeer:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
-            message = try node.connectPeer(contactId: id, hostname: request.hostname)
+            message = try node.connectPeer(peer: id, hostname: request.hostname)
         case .approveConnection:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             try node.approveConnection(id: id)
         case .rejectConnection:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             try node.rejectConnection(id: id)
+        case .blockConnection:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
+            try node.blockConnection(id: id)
+        case .acceptInvitation:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingInvitation }
+            try node.acceptInvitation(id: id)
+        case .declineInvitation:
+            guard let id = request.id, !id.isEmpty else { throw ProviderError.missingInvitation }
+            try node.declineInvitation(id: id)
+        case .sendInvite:
+            guard let name = request.name, !name.isEmpty else { throw ProviderError.missingNetworkName }
+            guard let peer = request.peer, !peer.isEmpty else { throw ProviderError.missingPeer }
+            message = try node.sendInvite(network: name, recipient: peer)
+        case .setInboundPolicy:
+            guard let policy = request.inboundPolicy else { throw ProviderError.missingSetting }
+            switch policy {
+            case .anyone: try node.setInboundPolicy(policy: .anyone)
+            case .known: try node.setInboundPolicy(policy: .known)
+            case .nobody: try node.setInboundPolicy(policy: .nobody)
+            }
+        case .blockPeer:
+            guard let peer = request.peer, !peer.isEmpty else { throw ProviderError.missingPeer }
+            try node.blockPeer(peer: peer)
+        case .unblockPeer:
+            guard let peer = request.peer, !peer.isEmpty else { throw ProviderError.missingPeer }
+            try node.unblockPeer(peer: peer)
         case .acceptFile:
             guard let id = request.fileId, let directory = request.directory, !directory.isEmpty,
                   let uid = request.uid, let gid = request.gid,
@@ -323,7 +372,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     waitingSecs: request.waitingSecs
                 )
             },
-            contactId: status.requests.contactId,
+            identity: status.requests.identity,
             connectionRequests: status.requests.connectionRequests.map { request in
                 ProviderConnectionRequest(id: request.id, hostname: request.hostname, waitingSecs: request.waitingSecs)
             },
@@ -339,11 +388,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             },
             sshEnabled: status.ssh.enabled,
             sshRules: status.ssh.rules.map { ProviderSSHRule(network: $0.network, peer: $0.peer, users: $0.users) },
+            fileAutoAcceptPeers: status.fileAutoAcceptPeers,
             connectionWarning: status.connectionWarning,
-            quicLossTolerant: status.services.quicLossTolerant,
+            quicFqCodel: status.services.quicFqCodel,
+            inboundPolicy: providerPolicy(status.inbound.policy),
+            blocked: status.inbound.blocked,
+            invitations: status.inbound.invitations.filter { $0.state == .pending }.map { invitation in
+                ProviderInvitation(id: invitation.id, network: invitation.network, coordinator: invitation.coordinator)
+            },
             exitNodes: status.exitNodes.map { ProviderExitNodeNetwork(network: $0.network, using: $0.using,
                 available: $0.available, refused: $0.refused, problem: $0.problem) }
         )
+    }
+
+    private func providerPolicy(_ policy: InboundPolicy) -> ProviderInboundPolicy {
+        switch policy {
+        case .anyone: .anyone
+        case .known: .known
+        case .nobody: .nobody
+        }
     }
 }
 
@@ -357,6 +420,7 @@ private enum ProviderError: LocalizedError {
     case missingPeer
     case missingOwner
     case missingFile
+    case missingInvitation
 
     var errorDescription: String? {
         switch self {
@@ -373,11 +437,13 @@ private enum ProviderError: LocalizedError {
         case .missingSetting:
             "A setting and its value are required"
         case .missingPeer:
-            "A peer contact ID or request ID is required"
+            "A peer identity or request ID is required"
         case .missingOwner:
             "Open the Rayfish app and reconnect to authorize your shell commands"
         case .missingFile:
             "A file and destination owned by the Rayfish user are required"
+        case .missingInvitation:
+            "An invitation ID is required"
         }
     }
 }

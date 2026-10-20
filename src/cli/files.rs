@@ -112,44 +112,45 @@ impl DisplayOut for FilesOutput<'_> {
             print!("{}", table(&["id", "to", "size", "file", ""], rows, 2));
         }
         if !self.transfers.is_empty() {
-            let rows = self
-                .transfers
-                .iter()
-                .map(|t| {
-                    let state = format!("{:?}", t.state).to_lowercase();
-                    let action = if t.outgoing
-                        && matches!(
-                            t.state,
-                            ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
-                        ) {
-                        format!("ray files cancel-transfer {}", t.id)
-                    } else {
-                        String::new()
-                    };
-                    vec![
-                        layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
-                        layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
-                        layout::Cell::right(
-                            format!("{} / {}", format_size(t.transferred), format_size(t.size)),
-                            style::faint(&format_size(t.size)),
-                        ),
-                        layout::Cell::new(
-                            format!("{} ({state})", t.filename),
-                            style::value(&t.filename),
-                        ),
-                        layout::Cell::new(action.clone(), style::faint(&action)),
-                    ]
-                })
-                .collect();
             println!();
             println!("  {}", style::faint("transfers"));
-            print!(
-                "{}",
-                table(&["id", "peer", "progress", "file", ""], rows, 2)
-            );
+            print!("{}", transfers_table(self.transfers));
         }
         println!();
     }
+}
+
+/// Active transfers as a table: progress is `transferred / total` and the file
+/// cell carries the transfer state.
+fn transfers_table(transfers: &[ipc::TransferFileInfo]) -> String {
+    let rows = transfers
+        .iter()
+        .map(|t| {
+            let state = format!("{:?}", t.state).to_lowercase();
+            let action = if t.outgoing
+                && matches!(
+                    t.state,
+                    ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
+                ) {
+                format!("ray files cancel-transfer {}", t.id)
+            } else {
+                String::new()
+            };
+            let progress = format!("{} / {}", format_size(t.transferred), format_size(t.size));
+            let state = format!("({state})");
+            vec![
+                layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
+                layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
+                layout::Cell::right(progress.clone(), style::faint(&progress)),
+                layout::Cell::new(
+                    format!("{} {state}", t.filename),
+                    format!("{} {}", style::value(&t.filename), style::faint(&state)),
+                ),
+                layout::Cell::new(action.clone(), style::faint(&action)),
+            ]
+        })
+        .collect();
+    table(&["id", "peer", "progress", "file", ""], rows, 2)
 }
 
 /// `ray send <peer> <files...>`: one `SendFileFd` request per file. Each file
@@ -305,10 +306,48 @@ async fn config_row(key: NodeKey) -> Result<String> {
     }
 }
 
+/// Add or remove one peer in a peer-list setting (`file-auto-accept-peers`,
+/// `blocked`). The daemon resolves a hostname to its identity.
+pub(crate) async fn edit_peer_list(key: GlobalKey, peer: &str, remove: bool) -> Result<()> {
+    crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: NodeKey::Global(key),
+        value: crate::config::settings::peer_list_edit(peer, remove)?,
+        replace: false,
+    })
+    .await
+}
+
+/// The identities in a peer-list setting.
+pub(crate) async fn peer_list(key: GlobalKey) -> Result<Vec<String>> {
+    let row = config_row(NodeKey::Global(key)).await?;
+    Ok(row
+        .split(',')
+        .filter(|peer| !peer.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     // These subcommands change (or read) global settings the daemon owns. They
     // route through the daemon so the write lands in the config dir the daemon
     // reads (see the config-writing commands note in main.rs / rayfish#94).
+    if let Some(FilesAction::AutoAccept {
+        action: Some(action),
+        ..
+    }) = &action
+    {
+        let key = GlobalKey::FileAutoAcceptPeers;
+        return match action {
+            crate::FilesAutoAcceptAction::Add { peer } => edit_peer_list(key, peer, false).await,
+            crate::FilesAutoAcceptAction::Remove { peer } => edit_peer_list(key, peer, true).await,
+            crate::FilesAutoAcceptAction::List => {
+                for peer in peer_list(key).await? {
+                    println!("{peer}");
+                }
+                Ok(())
+            }
+        };
+    }
     match &action {
         Some(FilesAction::DownloadDir { path, clear }) => {
             if *clear {
@@ -437,7 +476,9 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 other => fail_unexpected(&other),
             }
         }
-        Some(FilesAction::AutoAccept { network, state }) => {
+        Some(FilesAction::AutoAccept { network, state, .. }) => {
+            let network = network.context("network is required")?;
+            let state = state.context("state is required")?;
             parse_on_off(&state)?;
             ipc::send(
                 &mut stream,
@@ -472,3 +513,28 @@ pub(crate) fn format_size(bytes: u64) -> String {
 // ---------------------------------------------------------------------------
 // Device pairing
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfers_table_shows_progress_and_state() {
+        style::set_plain(true);
+        let transfers = [ipc::TransferFileInfo {
+            id: 7,
+            outgoing: true,
+            peer: "laptop".to_string(),
+            filename: "notes.txt".to_string(),
+            size: 2048,
+            transferred: 1024,
+            state: ipc::TransferFileState::Transferring,
+            destination: None,
+        }];
+        let out = transfers_table(&transfers);
+        let row = out.lines().nth(1).expect("table has a header and one row");
+        assert!(row.contains("1 KiB / 2 KiB"), "{out}");
+        assert!(row.contains("notes.txt (transferring)"), "{out}");
+        assert!(row.contains("ray files cancel-transfer 7"), "{out}");
+    }
+}

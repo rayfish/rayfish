@@ -124,18 +124,12 @@ fn update_template(template: &mut serde_json::Value, blob: &str, public_key: &st
         .get_mut("fields")
         .and_then(serde_json::Value::as_array_mut)
         .context("existing 1Password item has no fields")?;
-    update_field(fields, FIELD, blob, "CONCEALED", None);
-    update_field(fields, "public_key", public_key, "STRING", None);
+    update_field(fields, FIELD, blob, "CONCEALED");
+    update_field(fields, "public_key", public_key, "STRING");
     Ok(())
 }
 
-fn update_field(
-    fields: &mut Vec<serde_json::Value>,
-    label: &str,
-    value: &str,
-    field_type: &str,
-    purpose: Option<&str>,
-) {
+fn update_field(fields: &mut Vec<serde_json::Value>, label: &str, value: &str, field_type: &str) {
     if let Some(field) = fields.iter_mut().find(|field| {
         field.get("id").and_then(serde_json::Value::as_str) == Some(label)
             || field.get("label").and_then(serde_json::Value::as_str) == Some(label)
@@ -144,16 +138,11 @@ fn update_field(
         return;
     }
 
-    let mut field = serde_json::json!({
+    fields.push(serde_json::json!({
         "label": label,
         "type": field_type,
         "value": value,
-    });
-    if let Some(purpose) = purpose {
-        field["id"] = serde_json::Value::String(label.to_string());
-        field["purpose"] = serde_json::Value::String(purpose.to_string());
-    }
-    fields.push(field);
+    }));
 }
 
 /// Read the backup blob back from a 1Password item.

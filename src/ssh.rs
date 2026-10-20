@@ -45,21 +45,16 @@
 //! `ray firewall ssh allow/deny` changes apply to *new* sessions; an
 //! already-established session is not torn down by a later `deny`.
 //!
-//! A connection from this host to its own mesh address never arrives here. The
-//! kernel short-circuits self-traffic over loopback (see
-//! [`crate::tun::route_self_loopback`]), so it never enters the TUN, and the
-//! port rewrite that makes the configured mesh SSH port reach the internal listener lives in
-//! that forwarding path. The connection lands on the mesh IP, where nothing
-//! is bound, and the kernel refuses it. Binding `:22` as well would not fix
-//! that: the `none` auth method is safe only because the mesh link proves who
-//! the peer is, and a loopback connection proves nothing beyond "some account
-//! on this box", so admitting it would hand every local user a root shell. On
-//! the host itself, use the host sshd (`ssh localhost`), which authenticates.
+//! Self-connections use a separate listener on the configured mesh SSH port.
+//! The client socket's local UID authorizes login to that same account; root
+//! may select any account. Mesh grants do not give local users extra privileges.
+//! An IPv6 host sshd already occupying that port continues to handle self-SSH.
 
 #[cfg(any(target_os = "macos", test))]
 pub mod app_helper;
 mod authz;
 mod host_keys;
+mod local;
 mod login;
 mod permissions;
 mod session;
@@ -135,7 +130,7 @@ const LOGIN_GRACE: Duration = Duration::from_secs(60);
 fn server_config(key: PrivateKey) -> Config {
     Config {
         keys: vec![key],
-        // Identity is proven by the mesh link; `auth_none` is the gate.
+        // Mesh identity or the local socket owner authorizes `auth_none`.
         methods: MethodSet::from(&[MethodKind::None][..]),
         // Quiet sessions stay open while the client answers SSH keepalives.
         // This also refreshes the mesh firewall's idle TCP flow tracking.
@@ -175,8 +170,9 @@ impl SshServer {
 
     /// Spawn a listener on each mesh address (at [`SSH_LISTEN_PORT`]). Runs until
     /// `token` is cancelled. The configured mesh SSH port is mapped to this port
-    /// by the userspace NAT in `forward.rs`.
+    /// by the userspace NAT in `forward.rs`, with a separate listener for self-SSH.
     pub fn spawn(self, addrs: Vec<IpAddr>, token: CancellationToken) {
+        session_env::warm_scope_tools();
         tokio::spawn(async move {
             let key = match load_host_key() {
                 Ok(k) => k,
@@ -194,6 +190,18 @@ impl SshServer {
                         continue;
                     }
                 };
+                let local_listener = match addr {
+                    IpAddr::V6(address) => {
+                        match local::bind_retry(address, crate::forward::ssh_port()).await {
+                            Ok(listener) => Some(listener),
+                            Err(error) => {
+                                warn!(%error, "mesh SSH: cannot bind self-SSH port; a host sshd may already own it");
+                                None
+                            }
+                        }
+                    }
+                    IpAddr::V4(_) => None,
+                };
                 info!(%addr, port = SSH_LISTEN_PORT, mesh_port = crate::forward::ssh_port(), "mesh SSH listening");
                 let registry = Arc::clone(&self.registry);
                 let authz = Arc::clone(&self.authz);
@@ -203,7 +211,7 @@ impl SshServer {
                     loop {
                         tokio::select! {
                             _ = token.cancelled() => break,
-                            accepted = listener.accept() => {
+                            accepted = local::accept(&listener, local_listener.as_ref()) => {
                                 let (stream, peer) = match accepted {
                                     Ok(p) => p,
                                     Err(e) => { debug!(error = %e, "mesh SSH accept failed"); continue; }
@@ -245,6 +253,12 @@ fn disable_nagle(stream: &TcpStream) {
     }
 }
 
+struct SshAuthorization {
+    user_identity: EndpointId,
+    policy: UserPolicy,
+    banner: Option<String>,
+}
+
 /// Resolve the connecting peer, decide authorization, and run the SSH session.
 async fn handle_conn(
     stream: TcpStream,
@@ -259,24 +273,49 @@ async fn handle_conn(
         debug!(peer = %peer.ip(), "mesh SSH: non-IPv6 source on the mesh listener, dropping");
         return;
     };
-    let Some(peer_id) = registry.peers.identity_for_ip(&src) else {
-        debug!(%src, "mesh SSH: connection from unknown mesh IP, dropping");
-        return;
+    let SshAuthorization {
+        user_identity,
+        policy,
+        banner,
+    } = if src == registry.transport.identity.local_ipv6() {
+        let Ok(server) = stream.local_addr() else {
+            return;
+        };
+        let Some(uid) = local::uid(peer, server).await else {
+            debug!(%src, "mesh SSH: cannot identify local socket owner, dropping");
+            return;
+        };
+        SshAuthorization {
+            user_identity: registry.transport.identity.local_identity(),
+            policy: UserPolicy::local(uid),
+            banner: None,
+        }
+    } else {
+        let Some(peer_id) = registry.peers.identity_for_ip(&src) else {
+            debug!(%src, "mesh SSH: connection from unknown mesh IP, dropping");
+            return;
+        };
+        let user_identity = registry.device_user_map.resolve(&peer_id);
+        let networks = registry.authorization_networks(peer_id);
+        let resolve = |network: &str, hostname: &str| {
+            registry
+                .resolve_peer_in_network(network, hostname)
+                .map(|id| registry.device_user_map.resolve(&id))
+        };
+        let policy =
+            resolve_user_policy_with_hostnames(&authz, &user_identity, &networks, &resolve);
+        let banner = auth_banner(&policy, &user_identity, &networks);
+        SshAuthorization {
+            user_identity,
+            policy,
+            banner,
+        }
     };
-    let user_identity = registry.device_user_map.resolve(&peer_id);
-    let networks = registry.authorization_networks(peer_id);
-    let resolve = |network: &str, hostname: &str| {
-        registry
-            .resolve_peer_in_network(network, hostname)
-            .map(|id| registry.device_user_map.resolve(&id))
-    };
-    let policy = resolve_user_policy_with_hostnames(&authz, &user_identity, &networks, &resolve);
     // Logged before the handshake, and with the source port, so a session that
     // stalls before it authenticates (and so logs nothing else) is still
     // visible here and can be matched to a socket in `ss` output.
     debug!(%src, port = peer.port(), peer = %user_identity.fmt_short(),
         authorized = policy.authorized(), "mesh SSH connection");
-    let banner = auth_banner(&policy, &user_identity, &networks);
     // The address the client believes it reached, not the internal listen port
     // the SSH NAT sent it to: this is what the session reports in
     // `SSH_CONNECTION` and what `login` records as the origin.
@@ -481,8 +520,6 @@ struct SshHandler {
     /// Shown before auth when the peer is unauthorized or restricted, so a
     /// refusal reaches the person connecting instead of only this node's log.
     banner: Option<String>,
-    /// The unix user the client asked to log in as (the `user` in `user@host`).
-    login_user: String,
     /// The resolved login account, set in `auth_none` once the requested user
     /// passes the policy, so the session task doesn't re-run `getpwnam`. Shared,
     /// never consumed: every channel on the connection logs in as this account.
@@ -525,7 +562,6 @@ impl SshHandler {
             policy,
             user,
             banner,
-            login_user: String::new(),
             login: None,
             channels: HashMap::new(),
             forwards: HashMap::new(),
@@ -657,7 +693,6 @@ impl Handler for SshHandler {
     }
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        self.login_user = user.to_string();
         if !self.policy.authorized() {
             info!(peer = %self.user.fmt_short(), "mesh SSH: rejecting unauthorized peer");
             return Ok(Auth::reject());
@@ -1004,7 +1039,7 @@ impl Handler for SshHandler {
             return Ok(false);
         }
         let peer = self.user;
-        let (agent_dir, listener, path) = match open_agent_socket(&info) {
+        let (agent_dir, listener) = match open_agent_socket(&info) {
             Ok(a) => a,
             Err(e) => {
                 warn!(peer = %peer.fmt_short(), error = %e,
@@ -1012,6 +1047,7 @@ impl Handler for SshHandler {
                 return Ok(false);
             }
         };
+        let path = agent_dir.join(AGENT_SOCKET);
         let token = self.token.child_token();
         let accept_token = token.clone();
         let socket = path.clone();
@@ -1273,21 +1309,24 @@ where
     let _ = handle.close(channel_id).await;
 }
 
+/// File name of the agent-forwarding socket inside its private directory.
+const AGENT_SOCKET: &str = "agent.sock";
+
 /// Create the agent-forwarding socket for one session: a private directory
 /// holding a single unix socket, both owned by the login account, so nothing
 /// but that account can talk to the peer's ssh-agent through it. Returns the
-/// directory, the bound listener, and the socket path the session's
-/// `SSH_AUTH_SOCK` will name.
+/// directory and the bound listener; the socket the session's `SSH_AUTH_SOCK`
+/// names is [`AGENT_SOCKET`] inside that directory.
 ///
 /// The directory name is random and created exclusively (`create_dir` fails on
 /// an existing path), so nothing can be waiting at the path to be handed the
 /// socket when the daemon chowns it away from root.
-fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf)> {
+fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener)> {
     let dir =
         std::env::temp_dir().join(format!("rayfish-ssh-agent.{:016x}", rand::random::<u64>()));
     std::fs::create_dir(&dir).context("creating the agent socket directory")?;
     hand_over(&dir, info, 0o700)?;
-    let path = dir.join("agent.sock");
+    let path = dir.join(AGENT_SOCKET);
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
@@ -1299,7 +1338,7 @@ fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    Ok((dir, listener, path))
+    Ok((dir, listener))
 }
 
 /// Which local address an `ssh -R` listener binds. A reverse forward publishes
@@ -1544,6 +1583,63 @@ mod tests {
             .to_string()
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn self_ssh_authenticates_the_socket_owner_and_executes() -> Result<()> {
+        let mesh = local::bind(Ipv6Addr::LOCALHOST, 0)?;
+        let local = local::bind(Ipv6Addr::LOCALHOST, 0)?;
+        let address = local.local_addr()?;
+        let config = Arc::new(server_config(PrivateKey::random(
+            &mut rand::rng(),
+            Algorithm::Ed25519,
+        )?));
+        let attempts = if uzers::get_effective_uid() == 0 {
+            1
+        } else {
+            2
+        };
+        tokio::spawn(async move {
+            for _ in 0..attempts {
+                let (stream, client) = local::accept(&mesh, Some(&local))
+                    .await
+                    .expect("accept self-SSH");
+                let server = stream.local_addr().expect("server address");
+                let uid = local::uid(client, server)
+                    .await
+                    .expect("live local socket owner");
+                let handler = SshHandler::new(
+                    UserPolicy::local(uid),
+                    id(1),
+                    None,
+                    Origin { client, server },
+                );
+                tokio::spawn(serve(Arc::clone(&config), stream, handler, LOGIN_GRACE));
+            }
+        });
+        if attempts == 2 {
+            let mut denied = client::connect(
+                Arc::new(client::Config::default()),
+                address,
+                AcceptAnyHost { opened: None },
+            )
+            .await?;
+            assert!(!denied.authenticate_none("root").await?.success());
+        }
+        let mut handle = client::connect(
+            Arc::new(client::Config::default()),
+            address,
+            AcceptAnyHost { opened: None },
+        )
+        .await?;
+        assert!(handle.authenticate_none(test_account()).await?.success());
+        let mut channel = handle.channel_open_session().await?;
+        channel.exec(true, "printf self-ssh-ok").await?;
+        let (output, code) = drain(&mut channel).await;
+        assert_eq!(output, "self-ssh-ok");
+        assert_eq!(code, Some(0));
+        Ok(())
+    }
+
     /// Serve the real [`SshHandler`] on loopback and return an authenticated
     /// client connection to it. The peer is authorized for any user, the same
     /// state a live mesh connection reaches before it opens a channel.
@@ -1580,6 +1676,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
             let (stream, client) = listener.accept().await.expect("accept");
+            disable_nagle(&stream);
             let mut policy = UserPolicy::default();
             policy.add(&["*".to_string()]);
             // The same origin the live path builds: the client's real address,
@@ -1593,7 +1690,10 @@ mod tests {
         });
 
         let mut handle = client::connect(
-            Arc::new(client::Config::default()),
+            Arc::new(client::Config {
+                nodelay: true,
+                ..client::Config::default()
+            }),
             addr,
             AcceptAnyHost { opened },
         )
@@ -1656,9 +1756,11 @@ mod tests {
     async fn an_authenticated_session_outlives_the_login_grace() {
         // The grace has to stop counting once a peer is admitted, or every
         // session would be cut off partway through whatever it was doing.
-        let handle =
-            connect_watching_openings(None, test_account(), Duration::from_millis(200)).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Allow the cryptographic handshake to complete under parallel test
+        // load, then wait past the same grace before using the session.
+        let grace = Duration::from_secs(2);
+        let handle = connect_watching_openings(None, test_account(), grace).await;
+        tokio::time::sleep(grace + Duration::from_millis(100)).await;
         let mut channel = handle
             .channel_open_session()
             .await

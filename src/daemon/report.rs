@@ -164,27 +164,21 @@ fn hand_bundle_to_requester(_file: &File, _owner: Option<&ReportRequester>) -> s
     Ok(())
 }
 
-/// Delete `uid`'s earlier bundles in `dir`.
-///
-/// The old fixed `rayfish-report-{ts}.tgz` was truncated and reused within the
-/// same second, which bounded a flood at one file. An unpredictable name closed
-/// the symlink hole but took that bound away, and `IpcMessage::Report` is in the
-/// open-reads arm of `check_authorized`: without this, any local account can
-/// loop `ray report` and have the root daemon leave a fresh gzip of up to seven
-/// days of debug logs in `/tmp` every time, forever.
-///
-/// `/tmp` is world-writable and this runs as root, so the unlink is deliberately
-/// narrow: `symlink_metadata` does not follow a planted link, and only a regular
-/// file owned by the same uid whose name matches the bundle pattern is removed.
 /// A short, stable tag naming the principal a bundle belongs to, so the sweep
 /// can pick out this caller's own without reading an owner back off the disk.
 #[cfg(unix)]
 fn requester_tag(owner: Option<&ReportRequester>) -> String {
-    let uid = match owner {
+    format!("u{}", requester_uid(owner))
+}
+
+/// The uid a bundle belongs to: the requester's, or the daemon's own when
+/// nobody was identified.
+#[cfg(unix)]
+fn requester_uid(owner: Option<&ReportRequester>) -> u32 {
+    match owner {
         Some(ReportRequester::Unix { uid, .. }) => *uid,
         None => unsafe { libc::geteuid() },
-    };
-    format!("u{uid}")
+    }
 }
 
 /// The Windows counterpart. A hash of the SID rather than the SID itself: the
@@ -203,6 +197,19 @@ fn requester_tag(owner: Option<&ReportRequester>) -> String {
     format!("s{}", hex::encode(&Sha256::digest(sid.as_bytes())[..8]))
 }
 
+/// Delete `uid`'s earlier bundles in `dir`.
+///
+/// The old fixed `rayfish-report-{ts}.tgz` was truncated and reused within the
+/// same second, which bounded a flood at one file. An unpredictable name closed
+/// the symlink hole but took that bound away, and `IpcMessage::Report` is in the
+/// open-reads arm of `check_authorized`: without this, any local account can
+/// loop `ray report` and have the root daemon leave a fresh gzip of up to seven
+/// days of debug logs in `/tmp` every time, forever.
+///
+/// `/tmp` is world-writable and this runs as root, so the unlink is deliberately
+/// narrow: `symlink_metadata` does not follow a planted link, and only a regular
+/// file owned by the same uid whose name matches the bundle pattern is removed.
+///
 /// A reader holding one open keeps it until they close it.
 fn sweep_prior_bundles(dir: &Path, owner: Option<&ReportRequester>) {
     #[cfg(unix)]
@@ -218,10 +225,7 @@ fn sweep_prior_bundles(dir: &Path, owner: Option<&ReportRequester>) {
     // On Unix the name is a hint and the uid below is the decision, since `/tmp`
     // lets any account create a file with any name in it.
     #[cfg(unix)]
-    let uid = match owner {
-        Some(ReportRequester::Unix { uid, .. }) => *uid,
-        None => unsafe { libc::geteuid() },
-    };
+    let uid = requester_uid(owner);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

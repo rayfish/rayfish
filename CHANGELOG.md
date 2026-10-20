@@ -8,11 +8,289 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- iOS 18: a Rayfish control turns the VPN on and off from Control Center,
+  the Lock Screen or the Action button.
+
 - The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
   and DNS through the packet tunnel, or restore a direct connection.
 
 - Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
   with only an IPv4 internet connection.
+
+### Changed
+
+- While an exit node is selected, the LAN, Docker networks and other VPNs stay
+  reachable directly, and SSH sessions to the client's own address keep
+  working. Only new connections to the internet outside the tunnel are
+  blocked. If the client's IPv4 tunnel address conflicts with a local route,
+  the exit carries IPv6 only instead of failing.
+
+## [0.5.10] - 2026-10-19
+
+### Added
+
+- iOS: crash reporting, with an opt-out toggle and a Send diagnostics button in
+  the You tab, as on Android.
+- `just ios-run` builds, installs, and launches the iOS app on a connected iPhone.
+- An iOS app, the counterpart of the Android one: networks, invites and QR
+  codes, pairing, file transfer, firewall rules, join and connect requests,
+  and identity backup and restore. It keeps the identity in iCloud Keychain on
+  its own, so a new iPhone on the same Apple ID can restore it. It
+  runs Rayfish as a VPN through a packet tunnel extension.
+- `ray up --set KEY=VALUE` persists settings after startup, alongside controller
+  enrollment. Repeat the flag for multiple settings; `--enable` is an alias and
+  a bare key means `on`, for example `--enable v4-bridge --set dns=partial`.
+
+- `ray connect deny`, `ray block`, `ray unblock` and `ray blocked` control who
+  can send you connect requests; denying a request blocks its sender.
+  `ray config set inbound anyone|known|none` refuses strangers or everyone.
+  Refused peers get no reply, so they cannot tell a block from a full queue.
+
+- `ray apply --invite-missing` privately invites aliases that have no joined
+  device. The invitation waits in their `ray invitations` until they accept or
+  decline; nothing joins on its own. Offline recipients get it when they come
+  back, until it expires after 7 days. A recipient on an older Rayfish cannot
+  receive one, so you get the code to send them instead. Accepting an invite
+  that was revoked or has expired removes it.
+
+- The macOS and Android apps show received invitations to join or decline,
+  send an invite straight to someone's identity from a network you coordinate,
+  block a connection request's sender, and set who can reach you and who is
+  blocked. Android also shows your identity and can connect to a peer by it.
+  On macOS a new invitation posts a notification you can join or decline from.
+
+- `ray rename <network> <new-name>` renames a network on this machine only. Its
+  hosts then resolve as `<host>.<new-name>.ray`, and its firewall rules, SSH
+  access, exit-node settings and outstanding invites follow the new name. Other
+  members keep their own name for it. A live network briefly reconnects under
+  the new name.
+
+### Changed
+
+- Phones are outgoing-only while idle. After two minutes without traffic from
+  the phone, Android and iOS close their peer links and disconnect from the
+  relay, and reconnect as soon as the phone sends something. While idle, peers
+  cannot reach the phone, file offers included, until it is used again.
+
+- Android and iOS: a new install takes its mesh name from the device name in
+  Settings, so `Alice's Pixel` joins as `alice-pixel`. iOS shares only
+  `iPhone` until Apple grants the app the device name entitlement. A possessive `'s` is
+  dropped from system hostnames everywhere, so `Alice's MacBook` becomes
+  `alice-macbook` instead of `alice-s-macbook`.
+- The `nightly` pre-release no longer includes the Android APK. Apps ship only
+  with versioned releases; `ray update --nightly` still updates the CLI and
+  daemon.
+- Linux: the file-transfer and membership store moved from
+  `/etc/rayfish/blobs` to `/var/lib/rayfish/blobs`. An existing store is moved
+  on first start.
+- Linux: mesh SSH commands, scp, rsync and root sessions start in their own
+  systemd scope, so background jobs started from them survive a daemon
+  restart. Open SSH sessions still disconnect.
+- The systemd, OpenRC and SysV services now restore DNS and exit-node settings
+  when the daemon stops or crashes. The daemon raises its own open file limit
+  and never lowers one the host set higher.
+- On systemd-resolved, Rayfish is chosen only when `/etc/resolv.conf` points at
+  the resolved stub and resolved is running; otherwise it writes resolv.conf.
+- `ray connect` takes the peer's identity, shown by `ray status` and
+  `ray identityof`. Contact ids and `ray contact` are removed. A node on 0.5.9
+  cannot `ray connect` to a newer one until it upgrades.
+
+### Fixed
+
+- Android: error messages say what went wrong instead of showing `v1=...` or
+  nothing.
+- After pairing, a new device joins all of its networks at once instead of
+  waiting for each join to finish before starting the next. The device it
+  paired with now admits those joins side by side too, so pairing with many
+  shared networks takes about as long as joining one.
+- Someone who joins a network seconds after it was created is no longer
+  dropped from it right away. A background check could mistake the new network
+  for one that failed to start and start it a second time, and the second copy
+  then published the roster from before the join.
+- Android: receiving or sending a file no longer crashes the app when Android
+  15 or later has used up the daily background transfer time; the transfer is
+  marked failed instead.
+- Android: crash reports for killed processes are grouped by exit reason and
+  signal, and connection errors keep the underlying system error.
+- On systemd-resolved hosts, Rayfish no longer receives DNS queries for every
+  name on the machine; only `.ray` is routed to it.
+- After a crash, Rayfish no longer restores an old resolv.conf over one that
+  NetworkManager or DHCP rewrote in the meantime. resolv.conf is written
+  atomically, a symlinked resolv.conf is restored as a symlink, IPv6 DNS
+  servers are kept, and an unwritable resolv.conf gives a clear warning.
+- Turning DNS on while Rayfish is already up no longer leaves an old watcher
+  fighting the new settings.
+- DNS-over-TCP queries to Rayfish now fail at once instead of hanging.
+- An IPv6 exit node no longer loses its router-advertised default route when
+  forwarding is turned on, and turning it off restores each interface's own
+  forwarding setting.
+- An exit node now forwards traffic on hosts whose firewall drops forwarding
+  (Docker, ufw, firewalld), or prints the command to allow it.
+- Using an exit node on Linux no longer overwrites packet marks set by
+  WireGuard, Mullvad or kube-proxy, and container traffic is no longer routed
+  around the tunnel.
+- Exit-node rules removed by a firewall reload or `nft flush ruleset` are
+  restored within 30 seconds, and so is the mesh SSH firewall accept. TCP MSS
+  is clamped on exit traffic.
+- The mesh SSH firewall check now sees a native nftables drop on hosts that use
+  iptables-nft.
+- Linux: if the TUN device fails, the daemon exits and the service manager
+  restarts it, instead of reporting the VPN as up while carrying no traffic
+  (systemd, OpenRC and launchd restart it; SysV does not).
+- Linux: taking the Rayfish link down from outside no longer leaves the mesh
+  dead until the next `ray up`.
+- Linux: `ray up` works on hosts that disable IPv6 for new interfaces, and the
+  error for a missing `/dev/net/tun`, missing CAP_NET_ADMIN or disabled IPv6
+  says which it is.
+- UDP packets larger than the MTU are no longer dropped: IPv6 fragments pass
+  the firewall when their first fragment does.
+- `ray up` warns when another interface, such as Yggdrasil, routes part of
+  `200::/7`.
+- Router solicitations and MLD reports no longer show as dropped packets.
+- Linux: the connection recovers right after the machine wakes from sleep.
+- Starting two daemons at once now fails cleanly instead of breaking the
+  running one.
+
+### Security
+
+- Self-update no longer stages the new binary under a fixed name in the shared
+  temp directory.
+- Config files holding secrets are private from the moment they are created.
+- Services reached through the IPv4 bridge see the host's own address instead
+  of `127.0.0.1`, so mesh peers no longer get trust meant for local clients.
+  Services that trust the host's own subnet now treat bridged peers as LAN
+  clients. On hosts with no IPv4 address besides loopback, the bridge now
+  serves nothing.
+- The local control socket limits concurrent and stalled clients.
+
+### Performance
+
+- An idle iPhone no longer wakes several times a minute. It used to rebind its
+  connections on every wake, and the relay and open peer links kept waking it.
+
+- Linux: the TUN MTU is now 1280, so full-sized packets fit one QUIC datagram
+  instead of being split in two.
+
+## [0.5.9] - 2026-10-15
+
+### Added
+
+- `ray firewall test <peer> <proto:port>` shows whether the firewall would let a
+  packet through and which rule or default decides, without sending anything.
+  `--direction out` checks traffic to the peer, `--network` looks the peer up on
+  one network, and `--json` prints the verdict for scripts.
+
+### Changed
+
+- Updated peer connections to iroh 1.3 with upstream connection setup and
+  protocol routing fixes.
+
+- Standalone forwarding uses a 16 KiB QUIC send queue instead of 1 MiB so
+  excess traffic is dropped sooner rather than building a long backlog.
+
+- mDNS discovery listens in 30-second windows instead of keeping its sockets
+  open. Windows start on the clock every 5 minutes (:00, :05, ...) on
+  every platform, so nodes listen at the same time, and right away
+  after joining another network. On busy Wi-Fi the open sockets received every mDNS
+  packet on the LAN, which drained Android batteries. LAN sightings now expire
+  after two missed windows.
+
+### Fixed
+
+- `.ray` names resolve on hosts with systemd-resolved `DNSOverTLS=yes`. Rayfish
+  now turns DNS over TLS off on its own interface, since Magic DNS answers plain
+  UDP only; lookups used to time out.
+
+- `ray apply` accepts target exclusions containing aliases with no joined
+  devices. Rules go only to concrete targets, so later user devices receive no
+  grant before reapplying. Peer exclusions still require joined devices.
+
+- The macOS Files page asks before replacing an existing file, shows live
+  download progress, and offers Show in Finder for received files.
+
+- The macOS app reuses its VPN session for status updates and commands, avoiding
+  memory growth while it stays open.
+
+- Mesh SSH port mapping, TCP resets and Magic DNS replies now find the
+  TCP or UDP header after IPv6 extension headers instead of assuming it
+  starts at byte 40, which wrote the new port into the extension header.
+
+- Mesh SSH reports a child killed by USR2, TSTP, CONT or WINCH by its signal
+  name instead of a bare number the client could not read.
+
+- `ray files` shows transfer progress and state instead of only the
+  total size and file name.
+
+- A fresh install without `settings.toml` now starts with on-demand mode and
+  the macOS pf passthrough on, as documented. A pending-join update no longer
+  races with other settings writes and loses one of them.
+
+- Leaving a network could close a peer connection that a concurrent reconnect
+  had just reused for another network.
+
+- Turning mDNS discovery off while a window was opening could leave the mDNS
+  sockets open and still answering lookups.
+
+- Failed file downloads stay in `ray files` for retry with `ray files accept <id>`,
+  reusing data already downloaded. Android offers Retry on Home and in notifications.
+
+- SSH to your own mesh address permits your local account without a password.
+  Root may select any account; mesh SSH grants do not apply to local callers.
+
+- `ray leave` reaches the network's coordinator even when the connection to it
+  had gone idle, as it usually has on a phone. The device no longer stays on the
+  roster holding its hostname until someone runs `ray kick`.
+
+- Creating or joining a network no longer overwrites a saved network of the same
+  name that is not active, such as one still waiting for its restore, along with
+  its keys. A `--name` that another network holds is refused, and a name Rayfish
+  picks itself gets the next free suffix, so a second `gaming` joins as
+  `gaming-1`.
+
+- Transfers over a link that loses packets no longer stall for seconds at a
+  time. Packets too large for one QUIC datagram travel in pieces, and the
+  receiver keeps up to 64 unfinished ones per peer, each for up to 5 seconds.
+  When lost pieces filled those slots, every later split packet was dropped
+  until they expired. Now the oldest unfinished packet makes room.
+
+- On Linux, outgoing mesh traffic could stop until Rayfish was restarted, while
+  `ray status` still showed peers as connected, after the TUN interface handed
+  over a large offloaded packet that Rayfish could not split ("too many GSO
+  segments"). Rayfish now drops that one packet, counts it as a `TunRead` drop,
+  and keeps forwarding.
+
+- The Linux systemd service starts the daemon as root again so it can
+  configure the interface and manage DNS.
+
+## [0.5.8] - 2026-10-04
+
+### Added
+
+- Experimental `ray config set quic-engine fq-codel` gives inner flows
+  separate queues and favors sparse traffic over bulk transfers. It combines
+  CoDel queue management with loss-tolerant congestion control and applies after restarting the daemon.
+
+- `ray files auto-accept add/remove <peer>` saves trusted file senders; `list`
+  shows their identities. The macOS Files page can add and remove them too.
+
+### Changed
+
+- `quic-engine` replaces `quic-congestion`, with `standalone` (default) and
+  `fq-codel` choices. Both use loss-tolerant congestion control. Saved controller
+  settings migrate to the corresponding engine. macOS Settings and Android You
+  offer an engine selector and a reconnect or restart action.
+
+### Fixed
+
+- Peer send queue metrics include the FQ-CoDel backlog and use the selected
+  engine's QUIC buffer size.
+
+- Network-scoped firewall rules apply to peers sharing that network, regardless
+  of which shared network carries their packets.
+
+## [0.5.7] - 2026-10-03
+
+### Added
 
 - `ray status` and the macOS app warn when a peer connection has high latency,
   packet loss, or a backed-up send queue.
@@ -42,6 +320,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- New members and reconnecting peers no longer get stuck with a connection
+  that appears online but cannot carry traffic.
 - The macOS app version now matches the Rayfish version in `Cargo.toml`.
 - IPv4 listener bridging is enabled by default on fresh installs and starts
   with the macOS app's VPN. An explicit `v4-bridge off` setting is preserved.
@@ -2654,7 +2934,11 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.10...HEAD
+[0.5.10]: https://github.com/rayfish/rayfish/compare/v0.5.9...v0.5.10
+[0.5.9]: https://github.com/rayfish/rayfish/compare/v0.5.8...v0.5.9
+[0.5.8]: https://github.com/rayfish/rayfish/compare/v0.5.7...v0.5.8
+[0.5.7]: https://github.com/rayfish/rayfish/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/rayfish/rayfish/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/rayfish/rayfish/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/rayfish/rayfish/compare/v0.5.3...v0.5.4

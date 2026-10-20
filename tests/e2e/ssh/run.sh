@@ -35,8 +35,8 @@ B="$(server_ip "$SERVERS" srv-b || true)"
 # hanging the test.
 ssh_try(){ # <from-ip> <dst-mesh-ip> <remote-cmd>
   local from="$1" dst="$2" cmd="$3"
-  local user="${4:-root}"
-  on "$from" "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  local user="${4:-root}" port="${5:-22}"
+  on "$from" "ssh -p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o BatchMode=yes -o ConnectTimeout=8 -o PreferredAuthentications=none,publickey \
     $user@$dst $cmd 2>&1 || true"
 }
@@ -58,8 +58,7 @@ INV_B="$(mint_invite "$A" "$NET" srv-b)"
 on "$B" "ray join $INV_B --hostname srv-b" 2>&1 | strip | sed 's/^/   b| /'
 wait_roster "$A" srv-b
 
-SA="$(on "$A" 'ray status' | strip)"; SB="$(on "$B" 'ray status' | strip)"
-A_IP="$(own_ip "$SA")"; B_IP="$(own_ip "$SB")"
+A_IP="$(my_ip "$A" "$NET")"; B_IP="$(my_ip "$B" "$NET")"
 echo "   A mesh ip=$A_IP  B mesh ip=$B_IP"
 [[ -n "$A_IP" && -n "$B_IP" ]] || { fail "missing mesh IP(s)"; summary; }
 pass "both have a mesh IP"
@@ -198,6 +197,36 @@ OUT="$(ssh_try "$B" "$A_IP" whoami root)"
 echo "$OUT" | sed 's/^/   b| /'
 echo "$OUT" | grep -qi '^root' && pass "wildcard allow admits srv-b as root" \
   || fail "wildcard allow did not admit srv-b: $OUT"
+
+# ---------------------------------------------------------------------------
+step "7b. self-SSH follows the local socket owner, even with wildcard mesh grants"
+# An IPv6 host sshd may own port 22; exercise the configured mesh listener.
+on "$A" 'ray config set ssh-port 2222' >/dev/null
+OUT="$(ssh_try "$A" "$A_IP" whoami root 2222)"
+echo "$OUT" | grep -qx root && pass "root can SSH to its own mesh address" \
+  || fail "root self-SSH failed: $OUT"
+for user in meshtest root deploy; do
+  OUT="$(on "$A" "runuser -u meshtest -- ssh -p 2222 -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=8 \
+    -o PreferredAuthentications=none $user@$A_IP whoami 2>&1 || true")"
+  if [[ "$user" == meshtest ]]; then
+    echo "$OUT" | grep -qx meshtest && pass "local user can self-SSH as itself" \
+      || fail "local user self-SSH failed: $OUT"
+  else
+    echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
+      && pass "local user cannot self-SSH as $user" \
+      || fail "local user self-SSH should deny $user: $OUT"
+  fi
+done
+
+step "7c. changing the SSH port moves the self listener"
+on "$A" 'ray config set ssh-port 2223' >/dev/null
+OUT="$(on "$A" "ssh -p 2223 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o BatchMode=yes -o ConnectTimeout=8 -o PreferredAuthentications=none \
+  root@$A_IP whoami 2>&1 || true")"
+echo "$OUT" | grep -qx root && pass "self-SSH works on the configured port" \
+  || fail "self-SSH on changed port failed: $OUT"
+on "$A" 'ray config set ssh-port 22' >/dev/null
 
 # ---------------------------------------------------------------------------
 step "8. ray firewall ssh off — port closes again"

@@ -13,6 +13,11 @@
 # to /etc/init.d/rayfish with the path of the running binary substituted for
 # /usr/local/bin/ray. Plain POSIX sh: start-stop-daemon is used when present
 # (Debian and derivatives), otherwise a portable kill/pidfile fallback.
+#
+# SysV does not restart a daemon that exits. The daemon exits on a TUN failure
+# rather than run without a data plane, so on this init system a failed TUN
+# leaves rayfish stopped until `service rayfish start` (systemd, OpenRC and
+# launchd restart it on their own).
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
 NAME=rayfish
@@ -28,6 +33,11 @@ running() {
 	pid=$(cat "$PIDFILE" 2>/dev/null)
 	[ -n "$pid" ] || return 1
 	kill -0 "$pid" 2>/dev/null
+}
+
+# Undo DNS and exit-node changes when the daemon died without its own teardown.
+cleanup() {
+	"$DAEMON" daemon --cleanup >>"$LOGFILE" 2>&1 || true
 }
 
 do_start() {
@@ -49,6 +59,7 @@ do_stop() {
 	if ! running; then
 		echo "$NAME is not running"
 		rm -f "$PIDFILE"
+		cleanup
 		return 0
 	fi
 	echo "Stopping $NAME"
@@ -65,6 +76,7 @@ do_stop() {
 		kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
 	fi
 	rm -f "$PIDFILE"
+	cleanup
 }
 
 case "$1" in

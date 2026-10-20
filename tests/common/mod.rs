@@ -189,6 +189,7 @@ impl PacketSpec {
             } else {
                 0
             },
+            transport_offset: self.header_len(),
         }
     }
 }

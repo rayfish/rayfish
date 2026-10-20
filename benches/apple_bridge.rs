@@ -44,22 +44,17 @@ const BATCH_SIZES: &[usize] = &[1, 8, 32];
 const ITERATIONS: usize = 10_000;
 const POOL_CHUNK: usize = 64 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::Display)]
 enum Path {
+    #[strum(to_string = "bridge-per-packet")]
     PerPacketBridge,
+    #[strum(to_string = "bridge-batched")]
     BatchedBridge,
+    #[strum(to_string = "owned-handoff")]
     OwnedHandoff,
 }
 
 impl Path {
-    fn name(self) -> &'static str {
-        match self {
-            Self::PerPacketBridge => "bridge-per-packet",
-            Self::BatchedBridge => "bridge-batched",
-            Self::OwnedHandoff => "owned-handoff",
-        }
-    }
-
     fn copies_per_packet(self) -> usize {
         match self {
             Self::PerPacketBridge | Self::BatchedBridge => 2,
@@ -83,7 +78,7 @@ fn main() {
                 let report = measure(path, &packet, batch_size);
                 println!(
                     "{},{},{},{:.0},{:.2},{:.0},{:.0},{:.1},{:.3},{},{},{}",
-                    path.name(),
+                    path,
                     packet_size,
                     batch_size,
                     report.packets_per_second,

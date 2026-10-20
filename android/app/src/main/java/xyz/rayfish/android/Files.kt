@@ -281,6 +281,7 @@ object FileAutoAccept {
                     // for this key, so stop treating it as pending immediately
                     // rather than making the result notification wait out the
                     // timeout for a failure that has already happened.
+                    OfferNotifier.markFailed(context, f.id)
                     DownloadsOutcome.clearPending(key)
                     val tries = attempts.merge(f.id, 1) { old, inc -> old + inc } ?: 1
                     if (tries < MAX_ATTEMPTS) {

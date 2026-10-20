@@ -5,14 +5,7 @@
 //! reader and coordinator/member accept handlers now live in the per-connection
 //! demux (`ProtocolRouter::drive_mesh_connection` → `AcceptHandler::handle_frame`).
 
-use std::net::Ipv6Addr;
-
 use super::super::*;
-
-/// Maximum time one serialized mesh dial may own or wait for a peer's dial gate.
-/// The bound covers the transport connection and mesh registration so a stalled
-/// attempt cannot block every later reconnect and on-demand dial to that peer.
-const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct NetworkToNullify {
     name: String,
@@ -55,7 +48,7 @@ impl NetworkRegistry {
     }
 
     async fn handle_disconnect(self: Arc<Self>, ev: forward::DisconnectEvent) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if self.transport.is_suspended() {
             // Android's idle suspension deliberately closes links. Keep the
             // roster/route state intact so the next TUN packet can wake and
@@ -422,24 +415,12 @@ impl NetworkRegistry {
         let peer_ip = derive_ipv6(&peer_id);
         let my_identity = self.transport.identity.local_identity();
         let device_cert = self.current_device_cert();
-        let dial_lock = self.mesh_dial_lock(peer_id);
-        let _dial_guard = dial_lock.lock().await;
         // An accept or another network's dial may already have established the
-        // peer. Reuse that connection and send the remaining network hellos on it.
-        let connected = if let Some(conn) = self.peers.conn_for_ip(&peer_ip)
-            && conn.close_reason().is_none()
-        {
-            Ok(conn)
-        } else {
-            transport::connect_to_peer_with_alpn(
-                &self.transport.endpoint,
-                peer_id,
-                &transport::mesh_alpn(),
-            )
-            .await
-        };
-        let conn = match connected {
-            Ok(c) => c,
+        // peer, or be dialing it now. Reuse that connection and send the
+        // remaining network hellos on it. The claim keeps a fresh connection
+        // findable by other dialers until it is registered below.
+        let (conn, _claim) = match self.connect_mesh_peer(peer_id).await {
+            Ok(DialedPeer { conn, claim }) => (conn, claim),
             Err(e) => {
                 // Flag an incompatible-version peer (ALPN gate) so `ray status`
                 // shows it instead of plain offline; a different failure can't be
@@ -450,34 +431,38 @@ impl NetworkRegistry {
                 } else {
                     self.peers.clear_incompatible(&peer_id);
                 }
-                tracing::debug!(peer = %peer_id.fmt_short(), error = %e, "dial attempt failed");
+                tracing::debug!(peer = %peer_id.fmt_short(), error = %format!("{e:#}"), "dial attempt failed");
                 self.reachability.note_fail(peer_id);
                 return false;
             }
         };
-        // Announce ourselves on every still-shared network over the one connection
-        // and register the peer's route per network. `conn_changed` accumulates
-        // whether the connection became newly current (it always is for a fresh
-        // dial / reconnect), which gates driving its demux.
-        let mut conn_changed = false;
+        // Establish each shared network over the one connection. Start a fresh
+        // connection's driver as soon as its first route is registered: a later
+        // hello may time out, but already-established networks must stay usable.
         for t in targets {
-            let Ok((mut send, _)) = conn.open_bi().await else {
-                continue;
-            };
             let hello = ControlMsg::MeshHello {
                 identity: my_identity,
                 hostname: outgoing_hostname(&t.network),
                 device_cert: device_cert.clone(),
             };
-            if control::send_msg(&mut send, Some(t.network_key), &hello)
-                .await
-                .is_err()
-            {
+            if send_mesh_hello(&conn, t.network_key, &hello).await.is_err() {
                 continue;
             }
-            conn_changed |= self
+            let conn_changed = self
                 .mesh_ctx()
                 .register_peer_conn(&conn, peer_id, &t.network);
+            if conn_changed
+                && self
+                    .peers
+                    .conn_for_ip(&peer_ip)
+                    .is_some_and(|selected| selected.stable_id() == conn.stable_id())
+            {
+                tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
+                let router = Arc::clone(self.protocol_router());
+                let dconn = conn.clone();
+                tokio::spawn(router.drive_mesh_connection(dconn, true));
+            }
+            announce_network_handles(&self.peers, &conn, peer_ip).await;
         }
         // Registration may have kept a different, globally preferred connection.
         // Success means a live selected connection exists, not that this dial won.
@@ -489,12 +474,6 @@ impl NetworkRegistry {
             return false;
         };
         self.reachability.note_ok(peer_id);
-        if conn_changed && selected.stable_id() == conn.stable_id() {
-            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
-            let router = Arc::clone(self.protocol_router());
-            let dconn = conn.clone();
-            tokio::spawn(router.drive_mesh_connection(dconn, true));
-        }
         announce_network_handles(&self.peers, &selected, peer_ip).await;
         true
     }
@@ -610,9 +589,8 @@ pub(crate) fn sender_is_coordinator(state: &SharedNetworkState, peer: EndpointId
         .read()
         .unwrap()
         .members
-        .all()
-        .iter()
-        .any(|m| m.identity == peer && m.is_coordinator)
+        .get(&peer)
+        .is_some_and(|m| m.is_coordinator)
 }
 
 /// Pure prune decision for one member under the ephemeral policy. Never prunes
@@ -647,7 +625,6 @@ pub(crate) async fn remove_member_roster_only(
     network: &str,
     state: &SharedNetworkState,
     member_id: EndpointId,
-    member_ipv6: Ipv6Addr,
 ) {
     {
         let mut s = state.write().unwrap();
@@ -658,7 +635,7 @@ pub(crate) async fn remove_member_roster_only(
         &ctx.hostname_table,
         &ctx.reverse_table,
         network,
-        member_ipv6,
+        derive_ipv6(&member_id),
     )
     .await;
 }
@@ -778,7 +755,7 @@ pub(crate) fn spawn_stale_member_pruner(
                 continue;
             }
             for id in &removed_members {
-                remove_member_roster_only(&ctx, &network, &state, *id, derive_ipv6(id)).await;
+                remove_member_roster_only(&ctx, &network, &state, *id).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
             finalize_removal(&ctx, &network, &state, &dht_notify, &removed_members).await;

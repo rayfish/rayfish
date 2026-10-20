@@ -56,11 +56,11 @@ fn is_loopable_upstream(ip: IpAddr) -> bool {
 pub struct Resolver {
     table: HostnameTable,
     reverse: ReverseLookupTable,
-    upstreams: Arc<ArcSwap<Vec<SocketAddr>>>,
+    upstreams: ArcSwap<Vec<SocketAddr>>,
     /// Upstreams to use instead of `upstreams` while a full tunnel is up, so
     /// lookups leave by the exit node rather than around it. See
     /// [`set_tunnel_upstreams`](Resolver::set_tunnel_upstreams).
-    tunnel_upstreams: Arc<ArcSwapOption<Vec<SocketAddr>>>,
+    tunnel_upstreams: ArcSwapOption<Vec<SocketAddr>>,
     /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
     /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
     overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
@@ -100,8 +100,8 @@ impl Resolver {
         Self {
             table,
             reverse,
-            upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
-            tunnel_upstreams: Arc::new(ArcSwapOption::empty()),
+            upstreams: ArcSwap::from_pointee(Vec::new()),
+            tunnel_upstreams: ArcSwapOption::empty(),
             overlay_forwards: DashMap::new(),
             defer_off_mesh: AtomicBool::new(false),
             short_names: AtomicBool::new(true),
@@ -215,25 +215,27 @@ impl Resolver {
     }
 
     /// Answer a DNS query that arrived addressed to the magic IP via the TUN.
-    /// UDP only; TCP is dropped (no userspace TCP handler yet).
+    /// UDP only. TCP is refused with a reset: answering it would need a TCP
+    /// stack in the packet path, and a dropped SYN hangs the client for its
+    /// whole connect timeout.
     pub async fn handle_tun_query(
         &self,
         pkt: &[u8],
         info: &crate::firewall::PacketInfo,
         tun_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
     ) {
-        if info.protocol != 17 {
-            return; // TCP/other: drop cleanly.
+        if info.protocol == 6 {
+            if let Some(rst) = crate::reject::build_tcp_rst(pkt, info) {
+                let _ = tun_tx.send(rst).await;
+            }
+            return;
         }
-        // UDP payload begins after the IP header + the 8-byte UDP header. IPv4's
-        // header is IHL words long; IPv6's is a fixed 40 bytes (`parse_packet_info`
-        // read the next-header field directly, so there are no extension headers
-        // to walk past here).
-        let ip_header_len = match info.dst_ip {
-            IpAddr::V6(_) => 40,
-            IpAddr::V4(_) => ((pkt.first().copied().unwrap_or(0) & 0x0f) as usize) * 4,
-        };
-        let payload_start = ip_header_len + 8;
+        if info.protocol != 17 {
+            return; // other protocols: drop cleanly.
+        }
+        // UDP payload begins after the UDP header, which starts where the parser
+        // found it (past IPv4 options or any IPv6 extension headers).
+        let payload_start = info.transport_offset + 8;
         let Some(dns_query) = pkt.get(payload_start..) else {
             return;
         };
@@ -254,11 +256,10 @@ impl Resolver {
     }
 
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let tunnel = self.tunnel_upstreams.load_full();
-        let upstreams = match &tunnel {
-            Some(over) => Arc::clone(over),
-            None => self.upstreams.load_full(),
-        };
+        let upstreams = self
+            .tunnel_upstreams
+            .load_full()
+            .unwrap_or_else(|| self.upstreams.load_full());
         if upstreams.is_empty() {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
@@ -428,10 +429,13 @@ async fn probe_query(up: SocketAddr, query: &[u8]) -> bool {
 /// question times out, then the dotted fallback), but the whole set pays that
 /// once, not per entry. Order is preserved: callers treat the first as
 /// preferred.
-pub async fn live_upstreams(candidates: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+pub async fn live_upstreams<A>(candidates: &[A]) -> Vec<A>
+where
+    A: Into<IpAddr> + Copy,
+{
     let probes = candidates
         .iter()
-        .map(|ip| async move { probe_upstream(SocketAddr::from((*ip, 53u16))).await });
+        .map(|ip| async move { probe_upstream(SocketAddr::from(((*ip).into(), 53u16))).await });
     let alive = futures::future::join_all(probes).await;
     candidates
         .iter()
@@ -445,13 +449,7 @@ pub async fn live_upstreams(candidates: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
 /// outstanding query. Editing the header beats decoding and re-encoding: it
 /// can't drop a section we failed to model.
 fn servfail(query: &[u8]) -> Option<Vec<u8>> {
-    if query.len() < 12 {
-        return None;
-    }
-    let mut resp = query.to_vec();
-    resp[2] |= 0x80; // QR: this is a response
-    resp[3] = 0x80 | 2; // RA=1, Z=0, RCODE=2 (server failure)
-    Some(resp)
+    rcode_reply(query, 2) // server failure
 }
 
 /// "Not mine, ask somebody else."
@@ -462,12 +460,18 @@ fn servfail(query: &[u8]) -> Option<Vec<u8>> {
 /// while any of REFUSED/SERVFAIL/NOTIMP makes it try the next nameserver at
 /// once. musl asks every server at once and discards the refusal.
 fn refused(query: &[u8]) -> Option<Vec<u8>> {
+    rcode_reply(query, 5) // refused
+}
+
+/// Turn a query into a response carrying `rcode` by editing the header in
+/// place. `None` for a packet too short to hold a DNS header.
+fn rcode_reply(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
     if query.len() < 12 {
         return None;
     }
     let mut resp = query.to_vec();
     resp[2] |= 0x80; // QR: this is a response
-    resp[3] = 0x80 | 5; // RA=1, Z=0, RCODE=5 (refused)
+    resp[3] = 0x80 | rcode; // RA=1, Z=0, RCODE
     Some(resp)
 }
 
@@ -633,6 +637,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let query_pkt = crate::dns::packet::build_udp_reply(
             &crate::firewall::PacketInfo {
@@ -674,9 +679,12 @@ mod tests {
             tcp_flags: 0x02,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 20,
         };
+        // An IPv4 segment cannot be reset from the v6-only resolver, so it gets
+        // nothing (an IPv6 SYN gets a reset, see `reject::build_tcp_rst`).
         r.handle_tun_query(&[0u8; 40], &info, &tx).await;
-        assert!(rx.try_recv().is_err(), "TCP must be dropped, no reply");
+        assert!(rx.try_recv().is_err(), "no reply to an IPv4 TCP segment");
     }
 
     #[tokio::test]
@@ -818,6 +826,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let query_pkt = crate::dns::packet::build_udp_reply(
             &crate::firewall::PacketInfo {
@@ -869,7 +878,7 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert!(live_upstreams(&[]).await.is_empty());
+        assert!(live_upstreams::<Ipv4Addr>(&[]).await.is_empty());
     }
 
     /// #111: with no upstream that answers, a forwarded query must come back
@@ -896,6 +905,7 @@ mod tests {
             tcp_flags: 0,
             icmp_type: 0,
             icmp_id: 0,
+            transport_offset: 40,
         };
         let query_pkt = crate::dns::packet::build_udp_reply(
             &crate::firewall::PacketInfo {

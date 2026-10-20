@@ -72,6 +72,13 @@ pub enum IpcMessage {
     Leave {
         name: String,
     },
+    /// Rename a saved network on this node only (`ray rename`). Like a join
+    /// alias, the name is local: peers and the signed blob keep their own.
+    /// Mutating (root/operator).
+    RenameNetwork {
+        network: String,
+        new_name: String,
+    },
     Nuke {
         name: String,
         force: bool,
@@ -137,6 +144,19 @@ pub enum IpcMessage {
         index: usize,
     },
     FirewallShow,
+    /// `ray firewall test`: how the local firewall would treat a new packet from
+    /// (`In`) or to (`Out`) `peer`, and what decided it. Nothing is sent and no
+    /// conntrack state is recorded. `peer` is resolved like `FirewallAdd`'s, and
+    /// only on `network` when one is given. `port` is `None` for ICMP. Open
+    /// read, like `FirewallShow`.
+    FirewallTest {
+        peer: String,
+        direction: Direction,
+        protocol: Protocol,
+        port: Option<u16>,
+        #[serde(default)]
+        network: Option<String>,
+    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -387,6 +407,24 @@ pub enum IpcMessage {
         #[serde(default)]
         reusable: bool,
     },
+    /// Deliver an invite privately to `recipient` for a network this node
+    /// coordinates (`ray apply --invite-missing`). Queued while unreachable.
+    InviteDeliver {
+        network: NetworkName,
+        recipient: EndpointId,
+    },
+    /// `ray invitations`: received private invitations, metadata only. Open
+    /// read.
+    Invitations,
+    /// `ray invitations accept <id>`: join the invitation's network.
+    InvitationAccept {
+        id: String,
+        hostname: Option<MachineHostname>,
+    },
+    /// `ray invitations decline <id>`: refuse it and block the sender.
+    InvitationDecline {
+        id: String,
+    },
     /// List invites for a network (coordinator-only).
     InviteList {
         network: String,
@@ -421,11 +459,11 @@ pub enum IpcMessage {
     AdminList {
         network: String,
     },
-    /// `ray connect <contact-id>`: request a direct 2-peer connection by the
-    /// recipient's contact id. Resolves the contact id to an endpoint, dials the
-    /// connect ALPN, and waits (recipient-only approval).
+    /// `ray connect <identity>`: request a direct 2-peer connection. Dials the
+    /// identity (or a LAN sighting) on the connect ALPN and waits for the
+    /// recipient's approval.
     Connect {
-        contact_id: String,
+        peer: String,
         hostname: Option<String>,
     },
     /// `ray connections`: list pending incoming connect requests. Open read.
@@ -435,19 +473,15 @@ pub enum IpcMessage {
     ApproveConnection {
         id: String,
     },
+    /// `ray connect deny <id>`: drop a pending connect request and block the
+    /// requester on the connect channel.
+    ConnectDeny {
+        id: String,
+    },
     /// `ray mdns scan`: list rayfish nodes seen on the LAN over mDNS. A sighting
     /// is not a relationship, so this is an open read.
     /// Reply: [`IpcMessage::LanPeersList`].
     ListLanPeers,
-    /// `ray contact id`: print this node's contact id. Open read.
-    ContactId,
-    /// Resolve a contact's signed record without dialing the peer. Open read.
-    ResolveContact {
-        contact_id: EndpointId,
-    },
-    /// `ray contact rotate`: rotate this node's contact key (old id stops
-    /// resolving once its pkarr record expires).
-    RotateContact,
     /// `ray ping <peer>`: active liveness probe. Resolves `peer`, sends `count`
     /// echo probes over the mesh connection, and returns per-probe RTTs. Open
     /// read, like `Status`.
@@ -541,10 +575,10 @@ pub enum IpcMessage {
         auto_update: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
-        /// This node's contact id (`ray connect`), shown at the top of status.
-        /// `None` if the daemon has not generated one yet.
+        /// What to share for `ray connect`: the paired user identity, or this
+        /// endpoint when unpaired. `None` from daemons that predate it.
         #[serde(default)]
-        contact_id: Option<String>,
+        identity: Option<EndpointId>,
         /// The running daemon's compiled version (`CARGO_PKG_VERSION`). The CLI
         /// compares it to its own version and hints `ray update` on a mismatch
         /// — e.g. after a self-update where the daemon never restarted onto the
@@ -630,6 +664,33 @@ pub enum IpcMessage {
         #[serde(default)]
         disabled: bool,
         rules: Vec<FirewallRuleView>,
+    },
+    /// Reply to `FirewallTest`.
+    FirewallTestResult {
+        /// The peer's hostname, or its short id when it has none.
+        peer_name: String,
+        /// The identity the rules were matched against, as a short id: inbound,
+        /// a paired device's user identity; outbound, the device itself.
+        identity: String,
+        action: Action,
+        /// The rule that decided, with its index in `FirewallState::rules` (its
+        /// `ray firewall show` number). `None` when a default decided, or the
+        /// firewall is off.
+        rule_index: Option<usize>,
+        rule: Option<FirewallRuleView>,
+        /// The firewall is off (`ray firewall off`): every packet passes.
+        disabled: bool,
+        /// Denied with REJECT mode on: answered instead of dropped.
+        reject: bool,
+        /// Denied by the inbound default, which still admits return traffic of
+        /// a connection this device opened.
+        return_traffic: bool,
+        /// Networks this node shares with the peer, the ones a network-scoped
+        /// rule can match on.
+        networks: Vec<String>,
+        /// Whether the peer is connected. When it is not, `networks` comes from
+        /// the rosters: the networks it would share on connecting.
+        connected: bool,
     },
     /// Current suggested firewall rules for a network (reply to
     /// `FirewallSuggestions`).
@@ -728,6 +789,10 @@ pub enum IpcMessage {
         id: String,
         expires_secs: u64,
     },
+    /// Received private invitations (reply to `Invitations`).
+    InvitationsResponse {
+        invitations: Vec<InvitationInfo>,
+    },
     /// The list of invites for a network.
     InviteListResponse {
         invites: Vec<InviteInfo>,
@@ -740,14 +805,6 @@ pub enum IpcMessage {
     /// plus every identity it has granted the key to.
     AdminListResponse {
         admins: Vec<AdminInfo>,
-    },
-    /// This node's contact id (reply to `ContactId`/`RotateContact`).
-    ContactIdResponse {
-        contact_id: String,
-    },
-    /// The device endpoint advertised by a contact, not its paired user identity.
-    ContactResolved {
-        endpoint_id: EndpointId,
     },
     /// Reply to `ConfigGet`: `(key, value)` rows as `config::config_get` renders.
     ConfigValues {
@@ -883,8 +940,9 @@ pub struct MachineEnrollmentInfo {
 }
 
 /// Lifecycle state of a controller ticket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum MachineEnrollmentStatus {
     /// Valid and unused.
     Pending,
@@ -924,8 +982,9 @@ pub struct ManagedMachineInfo {
 }
 
 /// Reachability and authorization state of an enrolled machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ManagedMachineState {
     /// The machine responded and authorized this controller.
     Online,
@@ -935,18 +994,6 @@ pub enum ManagedMachineState {
     Unauthorized,
     /// The machine was not probed.
     Unknown,
-}
-
-impl ManagedMachineState {
-    /// Returns the protocol name of this state.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Online => "online",
-            Self::Offline => "offline",
-            Self::Unauthorized => "unauthorized",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 /// Whole seconds since the Unix epoch.
@@ -1047,22 +1094,67 @@ impl fmt::Display for InvalidMachineHostname {
 
 impl std::error::Error for InvalidMachineHostname {}
 
+/// The shared surface of a free-form string newtype: `new`, `AsRef<str>`,
+/// `Display` and an infallible `FromStr`.
+macro_rules! string_newtype {
+    ($name:ident, $new_doc:literal) => {
+        impl $name {
+            #[doc = $new_doc]
+            pub fn new(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = Infallible;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Ok(Self::new(value.to_string()))
+            }
+        }
+    };
+}
+
 /// Network name carried across the IPC and management protocols.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NetworkName(String);
 
-impl NetworkName {
-    /// Wraps a network name.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
+string_newtype!(NetworkName, "Wraps a network name.");
+
+/// Where a received invitation stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Declined,
 }
 
-impl AsRef<str> for NetworkName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
+/// A received invitation, metadata only: its code never crosses IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationInfo {
+    pub id: String,
+    /// The sender's label for the network.
+    pub network: NetworkName,
+    /// The coordinator that sent it (authenticated).
+    pub coordinator: EndpointId,
+    /// Unix seconds it arrived.
+    pub received: u64,
+    pub status: InvitationStatus,
 }
 
 impl From<NetworkName> for String {
@@ -1071,83 +1163,25 @@ impl From<NetworkName> for String {
     }
 }
 
-impl fmt::Display for NetworkName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for NetworkName {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
-
 /// Short identifier for a stored enrollment credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EnrollmentCredentialId(String);
 
-impl EnrollmentCredentialId {
-    /// Wraps an enrollment credential identifier.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for EnrollmentCredentialId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnrollmentCredentialId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for EnrollmentCredentialId {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(
+    EnrollmentCredentialId,
+    "Wraps an enrollment credential identifier."
+);
 
 /// Full or prefix selector for an enrollment credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EnrollmentCredentialSelector(String);
 
-impl EnrollmentCredentialSelector {
-    /// Wraps an enrollment credential selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for EnrollmentCredentialSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnrollmentCredentialSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for EnrollmentCredentialSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(
+    EnrollmentCredentialSelector,
+    "Wraps an enrollment credential selector."
+);
 
 /// Shareable capability for enrolling a machine with a controller.
 ///
@@ -1247,36 +1281,11 @@ impl<'de> Deserialize<'de> for EnrollmentTicket {
 #[serde(transparent)]
 pub struct ManagedMachineSelector(String);
 
-impl ManagedMachineSelector {
-    /// Wraps a managed-machine selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
+string_newtype!(ManagedMachineSelector, "Wraps a managed-machine selector.");
 
 impl From<EndpointId> for ManagedMachineSelector {
     fn from(identity: EndpointId) -> Self {
         Self(identity.to_string())
-    }
-}
-
-impl AsRef<str> for ManagedMachineSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedMachineSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for ManagedMachineSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
     }
 }
 
@@ -1285,32 +1294,7 @@ impl FromStr for ManagedMachineSelector {
 #[serde(transparent)]
 pub struct ControllerSelector(String);
 
-impl ControllerSelector {
-    /// Wraps a controller selector.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<str> for ControllerSelector {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ControllerSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for ControllerSelector {
-    type Err = Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value.to_string()))
-    }
-}
+string_newtype!(ControllerSelector, "Wraps a controller selector.");
 
 /// One roster row a pending kick would remove (reply to an unconfirmed
 /// [`IpcMessage::Kick`]).
@@ -1494,17 +1478,15 @@ pub struct NetworkStatus {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, derive_more::IsVariant, derive_more::Display,
+    Debug, Clone, PartialEq, Serialize, Deserialize, derive_more::IsVariant, strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum NetworkRole {
-    #[display("coordinator")]
     Coordinator,
-    #[display("member")]
     Member,
     /// An auto-minted 2-peer direct connection (`ray connect`). Display-only: the
     /// node is structurally still the coordinator or a member, but `ray status`
     /// surfaces these as `direct` and hides the (non-shareable) room id.
-    #[display("direct")]
     Direct,
 }
 
@@ -1565,19 +1547,17 @@ pub struct PeerStatus {
     Serialize,
     Deserialize,
     derive_more::IsVariant,
-    derive_more::Display,
+    strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum PeerState {
     /// A live mesh connection to the peer exists right now.
-    #[display("active")]
     Active,
     /// No live connection, but no failed reach either: presumed reachable (dialed
     /// lazily on demand). The optimistic default for a freshly booted node.
     #[default]
-    #[display("idle")]
     Idle,
     /// A recent reach attempt failed and wasn't cleared by a later success.
-    #[display("offline")]
     Offline,
 }
 
@@ -1607,15 +1587,13 @@ pub struct ConnectionInfo {
     Serialize,
     Deserialize,
     derive_more::IsVariant,
-    derive_more::Display,
+    strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum ConnectionQuality {
     #[default]
-    #[display("good")]
     Good,
-    #[display("degraded")]
     Degraded,
-    #[display("congested")]
     Congested,
 }
 
@@ -1628,35 +1606,25 @@ pub enum ConnectionQuality {
     Serialize,
     Deserialize,
     derive_more::IsVariant,
-    derive_more::Display,
+    strum::Display,
 )]
 pub enum ConnectionIssue {
-    #[display("high latency")]
+    #[strum(to_string = "high latency")]
     HighLatency,
-    #[display("packet loss")]
+    #[strum(to_string = "packet loss")]
     PacketLoss,
-    #[display("send queue full")]
+    #[strum(to_string = "send queue full")]
     SendQueue,
 }
 
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    derive_more::IsVariant,
-    derive_more::Display,
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant, strum::Display,
 )]
+#[strum(serialize_all = "lowercase")]
 pub enum ConnType {
-    #[display("direct")]
     Direct,
-    #[display("relay")]
     Relay,
-    #[display("tor")]
     Tor,
-    #[display("unknown")]
     Unknown,
 }
 
@@ -2041,6 +2009,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn status_enums_display_their_status_words() {
+        assert_eq!(NetworkRole::Coordinator.to_string(), "coordinator");
+        assert_eq!(PeerState::Offline.to_string(), "offline");
+        assert_eq!(ConnectionQuality::Degraded.to_string(), "degraded");
+        assert_eq!(ConnType::Relay.to_string(), "relay");
+        assert_eq!(ConnectionIssue::SendQueue.to_string(), "send queue full");
+    }
+
+    #[test]
+    fn management_state_names_match_their_serde_names() {
+        for status in [
+            MachineEnrollmentStatus::Pending,
+            MachineEnrollmentStatus::Used,
+            MachineEnrollmentStatus::Expired,
+            MachineEnrollmentStatus::Revoked,
+        ] {
+            let bytes = rmp_serde::to_vec(&status).expect("a unit variant serializes");
+            let serde_name: String =
+                rmp_serde::from_slice(&bytes).expect("a unit variant is a string");
+            assert_eq!(serde_name, <&str>::from(status));
+        }
+        for state in [
+            ManagedMachineState::Online,
+            ManagedMachineState::Offline,
+            ManagedMachineState::Unauthorized,
+            ManagedMachineState::Unknown,
+        ] {
+            let bytes = rmp_serde::to_vec(&state).expect("a unit variant serializes");
+            let serde_name: String =
+                rmp_serde::from_slice(&bytes).expect("a unit variant is a string");
+            assert_eq!(serde_name, <&str>::from(state));
+        }
+    }
+
+    #[test]
     fn test_request_roundtrip() {
         let req = IpcMessage::Create {
             mode: GroupMode::Open,
@@ -2325,6 +2328,62 @@ mod tests {
     }
 
     #[test]
+    fn firewall_test_roundtrips() {
+        for msg in [
+            IpcMessage::FirewallTest {
+                peer: "laptop".into(),
+                direction: Direction::In,
+                protocol: Protocol::Tcp,
+                port: Some(22),
+                network: Some("home".into()),
+            },
+            IpcMessage::FirewallTest {
+                peer: "laptop".into(),
+                direction: Direction::Out,
+                protocol: Protocol::Icmp,
+                port: None,
+                network: None,
+            },
+            IpcMessage::FirewallTestResult {
+                peer_name: "laptop".into(),
+                identity: "k3x9f2a1b0".into(),
+                action: Action::Allow,
+                rule_index: Some(2),
+                rule: Some(FirewallRuleView {
+                    direction: Direction::In,
+                    action: Action::Allow,
+                    protocol: Protocol::Tcp,
+                    port: "22".into(),
+                    peer: "any".into(),
+                    network: "home".into(),
+                    suggested_by: Some("home".into()),
+                }),
+                disabled: false,
+                reject: false,
+                return_traffic: false,
+                networks: vec!["home".into()],
+                connected: true,
+            },
+            IpcMessage::FirewallTestResult {
+                peer_name: "laptop".into(),
+                identity: "k3x9f2a1b0".into(),
+                action: Action::Deny,
+                rule_index: None,
+                rule: None,
+                disabled: false,
+                reject: true,
+                return_traffic: true,
+                networks: vec![],
+                connected: false,
+            },
+        ] {
+            let bytes = rmp_serde::to_vec_named(&msg).unwrap();
+            let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
+        }
+    }
+
+    #[test]
     fn test_response_roundtrip() {
         let key = iroh::SecretKey::generate().public();
         let resp = IpcMessage::Created {
@@ -2549,17 +2608,14 @@ mod tests {
     #[test]
     fn test_connect_roundtrip() {
         let req = IpcMessage::Connect {
-            contact_id: "contactabc".to_string(),
+            peer: "peerabc".to_string(),
             hostname: Some("laptop".to_string()),
         };
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcMessage::Connect {
-                contact_id,
-                hostname,
-            } => {
-                assert_eq!(contact_id, "contactabc");
+            IpcMessage::Connect { peer, hostname } => {
+                assert_eq!(peer, "peerabc");
                 assert_eq!(hostname.as_deref(), Some("laptop"));
             }
             _ => panic!("wrong variant"),
@@ -2613,35 +2669,6 @@ mod tests {
     }
 
     #[test]
-    fn test_contact_id_response_roundtrip() {
-        let resp = IpcMessage::ContactIdResponse {
-            contact_id: "abc123".to_string(),
-        };
-        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
-        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
-        match decoded {
-            IpcMessage::ContactIdResponse { contact_id } => assert_eq!(contact_id, "abc123"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn contact_lookup_roundtrip() {
-        let contact_id = iroh::SecretKey::from([7; 32]).public();
-        let endpoint_id = iroh::SecretKey::from([8; 32]).public();
-        let bytes = rmp_serde::to_vec_named(&IpcMessage::ResolveContact { contact_id }).unwrap();
-        assert!(matches!(
-            rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap(),
-            IpcMessage::ResolveContact { contact_id: decoded } if decoded == contact_id
-        ));
-        let bytes = rmp_serde::to_vec_named(&IpcMessage::ContactResolved { endpoint_id }).unwrap();
-        assert!(matches!(
-            rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap(),
-            IpcMessage::ContactResolved { endpoint_id: decoded } if decoded == endpoint_id
-        ));
-    }
-
-    #[test]
     fn test_status_response_roundtrip() {
         let ep_id = iroh::SecretKey::generate().public();
         let peer_id = iroh::SecretKey::generate().public();
@@ -2650,7 +2677,7 @@ mod tests {
             mdns_enabled: true,
             auto_update: false,
             active: true,
-            contact_id: Some("contact123".to_string()),
+            identity: Some(ep_id),
             daemon_version: "0.1.0".to_string(),
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),

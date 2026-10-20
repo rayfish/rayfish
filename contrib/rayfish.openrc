@@ -20,5 +20,10 @@ respawn_max=0
 
 depend() {
 	need net
-	after firewall
+	after firewall NetworkManager
+}
+
+# Undo DNS and exit-node changes when the daemon died without its own teardown.
+stop_post() {
+	"$command" daemon --cleanup
 }

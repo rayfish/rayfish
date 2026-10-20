@@ -375,11 +375,11 @@
           <div class="spacer"></div>
           <button id="connectPeerBtn" class="small primary">Connect to a peer</button>
         </div>
-        <div id="contactCard" class="card summary-card" hidden>
-          <span class="label">Your contact ID</span>
-          <span id="contactId" class="value"></span>
+        <div id="identityCard" class="card summary-card" hidden>
+          <span class="label">Your identity</span>
+          <span id="identityId" class="value"></span>
           <span class="spacer"></span>
-          <button id="copyContact" class="small">Copy</button>
+          <button id="copyIdentity" class="small">Copy</button>
         </div>
       </section>
       <section id="connectionSection" hidden>
@@ -543,8 +543,8 @@
   <dialog id="connectDlg">
     <h3>Connect to a peer</h3>
     <form id="connectForm" method="dialog">
-      <p class="dlg-note">Paste their contact ID. They must approve the request before a private network is created.</p>
-      <label>Contact ID or nearby peer ID<input id="connectId" required autocomplete="off"></label>
+      <p class="dlg-note">Paste their identity. They must approve the request before a private network is created.</p>
+      <label>Identity or nearby peer ID<input id="connectId" required autocomplete="off"></label>
       <label>This PC's name <span>(optional)</span><input id="connectHost" autocomplete="off"></label>
       <div class="dlg-actions">
         <button type="button" data-close>Cancel</button>
@@ -587,13 +587,13 @@
     const templates = [
       "status", "netcheck", "ping <peer> -c 3", "invite <network> --reusable",
       "invite <network> list", "invite <network> revoke <id>", "ephemeral <network> 7d",
-      "kick <network> <peer>", "hostname <network> <new-name>",
+      "kick <network> <peer>", "hostname <network> <new-name>", "rename <network> <new-name>",
       "firewall show", "firewall add in allow -p tcp --port 22", "firewall remove <index>",
       "firewall reject on", "firewall off", "firewall pending <network>", "firewall accept <network>",
       "firewall suggest <network> --subject '*' --allow tcp:22", "firewall auto-accept <network> on",
       "firewall ssh on", "firewall ssh allow <network> <peer>",
       "send <file> <peer>", "files accept <id>", "files auto-accept <network> on", "files download-dir <dir>",
-      "connect <contact-id>", "connect approve <id>", "contact id", "contact rotate",
+      "connect <identity>", "connect approve <id>",
       "pair", "pair accept <ticket>", "pair list", "pair backup", "unpair <device>",
       "alias <network> set <host> <alias>", "identityof <peer>",
       "exit-node allow", "exit-node use <peer>", "exit-node none",
@@ -834,9 +834,9 @@
     }
 
     function renderDevices(data) {
-      const contactId = data.contact_id || "";
-      $("contactCard").hidden = !contactId;
-      $("contactId").textContent = contactId;
+      const identity = data.identity || "";
+      $("identityCard").hidden = !identity;
+      $("identityId").textContent = identity;
 
       const machines = Array.isArray(data.managed_machines) ? data.managed_machines : [];
       $("managedSection").hidden = false;
@@ -1064,7 +1064,7 @@
     $("createBtn").onclick = () => $("createDlg").showModal();
     $("joinBtn").onclick = () => $("joinDlg").showModal();
     $("connectPeerBtn").onclick = () => $("connectDlg").showModal();
-    $("copyContact").onclick = () => copyText($("contactId").textContent).then(() => toast("contact ID copied"));
+    $("copyIdentity").onclick = () => copyText($("identityId").textContent).then(() => toast("identity copied"));
     $("refreshMachines").onclick = () => refresh();
     $("refreshFirewall").onclick = () => refreshFirewall();
     $("addFirewallRule").onclick = () => $("firewallRuleDlg").showModal();

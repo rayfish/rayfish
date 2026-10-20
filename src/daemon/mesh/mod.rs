@@ -51,3 +51,5 @@ pub use bootstrap::run_daemon;
 pub use bootstrap::build_headless;
 #[cfg(unix)]
 pub use bootstrap::start_embedded_ipc;
+#[cfg(unix)]
+pub use bootstrap::{CleanupOutcome, cleanup_after_exit};

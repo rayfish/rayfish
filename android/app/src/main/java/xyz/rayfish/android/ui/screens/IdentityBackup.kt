@@ -20,6 +20,7 @@ import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.R
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
+import xyz.rayfish.android.ui.userMessage
 
 /**
  * Back up and restore this device's identity, from the You tab.
@@ -145,7 +146,7 @@ fun IdentityBackupCard(status: Status?, onToast: (String) -> Unit, onChanged: ()
                                 pendingCode = backup.code
                                 saveBackup.launch("rayfish-identity-${shortId(backup.publicKey)}.txt")
                             } catch (t: Throwable) {
-                                onToast(context.getString(R.string.error_backup_failed, t.message.orEmpty()))
+                                onToast(context.getString(R.string.error_backup_failed, t.userMessage))
                             } finally {
                                 busy = false
                             }

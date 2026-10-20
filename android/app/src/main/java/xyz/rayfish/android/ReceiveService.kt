@@ -79,10 +79,22 @@ class ReceiveService : Service() {
             // Even a duplicate is the newest command for stopSelf(startId).
             lastStartId = startId
             if (!activeIds.add(offerId)) return START_NOT_STICKY
-            startForegroundNotification(
+            val foreground = startForegroundNotification(
                 if (accepting) getString(R.string.notif_saving_file, filename) else getString(R.string.app_name),
                 if (accepting) getString(R.string.notif_from_peer, peer) else getString(R.string.notif_declining_file, filename),
             )
+            if (!foreground) {
+                // Refused by the system (on Android 15+ usually the dataSync
+                // daily quota). Running the accept as a plain background service
+                // would get it killed mid-download, so fail the offer now and
+                // leave it to the user to retry from the app.
+                activeIds.remove(offerId)
+                acceptingOffers.value = acceptingOffers.value - offerId
+                if (accepting) OfferNotifier.markFailed(applicationContext, offerId)
+                else OfferNotifier.clearActedOn(offerId)
+                if (activeIds.isEmpty()) stopSelf(lastStartId)
+                return START_NOT_STICKY
+            }
         }
 
         // Blocking FFI work off the main thread. The cleanup is not best-effort:
@@ -94,11 +106,8 @@ class ReceiveService : Service() {
                 if (accepting) accept(offerId, filename, peer, size, mime) else reject(offerId, filename)
             } catch (t: Throwable) {
                 Log.e(TAG, "receive action $action for $filename failed", t)
-                // A failed accept still consumed the offer core-side, but a failed
-                // reject did not: let the next poll put the notification back
-                // rather than suppressing an offer that is still sitting there
-                // with no way left to answer it.
-                OfferNotifier.clearActedOn(offerId)
+                if (accepting) OfferNotifier.markFailed(applicationContext, offerId)
+                else OfferNotifier.clearActedOn(offerId)
             } finally {
                 // Only the last one out tears anything down. startForeground and
                 // stopForeground are service-wide, not per start command, so a
@@ -161,7 +170,22 @@ class ReceiveService : Service() {
         Log.i(TAG, "rejected offer for $filename")
     }
 
-    private fun startForegroundNotification(title: String, text: String) {
+    /** Called on Android 15+ when the dataSync time limit runs out while this
+     * service is foreground. The service must stop within a few seconds or the
+     * system crashes the app. A running accept keeps going on its own thread,
+     * and its `finally` still clears the bookkeeping. */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w(TAG, "foreground time limit reached, stopping")
+        synchronized(lifecycle) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    /** False when the system refuses to let the service go foreground. That
+     * throws ForegroundServiceStartNotAllowedException, an IllegalStateException
+     * caught by its base type because the class only exists from API 31. */
+    private fun startForegroundNotification(title: String, text: String): Boolean {
         TransferNotifier.ensureChannel(this)
         val notification = Notification.Builder(this, TransferNotifier.CHANNEL_ID)
             .setContentTitle(title)
@@ -169,10 +193,16 @@ class ReceiveService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ONGOING, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(NOTIF_ONGOING, notification)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ONGOING, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(NOTIF_ONGOING, notification)
+            }
+            true
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "could not go foreground", e)
+            false
         }
     }
 
