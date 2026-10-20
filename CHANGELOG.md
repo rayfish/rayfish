@@ -22,8 +22,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - While an exit node is selected, the LAN, Docker networks and other VPNs stay
   reachable directly, and SSH sessions to the client's own address keep
   working. Only new connections to the internet outside the tunnel are
-  blocked. If the client's IPv4 tunnel address conflicts with a local route,
-  the exit carries IPv6 only instead of failing.
+  blocked.
+
+### Security
+
+- An exit node no longer forwards unsolicited inbound connections from the
+  internet to the clients using it, and clients drop them too.
 
 ## [0.5.10] - 2026-10-19
 

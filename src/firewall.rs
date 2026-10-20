@@ -360,6 +360,24 @@ struct Flow {
     icmp_id: u16,
 }
 
+impl Flow {
+    /// The flow `info` belongs to, seen from this host in `direction`.
+    fn of(direction: Direction, info: &PacketInfo) -> Self {
+        let (local_ip, local_port, peer_ip, peer_port) = match direction {
+            Direction::Out => (info.src_ip, info.src_port, info.dst_ip, info.dst_port),
+            Direction::In => (info.dst_ip, info.dst_port, info.src_ip, info.src_port),
+        };
+        Self {
+            proto: info.protocol,
+            local_ip,
+            local_port,
+            peer_ip,
+            peer_port,
+            icmp_id: info.icmp_id,
+        }
+    }
+}
+
 /// What decided a [`Verdict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecidedBy {
@@ -505,18 +523,7 @@ impl SharedFirewall {
             return Action::Allow;
         }
         let proto = info.protocol;
-        let (local_ip, local_port, peer_ip, peer_port) = match direction {
-            Direction::Out => (info.src_ip, info.src_port, info.dst_ip, info.dst_port),
-            Direction::In => (info.dst_ip, info.dst_port, info.src_ip, info.src_port),
-        };
-        let flow = Flow {
-            proto,
-            local_ip,
-            local_port,
-            peer_ip,
-            peer_port,
-            icmp_id: info.icmp_id,
-        };
+        let flow = Flow::of(direction, info);
 
         // 1. Explicit rules always win.
         if let Some((_, rule)) = Self::match_rule(
@@ -554,13 +561,30 @@ impl SharedFirewall {
                 // the rules/default. Without this, a request and reply share a
                 // flow (ICMP has no ports) and a recent outbound ping would
                 // wrongly whitelist the peer's inbound pings.
-                if conntrack_eligible(info) && self.flow_active(&flow) {
-                    self.conntrack.insert(flow, Instant::now());
+                if self.rescue_reply(flow, info) {
                     Action::Allow
                 } else {
                     Self::default_for(&config, Direction::In)
                 }
             }
+        }
+    }
+
+    /// Whether an inbound packet answers a flow this host opened. Exit-node
+    /// replies come from internet hosts no rule names, so they are admitted on
+    /// conntrack alone: an allow rule for the gateway peer must not let a flow
+    /// started on the gateway's side reach a local port.
+    pub fn admits_reply(&self, info: &PacketInfo) -> bool {
+        self.inner.load().disabled || self.rescue_reply(Flow::of(Direction::In, info), info)
+    }
+
+    /// Whether an inbound `flow` answers one we opened, refreshing it if so.
+    fn rescue_reply(&self, flow: Flow, info: &PacketInfo) -> bool {
+        if conntrack_eligible(info) && self.flow_active(&flow) {
+            self.conntrack.insert(flow, Instant::now());
+            true
+        } else {
+            false
         }
     }
 

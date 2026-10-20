@@ -42,7 +42,7 @@ struct Cleanup {
 }
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        teardown_client_routing();
+        teardown_client_routing(None);
         disable();
         let _ = self.echo.kill();
         let _ = self.echo.wait();
@@ -278,7 +278,7 @@ while True:
     }
     anyhow::ensure!(server.offers_v4(), "IPv4 transit restored");
 
-    teardown_client_routing();
+    teardown_client_routing(Some(&client_name));
     disable();
     let direct = UdpSocket::bind("0.0.0.0:0").await?;
     direct.send_to(b"direct", "8.8.8.8:9000").await?;

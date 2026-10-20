@@ -97,8 +97,8 @@ fn install_filter(tun: &str) -> Result<()> {
     // after the uplink changed blocks the new one.
     let mut uplinks: Vec<String> = Vec::new();
     for (family, af, prefix, destination) in [
-        ("-inet", "inet", ipv4::SERVER_PREFIX, "any"),
-        ("-inet6", "inet6", V6_OVERLAY, "! 200::/7"),
+        ("-inet", "inet", ipv4::SERVER_PREFIX, "any".to_owned()),
+        ("-inet6", "inet6", V6_OVERLAY, format!("! {V6_OVERLAY}")),
     ] {
         if let Some(route) = pf::physical_default_route(family) {
             rules.push_str(&format!("pass in quick on {tun} route-to ({} {}) {af} from {prefix} to {destination} tag RAYFISH_TRANSIT keep state\n", route.interface, route.gateway));

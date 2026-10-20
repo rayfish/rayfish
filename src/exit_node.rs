@@ -555,8 +555,16 @@ impl ExitServer {
             self.v6_uplink.store(has_v6_uplink(), Ordering::Relaxed);
             self.v4_uplink.store(has_v4_uplink(), Ordering::Relaxed);
             let enabled = crate::config::config_dir().and_then(|dir| {
-                self.ipv4.initialize(dir.join("exit-ipv4-leases.json"))?;
-                enable(tun_name, self.v4_uplink.load(Ordering::Relaxed))
+                // A lease file we cannot read costs IPv4 transit, not the
+                // gateway: IPv6 needs no leases.
+                let leases = self.ipv4.initialize(dir.join("exit-ipv4-leases.json"));
+                if let Err(error) = &leases {
+                    tracing::warn!(%error, "IPv4 exit leases unavailable; IPv4 transit is off");
+                }
+                enable(
+                    tun_name,
+                    leases.is_ok() && self.v4_uplink.load(Ordering::Relaxed),
+                )
             });
             match enabled {
                 Ok(v4_pool) => self.v4_pool.store(v4_pool, Ordering::Relaxed),
@@ -708,7 +716,7 @@ fn has_v6_uplink() -> bool {
 /// Inspect the physical default, excluding our own full-tunnel routes.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn has_v6_uplink() -> bool {
-    default_interface("-inet6").is_some_and(|n| !is_tunnel_iface(&n))
+    default_interface("-inet6").is_some()
 }
 
 /// Whether `name` is a tunnel interface rather than a physical uplink: `utun*` on
@@ -725,7 +733,7 @@ fn has_v4_uplink() -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn has_v4_uplink() -> bool {
-    default_interface("-inet").is_some_and(|n| !is_tunnel_iface(&n))
+    default_interface("-inet").is_some()
 }
 
 /// Client-side exit-node selection: the peer this node routes all its non-mesh
@@ -752,10 +760,9 @@ pub struct ExitSelection {
     /// gateway's claim and our own data plane. Never `Unknown` or `Neither`, since
     /// a selection that carries nothing is refused rather than installed.
     ///
-    /// Held on the selection rather than re-derived at install time because the
-    /// two must not be able to disagree: the routing rules, the socket pin and the
-    /// DNS override are three separate decisions that all have to be made about
-    /// the same tunnel.
+    /// Routing claims both families either way, so a family the tunnel does not
+    /// carry is dropped rather than leaked. This is what the data plane, the DNS
+    /// override and status read, held here so they describe the same tunnel.
     pub carries: ExitFamilies,
 }
 
@@ -881,6 +888,10 @@ const V6_FORWARD: &str = "net.inet6.ip6.forwarding";
 /// Present-but-empty fields mean "we could not read the original, so do not touch
 /// it on the way out". `pf_token` is BSD-only (see [`pf_enable`]).
 ///
+/// `v4` is IPv4 forwarding as it was when we turned it on for the lease pool,
+/// and empty while we have not. It is stored as `v4_set`: older builds wrote a
+/// `v4` they never changed, and restoring that would undo whatever set it since.
+///
 /// `extra` holds further sysctls to put back after `v4`/`v6`, in order: on Linux the
 /// per-interface IPv6 `forwarding` values (writing `all` overwrites every one of
 /// them) and any `accept_ra` we raised. Each is its own `sysctl:<path>=<value>` line,
@@ -927,7 +938,7 @@ impl Snapshot {
             }
             match line.split_once('=') {
                 Some(("tun", v)) => snap.tun_name = Some(v.to_owned()),
-                Some(("v4", v)) => snap.v4 = v.to_string(),
+                Some(("v4_set", v)) => snap.v4 = v.to_string(),
                 Some(("v6", v)) => snap.v6 = v.to_string(),
                 Some(("pf_token", v)) if !v.is_empty() => snap.pf_token = Some(v.to_string()),
                 _ => {}
@@ -937,7 +948,7 @@ impl Snapshot {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        let mut body = format!("v4={}\nv6={}\n", self.v4, self.v6);
+        let mut body = format!("v4_set={}\nv6={}\n", self.v4, self.v6);
         if let Some(tun) = &self.tun_name {
             body.push_str(&format!("tun={tun}\n"));
         }
@@ -948,6 +959,27 @@ impl Snapshot {
             body.push_str(&format!("sysctl:{}={}\n", saved.path, saved.value));
         }
         crate::config::write_file(path, body.as_bytes(), false)
+    }
+
+    /// Turn IPv4 forwarding on for the lease pool, or put back what it was when
+    /// we turned it on. `v4` is saved only at that moment and cleared once
+    /// restored, so a host that never carried IPv4 keeps whatever Docker or
+    /// libvirt set after the snapshot was first taken.
+    fn set_v4_forwarding(&mut self, path: &Path, on: bool) -> Result<()> {
+        if on {
+            if self.v4.is_empty() {
+                self.v4 = read_sysctl(V4_FORWARD);
+                self.save(path)?;
+            }
+            write_sysctl(V4_FORWARD, "1")
+        } else {
+            if !self.v4.is_empty() {
+                let _ = write_sysctl(V4_FORWARD, &self.v4);
+                self.v4.clear();
+                self.save(path)?;
+            }
+            Ok(())
+        }
     }
 
     /// Put the forwarding sysctls back, skipping any we never managed to read.
@@ -999,7 +1031,7 @@ mod pf;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use pf::*;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub use pf::{configure_client_ipv4, disable};
+pub use pf::{add_client_ipv4, disable, remove_client_ipv4};
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) use pf::{pf_load_anchor, pfctl};
 
@@ -1014,7 +1046,7 @@ pub fn disable() {}
 /// pinning lives inside the process. So the panic hook, which calls this on every
 /// platform, has nothing to do here.
 #[cfg(not(target_os = "linux"))]
-pub fn teardown_client_routing() {}
+pub fn teardown_client_routing(_tun_name: Option<&str>) {}
 
 #[cfg(test)]
 mod tests {
@@ -1268,18 +1300,20 @@ mod tests {
     /// gateway that comes up and quietly NATs nothing.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
-    fn nat_rules_masquerade_the_overlay_out_the_v6_uplink_and_claim_no_ipv4() {
+    fn gateway_rules_masquerade_each_uplink_and_admit_only_replies() {
         assert_eq!(
-            nat_rules(Some("en1")),
-            "nat on en1 inet6 from 200::/7 to any -> (en1)\n"
+            pf::gateway_rules("utun9", Some("en0"), Some("en1")),
+            "nat on en0 inet from 198.19.0.0/16 to any -> (en0)\n\
+             nat on en1 inet6 from 200::/7 to any -> (en1)\n\
+             block drop in quick on ! utun9 inet to 198.19.0.0/16\n\
+             block drop in quick on ! utun9 inet6 to 200::/7\n"
         );
-        // `nat on <uplink> inet` matches on the uplink, not our TUN, so an IPv4 half
-        // could only ever catch a co-resident VPN's traffic. There must not be one.
-        assert!(!nat_rules(Some("en1")).contains("100.64.0.0/10"));
-        assert!(!nat_rules(Some("en1")).contains(" inet from"));
-        // No IPv6 uplink is nothing to masquerade, not an error: the offer stands
-        // and the client refuses it by name.
-        assert_eq!(nat_rules(None), "");
+        // No uplink is nothing to masquerade, not an error. The blocks stay.
+        assert_eq!(
+            pf::gateway_rules("utun9", None, None),
+            "block drop in quick on ! utun9 inet to 198.19.0.0/16\n\
+             block drop in quick on ! utun9 inet6 to 200::/7\n"
+        );
     }
 
     /// A gateway's own IPv6 LAN is a *global* prefix, which is exactly why
@@ -1568,7 +1602,16 @@ unreachable default metric 4294967295 table 29793
                 "{rules}"
             );
         }
-        assert!(!rules.contains(" drop"), "{rules}");
+        // The only drops are new inbound flows to clients; transit is untouched.
+        let drops: Vec<_> = rules.lines().filter(|l| l.contains(" drop")).collect();
+        assert_eq!(drops.len(), 2, "{rules}");
+        assert!(
+            drops.iter().all(|l| l
+                .trim()
+                .starts_with("iifname != \"tun-rayfish\" oifname \"tun-rayfish\"")
+                && l.ends_with("ct direction original drop")),
+            "{rules}"
+        );
         assert!(!rules.contains("rt mtu"), "{rules}");
     }
 
@@ -1627,7 +1670,7 @@ unreachable default metric 4294967295 table 29793
     }
 
     /// The snapshot keeps its extra sysctls in order and still reads a file an
-    /// older build wrote, which has none.
+    /// older build wrote, which has none and whose `v4` rayfish never set.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_snapshot_round_trips_extra_sysctls_and_reads_old_files() {
@@ -1635,7 +1678,7 @@ unreachable default metric 4294967295 table 29793
         let path = dir.path().join("exit-forward.snapshot");
         fs::write(&path, "v4=0\nv6=0\n").unwrap();
         let old = Snapshot::load(&path);
-        assert_eq!((old.v4.as_str(), old.v6.as_str()), ("0", "0"));
+        assert_eq!((old.v4.as_str(), old.v6.as_str()), ("", "0"));
         assert!(old.extra.is_empty());
 
         let saved = |path: &str, value: &str| SavedSysctl {
@@ -1655,7 +1698,7 @@ unreachable default metric 4294967295 table 29793
         snap.save(&path).unwrap();
         let back = Snapshot::load(&path);
         assert_eq!(back.extra, snap.extra);
-        assert_eq!(back.v6, "0");
+        assert_eq!((back.v4.as_str(), back.v6.as_str()), ("0", "0"));
     }
 
     /// The Linux twin of the above, and the same argument: `nft_load` never runs in

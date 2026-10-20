@@ -61,7 +61,7 @@ pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
         Snapshot::load(&path)
     } else {
         let snap = Snapshot {
-            v4: read_sysctl(V4_FORWARD),
+            v4: String::new(),
             v6: read_sysctl(V6_FORWARD),
             pf_token: None,
             tun_name: Some(tun_name.to_owned()),
@@ -71,7 +71,7 @@ pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
         snap
     };
     let v4_pool = v4_uplink
-        && match ensure_ipv4_space(tun_name, ipv4::AddressSpace::Gateway) {
+        && match ensure_ipv4_space(tun_name) {
             Ok(()) => {
                 bsd_route_pool(tun_name, true)?;
                 true
@@ -81,14 +81,12 @@ pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
                 false
             }
         };
-    if v4_pool {
-        write_sysctl(V4_FORWARD, "1")?;
-    } else {
+    if !v4_pool {
         let _ = bsd_route_pool(tun_name, false);
-        if !snap.v4.is_empty() {
-            let _ = write_sysctl(V4_FORWARD, &snap.v4);
-        }
     }
+    // A re-apply after the pool lost its route or the uplink went away puts
+    // back whatever this host had before we first turned it on.
+    snap.set_v4_forwarding(&path, v4_pool)?;
     write_sysctl(V6_FORWARD, "1")?;
 
     // Enable pf before loading the anchor (an unloaded ruleset has no anchors to
@@ -106,17 +104,20 @@ pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
     let v6 = default_interface("-inet6");
     pf_load_anchor(
         ANCHOR,
-        &nat_rules_for_uplinks(default_interface("-inet").as_deref(), v6.as_deref()),
+        &gateway_rules(
+            tun_name,
+            default_interface("-inet").as_deref(),
+            v6.as_deref(),
+        ),
     )?;
     tracing::info!(v6 = ?v6, v4_pool, "exit node forwarding + NAT enabled");
     Ok(v4_pool)
 }
 
-/// IPv6 NAT uses the current address of the physical uplink.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(super) fn nat_rules(v6: Option<&str>) -> String {
-    match v6 {
-        Some(iface) => format!("nat on {iface} inet6 from {V6_OVERLAY} to any -> ({iface})\n"),
+/// NAT for one family, using the current address of its physical uplink.
+fn nat_rules(uplink: Option<&str>, af: &str, prefix: &str) -> String {
+    match uplink {
+        Some(iface) => format!("nat on {iface} {af} from {prefix} to any -> ({iface})\n"),
         None => String::new(),
     }
 }
@@ -359,15 +360,18 @@ pub(super) fn write_sysctl(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn nat_rules_for_uplinks(v4: Option<&str>, v6: Option<&str>) -> String {
-    let mut rules = String::new();
-    if let Some(iface) = v4 {
+/// The gateway's NAT, and a filter that admits traffic to the lease pool and
+/// the overlay only as replies. The pool route makes every lease reachable from
+/// the uplink's segment; pf passes packets that match a NAT state before reading the block,
+/// so only a flow someone else starts towards a client is refused.
+pub(super) fn gateway_rules(tun: &str, v4: Option<&str>, v6: Option<&str>) -> String {
+    let mut rules = nat_rules(v4, "inet", ipv4::SERVER_PREFIX);
+    rules.push_str(&nat_rules(v6, "inet6", V6_OVERLAY));
+    for (af, prefix) in [("inet", ipv4::SERVER_PREFIX), ("inet6", V6_OVERLAY)] {
         rules.push_str(&format!(
-            "nat on {iface} inet from {} to any -> ({iface})\n",
-            ipv4::SERVER_PREFIX
+            "block drop in quick on ! {tun} {af} to {prefix}\n"
         ));
     }
-    rules.push_str(&nat_rules(v6));
     rules
 }
 
@@ -410,54 +414,46 @@ fn bsd_command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn ensure_ipv4_space(tun: &str, space: ipv4::AddressSpace) -> Result<()> {
+fn ensure_ipv4_space(tun: &str) -> Result<()> {
     let output = Command::new("netstat")
         .args(["-rn", "-f", "inet"])
         .output()?;
     anyhow::ensure!(output.status.success(), "cannot read IPv4 routes");
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.contains(&tun) {
-            continue;
-        }
-        if fields
-            .first()
-            .is_some_and(|cidr| ipv4::conflicts_with_route(cidr, space))
-        {
-            anyhow::bail!("IPv4 exit address space overlaps an existing route: {line}");
-        }
+    let routes = String::from_utf8_lossy(&output.stdout);
+    if let Some(line) = ipv4::conflicting_route(&routes, 1, |fields| fields.contains(&tun)) {
+        anyhow::bail!("IPv4 exit address space overlaps an existing route: {line}");
     }
     Ok(())
 }
 
-pub fn configure_client_ipv4(tun: &str, enabled: bool) -> Result<()> {
+/// Give the TUN the client IPv4 address. Idempotent.
+pub fn add_client_ipv4(tun: &str) -> Result<()> {
     let addr = ipv4::CLIENT_ADDR.to_string();
-    if enabled {
-        let existing = Command::new("ifconfig").args([tun, "inet"]).output()?;
-        if existing.status.success()
-            && String::from_utf8_lossy(&existing.stdout)
-                .split_whitespace()
-                .any(|word| word == addr)
-        {
-            return Ok(());
-        }
-        ensure_ipv4_space(tun, ipv4::AddressSpace::Client)?;
-        bsd_command(
-            "ifconfig",
-            &[
-                tun,
-                "inet",
-                &addr,
-                &addr,
-                "netmask",
-                "255.255.255.255",
-                "alias",
-            ],
-        )?;
-    } else {
-        let _ = Command::new("ifconfig")
-            .args([tun, "inet", &addr, "-alias"])
-            .output();
+    let existing = Command::new("ifconfig").args([tun, "inet"]).output()?;
+    if existing.status.success()
+        && String::from_utf8_lossy(&existing.stdout)
+            .split_whitespace()
+            .any(|word| word == addr)
+    {
+        return Ok(());
     }
-    Ok(())
+    bsd_command(
+        "ifconfig",
+        &[
+            tun,
+            "inet",
+            &addr,
+            &addr,
+            "netmask",
+            "255.255.255.255",
+            "alias",
+        ],
+    )
+}
+
+/// Remove the client IPv4 address. Best-effort: it may already be gone.
+pub fn remove_client_ipv4(tun: &str) {
+    let _ = Command::new("ifconfig")
+        .args([tun, "inet", &ipv4::CLIENT_ADDR.to_string(), "-alias"])
+        .output();
 }

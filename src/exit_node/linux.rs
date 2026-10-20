@@ -81,7 +81,7 @@ pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
         Snapshot::load(&path)
     } else {
         let snap = Snapshot {
-            v4: read_sysctl(V4_FORWARD),
+            v4: String::new(),
             v6: read_sysctl(V6_FORWARD),
             pf_token: None,
             tun_name: Some(tun_name.to_owned()),
@@ -96,9 +96,9 @@ pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
         keep_accepting_ras(tun_name, &mut snap, &path)?;
     }
     let v4_pool = v4_uplink
-        && match read_ipv4_routes().and_then(|routes| {
-            ensure_ipv4_routes_available(&routes, tun_name, ipv4::AddressSpace::Gateway)
-        }) {
+        && match read_ipv4_routes()
+            .and_then(|routes| ensure_ipv4_routes_available(&routes, tun_name))
+        {
             Ok(()) => {
                 run_ip(&[
                     "-4",
@@ -115,16 +115,12 @@ pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
                 false
             }
         };
-    if v4_pool {
-        write_sysctl(V4_FORWARD, "1")?;
-    } else {
+    if !v4_pool {
         let _ = run_ip(&["-4", "route", "del", ipv4::SERVER_PREFIX, "dev", tun_name]);
-        // A re-apply after the pool lost its route or the uplink went away
-        // puts back whatever this host had before we first turned it on.
-        if !snap.v4.is_empty() {
-            let _ = write_sysctl(V4_FORWARD, &snap.v4);
-        }
     }
+    // A re-apply after the pool lost its route or the uplink went away puts
+    // back whatever this host had before we first turned it on.
+    snap.set_v4_forwarding(&path, v4_pool)?;
     write_sysctl(V6_FORWARD, "1")?;
     nft_load(&server_nft_ruleset(tun_name))?;
     let report = forward_fw::allow(tun_name);
@@ -314,15 +310,11 @@ fn server_state_intact(ruleset: Option<&str>) -> bool {
 }
 
 /// Whether the client full tunnel is still installed: our nft table, and for each
-/// family it routes, the bypass and catch-all rules and the tunnel table's default
-/// route. IPv4 counts only when the last install routed it ([`CLIENT_V4_MARKER`]),
-/// so a host whose routes ruled IPv4 out is not re-applied on every check.
+/// family, the bypass and catch-all rules and the tunnel table's default route.
 #[cfg(target_os = "linux")]
 fn client_state_intact(ruleset: Option<&str>) -> bool {
-    let v4 = crate::config::config_dir().is_ok_and(|dir| dir.join(CLIENT_V4_MARKER).exists());
-    let families: &[&str] = if v4 { &["-4", "-6"] } else { &["-6"] };
     nft_table_exists(ruleset, CLIENT_TABLE)
-        && families.iter().all(|family| {
+        && ["-4", "-6"].iter().all(|family| {
             ip_output(&[family, "rule", "show"]).is_some_and(|show| client_rules_present(&show))
                 && ip_output(&[family, "route", "show", "table", EXIT_TABLE])
                     .is_some_and(|routes| routes.lines().any(|l| l.starts_with("default")))
@@ -401,8 +393,12 @@ pub(super) const TUN_MSS: u16 = crate::tun::MIN_TUN_MTU - 40 - 20;
 /// full-sized segment. `rt mtu` is no good here: for a SYN arriving from the
 /// TUN it reads the uplink's route, typically 1500, so a 1500-MTU client's MSS
 /// of 1440 would pass. The fixed ceiling holds for either direction, since no
-/// IPv6 uplink is narrower than 1280. It only ever lowers the MSS and its
-/// policy is `accept`, so it filters nothing.
+/// IPv6 uplink is narrower than 1280.
+///
+/// The same chain refuses flows that start outside the TUN and head for a
+/// client. The pool route makes every lease reachable from the uplink's
+/// segment, and a client's mesh rules judge such a packet as the gateway's own,
+/// so only replies to masqueraded flows may cross into the TUN.
 #[cfg(target_os = "linux")]
 pub(super) fn server_nft_ruleset(tun_name: &str) -> String {
     format!(
@@ -422,6 +418,8 @@ pub(super) fn server_nft_ruleset(tun_name: &str) -> String {
          \t\ttype filter hook forward priority mangle; policy accept;\n\
          \t\tiifname \"{tun}\" tcp flags & (syn | rst) == syn tcp option maxseg size > {mss} tcp option maxseg size set {mss}\n\
          \t\toifname \"{tun}\" tcp flags & (syn | rst) == syn tcp option maxseg size > {mss} tcp option maxseg size set {mss}\n\
+         \t\tiifname != \"{tun}\" oifname \"{tun}\" ip daddr {v4} ct direction original drop\n\
+         \t\tiifname != \"{tun}\" oifname \"{tun}\" ip6 daddr {v6} ct direction original drop\n\
          \t}}\n\
          }}\n",
         reset = drop_table(SERVER_TABLE),
@@ -626,8 +624,7 @@ pub(super) fn guarded_exceptions(routes: &RouteTables, tun_name: &str) -> GuardE
 }
 
 /// `ip route show table all` per family, read once per install and shared by
-/// the guard, the IPv4 conflict check and the foreign-route mirror. `None`
-/// where the read failed.
+/// the guard and the foreign-route mirror. `None` where the read failed.
 #[cfg(target_os = "linux")]
 pub(super) struct RouteTables {
     v4: Option<String>,
@@ -747,10 +744,7 @@ fn prefix_contains(outer: IpAddr, outer_len: u8, inner: IpAddr, inner_len: u8) -
 /// table is replaced wholesale). Linux only.
 ///
 /// Both families go into the tunnel whatever the gateway carries, so a family it
-/// cannot return is dropped at the forwarder rather than leaving directly. IPv4
-/// is skipped when this host already routes the client address
-/// ([`ipv4::CLIENT_ADDR`]) somewhere: then IPv6 still goes through the exit, and
-/// IPv4 to the internet is held by the guard.
+/// cannot return is dropped at the forwarder rather than leaving directly.
 #[cfg(target_os = "linux")]
 pub fn install_client_routing(tun_name: &str) -> Result<()> {
     // The client table loads first: nothing routes into the tunnel until the
@@ -765,35 +759,15 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
         tun_name,
         &guarded_exceptions(&routes, tun_name),
     ))?;
-    let v4 = match routes
-        .v4
-        .as_deref()
-        .context("read IPv4 routes before installing exit routing")
-        .and_then(|show| ensure_ipv4_routes_available(show, tun_name, ipv4::AddressSpace::Client))
-    {
-        Ok(()) => {
-            run_ip(&[
-                "-4",
-                "addr",
-                "replace",
-                &format!("{}/32", ipv4::CLIENT_ADDR),
-                "dev",
-                tun_name,
-            ])?;
-            let path = crate::config::config_dir()?.join(CLIENT_V4_MARKER);
-            crate::config::write_file(&path, tun_name.as_bytes(), false)?;
-            true
-        }
-        Err(error) => {
-            tracing::warn!(%error, "IPv4 is not tunnelled through the exit node");
-            remove_client_rules("-4", RuleSweep::All);
-            let _ = run_ip(&["-4", "route", "flush", "table", EXIT_TABLE]);
-            remove_ipv4_client_address();
-            false
-        }
-    };
-    let families: &[&str] = if v4 { &["-4", "-6"] } else { &["-6"] };
-    for family in families.iter().copied() {
+    run_ip(&[
+        "-4",
+        "addr",
+        "replace",
+        &format!("{}/32", ipv4::CLIENT_ADDR),
+        "dev",
+        tun_name,
+    ])?;
+    for family in ["-4", "-6"] {
         // Give the tunnel table the prefixes another VPN serves out of a table of
         // its own, or our catch-all rule swallows them (see the fn docs).
         let mirrored = routes
@@ -927,7 +901,6 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
     }
     tracing::info!(
         tun = tun_name,
-        v4,
         "exit-node client full-tunnel routing installed"
     );
     Ok(())
@@ -936,14 +909,19 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
 /// Remove the client full-tunnel policy routing installed by
 /// [`install_client_routing`]: drop the rules, flush the tunnel table, remove the
 /// conntrack-mark table. Best-effort and idempotent (the TUN going down also drops
-/// its routes). Linux only.
+/// its routes). `tun_name` is the TUN still carrying the client IPv4 address, or
+/// `None` when the TUN dies with the process and takes the address along. Linux
+/// only.
 #[cfg(target_os = "linux")]
-pub fn teardown_client_routing() {
+pub fn teardown_client_routing(tun_name: Option<&str>) {
     for family in ["-4", "-6"] {
         remove_client_rules(family, RuleSweep::All);
         let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
     }
-    remove_ipv4_client_address();
+    if let Some(tun) = tun_name {
+        let address = format!("{}/32", ipv4::CLIENT_ADDR);
+        let _ = run_ip(&["-4", "addr", "del", &address, "dev", tun]);
+    }
     let _ = nft_load(&drop_table(CLIENT_TABLE));
     tracing::info!("exit-node client full-tunnel routing removed");
 }
@@ -1593,54 +1571,20 @@ pub(super) fn run_ip(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Holds the TUN name while the client address is installed, so teardown can
-/// remove it after a restart, and the kernel check knows IPv4 was routed.
-#[cfg(target_os = "linux")]
-const CLIENT_V4_MARKER: &str = "exit-ipv4-client-interface";
-
-#[cfg(target_os = "linux")]
-fn remove_ipv4_client_address() {
-    let Ok(dir) = crate::config::config_dir() else {
-        return;
-    };
-    let path = dir.join(CLIENT_V4_MARKER);
-    if let Ok(tun) = fs::read_to_string(&path) {
-        let _ = run_ip(&[
-            "-4",
-            "addr",
-            "del",
-            &format!("{}/32", ipv4::CLIENT_ADDR),
-            "dev",
-            tun.trim(),
-        ]);
-        let _ = fs::remove_file(path);
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn read_ipv4_routes() -> Result<String> {
     ip_output(&["-4", "route", "show", "table", "all"])
         .context("read IPv4 routes before installing exit routing")
 }
 
-/// Do not take an address or a specific route from another interface or VPN.
+/// Do not take the gateway pool's route from another interface or VPN.
 /// `routes` is `ip -4 route show table all`.
 #[cfg(target_os = "linux")]
-fn ensure_ipv4_routes_available(
-    routes: &str,
-    tun_name: &str,
-    space: ipv4::AddressSpace,
-) -> Result<()> {
-    for line in routes.lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.windows(2).any(|pair| pair == ["dev", tun_name]) {
-            continue;
-        }
-        for field in fields.iter().take(2) {
-            if ipv4::conflicts_with_route(field, space) {
-                anyhow::bail!("IPv4 exit address space overlaps an existing route: {line}");
-            }
-        }
+fn ensure_ipv4_routes_available(routes: &str, tun_name: &str) -> Result<()> {
+    // `ip route` puts a route type such as `unreachable` before the destination.
+    let ours = |fields: &[&str]| fields.windows(2).any(|pair| pair == ["dev", tun_name]);
+    if let Some(line) = ipv4::conflicting_route(routes, 2, ours) {
+        anyhow::bail!("IPv4 exit address space overlaps an existing route: {line}");
     }
     Ok(())
 }

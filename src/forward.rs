@@ -306,8 +306,9 @@ fn evaluate_inbound(
         // let them face the firewall like any other inbound packet.
         //
         // They are not waved through: the conntrack entry our own outbound packet
-        // created is what admits the reply. So the exit peer can deliver traffic for
-        // flows we opened, but cannot inject unsolicited packets at our local ports.
+        // created is what admits the reply, and no inbound rule can stand in for
+        // it. So the exit peer can deliver traffic for flows we opened, but cannot
+        // inject unsolicited packets at our local ports.
         // (It is on-path for our real flows and can forge within them, as any
         // gateway or ISP can; that is what TLS is for. Reaching a service we never
         // dialed is a different matter, and it can't.)
@@ -375,10 +376,14 @@ fn evaluate_inbound(
         }
         Some(f) if is_ssh_fragment(&f.info, ssh_port()) => InboundDecision::DropFragment,
         whole_or_first => {
-            if firewall
-                .evaluate_packet(Direction::In, &info, peer_id, shares_network)
-                .is_deny()
-            {
+            let admitted = if returning {
+                firewall.admits_reply(&info)
+            } else {
+                !firewall
+                    .evaluate_packet(Direction::In, &info, peer_id, shares_network)
+                    .is_deny()
+            };
+            if !admitted {
                 return InboundDecision::DropFirewall(info);
             }
             if let Some(f) = whole_or_first {
@@ -2750,6 +2755,42 @@ mod tests {
                 "test-net"
             ),
             InboundDecision::DropFirewall(_)
+        ));
+    }
+
+    #[test]
+    fn an_inbound_allow_does_not_admit_unsolicited_exit_traffic() {
+        // An allow-inbound default (or a rule such as mesh SSH's) speaks for mesh
+        // peers. A flow started from the gateway's side of the exit must still
+        // answer one of ours, or anyone routing to the gateway reaches our ports.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig {
+            default_inbound: firewall::Action::Allow,
+            ..Default::default()
+        });
+        let exit = exit_via(peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V6),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropFirewall(_)
+        ));
+        open_flow_to_internet(&fw, &peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V6),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept(_)
         ));
     }
 

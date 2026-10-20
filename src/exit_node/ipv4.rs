@@ -310,15 +310,10 @@ fn replace_checksum(p: &mut [u8], off: usize, old: u16, new: u16, udp: bool) {
     p[off..off + 2].copy_from_slice(&updated.to_be_bytes());
 }
 
-/// Defaults and split defaults do not claim local address space. Specific
-/// routes overlapping our local source or gateway pool must remain untouched.
-#[derive(Clone, Copy)]
-pub enum AddressSpace {
-    Client,
-    Gateway,
-}
-
-pub fn conflicts_with_route(cidr: &str, space: AddressSpace) -> bool {
+/// Whether a specific route overlaps the gateway lease pool. Defaults and split
+/// defaults do not count. The client address is not checked: a host that already
+/// routes `192.0.0.2` elsewhere is rare enough to leave broken.
+pub fn conflicts_with_route(cidr: &str) -> bool {
     let (ip, bits) = cidr.split_once('/').unwrap_or((cidr, "32"));
     // BSD route tables abbreviate network addresses, such as 198.19/16.
     let mut ip = ip.to_owned();
@@ -337,11 +332,25 @@ pub fn conflicts_with_route(cidr: &str, space: AddressSpace) -> bool {
     let mask = u32::MAX << (32 - bits);
     let first = u32::from(ip) & mask;
     let last = first | !mask;
-    let client = u32::from(CLIENT_ADDR);
-    match space {
-        AddressSpace::Client => first <= client && client <= last,
-        AddressSpace::Gateway => first <= SERVER_NET | !SERVER_MASK && last >= SERVER_NET,
-    }
+    first <= SERVER_NET | !SERVER_MASK && last >= SERVER_NET
+}
+
+/// The first line of a route table that overlaps the gateway lease pool. A line
+/// is skipped when `ours` says it is our own route; otherwise each of its first
+/// `leading` fields is read as a destination.
+pub fn conflicting_route(
+    routes: &str,
+    leading: usize,
+    ours: impl Fn(&[&str]) -> bool,
+) -> Option<&str> {
+    routes.lines().find(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        !ours(&fields)
+            && fields
+                .iter()
+                .take(leading)
+                .any(|field| conflicts_with_route(field))
+    })
 }
 
 #[cfg(test)]
@@ -582,18 +591,8 @@ mod tests {
 
     #[test]
     fn route_conflicts_leave_other_vpns_alone() {
-        for prefix in [
-            "198.19.0.0/16",
-            "198.18.0.0/15",
-            "198.19.2.3",
-            "192.0.0.0/24",
-            "192.0.0.2",
-        ] {
-            assert!(
-                conflicts_with_route(prefix, AddressSpace::Client)
-                    || conflicts_with_route(prefix, AddressSpace::Gateway),
-                "{prefix}"
-            );
+        for prefix in ["198.19.0.0/16", "198.18.0.0/15", "198.19.2.3", "198.19/16"] {
+            assert!(conflicts_with_route(prefix), "{prefix}");
         }
         for prefix in [
             "default",
@@ -603,12 +602,25 @@ mod tests {
             "100.64.0.0/10",
             "192.168.0.0/16",
             "198.18.0.0/16",
+            "192.0.0.2",
         ] {
-            assert!(
-                !conflicts_with_route(prefix, AddressSpace::Client)
-                    && !conflicts_with_route(prefix, AddressSpace::Gateway),
-                "{prefix}"
-            );
+            assert!(!conflicts_with_route(prefix), "{prefix}");
         }
+    }
+
+    #[test]
+    fn a_route_table_scan_skips_our_own_routes_and_reads_only_destinations() {
+        let routes = "default via 10.0.0.1 dev eth0\n\
+                      198.19.0.0/16 dev tun0\n\
+                      unreachable 198.19.4.0/24\n";
+        let ours = |fields: &[&str]| fields.windows(2).any(|pair| pair == ["dev", "tun0"]);
+        assert_eq!(
+            conflicting_route(routes, 2, ours),
+            Some("unreachable 198.19.4.0/24")
+        );
+        assert_eq!(conflicting_route(routes, 1, ours), None);
+        // A gateway in the pool is not a destination.
+        let bsd = "Destination Gateway Flags Netif\n10.0.0.0/8 198.19.0.9 UGS en0\n";
+        assert_eq!(conflicting_route(bsd, 1, |_| false), None);
     }
 }

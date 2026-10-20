@@ -1802,24 +1802,11 @@ impl Daemon {
         }
     }
 
-    /// Which families the tunnel currently selected would carry, or
-    /// [`ExitFamilies::Neither`] when nothing is selected.
-    ///
-    /// One reader for the routing install, the socket pin and the DNS override,
-    /// so the three cannot end up describing different tunnels.
-    fn tunnel_carries(&self) -> ExitFamilies {
-        self.registry
-            .exit_client
-            .selection()
-            .map(|s| s.carries)
-            .unwrap_or(ExitFamilies::Neither)
-    }
-
     /// Forward DNS through the selected exit, restoring captured resolvers on disconnect.
     fn apply_exit_dns(&self) {
-        let over = self.registry.exit_client.is_active().then(|| {
+        let over = self.registry.exit_client.selection().map(|selection| {
             let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
-            crate::exit_node::tunnel_upstreams(self.tunnel_carries(), &configured)
+            crate::exit_node::tunnel_upstreams(selection.carries, &configured)
         });
         self.dns.resolver.set_tunnel_upstreams(over);
     }
@@ -1834,7 +1821,7 @@ impl Daemon {
         let owned_tun_name = tun_name.to_owned();
         let result = tokio::task::spawn_blocking(move || {
             if !install {
-                crate::exit_node::teardown_client_routing();
+                crate::exit_node::teardown_client_routing(Some(&owned_tun_name));
                 return Ok(());
             }
             crate::exit_node::install_client_routing(&owned_tun_name)

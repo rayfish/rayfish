@@ -242,7 +242,7 @@ pub fn restore_host_state() {
     crate::dns::config::emergency_restore_resolv_conf();
     crate::dns::config::emergency_withdraw_resolvconf();
     crate::exit_node::disable();
-    crate::exit_node::teardown_client_routing();
+    crate::exit_node::teardown_client_routing(None);
 }
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
