@@ -1645,6 +1645,7 @@ mod tests {
         let (tun_tx, mut tun_rx) = mpsc::channel::<Bytes>(8);
         let ctx = ForwardCtx {
             firewall: SharedFirewall::new(FirewallConfig::default()),
+            reassembly_autotune: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tun_tx: Arc::new(arc_swap::ArcSwap::new(Arc::new(tun_tx))),
             token: CancellationToken::new(),
             stats: Arc::new(ForwardMetrics::default()),

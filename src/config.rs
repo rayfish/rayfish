@@ -676,6 +676,10 @@ pub struct AppConfig {
         deserialize_with = "deserialize_quic_engine"
     )]
     pub quic_engine: QuicEngine,
+    /// Opt-in receiver-local fragment capacity trials; off keeps 64 assemblies.
+    /// `ray config set reassembly-autotune on|off` also updates existing readers.
+    #[serde(default)]
+    pub reassembly_autotune: bool,
     /// Recently successful peer transport paths.  These are only connection
     /// hints: iroh still authenticates the endpoint identity in TLS and falls
     /// back to its normal discovery services when a hint is stale.  Keeping
@@ -823,6 +827,7 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             dns_mode: DnsMode::On,
             quic_engine: QuicEngine::default(),
+            reassembly_autotune: false,
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
             ssh_port: default_ssh_port(),
@@ -962,6 +967,8 @@ struct Settings {
         deserialize_with = "deserialize_quic_engine"
     )]
     quic_engine: QuicEngine,
+    #[serde(default)]
+    reassembly_autotune: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoint_hints: Vec<iroh::EndpointAddr>,
     #[serde(default)]
@@ -1788,6 +1795,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         dns_upstreams: settings.dns_upstreams,
         dns_mode: settings.dns_mode,
         quic_engine: settings.quic_engine,
+        reassembly_autotune: settings.reassembly_autotune,
         endpoint_hints: settings.endpoint_hints,
         ssh_enabled: settings.ssh_enabled,
         ssh_port: settings.ssh_port,
@@ -1869,6 +1877,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         dns_upstreams: config.dns_upstreams.clone(),
         dns_mode: config.dns_mode,
         quic_engine: config.quic_engine,
+        reassembly_autotune: config.reassembly_autotune,
         endpoint_hints: config.endpoint_hints.clone(),
         ssh_enabled: config.ssh_enabled,
         ssh_port: config.ssh_port,
@@ -3327,6 +3336,26 @@ name = "test"
             load_in(tmp.path()).expect("load new setting").dns_mode,
             DnsMode::Partial
         );
+    }
+
+    #[test]
+    fn reassembly_opt_in_defaults_off_and_round_trips_through_settings_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = load_in(tmp.path()).unwrap();
+        let key = settings::GlobalKey::ReassemblyAutotune;
+        assert!(!cfg.reassembly_autotune);
+        std::fs::write(tmp.path().join(SETTINGS_FILE), "mdns_enabled = true\n").unwrap();
+        assert!(!load_in(tmp.path()).unwrap().reassembly_autotune);
+        config_set(&mut cfg, key, "on", false).unwrap();
+        save_settings_in(tmp.path(), &cfg).unwrap();
+        let mut cfg = load_in(tmp.path()).unwrap();
+        assert!(cfg.reassembly_autotune);
+        assert_eq!(settings::render_global(&cfg, key), "on");
+        assert!(config_set(&mut cfg, key, "maybe", false).is_err());
+        assert!(cfg.reassembly_autotune);
+        config_set(&mut cfg, key, "", false).unwrap();
+        save_settings_in(tmp.path(), &cfg).unwrap();
+        assert!(!load_in(tmp.path()).unwrap().reassembly_autotune);
     }
 
     #[test]

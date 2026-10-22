@@ -120,6 +120,7 @@ impl Harness {
                 table.clone(),
                 ForwardCtx {
                     firewall: firewall.clone(),
+                    reassembly_autotune: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(tun_tx.clone())),
                     token: token.clone(),
                     stats: Arc::clone(&stats),

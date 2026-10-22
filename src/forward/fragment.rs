@@ -25,13 +25,18 @@ use tokio::time::Instant;
 use super::{TAG_LEN, tag_datagram};
 use crate::stats::DropReason;
 
+mod autotune;
+mod pending;
+use autotune::{Budget, Controller, Events};
+use pending::Pending;
+
 pub(super) const MAX_PACKET: usize = crate::tun::TUN_MTU as usize;
 const HEADER: usize = TAG_LEN + 1 + 8 + 2 + 2;
 const MAX_FRAGMENTS: usize = 16;
 const MAX_PENDING: usize = 64;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 // Includes the packet buffer, coverage bitmap and allowance for map metadata.
-const ASSEMBLY_COST: usize = MAX_PACKET + 512;
+const ASSEMBLY_COST: usize = MAX_PACKET + 576;
 const GLOBAL_BUDGET: usize = 8 * 1024 * 1024;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -88,17 +93,75 @@ pub(super) fn encode(handle: u16, packet: &[u8], max: usize) -> Option<Encoded> 
     Some(Encoded::Fragments(parts))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct AssemblyKey {
     handle: u16,
     id: u64,
 }
 
-struct Assembly {
-    packet: Vec<u8>,
+#[derive(Clone)]
+struct Progress {
+    total: usize,
     covered: [u64; MAX_PACKET.div_ceil(64)],
     received: usize,
     deadline: Instant,
+}
+
+impl Progress {
+    fn new(total: usize, deadline: Instant) -> Self {
+        Self {
+            total,
+            covered: [0; MAX_PACKET.div_ceil(64)],
+            received: 0,
+            deadline,
+        }
+    }
+
+    /// Returns true only for newly covered bytes; duplicates never make progress.
+    fn mark(&mut self, pos: usize) -> bool {
+        let word = &mut self.covered[pos / 64];
+        let mask = 1u64 << (pos % 64);
+        if *word & mask != 0 {
+            false
+        } else {
+            *word |= mask;
+            self.received += 1;
+            true
+        }
+    }
+
+    /// Metadata observers need coverage, without re-reading every payload byte.
+    fn cover(&mut self, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let last = offset + len - 1;
+        for index in offset / 64..=last / 64 {
+            let start = if index == offset / 64 { offset % 64 } else { 0 };
+            let end = if index == last / 64 {
+                last % 64 + 1
+            } else {
+                64
+            };
+            let mask = (u64::MAX << start) & (u64::MAX >> (64 - end));
+            let word = &mut self.covered[index];
+            self.received += (mask & !*word).count_ones() as usize;
+            *word |= mask;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Fragment {
+    key: AssemblyKey,
+    total: usize,
+    offset: usize,
+    len: usize,
+}
+
+struct Assembly {
+    packet: Vec<u8>,
+    progress: Progress,
     permit: OwnedSemaphorePermit,
 }
 
@@ -106,31 +169,47 @@ struct Assembly {
 /// validates the network handle. Both per-connection and process-wide limits
 /// apply; dropping a reader releases all its reservations.
 pub(super) struct Reassembler {
-    pending: HashMap<AssemblyKey, Assembly>,
-    budget: Arc<Semaphore>,
+    pending: Pending<Assembly>,
+    budget: Arc<Budget>,
     evicted: usize,
+    control: Controller,
+    events: Events,
 }
 
 impl Default for Reassembler {
     fn default() -> Self {
-        static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        Self {
-            pending: HashMap::new(),
-            budget: Arc::clone(BUDGET.get_or_init(|| Arc::new(Semaphore::new(GLOBAL_BUDGET)))),
-            evicted: 0,
-        }
+        static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
+        Self::with_budget(
+            Arc::clone(BUDGET.get_or_init(|| Budget::new(GLOBAL_BUDGET))),
+            false,
+        )
     }
 }
 
 impl Reassembler {
+    fn with_budget(budget: Arc<Budget>, autotune: bool) -> Self {
+        Self {
+            pending: Pending::default(),
+            budget,
+            evicted: 0,
+            control: Controller::new(Instant::now(), autotune),
+            events: Events::default(),
+        }
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
-        self.pending.values().map(|p| p.deadline).min()
+        self.pending
+            .deadline()
+            .into_iter()
+            .chain(self.control.deadline())
+            .min()
     }
 
     pub(super) fn expire(&mut self, now: Instant) -> usize {
-        let before = self.pending.len();
-        self.pending.retain(|_, p| now < p.deadline);
-        before - self.pending.len()
+        let expired = self.pending.expire(now);
+        self.events.expired += expired;
+        self.autotune_tick(now);
+        expired
     }
 
     /// Incomplete packets dropped to make room since the last call. The caller
@@ -146,21 +225,48 @@ impl Reassembler {
     /// were lost. Fragments are sent back to back, so the oldest packet is the
     /// least likely to complete. Only this connection's room is reused, so a
     /// peer cannot evict another peer's packets.
-    fn reserve(&mut self) -> Result<OwnedSemaphorePermit, DropReason> {
-        if self.pending.len() < MAX_PENDING
+    fn reserve(&mut self, now: Instant) -> Result<OwnedSemaphorePermit, DropReason> {
+        // Expired entries are free space, not evidence of insufficient capacity.
+        if self.pending.len() >= self.control.limit
+            || self.budget.memory.available_permits() < ASSEMBLY_COST
+        {
+            self.expire(now);
+        }
+        let draining = self.pending.len() > self.control.limit;
+        if draining {
+            // Replacing one item with one item would keep an oversized table
+            // full forever under a stream of orphan heads. Reclaim at most one
+            // extra old item per new admission, without a bulk purge or lockout.
+            let oldest = self.oldest().expect("an oversized table is nonempty");
+            self.pending.remove(&oldest);
+            self.evicted += 1;
+            self.events.local += 1;
+        }
+        if !draining && self.pending.len() >= self.control.limit {
+            self.capacity_pressure(now);
+        }
+        if self.pending.len() < self.control.limit
             && let Ok(permit) =
-                Arc::clone(&self.budget).try_acquire_many_owned(ASSEMBLY_COST as u32)
+                Arc::clone(&self.budget.memory).try_acquire_many_owned(ASSEMBLY_COST as u32)
         {
             return Ok(permit);
         }
-        let oldest = self
-            .pending
-            .iter()
-            .min_by_key(|(_, part)| part.deadline)
-            .map(|(key, _)| *key)
-            .ok_or(DropReason::ReassemblyLimit)?;
+        if self.pending.len() < self.control.limit {
+            self.abort_probe(now, true);
+            self.events.global += usize::from(!self.pending.is_empty());
+        } else {
+            self.events.local += usize::from(!self.pending.is_empty());
+        }
+        let oldest = self.oldest().ok_or_else(|| {
+            self.events.rejected += 1;
+            DropReason::ReassemblyLimit
+        })?;
         self.evicted += 1;
         Ok(self.pending.remove(&oldest).unwrap().permit)
+    }
+
+    fn oldest(&self) -> Option<AssemblyKey> {
+        self.pending.oldest()
     }
 
     /// The datagram still includes its validated network handle. Whole packets
@@ -173,16 +279,19 @@ impl Reassembler {
     ) -> Result<Option<Bytes>, DropReason> {
         let malformed = DropReason::Malformed;
         if datagram.len() <= TAG_LEN || datagram.len() > MAX_PACKET + TAG_LEN {
+            self.abort_probe(now, false);
             return Err(malformed);
         }
         let handle = u16::from_be_bytes([datagram[0], datagram[1]]);
         if handle == 0 {
+            self.abort_probe(now, false);
             return Err(malformed);
         }
         if matches!(datagram[TAG_LEN] >> 4, 4 | 6) {
             return Ok(Some(datagram.slice(TAG_LEN..)));
         }
         if datagram[TAG_LEN] != 0 || datagram.len() <= HEADER {
+            self.abort_probe(now, false);
             return Err(malformed);
         }
         let id = u64::from_be_bytes(datagram[3..11].try_into().unwrap());
@@ -192,25 +301,61 @@ impl Reassembler {
         let key = AssemblyKey { handle, id };
         if total == 0 || total > MAX_PACKET || offset + payload.len() > total {
             self.pending.remove(&key);
+            self.abort_probe(now, false);
             return Err(malformed);
         }
+        self.touch_fragment(now);
+        let fragment = Fragment {
+            key,
+            total,
+            offset,
+            len: payload.len(),
+        };
+        let result = self.accept_fragment(fragment, payload, now);
+        match &result {
+            Ok(packet) => {
+                let complete = packet.as_ref().map(Bytes::len);
+                self.control.observe(fragment, complete, now);
+                if let Some(len) = complete {
+                    self.events.completed += 1;
+                    self.events.bytes += len;
+                }
+            }
+            Err(reason) => self.abort_probe(now, *reason == DropReason::ReassemblyLimit),
+        }
+        result
+    }
+
+    fn accept_fragment(
+        &mut self,
+        fragment: Fragment,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<Option<Bytes>, DropReason> {
+        let Fragment {
+            key, total, offset, ..
+        } = fragment;
+        let malformed = DropReason::Malformed;
         // The timer also expires quiet connections. Check this entry here so a
         // busy peer cannot extend its deadline by racing the cleanup tick.
-        if self.pending.get(&key).is_some_and(|p| now >= p.deadline) {
+        if self
+            .pending
+            .get(&key)
+            .is_some_and(|p| now >= p.progress.deadline)
+        {
             self.pending.remove(&key);
             return Err(DropReason::ReassemblyTimeout);
         }
         if !self.pending.contains_key(&key) {
-            let permit = self.reserve()?;
+            let permit = self.reserve(now)?;
             self.pending.insert(
                 key,
                 Assembly {
                     packet: vec![0; total],
-                    covered: [0; MAX_PACKET.div_ceil(64)],
-                    received: 0,
-                    deadline: now + TIMEOUT,
+                    progress: Progress::new(total, now + TIMEOUT),
                     permit,
                 },
+                now + TIMEOUT,
             );
         }
         let part = self.pending.get_mut(&key).unwrap();
@@ -219,19 +364,16 @@ impl Reassembler {
             return Err(malformed);
         }
         for (pos, byte) in (offset..).zip(payload) {
-            let mask = 1u64 << (pos % 64);
-            if part.covered[pos / 64] & mask != 0 {
+            if !part.progress.mark(pos) {
                 if part.packet[pos] != *byte {
                     self.pending.remove(&key);
                     return Err(malformed);
                 }
             } else {
-                part.covered[pos / 64] |= mask;
                 part.packet[pos] = *byte;
-                part.received += 1;
             }
         }
-        if part.received == total {
+        if part.progress.received == total {
             let part = self.pending.remove(&key).unwrap();
             return Ok(Some(Bytes::from(part.packet)));
         }
@@ -245,11 +387,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn receiver(slots: usize) -> Reassembler {
-        Reassembler {
-            pending: HashMap::new(),
-            budget: Arc::new(Semaphore::new(slots * ASSEMBLY_COST)),
-            evicted: 0,
-        }
+        Reassembler::with_budget(Budget::new(slots * ASSEMBLY_COST), false)
     }
 
     fn packet(len: usize) -> Vec<u8> {
@@ -275,7 +413,10 @@ mod tests {
             Some(Bytes::from(packet))
         );
         assert!(receiver.pending.is_empty());
-        assert_eq!(receiver.budget.available_permits(), 2 * ASSEMBLY_COST);
+        assert_eq!(
+            receiver.budget.memory.available_permits(),
+            2 * ASSEMBLY_COST
+        );
     }
 
     #[test]
@@ -346,7 +487,7 @@ mod tests {
         receiver.accept(first.clone(), now).unwrap();
         receiver.accept(first, now + TIMEOUT / 2).unwrap();
         assert_eq!(receiver.expire(now + TIMEOUT), 1);
-        assert_eq!(receiver.budget.available_permits(), ASSEMBLY_COST);
+        assert_eq!(receiver.budget.memory.available_permits(), ASSEMBLY_COST);
         // A late tail alone must not produce a packet from expired state.
         assert_eq!(
             receiver
@@ -409,7 +550,7 @@ mod tests {
                 Err(DropReason::Malformed)
             );
             assert!(receiver.pending.is_empty());
-            assert_eq!(receiver.budget.available_permits(), ASSEMBLY_COST);
+            assert_eq!(receiver.budget.memory.available_permits(), ASSEMBLY_COST);
         }
     }
 
@@ -424,11 +565,7 @@ mod tests {
         let mut tail = encoded.datagrams()[1].to_vec();
         tail[..2].copy_from_slice(&2u16.to_be_bytes());
         assert_eq!(receiver.accept(Bytes::from(tail), now).unwrap(), None);
-        let mut other_connection = Reassembler {
-            pending: HashMap::new(),
-            budget: Arc::new(Semaphore::new(ASSEMBLY_COST)),
-            evicted: 0,
-        };
+        let mut other_connection = Reassembler::with_budget(Budget::new(ASSEMBLY_COST), false);
         assert_eq!(
             other_connection
                 .accept(encoded.datagrams()[1].clone(), now)
@@ -455,12 +592,8 @@ mod tests {
         // At its own limit, a connection reuses its oldest packet's room.
         assert_eq!(a.accept(head(), now), Ok(None));
         assert_eq!(a.take_evicted(), 1);
-        assert_eq!(budget.available_permits(), ASSEMBLY_COST);
-        let shared = || Reassembler {
-            pending: HashMap::new(),
-            budget: Arc::clone(&budget),
-            evicted: 0,
-        };
+        assert_eq!(budget.memory.available_permits(), ASSEMBLY_COST);
+        let shared = || Reassembler::with_budget(Arc::clone(&budget), false);
         let mut b = shared();
         b.accept(head(), now).unwrap();
         // It does the same once the shared budget is spent, but a connection
@@ -474,12 +607,15 @@ mod tests {
             Err(DropReason::ReassemblyLimit)
         );
         drop(a);
-        assert_eq!(budget.available_permits(), MAX_PENDING * ASSEMBLY_COST);
+        assert_eq!(
+            budget.memory.available_permits(),
+            MAX_PENDING * ASSEMBLY_COST
+        );
         c.accept(extra, now).unwrap();
         drop(b);
         drop(c);
         assert_eq!(
-            budget.available_permits(),
+            budget.memory.available_permits(),
             (MAX_PENDING + 1) * ASSEMBLY_COST
         );
     }
@@ -505,7 +641,7 @@ mod tests {
             );
         }
         assert!(receiver.pending.is_empty());
-        assert_eq!(receiver.budget.available_permits(), ASSEMBLY_COST);
+        assert_eq!(receiver.budget.memory.available_permits(), ASSEMBLY_COST);
         assert!(encode(0, &packet(1280), 1162).is_none());
         assert!(encode(1, &packet(MAX_PACKET + 1), 1162).is_none());
         assert!(encode(1, &packet(1280), HEADER + 1).is_none());

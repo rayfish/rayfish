@@ -633,6 +633,10 @@ async fn build_daemon_inner(
         on_demand,
         app_config.idle_timeout(),
     ));
+    registry.reassembly_autotune.store(
+        app_config.reassembly_autotune,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
     // calling NetworkRegistry directly (was the reauth_tx hand-off channel), so it
