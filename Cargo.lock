@@ -7829,7 +7829,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tun-rs"
 version = "2.8.11"
-source = "git+https://github.com/extrowerk/tun-rs?branch=illumos#de333faa6b44f55d3f4ed2101e09441b4cb688a4"
+source = "git+https://github.com/extrowerk/tun-rs?branch=illumos#9ef6a5edb05135d0df0be480d906bbb16143a91c"
 dependencies = [
  "blocking",
  "byteorder",
