@@ -1499,6 +1499,9 @@ impl Daemon {
 fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
     let restart = "Restart the daemon for changes to take effect.";
     match key {
+        GlobalKey::EndpointHints => {
+            "Endpoint hints cleared. Existing connections are unchanged.".to_string()
+        }
         GlobalKey::FileAutoAcceptPeers => "File auto-accept peers updated.".to_string(),
         GlobalKey::Inbound => "Inbound policy updated.".to_string(),
         GlobalKey::Blocked => "Block list updated.".to_string(),
@@ -2358,7 +2361,7 @@ pub(crate) mod accept_handler_tests {
             Arc::new(ForwardMetrics::default()),
             TransportBootstrap {
                 lan_peers: Arc::new(LanPeers::new()),
-                warm_lookup: iroh::address_lookup::memory::MemoryLookup::new(),
+                warm_lookup: crate::endpoint_hints::WarmLookup::new(),
                 pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
             },
         ));
@@ -5163,6 +5166,92 @@ mod headless_tests {
             matches!(&msg, IpcMessage::Error { message } if message.contains("unknown peer")),
             "{msg:?}"
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_hint_migration_and_ipc_reset_follow_the_live_lookup() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+        let first = SecretKey::from([45; 32]).public();
+        let second = SecretKey::from([46; 32]).public();
+        config::update_settings(|cfg| {
+            cfg.mdns_enabled = false;
+            cfg.endpoint_hints = vec![
+                iroh::EndpointAddr::new(first).with_ip_addr("192.0.2.1:41383".parse().unwrap()),
+            ];
+            Ok(())
+        })
+        .unwrap();
+        let daemon = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            config::load().unwrap().endpoint_hints.is_empty(),
+            "daemon startup drops legacy hints without inventing an observation time"
+        );
+        assert!(
+            daemon
+                .transport
+                .warm_lookup
+                .get_endpoint_info(first)
+                .is_none()
+        );
+        // The runtime getter must include unsaved live observations, too.
+        daemon.transport.warm_lookup.add_endpoint_info(
+            iroh::EndpointAddr::new(first).with_ip_addr("192.0.2.1:41383".parse().unwrap()),
+        );
+        let key = NodeKey::Global(GlobalKey::EndpointHints);
+        let get = daemon
+            .handle_authorized_request(IpcMessage::ConfigGet { key: Some(key) }, None, vec![])
+            .await;
+        let IpcMessage::ConfigValues { rows } = get else {
+            panic!("expected cache rows")
+        };
+        assert!(rows[0].1.contains(&first.to_string()));
+        daemon
+            .transport
+            .warm_lookup
+            .remember_verified(
+                iroh::EndpointAddr::new(second).with_ip_addr("192.0.2.2:41383".parse().unwrap()),
+            )
+            .unwrap();
+        let reply = daemon
+            .config_set(GlobalKey::EndpointHints, &first.to_string())
+            .await;
+        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        assert!(
+            daemon
+                .transport
+                .warm_lookup
+                .get_endpoint_info(first)
+                .is_none()
+        );
+        assert!(
+            daemon
+                .transport
+                .warm_lookup
+                .get_endpoint_info(second)
+                .is_some()
+        );
+        let reply = daemon
+            .handle_authorized_request(IpcMessage::ConfigUnset { key }, None, vec![])
+            .await;
+        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        assert!(
+            daemon
+                .transport
+                .warm_lookup
+                .get_endpoint_info(second)
+                .is_none()
+        );
+        let cfg = config::load().unwrap();
+        assert!(cfg.endpoint_hints.is_empty());
+        assert!(cfg.endpoint_hint_timestamps.is_empty());
+        assert!(!cfg.mdns_enabled);
+        daemon.transport.endpoint.close().await;
     }
 
     /// `net_config_apply` gates on the network's presence ON DISK, not in the

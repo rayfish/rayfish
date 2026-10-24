@@ -317,7 +317,34 @@ async fn build_daemon_inner(
     forward::init_ssh_nat(my_ip, crate::forward::SSH_LISTEN_PORT);
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
-    let app_config = config::load()?;
+    let mut app_config = config::load()?;
+    let previous_hints = app_config.endpoint_hints.clone();
+    let previous_times = app_config.endpoint_hint_timestamps.clone();
+    let now = crate::endpoint_hints::now_secs();
+    crate::endpoint_hints::prune(
+        &mut app_config.endpoint_hints,
+        &mut app_config.endpoint_hint_timestamps,
+        now,
+    );
+    if app_config.endpoint_hints != previous_hints
+        || app_config.endpoint_hint_timestamps != previous_times
+    {
+        // Only daemon startup writes a migrated/pruned cache. Read-only config
+        // consumers and endpoint constructors must never create host settings.
+        match config::update_settings(|cfg| {
+            crate::endpoint_hints::prune(
+                &mut cfg.endpoint_hints,
+                &mut cfg.endpoint_hint_timestamps,
+                now,
+            );
+            Ok(())
+        }) {
+            Ok(saved) => app_config = saved,
+            Err(error) => {
+                tracing::warn!(%error, "could not persist pruned endpoint hints; using filtered hints in memory")
+            }
+        }
+    }
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
     let on_demand = overrides.on_demand.unwrap_or(app_config.on_demand);

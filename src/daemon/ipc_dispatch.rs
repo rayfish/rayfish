@@ -238,6 +238,14 @@ impl Daemon {
                 value
             };
         let key = match key {
+            NodeKey::Global(GlobalKey::EndpointHints) => {
+                return match self.transport.warm_lookup.clear_config(value, replace) {
+                    Ok(cfg) => IpcMessage::Ok {
+                        message: global_set_message(&cfg, GlobalKey::EndpointHints, reset),
+                    },
+                    Err(error) => ipc_err(format!("failed to clear endpoint hints: {error}")),
+                };
+            }
             NodeKey::Firewall(k) => return self.registry.firewall_config_set(k, value),
             NodeKey::Global(GlobalKey::Dns) => return self.dns_config_set(value).await,
             NodeKey::Global(GlobalKey::Mdns) => return self.mdns_config_set(value).await,
@@ -352,10 +360,13 @@ impl Daemon {
             Some(NodeKey::Global(k)) => Some(k),
             None => None,
         };
-        let app_config = match config::load() {
+        let mut app_config = match config::load() {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
         };
+        if key.is_none() || key == Some(GlobalKey::EndpointHints) {
+            self.transport.warm_lookup.copy_to(&mut app_config);
+        }
         let mut rows = config::config_get(&app_config, key);
         if key.is_none() {
             rows.extend(self.registry.firewall_config_rows(None));
@@ -814,6 +825,25 @@ fn rootless_request_supported(req: &IpcMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_endpoint_hints_requires_mutation_authority() {
+        let key = NodeKey::Global(GlobalKey::EndpointHints);
+        assert!(Daemon::is_open_read(&IpcMessage::ConfigGet {
+            key: Some(key)
+        }));
+        for request in [
+            IpcMessage::ConfigUnset { key },
+            IpcMessage::ConfigSet {
+                key,
+                value: SecretKey::from([7; 32]).public().to_string(),
+                replace: false,
+            },
+        ] {
+            assert!(!Daemon::is_open_read(&request));
+            assert!(Daemon::check_authorized(&request, None).is_some());
+        }
+    }
 
     #[test]
     fn rootless_rejects_host_network_mutations() {

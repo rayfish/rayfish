@@ -11,7 +11,7 @@
 //! the crate-level `transport` module that owns iroh endpoint setup.
 
 use super::*;
-use iroh::address_lookup::memory::MemoryLookup;
+use crate::endpoint_hints::WarmLookup;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use iroh::{RelayMap, RelayUrl};
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -33,7 +33,7 @@ pub(crate) struct Transport {
     /// Bootstrap-only address hints from successful prior connections.  This is
     /// registered with iroh's lookup chain, so a stale hint simply falls through
     /// to normal discovery and can never impersonate its endpoint id.
-    pub(crate) warm_lookup: MemoryLookup,
+    pub(crate) warm_lookup: WarmLookup,
     /// The discovery relay selected for this daemon at startup. Keeping this
     /// with the endpoint prevents a later embedded daemon from inheriting a
     /// prior instance's process-global setting.
@@ -59,7 +59,7 @@ pub(crate) struct Transport {
 /// endpoint, identity, store, and metrics dependencies.
 pub(crate) struct TransportBootstrap {
     pub(crate) lan_peers: Arc<LanPeers>,
-    pub(crate) warm_lookup: MemoryLookup,
+    pub(crate) warm_lookup: WarmLookup,
     pub(crate) pkarr_relay_url: Url,
     #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) suspended: Arc<AtomicBool>,

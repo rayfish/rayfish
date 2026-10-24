@@ -23,7 +23,14 @@ impl TestConfig {
             settings.mdns_enabled = false;
             settings.dns_mode = config::DnsMode::Off;
             settings.default_hostname = Some("managed-test".to_string());
-            settings.endpoint_hints = vec![peer.addr()];
+            let addr = peer.addr();
+            crate::endpoint_hints::remember(
+                &mut settings.endpoint_hints,
+                &mut settings.endpoint_hint_timestamps,
+                addr.id,
+                addr.addrs,
+                crate::endpoint_hints::now_secs(),
+            );
             Ok(())
         })
         .unwrap();

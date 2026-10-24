@@ -42,10 +42,6 @@ const RENAME_RESTORE_WAIT: Duration = Duration::from_secs(10);
 /// after five seconds, so this leaves room for a second attempt.
 const REAUTHORIZATION_PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
-/// Keep the persisted hint set small and bounded.  A hint is only a speed-up;
-/// the endpoint id in the QUIC certificate remains the authentication boundary.
-const MAX_WARM_ENDPOINT_HINTS: usize = 64;
-
 /// Finish a `ray rename` that a crash interrupted, from the intent it saved
 /// before anything moved ([`config::rename_network`]): move the network's file
 /// and the name inside it if either is left, and point the firewall rules that
@@ -589,40 +585,22 @@ impl NetworkRegistry {
         {
             return;
         }
-        let hint = iroh::EndpointAddr::from_parts(peer, [addr]);
-        self.transport.warm_lookup.add_endpoint_info(hint.clone());
-        if let Err(e) = config::update_settings(|cfg| {
-            if let Some(index) = cfg.endpoint_hints.iter().position(|h| h.id == peer) {
-                // Move a refreshed entry to the tail so the bounded vector is a
-                // simple LRU.  Retain every prior path for that identity: a
-                // direct candidate and its relay are useful fallbacks for each
-                // other after a network change.
-                let mut existing = cfg.endpoint_hints.remove(index);
-                existing.addrs.extend(hint.addrs);
-                cfg.endpoint_hints.push(existing);
-            } else {
-                cfg.endpoint_hints.push(hint);
-            }
-            // Every entry is appended or refreshed at the tail, so trimming from
-            // the front evicts the least-recently useful peer hint.
-            let overflow = cfg
-                .endpoint_hints
-                .len()
-                .saturating_sub(MAX_WARM_ENDPOINT_HINTS);
-            if overflow != 0 {
-                cfg.endpoint_hints.drain(..overflow);
-            }
-            Ok(())
-        }) {
+        if let Err(e) = self
+            .transport
+            .warm_lookup
+            .remember_verified(iroh::EndpointAddr::from_parts(peer, [addr]))
+        {
             tracing::debug!(peer = %peer.fmt_short(), error = %e, "failed to persist warm endpoint hint");
         }
     }
 
-    /// Capture the paths available now and keep listening for a relay-to-direct
-    /// upgrade.  This runs once per established mesh connection and exits with
-    /// that connection's path-event stream.
+    /// Capture live authenticated paths and subsequent upgrades. Periodically
+    /// refresh live paths so a long-lived connection does not lose its warm
+    /// hints merely because it needed no new handshake. Closed paths are not
+    /// refreshed; lookups do not renew timestamps.
     pub(crate) fn remember_connection_hints(self: &Arc<Self>, conn: &Connection) {
         let peer = conn.remote_id();
+        let mut events = conn.path_events();
         for path in conn.paths().iter() {
             self.remember_endpoint_hint(peer, path.remote_addr().clone());
         }
@@ -630,10 +608,29 @@ impl NetworkRegistry {
         let conn = conn.clone();
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut events = conn.path_events();
-            while let Some(event) = events.next().await {
-                if let iroh::endpoint::PathEvent::Opened { remote_addr, .. } = event {
-                    this.remember_endpoint_hint(peer, remote_addr);
+            let interval = Duration::from_secs(crate::endpoint_hints::REFRESH_INTERVAL_SECS);
+            let mut refresh =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    event = events.next() => match event {
+                        Some(iroh::endpoint::PathEvent::Opened { remote_addr, .. }) => {
+                            this.remember_endpoint_hint(peer, remote_addr);
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    _ = refresh.tick() => {
+                        let addrs = conn.paths().iter().map(|path| path.remote_addr().clone()).collect::<Vec<_>>();
+                        if peer != this.transport.identity.local_identity()
+                            && let Err(error) = this.transport.warm_lookup.remember_verified(
+                                iroh::EndpointAddr::from_parts(peer, addrs),
+                            )
+                        {
+                            tracing::debug!(peer = %peer.fmt_short(), %error, "failed to refresh warm endpoint hint");
+                        }
+                    }
                 }
             }
         });
@@ -2007,6 +2004,66 @@ fn record_is_published(network: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the production observation path, not a hand-built cache. This
+    /// regression also runs on the parent commit, where all 32 addresses stay
+    /// in settings indefinitely for a single continuously active peer.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verified_path_observations_bound_warm_cache_addresses() {
+        let _env_lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                        None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("RAYFISH_CONFIG_DIR"));
+        unsafe {
+            std::env::set_var("RAYFISH_CONFIG_DIR", dir.path());
+        }
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let registry = super::super::accept_handler_tests::sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            FsStore::load(dir.path().join("blobs")).await.unwrap(),
+        );
+        let peer = SecretKey::from([71; 32]).public();
+        for port in 10000..10032 {
+            registry.remember_endpoint_hint(
+                peer,
+                iroh::TransportAddr::Ip(format!("192.0.2.1:{port}").parse().unwrap()),
+            );
+        }
+        let cfg = config::load().unwrap();
+        assert_eq!(cfg.endpoint_hints.len(), 1);
+        assert!(
+            cfg.endpoint_hints[0].addrs.len() <= 8,
+            "a peer's old paths must not accumulate indefinitely: {} retained",
+            cfg.endpoint_hints[0].addrs.len()
+        );
+        let info = registry
+            .transport
+            .warm_lookup
+            .get_endpoint_info(peer)
+            .unwrap();
+        let addr = info.into_endpoint_addr();
+        assert!(addr.addrs.len() <= 8);
+        endpoint.close().await;
+    }
 
     #[test]
     fn network_selector_accepts_public_key_and_invite_code() {

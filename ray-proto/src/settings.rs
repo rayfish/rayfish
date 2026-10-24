@@ -81,6 +81,7 @@ setting_keys! {
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
         Dns = "dns", "Magic DNS mode (on|partial|off)";
         QuicEngine = "quic-engine", "QUIC forwarding engine, applies on restart (standalone|fq-codel)";
+        EndpointHints = "endpoint-hints", "cached peer paths (set peers to forget; unset clears all)";
         DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders, including mesh peer IPv6 addresses (comma-separated)";
         AutoUpdate = "auto-update", "install new releases automatically (on|off)";
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";
@@ -97,10 +98,13 @@ setting_keys! {
 }
 
 impl GlobalKey {
-    /// Keys whose value is a list of peer identities, edited by `-identity`
-    /// entries. The daemon resolves hostnames in them, which the CLI cannot.
+    /// Keys whose input lists peer identities (optionally `-identity` edits).
+    /// The daemon resolves hostnames in them, which the CLI cannot.
     pub fn is_peer_list(self) -> bool {
-        matches!(self, Self::FileAutoAcceptPeers | Self::Blocked)
+        matches!(
+            self,
+            Self::FileAutoAcceptPeers | Self::Blocked | Self::EndpointHints
+        )
     }
 }
 

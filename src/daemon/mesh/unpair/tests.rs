@@ -412,7 +412,15 @@ async fn a_restart_during_cleanup_finishes_the_unpair() {
                     cert: saved,
                     phase: UnpairPhase::Cleanup,
                 });
-                cfg.endpoint_hints = vec![hint];
+                cfg.endpoint_hints.clear();
+                cfg.endpoint_hint_timestamps.clear();
+                crate::endpoint_hints::remember(
+                    &mut cfg.endpoint_hints,
+                    &mut cfg.endpoint_hint_timestamps,
+                    hint.id,
+                    hint.addrs.clone(),
+                    crate::endpoint_hints::now_secs(),
+                );
                 Ok(())
             })
             .unwrap();

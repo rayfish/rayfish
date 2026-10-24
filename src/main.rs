@@ -1083,6 +1083,9 @@ pub(crate) enum ConfigAction {
             add = complete::node_settings_keys()
         )]
         key: String,
+        /// Forget only this peer's endpoint hints (endpoint-hints key only)
+        #[arg(long)]
+        peer: Option<String>,
     },
 }
 
@@ -2177,12 +2180,31 @@ async fn cmd_config(action: Option<ConfigAction>) -> Result<()> {
             })
             .await
         }
-        ConfigAction::Unset { key } => {
-            ipc_mutate(ipc::IpcMessage::ConfigUnset {
-                key: parse_node_key(&key),
-            })
-            .await
+        ConfigAction::Unset { key, peer } => {
+            ipc_mutate(config_unset_request(parse_node_key(&key), peer)?).await
         }
+    }
+}
+
+fn config_unset_request(key: ipc::NodeKey, peer: Option<String>) -> Result<ipc::IpcMessage> {
+    match peer {
+        Some(peer) => {
+            anyhow::ensure!(
+                key == ipc::NodeKey::Global(ipc::GlobalKey::EndpointHints),
+                "--peer is only supported for endpoint-hints"
+            );
+            let peer = peer.trim();
+            anyhow::ensure!(
+                !peer.is_empty() && !peer.contains(',') && !peer.starts_with('-'),
+                "one peer name or identity is required"
+            );
+            Ok(ipc::IpcMessage::ConfigSet {
+                key,
+                value: peer.to_owned(),
+                replace: false,
+            })
+        }
+        None => Ok(ipc::IpcMessage::ConfigUnset { key }),
     }
 }
 
@@ -2273,6 +2295,51 @@ mod tests {
     use rayfish::update::{
         nightly_asset_name, normalize_version, release_asset_name, version_is_newer,
     };
+
+    #[test]
+    fn endpoint_hint_reset_accepts_one_peer_and_uses_authorized_config_ipc() {
+        let cli = Cli::try_parse_from([
+            "ray",
+            "config",
+            "unset",
+            "endpoint-hints",
+            "--peer",
+            "build-box",
+        ])
+        .unwrap();
+        let Command::Config {
+            action: Some(ConfigAction::Unset { key, peer }),
+            ..
+        } = cli.command
+        else {
+            panic!("expected config unset");
+        };
+        assert!(
+            matches!(config_unset_request(parse_node_key(&key), peer).unwrap(),
+            ipc::IpcMessage::ConfigSet { key: ipc::NodeKey::Global(ipc::GlobalKey::EndpointHints), value, replace: false } if value == "build-box")
+        );
+        assert!(matches!(
+            config_unset_request(ipc::NodeKey::Global(ipc::GlobalKey::EndpointHints), None)
+                .unwrap(),
+            ipc::IpcMessage::ConfigUnset { .. }
+        ));
+        for peer in ["", " ", "first,second", "-first"] {
+            assert!(
+                config_unset_request(
+                    ipc::NodeKey::Global(ipc::GlobalKey::EndpointHints),
+                    Some(peer.into())
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            config_unset_request(
+                ipc::NodeKey::Global(ipc::GlobalKey::Relay),
+                Some("build-box".into())
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn identityof_accepts_global_and_scoped_lookups() {

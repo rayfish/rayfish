@@ -683,6 +683,10 @@ pub struct AppConfig {
     /// before a pkarr lookup completes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoint_hints: Vec<iroh::EndpointAddr>,
+    /// Per-address authenticated observation times for the bootstrap cache.
+    /// Kept separate so older binaries can still read `endpoint_hints`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub endpoint_hint_timestamps: crate::endpoint_hints::HintTimestamps,
     /// Global toggle for the embedded mesh SSH server (`ray firewall ssh on`).
     /// When on, the daemon listens on each mesh IP's configured SSH port and admits peers
     /// authorized in a network's local or managed SSH allow list. Off by default.
@@ -824,6 +828,7 @@ impl Default for AppConfig {
             dns_mode: DnsMode::On,
             quic_engine: QuicEngine::default(),
             endpoint_hints: Vec::new(),
+            endpoint_hint_timestamps: Default::default(),
             ssh_enabled: false,
             ssh_port: default_ssh_port(),
             v4_bridge: true,
@@ -964,6 +969,8 @@ struct Settings {
     quic_engine: QuicEngine,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoint_hints: Vec<iroh::EndpointAddr>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    endpoint_hint_timestamps: crate::endpoint_hints::HintTimestamps,
     #[serde(default)]
     ssh_enabled: bool,
     #[serde(default = "default_ssh_port")]
@@ -1789,6 +1796,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         dns_mode: settings.dns_mode,
         quic_engine: settings.quic_engine,
         endpoint_hints: settings.endpoint_hints,
+        endpoint_hint_timestamps: settings.endpoint_hint_timestamps,
         ssh_enabled: settings.ssh_enabled,
         ssh_port: settings.ssh_port,
         v4_bridge: settings.v4_bridge,
@@ -1870,6 +1878,7 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
         dns_mode: config.dns_mode,
         quic_engine: config.quic_engine,
         endpoint_hints: config.endpoint_hints.clone(),
+        endpoint_hint_timestamps: config.endpoint_hint_timestamps.clone(),
         ssh_enabled: config.ssh_enabled,
         ssh_port: config.ssh_port,
         v4_bridge: config.v4_bridge,
@@ -3237,14 +3246,61 @@ name = "test"
         let dir = tmp.path();
         let hint =
             iroh::EndpointAddr::new(test_id(7)).with_ip_addr("203.0.113.7:41383".parse().unwrap());
-        let cfg = AppConfig {
+        let mut cfg = AppConfig {
             endpoint_hints: vec![hint.clone()],
             ..Default::default()
         };
+        crate::endpoint_hints::remember(
+            &mut cfg.endpoint_hints,
+            &mut cfg.endpoint_hint_timestamps,
+            hint.id,
+            hint.addrs.clone(),
+            crate::endpoint_hints::now_secs(),
+        );
         save_settings_in(dir, &cfg).unwrap();
 
         let loaded = load_in(dir).unwrap();
-        assert_eq!(loaded.endpoint_hints, vec![hint]);
+        assert_eq!(loaded.endpoint_hints, vec![hint.clone()]);
+        assert_eq!(
+            loaded.endpoint_hint_timestamps,
+            cfg.endpoint_hint_timestamps
+        );
+
+        // The address representation remains readable by the old settings
+        // schema; additive timestamp tables are ignored by older readers.
+        #[derive(Deserialize)]
+        struct LegacySettings {
+            endpoint_hints: Vec<iroh::EndpointAddr>,
+        }
+        let saved = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        let legacy: LegacySettings = toml::from_str(&saved).unwrap();
+        assert_eq!(legacy.endpoint_hints, vec![hint]);
+    }
+
+    #[test]
+    fn legacy_hints_load_without_becoming_new_observations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hint =
+            iroh::EndpointAddr::new(test_id(7)).with_ip_addr("203.0.113.7:41383".parse().unwrap());
+        save_settings_in(
+            tmp.path(),
+            &AppConfig {
+                endpoint_hints: vec![hint],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = tmp.path().join(SETTINGS_FILE);
+        let before = std::fs::read(&path).unwrap();
+        let cfg = load_in(tmp.path()).unwrap();
+        assert!(cfg.endpoint_hint_timestamps.is_empty());
+        let lookup = crate::endpoint_hints::WarmLookup::from_config(&cfg);
+        assert!(lookup.get_endpoint_info(test_id(7)).is_none());
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            before,
+            "readers must not write migrated settings"
+        );
     }
 
     /// The IPv6-only cutover deleted the `ipv6-only` setting, and the release

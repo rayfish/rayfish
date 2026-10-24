@@ -28,6 +28,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Cached peer paths expire after 24 hours and retain at most eight addresses per
+  peer. Legacy hints without observation times are discarded on startup.
+  `ray config get endpoint-hints` shows the remaining hints and their ages;
+  `ray config unset endpoint-hints --peer <name-or-id>` forgets one peer in memory
+  and on disk without a service restart. Omit `--peer` to clear the whole cache.
+
 - Denied network join requests stop retrying, including after restart, and show
   the coordinator denial in status. Invalid credentials and unavailable networks
   receive explicit replies.

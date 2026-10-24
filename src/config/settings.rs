@@ -53,6 +53,28 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
     let entries = super::parse_entries(value);
     let reset = entries.is_empty() || entries == ["n0"];
     match key {
+        GlobalKey::EndpointHints => {
+            if entries.is_empty() {
+                cfg.endpoint_hints.clear();
+                cfg.endpoint_hint_timestamps.clear();
+            } else {
+                anyhow::ensure!(!replace, "--replace does not apply to endpoint hints");
+                let peers: Vec<EndpointId> = entries
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .strip_prefix('-')
+                            .unwrap_or(entry)
+                            .parse()
+                            .context("invalid endpoint identity")
+                    })
+                    .collect::<Result<_>>()?;
+                cfg.endpoint_hints.retain(|hint| !peers.contains(&hint.id));
+                for peer in peers {
+                    cfg.endpoint_hint_timestamps.remove(&peer.to_string());
+                }
+            }
+        }
         GlobalKey::FileAutoAcceptPeers => apply_peer_list(
             &mut cfg.file_auto_accept_peers,
             &entries,
@@ -229,6 +251,7 @@ fn render_peer_list(list: &[EndpointId]) -> String {
 /// the compiler rejects a `GlobalKey` variant with no arm here.
 pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
     match key {
+        GlobalKey::EndpointHints => crate::endpoint_hints::render(cfg),
         GlobalKey::FileAutoAcceptPeers => render_peer_list(&cfg.file_auto_accept_peers),
         GlobalKey::Blocked => render_peer_list(&cfg.blocked),
         GlobalKey::Inbound => cfg.inbound.as_ref().to_string(),
