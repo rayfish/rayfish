@@ -741,7 +741,7 @@ pub(crate) enum Command {
     Pair {
         #[command(subcommand)]
         action: Option<PairAction>,
-        /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
+        /// Pairing ticket from the primary device (shorthand for `ray pair accept <ticket>`)
         ticket: Option<String>,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
@@ -1387,7 +1387,7 @@ pub(crate) enum ExitNodeAction {
 pub(crate) enum FilesAction {
     /// Accept a pending file transfer
     Accept {
-        /// Transfer ID (from 'rayfish files')
+        /// Transfer ID (from 'ray files')
         #[arg(add = complete::incoming_files())]
         id: u64,
         /// Output directory (default: ~/Downloads)

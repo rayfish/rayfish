@@ -40,15 +40,15 @@ impl DisplayOut for PairedDevicesOutput<'_> {
 
 pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<()> {
     match (action, ticket) {
-        // `rayfish pair <ticket>` shorthand
+        // `ray pair <ticket>` shorthand
         (None, Some(ticket)) | (Some(PairAction::Accept { ticket }), _) => {
             ipc_pair_accept(&ticket).await
         }
-        // `rayfish pair list`
+        // `ray pair list`
         (Some(PairAction::List), _) => ipc_pair_list().await,
-        // `rayfish pair`: start pairing on primary device
+        // `ray pair`: start pairing on primary device
         (None, None) => ipc_pair_start().await,
-        // `rayfish pair backup`
+        // `ray pair backup`
         (
             Some(PairAction::Backup {
                 onepassword,
@@ -57,7 +57,7 @@ pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>)
             }),
             _,
         ) => cmd_pair_backup(onepassword, vault.as_deref(), &item).await,
-        // `rayfish pair restore <backup>`
+        // `ray pair restore <backup>`
         (
             Some(PairAction::Restore {
                 backup,
@@ -81,7 +81,7 @@ pub(crate) async fn ipc_pair_start() -> Result<()> {
             qr2term::print_qr(&ticket).ok();
             println!();
             println!("On the other device, run:");
-            println!("  rayfish pair {}", ticket);
+            println!("  ray pair {}", ticket);
             println!();
             println!("Waiting for device to connect (this ticket expires in 5 minutes)...");
             // The daemon handles the pairing asynchronously via the accept loop.
