@@ -65,6 +65,19 @@ pub(crate) fn evict_oldest_connect(
     Some(oldest)
 }
 
+/// Marks a peer's connect retry loop as running until the loop ends, however
+/// it ends.
+struct RetryRunning {
+    retries: Arc<DashSet<EndpointId>>,
+    peer: EndpointId,
+}
+
+impl Drop for RetryRunning {
+    fn drop(&mut self) {
+        self.retries.remove(&self.peer);
+    }
+}
+
 struct ConnectDecision {
     reply: control::ConnectMsg,
     rejection: Option<Instant>,
@@ -82,6 +95,9 @@ pub(crate) struct ConnectService {
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
     pub(crate) outgoing_connects: DashSet<EndpointId>,
+    /// Peers with a connect retry loop running, so asking again while one
+    /// waits for approval does not start a second loop for the same peer.
+    connect_retries: Arc<DashSet<EndpointId>>,
     /// Rejected requests remain terminal when a cooperative requester polls.
     rejected_connects: DashMap<EndpointId, Instant>,
     connect_decision_lock: Mutex<()>,
@@ -106,6 +122,7 @@ impl ConnectService {
             pending_connects: DashMap::new(),
             approved_connects: DashMap::new(),
             outgoing_connects: DashSet::new(),
+            connect_retries: Arc::new(DashSet::new()),
             rejected_connects: DashMap::new(),
             connect_decision_lock: Mutex::new(()),
             connection_errors: DashMap::new(),
@@ -320,13 +337,23 @@ impl ConnectService {
     }
 
     /// Retry a pending connect request on a backoff until approved/denied.
+    /// One loop per peer: while one runs, a repeated `ray connect` to the same
+    /// peer starts nothing and returns `None`.
     pub(crate) fn spawn_connect_retry(
         self: &Arc<Self>,
         peer: EndpointId,
         hostname: Option<String>,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.connect_retries.insert(peer) {
+            return None;
+        }
         let me = Arc::clone(self);
-        tokio::spawn(async move {
+        let running = RetryRunning {
+            retries: Arc::clone(&self.connect_retries),
+            peer,
+        };
+        Some(tokio::spawn(async move {
+            let _running = running;
             let mut backoff = BACKOFF_INITIAL;
             loop {
                 tokio::select! {
@@ -361,7 +388,7 @@ impl ConnectService {
                     _ => {} // Pending or transient error, keep retrying.
                 }
             }
-        });
+        }))
     }
 
     /// List pending incoming `ray connect` requests awaiting approval.
@@ -462,7 +489,8 @@ impl ConnectService {
         let already = self
             .approved_connects
             .get(&from_endpoint)
-            .map(|r| *r.value());
+            .map(|r| *r.value())
+            .or_else(|| self.coordinated_direct_network_with(from_endpoint));
         let rejection = self
             .rejected_connects
             .get(&from_endpoint)
@@ -504,6 +532,22 @@ impl ConnectService {
             control::ConnectMsg::Pending
         };
         Ok(ConnectDecision { reply, rejection })
+    }
+
+    /// The approval a restart forgot: `approved_connects` lives in memory, but
+    /// the direct network this node minted for `peer` is saved. While it
+    /// exists, a retry from `peer` is answered with it rather than queued as a
+    /// new request that `approve` would then call already connected.
+    fn coordinated_direct_network_with(
+        &self,
+        peer: EndpointId,
+    ) -> Option<(EndpointId, EndpointId)> {
+        let name = self.registry.existing_direct_network_with(&peer)?;
+        let handle = self.registry.networks.get(&name)?;
+        handle
+            .role
+            .is_coordinator()
+            .then(|| (handle.network_key, self.transport.endpoint.id()))
     }
 
     fn reject_pending_with(
@@ -816,6 +860,109 @@ mod pending_connect_cap_tests {
             assert!(matches!(decision.reply, control::ConnectMsg::Denied { .. }));
             assert!(service.pending_connects.is_empty());
         });
+        endpoint.close().await;
+    }
+
+    /// A connect service over a fresh endpoint and config tree in `tmp`.
+    async fn test_service(tmp: &std::path::Path) -> (Endpoint, Arc<ConnectService>) {
+        config::set_thread_config_dir(tmp.join("config"));
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let store = FsStore::load(tmp.join("blobs")).await.unwrap();
+        let registry = crate::daemon::accept_handler_tests::sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            store,
+        );
+        (endpoint, Arc::new(ConnectService::new(registry)))
+    }
+
+    /// Asking again while a request waits for approval must not start a second
+    /// endless retry loop for the same peer; once the loop ends, a new one can.
+    #[tokio::test]
+    async fn one_connect_retry_loop_per_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        let peer = eid(7);
+        let first = service
+            .spawn_connect_retry(peer, None)
+            .expect("the first request starts a loop");
+        assert!(service.spawn_connect_retry(peer, None).is_none());
+        let other = service
+            .spawn_connect_retry(eid(8), None)
+            .expect("another peer gets its own loop");
+        service.registry.shutdown_token.cancel();
+        first.await.unwrap();
+        other.await.unwrap();
+        let again = service
+            .spawn_connect_retry(peer, None)
+            .expect("a finished loop frees its peer");
+        again.await.unwrap();
+        endpoint.close().await;
+    }
+
+    /// The approver restarted after minting the direct network, so its
+    /// in-memory approval is gone. The requester's retry still gets the
+    /// network instead of waiting forever behind a new pending request.
+    #[tokio::test]
+    async fn a_retry_after_the_approver_restarts_gets_the_saved_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        let requester = eid(42);
+        config::save_network(&config::NetworkConfig {
+            name: "me-them".to_string(),
+            direct: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let state = crate::daemon::accept_handler_tests::hold_network(
+            &service.registry,
+            "me-them",
+            NetworkRole::Coordinator,
+            Vec::new(),
+            vec![crate::membership::ApprovedEntry {
+                identity: requester,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+            }],
+        );
+        let network_key = state.read().unwrap().network_public_key;
+
+        let decision = service.connect_reply(requester, None, false).unwrap();
+        assert!(
+            matches!(
+                decision.reply,
+                control::ConnectMsg::Approved { room_id, coordinator }
+                    if room_id == network_key && coordinator == endpoint.id()
+            ),
+            "{:?}",
+            decision.reply
+        );
+        assert!(service.pending_connects.is_empty());
+        endpoint.close().await;
+    }
+
+    /// A finished delivery does not leave its recipient's lock behind.
+    #[tokio::test]
+    async fn invite_delivery_locks_are_dropped_when_idle() {
+        use crate::daemon::invite_delivery::Mint;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        for seed in 1..=3 {
+            // No such network here, so each delivery fails at once.
+            let delivered = service
+                .deliver_locked("missing", eid(seed), Mint::Never)
+                .await;
+            assert!(delivered.is_err());
+        }
+        assert!(service.delivery_locks.is_empty());
         endpoint.close().await;
     }
 

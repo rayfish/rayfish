@@ -975,7 +975,6 @@ pub struct Daemon {
     connect: Arc<ConnectService>,
     /// Delegated machine enrollment and direct management protocol.
     management: Arc<ManagementService>,
-    device_cert: Option<control::DeviceCert>,
     /// Whether the VPN is currently active (TUN up, networks connected) or on
     /// standby. Toggled by the `Up`/`Down` IPC commands.
     active: Arc<AtomicBool>,
@@ -1102,6 +1101,9 @@ impl Daemon {
         // that rebuilds a daemon in the same process keeps the whole dead service
         // alive; see `DnsService::shutdown_background`.
         self.dns.shutdown_background();
+        // Accept handlers hold the registry, which owns the manager they are
+        // registered on; drop them so the registry can go with the daemon.
+        self.registry.conn.unregister_all();
         let (router_result, ()) =
             tokio::join!(self.router.shutdown(), self.transport.endpoint.close(),);
         if let Err(error) = router_result {
@@ -1372,6 +1374,23 @@ impl Daemon {
             hostname.to_string()
         };
 
+        // Persist to config first, so a failed save changes nothing. A member
+        // also records the rename as a durable pending intent so it keeps
+        // being delivered to a coordinator across reconnects/restarts until the
+        // signed blob confirms it; a coordinator publishes authoritatively, so
+        // it clears any pending intent.
+        if let Err(error) = config::update_network(network, |net| {
+            net.my_hostname = Some(new_hostname.clone());
+            net.pending_hostname = if is_coord {
+                None
+            } else {
+                Some(new_hostname.clone())
+            };
+            Ok(())
+        }) {
+            return ipc_err(format!("could not save hostname: {error:#}"));
+        }
+
         // Update our own member entry.
         if let Ok(mut s) = state.write()
             && let Some(me) = s.members.get_mut(&my_identity)
@@ -1395,20 +1414,6 @@ impl Daemon {
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
-
-        // Persist to config. A member also records the rename as a durable
-        // pending intent so it keeps being delivered to a coordinator across
-        // reconnects/restarts until the signed blob confirms it; a coordinator
-        // publishes authoritatively, so it clears any pending intent.
-        let _ = config::update_network(network, |net| {
-            net.my_hostname = Some(new_hostname.clone());
-            net.pending_hostname = if is_coord {
-                None
-            } else {
-                Some(new_hostname.clone())
-            };
-            Ok(())
-        });
 
         // Fast-path the rename to connected peers via `MeshHello`, regardless of
         // role. A peer *coordinator* only learns a self-rename this way: it acts
@@ -2114,7 +2119,7 @@ pub(crate) mod accept_handler_tests {
     use std::sync::Arc;
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
-    fn make_network_state() -> SharedNetworkState {
+    pub(crate) fn make_network_state() -> SharedNetworkState {
         let net_secret = SecretKey::from_bytes(&[1u8; 32]);
         let net_pub = net_secret.public();
         Arc::new(RwLock::new(NetworkState {
@@ -2646,6 +2651,32 @@ pub(crate) mod accept_handler_tests {
         endpoint.close().await;
     }
 
+    /// Pairing or unpairing at runtime changes which file senders count as our
+    /// own devices, without a restart.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn own_device_sender_follows_pairing_at_runtime() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let me = endpoint.id();
+        let files = FileService::new(
+            SecretKey::generate(),
+            Arc::clone(&registry.transport),
+            Arc::clone(&registry),
+            registry.device_user_map.clone(),
+            Arc::new(transfers::TransferRegistry::new()),
+        );
+        let user = SecretKey::from_bytes(&[9u8; 32]);
+        let sibling = SecretKey::generate().public();
+        registry.device_user_map.insert(sibling, user.public());
+        assert!(!files.is_own_device_sender(sibling));
+        crate::identity::store_device_cert(&control::DeviceCert::create(&user, &me, 0)).unwrap();
+        assert!(files.is_own_device_sender(sibling));
+        crate::identity::delete_device_cert().unwrap();
+        assert!(!files.is_own_device_sender(sibling));
+        endpoint.close().await;
+    }
+
     /// Serializes a test that points `RAYFISH_CONFIG_DIR` at a temp dir and
     /// restores it on drop, even if the test panics.
     struct TestConfigDir {
@@ -2697,7 +2728,7 @@ pub(crate) mod accept_handler_tests {
     }
 
     /// Register a member-role network holding `members` and `approved`.
-    fn hold_network(
+    pub(crate) fn hold_network(
         registry: &NetworkRegistry,
         name: &str,
         role: NetworkRole,
@@ -2746,6 +2777,53 @@ pub(crate) mod accept_handler_tests {
             IrohIdentityProvider::new(endpoint.id()),
             store,
         )
+    }
+
+    /// A short id resolves only when it names one peer. Empty and ambiguous
+    /// prefixes resolve to nothing, while a peer seen on two networks is still
+    /// one peer.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn short_id_resolution_rejects_empty_and_ambiguous_prefixes() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        // Two peers whose ids share a first character, and one that does not.
+        let ids: Vec<EndpointId> = (1..=u8::MAX)
+            .map(|seed| SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let first = |id: &EndpointId| id.to_string().chars().next().unwrap();
+        let alice = ids[0];
+        let bob = *ids[1..]
+            .iter()
+            .find(|id| first(id) == first(&alice))
+            .unwrap();
+        let carol = *ids.iter().find(|id| first(id) != first(&alice)).unwrap();
+        hold_network(
+            &registry,
+            "home",
+            NetworkRole::Member,
+            vec![seated(alice), seated(bob), seated(carol)],
+            Vec::new(),
+        );
+        hold_network(
+            &registry,
+            "work",
+            NetworkRole::Member,
+            vec![seated(carol)],
+            Vec::new(),
+        );
+        let shared = first(&alice).to_string();
+        assert_eq!(registry.resolve_short_id_any_network(&shared), None);
+        assert_eq!(registry.resolve_short_id_any_network(""), None);
+        assert_eq!(
+            registry.resolve_short_id_any_network(&alice.to_string()),
+            Some(alice)
+        );
+        assert_eq!(
+            registry.resolve_short_id_any_network(&first(&carol).to_string()),
+            Some(carol)
+        );
+        endpoint.close().await;
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -4001,7 +4079,6 @@ pub(crate) mod accept_handler_tests {
                 SecretKey::generate(),
                 Arc::clone(&registry.transport),
                 Arc::clone(&registry),
-                None,
                 registry.device_user_map.clone(),
                 Arc::new(transfers::TransferRegistry::new()),
             )),
@@ -4014,11 +4091,11 @@ pub(crate) mod accept_handler_tests {
             Arc::clone(&registry.conn),
         ));
         router.set_mesh_dispatch(MeshDispatch {
-            ctx: registry.mesh_ctx(),
+            registry: Arc::downgrade(&registry),
             token: registry.shutdown_token.clone(),
             on_peer_connected: Arc::new(|_| {}),
         });
-        registry.set_protocol_router(router);
+        registry.set_protocol_router(&router);
         let targets = ["net-a", "net-b"].map(|network| DialTarget {
             network: network.to_string(),
             network_key: SecretKey::generate().public(),
@@ -4302,7 +4379,7 @@ pub(crate) mod accept_handler_tests {
         };
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
-            ctx: mesh_ctx(),
+            registry: Arc::downgrade(registry),
             token: CancellationToken::new(),
             on_peer_connected: Arc::new(|_| {}),
         });
@@ -4628,6 +4705,51 @@ pub(crate) mod accept_handler_tests {
             recorded,
             "sync_exit_offers did not get the offer recorded on the coordinator over the retained connection"
         );
+    }
+
+    /// A hostname that cannot be saved is reported, and the running network
+    /// keeps its old name instead of drifting from the saved config.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_hostname_reports_a_failed_save() {
+        let env = TestConfigDir::new();
+        let daemon = build_headless(false).await.unwrap();
+        let state = make_network_state();
+        let me = daemon.transport.endpoint.id();
+        state.write().unwrap().members.add(seated(me));
+        let network_key = state.read().unwrap().network_public_key;
+        daemon.registry.networks.insert(
+            "test-net".into(),
+            NetworkHandle {
+                name: "test-net".into(),
+                network_key,
+                role: NetworkRole::Member,
+                state: Arc::clone(&state),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
+            },
+        );
+        // A directory where the network's file belongs makes the save fail.
+        std::fs::create_dir_all(env.dir.path().join("networks/test-net.toml")).unwrap();
+        let before = state
+            .read()
+            .unwrap()
+            .members
+            .get(&me)
+            .unwrap()
+            .hostname
+            .clone();
+        let reply = daemon.set_hostname("test-net", "renamed").await;
+        assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+        assert_eq!(
+            state.read().unwrap().members.get(&me).unwrap().hostname,
+            before
+        );
+        daemon.registry.networks.remove("test-net");
+        daemon.shutdown_and_close().await;
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -5344,6 +5466,34 @@ mod headless_tests {
     ///
     /// See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
     /// only serializes tests and guards no data across the awaits.
+    /// A mobile rebuild drops the old daemon. Nothing it built may keep its
+    /// registry alive afterwards through a reference cycle.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_close_frees_the_registry() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon = build_headless(false).await.unwrap();
+        let registry = Arc::downgrade(&daemon.registry);
+        daemon.shutdown_and_close().await;
+        drop(daemon);
+        // Background tasks end on their own after shutdown and drop their
+        // clones as they go; wait for that rather than guessing a delay.
+        let freed = tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.strong_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            freed.is_ok(),
+            "{} references still hold the registry",
+            registry.strong_count()
+        );
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_and_close_releases_the_blob_store_for_a_rebuild() {

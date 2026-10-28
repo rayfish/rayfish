@@ -47,6 +47,24 @@ pub(super) enum Mint {
     Never,
 }
 
+/// One delivery's share of its recipient's lock. Dropping the last share,
+/// however the delivery ends, removes the lock from the map.
+struct DeliveryLock<'a> {
+    locks: &'a DashMap<EndpointId, Arc<AsyncMutex<()>>>,
+    recipient: EndpointId,
+    lock: Arc<AsyncMutex<()>>,
+}
+
+impl Drop for DeliveryLock<'_> {
+    fn drop(&mut self) {
+        // Ours and the map's: nobody else holds or waits on it. A delivery
+        // starting now takes its clone under the same shard lock this check
+        // holds, so it either keeps the entry or makes a fresh one.
+        self.locks
+            .remove_if(&self.recipient, |_, lock| Arc::strong_count(lock) <= 2);
+    }
+}
+
 impl ConnectService {
     /// `InviteDeliver`: deliver (or reuse and redeliver) an invite to
     /// `recipient` for `network`.
@@ -60,7 +78,8 @@ impl ConnectService {
     }
 
     /// One delivery per recipient at a time, so a slow dial to one recipient
-    /// never holds up another.
+    /// never holds up another. A recipient's lock is dropped from the map once
+    /// no delivery holds or waits on it.
     pub(super) async fn deliver_locked(
         &self,
         network: &str,
@@ -73,7 +92,12 @@ impl ConnectService {
                 .entry(recipient)
                 .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
         );
-        let _guard = lock.lock().await;
+        let held = DeliveryLock {
+            locks: &self.delivery_locks,
+            recipient,
+            lock,
+        };
+        let _guard = held.lock.lock().await;
         self.deliver_inner(network, recipient, mint).await
     }
 

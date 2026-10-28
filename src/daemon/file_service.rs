@@ -456,8 +456,6 @@ pub(crate) struct FileService {
     transport: Arc<Transport>,
     /// The network-owning service, for the own-device auto-accept membership gate.
     registry: Arc<NetworkRegistry>,
-    /// This device's cert (if paired), to resolve our own user identity.
-    device_cert: Option<control::DeviceCert>,
     /// Transport-key → user-identity map, to resolve a file sender's owner.
     device_user_map: peers::DeviceUserMap,
     /// In-flight transfers, for progress reporting.
@@ -477,7 +475,6 @@ impl FileService {
         secret_key: SecretKey,
         transport: Arc<Transport>,
         registry: Arc<NetworkRegistry>,
-        device_cert: Option<control::DeviceCert>,
         device_user_map: peers::DeviceUserMap,
         transfers: Arc<transfers::TransferRegistry>,
     ) -> Self {
@@ -516,7 +513,6 @@ impl FileService {
             secret_key,
             transport,
             registry,
-            device_cert,
             device_user_map,
             transfers,
             outbox: Arc::new(Mutex::new(queued)),
@@ -688,12 +684,7 @@ impl FileService {
     /// node uses its endpoint id as its own user identity, so a stranger can
     /// never match. Shared by `try_auto_accept_file` and `list_files`.
     pub(crate) fn is_own_device_sender(&self, from: EndpointId) -> bool {
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.transport.endpoint.id());
-        self.device_user_map.resolve(&from) == own_user
+        self.device_user_map.resolve(&from) == self.registry.own_identity()
     }
 
     pub(crate) fn should_auto_accept_file(&self, from: EndpointId) -> bool {
@@ -960,13 +951,9 @@ impl FileService {
         }
     }
 
-    /// This device's pairing cert. On-disk authoritative (a cleanly-absent file
-    /// means unpaired); only a genuine read error falls back to the boot copy.
+    /// This device's pairing cert, as the registry currently holds it.
     fn current_device_cert(&self) -> Option<control::DeviceCert> {
-        match identity::load_device_cert() {
-            Ok(cert) => cert,
-            Err(_) => self.device_cert.clone(),
-        }
+        self.registry.current_device_cert()
     }
 
     /// `ray pair list`: enumerate this user's other paired devices as roster
@@ -1990,7 +1977,6 @@ mod tests {
             SecretKey::generate(),
             Arc::clone(&registry.transport),
             registry,
-            None,
             peers::DeviceUserMap::new(),
             Arc::new(transfers::TransferRegistry::new()),
         ))

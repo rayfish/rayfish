@@ -643,7 +643,6 @@ async fn build_daemon_inner(
         key.clone(),
         Arc::clone(&transport),
         Arc::clone(&registry),
-        device_cert.clone(),
         device_user_map.clone(),
         Arc::clone(&transfers),
     ));
@@ -679,7 +678,7 @@ async fn build_daemon_inner(
     ));
     // The registry (re)connect paths drive a dialed connection's demux through the
     // router; install it now that it exists (the registry was built before it).
-    registry.set_protocol_router(Arc::clone(&protocol_router));
+    registry.set_protocol_router(&protocol_router);
     // Single daemon-wide connection supervisor: consumes every data reader's
     // disconnect and, per dropped identity, prunes departed peers we coordinate and
     // reconnects the rest across all their shared networks. Spawned here (not in
@@ -713,20 +712,23 @@ async fn build_daemon_inner(
     // `Option`. Dispatch must be installed before the accept loop starts handing
     // out connections, hence the order.
     protocol_router.set_mesh_dispatch(MeshDispatch {
-        ctx: registry.mesh_ctx(),
+        registry: Arc::downgrade(&registry),
         token: token.clone(),
         on_peer_connected: {
             // Deliver queued `ray send` offers the moment their peer connects.
-            let files = Arc::clone(&files);
-            let registry = Arc::clone(&registry);
+            // Weak, as the dispatch is: the registry owns it.
+            let files = Arc::downgrade(&files);
+            let registry = Arc::downgrade(&registry);
             Arc::new(move |peer| {
+                let (Some(files), Some(registry)) = (files.upgrade(), registry.upgrade()) else {
+                    return;
+                };
                 if registry
                     .current_device_cert()
                     .is_some_and(|cert| cert.user_identity == peer)
                 {
                     registry.poll_nudge.notify_waiters();
                 }
-                let files = Arc::clone(&files);
                 tokio::spawn(async move { files.flush_outbox_for(peer).await });
             })
         },
@@ -804,7 +806,6 @@ async fn build_daemon_inner(
         transfers,
         connect,
         management,
-        device_cert,
         active: Arc::clone(&active),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),

@@ -516,7 +516,7 @@ impl Daemon {
                 confirm,
             } => self.registry.kick_member(&network, &peer, confirm).await,
             IpcMessage::Status => self.status(),
-            IpcMessage::Report => self.build_report(peer.as_ref()),
+            IpcMessage::Report => self.build_report(peer.as_ref()).await,
             IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {

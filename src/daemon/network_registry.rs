@@ -18,7 +18,7 @@ use iroh::TransportAddr;
 use iroh::endpoint::PathEvent;
 use iroh_dns::pkarr::SignedPacket;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
@@ -173,9 +173,10 @@ pub(crate) struct NetworkRegistry {
     /// The TUN interface name, shared with the daemon (which sets it once the TUN
     /// is up), for refreshing DNS search domains after a network is torn down.
     pub(crate) tun_name: Arc<ArcSwap<String>>,
-    /// This device's cert loaded at boot, the in-memory fallback for the paired
-    /// check when the on-disk cert read errors (see [`Self::current_device_cert`]).
-    pub(crate) device_cert: Option<control::DeviceCert>,
+    /// This device's cert as last read from disk (seeded at boot), the
+    /// in-memory fallback for the paired check when the on-disk cert read
+    /// errors (see [`Self::current_device_cert`]).
+    pub(crate) device_cert: ArcSwapOption<control::DeviceCert>,
     /// Daemon-wide shutdown token; each network's cancel is a child of it.
     pub(crate) shutdown_token: CancellationToken,
     /// Per-device firewall, threaded into the [`MeshCtx`] handler bundle.
@@ -198,8 +199,9 @@ pub(crate) struct NetworkRegistry {
     /// The inbound QUIC router, needed to drive a freshly (re)dialed connection's
     /// control demux. Built after the registry (it depends on FileService /
     /// ConnectService, which depend on the registry), so it is set once at boot
-    /// via [`Self::set_protocol_router`] rather than passed to `new`.
-    protocol_router: OnceLock<Arc<ProtocolRouter>>,
+    /// via [`Self::set_protocol_router`] rather than passed to `new`. Weak: the
+    /// router's services hold this registry, and the daemon owns the router.
+    protocol_router: OnceLock<Weak<ProtocolRouter>>,
     /// On-demand mode: run the per-connection idle timer that closes a link idle
     /// past [`idle_timeout`](Self::idle_timeout), and never auto-reconnect an
     /// idle-closed peer (re-dialing is lazy). See [`Daemon::on_demand`](crate::daemon::Daemon).
@@ -393,7 +395,7 @@ impl NetworkRegistry {
             conn,
             dns,
             tun_name,
-            device_cert,
+            device_cert: ArcSwapOption::from(device_cert.map(Arc::new)),
             shutdown_token,
             firewall,
             device_user_map,
@@ -552,15 +554,14 @@ impl NetworkRegistry {
     /// Install the inbound QUIC router. Called once at boot after the router is
     /// built; the network (re)connect paths use it to drive a dialed connection's
     /// control demux.
-    pub(crate) fn set_protocol_router(&self, router: Arc<ProtocolRouter>) {
-        let _ = self.protocol_router.set(router);
+    pub(crate) fn set_protocol_router(&self, router: &Arc<ProtocolRouter>) {
+        let _ = self.protocol_router.set(Arc::downgrade(router));
     }
 
-    /// The inbound QUIC router (panics if used before [`Self::set_protocol_router`]).
-    pub(crate) fn protocol_router(&self) -> &Arc<ProtocolRouter> {
-        self.protocol_router
-            .get()
-            .expect("protocol_router set at boot")
+    /// The inbound QUIC router, or `None` before [`Self::set_protocol_router`]
+    /// and once the daemon that owns it is gone.
+    pub(crate) fn protocol_router(&self) -> Option<Arc<ProtocolRouter>> {
+        self.protocol_router.get().and_then(Weak::upgrade)
     }
 
     /// Build the [`MeshCtx`] handler bundle from the registry's own handles. This
@@ -668,11 +669,18 @@ impl NetworkRegistry {
 
     /// This device's pairing cert. The on-disk cert is authoritative: a cleanly
     /// absent file (`Ok(None)`, e.g. after `unpair_self` deletes it) means
-    /// unpaired, so only a genuine read error falls back to the in-memory copy.
+    /// unpaired, so only a genuine read error falls back to the in-memory copy,
+    /// which every successful read refreshes so it follows pairing and unpairing
+    /// at runtime.
     pub(crate) fn current_device_cert(&self) -> Option<control::DeviceCert> {
         match identity::load_device_cert() {
-            Ok(cert) => cert,
-            Err(_) => self.device_cert.clone(),
+            Ok(cert) => {
+                if self.device_cert.load().as_deref() != cert.as_ref() {
+                    self.device_cert.store(cert.clone().map(Arc::new));
+                }
+                cert
+            }
+            Err(_) => self.device_cert.load().as_deref().cloned(),
         }
     }
 
@@ -1735,23 +1743,33 @@ impl NetworkRegistry {
     }
 
     /// Resolve `"self"` or a short / prefix endpoint id against every network's
-    /// roster to a full endpoint id.
+    /// roster to a full endpoint id. As with
+    /// [`MemberList::resolve_peer_selector`], a prefix must name exactly one
+    /// peer: an empty or ambiguous one resolves to nothing rather than to
+    /// whichever peer the scan meets first.
     pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
         if short == "self" {
             return Some(self.transport.endpoint.id());
         }
+        if short.is_empty() {
+            return None;
+        }
+        let mut found = None;
         for entry in self.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state
-                .members
-                .all()
-                .iter()
-                .find(|m| m.identity.to_string().starts_with(short))
-            {
-                return Some(m.identity);
+            for member in state.members.all() {
+                if !member.identity.to_string().starts_with(short) {
+                    continue;
+                }
+                match found {
+                    None => found = Some(member.identity),
+                    // The same peer on another network is still one peer.
+                    Some(identity) if identity == member.identity => {}
+                    Some(_) => return None,
+                }
             }
         }
-        None
+        found
     }
 
     /// Verified memberships for authorization, independent of transport handles.
