@@ -2,7 +2,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -153,26 +154,12 @@ fn prepare_ray_args(mut args: Vec<String>, json: bool) -> Result<Vec<String>> {
 fn run_ray_command(exe: &std::path::Path, args: Vec<String>) -> Result<RunResponse> {
     #[cfg(target_os = "linux")]
     let args = inherit_instance(args, rayfish::instance::is_rootless());
-    let mut child = ProcessCommand::new(exe)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut command = ProcessCommand::new(exe);
+    command.args(&args);
+    let output = run_with_timeout(command, COMMAND_TIMEOUT)
         .with_context(|| format!("running ray {}", args.join(" ")))?;
 
-    // ponytail: fixed timeout; add streaming/cancel controls if long-running commands need them.
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
-    let (output, timed_out) = loop {
-        if child.try_wait()?.is_some() {
-            break (child.wait_with_output()?, false);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            break (child.wait_with_output()?, true);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-
+    let timed_out = output.timed_out;
     let status = output
         .status
         .code()
@@ -185,6 +172,71 @@ fn run_ray_command(exe: &std::path::Path, args: Vec<String>) -> Result<RunRespon
         stderr: clamp_output(String::from_utf8_lossy(&output.stderr).into_owned()),
         timed_out,
     })
+}
+
+struct TimedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+/// Runs `command` with piped output, killing it after `timeout`.
+///
+/// Both pipes are drained on their own threads while the child runs. A child
+/// that writes more than the pipe buffer (64 KiB on Linux) would otherwise
+/// block on write and never exit, so it would always hit the timeout.
+fn run_with_timeout(mut command: ProcessCommand, timeout: Duration) -> Result<TimedOutput> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+
+    // ponytail: fixed timeout; add streaming/cancel controls if long-running commands need them.
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            // The child may exit between the check and the kill; `wait` below
+            // reports whichever status it ended with.
+            if let Err(err) = child.kill() {
+                tracing::debug!("killing timed-out command: {err}");
+            }
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok(TimedOutput {
+        status,
+        stdout: join_drain(stdout)?,
+        stderr: join_drain(stderr)?,
+        timed_out,
+    })
+}
+
+type Drain = Option<JoinHandle<std::io::Result<Vec<u8>>>>;
+
+fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
+    pipe.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            pipe.read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+    })
+}
+
+fn join_drain(handle: Drain) -> Result<Vec<u8>> {
+    match handle {
+        Some(handle) => Ok(handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("output reader thread panicked"))??),
+        None => Ok(Vec::new()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -350,6 +402,23 @@ mod tests {
                 assert_eq!(inherit_instance(args.clone(), rootless), args);
             }
         }
+    }
+
+    /// Output larger than the pipe buffer must not stall the child until the
+    /// timeout: the pipes are drained while it runs.
+    #[cfg(unix)]
+    #[test]
+    fn large_output_does_not_block_the_child() {
+        let mut command = ProcessCommand::new("sh");
+        command.args([
+            "-c",
+            "head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2",
+        ]);
+        let output = run_with_timeout(command, Duration::from_secs(30)).unwrap();
+        assert!(!output.timed_out);
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 300_000);
+        assert_eq!(output.stderr.len(), 300_000);
     }
 
     #[test]
