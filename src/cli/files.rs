@@ -330,6 +330,60 @@ pub(crate) async fn peer_list(key: GlobalKey) -> Result<Vec<String>> {
         .collect())
 }
 
+/// `ray files auto-accept list`: a JSON array, or one peer per line.
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct PeerListOutput(Vec<String>);
+
+impl DisplayOut for PeerListOutput {
+    fn print_human(&self) {
+        for peer in &self.0 {
+            println!("{peer}");
+        }
+    }
+}
+
+/// `ray files download-dir`: `null` in JSON when unset.
+#[derive(serde::Serialize)]
+struct DownloadDirOutput<'a> {
+    download_dir: Option<&'a str>,
+}
+
+impl DisplayOut for DownloadDirOutput<'_> {
+    fn print_human(&self) {
+        println!("download-dir = {}", self.download_dir.unwrap_or("<unset>"));
+    }
+}
+
+/// `ray files download-user`: the uid, `null` in JSON when unset.
+#[derive(serde::Serialize)]
+struct DownloadUserOutput {
+    download_user: Option<u32>,
+}
+
+impl DownloadUserOutput {
+    /// The settings row renders the uid as text, empty when unset.
+    fn parse(row: &str) -> Result<Self> {
+        let download_user = match row {
+            "" => None,
+            uid => Some(
+                uid.parse()
+                    .with_context(|| format!("daemon reported an invalid download-user '{uid}'"))?,
+            ),
+        };
+        Ok(Self { download_user })
+    }
+}
+
+impl DisplayOut for DownloadUserOutput {
+    fn print_human(&self) {
+        match self.download_user {
+            Some(uid) => println!("download-user = uid {uid}"),
+            None => println!("download-user = <unset>"),
+        }
+    }
+}
+
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     // These subcommands change (or read) global settings the daemon owns. They
     // route through the daemon so the write lands in the config dir the daemon
@@ -343,12 +397,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         return match action {
             crate::FilesAutoAcceptAction::Add { peer } => edit_peer_list(key, peer, false).await,
             crate::FilesAutoAcceptAction::Remove { peer } => edit_peer_list(key, peer, true).await,
-            crate::FilesAutoAcceptAction::List => {
-                for peer in peer_list(key).await? {
-                    println!("{peer}");
-                }
-                Ok(())
-            }
+            crate::FilesAutoAcceptAction::List => printout(&PeerListOutput(peer_list(key).await?)),
         };
     }
     match &action {
@@ -374,11 +423,9 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 .await;
             }
             let dir = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await?;
-            println!(
-                "download-dir = {}",
-                if dir.is_empty() { "<unset>" } else { &dir }
-            );
-            return Ok(());
+            return printout(&DownloadDirOutput {
+                download_dir: (!dir.is_empty()).then_some(dir.as_str()),
+            });
         }
         Some(FilesAction::DownloadUser { user, clear }) => {
             if *clear {
@@ -400,12 +447,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 .await;
             }
             let uid = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await?;
-            if uid.is_empty() {
-                println!("download-user = <unset>");
-            } else {
-                println!("download-user = uid {uid}");
-            }
-            return Ok(());
+            return printout(&DownloadUserOutput::parse(&uid)?);
         }
         _ => {}
     }
@@ -510,6 +552,27 @@ pub(crate) fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_settings_reads_serialize_for_json() {
+        let peers = PeerListOutput(vec!["laptop".into()]);
+        assert_eq!(
+            serde_json::to_value(&peers).unwrap(),
+            serde_json::json!(["laptop"])
+        );
+        let dir = DownloadDirOutput { download_dir: None };
+        assert_eq!(
+            serde_json::to_value(&dir).unwrap(),
+            serde_json::json!({ "download_dir": null })
+        );
+        let user = DownloadUserOutput::parse("1000").unwrap();
+        assert_eq!(
+            serde_json::to_value(&user).unwrap(),
+            serde_json::json!({ "download_user": 1000 })
+        );
+        assert_eq!(DownloadUserOutput::parse("").unwrap().download_user, None);
+        assert!(DownloadUserOutput::parse("bob").is_err());
+    }
 
     #[test]
     fn transfers_table_shows_progress_and_state() {
