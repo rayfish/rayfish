@@ -488,7 +488,8 @@ impl ConnectService {
         let already = self
             .approved_connects
             .get(&from_endpoint)
-            .map(|r| *r.value());
+            .map(|r| *r.value())
+            .or_else(|| self.coordinated_direct_network_with(from_endpoint));
         let rejection = self
             .rejected_connects
             .get(&from_endpoint)
@@ -530,6 +531,22 @@ impl ConnectService {
             control::ConnectMsg::Pending
         };
         Ok(ConnectDecision { reply, rejection })
+    }
+
+    /// The approval a restart forgot: `approved_connects` lives in memory, but
+    /// the direct network this node minted for `peer` is saved. While it
+    /// exists, a retry from `peer` is answered with it rather than queued as a
+    /// new request that `approve` would then call already connected.
+    fn coordinated_direct_network_with(
+        &self,
+        peer: EndpointId,
+    ) -> Option<(EndpointId, EndpointId)> {
+        let name = self.registry.existing_direct_network_with(&peer)?;
+        let handle = self.registry.networks.get(&name)?;
+        handle
+            .role
+            .is_coordinator()
+            .then(|| (handle.network_key, self.transport.endpoint.id()))
     }
 
     fn reject_pending_with(
@@ -885,6 +902,48 @@ mod pending_connect_cap_tests {
             .spawn_connect_retry(peer, None)
             .expect("a finished loop frees its peer");
         again.await.unwrap();
+        endpoint.close().await;
+    }
+
+    /// The approver restarted after minting the direct network, so its
+    /// in-memory approval is gone. The requester's retry still gets the
+    /// network instead of waiting forever behind a new pending request.
+    #[tokio::test]
+    async fn a_retry_after_the_approver_restarts_gets_the_saved_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        let requester = eid(42);
+        config::save_network(&config::NetworkConfig {
+            name: "me-them".to_string(),
+            direct: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let state = crate::daemon::accept_handler_tests::hold_network(
+            &service.registry,
+            "me-them",
+            NetworkRole::Coordinator,
+            Vec::new(),
+            vec![crate::membership::ApprovedEntry {
+                identity: requester,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+            }],
+        );
+        let network_key = state.read().unwrap().network_public_key;
+
+        let decision = service.connect_reply(requester, None, false).unwrap();
+        assert!(
+            matches!(
+                decision.reply,
+                control::ConnectMsg::Approved { room_id, coordinator }
+                    if room_id == network_key && coordinator == endpoint.id()
+            ),
+            "{:?}",
+            decision.reply
+        );
+        assert!(service.pending_connects.is_empty());
         endpoint.close().await;
     }
 

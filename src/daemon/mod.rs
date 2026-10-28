@@ -2086,7 +2086,7 @@ pub(crate) mod accept_handler_tests {
     use std::sync::Arc;
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
-    fn make_network_state() -> SharedNetworkState {
+    pub(crate) fn make_network_state() -> SharedNetworkState {
         let net_secret = SecretKey::from_bytes(&[1u8; 32]);
         let net_pub = net_secret.public();
         Arc::new(RwLock::new(NetworkState {
@@ -2695,7 +2695,7 @@ pub(crate) mod accept_handler_tests {
     }
 
     /// Register a member-role network holding `members` and `approved`.
-    fn hold_network(
+    pub(crate) fn hold_network(
         registry: &NetworkRegistry,
         name: &str,
         role: NetworkRole,
