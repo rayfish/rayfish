@@ -95,6 +95,7 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             }
         }
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
+        GlobalKey::ReassemblyAutotune => cfg.reassembly_autotune = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
         // caller must also seed/remove the passthrough for the configured port and
@@ -236,6 +237,7 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
         GlobalKey::Dns => cfg.dns_mode.as_ref().to_string(),
         GlobalKey::QuicEngine => cfg.quic_engine.as_ref().to_string(),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
+        GlobalKey::ReassemblyAutotune => on_off(cfg.reassembly_autotune),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
         GlobalKey::SshPort => cfg.ssh_port.to_string(),

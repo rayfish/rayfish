@@ -81,6 +81,7 @@ setting_keys! {
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
         Dns = "dns", "Magic DNS mode (on|partial|off)";
         QuicEngine = "quic-engine", "QUIC forwarding engine, applies on restart (standalone|fq-codel)";
+        ReassemblyAutotune = "reassembly-autotune", "experimental adaptive fragment capacity, default off; applies live (on|off)";
         DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders, including mesh peer IPv6 addresses (comma-separated)";
         AutoUpdate = "auto-update", "install new releases automatically (on|off)";
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";

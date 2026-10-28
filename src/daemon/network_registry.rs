@@ -205,6 +205,8 @@ pub(crate) struct NetworkRegistry {
     /// past [`idle_timeout`](Self::idle_timeout), and never auto-reconnect an
     /// idle-closed peer (re-dialing is lazy). See [`Daemon::on_demand`](crate::daemon::Daemon).
     pub(crate) on_demand: bool,
+    /// Live, receiver-local opt-in shared with already-connected peer readers.
+    pub(crate) reassembly_autotune: Arc<AtomicBool>,
     /// How long a connection may sit with no traffic (either direction) before an
     /// on-demand node idle-closes it. Read by each [`MeshConnection`]'s idle timer.
     pub(crate) idle_timeout: Duration,
@@ -401,6 +403,7 @@ impl NetworkRegistry {
             disconnect_tx,
             protocol_router: OnceLock::new(),
             on_demand,
+            reassembly_autotune: Arc::new(AtomicBool::new(false)),
             idle_timeout,
             exit_server: crate::exit_node::ExitServer::new(),
             exit_client: crate::exit_node::ExitClient::new(),

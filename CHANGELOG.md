@@ -243,6 +243,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Linux: the TUN MTU is now 1280, so full-sized packets fit one QUIC datagram
   instead of being split in two.
 
+- Fragment reassembly can opt into larger receive windows with
+  `ray config set reassembly-autotune on` (off by default; changes apply to
+  existing connections). Turning it off releases trial resources and returns
+  to the fixed 64-packet limit without clearing all pending packets at once.
+  Trials start when reordered packets
+  exceed 64 concurrent assemblies. It retains a larger window only when a bounded
+  metadata observer at the previous limit completes fewer packets and bytes,
+  and steps down again when the extra capacity is no longer useful. The shared
+  8 MiB budget, five-second timeout and fragment wire format are unchanged.
+- Fragment expiry and oldest-packet eviction use a live deadline index, avoiding
+  full-table scans when fragmented traffic fills a larger reassembly window.
+
 ## [0.5.9] - 2026-10-15
 
 ### Added

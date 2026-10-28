@@ -488,6 +488,9 @@ pub struct DisconnectEvent {
 /// daemon's `MeshCtx` via `MeshCtx::forward_ctx`.
 pub struct ForwardCtx {
     pub firewall: SharedFirewall,
+    /// Receiver-local opt-in, checked once per batch/timer. A pending trial has
+    /// a 250 ms timer, so disabling also releases idle observers promptly.
+    pub reassembly_autotune: Arc<std::sync::atomic::AtomicBool>,
     /// Swappable sender cell for the TUN writer. Peer readers outlive TUN
     /// attach/detach cycles (the control plane stays up across a VPN toggle), so
     /// they resolve the current writer per packet through an `arc_swap` `Cache`
@@ -988,6 +991,7 @@ pub fn spawn_peer_reader(
     let legacy = conn.alpn() == crate::transport::MESH_V5_ALPN;
     let ForwardCtx {
         firewall,
+        reassembly_autotune,
         tun_tx,
         token,
         stats,
@@ -1020,6 +1024,10 @@ pub fn spawn_peer_reader(
         let mut reassembly = fragment::Reassembler::default();
         let mut ip_fragments = FragmentVerdicts::default();
         loop {
+            reassembly.set_autotune(
+                reassembly_autotune.load(std::sync::atomic::Ordering::Relaxed),
+                tokio::time::Instant::now(),
+            );
             let deadline = reassembly.deadline();
             // Wait for the next batch, exiting on cancellation or connection loss.
             // Keeping the `select!` to "yield datagrams or return" leaves the
@@ -1032,9 +1040,8 @@ pub fn spawn_peer_reader(
                         None => std::future::pending().await,
                     }
                 } => {
-                    for _ in 0..reassembly.expire(tokio::time::Instant::now()) {
-                        stats.record_drop(DropReason::ReassemblyTimeout);
-                    }
+                    reassembly.expire(tokio::time::Instant::now());
+                    reassembly.record_metrics(&stats);
                     continue;
                 }
                 result = conn.read_many_datagrams(&mut batch) => match result {
@@ -1169,9 +1176,7 @@ pub fn spawn_peer_reader(
                     }
                 }
             }
-            for _ in 0..reassembly.take_evicted() {
-                stats.record_drop(DropReason::ReassemblyLimit);
-            }
+            reassembly.record_metrics(&stats);
         }
     };
     tokio::spawn(reader.instrument(span))
@@ -1564,6 +1569,7 @@ mod tests {
             receiver_peers.clone(),
             ForwardCtx {
                 firewall: firewall.clone(),
+                reassembly_autotune: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(tun_tx)),
                 token: token.clone(),
                 stats: Arc::clone(&stats),

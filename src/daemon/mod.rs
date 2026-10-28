@@ -377,6 +377,7 @@ impl MeshCtx {
     pub(crate) fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
         forward::ForwardCtx {
             firewall: self.firewall.clone(),
+            reassembly_autotune: Arc::clone(&self.registry.reassembly_autotune),
             tun_tx: Arc::clone(&self.tun_tx),
             token,
             stats: Arc::clone(&self.stats),
@@ -1518,6 +1519,14 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         GlobalKey::QuicEngine => {
             format!("QUIC engine set to {}. {restart}", cfg.quic_engine.as_ref())
         }
+        GlobalKey::ReassemblyAutotune => format!(
+            "Fragment reassembly autotuning {} for existing and new connections.",
+            if cfg.reassembly_autotune {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {
@@ -5106,6 +5115,66 @@ mod headless_tests {
 
         // The embedding `status()` API answers without a socket ever being bound.
         assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reassembly_opt_in_loads_persisted_state_and_updates_existing_handles() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+        config::update_settings(|cfg| {
+            cfg.reassembly_autotune = true;
+            Ok(())
+        })
+        .unwrap();
+        let daemon = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = daemon.registry.mesh_ctx();
+        let flag = ctx
+            .forward_ctx(CancellationToken::new())
+            .reassembly_autotune;
+        assert!(flag.load(Ordering::Relaxed));
+        let key = NodeKey::Global(GlobalKey::ReassemblyAutotune);
+        for (value, expected) in [("off", false), ("on", true)] {
+            let response = daemon
+                .handle_authorized_request(
+                    IpcMessage::ConfigSet {
+                        key,
+                        value: value.into(),
+                        replace: false,
+                    },
+                    None,
+                    vec![],
+                )
+                .await;
+            assert!(matches!(response, IpcMessage::Ok { .. }));
+            assert_eq!(flag.load(Ordering::Relaxed), expected);
+            assert_eq!(config::load().unwrap().reassembly_autotune, expected);
+        }
+        let response = daemon
+            .handle_authorized_request(
+                IpcMessage::ConfigSet {
+                    key,
+                    value: "maybe".into(),
+                    replace: false,
+                },
+                None,
+                vec![],
+            )
+            .await;
+        assert!(matches!(response, IpcMessage::Error { .. }));
+        assert!(flag.load(Ordering::Relaxed));
+        let response = daemon
+            .handle_authorized_request(IpcMessage::ConfigUnset { key }, None, vec![])
+            .await;
+        assert!(matches!(response, IpcMessage::Ok { .. }));
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(!config::load().unwrap().reassembly_autotune);
+        daemon.shutdown_token.cancel();
+        let _ = daemon.router.shutdown().await;
     }
 
     #[allow(clippy::await_holding_lock)]

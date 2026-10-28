@@ -137,6 +137,26 @@ pub struct ForwardMetrics {
     pub idle_teardowns: Counter,
     /// Pending join requests evicted from the bounded approval queue
     pub pending_joins_evicted: Counter,
+    /// Incomplete assemblies evicted at the receiver's connection-local limit.
+    pub reassembly_evicted_local: Counter,
+    /// Incomplete assemblies replaced because the shared budget was exhausted.
+    pub reassembly_evicted_global: Counter,
+    /// New fragments refused with no shared budget or local reservation to reuse.
+    pub reassembly_rejected_global: Counter,
+    /// Receiver-local capacity trials started.
+    pub reassembly_trials: Counter,
+    /// Trials retained, or a recently validated capacity restored.
+    pub reassembly_retained: Counter,
+    /// Trials rolled back without changing the fragment wire format.
+    pub reassembly_rolled_back: Counter,
+    /// Trials abandoned with insufficient or invalid observations.
+    pub reassembly_inconclusive: Counter,
+    /// Trials cancelled by shared resource pressure.
+    pub reassembly_resource_limited: Counter,
+    /// Fragmented IP packets completed, before ingress policy checks.
+    pub reassembly_completed: Counter,
+    /// IP bytes completed by fragment reassembly, before ingress policy checks.
+    pub reassembly_completed_bytes: Counter,
 }
 
 impl ForwardMetrics {

@@ -263,6 +263,7 @@ impl Daemon {
                 | GlobalKey::AutoUpdate
                 | GlobalKey::OnDemand
                 | GlobalKey::QuicEngine
+                | GlobalKey::ReassemblyAutotune
                 | GlobalKey::DownloadDir
                 | GlobalKey::DownloadUser
                 | GlobalKey::FileAutoAcceptPeers
@@ -276,6 +277,12 @@ impl Daemon {
         };
         if key == GlobalKey::FileAutoAcceptPeers {
             self.files.drain_auto_acceptable().await;
+        }
+        if key == GlobalKey::ReassemblyAutotune {
+            self.registry.reassembly_autotune.store(
+                app_config.reassembly_autotune,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         if key == GlobalKey::Blocked {
             self.connect.drop_blocked(&app_config.blocked).await;
