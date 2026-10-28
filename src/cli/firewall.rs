@@ -853,6 +853,8 @@ pub(crate) async fn ipc_apply(
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
     let mut removal_failures = false;
     let mut ssh_failures = false;
+    let mut network_failures = false;
+    let mut invite_failures = false;
     for (net_name, net_firewall) in &expanded.networks {
         let is_active = active_names.contains(net_name.as_str());
         // Create-if-absent (always a closed network).
@@ -863,6 +865,7 @@ pub(crate) async fn ipc_apply(
                 style::bold(net_name),
             );
             if let Err(e) = ipc_apply_create(net_name).await {
+                network_failures = true;
                 eprintln!("{}  create failed: {e}", style::red("  !"));
                 continue;
             }
@@ -897,7 +900,10 @@ pub(crate) async fn ipc_apply(
         };
         match ipc_firewall_suggest_set(net_name, to_publish).await {
             Ok(msg) => println!("{}   {msg}", style::faint("→")),
-            Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
+            Err(e) => {
+                network_failures = true;
+                eprintln!("{}   suggest failed: {e}", style::red("  !"));
+            }
         }
 
         // Reconcile this network's concrete hostnames against both the
@@ -1098,11 +1104,14 @@ pub(crate) async fn ipc_apply(
                         cmd,
                         style::faint(&format!("→ {code}"))
                     ),
-                    Err(e) => eprintln!(
-                        "  {}  {cmd}  {}",
-                        style::red(host),
-                        style::red(&e.to_string())
-                    ),
+                    Err(e) => {
+                        invite_failures = true;
+                        eprintln!(
+                            "  {}  {cmd}  {}",
+                            style::red(host),
+                            style::red(&e.to_string())
+                        );
+                    }
                 }
             } else {
                 println!("  {}  {cmd}", style::bold(host));
@@ -1126,9 +1135,14 @@ pub(crate) async fn ipc_apply(
         }
         false
     };
+    anyhow::ensure!(
+        !network_failures,
+        "some networks could not be created or published"
+    );
     anyhow::ensure!(!removal_failures, "some members could not be removed");
     anyhow::ensure!(!ssh_failures, "some SSH grants could not be applied");
     anyhow::ensure!(!delivery_failures, "some invitations could not be queued");
+    anyhow::ensure!(!invite_failures, "some invites could not be minted");
     Ok(())
 }
 
