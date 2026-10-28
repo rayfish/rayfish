@@ -11,7 +11,9 @@
 //! [`android_tun`], and everything else is a thin map from the core's
 //! `IpcMessage` results to the UniFFI records below.
 
-#[cfg(target_os = "android")]
+// Also built for Linux tests, which exercise the fd handling on a pipe.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod android_tun;
 mod diag;
 mod file_events;

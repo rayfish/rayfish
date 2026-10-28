@@ -24,10 +24,14 @@ const RECEIVE_POOL_CHUNK: usize = 64 * 1024;
 
 /// Mark an already-owned fd non-blocking (required by `AsyncFd`), in place.
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFL only reads the descriptor's status flags; an invalid fd
+    // is reported as -1/EBADF, not undefined behaviour.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: F_SETFL with the flags just read plus O_NONBLOCK touches only
+    // this descriptor's status flags, and the caller owns the descriptor.
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -126,16 +130,18 @@ impl AndroidTunWriter {
 }
 
 impl TunWrite for AndroidTunWriter {
+    /// One `write` per packet. A TUN takes a whole packet or none of it, so a
+    /// short write is an error: writing the remainder again would hand the
+    /// kernel a second, truncated packet made of the first one's tail.
     async fn write_packet(&mut self, packet: &[u8]) -> Result<()> {
-        let mut off = 0;
-        while off < packet.len() {
+        loop {
             let mut guard = self.fd.writable_mut().await?;
             let out = guard.try_io(|inner| {
                 let raw = inner.get_ref().as_raw_fd();
-                let chunk = &packet[off..];
-                // SAFETY: writes at most `chunk.len()` bytes from a valid slice.
-                let n =
-                    unsafe { libc::write(raw, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
+                // SAFETY: writes at most `packet.len()` bytes from a valid slice.
+                let n = unsafe {
+                    libc::write(raw, packet.as_ptr().cast::<libc::c_void>(), packet.len())
+                };
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -143,11 +149,47 @@ impl TunWrite for AndroidTunWriter {
                 }
             });
             match out {
-                Ok(Ok(n)) => off += n,
+                Ok(Ok(n)) if n == packet.len() => return Ok(()),
+                Ok(Ok(n)) => bail!(
+                    "android tun accepted {n} of {} bytes; packet dropped",
+                    packet.len()
+                ),
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_would_block) => continue,
             }
         }
-        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    /// A pipe stands in for the TUN fd: with its buffer at one page, a larger
+    /// write is accepted only in part, which is the case a TUN must never
+    /// receive as two packets.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_short_write_is_an_error_not_a_second_packet() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe writes.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just returned by pipe and are owned here.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: F_SETPIPE_SZ resizes the pipe buffer of a descriptor we own.
+        let size = unsafe { libc::fcntl(write_end.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        assert!(size >= 4096);
+        let page = usize::try_from(size).expect("pipe size is positive");
+
+        let mut writer = AndroidTunWriter::new(write_end.as_raw_fd()).expect("writer");
+        let packet = vec![0u8; page * 2];
+        let result = tokio::time::timeout(Duration::from_secs(10), writer.write_packet(&packet))
+            .await
+            .expect("a short write must fail, not wait to write the rest");
+        assert!(result.is_err());
+        drop(read_end);
     }
 }
