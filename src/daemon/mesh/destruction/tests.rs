@@ -7,10 +7,10 @@ use url::Url;
 
 use super::*;
 
-struct ConfigDir(Option<OsString>);
+pub(in crate::daemon::mesh) struct ConfigDir(Option<OsString>);
 
 impl ConfigDir {
-    fn set(path: &Path) -> Self {
+    pub(in crate::daemon::mesh) fn set(path: &Path) -> Self {
         let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
         unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", path) };
         Self(previous)
@@ -70,7 +70,7 @@ impl Relay {
         }
     }
 
-    fn configure(&self) {
+    pub(in crate::daemon::mesh) fn configure(&self) {
         config::update_settings(|cfg| {
             cfg.mdns_enabled = false;
             cfg.discovery_dns = config::ServerOverride {
@@ -148,7 +148,7 @@ async fn serve(
     Ok(())
 }
 
-async fn create(daemon: &Daemon, name: &str) -> config::NetworkConfig {
+pub(in crate::daemon::mesh) async fn create(daemon: &Daemon, name: &str) -> config::NetworkConfig {
     let result = daemon
         .create_network(
             GroupMode::Restricted,
