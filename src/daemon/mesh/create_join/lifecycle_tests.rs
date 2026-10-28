@@ -257,3 +257,111 @@ async fn a_queued_join_stops_retrying_once_the_network_is_live() {
     assert!(config::load().unwrap().pending_joins.is_empty());
     daemon.shutdown_and_close().await;
 }
+
+/// Save `name` as a member network whose last published roster (this node plus
+/// `others`) is in the local blob store, as a warm resume finds it at startup.
+async fn cache_member_network(
+    registry: &NetworkRegistry,
+    name: &str,
+    network_key: EndpointId,
+    others: &[EndpointId],
+) -> SavedMemberNetwork {
+    let me = registry.transport.identity.local_identity();
+    let mut members = MemberList::new();
+    members.add(roster_row(me, false, None));
+    for other in others {
+        members.add(roster_row(*other, true, None));
+    }
+    let bytes = crate::membership::canonical_group_bytes(
+        &members,
+        &ApprovedList::new(),
+        &SuggestedFirewall::default(),
+        Some(name),
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+    );
+    let hash = blake3::hash(&bytes);
+    registry
+        .transport
+        .blob_store
+        .blobs()
+        .add_slice(&bytes)
+        .await
+        .unwrap();
+    config::save_network(&config::NetworkConfig {
+        network_public_key: Some(network_key),
+        last_group_hash: Some(hash),
+        last_group_hash_published: true,
+        my_hostname: Some("studio".into()),
+        ..config::empty_network_config(name)
+    })
+    .unwrap();
+    SavedMemberNetwork {
+        name: name.to_string(),
+        net_pubkey: network_key.to_string(),
+        persisted_hostname: Some("studio".into()),
+        auto_accept_firewall: false,
+        auto_accept_files: false,
+        cached_hash: Some(hash),
+        cached_is_published: true,
+    }
+}
+
+/// A fresh join claims its name the way create and restore do. Without the
+/// claim a restore sweep could start on the config the join had just saved
+/// and register a second live state beside the join's.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_fresh_join_waits_out_a_restore_of_the_same_name() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    let restoring = daemon.registry.claim_registration("home").unwrap();
+
+    let joined = daemon
+        .registry
+        .join_network_inner(
+            &key.to_string(),
+            Some("home"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await;
+    let error = joined.err().expect("the name is being restored");
+    assert!(
+        format!("{error:#}").contains("already being joined or restored"),
+        "{error:#}"
+    );
+    drop(restoring);
+    daemon.shutdown_and_close().await;
+}
+
+/// Registration never replaces a live handle. A restore that lost the race to
+/// another path used to overwrite it, leaving the first handle's tasks running
+/// forever on a state nothing could reach.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resume_never_replaces_a_live_network() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let key = SecretKey::generate().public();
+    let saved = cache_member_network(&registry, "home", key, &[]).await;
+    let live_cancel = hold_live(&registry, "home", key);
+    let live_state = Arc::clone(&registry.networks.get("home").unwrap().state);
+
+    let resumed = registry.warm_resume_member_network(&saved, key).await;
+
+    assert!(resumed.is_err(), "the network is already live");
+    let handle = registry.networks.get("home").unwrap();
+    assert!(Arc::ptr_eq(&handle.state, &live_state));
+    assert!(!live_cancel.is_cancelled());
+    drop(handle);
+    daemon.shutdown_and_close().await;
+}

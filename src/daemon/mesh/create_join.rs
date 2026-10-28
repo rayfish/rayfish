@@ -1,7 +1,9 @@
 //! Network create + join handlers for `Daemon`: `create_network*`, the join
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
+use super::super::network_registry::RegistrationClaim;
 use super::super::*;
+use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 
 /// A cold resume should give every recently known peer an equal chance to win
@@ -507,6 +509,13 @@ impl NetworkRegistry {
     ) -> Result<TryJoin> {
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
+        // A fresh join claims its name the way a create or a restore does, and
+        // holds the claim until its handle is registered. A join saves the
+        // network's config before that, and a restore sweep landing in the gap
+        // would otherwise bring up a second live state for the same network. A
+        // restore (`initial == false`) runs under its caller's claim.
+        let mut registration = None;
+
         // A name given with `--name` (or a restore's saved one) is used as is, so
         // it must be free or this network's own: a restore, or a rejoin of a
         // network whose saved config the join then updates.
@@ -522,6 +531,9 @@ impl NetworkRegistry {
                     "network name '{a}' belongs to another network on this node; \
                      choose another --name"
                 ),
+            }
+            if initial {
+                registration = Some(self.claim_join_registration(a)?);
             }
         }
 
@@ -572,6 +584,9 @@ impl NetworkRegistry {
             None => self.unclaimed_network_name(&blob_name, Some(net_pubkey))?,
         };
         let display_name = display_name_owned.as_str();
+        if initial && registration.is_none() {
+            registration = Some(self.claim_join_registration(display_name)?);
+        }
         self.restore_errors.remove(display_name);
 
         if self.networks.contains_key(display_name) {
@@ -625,7 +640,17 @@ impl NetworkRegistry {
             return Ok(TryJoin::Pending);
         };
 
-        self.finalize_join(ctx, &data, mesh).await
+        let joined = self.finalize_join(ctx, &data, mesh).await;
+        drop(registration);
+        joined
+    }
+
+    /// Claim `name` for a fresh join, or refuse while a create, restore or
+    /// another join is bringing it up.
+    fn claim_join_registration(&self, name: &str) -> Result<RegistrationClaim> {
+        self.claim_registration(name).with_context(|| {
+            format!("network '{name}' is already being joined or restored; try again shortly")
+        })
     }
 
     /// Resolve a network's signed pkarr record, gate on mesh-protocol version,
@@ -957,6 +982,12 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
     ) -> Result<bool> {
         let name = saved.name.as_str();
+        // Another path registered it meanwhile. `finalize_join` refuses too, but
+        // the route seeding before it would already touch the live network.
+        anyhow::ensure!(
+            !self.networks.contains_key(name),
+            "already in network '{name}'"
+        );
         self.check_destruction(name, net_pubkey, None).await?;
         let persisted_hostname = saved.persisted_hostname.clone();
         let auto_accept_firewall = saved.auto_accept_firewall;
@@ -1115,6 +1146,14 @@ impl NetworkRegistry {
             ..
         } = ctx;
 
+        // Never replace a live handle: its tasks would keep running on a second
+        // state for the same network. Checked before the config write too, so a
+        // losing registration does not rewrite the live one's record pointer.
+        if self.networks.contains_key(display_name) {
+            cancel.cancel();
+            anyhow::bail!("already in network '{display_name}'");
+        }
+
         // Serialize the authority transition with every snapshot mutation. This
         // binds the durable key and provenance to one exact live generation.
         let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
@@ -1218,7 +1257,15 @@ impl NetworkRegistry {
             invite_lock: Arc::clone(&invite_lock),
             incompatible: mismatch,
         };
-        self.networks.insert(display_name.to_string(), handle);
+        match self.networks.entry(display_name.to_string()) {
+            Entry::Occupied(_) => {
+                cancel.cancel();
+                anyhow::bail!("already in network '{display_name}'");
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(handle);
+            }
+        }
 
         // Expose coordinator authority only after its key, exact complete hash,
         // publisher, and Coordinator handle are all installed.
