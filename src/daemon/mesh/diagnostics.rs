@@ -25,6 +25,30 @@ type ServedFramed<S> = Framed<S, MsgpackCodec<IpcMessage>>;
 /// briefly unreachable doesn't stay flagged offline forever without a re-probe.
 const STATUS_OFFLINE_WINDOW: Duration = Duration::from_secs(300);
 
+/// Most probes one `ray ping` sends.
+const PING_MAX_COUNT: u32 = 100;
+/// Longest wait between two probes of one `ray ping`. With the count cap it
+/// bounds how long one request can hold its IPC connection and the daemon task
+/// serving it.
+const PING_MAX_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many probes a `ray ping` sends and how far apart, after clamping what
+/// the client asked for.
+#[derive(Debug, PartialEq, Eq)]
+struct PingPlan {
+    count: u32,
+    interval: Duration,
+}
+
+impl PingPlan {
+    fn new(count: u32, interval_ms: u64) -> Self {
+        Self {
+            count: count.clamp(1, PING_MAX_COUNT),
+            interval: Duration::from_millis(interval_ms).min(PING_MAX_INTERVAL),
+        }
+    }
+}
+
 const RTT_WINDOW: usize = 32;
 const RTT_MIN_SAMPLES: usize = 8;
 const HIGH_RTT_MS: f64 = 150.0;
@@ -959,12 +983,12 @@ impl Daemon {
         };
         let conn = route.conn;
         let network = route.network.to_string();
-        let count = count.clamp(1, 100);
-        let mut probes: Vec<Option<f64>> = Vec::with_capacity(count as usize);
+        let plan = PingPlan::new(count, interval_ms);
+        let mut probes: Vec<Option<f64>> = Vec::with_capacity(plan.count as usize);
 
-        for seq in 0..count {
+        for seq in 0..plan.count {
             if seq > 0 {
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                tokio::time::sleep(plan.interval).await;
             }
             let nonce: u64 = rand::random();
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1495,6 +1519,26 @@ pub(crate) fn saved_network_status(
 #[cfg(test)]
 mod log_tests {
     use super::*;
+
+    /// A client cannot ask for a ping that sleeps without bound between probes.
+    #[test]
+    fn ping_plan_clamps_count_and_interval() {
+        assert_eq!(
+            PingPlan::new(5, 250),
+            PingPlan {
+                count: 5,
+                interval: Duration::from_millis(250),
+            }
+        );
+        assert_eq!(
+            PingPlan::new(u32::MAX, u64::MAX),
+            PingPlan {
+                count: PING_MAX_COUNT,
+                interval: PING_MAX_INTERVAL,
+            }
+        );
+        assert_eq!(PingPlan::new(0, 0).count, 1);
+    }
 
     const CUTOFF: &str = "2026-08-15T12:00:00.000000Z";
 
