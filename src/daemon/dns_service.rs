@@ -280,7 +280,6 @@ impl DnsService {
             // Same merge the initial adopt does, so an operator's `dns-upstreams`
             // keeps its precedence instead of being overwritten by the capture.
             let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
-            let live = live.into_iter().map(IpAddr::V4).collect();
             let desired = config::resolve_upstreams(&dns_override, live);
 
             let mut answering = Vec::new();

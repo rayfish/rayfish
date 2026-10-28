@@ -713,12 +713,7 @@ pub(crate) fn system_nameservers() -> Option<Vec<IpAddr>> {
         &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
     ));
     #[cfg(target_os = "macos")]
-    let found = Some(
-        macos::capture_system_upstreams()
-            .into_iter()
-            .map(IpAddr::V4)
-            .collect::<Vec<_>>(),
-    );
+    let found = Some(macos::capture_system_upstreams());
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let found: Option<Vec<IpAddr>> = None;
 
