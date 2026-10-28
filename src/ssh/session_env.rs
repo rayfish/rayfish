@@ -328,11 +328,31 @@ pub(super) fn login_env<'a>(
     ]
 }
 
+/// The directory a session starts in: the account's home, or `/` when the
+/// home is missing, as OpenSSH does. Spawning with a missing home as the
+/// working directory fails the whole session before the shell ever runs.
+pub(super) fn session_dir(home: &Path) -> &Path {
+    if home.is_dir() {
+        home
+    } else {
+        tracing::debug!(home = %home.display(), "mesh SSH: home directory missing, starting in /");
+        Path::new("/")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
 
     use super::*;
+
+    #[test]
+    fn a_missing_home_starts_the_session_in_root() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(session_dir(dir.path()), dir.path());
+        let missing = dir.path().join("gone");
+        assert_eq!(session_dir(&missing), Path::new("/"));
+    }
 
     #[test]
     fn scoped_launch_execs_the_shell_as_the_user_inside_a_scope() {
