@@ -446,3 +446,72 @@ async fn a_warm_resumed_member_reconverges_on_a_trigger() {
         .unwrap();
     daemon.shutdown_and_close().await;
 }
+
+/// A warm resume marks a network whose record advertises a mesh version this
+/// build does not speak, as the cold restore of the same record does. It used
+/// to register it as healthy: `ray status` showed a network no peer on it could
+/// reach, and nothing watched for the coordinator to republish.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resume_records_an_incompatible_mesh_version() {
+    let _config = ConfigDir::new();
+    let relay = super::super::destruction::tests::Relay::start().await;
+    config::update_settings(|cfg| {
+        cfg.mdns_enabled = false;
+        cfg.discovery_dns = config::ServerOverride {
+            servers: vec![relay.url.to_string()],
+            replace: true,
+        };
+        Ok(())
+    })
+    .unwrap();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let network_key = SecretKey::generate();
+    let saved = cache_member_network(&registry, "home", network_key.public(), &[]).await;
+    let old = transport::MESH_PROTOCOL_VERSION - 3;
+    assert!(!mesh_version_is_speakable(
+        Some(old),
+        transport::MESH_PROTOCOL_VERSION
+    ));
+    let record = dht::encode_foreign_network_record(
+        &network_key,
+        &saved.cached_hash.unwrap(),
+        &[SecretKey::generate().public()],
+        old,
+    )
+    .unwrap();
+    let client = dht::create_pkarr_client(
+        &registry.transport.endpoint,
+        &registry.transport.pkarr_relay_url,
+    )
+    .unwrap();
+    dht::publish_record(&client, &record).await.unwrap();
+
+    let restore = registry
+        .spawn_member_restore(&config::load_network("home").unwrap().unwrap())
+        .unwrap();
+    let flagged = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(m) = registry
+                .networks
+                .get("home")
+                .and_then(|h| h.incompatible.clone())
+            {
+                return m;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the warm-resumed network is marked incompatible");
+    assert_eq!(
+        flagged,
+        MeshVersionMismatch {
+            network: old,
+            ours: transport::MESH_PROTOCOL_VERSION
+        }
+    );
+    daemon.shutdown_and_close().await;
+    restore.await.unwrap();
+}

@@ -1040,6 +1040,8 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock,
             coordinator: None,
+            // Not known without the record. The restore loop reads it once the
+            // network is registered and flags the handle on a mismatch.
             mismatch: None,
         };
 
