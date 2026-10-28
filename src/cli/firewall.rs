@@ -1,6 +1,7 @@
 //! CLI firewall + declarative-apply handlers and their parsers/renderers.
 
 use std::collections::{BTreeSet, HashSet};
+use std::io::IsTerminal;
 
 use crate::*;
 use firewall::Action;
@@ -644,7 +645,8 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
     };
 
     // JSON and non-interactive output stop before the picker can mutate rules.
-    if json_enabled() || rules.is_empty() || !style::is_enabled() {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !use_pending_picker(json_enabled(), rules.is_empty(), interactive) {
         printout(&PendingFirewallOutput {
             network,
             rules: &rules,
@@ -679,6 +681,14 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         other => fail_unexpected(&other),
     }
     Ok(())
+}
+
+/// Whether `ray firewall pending` opens the picker. It reads keys from stdin
+/// and draws on stdout, so it needs both to be a terminal; colour being off
+/// (`NO_COLOR`) is no reason to skip it, and colour being forced on a pipe is
+/// no reason to start it.
+fn use_pending_picker(json: bool, no_rules: bool, interactive: bool) -> bool {
+    !json && !no_rules && interactive
 }
 
 /// Parse a `--allow`/`--deny` value into `(peer, proto:ports-list)`.
@@ -1671,6 +1681,14 @@ networks:
         ))
         .unwrap();
         (spec, invited)
+    }
+
+    #[test]
+    fn pending_picker_needs_a_terminal_not_colour() {
+        assert!(use_pending_picker(false, false, true));
+        assert!(!use_pending_picker(false, false, false));
+        assert!(!use_pending_picker(true, false, true));
+        assert!(!use_pending_picker(false, true, true));
     }
 
     /// Without `--prune`, a failed read of the live set must stop the publish
