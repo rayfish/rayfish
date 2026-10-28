@@ -157,11 +157,14 @@ pub async fn sync_network_hostnames(
         reverse.insert(*v6, (name.clone(), network.to_string()));
     }
     // Addresses the network no longer holds may still belong to another one.
-    let dropped: Vec<Ipv6Addr> = t
-        .insert(network.to_string(), hosts)
+    // Held means held by a valid name: a peer renamed to an invalid one is
+    // gone from `hosts`, and its PTR must stop answering the old name.
+    let previous = t.insert(network.to_string(), hosts);
+    let current = &t[network];
+    let dropped: Vec<Ipv6Addr> = previous
         .into_iter()
         .flat_map(HashMap::into_values)
-        .filter(|v6| !entries.iter().any(|(_, new)| new == v6))
+        .filter(|v6| !current.values().any(|new| new == v6))
         .collect();
     for v6 in dropped {
         repoint_reverse(&t, reverse, v6);
@@ -549,6 +552,20 @@ mod tests {
             reverse.get(&v6(1)).map(|e| e.0.clone()),
             Some("laptop".to_string())
         );
+    }
+
+    /// A rename to an invalid name drops the peer from the table, so its PTR
+    /// must go too rather than keep answering the old name.
+    #[tokio::test]
+    async fn a_rename_to_an_invalid_name_drops_the_ptr() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        sync_network_hostnames(&table, &reverse, "net", &[("alice".to_string(), v6(1))]).await;
+        assert!(reverse.get(&v6(1)).is_some());
+
+        sync_network_hostnames(&table, &reverse, "net", &[("web.prod".to_string(), v6(1))]).await;
+        assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, None);
+        assert!(reverse.get(&v6(1)).is_none());
     }
 
     #[tokio::test]
