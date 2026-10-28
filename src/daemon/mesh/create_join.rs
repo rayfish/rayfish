@@ -1004,7 +1004,8 @@ impl NetworkRegistry {
             cancel.clone(),
             Arc::clone(self),
             Arc::clone(&ctx.invite_lock),
-            Arc::clone(self.protocol_router()),
+            self.protocol_router()
+                .context("the daemon is shutting down")?,
         )
         .await
     }
@@ -1151,8 +1152,10 @@ impl NetworkRegistry {
                 net_pubkey,
             ),
             NetworkRole::Member | NetworkRole::Direct => {
-                if !self.protocol_router().is_registered(&net_pubkey) {
-                    self.protocol_router().register(
+                if let Some(router) = self.protocol_router()
+                    && !router.is_registered(&net_pubkey)
+                {
+                    router.register(
                         net_pubkey,
                         AcceptHandler::Member(Arc::new(MemberAcceptState {
                             ctx: self.mesh_ctx(),
@@ -1453,14 +1456,10 @@ impl NetworkRegistry {
                 crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                 // Register the route, then drive the new connection's control
                 // demux (which owns the data reader) and announce our handles.
-                register_dialed_peer(
-                    &ctx,
-                    self.protocol_router(),
-                    peer_conn,
-                    m.identity,
-                    network_name,
-                )
-                .await;
+                let Some(router) = self.protocol_router() else {
+                    return;
+                };
+                register_dialed_peer(&ctx, &router, peer_conn, m.identity, network_name).await;
                 // Registered: later callers find the connection in the peer table.
                 drop(claim);
                 // Eager-connect reachability: a successful dial marks the peer

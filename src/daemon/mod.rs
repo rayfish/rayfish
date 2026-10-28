@@ -1101,6 +1101,9 @@ impl Daemon {
         // that rebuilds a daemon in the same process keeps the whole dead service
         // alive; see `DnsService::shutdown_background`.
         self.dns.shutdown_background();
+        // Accept handlers hold the registry, which owns the manager they are
+        // registered on; drop them so the registry can go with the daemon.
+        self.registry.conn.unregister_all();
         let (router_result, ()) =
             tokio::join!(self.router.shutdown(), self.transport.endpoint.close(),);
         if let Err(error) = router_result {
@@ -4058,11 +4061,11 @@ pub(crate) mod accept_handler_tests {
             Arc::clone(&registry.conn),
         ));
         router.set_mesh_dispatch(MeshDispatch {
-            ctx: registry.mesh_ctx(),
+            registry: Arc::downgrade(&registry),
             token: registry.shutdown_token.clone(),
             on_peer_connected: Arc::new(|_| {}),
         });
-        registry.set_protocol_router(router);
+        registry.set_protocol_router(&router);
         let targets = ["net-a", "net-b"].map(|network| DialTarget {
             network: network.to_string(),
             network_key: SecretKey::generate().public(),
@@ -4346,7 +4349,7 @@ pub(crate) mod accept_handler_tests {
         };
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
-            ctx: mesh_ctx(),
+            registry: Arc::downgrade(registry),
             token: CancellationToken::new(),
             on_peer_connected: Arc::new(|_| {}),
         });
@@ -5433,6 +5436,34 @@ mod headless_tests {
     ///
     /// See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
     /// only serializes tests and guards no data across the awaits.
+    /// A mobile rebuild drops the old daemon. Nothing it built may keep its
+    /// registry alive afterwards through a reference cycle.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_close_frees_the_registry() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon = build_headless(false).await.unwrap();
+        let registry = Arc::downgrade(&daemon.registry);
+        daemon.shutdown_and_close().await;
+        drop(daemon);
+        // Background tasks end on their own after shutdown and drop their
+        // clones as they go; wait for that rather than guessing a delay.
+        let freed = tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.strong_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            freed.is_ok(),
+            "{} references still hold the registry",
+            registry.strong_count()
+        );
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_and_close_releases_the_blob_store_for_a_rebuild() {

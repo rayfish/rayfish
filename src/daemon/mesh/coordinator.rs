@@ -515,9 +515,9 @@ impl NetworkRegistry {
                     .is_some_and(|selected| selected.stable_id() == conn.stable_id())
             {
                 tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
-                let router = Arc::clone(self.protocol_router());
-                let dconn = conn.clone();
-                tokio::spawn(router.drive_mesh_connection(dconn, true));
+                if let Some(router) = self.protocol_router() {
+                    tokio::spawn(router.drive_mesh_connection(conn.clone(), true));
+                }
             }
             announce_network_handles(&self.peers, &conn, peer_ip).await;
         }

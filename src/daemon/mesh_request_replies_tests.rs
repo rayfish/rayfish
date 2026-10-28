@@ -158,7 +158,7 @@ async fn member_replies_to_join_and_invalid_admin_grant() {
     );
     let manager = Arc::new(ConnectionManager::new());
     manager.set_mesh_dispatch(MeshDispatch {
-        ctx: ctx.clone(),
+        registry: Arc::downgrade(&registry),
         token: CancellationToken::new(),
         on_peer_connected: Arc::new(|_| {}),
     });
@@ -335,15 +335,10 @@ async fn stalled_control_stream_does_not_block_shutdown() {
         IrohIdentityProvider::new(server.id()),
         store.clone(),
     );
-    let ctx = sample_mesh_ctx(
-        IrohIdentityProvider::new(server.id()),
-        store.clone(),
-        Arc::clone(&registry),
-    );
     let token = CancellationToken::new();
     let manager = Arc::new(ConnectionManager::new());
     manager.set_mesh_dispatch(MeshDispatch {
-        ctx,
+        registry: Arc::downgrade(&registry),
         token: token.clone(),
         on_peer_connected: Arc::new(|_| {}),
     });

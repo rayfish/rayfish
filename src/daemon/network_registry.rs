@@ -18,7 +18,7 @@ use iroh::TransportAddr;
 use iroh::endpoint::PathEvent;
 use iroh_dns::pkarr::SignedPacket;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
@@ -199,8 +199,9 @@ pub(crate) struct NetworkRegistry {
     /// The inbound QUIC router, needed to drive a freshly (re)dialed connection's
     /// control demux. Built after the registry (it depends on FileService /
     /// ConnectService, which depend on the registry), so it is set once at boot
-    /// via [`Self::set_protocol_router`] rather than passed to `new`.
-    protocol_router: OnceLock<Arc<ProtocolRouter>>,
+    /// via [`Self::set_protocol_router`] rather than passed to `new`. Weak: the
+    /// router's services hold this registry, and the daemon owns the router.
+    protocol_router: OnceLock<Weak<ProtocolRouter>>,
     /// On-demand mode: run the per-connection idle timer that closes a link idle
     /// past [`idle_timeout`](Self::idle_timeout), and never auto-reconnect an
     /// idle-closed peer (re-dialing is lazy). See [`Daemon::on_demand`](crate::daemon::Daemon).
@@ -542,15 +543,14 @@ impl NetworkRegistry {
     /// Install the inbound QUIC router. Called once at boot after the router is
     /// built; the network (re)connect paths use it to drive a dialed connection's
     /// control demux.
-    pub(crate) fn set_protocol_router(&self, router: Arc<ProtocolRouter>) {
-        let _ = self.protocol_router.set(router);
+    pub(crate) fn set_protocol_router(&self, router: &Arc<ProtocolRouter>) {
+        let _ = self.protocol_router.set(Arc::downgrade(router));
     }
 
-    /// The inbound QUIC router (panics if used before [`Self::set_protocol_router`]).
-    pub(crate) fn protocol_router(&self) -> &Arc<ProtocolRouter> {
-        self.protocol_router
-            .get()
-            .expect("protocol_router set at boot")
+    /// The inbound QUIC router, or `None` before [`Self::set_protocol_router`]
+    /// and once the daemon that owns it is gone.
+    pub(crate) fn protocol_router(&self) -> Option<Arc<ProtocolRouter>> {
+        self.protocol_router.get().and_then(Weak::upgrade)
     }
 
     /// Build the [`MeshCtx`] handler bundle from the registry's own handles. This

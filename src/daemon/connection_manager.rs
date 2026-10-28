@@ -14,15 +14,21 @@
 //! ALPN entry dispatcher) holds an `Arc<ConnectionManager>` and delegates the
 //! mesh ALPN to it; the other ALPNs go to `FileService`/`ConnectService`/blobs.
 
+use std::sync::Weak;
+
 use super::*;
 
-/// Daemon-wide dispatch context the driver needs: the shared handles (`ctx`
-/// carries `tun_tx` + the disconnect sender a [`MeshConnection`] uses to report a
-/// drop) plus the cancellation token. Set once after construction via a
-/// `OnceLock`, because the router/connection-manager are built before the daemon
-/// that owns the ctx.
+/// Daemon-wide dispatch context the driver needs: the registry each
+/// connection's [`MeshCtx`] is built from (it carries `tun_tx` + the disconnect
+/// sender a [`MeshConnection`] uses to report a drop) plus the cancellation
+/// token. Set once after construction via a `OnceLock`, because the
+/// router/connection-manager are built before the daemon that owns the ctx.
+///
+/// The registry is held weakly: it owns this manager, so a strong reference
+/// here would keep both alive after the daemon is dropped, which leaks a whole
+/// daemon on every mobile rebuild.
 pub(crate) struct MeshDispatch {
-    pub(crate) ctx: MeshCtx,
+    pub(crate) registry: Weak<NetworkRegistry>,
     pub(crate) token: CancellationToken,
     /// Fired once per mesh connection as it starts (dialed or accepted), with
     /// the peer's id. Wired by the composition root to the file-service send
@@ -72,6 +78,13 @@ impl ConnectionManager {
         self.handlers.insert(net_pubkey, handler);
     }
 
+    /// Drop every network's accept handler. Called at shutdown: a handler holds
+    /// the registry that owns this manager, so leaving them registered would
+    /// keep the registry alive after the daemon is gone.
+    pub(crate) fn unregister_all(&self) {
+        self.handlers.clear();
+    }
+
     /// Whether a handler is registered for this network public key.
     pub(crate) fn is_registered(&self, net_pubkey: &EndpointId) -> bool {
         self.handlers.contains_key(net_pubkey)
@@ -100,15 +113,19 @@ impl ConnectionManager {
             tracing::error!("mesh dispatch not set; dropping connection");
             return;
         };
+        let Some(registry) = mesh.registry.upgrade() else {
+            tracing::debug!("daemon is gone; dropping connection");
+            return;
+        };
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        if !pre_registered && mesh.ctx.registry.transport.is_suspended() {
+        if !pre_registered && registry.transport.is_suspended() {
             conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
             return;
         }
         MeshConnection::new(
             conn,
             Arc::clone(&self),
-            mesh.ctx.clone(),
+            registry.mesh_ctx(),
             mesh.token.clone(),
             pre_registered,
         )
@@ -126,7 +143,9 @@ impl ConnectionManager {
         peer_id: EndpointId,
         entries: &[control::NetworkHandle],
     ) {
-        let Some(mesh) = self.mesh.get() else { return };
+        let Some(registry) = self.mesh.get().and_then(|mesh| mesh.registry.upgrade()) else {
+            return;
+        };
         let ipv6 = derive_ipv6(&peer_id);
         // Map network pubkey → local network name via the registry.
         let mut table: Vec<(u16, SmolStr)> = Vec::new();
@@ -135,6 +154,6 @@ impl ConnectionManager {
                 table.push((e.handle, SmolStr::new(h.network_name())));
             }
         }
-        mesh.ctx.peers.set_inbound_handles(&ipv6, conn, &table);
+        registry.peers.set_inbound_handles(&ipv6, conn, &table);
     }
 }
