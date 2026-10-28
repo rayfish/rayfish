@@ -609,6 +609,14 @@ pub(crate) fn unsaved_snapshot_error(network: &str) -> IpcMessage {
     ))
 }
 
+/// The note appended to the reply for a change that stays live although its
+/// snapshot could not be saved. See [`unsaved_snapshot_error`].
+pub(crate) fn unsaved_snapshot_warning(network: &str) -> String {
+    format!(
+        "warning: could not save the updated roster for '{network}'; it is not published yet and will be retried"
+    )
+}
+
 pub(crate) async fn update_snapshot_and_publish(
     state: &SharedNetworkState,
     blob_store: &FsStore,

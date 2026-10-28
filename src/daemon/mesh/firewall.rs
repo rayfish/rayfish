@@ -266,9 +266,10 @@ impl NetworkRegistry {
             let mut s = state.write().unwrap();
             s.suggested_firewall = suggestions;
         }
-        if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
-            return unsaved_snapshot_error(network);
-        }
+        // The suggestions are live either way, and the publisher retries a
+        // failed save, so still nudge members and apply them here.
+        let saved =
+            update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         // Nudge connected members to reconverge from the freshly-published signed
         // record now, instead of waiting for the group poller. Like the
         // rename flow, this is a payload-free trigger, the suggestions still come
@@ -285,9 +286,15 @@ impl NetworkRegistry {
             network,
             &state,
         );
-        IpcMessage::Ok {
-            message: format!("published firewall suggestions for '{network}' ({count} subjects)"),
-        }
+        let message = if saved {
+            format!("published firewall suggestions for '{network}' ({count} subjects)")
+        } else {
+            format!(
+                "set firewall suggestions for '{network}' ({count} subjects)\n{}",
+                unsaved_snapshot_warning(network)
+            )
+        };
+        IpcMessage::Ok { message }
     }
 
     pub(crate) fn firewall_suggestions(&self, network: &str) -> IpcMessage {

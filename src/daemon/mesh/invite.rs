@@ -146,9 +146,19 @@ impl NetworkRegistry {
         let id = key.id.clone();
         {
             let mut s = state.write().unwrap();
-            s.reusable_keys.insert(hash, key);
+            s.reusable_keys.insert(hash.clone(), key);
         }
         if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
+            // The publisher retries whatever is live, so a key left in place
+            // would be published later while its secret was never shown. Take
+            // it back out. Its own commit may fail too; the publisher's retry
+            // then picks up the state without it.
+            {
+                let mut s = state.write().unwrap();
+                s.reusable_keys.remove(&hash);
+            }
+            let _ =
+                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
             return unsaved_snapshot_error(network);
         }
         let code =
@@ -246,12 +256,13 @@ impl NetworkRegistry {
             crate::membership::revoke_reusable(&mut s.reusable_keys, id).is_ok()
         };
         if revoked_reusable {
+            // The revocation stays live even when it cannot be saved: undoing
+            // it would let the key admit again. The publisher retries.
+            let mut message = format!("revoked reusable key '{id}' (propagating to all admins)");
             if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
-                return unsaved_snapshot_error(network);
+                message = format!("{message}\n{}", unsaved_snapshot_warning(network));
             }
-            return IpcMessage::Ok {
-                message: format!("revoked reusable key '{id}' (propagating to all admins)"),
-            };
+            return IpcMessage::Ok { message };
         }
         // Fall back to the local single-use invite ledger.
         let result = {
@@ -334,9 +345,10 @@ impl NetworkRegistry {
             s.refresh_snapshot();
             net_pubkey
         };
-        if !self.store_and_publish_group(network).await {
-            return unsaved_snapshot_error(network);
-        }
+        // The joiner is approved in live state either way, so tell the other
+        // admins and the caller. Failing here instead left the request gone, a
+        // retried `ray accept` with nothing to match, and no broadcast.
+        let saved = self.store_and_publish_group(network).await;
         broadcast_control_msg(
             &self.peers,
             net_pubkey,
@@ -348,9 +360,11 @@ impl NetworkRegistry {
             },
         )
         .await;
-        IpcMessage::Ok {
-            message: format!("accepted {} — they'll join shortly", identity.fmt_short()),
+        let mut message = format!("accepted {} — they'll join shortly", identity.fmt_short());
+        if !saved {
+            message = format!("{message}\n{}", unsaved_snapshot_warning(network));
         }
+        IpcMessage::Ok { message }
     }
 
     pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
@@ -390,8 +404,11 @@ mod unsaved_snapshot_tests {
     use super::*;
     use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
 
-    /// A coordinator change whose snapshot cannot be saved reports an error. It
-    /// used to report success while nothing was published.
+    /// A coordinator change whose snapshot cannot be saved says so. A minted
+    /// reusable key is taken back out and reported as an error, since its
+    /// secret is never shown. A revocation, an accepted request and firewall
+    /// suggestions stay live, warn, and still reach the other members: an
+    /// accept used to fail after moving the joiner out of the pending list.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn a_failed_snapshot_commit_is_reported() {
@@ -411,7 +428,7 @@ mod unsaved_snapshot_tests {
         let joiner = SecretKey::generate().public();
         {
             let mut s = state.write().unwrap();
-            s.reusable_keys.insert(hash, key);
+            s.reusable_keys.insert(hash.clone(), key);
             s.pending.insert(
                 joiner,
                 PendingJoin {
@@ -426,19 +443,25 @@ mod unsaved_snapshot_tests {
         // snapshot commit fails.
         assert!(config::delete_network("home").unwrap());
 
+        let warned = |reply: &IpcMessage| matches!(reply, IpcMessage::Ok { message } if message.contains("will be retried"));
+
         let minted = registry.reusable_key_create("home", 3600, None).await;
         assert!(matches!(minted, IpcMessage::Error { .. }), "{minted:?}");
+        assert_eq!(
+            state.read().unwrap().reusable_keys.len(),
+            1,
+            "the key is rolled back"
+        );
         let revoked = registry.invite_revoke("home", &reusable_id).await;
-        assert!(matches!(revoked, IpcMessage::Error { .. }), "{revoked:?}");
+        assert!(warned(&revoked), "{revoked:?}");
+        assert!(state.read().unwrap().reusable_keys[&hash].revoked);
         let accepted = registry.accept_request("home", &joiner.to_string()).await;
-        assert!(matches!(accepted, IpcMessage::Error { .. }), "{accepted:?}");
+        assert!(warned(&accepted), "{accepted:?}");
+        assert!(state.read().unwrap().approved.is_approved(&joiner));
         let suggested = registry
             .firewall_suggest("home", SuggestedFirewall::default())
             .await;
-        assert!(
-            matches!(suggested, IpcMessage::Error { .. }),
-            "{suggested:?}"
-        );
+        assert!(warned(&suggested), "{suggested:?}");
         daemon.shutdown_and_close().await;
     }
 }

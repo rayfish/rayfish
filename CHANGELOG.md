@@ -49,7 +49,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A promoted co-coordinator now prunes expired ephemeral members.
 - A network running an incompatible mesh version is flagged after a restart.
 - Concurrent firewall edits no longer drop rules.
-- Coordinator changes that could not be saved now report an error.
+- Coordinator changes that could not be saved now say so. Minting a reusable
+  key or granting admin fails; accepting a request, revoking a reusable key or
+  suggesting firewall rules takes effect and warns that publishing will be
+  retried.
 - One unreadable destruction proof no longer stops republishing the others.
 - A stalled peer stream no longer blocks that peer's connection.
 - File auto-accept and `ray status` follow pairing and unpairing without a
