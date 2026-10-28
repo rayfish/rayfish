@@ -213,8 +213,11 @@ proptest! {
                 prop_assert_eq!(&assigned, &desired);
                 prop_assert!(!refs.contains(&desired.as_str()));
             }
-            Err(conflict) => {
-                prop_assert_eq!(&conflict, &desired);
+            Err(reason) => {
+                prop_assert_eq!(
+                    reason,
+                    format!("hostname '{desired}' is already in use on this network")
+                );
                 prop_assert!(refs.contains(&desired.as_str()));
             }
         }

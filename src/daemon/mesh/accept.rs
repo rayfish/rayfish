@@ -716,7 +716,7 @@ impl CoordinatorAcceptState {
             self.ctx.device_user_map.remove(&remote_id);
         }
 
-        let Some(desired) = hostname else {
+        let Some(desired) = valid_claim(remote_id, hostname) else {
             if cert_changed {
                 commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
                 drop(commit_guard);
@@ -1255,14 +1255,11 @@ impl CoordinatorAcceptState {
         let final_hostname = if let Some(desired) = hostname {
             let taken = self.state.read().unwrap().taken_hostnames(remote_id);
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-            match crate::hostname::admission_hostname(&desired, &taken_refs, authoritative) {
-                Ok(name) => Some(name),
-                Err(conflict) => {
-                    return Err(format!(
-                        "hostname '{conflict}' is already in use on this network"
-                    ));
-                }
-            }
+            Some(crate::hostname::admission_hostname(
+                &desired,
+                &taken_refs,
+                authoritative,
+            )?)
         } else {
             None
         };
@@ -1273,6 +1270,18 @@ impl CoordinatorAcceptState {
             hostname: final_hostname,
         })
     }
+}
+
+/// A member's hostname claim, or `None` when it is not a single valid label.
+/// The roster name becomes `<name>.<network>.ray`, so a claim like `web.prod`
+/// would otherwise answer for a host on another network.
+fn valid_claim(peer: EndpointId, hostname: Option<String>) -> Option<String> {
+    let name = hostname?;
+    if crate::hostname::is_valid_hostname(&name) {
+        return Some(name);
+    }
+    tracing::warn!(peer = %peer.fmt_short(), hostname = %name, "ignoring invalid hostname claim");
+    None
 }
 
 /// Result of writing a tentative admission while holding the snapshot lock.
@@ -1595,7 +1604,7 @@ impl MemberAcceptState {
                 s.approved.is_approved(&peer_identity),
             )
         };
-        let final_hostname = if let Some(desired) = hostname {
+        let final_hostname = if let Some(desired) = valid_claim(peer_identity, hostname) {
             let taken = self.state.read().unwrap().taken_hostnames(peer_identity);
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             Some(crate::hostname::resolve_collision(&desired, &taken_refs))
@@ -2307,6 +2316,17 @@ mod admission_rollback_tests {
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
         }
+    }
+
+    #[test]
+    fn a_member_claim_that_is_not_one_label_is_dropped() {
+        let peer = SecretKey::generate().public();
+        assert_eq!(
+            valid_claim(peer, Some("laptop".into())),
+            Some("laptop".into())
+        );
+        assert_eq!(valid_claim(peer, Some("web.prod".into())), None);
+        assert_eq!(valid_claim(peer, None), None);
     }
 
     #[test]
