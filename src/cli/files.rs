@@ -286,8 +286,9 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
+        // Returned, not exited, for the same reason as the Unix path.
         ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
-        other => eprintln!("Unexpected response: {other:?}"),
+        other => anyhow::bail!(unexpected_detail(&other)),
     }
     Ok(())
 }
