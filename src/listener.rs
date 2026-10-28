@@ -4,7 +4,9 @@
 //! every platform: this used to live in `ssh`, which is Unix-only, so `v4bridge`
 //! reaching into it stopped the Windows build compiling.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::net::TcpListener;
@@ -40,4 +42,66 @@ pub(crate) fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     sock.listen(128)?;
     let std_listener: std::net::TcpListener = sock.into();
     Ok(TcpListener::from_std(std_listener)?)
+}
+
+/// Pause between failed accepts so an accept loop neither dies nor spins.
+///
+/// Most accept errors are about the listener's process, not the listener:
+/// `EMFILE`/`ENFILE` when descriptors run out, `ECONNABORTED` for a client that
+/// gave up in the backlog. Ending the loop on one takes the whole service down
+/// for a single bad moment, and retrying at once on `EMFILE` is a busy loop,
+/// because the pending connection stays queued and the next accept fails the
+/// same way. So wait, doubling up to [`Self::MAX`], and start over after a
+/// success.
+pub(crate) struct AcceptBackoff {
+    delay: Duration,
+}
+
+impl AcceptBackoff {
+    const MIN: Duration = Duration::from_millis(5);
+    const MAX: Duration = Duration::from_secs(1);
+
+    pub(crate) const fn new() -> Self {
+        Self { delay: Self::MIN }
+    }
+
+    /// An accept succeeded: the next failure starts from the shortest wait.
+    pub(crate) fn reset(&mut self) {
+        self.delay = Self::MIN;
+    }
+
+    /// Log a failed accept and sleep before the next attempt.
+    pub(crate) async fn wait(&mut self, error: &io::Error, listener: &str) {
+        tracing::warn!(%error, listener, retry_in = ?self.delay, "accept failed");
+        tokio::time::sleep(self.delay).await;
+        self.delay = (self.delay * 2).min(Self::MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::time::Instant;
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_backoff_doubles_to_a_cap_and_resets() {
+        let error = io::Error::from_raw_os_error(24); // EMFILE
+        let mut backoff = AcceptBackoff::new();
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            let started = Instant::now();
+            backoff.wait(&error, "test").await;
+            waits.push(started.elapsed());
+        }
+        assert_eq!(waits[0], AcceptBackoff::MIN);
+        assert_eq!(waits[1], AcceptBackoff::MIN * 2);
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*waits.last().unwrap(), AcceptBackoff::MAX);
+
+        backoff.reset();
+        let started = Instant::now();
+        backoff.wait(&error, "test").await;
+        assert_eq!(started.elapsed(), AcceptBackoff::MIN);
+    }
 }

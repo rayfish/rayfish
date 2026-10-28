@@ -38,6 +38,8 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::listener::AcceptBackoff;
+
 use super::{
     Config, LOGIN_GRACE, Origin, SSH_LISTEN_PORT, SshHandler, UserPolicy, disable_nagle, local,
     serve, server_config,
@@ -376,6 +378,7 @@ async fn run_listener(
     let mut sessions = JoinSet::new();
     // The total is `MAX_SESSIONS` on accept; this is the per-source share.
     let slots = super::slots::ConnectionSlots::new(MAX_SESSIONS, super::MAX_CONNECTIONS_PER_SOURCE);
+    let mut backoff = AcceptBackoff::new();
     loop {
         let mut unexpected = [0];
         let (stream, client) = tokio::select! {
@@ -387,10 +390,29 @@ async fn run_listener(
                 bail!("SSH helper control connection closed or sent unexpected data");
             }
             _ = sessions.join_next(), if !sessions.is_empty() => continue,
-            accepted = local::accept(&listener, local_listener.as_ref()), if sessions.len() < MAX_SESSIONS => accepted?,
+            accepted = local::accept(&listener, local_listener.as_ref()), if sessions.len() < MAX_SESSIONS => match accepted {
+                Ok(accepted) => {
+                    backoff.reset();
+                    accepted
+                }
+                // One failed accept is no reason to drop every live session.
+                Err(e) => {
+                    backoff.wait(&e, "mesh SSH helper").await;
+                    continue;
+                }
+            },
         };
-        let server = stream.local_addr()?;
+        let server = match stream.local_addr() {
+            Ok(server) => server,
+            Err(e) => {
+                tracing::debug!(%client, error = %e, "mesh SSH: connection gone before it was authorized");
+                continue;
+            }
+        };
         let local_uid = local::uid(client, server).await;
+        // Unlike the per-connection failures around it, this one is fatal: a
+        // round trip that timed out or failed leaves the control connection
+        // out of step, and a late grant would be read as the next client's.
         let grant: Option<Grant> = timeout(CONTROL_TIMEOUT, async {
             send(&mut control, &Authorize { client, local_uid }).await?;
             receive(&mut control).await
@@ -406,8 +428,14 @@ async fn run_listener(
             continue;
         };
         disable_nagle(&stream);
-        let server = SocketAddr::new(stream.local_addr()?.ip(), grant.mesh_port);
-        let hangup = Hangup(StdTcpStream::from(stream.as_fd().try_clone_to_owned()?));
+        let server = SocketAddr::new(server.ip(), grant.mesh_port);
+        let hangup = match stream.as_fd().try_clone_to_owned() {
+            Ok(fd) => Hangup(StdTcpStream::from(fd)),
+            Err(e) => {
+                tracing::warn!(%client, error = %e, "mesh SSH: cannot track a connection, dropping it");
+                continue;
+            }
+        };
         let handler = SshHandler::new(
             grant.policy,
             grant.user,
