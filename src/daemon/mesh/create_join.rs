@@ -1246,6 +1246,28 @@ impl NetworkRegistry {
             ));
         }
 
+        // A member network registered without a handshake (warm resume, or a
+        // restore whose coordinator did not answer) has no member accept
+        // handler yet, so none of its reconverge worker either. Start the
+        // worker here, owned by this handle, and wire it to the handler below.
+        let member_reconverge = (!role.is_coordinator()
+            && !self.protocol_router().is_registered(&net_pubkey))
+        .then(|| {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            tasks.push(spawn_reconverge_worker(
+                Arc::clone(&notify),
+                cancel.clone(),
+                Arc::clone(&state),
+                display_name.to_string(),
+                self.mesh_ctx(),
+                self.transport.endpoint.clone(),
+                self.transport.identity.local_identity(),
+                net_pubkey,
+                self.current_device_cert(),
+            ));
+            notify
+        });
+
         let handle = NetworkHandle {
             name: display_name.to_string(),
             network_key: net_pubkey,
@@ -1279,7 +1301,7 @@ impl NetworkRegistry {
                 net_pubkey,
             ),
             NetworkRole::Member | NetworkRole::Direct => {
-                if !self.protocol_router().is_registered(&net_pubkey) {
+                if let Some(reconverge_notify) = member_reconverge {
                     self.protocol_router().register(
                         net_pubkey,
                         AcceptHandler::Member(Arc::new(MemberAcceptState {
@@ -1291,7 +1313,7 @@ impl NetworkRegistry {
                             endpoint: self.transport.endpoint.clone(),
                             registry: Arc::clone(self),
                             invite_lock: Arc::clone(&invite_lock),
-                            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+                            reconverge_notify,
                         })),
                     );
                 }

@@ -107,6 +107,49 @@ async fn startup_drops_a_pending_join_for_a_live_network() {
     daemon.shutdown_and_close().await;
 }
 
+/// A discovery relay that has no records and reports each lookup it serves.
+async fn watching_relay() -> tokio::sync::mpsc::UnboundedReceiver<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    config::update_settings(|cfg| {
+        cfg.mdns_enabled = false;
+        cfg.discovery_dns = config::ServerOverride {
+            servers: vec![url],
+            replace: true,
+        };
+        Ok(())
+    })
+    .unwrap();
+    let (lookups, seen) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let lookups = lookups.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if request.starts_with(b"GET") {
+                    let _ = lookups.send(());
+                }
+                let reply =
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    seen
+}
+
 /// Discovery pointed at a port nothing listens on, so a publisher fails fast
 /// instead of reaching a public relay.
 fn offline_discovery() {
@@ -363,5 +406,43 @@ async fn a_warm_resume_never_replaces_a_live_network() {
     assert!(Arc::ptr_eq(&handle.state, &live_state));
     assert!(!live_cancel.is_cancelled());
     drop(handle);
+    daemon.shutdown_and_close().await;
+}
+
+/// A member network registered from its cached roster still reconverges when
+/// a peer says the roster changed. Warm resume used to register its accept
+/// handler with a notify nothing listened on, so every `MemberSync` and
+/// `BlobUpdated` was dropped until the next poll, and a queued rename was
+/// never retried.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resumed_member_reconverges_on_a_trigger() {
+    let _config = ConfigDir::new();
+    let mut lookups = watching_relay().await;
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let key = SecretKey::generate().public();
+    let saved = cache_member_network(&registry, "home", key, &[]).await;
+
+    assert!(
+        registry
+            .warm_resume_member_network(&saved, key)
+            .await
+            .unwrap()
+    );
+    // The group poller resolves the record once at start.
+    tokio::time::timeout(Duration::from_secs(10), lookups.recv())
+        .await
+        .expect("the poller looks the record up")
+        .unwrap();
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("a member accept handler is registered");
+    };
+    handler.reconverge_notify.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(10), lookups.recv())
+        .await
+        .expect("the trigger reconverges against the signed record")
+        .unwrap();
     daemon.shutdown_and_close().await;
 }

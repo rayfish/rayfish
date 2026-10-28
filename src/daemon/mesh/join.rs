@@ -791,8 +791,13 @@ async fn perform_join_handshake(
 /// collapses into one pkarr resolve + reconverge, and a slow reconverge never
 /// blocks the control listener's accept loop. The network-key-signed record stays
 /// the source of truth, so converging once per burst suffices.
+///
+/// Every live member network needs exactly one, wired to its member accept
+/// handler's notify: [`join_mesh_shared`] starts it for a handshake, and
+/// `finalize_join` for a network registered without one (warm resume, a
+/// restore whose coordinator was unreachable). It ends with `token`.
 #[allow(clippy::too_many_arguments)]
-fn spawn_reconverge_worker(
+pub(crate) fn spawn_reconverge_worker(
     notify: Arc<tokio::sync::Notify>,
     token: CancellationToken,
     live_state: SharedNetworkState,
@@ -802,7 +807,7 @@ fn spawn_reconverge_worker(
     my_identity_w: EndpointId,
     net_pubkey_w: EndpointId,
     device_cert_w: Option<control::DeviceCert>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Backstop tick so a queued rename is retried even on a quiet
         // network that sends no `MemberSync`/`BlobUpdated` triggers. It does
@@ -848,7 +853,7 @@ fn spawn_reconverge_worker(
             )
             .await;
         }
-    });
+    })
 }
 
 #[cfg(test)]
