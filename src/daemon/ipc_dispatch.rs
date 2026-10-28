@@ -59,6 +59,18 @@ impl Daemon {
             return None;
         }
 
+        // A path-based send makes the daemon open the path with its own
+        // privileges, so an operator could send any file on the machine. Only
+        // root, who could read it anyway, may use it; everyone else passes an
+        // open descriptor (`SendFileFd`) or the bytes (`SendFileBegin`).
+        if matches!(req, IpcMessage::SendFile { .. }) {
+            return Some(ipc_err(
+                "permission denied: sending a file by path requires root; \
+                 update the ray CLI, which sends an open file instead"
+                    .to_string(),
+            ));
+        }
+
         // Granting operator access is reserved for root.
         if matches!(req, IpcMessage::SetOperator { .. }) {
             #[cfg(unix)]

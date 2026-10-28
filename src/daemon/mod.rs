@@ -1767,6 +1767,36 @@ mod net_config_authz_tests {
         assert!(Daemon::check_authorized(&get, Some(&unprivileged)).is_none());
     }
 
+    /// A path send has the daemon open the path itself, so only root may ask
+    /// for one; the operator sends an open descriptor instead.
+    #[cfg(unix)]
+    #[test]
+    fn only_root_may_send_a_file_by_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().to_path_buf());
+        config::update_settings(|cfg| {
+            cfg.operator_uid = Some(1000);
+            Ok(())
+        })
+        .unwrap();
+        let operator = PeerIdentity::Unix {
+            uid: 1000,
+            gid: 1000,
+        };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        let by_path = IpcMessage::SendFile {
+            path: "/etc/shadow".into(),
+            peer: "laptop".into(),
+        };
+        let by_fd = IpcMessage::SendFileFd {
+            filename: "notes.txt".into(),
+            peer: "laptop".into(),
+        };
+        assert!(Daemon::check_authorized(&by_path, Some(&operator)).is_some());
+        assert!(Daemon::check_authorized(&by_path, Some(&root)).is_none());
+        assert!(Daemon::check_authorized(&by_fd, Some(&operator)).is_none());
+    }
+
     /// The Windows half of the same rule, which has no root to fall back on: an
     /// unelevated client that is not the stored operator gets refused, and each
     /// of the three ways to be authorized is enough on its own.
