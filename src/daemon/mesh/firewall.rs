@@ -602,13 +602,27 @@ impl Daemon {
         // through UFW or ip6tables, or report the remaining host firewall block.
         // Desktop-only: the embedded SSH server (and the port NAT it needs) is
         // not part of the Android library, so there is nothing to warn about.
+        //
+        // The probe shells out, and this sync handler runs on an async worker,
+        // so hand the worker's other tasks off while it runs. A current-thread
+        // runtime cannot do that and has no other worker to starve.
         #[cfg(feature = "desktop")]
         if enabled
-            && let Some(warning) = crate::hostfw::ensure_inbound_tcp(
-                self.tun_name.load().as_str(),
-                crate::forward::SSH_LISTEN_PORT,
-            )
-            .warning(crate::forward::SSH_LISTEN_PORT)
+            && let Some(warning) = {
+                let tun_name = self.tun_name.load().as_str().to_owned();
+                let port = crate::forward::SSH_LISTEN_PORT;
+                let probe =
+                    move || crate::hostfw::ensure_inbound_tcp(&tun_name, port).warning(port);
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        tokio::task::block_in_place(probe)
+                    }
+                    _ => probe(),
+                }
+            }
         {
             tracing::warn!("{warning}");
             message.push_str("\n\n");
