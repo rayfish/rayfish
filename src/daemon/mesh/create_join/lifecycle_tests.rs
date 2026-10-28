@@ -190,3 +190,70 @@ async fn a_promoted_member_prunes_stale_members() {
     }
     registry.networks.get("home").unwrap().cancel.cancel();
 }
+
+fn retry_for(key: EndpointId) -> PendingJoinRetry {
+    PendingJoinRetry {
+        key,
+        name: Some("home".into()),
+        hostname: None,
+        invite: None,
+        coordinator: None,
+        auto_accept_firewall: false,
+        auto_accept_files: false,
+    }
+}
+
+/// A join queued twice retries once. Each `ray join`, startup resume and paired
+/// primary used to start its own loop, and none of them stopped once another
+/// had landed the join: they kept retrying into "already in network".
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_queued_join_has_one_retry_loop() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+
+    let first = daemon.registry.spawn_pending_join_retry(retry_for(key));
+    assert!(first.is_some());
+    assert!(
+        daemon
+            .registry
+            .spawn_pending_join_retry(retry_for(key))
+            .is_none(),
+        "a second loop for the same network"
+    );
+    daemon.shutdown_and_close().await;
+    first.unwrap().await.unwrap();
+    assert!(
+        !daemon.registry.pending_join_retries.contains(&key),
+        "the key is released when the loop ends"
+    );
+}
+
+/// A retry stops once its network is live, and drops the restart marker.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_queued_join_stops_retrying_once_the_network_is_live() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    config::add_pending_join(config::PendingJoinEntry {
+        network_key: key.to_string(),
+        name: Some("home".into()),
+    })
+    .unwrap();
+    hold_live(&daemon.registry, "home", key);
+
+    let retry = daemon
+        .registry
+        .spawn_pending_join_retry(retry_for(key))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), retry)
+        .await
+        .expect("the retry ends once the network is live")
+        .unwrap();
+    assert!(config::load().unwrap().pending_joins.is_empty());
+    daemon.shutdown_and_close().await;
+}

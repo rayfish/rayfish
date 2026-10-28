@@ -219,6 +219,30 @@ fn reconnect_coordinator(
     })
 }
 
+/// What a queued join retries with, kept from the request that queued it.
+struct PendingJoinRetry {
+    key: EndpointId,
+    name: Option<String>,
+    hostname: Option<String>,
+    invite: Option<Vec<u8>>,
+    coordinator: Option<EndpointId>,
+    auto_accept_firewall: bool,
+    auto_accept_files: bool,
+}
+
+/// A network key held in [`NetworkRegistry::pending_join_retries`] while its
+/// retry loop runs. Dropping it releases the key, however the loop ends.
+struct PendingJoinRetryClaim {
+    claims: Arc<DashSet<EndpointId>>,
+    key: EndpointId,
+}
+
+impl Drop for PendingJoinRetryClaim {
+    fn drop(&mut self) {
+        self.claims.remove(&self.key);
+    }
+}
+
 /// A live mesh connection produced by the dial phase: the per-network state cell
 /// plus the cancellation token that `finalize_join` folds into the
 /// `NetworkHandle`.
@@ -334,51 +358,17 @@ impl NetworkRegistry {
                 });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
-                let me = Arc::clone(self);
-                let nk = network_key.to_string();
-                let nm = name.map(|s| s.to_string());
-                tokio::spawn(async move {
-                    let mut backoff = BACKOFF_INITIAL;
-                    loop {
-                        tokio::select! {
-                            _ = me.shutdown_token.cancelled() => return,
-                            _ = tokio::time::sleep(backoff) => {}
-                        }
-                        backoff = (backoff * 2).min(BACKOFF_MAX);
-                        if let Ok(key) = nk.parse::<EndpointId>()
-                            && config::destruction::load(key).ok().flatten().is_some()
-                        {
-                            let _ = config::remove_pending_join(&nk);
-                            return;
-                        }
-                        match me
-                            .join_network_inner(
-                                &nk,
-                                nm.as_deref(),
-                                hostname.clone(),
-                                invite.clone(),
-                                coordinator,
-                                auto_accept_firewall,
-                                auto_accept_files,
-                                true,
-                            )
-                            .await
-                        {
-                            Ok(TryJoin::Joined(_)) => {
-                                let _ = config::remove_pending_join(&nk);
-                                tracing::info!(net = %nk, "approval granted - joined");
-                                return;
-                            }
-                            Ok(TryJoin::Pending) => continue,
-                            Err(e) => {
-                                if me.record_join_denial(&nk, &e) {
-                                    return;
-                                }
-                                tracing::warn!(net = %nk, error = %e, "join retry failed");
-                            }
-                        }
-                    }
-                });
+                if let Ok(key) = network_key.parse::<EndpointId>() {
+                    self.spawn_pending_join_retry(PendingJoinRetry {
+                        key,
+                        name: name.map(|s| s.to_string()),
+                        hostname,
+                        invite,
+                        coordinator,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                    });
+                }
                 IpcMessage::Ok {
                     message: "join request sent - waiting for coordinator approval (run `ray status` to check)"
                         .to_string(),
@@ -389,6 +379,97 @@ impl NetworkRegistry {
                 ipc_err(format!("{e:#}"))
             }
         }
+    }
+
+    /// Start the background retry for a join queued for approval, unless one is
+    /// already running for this network. The loop ends once the network is
+    /// live by any path, when it is destroyed or the join is denied, or at
+    /// shutdown. Returns the loop's handle, or `None` when one already runs.
+    fn spawn_pending_join_retry(
+        self: &Arc<Self>,
+        retry: PendingJoinRetry,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.pending_join_retries.insert(retry.key) {
+            return None;
+        }
+        let claim = PendingJoinRetryClaim {
+            claims: Arc::clone(&self.pending_join_retries),
+            key: retry.key,
+        };
+        let me = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            me.retry_pending_join(retry).await;
+            drop(claim);
+        }))
+    }
+
+    async fn retry_pending_join(self: Arc<Self>, retry: PendingJoinRetry) {
+        let PendingJoinRetry {
+            key,
+            name,
+            hostname,
+            invite,
+            coordinator,
+            auto_accept_firewall,
+            auto_accept_files,
+        } = retry;
+        let nk = key.to_string();
+        let mut backoff = BACKOFF_INITIAL;
+        loop {
+            if self.pending_join_landed(key) {
+                return;
+            }
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+            if config::destruction::load(key).ok().flatten().is_some() {
+                let _ = config::remove_pending_join(&nk);
+                return;
+            }
+            if self.pending_join_landed(key) {
+                return;
+            }
+            match self
+                .join_network_inner(
+                    &nk,
+                    name.as_deref(),
+                    hostname.clone(),
+                    invite.clone(),
+                    coordinator,
+                    auto_accept_firewall,
+                    auto_accept_files,
+                    true,
+                )
+                .await
+            {
+                Ok(TryJoin::Joined(_)) => {
+                    let _ = config::remove_pending_join(&nk);
+                    tracing::info!(net = %nk, "approval granted - joined");
+                    return;
+                }
+                Ok(TryJoin::Pending) => continue,
+                Err(e) => {
+                    if self.record_join_denial(&nk, &e) {
+                        return;
+                    }
+                    tracing::warn!(net = %nk, error = %e, "join retry failed");
+                }
+            }
+        }
+    }
+
+    /// Whether a queued join's network is live now, by this retry or any other
+    /// path. Drops the restart marker when it is: the join is done.
+    fn pending_join_landed(&self, key: EndpointId) -> bool {
+        if !self.is_live_network_key(key) {
+            return false;
+        }
+        if let Err(error) = config::remove_pending_join(&key.to_string()) {
+            tracing::warn!(%error, "could not remove a landed pending join");
+        }
+        true
     }
 
     /// Record a terminal refusal for status and remove the restart retry marker.

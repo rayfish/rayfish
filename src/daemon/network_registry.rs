@@ -245,6 +245,10 @@ pub(crate) struct NetworkRegistry {
     /// run a second coordinator state for the same network. See
     /// [`NetworkRegistry::claim_registration`].
     pub(crate) restoring: Arc<DashSet<String>>,
+    /// Network keys with a pending-join retry loop running, so a join queued
+    /// twice (startup resume, a repeated `ray join`, a paired primary) retries
+    /// once. See [`NetworkRegistry::spawn_pending_join_retry`].
+    pub(crate) pending_join_retries: Arc<DashSet<EndpointId>>,
     /// Why each saved-but-unregistered network's last restore attempt failed,
     /// keyed by network name. `ray status` reports it beside the network so a
     /// failed restore says what went wrong instead of sending the reader to the
@@ -408,6 +412,7 @@ impl NetworkRegistry {
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
             restoring: Arc::new(DashSet::new()),
+            pending_join_retries: Arc::new(DashSet::new()),
             restore_errors: Arc::new(DashMap::new()),
             restore_nudge: Arc::new(Notify::new()),
             poll_nudge: Arc::new(Notify::new()),
