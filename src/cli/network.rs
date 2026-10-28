@@ -289,6 +289,11 @@ pub(crate) fn format_ttl(secs: u64) -> String {
 /// `ray ephemeral <net> <duration|off|show>`: set, clear, or print a network's
 /// ephemeral auto-kick TTL.
 pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
+    // Parse before connecting so a bad duration fails without a daemon round trip.
+    let ttl_secs = match arg {
+        "show" | "off" => None,
+        _ => Some(parse_ephemeral_duration(arg).map_err(anyhow::Error::msg)?),
+    };
     let mut stream = ipc::connect().await?;
     if arg == "show" {
         ipc::send(
@@ -315,17 +320,6 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
         }
         return Ok(());
     }
-    let ttl_secs = if arg == "off" {
-        None
-    } else {
-        match parse_ephemeral_duration(arg) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                print_error("error", &e, None);
-                return Ok(());
-            }
-        }
-    };
     ipc::send(
         &mut stream,
         ipc::IpcMessage::NetConfigSet {
@@ -365,7 +359,15 @@ pub(crate) fn parse_ephemeral_duration(s: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ephemeral_duration;
+    use super::{ipc_ephemeral, parse_ephemeral_duration};
+
+    /// A bad duration is a failure, and is caught before any daemon is
+    /// contacted.
+    #[tokio::test]
+    async fn invalid_ephemeral_duration_fails_before_connecting() {
+        let error = ipc_ephemeral("net", "garbage").await.unwrap_err();
+        assert!(error.to_string().contains("invalid duration"), "{error}");
+    }
 
     #[test]
     fn parses_valid_durations() {
