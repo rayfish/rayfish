@@ -38,17 +38,60 @@ impl DisplayOut for PairedDevicesOutput<'_> {
     }
 }
 
+/// `ray pair` on the primary: the ticket for the other device.
+#[derive(serde::Serialize)]
+struct PairingTicketOutput {
+    ticket: String,
+}
+
+impl DisplayOut for PairingTicketOutput {
+    fn print_human(&self) {
+        let ticket = &self.ticket;
+        println!("Pairing ticket: {ticket}");
+        println!();
+        qr2term::print_qr(ticket).ok();
+        println!();
+        println!("On the other device, run:");
+        println!("  ray pair {ticket}");
+        println!();
+        println!("Waiting for device to connect (this ticket expires in 5 minutes)...");
+    }
+}
+
+/// `ray pair <ticket>`: the user identity this device now holds a cert for.
+#[derive(serde::Serialize)]
+struct PairedOutput {
+    user_identity: String,
+}
+
+impl DisplayOut for PairedOutput {
+    fn print_human(&self) {
+        println!("Paired successfully!");
+        println!("  User identity: {}", self.user_identity);
+        println!("  Device certificate stored.");
+        println!();
+        println!("This device will present its certificate when joining networks.");
+    }
+}
+
 pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<()> {
+    // The bare ticket is shorthand for `ray pair accept <ticket>`, so with a
+    // subcommand it would be dropped without a word.
+    anyhow::ensure!(
+        action.is_none() || ticket.is_none(),
+        "a pairing ticket cannot be combined with a pair subcommand; \
+         use `ray pair <ticket>` or `ray pair accept <ticket>`"
+    );
     match (action, ticket) {
-        // `rayfish pair <ticket>` shorthand
+        // `ray pair <ticket>` shorthand
         (None, Some(ticket)) | (Some(PairAction::Accept { ticket }), _) => {
             ipc_pair_accept(&ticket).await
         }
-        // `rayfish pair list`
+        // `ray pair list`
         (Some(PairAction::List), _) => ipc_pair_list().await,
-        // `rayfish pair`: start pairing on primary device
+        // `ray pair`: start pairing on primary device
         (None, None) => ipc_pair_start().await,
-        // `rayfish pair backup`
+        // `ray pair backup`
         (
             Some(PairAction::Backup {
                 onepassword,
@@ -57,7 +100,7 @@ pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>)
             }),
             _,
         ) => cmd_pair_backup(onepassword, vault.as_deref(), &item).await,
-        // `rayfish pair restore <backup>`
+        // `ray pair restore <backup>`
         (
             Some(PairAction::Restore {
                 backup,
@@ -75,19 +118,10 @@ pub(crate) async fn ipc_pair_start() -> Result<()> {
     ipc::send(&mut stream, ipc::IpcMessage::StartPairing).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::PairingTicket { ticket } => {
-            println!("Pairing ticket: {}", ticket);
-            println!();
-            qr2term::print_qr(&ticket).ok();
-            println!();
-            println!("On the other device, run:");
-            println!("  rayfish pair {}", ticket);
-            println!();
-            println!("Waiting for device to connect (this ticket expires in 5 minutes)...");
-            // The daemon handles the pairing asynchronously via the accept loop.
-            // We could poll for completion, but the daemon logs when it happens.
-            // For now, just tell the user it's ready.
-        }
+        // The daemon handles the pairing asynchronously via the accept loop.
+        // We could poll for completion, but the daemon logs when it happens.
+        // For now, just tell the user it's ready.
+        ipc::IpcMessage::PairingTicket { ticket } => printout(&PairingTicketOutput { ticket })?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
@@ -109,13 +143,9 @@ pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
     .await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::PairingComplete { user_identity } => {
-            println!("Paired successfully!");
-            println!("  User identity: {}", user_identity);
-            println!("  Device certificate stored.");
-            println!();
-            println!("This device will present its certificate when joining networks.");
-        }
+        ipc::IpcMessage::PairingComplete { user_identity } => printout(&PairedOutput {
+            user_identity: user_identity.to_string(),
+        })?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
@@ -228,3 +258,36 @@ pub(crate) async fn cmd_pair_restore(
 // ---------------------------------------------------------------------------
 // Service install/uninstall
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_ticket_with_a_subcommand_is_rejected() {
+        let cli = Cli::try_parse_from(["ray", "pair", "ticket", "list"]).unwrap();
+        let Command::Pair { action, ticket, .. } = cli.command else {
+            panic!("wrong command");
+        };
+        let error = cmd_pair(action, ticket).await.unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
+    }
+
+    #[test]
+    fn pairing_results_serialize_for_json() {
+        let ticket = PairingTicketOutput {
+            ticket: "ticket".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&ticket).unwrap(),
+            serde_json::json!({ "ticket": "ticket" })
+        );
+        let paired = PairedOutput {
+            user_identity: "identity".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&paired).unwrap(),
+            serde_json::json!({ "user_identity": "identity" })
+        );
+    }
+}

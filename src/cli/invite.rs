@@ -88,7 +88,9 @@ pub(crate) fn parse_duration_secs(s: &str) -> Result<u64> {
     let value: u64 = num
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration '{s}': use e.g. 30m, 24h, 7d"))?;
-    Ok(value * mult)
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("duration '{s}' is too large"))
 }
 
 pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
@@ -141,34 +143,53 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
             code,
             id,
             expires_secs,
-        } => print_invite_created(
-            &code,
-            &id,
+        } => printout(&InviteCreatedOutput {
+            code: &code,
+            id: &id,
             expires_secs,
+            reusable: reusable_requested,
+            hostname: hostname_opt.as_deref(),
             show_qr,
-            reusable_requested,
-            &hostname_opt,
-        ),
+        })?,
         ipc::IpcMessage::InviteListResponse { invites } => {
             printout(&InviteListOutput::from(invites.as_slice()))?
         }
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
     Ok(())
 }
 
+/// A freshly minted invite, as JSON under `--json` or the styled block.
+#[derive(serde::Serialize)]
+struct InviteCreatedOutput<'a> {
+    code: &'a str,
+    id: &'a str,
+    expires_secs: u64,
+    reusable: bool,
+    hostname: Option<&'a str>,
+    #[serde(skip)]
+    show_qr: bool,
+}
+
+impl DisplayOut for InviteCreatedOutput<'_> {
+    fn print_human(&self) {
+        print_invite_created(self);
+    }
+}
+
 /// Render a freshly minted invite: id, join code, optional QR, TTL, and the
 /// reusable/single-use + hostname-binding notes.
-fn print_invite_created(
-    code: &str,
-    id: &str,
-    expires_secs: u64,
-    show_qr: bool,
-    reusable_requested: bool,
-    hostname_opt: &Option<String>,
-) {
+fn print_invite_created(invite: &InviteCreatedOutput<'_>) {
+    let InviteCreatedOutput {
+        code,
+        id,
+        expires_secs,
+        reusable: reusable_requested,
+        hostname: hostname_opt,
+        show_qr,
+    } = *invite;
     println!();
     println!(
         "  {} {} {}",
@@ -320,5 +341,39 @@ pub(crate) async fn ipc_invitations(action: Option<InvitationAction>) -> Result<
             Ok(())
         }
         response => print_ok_reply(response),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InviteCreatedOutput, parse_duration_secs};
+
+    #[test]
+    fn created_invites_serialize_for_json() {
+        let output = InviteCreatedOutput {
+            code: "code",
+            id: "id",
+            expires_secs: 60,
+            reusable: true,
+            hostname: Some("server"),
+            show_qr: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&output).unwrap(),
+            serde_json::json!({
+                "code": "code",
+                "id": "id",
+                "expires_secs": 60,
+                "reusable": true,
+                "hostname": "server",
+            })
+        );
+    }
+
+    #[test]
+    fn invite_durations_parse_and_reject_overflow() {
+        assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
+        assert_eq!(parse_duration_secs("7d").unwrap(), 604_800);
+        assert!(parse_duration_secs("18446744073709551615d").is_err());
     }
 }

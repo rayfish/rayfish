@@ -75,15 +75,49 @@ pub(crate) fn fail_unexpected(reply: &impl std::fmt::Debug) -> ! {
     std::process::exit(1);
 }
 
+/// A daemon `Ok` message: `{"message": ...}` under `--json`, a plain line (or
+/// a checked line) otherwise.
+#[derive(serde::Serialize)]
+pub(crate) struct MessageOutput<'a> {
+    message: &'a str,
+    #[serde(skip)]
+    checked: bool,
+}
+
+impl DisplayOut for MessageOutput<'_> {
+    fn print_human(&self) {
+        if self.checked {
+            println!("  {} {}", style::check(), style::value(self.message));
+        } else {
+            println!("{}", self.message);
+        }
+    }
+}
+
+/// Print a daemon `Ok` message as a plain line, or as JSON under `--json`.
+pub(crate) fn print_message(message: &str) -> Result<()> {
+    printout(&MessageOutput {
+        message,
+        checked: false,
+    })
+}
+
+/// [`print_message`] with a check mark in front of the human form.
+pub(crate) fn print_checked_message(message: &str) -> Result<()> {
+    printout(&MessageOutput {
+        message,
+        checked: true,
+    })
+}
+
 /// Print the message of a daemon `Ok` reply, ending the command through
 /// [`fail_with`] or [`fail_unexpected`] for anything else.
 pub(crate) fn print_ok_reply(response: ipc::IpcMessage) -> Result<()> {
     match response {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_message(&message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
-    Ok(())
 }
 
 /// The same complaint as [`fail_unexpected`] as a string, for the two callers
@@ -408,6 +442,14 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
         // running daemon as down sends the reader after the wrong problem. The
         // IPC layer already tells the two apart, so keep its answer rather than
         // flattening every failure into one message.
+        // JSON callers get no styled fallback: the error goes to stderr and the
+        // command exits non-zero, as every other `--json` command does.
+        Err(error) if json_enabled() => {
+            if connect_was_refused(&error) {
+                return Err(error.context("not authorized to query the rayfish service"));
+            }
+            return Err(error);
+        }
         Err(error) if connect_was_refused(&error) => {
             print_not_authorized();
             return Ok(());
@@ -1287,6 +1329,20 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
 mod grouping_tests {
 
     use super::*;
+
+    /// Daemon `Ok` messages render as one JSON object under `--json`, with no
+    /// presentation-only fields.
+    #[test]
+    fn ok_messages_serialize_as_a_message_object() {
+        let output = MessageOutput {
+            message: "done",
+            checked: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&output).unwrap(),
+            serde_json::json!({ "message": "done" })
+        );
+    }
 
     fn conn() -> ipc::ConnectionInfo {
         ipc::ConnectionInfo {

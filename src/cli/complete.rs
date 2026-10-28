@@ -470,7 +470,7 @@ fn network_names() -> Vec<String> {
         names.extend(pending);
         return names;
     }
-    config::load()
+    config::load_for_read()
         .map(|cfg| cfg.networks.into_iter().map(|net| net.name).collect())
         .unwrap_or_default()
 }

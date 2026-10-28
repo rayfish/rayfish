@@ -1757,10 +1757,25 @@ pub fn socket_path() -> PathBuf {
 #[cfg(unix)]
 pub async fn connect() -> Result<IpcFramed> {
     let path = socket_path();
-    let stream = UnixStream::connect(&path)
-        .await
-        .context("daemon not running — start it with: sudo rayfish daemon")?;
+    let stream = match UnixStream::connect(&path).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let context = connect_error_context(&error);
+            return Err(error).context(context);
+        }
+    };
     Ok(Framed::new(stream, MsgpackCodec::new()))
+}
+
+/// What a failed socket connect means to the user. A refusal is a running
+/// daemon this user may not talk to, not a missing one.
+#[cfg(unix)]
+fn connect_error_context(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        "not authorized to connect to the rayfish daemon"
+    } else {
+        "daemon not running; start it with: sudo ray up"
+    }
 }
 
 #[cfg(windows)]
@@ -1780,7 +1795,7 @@ pub async fn connect() -> Result<IpcFramed> {
                     )
                 }
                 PipeOpenError::NotFound => {
-                    return Err(error).context("daemon not running — start the Rayfish service");
+                    return Err(error).context("daemon not running; start the Rayfish service");
                 }
                 PipeOpenError::Other(code) => {
                     return Err(error).context(format!(
@@ -2033,6 +2048,16 @@ pub async fn recv_with_fds(stream: &UnixStream) -> Result<(IpcMessage, Vec<Owned
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_errors_name_the_ray_binary_and_tell_refusal_apart() {
+        use std::io::{Error, ErrorKind};
+        let missing = connect_error_context(&Error::from(ErrorKind::NotFound));
+        assert!(missing.contains("sudo ray up"), "{missing}");
+        let refused = connect_error_context(&Error::from(ErrorKind::PermissionDenied));
+        assert!(refused.contains("not authorized"), "{refused}");
+    }
 
     #[test]
     fn status_enums_display_their_status_words() {

@@ -741,7 +741,7 @@ pub(crate) enum Command {
     Pair {
         #[command(subcommand)]
         action: Option<PairAction>,
-        /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
+        /// Pairing ticket from the primary device (shorthand for `ray pair accept <ticket>`)
         ticket: Option<String>,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
@@ -1387,7 +1387,7 @@ pub(crate) enum ExitNodeAction {
 pub(crate) enum FilesAction {
     /// Accept a pending file transfer
     Accept {
-        /// Transfer ID (from 'rayfish files')
+        /// Transfer ID (from 'ray files')
         #[arg(add = complete::incoming_files())]
         id: u64,
         /// Output directory (default: ~/Downloads)
@@ -2077,9 +2077,7 @@ async fn run() -> Result<()> {
 
 /// Send a mutating IPC request and print its `Ok`/`Error` reply.
 pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
-    let mut stream = ipc::connect()
-        .await
-        .context("rayfish daemon is not running; start it with: sudo ray up")?;
+    let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, msg).await?;
     print_ok_reply(ipc::recv(&mut stream).await?)
 }
@@ -2145,9 +2143,7 @@ async fn cmd_config(action: Option<ConfigAction>) -> Result<()> {
             // Before the connect, so a bad key reads the same whether or not the
             // daemon happens to be running (and the same as `set`/`unset`).
             let key = key.as_deref().map(parse_node_key);
-            let mut stream = ipc::connect()
-                .await
-                .context("rayfish daemon is not running; start it with: sudo ray up")?;
+            let mut stream = ipc::connect().await?;
             ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::ConfigValues { rows } => {

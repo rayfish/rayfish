@@ -1,6 +1,7 @@
 //! CLI firewall + declarative-apply handlers and their parsers/renderers.
 
 use std::collections::{BTreeSet, HashSet};
+use std::io::IsTerminal;
 
 use crate::*;
 use firewall::Action;
@@ -230,7 +231,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallState {
             default_inbound,
             default_outbound,
@@ -451,7 +452,7 @@ pub(crate) async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallSshState {
             enabled,
             port,
@@ -644,7 +645,8 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
     };
 
     // JSON and non-interactive output stop before the picker can mutate rules.
-    if json_enabled() || rules.is_empty() || !style::is_enabled() {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !use_pending_picker(json_enabled(), rules.is_empty(), interactive) {
         printout(&PendingFirewallOutput {
             network,
             rules: &rules,
@@ -679,6 +681,14 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         other => fail_unexpected(&other),
     }
     Ok(())
+}
+
+/// Whether `ray firewall pending` opens the picker. It reads keys from stdin
+/// and draws on stdout, so it needs both to be a terminal; colour being off
+/// (`NO_COLOR`) is no reason to skip it, and colour being forced on a pipe is
+/// no reason to start it.
+fn use_pending_picker(json: bool, no_rules: bool, interactive: bool) -> bool {
+    !json && !no_rules && interactive
 }
 
 /// Parse a `--allow`/`--deny` value into `(peer, proto:ports-list)`.
@@ -853,6 +863,8 @@ pub(crate) async fn ipc_apply(
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
     let mut removal_failures = false;
     let mut ssh_failures = false;
+    let mut network_failures = false;
+    let mut invite_failures = false;
     for (net_name, net_firewall) in &expanded.networks {
         let is_active = active_names.contains(net_name.as_str());
         // Create-if-absent (always a closed network).
@@ -863,6 +875,7 @@ pub(crate) async fn ipc_apply(
                 style::bold(net_name),
             );
             if let Err(e) = ipc_apply_create(net_name).await {
+                network_failures = true;
                 eprintln!("{}  create failed: {e}", style::red("  !"));
                 continue;
             }
@@ -878,26 +891,22 @@ pub(crate) async fn ipc_apply(
         // spec's set; without it, merge into the live set (so `apply` never
         // silently drops subjects authored out-of-band - use --prune for that).
         let to_publish = if prune {
-            apply::suggested_firewall(net_firewall)
+            Ok(apply::suggested_firewall(net_firewall))
         } else {
-            let mut live = ipc_firewall_suggestions_get(net_name)
-                .await
-                .unwrap_or_default();
-            // Merge spec subjects over live (spec wins on conflict).
-            for (subj, rules) in net_firewall {
-                live.insert(
-                    subj.clone(),
-                    ray_proto::policy::HostSuggestions {
-                        allows: rules.allows.clone(),
-                        denies: rules.denies.clone(),
-                    },
-                );
-            }
-            live
+            merge_live_suggestions(ipc_firewall_suggestions_get(net_name).await, net_firewall)
         };
-        match ipc_firewall_suggest_set(net_name, to_publish).await {
-            Ok(msg) => println!("{}   {msg}", style::faint("→")),
-            Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
+        match to_publish {
+            Ok(to_publish) => match ipc_firewall_suggest_set(net_name, to_publish).await {
+                Ok(msg) => println!("{}   {msg}", style::faint("→")),
+                Err(e) => {
+                    network_failures = true;
+                    eprintln!("{}   suggest failed: {e}", style::red("  !"));
+                }
+            },
+            Err(e) => {
+                network_failures = true;
+                eprintln!("{}   suggest skipped: {e:#}", style::red("  !"));
+            }
         }
 
         // Reconcile this network's concrete hostnames against both the
@@ -1098,11 +1107,14 @@ pub(crate) async fn ipc_apply(
                         cmd,
                         style::faint(&format!("→ {code}"))
                     ),
-                    Err(e) => eprintln!(
-                        "  {}  {cmd}  {}",
-                        style::red(host),
-                        style::red(&e.to_string())
-                    ),
+                    Err(e) => {
+                        invite_failures = true;
+                        eprintln!(
+                            "  {}  {cmd}  {}",
+                            style::red(host),
+                            style::red(&e.to_string())
+                        );
+                    }
                 }
             } else {
                 println!("  {}  {cmd}", style::bold(host));
@@ -1126,10 +1138,28 @@ pub(crate) async fn ipc_apply(
         }
         false
     };
+    anyhow::ensure!(
+        !network_failures,
+        "some networks could not be created or published"
+    );
     anyhow::ensure!(!removal_failures, "some members could not be removed");
     anyhow::ensure!(!ssh_failures, "some SSH grants could not be applied");
     anyhow::ensure!(!delivery_failures, "some invitations could not be queued");
+    anyhow::ensure!(!invite_failures, "some invites could not be minted");
     Ok(())
+}
+
+/// The suggestion set `ray apply` publishes without `--prune`: the live set
+/// with the spec's subjects merged over it (spec wins on conflict), so
+/// subjects authored out-of-band survive. If the live set cannot be read the
+/// merge fails: publishing the spec alone would silently drop those subjects.
+fn merge_live_suggestions(
+    live: Result<ray_proto::SuggestedFirewall>,
+    spec: &apply::DeployNetwork,
+) -> Result<ray_proto::SuggestedFirewall> {
+    let mut live = live.context("reading the live suggestions to merge into")?;
+    live.extend(apply::suggested_firewall(spec));
+    Ok(live)
 }
 
 /// One private invitation planned by `ray apply --invite-missing`.
@@ -1651,6 +1681,35 @@ networks:
         ))
         .unwrap();
         (spec, invited)
+    }
+
+    #[test]
+    fn pending_picker_needs_a_terminal_not_colour() {
+        assert!(use_pending_picker(false, false, true));
+        assert!(!use_pending_picker(false, false, false));
+        assert!(!use_pending_picker(true, false, true));
+        assert!(!use_pending_picker(false, true, true));
+    }
+
+    /// Without `--prune`, a failed read of the live set must stop the publish
+    /// rather than replace the live set with the spec alone.
+    #[test]
+    fn merge_fails_when_live_suggestions_cannot_be_read() {
+        let spec: apply::DeployNetwork =
+            serde_yml::from_str("server:\n  allows:\n    bob: tcp:22\n").unwrap();
+        assert!(merge_live_suggestions(Err(anyhow::anyhow!("daemon down")), &spec).is_err());
+
+        let mut live = ray_proto::SuggestedFirewall::new();
+        live.insert(
+            "other".into(),
+            ray_proto::policy::HostSuggestions {
+                allows: [("*".to_string(), "icmp".to_string())].into(),
+                denies: Default::default(),
+            },
+        );
+        let merged = merge_live_suggestions(Ok(live), &spec).unwrap();
+        assert!(merged.contains_key("other"));
+        assert_eq!(merged["server"].allows["bob"], "tcp:22");
     }
 
     #[test]
