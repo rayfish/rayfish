@@ -941,9 +941,19 @@ impl IpcHost {
                 "The Rayfish app manages access to its packet tunnel; no operator setting is needed",
             ));
         }
-        if peer.is_some_and(
-            |peer| matches!(peer, PeerIdentity::Unix { uid, .. } if *uid == 0 || *uid == owner_uid),
-        ) {
+        let uid = peer.map(|peer| match peer {
+            PeerIdentity::Unix { uid, .. } => *uid,
+        });
+        if uid == Some(0) {
+            return None;
+        }
+        // The extension writes as root, so the same settings stay root's here.
+        if Daemon::is_root_only_setting(req) {
+            return Some(ipc_err(
+                crate::daemon::ipc_dispatch::ROOT_ONLY_DOWNLOAD_SETTING,
+            ));
+        }
+        if uid == Some(owner_uid) {
             return None;
         }
         Some(ipc_err(

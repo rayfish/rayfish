@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// The refusal a non-root caller gets for [`Daemon::is_root_only_setting`].
+#[cfg(unix)]
+pub(crate) const ROOT_ONLY_DOWNLOAD_SETTING: &str = "permission denied: download-dir and download-user decide where the daemon \
+     writes received files, so only root may set them (re-run with sudo)";
+
 impl Daemon {
     pub(crate) fn is_open_read(req: &IpcMessage) -> bool {
         matches!(
@@ -92,6 +97,22 @@ impl Daemon {
             ));
         }
 
+        // Where auto-accepted files land, and whose they become, steer the
+        // daemon's own writes. An operator who could set them could have a peer
+        // drop a file anywhere root can write, so they are root's to set.
+        if Self::is_root_only_setting(req) {
+            #[cfg(unix)]
+            return Some(ipc_err(ROOT_ONLY_DOWNLOAD_SETTING.to_string()));
+            #[cfg(windows)]
+            if !windows_peer_authorized(peer, None) {
+                return Some(ipc_err(
+                    "permission denied: set download-dir and download-user from an \
+                     Administrator terminal"
+                        .to_string(),
+                ));
+            }
+        }
+
         #[cfg(windows)]
         if windows_peer_authorized(peer, config::operator_sid().ok().flatten().as_deref()) {
             return None;
@@ -121,6 +142,19 @@ impl Daemon {
              Grant access from an Administrator terminal with: ray set-operator <user>"
                 .to_string(),
         ))
+    }
+
+    /// Settings only root may change, even when an operator is configured:
+    /// the auto-accept target directory and the user it writes for.
+    pub(crate) fn is_root_only_setting(req: &IpcMessage) -> bool {
+        matches!(
+            req,
+            IpcMessage::ConfigSet { key, .. } | IpcMessage::ConfigUnset { key }
+                if matches!(
+                    key,
+                    NodeKey::Global(GlobalKey::DownloadDir | GlobalKey::DownloadUser)
+                )
+        )
     }
 
     /// Persist the operator UID so that user can run mutating `ray` commands
@@ -900,5 +934,50 @@ mod tests {
         };
         assert!(Daemon::is_open_read(&request));
         assert!(Daemon::check_authorized(&request, None).is_none());
+    }
+
+    /// An operator may change most settings, but not the ones that choose
+    /// where the root daemon writes auto-accepted files.
+    #[cfg(unix)]
+    #[test]
+    fn download_target_settings_are_root_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().to_path_buf());
+        config::update_settings(|cfg| {
+            cfg.operator_uid = Some(4242);
+            Ok(())
+        })
+        .unwrap();
+        let operator = PeerIdentity::Unix {
+            uid: 4242,
+            gid: 4242,
+        };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        for key in [GlobalKey::DownloadDir, GlobalKey::DownloadUser] {
+            for request in [
+                IpcMessage::ConfigSet {
+                    key: NodeKey::Global(key),
+                    value: "/etc".into(),
+                    replace: false,
+                },
+                IpcMessage::ConfigUnset {
+                    key: NodeKey::Global(key),
+                },
+            ] {
+                let Some(IpcMessage::Error { message }) =
+                    Daemon::check_authorized(&request, Some(&operator))
+                else {
+                    panic!("an operator must not set {key:?}");
+                };
+                assert!(message.contains("only root"), "{message}");
+                assert!(Daemon::check_authorized(&request, Some(&root)).is_none());
+            }
+        }
+        let other = IpcMessage::ConfigSet {
+            key: NodeKey::Global(GlobalKey::AutoUpdate),
+            value: "on".into(),
+            replace: false,
+        };
+        assert!(Daemon::check_authorized(&other, Some(&operator)).is_none());
     }
 }
