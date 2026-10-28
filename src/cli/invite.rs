@@ -88,7 +88,9 @@ pub(crate) fn parse_duration_secs(s: &str) -> Result<u64> {
     let value: u64 = num
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration '{s}': use e.g. 30m, 24h, 7d"))?;
-    Ok(value * mult)
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("duration '{s}' is too large"))
 }
 
 pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
@@ -320,5 +322,17 @@ pub(crate) async fn ipc_invitations(action: Option<InvitationAction>) -> Result<
             Ok(())
         }
         response => print_ok_reply(response),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration_secs;
+
+    #[test]
+    fn invite_durations_parse_and_reject_overflow() {
+        assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
+        assert_eq!(parse_duration_secs("7d").unwrap(), 604_800);
+        assert!(parse_duration_secs("18446744073709551615d").is_err());
     }
 }

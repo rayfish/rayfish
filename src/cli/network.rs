@@ -345,12 +345,15 @@ pub(crate) fn parse_ephemeral_duration(s: &str) -> Result<u64, String> {
     let n: u64 = num
         .parse()
         .map_err(|_| format!("invalid duration '{s}' (use Nh, Nd, or Nw)"))?;
-    let secs = match unit {
-        "h" => n * 3600,
-        "d" => n * 86_400,
-        "w" => n * 604_800,
+    let unit_secs: u64 = match unit {
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 604_800,
         other => return Err(format!("unknown unit '{other}' (use h, d, or w)")),
     };
+    let secs = n
+        .checked_mul(unit_secs)
+        .ok_or_else(|| format!("duration '{s}' is too large"))?;
     if secs < 3600 {
         return Err("minimum ephemeral TTL is 1h".to_string());
     }
@@ -385,5 +388,6 @@ mod tests {
         assert!(parse_ephemeral_duration("garbage").is_err());
         assert!(parse_ephemeral_duration("5").is_err()); // no unit
         assert!(parse_ephemeral_duration("").is_err());
+        assert!(parse_ephemeral_duration("18446744073709551615w").is_err()); // overflows
     }
 }
