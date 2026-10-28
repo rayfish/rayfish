@@ -1371,6 +1371,23 @@ impl Daemon {
             hostname.to_string()
         };
 
+        // Persist to config first, so a failed save changes nothing. A member
+        // also records the rename as a durable pending intent so it keeps
+        // being delivered to a coordinator across reconnects/restarts until the
+        // signed blob confirms it; a coordinator publishes authoritatively, so
+        // it clears any pending intent.
+        if let Err(error) = config::update_network(network, |net| {
+            net.my_hostname = Some(new_hostname.clone());
+            net.pending_hostname = if is_coord {
+                None
+            } else {
+                Some(new_hostname.clone())
+            };
+            Ok(())
+        }) {
+            return ipc_err(format!("could not save hostname: {error:#}"));
+        }
+
         // Update our own member entry.
         if let Ok(mut s) = state.write()
             && let Some(me) = s.members.get_mut(&my_identity)
@@ -1394,20 +1411,6 @@ impl Daemon {
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
-
-        // Persist to config. A member also records the rename as a durable
-        // pending intent so it keeps being delivered to a coordinator across
-        // reconnects/restarts until the signed blob confirms it; a coordinator
-        // publishes authoritatively, so it clears any pending intent.
-        let _ = config::update_network(network, |net| {
-            net.my_hostname = Some(new_hostname.clone());
-            net.pending_hostname = if is_coord {
-                None
-            } else {
-                Some(new_hostname.clone())
-            };
-            Ok(())
-        });
 
         // Fast-path the rename to connected peers via `MeshHello`, regardless of
         // role. A peer *coordinator* only learns a self-rename this way: it acts
@@ -4622,6 +4625,51 @@ pub(crate) mod accept_handler_tests {
             recorded,
             "sync_exit_offers did not get the offer recorded on the coordinator over the retained connection"
         );
+    }
+
+    /// A hostname that cannot be saved is reported, and the running network
+    /// keeps its old name instead of drifting from the saved config.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_hostname_reports_a_failed_save() {
+        let env = TestConfigDir::new();
+        let daemon = build_headless(false).await.unwrap();
+        let state = make_network_state();
+        let me = daemon.transport.endpoint.id();
+        state.write().unwrap().members.add(seated(me));
+        let network_key = state.read().unwrap().network_public_key;
+        daemon.registry.networks.insert(
+            "test-net".into(),
+            NetworkHandle {
+                name: "test-net".into(),
+                network_key,
+                role: NetworkRole::Member,
+                state: Arc::clone(&state),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
+            },
+        );
+        // A directory where the network's file belongs makes the save fail.
+        std::fs::create_dir_all(env.dir.path().join("networks/test-net.toml")).unwrap();
+        let before = state
+            .read()
+            .unwrap()
+            .members
+            .get(&me)
+            .unwrap()
+            .hostname
+            .clone();
+        let reply = daemon.set_hostname("test-net", "renamed").await;
+        assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+        assert_eq!(
+            state.read().unwrap().members.get(&me).unwrap().hostname,
+            before
+        );
+        daemon.registry.networks.remove("test-net");
+        daemon.shutdown_and_close().await;
     }
 
     #[allow(clippy::await_holding_lock)]
