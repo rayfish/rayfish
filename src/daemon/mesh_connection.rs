@@ -60,6 +60,29 @@ async fn reply_network_unavailable(mut send: SendStream, net: EndpointId, msg: &
     }
 }
 
+/// How long the demux loop waits for one control stream to deliver its frame.
+/// Frames are small, so a stream still short of a whole frame after this long
+/// is stalled, and the loop moves on rather than stop serving the connection.
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the demux loop waits on any other step it runs inline: opening a
+/// reply stream, or queueing a frame on a full network lane. Longer than a
+/// read, since a lane can be busy with an admission waiting on the relay.
+const INLINE_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run one inline step of the demux loop, giving up when it takes longer than
+/// `limit` or when the daemon shuts down. `None` means the step was abandoned.
+async fn bounded<F: Future>(
+    token: &CancellationToken,
+    limit: Duration,
+    step: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        _ = token.cancelled() => None,
+        result = tokio::time::timeout(limit, step) => result.ok(),
+    }
+}
+
 /// Bounds [`ControlMsg::NotSupported`] nacks on one connection: each unknown
 /// kind is nacked once, at most [`NackGate::LIMIT`] distinct kinds, and never a
 /// `NotSupported` itself, so two mismatched builds cannot ping-pong.
@@ -85,7 +108,8 @@ impl NackGate {
 /// Nothing is locked while an item runs, so a slow item delays only the items
 /// queued behind it under the same key. A lane holds at most
 /// [`Self::LANE_DEPTH`] items; a push to a full lane waits, which holds the
-/// caller back the way handling each item inline did.
+/// caller back the way handling each item inline did. The demux loop bounds
+/// that wait and drops the frame when a lane stays full.
 struct SerialLanes<K, T, R> {
     lanes: HashMap<K, mpsc::Sender<Queued<T>>>,
     workers: JoinSet<()>,
@@ -444,15 +468,24 @@ impl MeshConnection {
                     return;
                 }
             };
-            let frame = match control::recv_frame(&mut recv).await {
-                Ok(control::FrameRead::Frame(f)) => *f,
+            // Every inline step below is bounded, so one stalled stream cannot
+            // stop this loop from accepting streams, closing an idle link, or
+            // seeing shutdown. An abandoned step drops its streams.
+            let token = self.token.clone();
+            let read = bounded(&token, FRAME_READ_TIMEOUT, control::recv_frame(&mut recv)).await;
+            let frame = match read {
+                Some(Ok(control::FrameRead::Frame(f))) => *f,
                 // A frame from a newer build. Tell the sender once so its
                 // feature fails loudly on its side instead of silently here.
-                Ok(control::FrameRead::Unknown { msg_kind }) => {
-                    self.nack_unknown(msg_kind).await;
+                Some(Ok(control::FrameRead::Unknown { msg_kind })) => {
+                    bounded(&token, INLINE_STEP_TIMEOUT, self.nack_unknown(msg_kind)).await;
                     continue;
                 }
-                Err(_) => continue,
+                Some(Err(_)) => continue,
+                None => {
+                    tracing::debug!(peer = %self.peer_id.fmt_short(), "control stream stalled; dropping it");
+                    continue;
+                }
             };
             // Control traffic deliberately does NOT count as activity: "idle" means
             // no data-plane (TUN) traffic. Counting control frames would let periodic
@@ -495,7 +528,12 @@ impl MeshConnection {
                     continue;
                 }
                 ControlMsg::Ping { nonce } => {
-                    respond_pong(&self.conn, *nonce).await;
+                    bounded(
+                        &token,
+                        INLINE_STEP_TIMEOUT,
+                        respond_pong(&self.conn, *nonce),
+                    )
+                    .await;
                     continue;
                 }
                 ControlMsg::Pong { nonce } => {
@@ -577,20 +615,35 @@ impl MeshConnection {
                 // supervisor to retry now rather than at its next tick.
                 // Joining remains pending until the handler is restored.
                 self.ctx.registry.nudge_restore();
-                reply_network_unavailable(send, net_pubkey, &frame.msg).await;
+                bounded(
+                    &token,
+                    INLINE_STEP_TIMEOUT,
+                    reply_network_unavailable(send, net_pubkey, &frame.msg),
+                )
+                .await;
                 continue;
             }
             drop(recv); // one message per stream; the reply rides `send`
-            lanes
-                .push(
+            let queued = bounded(
+                &token,
+                INLINE_STEP_TIMEOUT,
+                lanes.push(
                     net_pubkey,
                     LaneFrame {
                         net: net_pubkey,
                         send,
                         msg: frame.msg,
                     },
-                )
-                .await;
+                ),
+            )
+            .await;
+            if queued.is_none() && !token.is_cancelled() {
+                tracing::warn!(
+                    peer = %self.peer_id.fmt_short(),
+                    net = %net_pubkey.fmt_short(),
+                    "network lane stayed full; dropping control frame"
+                );
+            }
         }
     }
 

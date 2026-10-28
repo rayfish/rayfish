@@ -318,3 +318,63 @@ async fn coordinator_acknowledges_repeated_grants_with_a_durable_key() {
     server.close().await;
     store.shutdown().await.unwrap();
 }
+
+/// A peer that opens a control stream and never finishes its frame must not
+/// hold the connection's demux loop: shutdown still ends it.
+#[tokio::test]
+async fn stalled_control_stream_does_not_block_shutdown() {
+    use iroh::address_lookup::memory::MemoryLookup;
+
+    let env = TestConfigDir::new();
+    let alpn = transport::mesh_alpn();
+    let server = loopback_endpoint_on(MemoryLookup::new(), vec![alpn.clone()]).await;
+    let client = loopback_endpoint_on(MemoryLookup::new(), vec![alpn.clone()]).await;
+    let store = FsStore::load(env.dir.path().join("blobs")).await.unwrap();
+    let registry = sample_registry(
+        server.clone(),
+        IrohIdentityProvider::new(server.id()),
+        store.clone(),
+    );
+    let ctx = sample_mesh_ctx(
+        IrohIdentityProvider::new(server.id()),
+        store.clone(),
+        Arc::clone(&registry),
+    );
+    let token = CancellationToken::new();
+    let manager = Arc::new(ConnectionManager::new());
+    manager.set_mesh_dispatch(MeshDispatch {
+        ctx,
+        token: token.clone(),
+        on_peer_connected: Arc::new(|_| {}),
+    });
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let driving = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let _ = accepted_tx.send(conn.clone());
+            manager.drive_mesh_connection(conn, false).await;
+        })
+    };
+    let connection = client.connect(server.addr(), &alpn).await.unwrap();
+    let server_conn = accepted_rx.await.unwrap();
+    // Half a length prefix: the stream reaches the server, the frame never does.
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    send.write_all(&[0, 0]).await.unwrap();
+    // Wait until the server has the stream, so the demux loop is reading it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server_conn.stats().frame_rx.stream < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server received the stalled stream");
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(5), driving)
+        .await
+        .expect("the demux loop sees shutdown while a stream stalls")
+        .unwrap();
+    client.close().await;
+    server.close().await;
+    store.shutdown().await.unwrap();
+}
