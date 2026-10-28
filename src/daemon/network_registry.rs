@@ -1598,15 +1598,17 @@ impl NetworkRegistry {
 
     /// Store a network's current blob snapshot, persist its recovery pointer,
     /// and wake its single publisher. Publication stays serialized in that task,
-    /// so an older async write can never complete after a newer one.
-    pub(crate) async fn store_and_publish_group(&self, network: &str) {
+    /// so an older async write can never complete after a newer one. `false`
+    /// when the network is gone or the snapshot could not be saved.
+    #[must_use]
+    pub(crate) async fn store_and_publish_group(&self, network: &str) -> bool {
         let (state, notify) = {
             let Some(handle) = self.networks.get(network) else {
-                return;
+                return false;
             };
             (Arc::clone(&handle.state), handle.dht_notify.clone())
         };
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await
     }
 
     /// This coordinator's current network record, serialized as a signed pkarr

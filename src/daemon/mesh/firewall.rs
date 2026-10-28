@@ -266,7 +266,9 @@ impl NetworkRegistry {
             let mut s = state.write().unwrap();
             s.suggested_firewall = suggestions;
         }
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+        if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
+            return unsaved_snapshot_error(network);
+        }
         // Nudge connected members to reconverge from the freshly-published signed
         // record now, instead of waiting for the group poller. Like the
         // rename flow, this is a payload-free trigger, the suggestions still come
