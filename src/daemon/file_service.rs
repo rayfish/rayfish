@@ -10,10 +10,8 @@
 
 use super::transfers;
 use super::*;
-#[cfg(unix)]
-use std::ffi::CString;
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use futures::StreamExt;
 use iroh_blobs::api::remote::GetProgressItem;
@@ -297,6 +295,21 @@ pub(crate) const MAX_PENDING_FILES: usize = 256;
 
 /// Drop the oldest queued offer when `pending` is at `cap`, returning it.
 /// Offers are pushed in arrival order, so the oldest is the front.
+/// Whether a peer-supplied file name is a single plain path component. The
+/// name is joined onto the receiver's download directory by a root daemon, so
+/// anything that could climb out of it (`..`, separators of either platform,
+/// a drive prefix) or name the directory itself is refused outright.
+fn is_safe_file_name(name: &str) -> bool {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(part)), None) if part == name
+    )
+}
+
 pub(crate) fn evict_oldest_file(pending: &mut Vec<PendingFile>, cap: usize) -> Option<PendingFile> {
     if pending.len() < cap {
         return None;
@@ -607,6 +620,9 @@ impl FileService {
         if file.from != remote {
             return FileOfferOutcome::declined(offer_id, "file offer sender identity mismatch");
         }
+        if !is_safe_file_name(&file.filename) {
+            return FileOfferOutcome::declined(offer_id, "invalid file name");
+        }
         let decisions = self.declines.lock().unwrap();
         if let Some(decision) = decisions
             .iter()
@@ -806,6 +822,11 @@ impl FileService {
     ) -> IpcMessage {
         #[cfg(windows)]
         let _ = peer_cred;
+        // Checked again here, not only when the offer was queued: offers saved
+        // by an older daemon were never validated.
+        if !is_safe_file_name(&pending_file.filename) {
+            return ipc_err(format!("invalid file name '{}'", pending_file.filename));
+        }
         let blob_hash = pending_file.blob_hash;
         let peer_label = pending_file.from.fmt_short().to_string();
         let transfer_id = self.transfers.register_receive(
@@ -889,6 +910,8 @@ impl FileService {
             }),
         };
 
+        #[cfg(unix)]
+        let created_dir = !dir.exists();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return ipc_err(format!("cannot create directory '{}': {e}", dir.display()));
         }
@@ -913,14 +936,17 @@ impl FileService {
         // duplication: every accepted file used to be kept twice, forever.
         self.reclaim_blob(recv_tag);
 
+        // Hand the result to the caller. `lchown` so a symlink is never
+        // followed to some other file, and the directory only when this
+        // receive created it, so an existing one keeps its owner.
         #[cfg(unix)]
         if let Some((uid, gid)) = peer_cred {
-            use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
+            use std::os::unix::fs::lchown;
+            if let Err(e) = lchown(&dest, Some(uid), Some(gid)) {
+                tracing::debug!("chown {}: {e}", dest.display());
             }
-            if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
+            if created_dir && let Err(e) = lchown(&dir, Some(uid), Some(gid)) {
+                tracing::debug!("chown {}: {e}", dir.display());
             }
         }
 
@@ -2426,6 +2452,72 @@ mod tests {
             mime_type: "application/octet-stream".to_string(),
             blob_hash: blake3::hash(b"payload").into(),
         }
+    }
+
+    #[test]
+    fn only_plain_file_names_are_safe() {
+        for name in ["photo.jpg", ".hidden", "a b..c", "..."] {
+            assert!(is_safe_file_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "/etc/passwd",
+            "a\\b",
+            "..\\x",
+            "a\0b",
+        ] {
+            assert!(!is_safe_file_name(name), "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offer_with_a_traversing_name_is_declined() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let mut file = pending(1);
+        file.filename = "../../etc/cron.d/evil".into();
+        let outcome = service.queue_incoming_offer(file.from, file);
+        assert!(matches!(outcome.reply, control::FileReply::Declined { .. }));
+        assert!(service.pending_files.lock().unwrap().is_empty());
+        assert!(load_pending_files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_saved_offer_with_a_traversing_name_is_not_exported() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let mut file = pending(1);
+        file.filename = "../escaped.bin".into();
+        file.size = 7;
+        let source = tmp.path().join("cached.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let _tag = service
+            .transport
+            .blob_store
+            .blobs()
+            .add_path(&source)
+            .temp_tag()
+            .await
+            .unwrap();
+        // As if loaded from a queue an older daemon saved without validation.
+        service.pending_files.lock().unwrap().push(file);
+        let response = service
+            .accept_file(
+                1,
+                Some(tmp.path().join("downloads").to_string_lossy().into_owned()),
+                None,
+            )
+            .await;
+        assert!(matches!(response, IpcMessage::Error { .. }));
+        assert!(!tmp.path().join("escaped.bin").exists());
     }
 
     /// `ray files accept` and `ray files reject` both consume the offer, so a
