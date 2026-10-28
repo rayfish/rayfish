@@ -31,6 +31,10 @@ use iroh_blobs::Hash;
 /// terminal state before it disappears.
 const TERMINAL_TTL: Duration = Duration::from_secs(60);
 
+/// Most finished transfers kept listable at once. A burst of short transfers
+/// inside one [`TERMINAL_TTL`] otherwise keeps every one of them.
+const MAX_FINISHED: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferState {
     /// Outgoing: the offer is delivered, the peer has not started pulling yet.
@@ -140,7 +144,9 @@ impl TransferRegistry {
     /// `register_receive`, not whatever string the caller typed at the CLI.
     pub fn register_send(&self, peer: EndpointId, filename: String, size: u64, hash: Hash) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.entries.lock().unwrap().insert(
+        let mut entries = self.entries.lock().unwrap();
+        prune_finished(&mut entries, Instant::now());
+        entries.insert(
             id,
             Entry {
                 info: TransferInfo {
@@ -166,7 +172,9 @@ impl TransferRegistry {
     /// An incoming transfer we drive ourselves, so it is moving from the start.
     pub fn register_receive(&self, peer: String, filename: String, size: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.entries.lock().unwrap().insert(
+        let mut entries = self.entries.lock().unwrap();
+        prune_finished(&mut entries, Instant::now());
+        entries.insert(
             id,
             Entry {
                 info: TransferInfo {
@@ -255,11 +263,11 @@ impl TransferRegistry {
     /// pair already finished as `Failed` from an aborted pull (not an offer that
     /// never reached the peer, see [`FailureKind`]), and it failed recently
     /// enough to still be live (within `TERMINAL_TTL`; terminal entries are only
-    /// evicted lazily in `list_at`, so an older one could otherwise sit around
-    /// forever waiting to be revived), a fresh `Started` revives it rather than
-    /// leaving the sender stuck showing a failure for a file that is now
-    /// actually arriving: a retried pull after an aborted one still deserves to
-    /// end up `Done`.
+    /// evicted lazily, on insert and in `list_at`, so an older one could
+    /// otherwise sit around forever waiting to be revived), a fresh `Started`
+    /// revives it rather than leaving the sender stuck showing a failure for a
+    /// file that is now actually arriving: a retried pull after an aborted one
+    /// still deserves to end up `Done`.
     pub fn provider_started(&self, hash: Hash, peer: EndpointId) {
         self.provider_started_at(hash, peer, Instant::now());
     }
@@ -305,10 +313,7 @@ impl TransferRegistry {
 
     fn list_at(&self, now: Instant) -> Vec<TransferInfo> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, e| match e.finished_at {
-            Some(at) => now.duration_since(at) < TERMINAL_TTL,
-            None => true,
-        });
+        prune_finished(&mut entries, now);
         let mut out: Vec<TransferInfo> = entries.values().map(|e| e.info.clone()).collect();
         out.sort_by_key(|t| t.id);
         out
@@ -353,6 +358,28 @@ impl Drop for FinishGuard {
     }
 }
 
+/// Drop finished entries older than [`TERMINAL_TTL`], then the oldest finished
+/// ones past [`MAX_FINISHED`]. Runs on every insert as well as every listing,
+/// so the map stays bounded when nothing polls it.
+fn prune_finished(entries: &mut HashMap<u64, Entry>, now: Instant) {
+    entries.retain(|_, e| match e.finished_at {
+        Some(at) => now.duration_since(at) < TERMINAL_TTL,
+        None => true,
+    });
+    let mut finished: Vec<(Instant, u64)> = entries
+        .values()
+        .filter_map(|e| e.finished_at.map(|at| (at, e.info.id)))
+        .collect();
+    if finished.len() <= MAX_FINISHED {
+        return;
+    }
+    finished.sort_unstable();
+    let excess = finished.len() - MAX_FINISHED;
+    for (_, id) in &finished[..excess] {
+        entries.remove(id);
+    }
+}
+
 /// A finished transfer reads as complete: a Done that showed 60/100 because the
 /// last progress event was coarse would be a worse lie than rounding up.
 ///
@@ -390,9 +417,9 @@ fn oldest_live_outgoing(
 /// `Started` event (see `provider_started`): it must have failed on the pull
 /// path (not the offer path, which the peer never even received), and recently
 /// enough that it has not already aged past `TERMINAL_TTL`. Terminal entries
-/// are only evicted lazily inside `list_at`, so without the TTL check an entry
-/// that is logically dead but hasn't been swept yet could be revived and then
-/// never expire at all.
+/// are only evicted lazily, on insert and in `list_at`, so without the TTL
+/// check an entry that is logically dead but hasn't been swept yet could be
+/// revived and then never expire at all.
 fn oldest_revivable_outgoing(
     entries: &HashMap<u64, Entry>,
     hash: Hash,
@@ -475,6 +502,23 @@ mod tests {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
         SecretKey::from(key_bytes).public()
+    }
+
+    /// Finished transfers are pruned as new ones arrive, not only when
+    /// something lists them, so a daemon nobody polls stays bounded.
+    #[test]
+    fn finished_transfers_are_pruned_without_a_listing() {
+        let reg = TransferRegistry::new();
+        let live = reg.register_receive("peer".into(), "live".into(), 1);
+        for n in 0..MAX_FINISHED * 2 {
+            let id = reg.register_receive("peer".into(), format!("file-{n}"), 1);
+            reg.finish(id, true);
+        }
+        reg.register_receive("peer".into(), "last".into(), 1);
+        let entries = reg.entries.lock().unwrap();
+        let finished = entries.values().filter(|e| e.finished_at.is_some()).count();
+        assert!(finished <= MAX_FINISHED, "{finished} finished entries kept");
+        assert!(entries.contains_key(&live), "a live transfer was pruned");
     }
 
     #[test]
