@@ -29,6 +29,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Windows: joining or leaving a network while Rayfish is down no longer routes
   `.ray` to a resolver that is not running.
 - Packets dropped for exceeding the TUN MTU are now counted and logged as warnings.
+- `ray create --tor` and `ray join --tor` now use Tor (after a daemon restart)
+  instead of silently ignoring the flag, and fail on builds without Tor.
+- Members resumed at startup apply roster and firewall updates as soon as a
+  peer pushes them, instead of waiting for the next poll.
+- Roster updates learned by polling now update `.ray` names and routes, an
+  older signed roster can no longer roll back a newer one, and a node removed
+  from a network leaves it.
+- A failed roster fetch no longer blocks the same update from applying later.
+- Joining a network while it is being restored no longer leaves two copies of
+  it running, and a closed-network join retries once per network.
+- A promoted co-coordinator now prunes expired ephemeral members.
+- A network running an incompatible mesh version is flagged after a restart.
+- Concurrent firewall edits no longer drop rules.
+- Coordinator changes that could not be saved now report an error.
+- One unreadable destruction proof no longer stops republishing the others.
+- A stalled peer stream no longer blocks that peer's connection.
+- File auto-accept and `ray status` follow pairing and unpairing without a
+  restart.
+- `ray hostname` reports a failed save.
+- `ray report` no longer stalls the daemon, and logs stay within the size cap.
+- Ambiguous or empty short peer ids are rejected instead of picking a peer.
+- `ray connect` runs one retry per peer and completes after the approver
+  restarts.
+- Mobile: rebuilding the node no longer leaks the previous one.
+- PTR lookups keep working for a peer shared by two networks.
+- Large forwarded DNS replies are truncated instead of dropped.
+- macOS: IPv6 DNS upstreams are used.
+- macOS and FreeBSD: an exit node re-enables pf after an unclean shutdown.
+- macOS: one failed SSH connection no longer ends the helper's other sessions.
+- SSH sessions start in `/` when the user's home directory is missing.
+- Rootless proxies and the IPv4 bridge keep listening after accept errors, and
+  the bridge caps connections per port.
+- Metrics stop exporting peers that left.
+- Android: reading status while stopped no longer creates an identity.
+- `ray gui` no longer hangs on commands with large output.
+- `ray open` join links auto-accept own-device files, like `ray join`.
+- `ray apply` exits non-zero on failed steps, keeps live suggestions when they
+  cannot be read, and rejects nested groups.
+- `ray ephemeral` rejects invalid durations, and durations that overflow are
+  refused.
+- `ray status --json`, `ray invite --json`, `ray pair --json` and the
+  `ray files` settings commands now print JSON.
+- `ray stop` fails when the service manager cannot stop the service, and
+  `ray uninstall` requires root.
+- The firewall pending picker opens only on a terminal.
+- Tab completion no longer creates or migrates config.
+
+### Security
+
+- Received files whose names would leave the download directory are refused.
+- Only root can ask the daemon to send a file by path, so operators cannot
+  read files they have no access to.
+- Peer hostnames must be a single valid DNS label, so a member cannot claim a
+  name such as `web.prod` and take over another network's `.ray` name.
 
 ## [0.5.11] - 2026-10-27
 
