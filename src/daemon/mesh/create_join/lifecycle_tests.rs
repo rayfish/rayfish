@@ -337,6 +337,82 @@ async fn a_queued_join_stops_retrying_once_the_network_is_live() {
     daemon.shutdown_and_close().await;
 }
 
+/// A fresh join of a network live under another name is refused before it
+/// dials. It used to pass the name check, and the dial replaced the live
+/// network's accept handler before `finalize_join` noticed.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_fresh_join_refuses_a_network_live_under_another_name() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    hold_live(&daemon.registry, "home", key);
+
+    let joined = daemon
+        .registry
+        .join_network_inner(
+            &key.to_string(),
+            Some("other"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await;
+    let Err(error) = joined else {
+        panic!("a second join of a live network");
+    };
+    assert_eq!(error.to_string(), "already in this network as 'home'");
+    daemon.shutdown_and_close().await;
+}
+
+fn member_handler(registry: &Arc<NetworkRegistry>, name: &str, key: EndpointId) -> AcceptHandler {
+    AcceptHandler::Member(Arc::new(MemberAcceptState {
+        ctx: registry.mesh_ctx(),
+        network_name: name.to_string(),
+        state: empty_state(key, name),
+        net_pubkey: key,
+        my_identity: registry.transport.endpoint.id(),
+        endpoint: registry.transport.endpoint.clone(),
+        registry: Arc::clone(registry),
+        invite_lock: Arc::new(AsyncMutex::new(())),
+        reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+    }))
+}
+
+/// A join that loses to a live network drops the handler it registered,
+/// unless a live network has the same key and so owns that handler.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn an_abandoned_join_drops_only_what_no_live_network_owns() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+
+    let losing = SecretKey::generate().public();
+    hold_live(registry, "home", SecretKey::generate().public());
+    registry
+        .conn
+        .register(losing, member_handler(registry, "home", losing));
+    let cancel = CancellationToken::new();
+    registry.abandon_join("home", losing, &cancel);
+    assert!(cancel.is_cancelled());
+    assert!(!registry.conn.is_registered(&losing));
+
+    let live = SecretKey::generate().public();
+    hold_live(registry, "work", live);
+    registry
+        .conn
+        .register(live, member_handler(registry, "work", live));
+    registry.abandon_join("work", live, &CancellationToken::new());
+    assert!(registry.conn.is_registered(&live));
+    daemon.shutdown_and_close().await;
+}
+
 /// Save `name` as a member network whose last published roster (this node plus
 /// `others`) is in the local blob store, as a warm resume finds it at startup.
 async fn cache_member_network(

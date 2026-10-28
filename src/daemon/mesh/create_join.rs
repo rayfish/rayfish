@@ -571,6 +571,18 @@ impl NetworkRegistry {
     ) -> Result<TryJoin> {
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
+        // A network already live under another name must not be joined again:
+        // the dial registers its accept handler by key, over the live one's.
+        if initial
+            && let Some(live) = self
+                .networks
+                .iter()
+                .find(|handle| handle.network_key == net_pubkey)
+                .map(|handle| handle.name.clone())
+        {
+            anyhow::bail!("already in this network as '{live}'");
+        }
+
         // A fresh join claims its name the way a create or a restore does, and
         // holds the claim until its handle is registered. A join saves the
         // network's config before that, and a restore sweep landing in the gap
@@ -1186,6 +1198,23 @@ impl NetworkRegistry {
         .await
     }
 
+    /// Undo what a join that will not register left behind: its tasks, its
+    /// accept handler, and the peers and routes it added under `display_name`.
+    /// A live network with the same key or name owns what is registered under
+    /// it, so that is left in place.
+    fn abandon_join(&self, display_name: &str, net_pubkey: EndpointId, cancel: &CancellationToken) {
+        cancel.cancel();
+        if !self.is_live_network_key(net_pubkey) {
+            self.conn.unregister(&net_pubkey);
+        }
+        if !self.networks.contains_key(display_name) {
+            for (_ip, conn) in self.peers.remove_by_network(display_name) {
+                conn.close(VarInt::from_u32(0), b"failed join");
+            }
+            self.route_map.remove_network(display_name);
+        }
+    }
+
     /// Register the accept handler, persist the network public key, seed the blob
     /// store, spawn the membership poller, install the `NetworkHandle`, and sync
     /// DNS. Runs once the dial phase produced a live mesh connection.
@@ -1215,7 +1244,7 @@ impl NetworkRegistry {
         // state for the same network. Checked before the config write too, so a
         // losing registration does not rewrite the live one's record pointer.
         if self.networks.contains_key(display_name) {
-            cancel.cancel();
+            self.abandon_join(display_name, net_pubkey, &cancel);
             anyhow::bail!("already in network '{display_name}'");
         }
 
@@ -1263,12 +1292,7 @@ impl NetworkRegistry {
             Ok(config) => config,
             Err(e) => {
                 drop(commit_guard);
-                cancel.cancel();
-                self.conn.unregister(&net_pubkey);
-                for (_ip, conn) in self.peers.remove_by_network(display_name) {
-                    conn.close(VarInt::from_u32(0), b"failed join");
-                }
-                self.route_map.remove_network(display_name);
+                self.abandon_join(display_name, net_pubkey, &cancel);
                 return Err(e);
             }
         };
@@ -1346,8 +1370,9 @@ impl NetworkRegistry {
             incompatible: mismatch,
         };
         match self.networks.entry(display_name.to_string()) {
-            Entry::Occupied(_) => {
-                cancel.cancel();
+            Entry::Occupied(slot) => {
+                drop(slot);
+                self.abandon_join(display_name, net_pubkey, &cancel);
                 anyhow::bail!("already in network '{display_name}'");
             }
             Entry::Vacant(slot) => {

@@ -46,6 +46,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A failed roster fetch no longer blocks the same update from applying later.
 - Joining a network while it is being restored no longer leaves two copies of
   it running, and a closed-network join retries once per network.
+- `ray join` for a network already joined under another name is refused
+  instead of taking over the live network's connections.
 - A promoted co-coordinator now prunes expired ephemeral members.
 - A network running an incompatible mesh version is flagged after a restart.
 - Concurrent firewall edits no longer drop rules.
