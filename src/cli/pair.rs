@@ -75,6 +75,13 @@ impl DisplayOut for PairedOutput {
 }
 
 pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<()> {
+    // The bare ticket is shorthand for `ray pair accept <ticket>`, so with a
+    // subcommand it would be dropped without a word.
+    anyhow::ensure!(
+        action.is_none() || ticket.is_none(),
+        "a pairing ticket cannot be combined with a pair subcommand; \
+         use `ray pair <ticket>` or `ray pair accept <ticket>`"
+    );
     match (action, ticket) {
         // `ray pair <ticket>` shorthand
         (None, Some(ticket)) | (Some(PairAction::Accept { ticket }), _) => {
@@ -255,6 +262,16 @@ pub(crate) async fn cmd_pair_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_ticket_with_a_subcommand_is_rejected() {
+        let cli = Cli::try_parse_from(["ray", "pair", "ticket", "list"]).unwrap();
+        let Command::Pair { action, ticket, .. } = cli.command else {
+            panic!("wrong command");
+        };
+        let error = cmd_pair(action, ticket).await.unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
+    }
 
     #[test]
     fn pairing_results_serialize_for_json() {
