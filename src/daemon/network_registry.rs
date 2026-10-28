@@ -1742,23 +1742,33 @@ impl NetworkRegistry {
     }
 
     /// Resolve `"self"` or a short / prefix endpoint id against every network's
-    /// roster to a full endpoint id.
+    /// roster to a full endpoint id. As with
+    /// [`MemberList::resolve_peer_selector`], a prefix must name exactly one
+    /// peer: an empty or ambiguous one resolves to nothing rather than to
+    /// whichever peer the scan meets first.
     pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
         if short == "self" {
             return Some(self.transport.endpoint.id());
         }
+        if short.is_empty() {
+            return None;
+        }
+        let mut found = None;
         for entry in self.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state
-                .members
-                .all()
-                .iter()
-                .find(|m| m.identity.to_string().starts_with(short))
-            {
-                return Some(m.identity);
+            for member in state.members.all() {
+                if !member.identity.to_string().starts_with(short) {
+                    continue;
+                }
+                match found {
+                    None => found = Some(member.identity),
+                    // The same peer on another network is still one peer.
+                    Some(identity) if identity == member.identity => {}
+                    Some(_) => return None,
+                }
             }
         }
-        None
+        found
     }
 
     /// Verified memberships for authorization, independent of transport handles.

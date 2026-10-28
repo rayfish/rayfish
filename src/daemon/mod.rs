@@ -2746,6 +2746,53 @@ pub(crate) mod accept_handler_tests {
         )
     }
 
+    /// A short id resolves only when it names one peer. Empty and ambiguous
+    /// prefixes resolve to nothing, while a peer seen on two networks is still
+    /// one peer.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn short_id_resolution_rejects_empty_and_ambiguous_prefixes() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        // Two peers whose ids share a first character, and one that does not.
+        let ids: Vec<EndpointId> = (1..=u8::MAX)
+            .map(|seed| SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let first = |id: &EndpointId| id.to_string().chars().next().unwrap();
+        let alice = ids[0];
+        let bob = *ids[1..]
+            .iter()
+            .find(|id| first(id) == first(&alice))
+            .unwrap();
+        let carol = *ids.iter().find(|id| first(id) != first(&alice)).unwrap();
+        hold_network(
+            &registry,
+            "home",
+            NetworkRole::Member,
+            vec![seated(alice), seated(bob), seated(carol)],
+            Vec::new(),
+        );
+        hold_network(
+            &registry,
+            "work",
+            NetworkRole::Member,
+            vec![seated(carol)],
+            Vec::new(),
+        );
+        let shared = first(&alice).to_string();
+        assert_eq!(registry.resolve_short_id_any_network(&shared), None);
+        assert_eq!(registry.resolve_short_id_any_network(""), None);
+        assert_eq!(
+            registry.resolve_short_id_any_network(&alice.to_string()),
+            Some(alice)
+        );
+        assert_eq!(
+            registry.resolve_short_id_any_network(&first(&carol).to_string()),
+            Some(carol)
+        );
+        endpoint.close().await;
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn classify_marks_blocked_known_and_strangers() {
