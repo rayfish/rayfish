@@ -19,6 +19,33 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use tokio_util::io::ReaderStream;
 
+#[cfg(unix)]
+mod receive_dest;
+
+/// Who an accepted file is for, and how far the directory it lands in is
+/// trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Recipient {
+    /// The user the file (and any directory created for it) is handed to.
+    /// `None` leaves it owned by the daemon.
+    pub(crate) owner: Option<(u32, u32)>,
+    /// `owner` named the directory, so it must be one they own. Off for the
+    /// root-configured auto-accept target.
+    pub(crate) caller_chose_dir: bool,
+}
+
+impl Recipient {
+    /// The uid the destination directory must belong to, if any. Root may
+    /// name any directory: it could write there anyway.
+    #[cfg(unix)]
+    fn required_dir_owner(self) -> Option<u32> {
+        match self.owner {
+            Some((uid, _)) if self.caller_chose_dir && uid != 0 => Some(uid),
+            _ => None,
+        }
+    }
+}
+
 /// Upper bound on one background offer dial. `Endpoint::connect` retries
 /// discovery with no timeout of its own; the outbox retries on the next
 /// peer-connected event anyway, so a stuck dial must not pin the flush task.
@@ -727,8 +754,14 @@ impl FileService {
             }
         };
         let output = Some(dir.to_string_lossy().into_owned());
+        // Root set both the directory and its user (`check_authorized`), so the
+        // directory is trusted; only the file name still comes from the peer.
+        let recipient = Recipient {
+            owner: cred,
+            caller_chose_dir: false,
+        };
 
-        match self.accept_file(id, output, cred).await {
+        match self.accept_file_for(id, output, recipient).await {
             IpcMessage::Ok { message } => {
                 tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted");
             }
@@ -740,13 +773,28 @@ impl FileService {
     }
 
     /// Fetch a pending file's blob from its sender, write it to disk, and (when a
-    /// `peer_cred` is given) chown it to that user. Failed receives stay queued
-    /// with their downloaded ranges so the destination can retry.
+    /// `peer_cred` is given) hand it to that user. A caller who names `output`
+    /// must own that directory unless they are root: the write happens with
+    /// the daemon's privileges. Failed receives stay queued with their
+    /// downloaded ranges so the destination can retry.
     pub(crate) async fn accept_file(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
+    ) -> IpcMessage {
+        let recipient = Recipient {
+            owner: peer_cred,
+            caller_chose_dir: true,
+        };
+        self.accept_file_for(id, output, recipient).await
+    }
+
+    async fn accept_file_for(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        recipient: Recipient,
     ) -> IpcMessage {
         let pending_file = {
             let mut pending = self.pending_files.lock().unwrap();
@@ -774,7 +822,7 @@ impl FileService {
             .as_ref()
             .expect("the offer is held until the receive succeeds");
         let peer = file.from;
-        let response = self.receive_file(file, output, peer_cred).await;
+        let response = self.receive_file(file, output, recipient).await;
         match response {
             IpcMessage::Ok { .. } => {
                 if let Some(file) = offer.file.as_ref()
@@ -809,10 +857,8 @@ impl FileService {
         &self,
         pending_file: &PendingFile,
         output: Option<String>,
-        peer_cred: Option<(u32, u32)>,
+        recipient: Recipient,
     ) -> IpcMessage {
-        #[cfg(windows)]
-        let _ = peer_cred;
         // Checked again here, not only when the offer was queued: offers saved
         // by an older daemon were never validated.
         if !is_safe_file_name(&pending_file.filename) {
@@ -902,44 +948,39 @@ impl FileService {
         };
 
         #[cfg(unix)]
-        let created_dir = !dir.exists();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return ipc_err(format!("cannot create directory '{}': {e}", dir.display()));
-        }
-
-        // Export straight from the blob store to the destination. The obvious
-        // alternative, `get_bytes` + `fs::write`, materializes the whole file in
-        // memory first (iroh-blobs documents it as "will run out of memory when
-        // called for very large blobs"), which on a phone sharing a video is a
-        // kill, not a slowdown. The fetch above already streamed the bytes to
-        // disk, so there is no reason to route them through RAM again.
-        let dest = dir.join(&pending_file.filename);
-        if let Err(e) = self
-            .transport
-            .blob_store
-            .blobs()
-            .export(blob_hash, &dest)
+        let dest = match self
+            .write_received(blob_hash, dir, &pending_file.filename, recipient)
             .await
         {
-            return ipc_err(format!("write failed: {e}"));
-        }
+            Ok(dest) => dest,
+            Err(e) => return ipc_err(format!("write failed: {e}")),
+        };
+        #[cfg(not(unix))]
+        let dest = {
+            // Windows has no `openat`, so this still writes through the path
+            // the caller named; `recipient` only matters to the Unix ownership
+            // checks.
+            let _ = recipient;
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return ipc_err(format!("cannot create directory '{}': {e}", dir.display()));
+            }
+            // Export straight from the blob store to the destination rather
+            // than through `get_bytes`, which holds the whole file in memory.
+            let dest = dir.join(&pending_file.filename);
+            if let Err(e) = self
+                .transport
+                .blob_store
+                .blobs()
+                .export(blob_hash, &dest)
+                .await
+            {
+                return ipc_err(format!("write failed: {e}"));
+            }
+            dest
+        };
         // The file is where the user wanted it, so the store's copy is now pure
         // duplication: every accepted file used to be kept twice, forever.
         self.reclaim_blob(recv_tag);
-
-        // Hand the result to the caller. `lchown` so a symlink is never
-        // followed to some other file, and the directory only when this
-        // receive created it, so an existing one keeps its owner.
-        #[cfg(unix)]
-        if let Some((uid, gid)) = peer_cred {
-            use std::os::unix::fs::lchown;
-            if let Err(e) = lchown(&dest, Some(uid), Some(gid)) {
-                tracing::debug!("chown {}: {e}", dest.display());
-            }
-            if created_dir && let Err(e) = lchown(&dir, Some(uid), Some(gid)) {
-                tracing::debug!("chown {}: {e}", dir.display());
-            }
-        }
 
         // The file is fully on disk (chown failures are ignored, by design,
         // and never fail the transfer): only now is the transfer really done.
@@ -949,6 +990,46 @@ impl FileService {
         IpcMessage::Ok {
             message: format!("saved to {}", dest.display()),
         }
+    }
+
+    /// Write a fetched blob to `file_name` in `dir` for `recipient`, returning
+    /// the path it was saved under (a numbered variant when the name exists).
+    ///
+    /// Streamed from the blob store rather than read whole: `get_bytes` holds
+    /// the entire file in memory, which on a phone sharing a video is a kill.
+    /// Not `export` either, which writes through the path and so follows
+    /// whatever link sits there; see [`receive_dest`].
+    #[cfg(unix)]
+    async fn write_received(
+        &self,
+        hash: iroh_blobs::Hash,
+        dir: PathBuf,
+        file_name: &str,
+        recipient: Recipient,
+    ) -> std::io::Result<PathBuf> {
+        use tokio::io::AsyncWriteExt;
+
+        let name = file_name.to_string();
+        let (dir, (dest, file)) = tokio::task::spawn_blocking(move || {
+            receive_dest::create(&dir, &name, recipient).map(|created| (dir, created))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        let mut reader = tokio::io::BufReader::with_capacity(
+            1 << 20,
+            self.transport.blob_store.blobs().reader(hash),
+        );
+        let mut out = tokio::fs::File::from_std(file);
+        let written = async {
+            tokio::io::copy_buf(&mut reader, &mut out).await?;
+            out.flush().await
+        }
+        .await;
+        if let Err(e) = written {
+            dest.discard();
+            return Err(e);
+        }
+        Ok(dir.join(&dest.name))
     }
 
     /// This device's pairing cert, as the registry currently holds it.
@@ -2802,6 +2883,127 @@ mod tests {
             "gc must still protect tagged blobs despite a dangling tag"
         );
         assert!(!store.blobs().has(absent).await.unwrap());
+    }
+
+    /// A receiver holding `payload` as offer 1 named `file.bin`, with no
+    /// sender needed since the blob is already complete locally.
+    #[cfg(unix)]
+    async fn cached_offer(tmp: &Path) -> Arc<FileService> {
+        config::set_thread_config_dir(tmp.join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.join("receiver")).await;
+        let mut file = pending(1);
+        file.filename = "file.bin".into();
+        file.size = 7;
+        let source = tmp.join("cached.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let tag = service
+            .transport
+            .blob_store
+            .blobs()
+            .add_path(&source)
+            .temp_tag()
+            .await
+            .unwrap();
+        // Keep the blob past this helper; the receive tags it itself.
+        std::mem::forget(tag);
+        service.queue_incoming_offer(file.from, file);
+        service
+    }
+
+    #[cfg(unix)]
+    fn current_cred() -> (u32, u32) {
+        // SAFETY: getuid and getgid cannot fail and touch no memory.
+        unsafe { (libc::getuid(), libc::getgid()) }
+    }
+
+    /// The daemon writes as root, so an operator naming a directory they do
+    /// not own (`/etc`, another user's home) must be refused, with nothing
+    /// written and the offer left to retry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_output_dir_the_caller_does_not_own_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = cached_offer(tmp.path()).await;
+        let (uid, gid) = current_cred();
+        let other = (uid.wrapping_add(1).max(1), gid);
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let response = service
+            .accept_file(
+                1,
+                Some(downloads.join("sub").to_string_lossy().into_owned()),
+                Some(other),
+            )
+            .await;
+        let IpcMessage::Error { message } = response else {
+            panic!("a directory owned by someone else must be refused");
+        };
+        assert!(message.contains("not owned by uid"), "{message}");
+        assert!(!downloads.join("sub").exists());
+        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+    }
+
+    /// A link planted at the file name must not redirect the daemon's write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_at_the_destination_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = cached_offer(tmp.path()).await;
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        std::os::unix::fs::symlink(&victim, downloads.join("file.bin")).unwrap();
+        let response = service
+            .accept_file(
+                1,
+                Some(downloads.to_string_lossy().into_owned()),
+                Some(current_cred()),
+            )
+            .await;
+        let IpcMessage::Ok { message } = response else {
+            panic!("the receive should land next to the link: {response:?}");
+        };
+        assert!(message.contains("file (1).bin"), "{message}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(
+            downloads
+                .join("file.bin")
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(downloads.join("file (1).bin")).unwrap(),
+            b"payload"
+        );
+    }
+
+    /// The ordinary case: the caller's own directory, created if missing, and
+    /// both it and the file end up theirs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_receive_into_the_callers_own_dir_is_theirs() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let service = cached_offer(tmp.path()).await;
+        let (uid, gid) = current_cred();
+        let downloads = tmp.path().join("downloads");
+        let response = service
+            .accept_file(
+                1,
+                Some(downloads.to_string_lossy().into_owned()),
+                Some((uid, gid)),
+            )
+            .await;
+        assert!(matches!(response, IpcMessage::Ok { .. }), "{response:?}");
+        let saved = downloads.join("file.bin");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"payload");
+        assert_eq!(std::fs::metadata(&saved).unwrap().uid(), uid);
+        assert_eq!(std::fs::metadata(&downloads).unwrap().uid(), uid);
+        assert!(service.pending_files.lock().unwrap().is_empty());
     }
 }
 
