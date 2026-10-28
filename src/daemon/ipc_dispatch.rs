@@ -59,6 +59,18 @@ impl Daemon {
             return None;
         }
 
+        // A path-based send makes the daemon open the path with its own
+        // privileges, so an operator could send any file on the machine. Only
+        // root, who could read it anyway, may use it; everyone else passes an
+        // open descriptor (`SendFileFd`) or the bytes (`SendFileBegin`).
+        if matches!(req, IpcMessage::SendFile { .. }) {
+            return Some(ipc_err(
+                "permission denied: sending a file by path requires root; \
+                 update the ray CLI, which sends an open file instead"
+                    .to_string(),
+            ));
+        }
+
         // Granting operator access is reserved for root.
         if matches!(req, IpcMessage::SetOperator { .. }) {
             #[cfg(unix)]
@@ -450,28 +462,42 @@ impl Daemon {
                 mode,
                 name,
                 hostname,
-                transport: _,
-            } => self.create_network(mode, name, hostname).await,
+                transport,
+            } => {
+                if let Err(e) = ensure_transport_supported(transport.as_ref()) {
+                    return ipc_err(format!("{e:#}"));
+                }
+                let resp = self.create_network(mode, name, hostname).await;
+                if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
+                    return ipc_err(format!("created, but could not save the transport: {e:#}"));
+                }
+                resp
+            }
             IpcMessage::Join {
                 network_key,
                 name,
                 hostname,
-                transport: _,
+                transport,
                 invite,
                 coordinator,
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
-                self.join_network(
-                    &network_key,
-                    name.as_deref(),
-                    hostname,
-                    invite,
-                    coordinator,
-                    auto_accept_firewall,
-                    auto_accept_files,
-                )
-                .await
+                if let Err(e) = ensure_transport_supported(transport.as_ref()) {
+                    return ipc_err(format!("{e:#}"));
+                }
+                self.registry
+                    .join_network(
+                        &network_key,
+                        name.as_deref(),
+                        hostname,
+                        invite,
+                        coordinator,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                        transport,
+                    )
+                    .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::RenameNetwork { network, new_name } => {

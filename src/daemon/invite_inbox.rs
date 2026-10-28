@@ -304,6 +304,7 @@ impl ConnectService {
                 Some(invitation.coordinator),
                 false,
                 false,
+                None,
             )
             .await;
         self.settle_accept(&invitation, reply).await

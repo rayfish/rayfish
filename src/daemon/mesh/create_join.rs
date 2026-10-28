@@ -290,9 +290,42 @@ impl Daemon {
                 coordinator,
                 auto_accept_firewall,
                 auto_accept_files,
+                None,
             )
             .await
     }
+}
+
+/// Refuse a transport this build cannot honor, rather than create or join a
+/// network that silently runs without it.
+pub(crate) fn ensure_transport_supported(transport: Option<&config::TransportMode>) -> Result<()> {
+    if transport.is_some_and(config::TransportMode::is_tor) && !cfg!(feature = "tor") {
+        anyhow::bail!("Tor support requires a build with --features tor");
+    }
+    Ok(())
+}
+
+/// Save the transport asked for at create or join on the network `resp`
+/// registered. The endpoint is built at startup from the saved networks (see
+/// `bootstrap`), so the saved choice is what turns Tor on.
+pub(crate) fn save_network_transport(
+    resp: &IpcMessage,
+    transport: Option<&config::TransportMode>,
+) -> Result<()> {
+    let (Some(transport), IpcMessage::Created { name, .. } | IpcMessage::Joined { name, .. }) =
+        (transport, resp)
+    else {
+        return Ok(());
+    };
+    config::update_network(name, |net| {
+        net.transport = Some(transport.clone());
+        Ok(())
+    })?
+    .context("network config was deleted")?;
+    if transport.is_tor() {
+        tracing::info!(network = %name, "Tor transport saved; it is enabled when the daemon starts");
+    }
+    Ok(())
 }
 
 impl NetworkRegistry {
@@ -308,6 +341,8 @@ impl NetworkRegistry {
         coordinator: Option<EndpointId>,
         auto_accept_firewall: bool,
         auto_accept_files: bool,
+        // `--tor`: saved on the network once admitted, now or after approval.
+        transport: Option<config::TransportMode>,
     ) -> IpcMessage {
         match self
             .join_network_inner(
@@ -324,6 +359,9 @@ impl NetworkRegistry {
         {
             Ok(TryJoin::Joined(resp)) => {
                 let _ = config::remove_pending_join(network_key);
+                if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
+                    return ipc_err(format!("joined, but could not save the transport: {e:#}"));
+                }
                 *resp
             }
             Ok(TryJoin::Pending) => {
@@ -364,8 +402,11 @@ impl NetworkRegistry {
                             )
                             .await
                         {
-                            Ok(TryJoin::Joined(_)) => {
+                            Ok(TryJoin::Joined(resp)) => {
                                 let _ = config::remove_pending_join(&nk);
+                                if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
+                                    tracing::error!(net = %nk, error = %e, "could not save the network transport");
+                                }
                                 tracing::info!(net = %nk, "approval granted - joined");
                                 return;
                             }
@@ -2287,5 +2328,60 @@ mod tests {
         assert_eq!(saved_key("lab"), Some(lab.public()));
         assert!(config::load_network("work").unwrap().is_none());
         daemon.shutdown_and_close().await;
+    }
+
+    /// `ray create --tor` reached the daemon and was dropped there, so the
+    /// network never asked for Tor and the endpoint never enabled it. It is now
+    /// saved on the network, or refused when this build has no Tor support.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn create_saves_the_requested_transport() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _config = TempConfigDir::new();
+        let daemon = build_headless(false).await.unwrap();
+        let create = IpcMessage::Create {
+            mode: GroupMode::Restricted,
+            name: Some("onion".into()),
+            hostname: Some("test-node".into()),
+            transport: Some(config::TransportMode::Tor),
+        };
+        let resp = daemon.handle_authorized_request(create, None, vec![]).await;
+        let saved = config::load_network("onion").unwrap();
+        if cfg!(feature = "tor") {
+            assert!(matches!(resp, IpcMessage::Created { .. }), "{resp:?}");
+            assert_eq!(
+                saved.and_then(|net| net.transport),
+                Some(config::TransportMode::Tor)
+            );
+        } else {
+            assert!(
+                matches!(&resp, IpcMessage::Error { message } if message.contains("--features tor")),
+                "{resp:?}"
+            );
+            assert!(saved.is_none());
+        }
+        daemon.shutdown_and_close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_saved_transport_lands_on_the_created_network() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _config = TempConfigDir::new();
+        config::save_network(&config::empty_network_config("onion")).unwrap();
+        let created = IpcMessage::Created {
+            name: "onion".into(),
+            network_key: SecretKey::generate().public(),
+            my_ipv6: Ipv6Addr::LOCALHOST,
+        };
+        save_network_transport(&created, Some(&config::TransportMode::Tor)).unwrap();
+        assert_eq!(
+            config::load_network("onion").unwrap().unwrap().transport,
+            Some(config::TransportMode::Tor)
+        );
     }
 }

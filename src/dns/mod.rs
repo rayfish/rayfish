@@ -84,6 +84,11 @@ pub async fn update_hostname(
     hostname: &str,
     ipv6: Ipv6Addr,
 ) {
+    // A name with a dot would answer for another network's `<host>.<net>.ray`.
+    if !crate::hostname::is_valid_hostname(hostname) {
+        tracing::warn!(%network, %hostname, "ignoring invalid hostname");
+        return;
+    }
     {
         let mut t = table.write().await;
         let hosts = t.entry(network.to_string()).or_default();
@@ -131,6 +136,10 @@ pub async fn sync_network_hostnames(
     }
     let mut hosts = HashMap::with_capacity(entries.len());
     for (name, v6) in entries {
+        if !crate::hostname::is_valid_hostname(name) {
+            tracing::warn!(%network, hostname = %name, "ignoring invalid hostname");
+            continue;
+        }
         hosts.insert(name.clone(), *v6);
         reverse.insert(*v6, (name.clone(), network.to_string()));
     }
@@ -465,6 +474,20 @@ mod tests {
         }
         let result = resolve_name("alice.gaming.ray", SUFFIX, &table).await;
         assert_eq!(result, Some(v6(5)));
+    }
+
+    /// A member named `web.prod` on one network must not answer for host
+    /// `web` on network `prod`.
+    #[tokio::test]
+    async fn a_dotted_hostname_never_enters_the_table() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v6 = |n: u16| Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, n);
+        update_hostname(&table, &reverse, "home", "web.prod", v6(1)).await;
+        sync_network_hostnames(&table, &reverse, "lab", &[("web.prod".to_string(), v6(2))]).await;
+        assert_eq!(resolve_name("web.prod.ray", SUFFIX, &table).await, None);
+        assert!(reverse.get(&v6(1)).is_none());
+        assert!(reverse.get(&v6(2)).is_none());
     }
 
     #[tokio::test]

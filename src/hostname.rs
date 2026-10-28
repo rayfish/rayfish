@@ -133,16 +133,22 @@ pub fn is_valid_hostname(name: &str) -> bool {
 /// collision-resolution (`alice` → `alice-1` → …).
 ///
 /// `taken` must already exclude the joining identity's own current name.
-/// Returns `Ok(assigned)` or `Err(conflicting_name)` when an authoritative name
-/// is already in use.
+/// Returns `Ok(assigned)`, or `Err(reason)` for a name that is not a valid
+/// label or an authoritative name already in use.
 pub fn admission_hostname(
     desired: &str,
     taken: &[&str],
     authoritative: bool,
 ) -> Result<String, String> {
+    // A dotted claim such as `web.prod` would answer for `web.prod.ray`.
+    if !is_valid_hostname(desired) {
+        return Err(format!("invalid hostname '{desired}'"));
+    }
     if authoritative {
         if taken.contains(&desired) {
-            return Err(desired.to_string());
+            return Err(format!(
+                "hostname '{desired}' is already in use on this network"
+            ));
         }
         return Ok(desired.to_string());
     }
@@ -154,7 +160,10 @@ pub fn resolve_collision(desired: &str, taken: &[&str]) -> String {
         return desired.to_string();
     }
     for i in 1u32.. {
-        let candidate = format!("{desired}-{i}");
+        // Shorten the base so the suffixed name still fits one DNS label.
+        let suffix = format!("-{i}");
+        let base: String = desired.chars().take(63 - suffix.len()).collect();
+        let candidate = format!("{}{suffix}", base.trim_end_matches('-'));
         if !taken.contains(&candidate.as_str()) {
             return candidate;
         }
@@ -276,8 +285,39 @@ mod tests {
         // rejected (no silent rename) so a peer can't steal another's name.
         assert_eq!(
             admission_hostname("alice", &["alice"], true),
-            Err("alice".to_string())
+            Err("hostname 'alice' is already in use on this network".to_string())
         );
+    }
+
+    #[test]
+    fn admission_refuses_a_name_that_is_not_one_label() {
+        for name in ["web.prod", "Web", "", "-x", &"a".repeat(64)] {
+            for authoritative in [true, false] {
+                assert!(
+                    admission_hostname(name, &[], authoritative).is_err(),
+                    "{name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_suffixed_collision_stays_one_valid_label() {
+        let long = "a".repeat(63);
+        let renamed = resolve_collision(&long, &[&long]);
+        assert_eq!(renamed, format!("{}-1", "a".repeat(61)));
+        assert!(is_valid_hostname(&renamed));
+        let taken: Vec<String> = (1..=9).map(|i| format!("{}-{i}", "a".repeat(61))).collect();
+        let mut taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+        taken.push(&long);
+        assert_eq!(
+            resolve_collision(&long, &taken),
+            format!("{}-10", "a".repeat(60))
+        );
+        // A cut that lands on a hyphen drops it rather than doubling it.
+        let hyphen = format!("{}-bc", "a".repeat(60));
+        let renamed = resolve_collision(&hyphen, &[&hyphen]);
+        assert_eq!(renamed, format!("{}-1", "a".repeat(60)));
     }
 
     #[test]
