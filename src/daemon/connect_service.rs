@@ -65,6 +65,19 @@ pub(crate) fn evict_oldest_connect(
     Some(oldest)
 }
 
+/// Marks a peer's connect retry loop as running until the loop ends, however
+/// it ends.
+struct RetryRunning {
+    retries: Arc<DashSet<EndpointId>>,
+    peer: EndpointId,
+}
+
+impl Drop for RetryRunning {
+    fn drop(&mut self) {
+        self.retries.remove(&self.peer);
+    }
+}
+
 struct ConnectDecision {
     reply: control::ConnectMsg,
     rejection: Option<Instant>,
@@ -82,6 +95,9 @@ pub(crate) struct ConnectService {
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
     pub(crate) outgoing_connects: DashSet<EndpointId>,
+    /// Peers with a connect retry loop running, so asking again while one
+    /// waits for approval does not start a second loop for the same peer.
+    connect_retries: Arc<DashSet<EndpointId>>,
     /// Rejected requests remain terminal when a cooperative requester polls.
     rejected_connects: DashMap<EndpointId, Instant>,
     connect_decision_lock: Mutex<()>,
@@ -106,6 +122,7 @@ impl ConnectService {
             pending_connects: DashMap::new(),
             approved_connects: DashMap::new(),
             outgoing_connects: DashSet::new(),
+            connect_retries: Arc::new(DashSet::new()),
             rejected_connects: DashMap::new(),
             connect_decision_lock: Mutex::new(()),
             connection_errors: DashMap::new(),
@@ -319,13 +336,23 @@ impl ConnectService {
     }
 
     /// Retry a pending connect request on a backoff until approved/denied.
+    /// One loop per peer: while one runs, a repeated `ray connect` to the same
+    /// peer starts nothing and returns `None`.
     pub(crate) fn spawn_connect_retry(
         self: &Arc<Self>,
         peer: EndpointId,
         hostname: Option<String>,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.connect_retries.insert(peer) {
+            return None;
+        }
         let me = Arc::clone(self);
-        tokio::spawn(async move {
+        let running = RetryRunning {
+            retries: Arc::clone(&self.connect_retries),
+            peer,
+        };
+        Some(tokio::spawn(async move {
+            let _running = running;
             let mut backoff = BACKOFF_INITIAL;
             loop {
                 tokio::select! {
@@ -360,7 +387,7 @@ impl ConnectService {
                     _ => {} // Pending or transient error, keep retrying.
                 }
             }
-        });
+        }))
     }
 
     /// List pending incoming `ray connect` requests awaiting approval.
@@ -815,6 +842,49 @@ mod pending_connect_cap_tests {
             assert!(matches!(decision.reply, control::ConnectMsg::Denied { .. }));
             assert!(service.pending_connects.is_empty());
         });
+        endpoint.close().await;
+    }
+
+    /// A connect service over a fresh endpoint and config tree in `tmp`.
+    async fn test_service(tmp: &std::path::Path) -> (Endpoint, Arc<ConnectService>) {
+        config::set_thread_config_dir(tmp.join("config"));
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let store = FsStore::load(tmp.join("blobs")).await.unwrap();
+        let registry = crate::daemon::accept_handler_tests::sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            store,
+        );
+        (endpoint, Arc::new(ConnectService::new(registry)))
+    }
+
+    /// Asking again while a request waits for approval must not start a second
+    /// endless retry loop for the same peer; once the loop ends, a new one can.
+    #[tokio::test]
+    async fn one_connect_retry_loop_per_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        let peer = eid(7);
+        let first = service
+            .spawn_connect_retry(peer, None)
+            .expect("the first request starts a loop");
+        assert!(service.spawn_connect_retry(peer, None).is_none());
+        let other = service
+            .spawn_connect_retry(eid(8), None)
+            .expect("another peer gets its own loop");
+        service.registry.shutdown_token.cancel();
+        first.await.unwrap();
+        other.await.unwrap();
+        let again = service
+            .spawn_connect_retry(peer, None)
+            .expect("a finished loop frees its peer");
+        again.await.unwrap();
         endpoint.close().await;
     }
 
