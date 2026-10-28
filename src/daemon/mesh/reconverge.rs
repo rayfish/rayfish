@@ -85,10 +85,11 @@ pub(crate) fn apply_suggested_firewall(
         })
         .unwrap_or(false);
     if auto_accept {
-        let config = firewall.replace_network_rules(network_name, rules);
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, network = network_name, "failed to persist firewall config");
-        }
+        firewall.replace_network_rules(network_name, rules, |config| {
+            if let Err(e) = firewall::save_firewall(config) {
+                tracing::warn!(error = %e, network = network_name, "failed to persist firewall config");
+            }
+        });
         state.write().unwrap().pending_suggestions.clear();
         tracing::info!(
             network = network_name,

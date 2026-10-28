@@ -1090,7 +1090,10 @@ impl NetworkRegistry {
     /// saved; the intent then stays, so the next start finishes saving the rules
     /// ([`finish_interrupted_rename`]).
     fn follow_rename(&self, from: &str, to: &str) -> Option<String> {
-        let rules = self.firewall.rename_network(from, to);
+        let mut rules_saved = Ok(());
+        self.firewall.rename_network(from, to, |rules| {
+            rules_saved = firewall::save_firewall(rules);
+        });
         self.exit_server.rename_network(from, to);
         self.exit_client.rename_network(from, to);
         let pruned: Vec<EndpointId> = self
@@ -1103,9 +1106,7 @@ impl NetworkRegistry {
             self.pruned_peers.remove(&(from.to_string(), peer));
             self.pruned_peers.insert((to.to_string(), peer));
         }
-        let saved = rules
-            .map_or(Ok(()), |rules| firewall::save_firewall(&rules))
-            .and_then(|()| config::clear_rename_intent());
+        let saved = rules_saved.and_then(|()| config::clear_rename_intent());
         saved.err().map(|e| {
             tracing::warn!(from, to, error = %format!("{e:#}"), "failed to save renamed network");
             format!(

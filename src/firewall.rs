@@ -63,11 +63,12 @@
 //! tracking immediately. This is a flow tracker, not TCP sequence validation:
 //! after eviction, permitted outbound traffic can create a fresh entry.
 
+use std::convert::Infallible;
 #[cfg(test)]
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::peers::FastDashMap;
@@ -337,6 +338,14 @@ impl FirewallConfig {
     /// to it and rules installed from its suggestions name it by its local name,
     /// and without this a scoped rule would stop matching while the suggested
     /// ones were never replaced again. Returns whether any rule named it.
+    /// Replace the rules installed from network `net`'s suggestions with
+    /// `new_rules`, leaving `Local` rules and other networks' rules untouched.
+    pub fn replace_network_rules(&mut self, net: &str, new_rules: Vec<FirewallRule>) {
+        self.rules
+            .retain(|r| !matches!(&r.origin, RuleOrigin::Network(n) if n == net));
+        self.rules.extend(new_rules);
+    }
+
     pub fn rename_network(&mut self, from: &str, to: &str) -> bool {
         let mut renamed = false;
         for rule in &mut self.rules {
@@ -459,6 +468,9 @@ pub struct SharedFirewall {
     /// Stateful connection tracker: outbound-initiated flows whose return
     /// traffic is allowed in even under a deny default.
     conntrack: Arc<FastDashMap<Flow, FlowState>>,
+    /// Serializes read-modify-write edits (see [`Self::try_edit`]). The data
+    /// path never takes it: packets read `inner` lock-free.
+    edits: Arc<Mutex<()>>,
 }
 
 impl SharedFirewall {
@@ -466,6 +478,41 @@ impl SharedFirewall {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(config)),
             conntrack: Arc::new(FastDashMap::default()),
+            edits: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Apply `edit` to the live config and `persist` the result, as one step.
+    /// Edits are serialized: two that ran concurrently used to start from the
+    /// same snapshot, and whichever stored last dropped the other's change.
+    /// `persist` runs before the next edit starts, so the saved file ends in
+    /// the same state as the live config. An `Err` from `edit` leaves both
+    /// untouched.
+    pub fn try_edit<T, E>(
+        &self,
+        edit: impl FnOnce(&mut FirewallConfig) -> std::result::Result<T, E>,
+        persist: impl FnOnce(&FirewallConfig),
+    ) -> std::result::Result<T, E> {
+        let _serialized = self.edits.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut config = (*self.inner.load_full()).clone();
+        let out = edit(&mut config)?;
+        let config = Arc::new(config);
+        self.inner.store(Arc::clone(&config));
+        persist(&config);
+        Ok(out)
+    }
+
+    /// [`Self::try_edit`] for an edit that cannot fail.
+    pub fn edit<T>(
+        &self,
+        edit: impl FnOnce(&mut FirewallConfig) -> T,
+        persist: impl FnOnce(&FirewallConfig),
+    ) -> T {
+        let result: std::result::Result<T, Infallible> =
+            self.try_edit(|config| Ok(edit(config)), persist);
+        match result {
+            Ok(out) => out,
+            Err(never) => match never {},
         }
     }
 
@@ -748,6 +795,7 @@ impl SharedFirewall {
     }
 
     pub fn update(&self, config: FirewallConfig) {
+        let _serialized = self.edits.lock().unwrap_or_else(PoisonError::into_inner);
         self.inner.store(Arc::new(config));
     }
 
@@ -758,44 +806,68 @@ impl SharedFirewall {
     /// Replace the set of rules suggested by trusted network `net` with
     /// `new_rules`, leaving `Local` rules and other networks' rules untouched.
     /// The blob is authoritative for what it manages, so each reconverge swaps
-    /// the whole `Network(net)` set. Returns the updated config for persistence.
-    pub fn replace_network_rules(&self, net: &str, new_rules: Vec<FirewallRule>) -> FirewallConfig {
-        let mut config = (*self.get_config()).clone();
-        config
-            .rules
-            .retain(|r| !matches!(&r.origin, RuleOrigin::Network(n) if n == net));
-        config.rules.extend(new_rules);
-        self.update(config.clone());
-        config
+    /// the whole `Network(net)` set. `persist` saves it (see [`Self::try_edit`]).
+    pub fn replace_network_rules(
+        &self,
+        net: &str,
+        new_rules: Vec<FirewallRule>,
+        persist: impl FnOnce(&FirewallConfig),
+    ) -> FirewallConfig {
+        self.edit(
+            |config| {
+                config.replace_network_rules(net, new_rules);
+                config.clone()
+            },
+            persist,
+        )
     }
 
-    /// [`FirewallConfig::rename_network`] on the live rules. Returns the updated
-    /// config for persistence, or `None` when no rule names the network.
-    pub fn rename_network(&self, from: &str, to: &str) -> Option<FirewallConfig> {
-        let mut config = (*self.get_config()).clone();
-        if !config.rename_network(from, to) {
-            return None;
-        }
-        self.update(config.clone());
-        Some(config)
+    /// [`FirewallConfig::rename_network`] on the live rules, saved by `persist`.
+    /// Returns the updated config, or `None` (and persists nothing) when no rule
+    /// names the network.
+    pub fn rename_network(
+        &self,
+        from: &str,
+        to: &str,
+        persist: impl FnOnce(&FirewallConfig),
+    ) -> Option<FirewallConfig> {
+        self.try_edit(
+            |config| {
+                if config.rename_network(from, to) {
+                    Ok(config.clone())
+                } else {
+                    Err(())
+                }
+            },
+            persist,
+        )
+        .ok()
     }
 
     /// Install or remove the auto-seeded SSH passthrough rule
     /// ([`RuleOrigin::Ssh`]) so the embedded mesh SSH listener can receive
     /// connections under the deny-inbound default. Idempotent: enabling twice
     /// keeps a single rule, disabling removes exactly the seeded rule and leaves
-    /// any hand-added rules alone. Returns the updated config to persist.
-    pub fn set_ssh_passthrough(&self, enabled: bool, port: u16) -> FirewallConfig {
-        let mut config = (*self.get_config()).clone();
-        config
-            .rules
-            .retain(|r| !matches!(&r.origin, RuleOrigin::Ssh));
-        if enabled {
-            // Front-insert so it wins over a stale deny, matching `firewall add`.
-            config.rules.insert(0, ssh_passthrough_rule(port));
-        }
-        self.update(config.clone());
-        config
+    /// any hand-added rules alone. `persist` saves it (see [`Self::try_edit`]).
+    pub fn set_ssh_passthrough(
+        &self,
+        enabled: bool,
+        port: u16,
+        persist: impl FnOnce(&FirewallConfig),
+    ) -> FirewallConfig {
+        self.edit(
+            |config| {
+                config
+                    .rules
+                    .retain(|r| !matches!(&r.origin, RuleOrigin::Ssh));
+                if enabled {
+                    // Front-insert so it wins over a stale deny, matching `firewall add`.
+                    config.rules.insert(0, ssh_passthrough_rule(port));
+                }
+                config.clone()
+            },
+            persist,
+        )
     }
 }
 
@@ -2981,7 +3053,7 @@ mod tests {
             network: Some("prod".to_string()),
             origin: RuleOrigin::Network("prod".to_string()),
         };
-        let updated = fw.replace_network_rules("prod", vec![fresh.clone()]);
+        let updated = fw.replace_network_rules("prod", vec![fresh.clone()], |_| {});
 
         // Local + other-network rules preserved; prod set fully replaced.
         assert!(updated.rules.iter().any(|r| r.origin == RuleOrigin::Local));
@@ -3027,7 +3099,7 @@ mod tests {
             ..FirewallConfig::default()
         });
 
-        let renamed = fw.rename_network("home", "lab").unwrap();
+        let renamed = fw.rename_network("home", "lab", |_| {}).unwrap();
         let expected = vec![
             rule(Some("lab"), RuleOrigin::Local),
             rule(Some("lab"), suggested("lab")),
@@ -3037,7 +3109,49 @@ mod tests {
         ];
         assert_eq!(renamed.rules, expected);
         assert_eq!(fw.get_config().rules, expected);
-        assert!(fw.rename_network("home", "office").is_none());
+        assert!(fw.rename_network("home", "office", |_| {}).is_none());
+    }
+
+    /// Concurrent edits each keep their change. They used to clone the same
+    /// snapshot, and the last store dropped the rules the others added.
+    #[test]
+    fn concurrent_edits_are_not_lost() {
+        const THREADS: u16 = 8;
+        const EDITS: u16 = 50;
+        let fw = SharedFirewall::new(FirewallConfig {
+            rules: Vec::new(),
+            ..FirewallConfig::default()
+        });
+        let start = std::sync::Barrier::new(usize::from(THREADS));
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (fw, start) = (&fw, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for edit in 0..EDITS {
+                        let port = thread * EDITS + edit + 1;
+                        fw.edit(
+                            |c| {
+                                c.rules.push(FirewallRule {
+                                    direction: Direction::In,
+                                    action: Action::Allow,
+                                    protocol: Protocol::Tcp,
+                                    port: Some(PortRange {
+                                        start: port,
+                                        end: port,
+                                    }),
+                                    peer: PeerFilter::Any,
+                                    network: None,
+                                    origin: RuleOrigin::Local,
+                                })
+                            },
+                            |_| {},
+                        );
+                    }
+                });
+            }
+        });
+        assert_eq!(fw.get_config().rules.len(), usize::from(THREADS * EDITS));
     }
 
     #[test]
@@ -3058,8 +3172,8 @@ mod tests {
         fw.update(cfg);
 
         // Changing ports replaces the old managed rule without touching local rules.
-        fw.set_ssh_passthrough(true, 22);
-        let cfg = fw.set_ssh_passthrough(true, 2222);
+        fw.set_ssh_passthrough(true, 22, |_| {});
+        let cfg = fw.set_ssh_passthrough(true, 2222, |_| {});
         let ssh_rules: Vec<_> = cfg
             .rules
             .iter()
@@ -3079,7 +3193,7 @@ mod tests {
         assert!(cfg.rules.contains(&local_22));
 
         // Disabling removes the managed rule but keeps the Local one.
-        let cfg = fw.set_ssh_passthrough(false, 2222);
+        let cfg = fw.set_ssh_passthrough(false, 2222, |_| {});
         assert!(!cfg.rules.iter().any(|r| r.origin == RuleOrigin::Ssh));
         assert!(cfg.rules.contains(&local_22));
     }
