@@ -89,6 +89,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read files they have no access to.
 - Peer hostnames must be a single valid DNS label, so a member cannot claim a
   name such as `web.prod` and take over another network's `.ray` name.
+- Received files only go into a directory the accepting user owns, never
+  through a link, and never over an existing file (the new one is saved as
+  `name (1).ext`). Only root can set `download-dir` and `download-user`.
 
 ## [0.5.11] - 2026-10-27
 
