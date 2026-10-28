@@ -13,6 +13,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the host's search domains are left alone. Existing installs keep their mode.
   Run `ray config set dns on` for short names.
 - macOS: turning DNS on in the app selects `partial` rather than `on`.
+- Under `--json`, commands that print a daemon confirmation now print
+  `{"message": ...}`, and `ray invite`, `ray pair` and the `ray files`
+  settings commands print JSON. `ray status --json` exits non-zero with the
+  error on stderr when the daemon is down or refuses the connection.
+- `ray pair <ticket>` with a subcommand is now an error.
 
 ### Fixed
 
@@ -67,12 +72,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ray open` join links auto-accept own-device files, like `ray join`.
 - `ray apply` exits non-zero on failed steps, keeps live suggestions when they
   cannot be read, and rejects nested groups.
-- `ray ephemeral` rejects invalid durations, and durations that overflow are
-  refused.
-- `ray status --json`, `ray invite --json`, `ray pair --json` and the
-  `ray files` settings commands now print JSON.
-- `ray stop` fails when the service manager cannot stop the service, and
-  `ray uninstall` requires root.
+- `ray ephemeral` exits non-zero on an invalid duration, and durations that
+  overflow are refused.
+- A refused daemon socket is reported as "not authorized" rather than "not
+  running", and the hint names `sudo ray up`.
+- Windows: `ray send` exits non-zero on an unexpected daemon reply.
+- Linux and Windows: `ray stop` fails when the service manager cannot stop the
+  service. `ray uninstall` requires root.
 - The firewall pending picker opens only on a terminal.
 - Tab completion no longer creates or migrates config.
 

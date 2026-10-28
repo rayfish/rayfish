@@ -205,14 +205,9 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
         // A daemon predating `SendFileFd` fails to decode the request and
         // drops the connection without a reply (never with an `Error`
         // response). Retry once the old way, path over IPC, so an updated CLI
-        // keeps working until the daemon restarts onto the new binary. Only
-        // as root: the daemon now refuses path sends from anyone else.
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        Err(error) if unsafe { libc::geteuid() } != 0 => {
-            return Err(error).context(
-                "the daemon did not accept the open file; restart it onto the new binary",
-            );
-        }
+        // keeps working until the daemon restarts onto the new binary. The new
+        // daemon refuses path sends from anyone but root, so this only helps
+        // across the upgrade.
         Err(_) => {
             let mut stream = ipc::connect().await?;
             ipc::send(

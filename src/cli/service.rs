@@ -496,7 +496,7 @@ pub(crate) async fn cmd_stop() -> Result<()> {
     InitSystem::require()?.stop()?;
 
     #[cfg(target_os = "macos")]
-    run_cmd_checked(
+    run_cmd(
         "launchctl",
         &["unload", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
     )?;
