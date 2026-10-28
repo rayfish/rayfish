@@ -11,6 +11,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use smol_str::SmolStr;
 
+use std::borrow::Cow;
+
+use crate::dns::packet::MAX_DNS_PAYLOAD;
 use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
 
 /// Whether `ip` is this resolver's own address, so forwarding to it is a loop
@@ -284,6 +287,17 @@ impl Resolver {
                 None => return,
             },
         };
+        // A reply past the MTU cannot be injected. Answer TC=1 instead of
+        // dropping it, so the client gives up at once rather than timing out.
+        let resp = if resp.len() > MAX_DNS_PAYLOAD {
+            tracing::debug!(len = resp.len(), "DNS reply too large for UDP, truncating");
+            match truncated(dns_query, &resp) {
+                Some(resp) => resp,
+                None => return,
+            }
+        } else {
+            resp
+        };
         if let Some(reply) = crate::dns::packet::build_udp_reply(info, &resp) {
             let _ = tun_tx.send(reply).await;
         }
@@ -298,12 +312,13 @@ impl Resolver {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
         }
+        let query = clamp_edns(query);
         // The name is only needed to count loops, so it is parsed only when an
         // upstream could loop. A host with ordinary resolvers pays nothing.
         let name = upstreams
             .iter()
             .any(|a| is_loopable_upstream(a.ip()))
-            .then(|| query_name(query))
+            .then(|| query_name(&query))
             .flatten();
         for up in upstreams.iter() {
             // Skip another mesh's resolver once this name has been bounced off
@@ -312,7 +327,7 @@ impl Resolver {
             if is_loopable_upstream(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
                 continue;
             }
-            match forward_once(query, *up, FORWARD_TIMEOUT).await {
+            match forward_once(&query, *up, FORWARD_TIMEOUT).await {
                 Ok(resp) => return Some(resp),
                 Err(e) => tracing::debug!(upstream = %up, error = %e, "upstream DNS query failed"),
             }
@@ -476,6 +491,38 @@ where
         .zip(alive)
         .filter_map(|(ip, ok)| ok.then_some(*ip))
         .collect()
+}
+
+/// Lower an EDNS UDP size the reply could not fit back into the TUN to
+/// [`MAX_DNS_PAYLOAD`], so the upstream trims or truncates its answer itself
+/// instead of sending one we would have to drop. A query without EDNS (512
+/// bytes) or one we cannot parse goes out unchanged.
+fn clamp_edns(query: &[u8]) -> Cow<'_, [u8]> {
+    let Ok(mut packet) = simple_dns::Packet::parse(query) else {
+        return Cow::Borrowed(query);
+    };
+    let Some(opt) = packet.opt_mut().as_mut() else {
+        return Cow::Borrowed(query);
+    };
+    let max = u16::try_from(MAX_DNS_PAYLOAD).unwrap_or(u16::MAX);
+    if opt.udp_packet_size <= max {
+        return Cow::Borrowed(query);
+    }
+    opt.udp_packet_size = max;
+    match packet.build_bytes_vec() {
+        Ok(bytes) => Cow::Owned(bytes),
+        Err(_) => Cow::Borrowed(query),
+    }
+}
+
+/// An empty response with TC set, for an answer too large to send over UDP.
+/// Built from the query like [`servfail`], keeping its id, question and OPT,
+/// with the rcode the real answer carried.
+fn truncated(query: &[u8], resp: &[u8]) -> Option<Vec<u8>> {
+    let rcode = resp.get(3)? & 0x0f;
+    let mut reply = rcode_reply(query, rcode)?;
+    reply[2] |= 0x02; // TC: truncated
+    Some(reply)
 }
 
 /// Turn a query into a SERVFAIL response by flipping the header in place,
@@ -1025,6 +1072,102 @@ mod tests {
         // response to its outstanding query and will ignore it.
         assert_eq!(pkt.id(), Packet::parse(&dns_query).unwrap().id());
         assert_eq!(pkt.questions.len(), 1);
+    }
+
+    /// Upstream that answers every query with `count` A records, far past what
+    /// fits in one IPv6 packet, and reports the EDNS size each query asked for.
+    async fn bulky_upstream(
+        count: u8,
+    ) -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<Option<u16>>,
+    ) {
+        use simple_dns::{ResourceRecord, rdata::A, rdata::RData};
+
+        let sock = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                let query = Packet::parse(&buf[..n]).expect("parse query");
+                let _ = seen_tx.send(query.opt().map(|o| o.udp_packet_size));
+                let mut reply = Packet::new_reply(query.id());
+                reply.questions.push(query.questions[0].clone());
+                for i in 0..count {
+                    reply.answers.push(ResourceRecord::new(
+                        query.questions[0].qname.clone(),
+                        simple_dns::CLASS::IN,
+                        60,
+                        RData::A(A {
+                            address: Ipv4Addr::new(10, 0, 0, i).into(),
+                        }),
+                    ));
+                }
+                let bytes = reply.build_bytes_vec().expect("build reply");
+                let _ = sock.send_to(&bytes, from).await;
+            }
+        });
+        (addr, seen_rx)
+    }
+
+    #[tokio::test]
+    async fn oversize_forwarded_reply_is_truncated_not_dropped() {
+        use std::net::IpAddr;
+
+        let (up, mut seen) = bulky_upstream(100).await;
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        r.set_upstream_addrs([up]);
+
+        let plain = build_a_query("example.com");
+        let mut query = Packet::parse(&plain).unwrap();
+        *query.opt_mut() = Some(simple_dns::rdata::OPT {
+            opt_codes: Vec::new(),
+            udp_packet_size: 4096,
+            version: 0,
+        });
+        let dns_query = query.build_bytes_vec().unwrap();
+        let app = crate::firewall::PacketInfo {
+            src_ip: IpAddr::V6("200::9".parse().unwrap()),
+            dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
+            protocol: 17,
+            src_port: 50000,
+            dst_port: 53,
+            tcp_flags: 0,
+            icmp_type: 0,
+            icmp_id: 0,
+            transport_offset: 40,
+        };
+        let query_pkt = crate::dns::packet::build_udp_reply(
+            &crate::firewall::PacketInfo {
+                src_ip: app.dst_ip,
+                dst_ip: app.src_ip,
+                src_port: app.dst_port,
+                dst_port: app.src_port,
+                ..app
+            },
+            &dns_query,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let info = crate::firewall::parse_packet_info(&query_pkt).unwrap();
+        r.handle_tun_query(&query_pkt, &info, &tx).await;
+
+        let asked = seen.recv().await.expect("upstream saw the query");
+        assert_eq!(asked, Some(MAX_DNS_PAYLOAD as u16));
+        let reply = rx.try_recv().expect("a truncated reply, not silence");
+        let pkt = Packet::parse(&reply[48..]).expect("parse truncated reply");
+        assert!(pkt.has_flags(PacketFlag::TRUNCATION));
+        assert_eq!(pkt.id(), query.id());
+        assert_eq!(pkt.questions.len(), 1);
+        assert!(pkt.answers.is_empty());
     }
 
     #[test]

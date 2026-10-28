@@ -14,6 +14,8 @@ const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 /// Keep DNS replies within IPv6's minimum MTU, even when the TUN is larger.
 const MTU: usize = 1280;
+/// The largest DNS message [`build_udp_reply`] can carry.
+pub const MAX_DNS_PAYLOAD: usize = MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN;
 
 /// Builds a complete IP+UDP reply packet for a query, swapping src/dst and
 /// computing the checksums. The resolver answers on [`crate::dns::MAGIC_DNS_V6`]
@@ -32,10 +34,10 @@ fn build_v6_reply(
     magic_ip: Ipv6Addr,
     dns_payload: &[u8],
 ) -> Option<Bytes> {
-    let total = IPV6_HEADER_LEN + UDP_HEADER_LEN + dns_payload.len();
-    if total > MTU {
+    if dns_payload.len() > MAX_DNS_PAYLOAD {
         return None;
     }
+    let total = IPV6_HEADER_LEN + UDP_HEADER_LEN + dns_payload.len();
     let mut p = vec![0u8; total];
 
     // ---- IPv6 header ----
