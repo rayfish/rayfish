@@ -493,13 +493,13 @@ pub(crate) async fn cmd_stop() -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    InitSystem::require()?.stop();
+    InitSystem::require()?.stop()?;
 
     #[cfg(target_os = "macos")]
-    run_cmd(
+    run_cmd_checked(
         "launchctl",
         &["unload", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
-    );
+    )?;
 
     #[cfg(windows)]
     rayfish::windows_service::stop()?;

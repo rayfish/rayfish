@@ -561,6 +561,18 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) {
     }
 }
 
+/// Run a command, failing on a non-zero exit. For `ray stop`, which has no
+/// later check that would notice the service is still running.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_cmd_checked(program: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run `{program}`"))?;
+    anyhow::ensure!(status.success(), "`{program}` exited with {status}");
+    Ok(())
+}
+
 /// Run a command, ignoring its exit status and output. For the launchd teardown
 /// in `install_and_start_service`, where unloading a job that was never loaded
 /// is both expected and noisy. macOS-only, as its one caller is.
