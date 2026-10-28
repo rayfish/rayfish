@@ -1508,40 +1508,30 @@ impl MemberAcceptState {
                 return;
             }
         };
-        let record_ts = packet.timestamp().as_micros();
-        let (current_hash, floor, needs) = {
-            let s = self.state.read().unwrap();
-            (
-                s.converged_hash,
-                s.last_record_timestamp,
-                s.needs_reconverge(remote_hash),
-            )
+        let record = SignedGroupRecord {
+            hash: remote_hash,
+            seeds: seed_peers,
+            timestamp: packet.timestamp().as_micros(),
         };
-        if !needs {
-            return;
-        }
-        if !record_is_newer(record_ts, floor) {
-            tracing::warn!(
-                record_ts,
-                floor,
-                "rejecting a signed record older than the last one applied (replay)"
-            );
-            return;
-        }
-        tracing::info!(old = ?current_hash, new = %remote_hash, "applying signed record handed by coordinator");
-        self.state.write().unwrap().last_record_timestamp = Some(record_ts);
-        fetch_and_apply_blob(
+        // Freshness is checked inside, against the last record applied, and the
+        // floor only moves once the blob is in hand: a record whose blob we could
+        // not fetch must stay acceptable to the next trigger.
+        let device_cert = crate::identity::load_device_cert().ok().flatten();
+        let outcome = apply_group_record(
             &self.endpoint,
-            &self.ctx.blob_store,
-            &self.ctx.peers,
-            &self.ctx.firewall,
-            &self.registry,
-            &self.state,
+            &self.ctx,
             &self.network_name,
-            remote_hash,
-            &seed_peers,
+            &self.state,
+            &device_cert,
+            &record,
         )
         .await;
+        if outcome == ReconvergeOutcome::Stale {
+            tracing::warn!(
+                record_ts = record.timestamp,
+                "rejecting a signed record older than the last one applied (replay)"
+            );
+        }
     }
 
     /// Another member (or an approved-but-not-yet-member peer) announced itself
@@ -2809,5 +2799,56 @@ mod pending_cap_tests {
         assert_eq!(evicted, Some(eid(0)));
         assert_eq!(pending.len(), 3);
         assert!(!pending.contains_key(&eid(0)));
+    }
+}
+
+#[cfg(test)]
+mod signed_record_fast_path_tests {
+    use super::*;
+    use crate::daemon::mesh::reconverge::apply_tests::{MemberFixture, NETWORK};
+
+    /// A record whose blob could not be fetched leaves the floor where it was, so
+    /// the next attempt at the same record is still taken. The fast path used to
+    /// advance the floor first, and a failed fetch then had every later path
+    /// refuse the record as a replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unfetched_record_does_not_advance_the_floor() {
+        let fx = MemberFixture::start().await;
+        let handler = MemberAcceptState {
+            ctx: fx.ctx(),
+            network_name: NETWORK.to_string(),
+            state: Arc::clone(&fx.state),
+            net_pubkey: fx.key.public(),
+            my_identity: fx.daemon.transport.endpoint.id(),
+            endpoint: fx.daemon.transport.endpoint.clone(),
+            registry: Arc::clone(&fx.daemon.registry),
+            invite_lock: Arc::new(AsyncMutex::new(())),
+            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        // No peer or seed can serve this blob.
+        let hash = blake3::hash(b"a blob nobody holds");
+        let packet = dht::encode_network_record(&fx.key, &hash, &[]).unwrap();
+        let floor = fx.state.read().unwrap().last_record_timestamp;
+
+        handler.apply_signed_record(packet.as_bytes()).await;
+
+        assert_eq!(fx.state.read().unwrap().last_record_timestamp, floor);
+        let record = SignedGroupRecord {
+            hash,
+            seeds: Vec::new(),
+            timestamp: packet.timestamp().as_micros(),
+        };
+        let retry = apply_group_record(
+            &fx.daemon.transport.endpoint,
+            &handler.ctx,
+            NETWORK,
+            &fx.state,
+            &None,
+            &record,
+        )
+        .await;
+        assert_eq!(retry, ReconvergeOutcome::Unfetched);
+        fx.finish().await;
     }
 }

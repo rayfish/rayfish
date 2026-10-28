@@ -60,7 +60,9 @@ impl NetworkRegistry {
             crate::membership::mark_coordinator(&mut s.members, &identity);
             s.refresh_snapshot();
         }
-        self.store_and_publish_group(network).await;
+        if !self.store_and_publish_group(network).await {
+            return unsaved_snapshot_error(network);
+        }
 
         // Record the grant locally (coordinator's record; not verifiable).
         let saved = config::update_network(network, |net| {

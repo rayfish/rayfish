@@ -110,15 +110,24 @@ impl NetworkRegistry {
     }
 
     pub fn firewall_remove(&self, index: usize) -> IpcMessage {
-        let len = self.firewall.get_config().rules.len();
-        if index >= len {
-            return ipc_err(format!("index {index} out of range (have {len} rules)"));
-        }
-        self.edit_firewall(|c| {
-            c.rules.remove(index);
-        });
-        IpcMessage::Ok {
-            message: "rule removed".to_string(),
+        // The bound is checked inside the edit: checked first, a concurrent
+        // removal could shrink the list before this one ran.
+        let removed = self.firewall.try_edit(
+            |c| {
+                let len = c.rules.len();
+                if index >= len {
+                    return Err(format!("index {index} out of range (have {len} rules)"));
+                }
+                c.rules.remove(index);
+                Ok(())
+            },
+            save_firewall_warn,
+        );
+        match removed {
+            Ok(()) => IpcMessage::Ok {
+                message: "rule removed".to_string(),
+            },
+            Err(message) => ipc_err(message),
         }
     }
 
@@ -257,7 +266,9 @@ impl NetworkRegistry {
             let mut s = state.write().unwrap();
             s.suggested_firewall = suggestions;
         }
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+        if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
+            return unsaved_snapshot_error(network);
+        }
         // Nudge connected members to reconverge from the freshly-published signed
         // record now, instead of waiting for the group poller. Like the
         // rename flow, this is a payload-free trigger, the suggestions still come
@@ -349,21 +360,23 @@ impl NetworkRegistry {
         if !accepted_rules.is_empty() {
             // Merge accepted rules into the network's existing installed set,
             // rather than replacing it, so earlier per-rule accepts survive.
-            let mut existing: Vec<firewall::FirewallRule> = self
-                .firewall
-                .get_config()
-                .rules
-                .iter()
-                .filter(|r| matches!(&r.origin, firewall::RuleOrigin::Network(n) if n == network))
-                .cloned()
-                .collect();
-            existing.extend(accepted_rules);
-            // Dedup by selector, newest (accepted) wins, so accepting a rule
-            // whose selector is already installed replaces it instead of stacking
-            // a duplicate (and a re-suggested action flip supersedes the old one).
-            let deduped = firewall::dedup_by_selector(existing);
-            let config = self.firewall.replace_network_rules(network, deduped);
-            save_firewall_warn(&config);
+            // Read and replace in one edit, so a concurrent one is not lost.
+            self.edit_firewall(|c| {
+                let mut existing: Vec<firewall::FirewallRule> = c
+                    .rules
+                    .iter()
+                    .filter(
+                        |r| matches!(&r.origin, firewall::RuleOrigin::Network(n) if n == network),
+                    )
+                    .cloned()
+                    .collect();
+                existing.extend(accepted_rules);
+                // Dedup by selector, newest (accepted) wins, so accepting a rule
+                // whose selector is already installed replaces it instead of
+                // stacking a duplicate (and a re-suggested action flip supersedes
+                // the old one).
+                c.replace_network_rules(network, firewall::dedup_by_selector(existing));
+            });
         }
         IpcMessage::Ok {
             message: format!(
@@ -388,8 +401,8 @@ impl NetworkRegistry {
             return ipc_err(format!("no pending suggested rules for '{network}'"));
         }
         let count = rules.len();
-        let config = self.firewall.replace_network_rules(network, rules);
-        save_firewall_warn(&config);
+        self.firewall
+            .replace_network_rules(network, rules, save_firewall_warn);
         IpcMessage::Ok {
             message: format!("accepted {count} suggested rules from '{network}'"),
         }
@@ -434,15 +447,11 @@ impl NetworkRegistry {
         self.firewall_config_set(FirewallKey::DefaultIn, &action.to_string())
     }
 
-    /// Read-modify-write the live firewall config: clone the current snapshot,
-    /// apply `edit`, swap it into the lock-free `ArcSwap`, and persist (logging on
-    /// write error). For infallible edits; [`Self::firewall_config_set`] spells
-    /// the same sequence out because its edit can fail.
+    /// Read-modify-write the live firewall config and persist it (logging on
+    /// write error), serialized with every other edit. See
+    /// [`firewall::SharedFirewall::try_edit`].
     fn edit_firewall(&self, edit: impl FnOnce(&mut firewall::FirewallConfig)) {
-        let mut config = (*self.firewall.get_config()).clone();
-        edit(&mut config);
-        self.firewall.update(config.clone());
-        save_firewall_warn(&config);
+        self.firewall.edit(edit, save_firewall_warn);
     }
 
     /// Apply one firewall settings key (`ray firewall on|off|reject|default`,
@@ -451,20 +460,20 @@ impl NetworkRegistry {
     /// Hot-swaps rather than doing a load/mutate/save: the packet path reads the
     /// config from a lock-free `ArcSwap`, so the edit has to be swapped into it
     /// for `ray firewall off` to take effect now instead of at the next daemon
-    /// restart. It repeats [`Self::edit_firewall`]'s sequence instead of calling
-    /// it because `apply_firewall` can fail and that helper takes an infallible
-    /// closure, so a rejected value must not reach the swap. Parsing and validation belong to
+    /// restart. A rejected value never reaches the swap. Parsing and validation belong to
     /// the registry (`settings::apply_firewall`); this method owns the live swap,
     /// the persist, and the per-key confirmation message.
     pub(crate) fn firewall_config_set(&self, key: FirewallKey, value: &str) -> IpcMessage {
-        let mut config = (*self.firewall.get_config()).clone();
-        if let Err(e) = settings::apply_firewall(&mut config, key, value) {
-            return ipc_err(e.to_string());
-        }
-        self.firewall.update(config.clone());
-        save_firewall_warn(&config);
-        IpcMessage::Ok {
-            message: firewall_set_message(&config, key),
+        let applied: Result<String> = self.firewall.try_edit(
+            |config| {
+                settings::apply_firewall(config, key, value)?;
+                Ok(firewall_set_message(config, key))
+            },
+            save_firewall_warn,
+        );
+        match applied {
+            Ok(message) => IpcMessage::Ok { message },
+            Err(e) => ipc_err(e.to_string()),
         }
     }
 
@@ -564,13 +573,11 @@ impl Daemon {
         };
         let enabled = app_config.ssh_enabled;
         // Open/close the configured port at the packet layer.
-        let fw = self
-            .registry
-            .firewall
-            .set_ssh_passthrough(enabled, app_config.ssh_port);
-        if let Err(e) = firewall::save_firewall(&fw) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        self.registry.firewall.set_ssh_passthrough(
+            enabled,
+            app_config.ssh_port,
+            save_firewall_warn,
+        );
         // Reflect immediately if the data plane is up (else activate() starts it).
         #[cfg(feature = "desktop")]
         if self.active.load(Ordering::SeqCst) {
@@ -635,13 +642,11 @@ impl Daemon {
             Ok(cfg) => cfg,
             Err(e) => return ipc_err(format!("failed to persist ssh-port setting: {e}")),
         };
-        let fw = self
-            .registry
-            .firewall
-            .set_ssh_passthrough(app_config.ssh_enabled, app_config.ssh_port);
-        if let Err(e) = firewall::save_firewall(&fw) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        self.registry.firewall.set_ssh_passthrough(
+            app_config.ssh_enabled,
+            app_config.ssh_port,
+            save_firewall_warn,
+        );
         crate::forward::set_ssh_nat_port(app_config.ssh_port);
         #[cfg(feature = "desktop")]
         if self.active.load(Ordering::SeqCst) && app_config.ssh_enabled {
@@ -1025,5 +1030,47 @@ mod ssh_user_tests {
     fn only_a_bare_asterisk_is_the_wildcard() {
         let got = normalize_ssh_users(v(&["ro*t", "alice"]));
         assert_eq!(got, v(&["alice", "ro*t"]));
+    }
+}
+
+#[cfg(test)]
+mod edit_race_tests {
+    use super::*;
+    use crate::daemon::mesh::reconverge::apply_tests::MemberFixture;
+
+    /// Concurrent removals of the same index each see the list as it is when
+    /// they run. The bound used to be checked before the edit, so two removals
+    /// of the last rule both passed it and the second panicked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn concurrent_removals_check_the_index_they_remove() {
+        const RULES: usize = 4;
+        const REMOVALS: usize = 16;
+        let fx = MemberFixture::start().await;
+        let registry = Arc::clone(&fx.daemon.registry);
+        registry.firewall.update(firewall::FirewallConfig {
+            rules: vec![firewall::default_icmp_rule(); RULES],
+            ..firewall::FirewallConfig::default()
+        });
+        let start = std::sync::Barrier::new(REMOVALS);
+        let removed = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..REMOVALS)
+                .map(|_| {
+                    let (registry, start) = (&registry, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        matches!(registry.firewall_remove(0), IpcMessage::Ok { .. })
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("a removal must not panic"))
+                .filter(|ok| *ok)
+                .count()
+        });
+        assert_eq!(removed, RULES);
+        assert!(registry.firewall.get_config().rules.is_empty());
+        fx.finish().await;
     }
 }

@@ -164,6 +164,29 @@ fn next_attempt_deadline(
     }
 }
 
+/// The proof that this network was destroyed, if there is one: the copy saved
+/// locally, else the one on the relay. A saved proof that cannot be read falls
+/// back to the relay rather than stopping publication for good. `Err` only when
+/// the relay cannot answer either.
+async fn destruction_proof(
+    client: &PkarrRelayClient,
+    key: &SecretKey,
+) -> Result<Option<SignedPacket>> {
+    match config::destruction::load(key.public()) {
+        Ok(Some(packet)) => return Ok(Some(packet)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "cannot read local network destruction status; asking the relay");
+        }
+    }
+    dht::destruction::resolve(
+        client,
+        dht::destruction::discovery_key(key).public(),
+        key.public(),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_network_publisher(
     client: PkarrRelayClient,
@@ -199,28 +222,14 @@ pub(crate) fn spawn_network_publisher(
                 if state.read().map(|s| s.destroyed).unwrap_or(true) {
                     break;
                 }
-                let proof = match config::destruction::load(net_secret_key.public()) {
-                    Ok(Some(packet)) => Some(packet),
-                    Ok(None) => match dht::destruction::resolve(
-                        &client,
-                        dht::destruction::discovery_key(&net_secret_key).public(),
-                        net_secret_key.public(),
-                    )
-                    .await
-                    {
-                        Ok(proof) => proof,
-                        Err(error) => {
-                            tracing::warn!(%error, "cannot verify network destruction status");
-                            if let Some(hash) = target {
-                                retry =
-                                    Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
-                            }
-                            continue;
-                        }
-                    },
+                let proof = match destruction_proof(&client, &net_secret_key).await {
+                    Ok(proof) => proof,
                     Err(error) => {
-                        tracing::warn!(%error, "cannot read local network destruction status");
-                        return;
+                        tracing::warn!(%error, "cannot verify network destruction status");
+                        if let Some(hash) = target {
+                            retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        }
+                        continue;
                     }
                 };
                 if let Some(packet) = proof {
@@ -589,6 +598,15 @@ pub(crate) async fn commit_current_snapshot(
         notify.notify_one();
     }
     ready_to_publish
+}
+
+/// The IPC reply for a change that reached live state but whose snapshot could
+/// not be stored or its recovery pointer saved. The publisher keeps retrying,
+/// so the change is not lost, but it is not published yet either.
+pub(crate) fn unsaved_snapshot_error(network: &str) -> IpcMessage {
+    ipc_err(format!(
+        "could not save the updated roster for '{network}'; it is not published yet and will be retried"
+    ))
 }
 
 pub(crate) async fn update_snapshot_and_publish(
@@ -993,5 +1011,35 @@ mod tests {
                 None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
             }
         }
+    }
+
+    /// A saved proof that cannot be read is a reason to ask the relay, not to
+    /// stop publishing: the publisher used to return for good on this error and
+    /// the network's record expired.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unreadable_saved_proof_falls_back_to_the_relay() {
+        use super::super::destruction::tests::{ConfigDir, Relay};
+
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ConfigDir::set(dir.path());
+        let key = SecretKey::from([12; 32]);
+        let saved = dir.path().join("destroyed-networks");
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::write(saved.join(format!("{}.pkarr", key.public())), b"garbage").unwrap();
+        assert!(config::destruction::load(key.public()).is_err());
+        let relay = Relay::start().await;
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let client = dht::create_pkarr_client(&endpoint, &relay.url).unwrap();
+
+        let proof = destruction_proof(&client, &key).await.unwrap();
+
+        assert!(proof.is_none());
+        endpoint.close().await;
     }
 }

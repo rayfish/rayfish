@@ -1090,7 +1090,10 @@ impl NetworkRegistry {
     /// saved; the intent then stays, so the next start finishes saving the rules
     /// ([`finish_interrupted_rename`]).
     fn follow_rename(&self, from: &str, to: &str) -> Option<String> {
-        let rules = self.firewall.rename_network(from, to);
+        let mut rules_saved = Ok(());
+        self.firewall.rename_network(from, to, |rules| {
+            rules_saved = firewall::save_firewall(rules);
+        });
         self.exit_server.rename_network(from, to);
         self.exit_client.rename_network(from, to);
         let pruned: Vec<EndpointId> = self
@@ -1103,9 +1106,7 @@ impl NetworkRegistry {
             self.pruned_peers.remove(&(from.to_string(), peer));
             self.pruned_peers.insert((to.to_string(), peer));
         }
-        let saved = rules
-            .map_or(Ok(()), |rules| firewall::save_firewall(&rules))
-            .and_then(|()| config::clear_rename_intent());
+        let saved = rules_saved.and_then(|()| config::clear_rename_intent());
         saved.err().map(|e| {
             tracing::warn!(from, to, error = %format!("{e:#}"), "failed to save renamed network");
             format!(
@@ -1597,15 +1598,17 @@ impl NetworkRegistry {
 
     /// Store a network's current blob snapshot, persist its recovery pointer,
     /// and wake its single publisher. Publication stays serialized in that task,
-    /// so an older async write can never complete after a newer one.
-    pub(crate) async fn store_and_publish_group(&self, network: &str) {
+    /// so an older async write can never complete after a newer one. `false`
+    /// when the network is gone or the snapshot could not be saved.
+    #[must_use]
+    pub(crate) async fn store_and_publish_group(&self, network: &str) -> bool {
         let (state, notify) = {
             let Some(handle) = self.networks.get(network) else {
-                return;
+                return false;
             };
             (Arc::clone(&handle.state), handle.dht_notify.clone())
         };
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await
     }
 
     /// This coordinator's current network record, serialized as a signed pkarr

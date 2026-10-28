@@ -148,7 +148,9 @@ impl NetworkRegistry {
             let mut s = state.write().unwrap();
             s.reusable_keys.insert(hash, key);
         }
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+        if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
+            return unsaved_snapshot_error(network);
+        }
         let code =
             crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
         IpcMessage::InviteCreated {
@@ -244,7 +246,9 @@ impl NetworkRegistry {
             crate::membership::revoke_reusable(&mut s.reusable_keys, id).is_ok()
         };
         if revoked_reusable {
-            update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+            if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
+                return unsaved_snapshot_error(network);
+            }
             return IpcMessage::Ok {
                 message: format!("revoked reusable key '{id}' (propagating to all admins)"),
             };
@@ -330,7 +334,9 @@ impl NetworkRegistry {
             s.refresh_snapshot();
             net_pubkey
         };
-        self.store_and_publish_group(network).await;
+        if !self.store_and_publish_group(network).await {
+            return unsaved_snapshot_error(network);
+        }
         broadcast_control_msg(
             &self.peers,
             net_pubkey,
@@ -374,5 +380,65 @@ impl NetworkRegistry {
             Ok(None) => ipc_err(format!("no pending request matching '{selector}'")),
             Err(()) => ipc_err(format!("pending request '{selector}' is ambiguous")),
         }
+    }
+}
+
+#[cfg(test)]
+mod unsaved_snapshot_tests {
+    use iroh::SecretKey;
+
+    use super::*;
+    use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
+
+    /// A coordinator change whose snapshot cannot be saved reports an error. It
+    /// used to report success while nothing was published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_failed_snapshot_commit_is_reported() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ConfigDir::set(dir.path());
+        let relay = Relay::start().await;
+        relay.configure();
+        let daemon = build_headless(false).await.unwrap();
+        create(&daemon, "home").await;
+        let registry = &daemon.registry;
+        let state = Arc::clone(&registry.networks.get("home").unwrap().state);
+        let (hash, key) = crate::membership::ReusableKey::from_secret(b"secret", now_secs(), 3600);
+        let reusable_id = key.id.clone();
+        let joiner = SecretKey::generate().public();
+        {
+            let mut s = state.write().unwrap();
+            s.reusable_keys.insert(hash, key);
+            s.pending.insert(
+                joiner,
+                PendingJoin {
+                    denied: false,
+                    hostname: None,
+                    device_cert: None,
+                    requested_at: Instant::now(),
+                },
+            );
+        }
+        // Without its config the recovery pointer cannot be written, so every
+        // snapshot commit fails.
+        assert!(config::delete_network("home").unwrap());
+
+        let minted = registry.reusable_key_create("home", 3600, None).await;
+        assert!(matches!(minted, IpcMessage::Error { .. }), "{minted:?}");
+        let revoked = registry.invite_revoke("home", &reusable_id).await;
+        assert!(matches!(revoked, IpcMessage::Error { .. }), "{revoked:?}");
+        let accepted = registry.accept_request("home", &joiner.to_string()).await;
+        assert!(matches!(accepted, IpcMessage::Error { .. }), "{accepted:?}");
+        let suggested = registry
+            .firewall_suggest("home", SuggestedFirewall::default())
+            .await;
+        assert!(
+            matches!(suggested, IpcMessage::Error { .. }),
+            "{suggested:?}"
+        );
+        daemon.shutdown_and_close().await;
     }
 }

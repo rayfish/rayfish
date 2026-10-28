@@ -296,7 +296,6 @@ pub(crate) async fn join_mesh_shared(
         network_name.to_string(),
         worker_ctx.clone(),
         ep.clone(),
-        my_identity,
         net_pubkey,
         device_cert.clone(),
     );
@@ -799,7 +798,6 @@ fn spawn_reconverge_worker(
     network_name: String,
     ctx_w: MeshCtx,
     endpoint_w: Endpoint,
-    my_identity_w: EndpointId,
     net_pubkey_w: EndpointId,
     device_cert_w: Option<control::DeviceCert>,
 ) {
@@ -843,7 +841,6 @@ fn spawn_reconverge_worker(
                 net_pubkey_w,
                 &network_name,
                 &live_state,
-                my_identity_w,
                 &device_cert_w,
             )
             .await;

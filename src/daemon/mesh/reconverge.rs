@@ -85,10 +85,11 @@ pub(crate) fn apply_suggested_firewall(
         })
         .unwrap_or(false);
     if auto_accept {
-        let config = firewall.replace_network_rules(network_name, rules);
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, network = network_name, "failed to persist firewall config");
-        }
+        firewall.replace_network_rules(network_name, rules, |config| {
+            if let Err(e) = firewall::save_firewall(config) {
+                tracing::warn!(error = %e, network = network_name, "failed to persist firewall config");
+            }
+        });
         state.write().unwrap().pending_suggestions.clear();
         tracing::info!(
             network = network_name,
@@ -271,56 +272,112 @@ fn spawn_self_unpair(
     });
 }
 
+/// A network-key-signed record, already verified: the group blob it names, the
+/// seed peers that can serve it, and when it was authored.
+pub(crate) struct SignedGroupRecord {
+    pub(crate) hash: blake3::Hash,
+    pub(crate) seeds: Vec<EndpointId>,
+    /// The record's author timestamp in microseconds, checked against
+    /// `last_record_timestamp` so a stale copy cannot roll the roster back.
+    pub(crate) timestamp: u64,
+}
+
 /// Reconverge the live network state from the signed pkarr record and apply it
 /// (roster + DNS + suggested firewall). Invoked when a peer sends a `MemberSync`
 /// or `BlobUpdated` *hint*: the hint is only a trigger; the roster/firewall come
 /// exclusively from the network-key-signed record, never from the peer message.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconverge_and_apply(
     endpoint: &Endpoint,
     ctx: &MeshCtx,
     net_pubkey: EndpointId,
     network_name: &str,
     state: &SharedNetworkState,
-    my_identity: EndpointId,
     device_cert: &Option<control::DeviceCert>,
 ) {
-    let MeshCtx {
-        peers,
-        blob_store,
-        firewall,
-        hostname_table,
-        reverse_table,
-        device_user_map,
-        pruned_peers,
-        route_map,
-        registry,
-        ..
-    } = ctx;
-    if !confirm_pending_snapshot_durability(state, blob_store, network_name).await {
+    if !confirm_pending_snapshot_durability(state, &ctx.blob_store, network_name).await {
         tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
         return;
     }
-    let (floor, generation) = {
-        let s = state.read().unwrap();
-        (s.last_record_timestamp, current_group_hash(&s))
-    };
-    let Some((signed, seeds, record_ts)) =
-        resolve_signed(endpoint, &registry.transport.pkarr_relay_url, net_pubkey).await
+    let Some((hash, seeds, timestamp)) = resolve_signed(
+        endpoint,
+        &ctx.registry.transport.pkarr_relay_url,
+        net_pubkey,
+    )
+    .await
     else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
     };
-    if pending_authored_group_hash(state, network_name).is_some_and(|pending| pending != signed) {
-        tracing::debug!(network = %network_name, "reconverge: keeping a durably authored snapshot until its publication is confirmed");
-        return;
+    let record = SignedGroupRecord {
+        hash,
+        seeds,
+        timestamp,
+    };
+    apply_group_record(endpoint, ctx, network_name, state, device_cert, &record).await;
+}
+
+/// Outcome of applying a signed group record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReconvergeOutcome {
+    /// Roster (and suggested firewall) updated from the new blob.
+    Applied,
+    /// We already hold the blob the record names; nothing was fetched.
+    Current,
+    /// The record is no newer than the last one applied, so it was refused.
+    Stale,
+    /// The blob could not be fetched from any peer or seed; nothing changed.
+    Unfetched,
+    /// State changed while the blob was in flight, so its result was discarded.
+    Superseded,
+    /// This node is no longer part of the network (kicked, or its own primary
+    /// nullified this device). The caller should stop polling this network.
+    Departed,
+}
+
+/// Converge on a verified signed record. The one apply routine behind every
+/// source of records: the trigger-driven reconverge, the group poller, and the
+/// `SignedRecord` fast path (a coordinator hands a reconnecting member the
+/// current record over the mesh). Each used to carry its own copy, and the copies
+/// drifted: one skipped DNS and routes, one skipped the timestamp floor, one
+/// missed our own removal.
+///
+/// The hash always comes from a network-key-signed record; the blob itself is
+/// verified in `fetch_verified_blob`.
+pub(crate) async fn apply_group_record(
+    endpoint: &Endpoint,
+    ctx: &MeshCtx,
+    network_name: &str,
+    state: &SharedNetworkState,
+    device_cert: &Option<control::DeviceCert>,
+    record: &SignedGroupRecord,
+) -> ReconvergeOutcome {
+    let blob_store = &ctx.blob_store;
+    let registry = &ctx.registry;
+    let my_identity = ctx.identity.local_identity();
+    if !confirm_pending_snapshot_durability(state, blob_store, network_name).await {
+        tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
+        return ReconvergeOutcome::Superseded;
     }
-    if !state.read().unwrap().needs_reconverge(signed) {
+    if pending_authored_group_hash(state, network_name)
+        .is_some_and(|pending| pending != record.hash)
+    {
+        tracing::debug!(network = %network_name, "reconverge: keeping a durably authored snapshot until its publication is confirmed");
+        return ReconvergeOutcome::Superseded;
+    }
+    let (needs_reconverge, floor, generation) = {
+        let s = state.read().unwrap();
+        (
+            s.needs_reconverge(record.hash),
+            s.last_record_timestamp,
+            current_group_hash(&s),
+        )
+    };
+    if !needs_reconverge {
         // A prior apply may have reached live state while its config write failed.
         // Retry the durable pointer even though no blob reconvergence is needed;
         // the stored verified bytes make this safe and stale pointers stay
         // unpublishable in the meantime.
-        persist_group_hash_if_needed(state, blob_store, network_name, signed, true).await;
+        persist_group_hash_if_needed(state, blob_store, network_name, record.hash, true).await;
         // Already converged on the signed hash. Even so, check whether we have
         // been nullified in the blob we already hold (e.g. we applied it while
         // still offline-blocked from ever receiving the primary's notice): if so,
@@ -334,7 +391,7 @@ pub(crate) async fn reconverge_and_apply(
             && self_is_nullified(cert, &roster, &nullifiers)
         {
             spawn_self_unpair(registry, network_name, cert.clone());
-            return;
+            return ReconvergeOutcome::Departed;
         }
         drain_pending_rename(&roster, network_name, my_identity, device_cert, registry).await;
         // Re-sync the exit-offer flag on this path too. An offer broadcast can
@@ -343,39 +400,91 @@ pub(crate) async fn reconverge_and_apply(
         // so the apply path below would never run and the offer would stay
         // invisible forever. Quiet no-op when the flag already matches.
         registry.sync_exit_offers().await;
-        return;
+        return ReconvergeOutcome::Current;
     }
     // The record names a different blob than we hold. Take it only if it was
-    // authored after the last one we applied: the DHT can serve a copy older than
-    // the record a coordinator already handed us over the mesh, and applying that
-    // would undo the roster rather than update it.
-    if !record_is_newer(record_ts, floor) {
+    // authored after the last one we applied: the DHT (or a peer replaying an
+    // old record over the mesh) can serve a copy older than the record we
+    // already applied, and applying that would undo the roster rather than
+    // update it.
+    if !record_is_newer(record.timestamp, floor) {
         tracing::debug!(
             network = %network_name,
-            record_ts,
+            record_ts = record.timestamp,
             floor,
-            "reconverge: DHT served a record older than the last applied; keeping ours"
+            "reconverge: refusing a signed record older than the last applied"
         );
-        return;
+        return ReconvergeOutcome::Stale;
     }
-    let Some(data) =
-        fetch_verified_blob(endpoint, blob_store, peers, signed, network_name, &seeds).await
+    // Fetch from any connected peer *or* the record's seed peers. The seeds
+    // matter: a node that has been isolated (e.g. an unpaired device the
+    // coordinator already severed) has no connected peers, so a connected-only
+    // fetch could never discover its own removal or nullification.
+    let Some(data) = fetch_verified_blob(
+        endpoint,
+        blob_store,
+        &ctx.peers,
+        record.hash,
+        network_name,
+        &record.seeds,
+    )
+    .await
     else {
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
-        return;
+        return ReconvergeOutcome::Unfetched;
     };
+    commit_group_blob(
+        ctx,
+        network_name,
+        state,
+        device_cert,
+        record,
+        generation,
+        data,
+    )
+    .await
+}
+
+/// Apply a fetched, verified blob for `record`: the half of
+/// [`apply_group_record`] after the network fetch. `generation` is the live
+/// group hash read before the fetch, so a mutation that landed meanwhile
+/// discards this result instead of being overwritten by it.
+async fn commit_group_blob(
+    ctx: &MeshCtx,
+    network_name: &str,
+    state: &SharedNetworkState,
+    device_cert: &Option<control::DeviceCert>,
+    record: &SignedGroupRecord,
+    generation: blake3::Hash,
+    data: crate::membership::GroupBlob,
+) -> ReconvergeOutcome {
+    let MeshCtx {
+        peers,
+        blob_store,
+        firewall,
+        hostname_table,
+        reverse_table,
+        device_user_map,
+        pruned_peers,
+        route_map,
+        registry,
+        ..
+    } = ctx;
+    let my_identity = ctx.identity.local_identity();
     // Self-unpair: if our own device cert is nullified in this (verified, signed)
     // blob and the blob is coordinated by our *own* primary, the primary has
     // revoked this device. Tear ourselves out (delete the cert + leave every
     // network) even if the primary's notice has not reached us yet (e.g. we
-    // were offline at unpair time). This rides the signed blob the group
-    // poller already fetches, so it needs no live mesh link. The
-    // own-primary-coordinator gate stops a foreign network's coordinator from
-    // forcing a global deauth by listing our key.
+    // were offline at unpair time). The own-primary-coordinator gate stops a
+    // foreign network's coordinator from forcing a global deauth by listing our
+    // key. See `self_is_nullified`.
     let nullified = device_cert
         .as_ref()
         .filter(|cert| self_is_nullified(cert, &data.members, &data.nullifiers))
         .cloned();
+    let self_removed = !data.members.iter().any(|m| m.identity == my_identity)
+        && !data.approved.iter().any(|a| a.identity == my_identity);
+
     let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let commit_guard = commit.lock().await;
     // A local author may have refreshed live state before its blob and recovery
@@ -383,11 +492,13 @@ pub(crate) async fn reconverge_and_apply(
     // under the same commit lock before an older signed record can replace it.
     if state.read().unwrap().unconfirmed_durable_hash.is_some() {
         tracing::debug!(network = %network_name, "reconverge: local snapshot durability became pending while fetching");
-        return;
+        return ReconvergeOutcome::Superseded;
     }
-    if pending_authored_group_hash(state, network_name).is_some_and(|pending| pending != signed) {
+    if pending_authored_group_hash(state, network_name)
+        .is_some_and(|pending| pending != record.hash)
+    {
         tracing::debug!(network = %network_name, "reconverge: keeping a durably authored snapshot until its publication is confirmed");
-        return;
+        return ReconvergeOutcome::Superseded;
     }
     // No tiebreak: an address is blake3 of the identity, so two coordinators
     // admitting concurrently cannot produce a roster with duplicate addresses.
@@ -396,24 +507,58 @@ pub(crate) async fn reconverge_and_apply(
     let roster = {
         let mut s = state.write().unwrap();
         if s.destroyed {
-            return;
+            return ReconvergeOutcome::Departed;
         }
         if current_group_hash(&s) != generation {
             tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
-            return;
+            return ReconvergeOutcome::Superseded;
+        }
+        // Another path may have applied a newer record while this fetch was in
+        // flight without changing the generation (it named the blob we hold).
+        if !record_is_newer(record.timestamp, s.last_record_timestamp) {
+            return ReconvergeOutcome::Superseded;
         }
         if let Some(cert) = nullified {
             drop(s);
             spawn_self_unpair(registry, network_name, cert);
-            return;
+            return ReconvergeOutcome::Departed;
+        }
+        if self_removed {
+            drop(s);
+            tracing::warn!(network = %network_name, "we have been removed from the network");
+            // Run cleanup on a task of its own. Teardown cancels and awaits
+            // every network task, possibly including the one running this.
+            let registry = Arc::clone(registry);
+            let network_name = network_name.to_owned();
+            tokio::spawn(async move {
+                registry.remove_kicked_network(&network_name).await;
+            });
+            return ReconvergeOutcome::Departed;
         }
         // What the network agreed on, which is not our re-encoding of it unless
         // the publisher writes the same bytes we would. See `converged_hash`.
-        adopt_blob(&mut s, data, signed);
-        s.last_record_timestamp = Some(record_ts);
+        adopt_blob(&mut s, data, record.hash);
+        // Only now: a record we could not fetch must stay acceptable to the
+        // next attempt.
+        s.last_record_timestamp = Some(record.timestamp);
         s.roster()
     };
-    persist_group_hash_locked(state, blob_store, network_name, signed, true).await;
+    // Drop any live connection to a peer the signed roster no longer lists (it was
+    // kicked, or left while we were offline). Removing it from the roster alone
+    // stops us *routing* to it, but the peer reader keeps injecting its inbound
+    // datagrams until the connection closes, so close it. This is the security
+    // boundary: the kicked device does not have to receive or honor a message.
+    // We record the peer in `pruned_peers` first: closing wakes our own reconnect
+    // loop, which would otherwise re-dial the peer (it still lists us).
+    prune_departed_peers(
+        peers,
+        device_user_map,
+        pruned_peers,
+        state,
+        network_name,
+        my_identity,
+    );
+    persist_group_hash_locked(state, blob_store, network_name, record.hash, true).await;
     drop(commit_guard);
     apply_roster_to_dns(
         &roster,
@@ -424,20 +569,6 @@ pub(crate) async fn reconverge_and_apply(
         route_map,
     )
     .await;
-    // Drop any live connection to a peer the signed roster no longer lists (it was
-    // kicked, or left while we were offline). Removing it from the roster alone
-    // stops us *routing* to it, but the peer reader keeps injecting its inbound
-    // datagrams until the connection closes, so close it. We record the peer in
-    // `pruned_peers` first: closing wakes our own reconnect loop, which would
-    // otherwise re-dial the peer (it still lists us) and re-form the link.
-    prune_departed_peers(
-        peers,
-        device_user_map,
-        pruned_peers,
-        state,
-        network_name,
-        my_identity,
-    );
     apply_suggested_firewall(firewall, my_identity, network_name, state);
     // The mirror of the prune: a peer we are already connected to that this roster
     // now lists, but whose connection never got registered for this network.
@@ -445,15 +576,16 @@ pub(crate) async fn reconverge_and_apply(
     // If a local rename is still unconfirmed by this just-applied blob, keep
     // delivering it to the coordinator set until it lands.
     drain_pending_rename(&roster, network_name, my_identity, device_cert, registry).await;
-    // Re-advertise the exit offer if the fresh roster disagrees with what we
-    // actually offer. This is the retry that makes the offer survive a missed
-    // broadcast: reconverges run exactly when a connection (re)forms (the
-    // "reconnected" trigger), so a sync here reaches a live coordinator, unlike
-    // the activation-time one, which can fire before any network is connected
-    // and go to zero peers. Quiet no-op when the flag already matches.
+    // Exit-node reconciliation. The fresh roster may have wiped our advertised
+    // offer (a coordinator rebuild) or missed one made while every coordinator was
+    // offline: re-sync the flag with what we actually offer. And it may carry the
+    // exit peer a pending client selection has been waiting on since boot, or a
+    // changed capability claim from the gateway a live tunnel already points at:
+    // nudge the daemon to re-run the exit reconcile. Quiet no-ops otherwise.
     registry.sync_exit_offers().await;
     registry.nudge_exit_reapply();
     tracing::info!(network = %network_name, "reconverged from signed record");
+    ReconvergeOutcome::Applied
 }
 
 /// Whether this device's own cert has been nullified by its **own primary** in a
@@ -681,13 +813,7 @@ pub(crate) fn spawn_group_poller(
     network_name: String,
     token: CancellationToken,
 ) -> JoinHandle<()> {
-    let MeshCtx {
-        peers,
-        blob_store,
-        firewall: fw,
-        registry,
-        ..
-    } = ctx;
+    let registry = Arc::clone(&ctx.registry);
     tokio::spawn(async move {
         // `interval` fires its first tick immediately, so the poller does an
         // at-start resolve (catching a blob that changed while we were offline or
@@ -727,221 +853,46 @@ pub(crate) fn spawn_group_poller(
                 registry.schedule_destruction(&network_name, packet);
                 break;
             }
-            let (remote_hash, seed_peers) = match dht::decode_network_record(&packet) {
+            let timestamp = packet.timestamp().as_micros();
+            let (hash, seeds) = match dht::decode_network_record(&packet) {
                 Ok(record) => record,
                 Err(error) => {
                     tracing::debug!(%error, "invalid group record");
                     continue;
                 }
             };
-
-            if pending_authored_group_hash(&state, &network_name)
-                .is_some_and(|pending| pending != remote_hash)
-            {
-                tracing::debug!(network = %network_name, "group poll: keeping a durably authored snapshot until its publication is confirmed");
-                continue;
-            }
-
-            // Through the same method as the trigger-driven path, so the two
-            // cannot answer "have we converged on this record" differently. They
-            // did: this one open-coded the comparison against the snapshot hash,
-            // our own re-encoding, and was missed when the other moved off it.
-            // This is the hotter of the two and has no timestamp floor to damp it,
-            // so a member whose bytes differ from the publisher's refetched the
-            // whole roster, re-materialized the suggested firewall and nudged the
-            // exit reconcile once a minute, forever.
-            let (needs_reconverge, current_hash) = {
-                let s = state.read().unwrap();
-                (s.needs_reconverge(remote_hash), s.converged_hash)
+            let record = SignedGroupRecord {
+                hash,
+                seeds,
+                timestamp,
             };
-            if !needs_reconverge {
-                persist_group_hash_if_needed(&state, &blob_store, &network_name, remote_hash, true)
-                    .await;
-                continue;
-            }
-
-            tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
-
-            if matches!(
-                fetch_and_apply_blob(
-                    &endpoint,
-                    &blob_store,
-                    &peers,
-                    &fw,
-                    &registry,
-                    &state,
-                    &network_name,
-                    remote_hash,
-                    &seed_peers,
-                )
-                .await,
-                ReconvergeOutcome::Departed
-            ) {
+            // Read per tick: the device may have been paired since the poller
+            // started.
+            let device_cert = crate::identity::load_device_cert().ok().flatten();
+            if apply_group_record(
+                &endpoint,
+                &ctx,
+                &network_name,
+                &state,
+                &device_cert,
+                &record,
+            )
+            .await
+                == ReconvergeOutcome::Departed
+            {
                 break;
             }
         }
     })
 }
 
-/// Outcome of applying a verified group blob at `remote_hash`.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReconvergeOutcome {
-    /// Roster (and suggested firewall) updated from the new blob.
-    Applied,
-    /// The blob could not be fetched from any peer or seed; nothing changed.
-    Unfetched,
-    /// State changed while the blob was in flight, so its result was discarded.
-    Superseded,
-    /// This node is no longer part of the network (kicked, or its own primary
-    /// nullified this device). The caller should stop polling this network.
-    Departed,
-}
-
-/// Fetch the verified group blob for `remote_hash` (from any connected peer or the
-/// record's seed peers) and apply it: honor a self-nullification, prune removed
-/// peers, detect our own removal, and refresh the roster + suggested firewall.
-///
-/// Shared by the group poller and the `SignedRecord` fast path (a coordinator
-/// hands a reconnecting member the current signed record over the mesh), so both
-/// converge through identical, verified logic. The hash always arrives from a
-/// network-key-signed record; the blob itself is verified in `fetch_verified_blob`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn fetch_and_apply_blob(
-    endpoint: &Endpoint,
-    blob_store: &FsStore,
-    peers: &PeerTable,
-    fw: &SharedFirewall,
-    registry: &Arc<NetworkRegistry>,
-    state: &SharedNetworkState,
-    network_name: &str,
-    remote_hash: blake3::Hash,
-    seed_peers: &[EndpointId],
-) -> ReconvergeOutcome {
-    if !confirm_pending_snapshot_durability(state, blob_store, network_name).await {
-        tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
-        return ReconvergeOutcome::Superseded;
-    }
-    if pending_authored_group_hash(state, network_name)
-        .is_some_and(|pending| pending != remote_hash)
-    {
-        tracing::debug!(network = %network_name, "reconverge: refusing to replace a pending authored snapshot with an older published record");
-        return ReconvergeOutcome::Superseded;
-    }
-    let generation = current_group_hash(&state.read().unwrap());
-    // Fetch the verified blob from any connected peer *or* the record's seed
-    // peers. Including the seeds is essential: a node that has been isolated
-    // (e.g. an unpaired device the coordinator already severed) has no connected
-    // peers, so a connected-only fetch could never discover its own
-    // removal/nullification.
-    let Some(data) = fetch_verified_blob(
-        endpoint,
-        blob_store,
-        peers,
-        remote_hash,
-        network_name,
-        seed_peers,
-    )
-    .await
-    else {
-        tracing::warn!("could not fetch updated group blob from any peer");
-        return ReconvergeOutcome::Unfetched;
-    };
-
-    // Self-unpair: our own primary listed this device in the signed blob's
-    // nullifiers (`ray unpair`). Tear ourselves out even though we never
-    // received the primary's notice (we were offline/severed). Rides the
-    // signed blob, so it needs no live mesh link. See `self_is_nullified`.
-    let nullified = crate::identity::load_device_cert()
-        .ok()
-        .flatten()
-        .filter(|cert| self_is_nullified(cert, &data.members, &data.nullifiers));
-
-    let new_member_ids: std::collections::HashSet<EndpointId> =
-        data.members.iter().map(|m| m.identity).collect();
-    let my_id = endpoint.id();
-    let self_removed =
-        !new_member_ids.contains(&my_id) && !data.approved.iter().any(|a| a.identity == my_id);
-
-    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
-    let commit_guard = commit.lock().await;
-    // The live generation can become durable after the optimistic check above
-    // but before this lock is acquired. Once its pending pointer exists, an older
-    // signed record must not roll it back.
-    if state.read().unwrap().unconfirmed_durable_hash.is_some() {
-        tracing::debug!(network = %network_name, "reconverge: local snapshot durability became pending while fetching");
-        return ReconvergeOutcome::Superseded;
-    }
-    if pending_authored_group_hash(state, network_name)
-        .is_some_and(|pending| pending != remote_hash)
-    {
-        tracing::debug!(network = %network_name, "reconverge: refusing to replace a pending authored snapshot with an older published record");
-        return ReconvergeOutcome::Superseded;
-    }
-    // Revalidate and replace under one write guard so a mutation cannot land in
-    // the gap and then be overwritten by this fetched state.
-    {
-        let mut s = state.write().unwrap();
-        if s.destroyed {
-            return ReconvergeOutcome::Departed;
-        }
-        if current_group_hash(&s) != generation {
-            tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
-            return ReconvergeOutcome::Superseded;
-        }
-        if let Some(cert) = nullified {
-            drop(s);
-            spawn_self_unpair(registry, network_name, cert);
-            return ReconvergeOutcome::Departed;
-        }
-        if self_removed {
-            drop(s);
-            tracing::warn!(network = %network_name, "we have been removed from the network");
-            // Run cleanup outside this network's poller. Teardown cancels and
-            // awaits every network task, including the task currently returning
-            // from this function.
-            let registry = Arc::clone(registry);
-            let network_name = network_name.to_owned();
-            tokio::spawn(async move {
-                registry.remove_kicked_network(&network_name).await;
-            });
-            return ReconvergeOutcome::Departed;
-        }
-        // The hash the network agreed on, not our re-encoding of it. See
-        // `converged_hash`.
-        adopt_blob(&mut s, data, remote_hash);
-    }
-
-    // Revoke the removed peer's network route immediately. If this was the last
-    // network shared over the transport, close it as well. This is the security
-    // boundary: the kicked device does not have to receive or honor a message.
-    prune_departed_peers(
-        peers,
-        &registry.device_user_map,
-        &registry.pruned_peers,
-        state,
-        network_name,
-        my_id,
-    );
-
-    persist_group_hash_locked(state, blob_store, network_name, remote_hash, true).await;
-    drop(commit_guard);
-    apply_suggested_firewall(fw, endpoint.id(), network_name, state);
-
-    // Exit-node reconciliation. The fresh roster may have wiped our advertised
-    // offer (a coordinator rebuild) or missed one made while every coordinator was
-    // offline: re-sync the flag with what we actually offer. And it may carry the
-    // exit peer a pending client selection has been waiting on since boot, or a
-    // changed capability claim from the gateway a live tunnel already points at:
-    // nudge the daemon to re-run the exit reconcile rather than leaking traffic
-    // until the next `ray up`. All cheap no-ops otherwise.
-    registry.sync_exit_offers().await;
-    registry.nudge_exit_reapply();
-    ReconvergeOutcome::Applied
-}
-
 /// Current Unix time in seconds. Reusable-key expiry uses wall-clock time (the
 /// same convention as the single-use invite ledger).
 pub(crate) use crate::membership::now_secs;
+
+// `pub(super)`: the accept tests drive the fast path through its fixture.
+#[cfg(test)]
+pub(in crate::daemon::mesh) mod apply_tests;
 
 #[cfg(test)]
 mod reconverge_tests {
