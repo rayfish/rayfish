@@ -230,7 +230,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallState {
             default_inbound,
             default_outbound,
@@ -451,7 +451,7 @@ pub(crate) async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallSshState {
             enabled,
             port,

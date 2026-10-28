@@ -258,7 +258,7 @@ pub(crate) async fn ipc_connect(peer: &str, hostname: Option<String>) -> Result<
     )
     .await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::Joined { name, my_ipv6, .. } => {
             println!(
                 "  {} connected — direct network {} ({})",
@@ -409,7 +409,7 @@ pub(crate) async fn ipc_admin(network: &str, action: AdminAction) -> Result<()> 
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, req).await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::AdminListResponse { admins } => {
             printout(&AdminsOutput(
                 admins

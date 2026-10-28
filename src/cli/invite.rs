@@ -154,7 +154,7 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
         ipc::IpcMessage::InviteListResponse { invites } => {
             printout(&InviteListOutput::from(invites.as_slice()))?
         }
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }

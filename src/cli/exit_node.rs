@@ -78,7 +78,7 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::ExitNodeState { networks } => printout(&ExitNodeOutput::new(&networks))?,
         ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
         other => fail_unexpected(&other),

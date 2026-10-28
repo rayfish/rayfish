@@ -440,9 +440,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             let resp = ipc::recv(&mut stream).await?;
             spinner.finish_and_clear();
             match resp {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -452,9 +450,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             // drops the entry and answers.
             ipc::send(&mut stream, ipc::IpcMessage::RejectFile { id }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -462,9 +458,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         Some(FilesAction::Cancel { id }) => {
             ipc::send(&mut stream, ipc::IpcMessage::CancelSend { id }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -472,9 +466,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         Some(FilesAction::CancelTransfer { id }) => {
             ipc::send(&mut stream, ipc::IpcMessage::CancelTransfer { id }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message))
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -494,9 +486,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             .await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
