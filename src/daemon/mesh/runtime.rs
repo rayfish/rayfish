@@ -1125,7 +1125,7 @@ impl NetworkRegistry {
             let name = pending.name.clone();
             tokio::spawn(async move {
                 let _ = me
-                    .join_network(&key, name.as_deref(), None, None, None, false, false)
+                    .join_network(&key, name.as_deref(), None, None, None, false, false, None)
                     .await;
             });
         }

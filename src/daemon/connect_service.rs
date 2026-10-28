@@ -307,6 +307,7 @@ impl ConnectService {
                 Some(coordinator),
                 false,
                 false,
+                None,
             )
             .await;
         if let IpcMessage::Joined { name, .. } = &resp {

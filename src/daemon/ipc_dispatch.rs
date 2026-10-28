@@ -462,28 +462,42 @@ impl Daemon {
                 mode,
                 name,
                 hostname,
-                transport: _,
-            } => self.create_network(mode, name, hostname).await,
+                transport,
+            } => {
+                if let Err(e) = ensure_transport_supported(transport.as_ref()) {
+                    return ipc_err(format!("{e:#}"));
+                }
+                let resp = self.create_network(mode, name, hostname).await;
+                if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
+                    return ipc_err(format!("created, but could not save the transport: {e:#}"));
+                }
+                resp
+            }
             IpcMessage::Join {
                 network_key,
                 name,
                 hostname,
-                transport: _,
+                transport,
                 invite,
                 coordinator,
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
-                self.join_network(
-                    &network_key,
-                    name.as_deref(),
-                    hostname,
-                    invite,
-                    coordinator,
-                    auto_accept_firewall,
-                    auto_accept_files,
-                )
-                .await
+                if let Err(e) = ensure_transport_supported(transport.as_ref()) {
+                    return ipc_err(format!("{e:#}"));
+                }
+                self.registry
+                    .join_network(
+                        &network_key,
+                        name.as_deref(),
+                        hostname,
+                        invite,
+                        coordinator,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                        transport,
+                    )
+                    .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::RenameNetwork { network, new_name } => {

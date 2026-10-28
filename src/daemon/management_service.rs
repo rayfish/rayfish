@@ -1205,6 +1205,7 @@ impl ManagementService {
                         Some(coordinator),
                         auto_accept_firewall,
                         auto_accept_files,
+                        None,
                     )
                     .await
                 {
