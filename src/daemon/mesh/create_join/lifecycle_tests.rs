@@ -483,6 +483,40 @@ async fn a_warm_resumed_member_reconverges_on_a_trigger() {
     daemon.shutdown_and_close().await;
 }
 
+/// A warm resume gives up its claim on the name while the record it checks
+/// the mesh version against is unreadable. It used to hold the claim until the
+/// record was read, so on an offline boot `ray network rename` was refused as
+/// "still being restored" for as long as the boot stayed offline.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resume_releases_its_claim_while_the_record_is_unreadable() {
+    let _config = ConfigDir::new();
+    // Every lookup is a 404, so the version check keeps retrying.
+    let mut lookups = watching_relay().await;
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let key = SecretKey::generate().public();
+    cache_member_network(&registry, "home", key, &[]).await;
+
+    let restore = registry
+        .spawn_member_restore(&config::load_network("home").unwrap().unwrap())
+        .unwrap();
+    // One lookup is the group poller's first, the other the version check's.
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(10), lookups.recv())
+            .await
+            .expect("the record is looked up")
+            .unwrap();
+    }
+    assert!(registry.networks.contains_key("home"));
+    assert!(
+        registry.claim_registration("home").is_some(),
+        "the name is free while the version check retries"
+    );
+    daemon.shutdown_and_close().await;
+    restore.await.unwrap();
+}
+
 /// A warm resume marks a network whose record advertises a mesh version this
 /// build does not speak, as the cold restore of the same record does. It used
 /// to register it as healthy: `ray status` showed a network no peer on it could

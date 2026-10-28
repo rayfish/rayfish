@@ -15,6 +15,7 @@ use tokio::sync::MutexGuard as AsyncMutexGuard;
 #[cfg(target_os = "linux")]
 use tokio::time::MissedTickBehavior;
 
+use super::super::network_registry::RegistrationClaim;
 use super::create_join::{RestoredGroupBlob, mesh_version_is_speakable};
 
 /// How long `ray exit-node use` waits for the exit peer to answer through the
@@ -737,36 +738,48 @@ impl NetworkRegistry {
     /// showed it inactive, and only a manual `ray restart` brought it back. So
     /// retry with backoff until the join lands, the network is gone from the
     /// config (leave/nuke), or the daemon shuts down.
-    async fn restore_member_network(self: Arc<Self>, saved: SavedMemberNetwork) {
+    ///
+    /// `claim` is this loop's hold on the name. A warm resume registers the
+    /// network at once, so it gives the claim up before checking the record's
+    /// mesh version: an offline boot can leave that record unreadable for as
+    /// long as it lasts, and `ray network rename` is refused while the name is
+    /// claimed.
+    async fn restore_member_network(
+        self: Arc<Self>,
+        saved: SavedMemberNetwork,
+        claim: RegistrationClaim,
+    ) {
         let name = saved.name.as_str();
         let net_pubkey = saved.net_pubkey.as_str();
-        let persisted_hostname = &saved.persisted_hostname;
-        let auto_accept_firewall = saved.auto_accept_firewall;
-        let auto_accept_files = saved.auto_accept_files;
-        let parsed_key = net_pubkey.parse::<EndpointId>();
-        if let Ok(net_public_key) = parsed_key {
+        if let Ok(net_public_key) = net_pubkey.parse::<EndpointId>() {
             match self
                 .warm_resume_member_network(&saved, net_public_key)
                 .await
             {
-                Ok(true) => match self.warm_resume_mismatch(name, net_pubkey).await {
-                    None => {
-                        self.restore_errors.remove(name);
+                Ok(true) => {
+                    drop(claim);
+                    self.restore_errors.remove(name);
+                    let Some(m) = self.warm_resume_mismatch(name, net_pubkey).await else {
                         return;
-                    }
+                    };
                     // Marked like a cold restore of the same record: the loop
-                    // below holds it open until the coordinator republishes.
-                    Some(m) => {
-                        self.restore_errors.insert(
-                            name.to_string(),
-                            format!(
-                                "runs mesh protocol v{}, this build speaks v{}",
-                                m.network, m.ours
-                            ),
-                        );
-                        tracing::warn!(network = %name, network_version = m.network, our_version = m.ours, "warm-resumed member network runs an incompatible mesh protocol version; waiting for the coordinator to republish");
-                    }
-                },
+                    // below holds it open until the coordinator republishes. A
+                    // path that claimed the name meanwhile (a rename) owns it.
+                    self.restore_errors.insert(
+                        name.to_string(),
+                        format!(
+                            "runs mesh protocol v{}, this build speaks v{}",
+                            m.network, m.ours
+                        ),
+                    );
+                    tracing::warn!(network = %name, network_version = m.network, our_version = m.ours, "warm-resumed member network runs an incompatible mesh protocol version; waiting for the coordinator to republish");
+                    let Some(claim) = self.claim_registration(name) else {
+                        return;
+                    };
+                    self.member_restore_loop(&saved).await;
+                    drop(claim);
+                    return;
+                }
                 Ok(false) => {}
                 Err(e) => {
                     // The normal signed-record restore immediately below remains
@@ -776,6 +789,18 @@ impl NetworkRegistry {
                 }
             }
         }
+        self.member_restore_loop(&saved).await;
+        drop(claim);
+    }
+
+    /// The signed-record restore loop of [`Self::restore_member_network`], run
+    /// under the caller's claim on the name.
+    async fn member_restore_loop(self: &Arc<Self>, saved: &SavedMemberNetwork) {
+        let name = saved.name.as_str();
+        let net_pubkey = saved.net_pubkey.as_str();
+        let persisted_hostname = &saved.persisted_hostname;
+        let auto_accept_firewall = saved.auto_accept_firewall;
+        let auto_accept_files = saved.auto_accept_files;
         let mut delay = RESTORE_RETRY_MIN;
         let mut attempt: u32 = 0;
         loop {
@@ -1022,8 +1047,7 @@ impl NetworkRegistry {
             cached_is_published: net.last_group_hash_published,
         };
         Some(tokio::spawn(async move {
-            Arc::clone(&me).restore_member_network(saved).await;
-            drop(claim);
+            Arc::clone(&me).restore_member_network(saved, claim).await;
         }))
     }
 
