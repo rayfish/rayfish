@@ -60,7 +60,13 @@ fn save_in(dir: &Path, packet: &SignedPacket, key: Option<&SecretKey>) -> Result
 }
 
 pub(crate) fn all() -> Result<Vec<SignedPacket>> {
-    let dir = super::config_dir_for_read()?.join(DIRECTORY);
+    all_in(&super::config_dir_for_read()?)
+}
+
+/// Every saved proof and index under `dir`. One unreadable or invalid file is
+/// skipped with a warning: it must not stop the others from being republished.
+fn all_in(dir: &Path) -> Result<Vec<SignedPacket>> {
+    let dir = dir.join(DIRECTORY);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -68,7 +74,13 @@ pub(crate) fn all() -> Result<Vec<SignedPacket>> {
     };
     let mut packets = Vec::new();
     for entry in entries {
-        let path = entry?.path();
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                tracing::warn!(%error, "skipping an unreadable destruction proof entry");
+                continue;
+            }
+        };
         if path
             .extension()
             .is_none_or(|e| e != "pkarr" && e != "index")
@@ -82,18 +94,31 @@ pub(crate) fn all() -> Result<Vec<SignedPacket>> {
         else {
             continue;
         };
-        let packet = SignedPacket::from_bytes(&fs::read(&path)?)?;
-        if path.extension().is_some_and(|e| e == "index") {
-            destruction::decode_index(&packet, network)?;
-        } else {
-            ensure!(
-                packet.public_key() == network && destruction::is_destroyed(&packet),
-                "invalid saved destruction proof"
-            );
+        match read_saved(&path, network) {
+            Ok(packet) => packets.push(packet),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "skipping an invalid destruction proof"
+                );
+            }
         }
-        packets.push(packet);
     }
     Ok(packets)
+}
+
+fn read_saved(path: &Path, network: EndpointId) -> Result<SignedPacket> {
+    let packet = SignedPacket::from_bytes(&fs::read(path)?)?;
+    if path.extension().is_some_and(|e| e == "index") {
+        destruction::decode_index(&packet, network)?;
+    } else {
+        ensure!(
+            packet.public_key() == network && destruction::is_destroyed(&packet),
+            "invalid saved destruction proof"
+        );
+    }
+    Ok(packet)
 }
 
 #[cfg(test)]
@@ -118,5 +143,24 @@ mod tests {
         let live = dht::encode_network_record(&key, &blake3::hash(b"roster"), &[]).unwrap();
         assert!(save_in(dir.path(), &live, None).is_err());
         assert!(load_in(dir.path(), key.public()).unwrap().is_some());
+    }
+
+    #[test]
+    fn one_bad_file_does_not_hide_the_other_proofs() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SecretKey::from([8; 32]);
+        let record = destruction::encode(&key).unwrap();
+        save_in(dir.path(), &record, None).unwrap();
+        let other = SecretKey::from([9; 32]).public();
+        fs::write(
+            dir.path().join(DIRECTORY).join(format!("{other}.pkarr")),
+            b"not a packet",
+        )
+        .unwrap();
+
+        let packets = all_in(dir.path()).unwrap();
+
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].as_bytes(), record.as_bytes());
     }
 }
