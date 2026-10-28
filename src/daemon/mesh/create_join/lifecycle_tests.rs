@@ -106,3 +106,87 @@ async fn startup_drops_a_pending_join_for_a_live_network() {
     assert!(config::load().unwrap().pending_joins.is_empty());
     daemon.shutdown_and_close().await;
 }
+
+/// Discovery pointed at a port nothing listens on, so a publisher fails fast
+/// instead of reaching a public relay.
+fn offline_discovery() {
+    config::update_settings(|cfg| {
+        cfg.mdns_enabled = false;
+        cfg.discovery_dns = config::ServerOverride {
+            servers: vec!["http://127.0.0.1:1/pkarr".into()],
+            replace: true,
+        };
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn roster_row(identity: EndpointId, is_coordinator: bool, last_seen: Option<u64>) -> Member {
+    Member {
+        identity,
+        is_coordinator,
+        hostname: None,
+        user_identity: None,
+        device_cert: None,
+        last_seen,
+        exit_node: false,
+        exit_families: ExitFamilies::Unknown,
+    }
+}
+
+/// A member promoted by an admin grant coordinates from then on, so it runs
+/// what every coordinator runs. Promotion used to start only the publisher:
+/// an ephemeral network that lost its original coordinator kept offline
+/// members forever.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_promoted_member_prunes_stale_members() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let network_key = SecretKey::generate();
+    let me = registry.transport.identity.local_identity();
+    let stale = SecretKey::generate().public();
+    config::save_network(&config::NetworkConfig {
+        network_public_key: Some(network_key.public()),
+        ephemeral_ttl_secs: Some(3_600),
+        ..config::empty_network_config("home")
+    })
+    .unwrap();
+    hold_live(&registry, "home", network_key.public());
+    let state = Arc::clone(&registry.networks.get("home").unwrap().state);
+    {
+        let mut state = state.write().unwrap();
+        state.members.add(roster_row(me, true, None));
+        state.members.add(roster_row(stale, false, Some(1)));
+        state.network_secret_key = Some(network_key.clone());
+        state.refresh_snapshot();
+    }
+    let client = dht::create_pkarr_client(
+        &registry.transport.endpoint,
+        &registry.transport.pkarr_relay_url,
+    )
+    .unwrap();
+
+    // The pruner needs no transport. Stopping it first keeps the endpoint's
+    // own timers from spinning once the clock is paused.
+    daemon.shutdown_and_close().await;
+    tokio::time::pause();
+    assert!(registry.promote_to_coordinator(&registry.mesh_ctx(), "home", network_key, client));
+    // The pruner's first sweep runs a minute after it starts. Advance the
+    // clock by hand: auto-advance waits on blocking-pool work in real time.
+    // Let the pruner start its timer first, or the advance happens before it.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let mut polls = 0;
+    while state.read().unwrap().members.get(&stale).is_some() {
+        polls += 1;
+        assert!(
+            polls < 10_000,
+            "the promoted coordinator prunes a member offline past the TTL"
+        );
+        tokio::task::yield_now().await;
+    }
+    registry.networks.get("home").unwrap().cancel.cancel();
+}

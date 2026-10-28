@@ -1573,32 +1573,19 @@ impl NetworkRegistry {
         cancel: &CancellationToken,
         initially_published: Option<blake3::Hash>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut tasks = Vec::new();
-
-        if let Ok(pkarr_client) =
+        let pkarr_client =
             dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-        {
-            tasks.push(spawn_network_publisher(
-                pkarr_client,
-                net_secret_key.clone(),
-                Arc::clone(state),
-                Arc::clone(&ctx.registry),
-                name.to_string(),
-                initially_published,
-                Arc::clone(dht_notify),
-                cancel.clone(),
-            ));
-        }
-
-        tasks.push(spawn_stale_member_pruner(
-            ctx.clone(),
-            name.to_string(),
-            Arc::clone(state),
-            Some(Arc::clone(dht_notify)),
-            cancel.clone(),
-        ));
-
-        tasks
+                .ok();
+        coordinator_tasks(
+            pkarr_client,
+            ctx,
+            name,
+            net_secret_key,
+            state,
+            dht_notify,
+            cancel,
+            initially_published,
+        )
     }
 
     /// Store a network's current blob snapshot, persist its recovery pointer,
@@ -1864,17 +1851,17 @@ impl NetworkRegistry {
                 return false;
             }
             notify = Arc::new(Notify::new());
-            let publisher = spawn_network_publisher(
-                pkarr_client,
-                key,
-                Arc::clone(&handle.state),
-                Arc::clone(&ctx.registry),
-                network.to_string(),
+            let tasks = coordinator_tasks(
+                Some(pkarr_client),
+                ctx,
+                network,
+                &key,
+                &handle.state,
+                &notify,
+                &handle.cancel,
                 None,
-                Arc::clone(&notify),
-                handle.cancel.clone(),
             );
-            handle.tasks.push(publisher);
+            handle.tasks.extend(tasks);
             handle.dht_notify = Some(Arc::clone(&notify));
             handle.role = NetworkRole::Coordinator;
             state = Arc::clone(&handle.state);
@@ -2024,6 +2011,44 @@ impl NetworkRegistry {
 fn record_is_published(network: &str) -> bool {
     config::load_network(network)
         .is_ok_and(|net| net.is_none_or(|net| net.last_group_hash_published))
+}
+
+/// Every task a coordinated network runs: the pkarr network publisher (when a
+/// relay client could be built) and the ephemeral stale-member pruner. Shared
+/// by every path that makes a network coordinated, promotion included, so none
+/// of them ends up with only part of the set.
+#[allow(clippy::too_many_arguments)]
+fn coordinator_tasks(
+    pkarr_client: Option<PkarrRelayClient>,
+    ctx: &MeshCtx,
+    name: &str,
+    net_secret_key: &SecretKey,
+    state: &SharedNetworkState,
+    dht_notify: &Arc<Notify>,
+    cancel: &CancellationToken,
+    initially_published: Option<blake3::Hash>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    if let Some(pkarr_client) = pkarr_client {
+        tasks.push(spawn_network_publisher(
+            pkarr_client,
+            net_secret_key.clone(),
+            Arc::clone(state),
+            Arc::clone(&ctx.registry),
+            name.to_string(),
+            initially_published,
+            Arc::clone(dht_notify),
+            cancel.clone(),
+        ));
+    }
+    tasks.push(spawn_stale_member_pruner(
+        ctx.clone(),
+        name.to_string(),
+        Arc::clone(state),
+        Some(Arc::clone(dht_notify)),
+        cancel.clone(),
+    ));
+    tasks
 }
 
 #[cfg(test)]
