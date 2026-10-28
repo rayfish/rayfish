@@ -1346,7 +1346,15 @@ impl Handler for SshHandler {
             session.channel_failure(channel)?;
             return Ok(());
         }
-        let Some(command) = sftp_subsystem_command() else {
+        // `sshd -T` behind it is a child process: keep it off the worker.
+        let command = match tokio::task::spawn_blocking(sftp_subsystem_command).await {
+            Ok(command) => command,
+            Err(e) => {
+                warn!(error = %e, "mesh SSH: sftp server lookup failed");
+                None
+            }
+        };
+        let Some(command) = command else {
             warn!(peer = %self.user.fmt_short(),
                 "mesh SSH: no sftp-server binary found, so scp and sftp cannot work. \
                  Install the OpenSSH sftp server package (openssh-sftp-server on Debian \
