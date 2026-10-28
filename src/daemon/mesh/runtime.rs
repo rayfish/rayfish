@@ -749,10 +749,24 @@ impl NetworkRegistry {
                 .warm_resume_member_network(&saved, net_public_key)
                 .await
             {
-                Ok(true) => {
-                    self.restore_errors.remove(name);
-                    return;
-                }
+                Ok(true) => match self.warm_resume_mismatch(name, net_pubkey).await {
+                    None => {
+                        self.restore_errors.remove(name);
+                        return;
+                    }
+                    // Marked like a cold restore of the same record: the loop
+                    // below holds it open until the coordinator republishes.
+                    Some(m) => {
+                        self.restore_errors.insert(
+                            name.to_string(),
+                            format!(
+                                "runs mesh protocol v{}, this build speaks v{}",
+                                m.network, m.ours
+                            ),
+                        );
+                        tracing::warn!(network = %name, network_version = m.network, our_version = m.ours, "warm-resumed member network runs an incompatible mesh protocol version; waiting for the coordinator to republish");
+                    }
+                },
                 Ok(false) => {}
                 Err(e) => {
                     // The normal signed-record restore immediately below remains
@@ -863,6 +877,42 @@ impl NetworkRegistry {
             match self.after_attempt(name, &mut delay, attempt).await {
                 RestoreNext::Retry => {}
                 RestoreNext::Stop => return,
+            }
+        }
+    }
+
+    /// Check a warm-resumed network's signed record for the mesh version the
+    /// warm path skipped reading, and flag the registration as a cold restore
+    /// would. Retries an unreadable record on the restore backoff: an unknown
+    /// version is not a healthy one. `None` once the record says the version
+    /// is speakable, or when the network is gone or the daemon stops.
+    async fn warm_resume_mismatch(
+        &self,
+        name: &str,
+        net_pubkey: &str,
+    ) -> Option<MeshVersionMismatch> {
+        let ours = transport::MESH_PROTOCOL_VERSION;
+        let mut delay = RESTORE_RETRY_MIN;
+        loop {
+            match self.record_mesh_version(net_pubkey).await {
+                Ok(Some(network)) if !mesh_version_is_speakable(Some(network), ours) => {
+                    let mismatch = MeshVersionMismatch { network, ours };
+                    let mut handle = self.networks.get_mut(name)?;
+                    handle.incompatible = Some(mismatch.clone());
+                    return Some(mismatch);
+                }
+                Ok(_) => return None,
+                Err(e) => {
+                    tracing::debug!(network = %name, error = %e, retry_in = ?delay, "could not read the record of a warm-resumed network, retrying");
+                }
+            }
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return None,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(RESTORE_RETRY_MAX);
+            if !self.networks.contains_key(name) {
+                return None;
             }
         }
     }
@@ -1117,7 +1167,15 @@ impl NetworkRegistry {
 
         // Resume closed-network joins that were still awaiting approval at shutdown.
         for pending in &app_config.pending_joins {
-            if self.networks.contains_key(&pending.network_key) {
+            // `networks` is keyed by name, the pending entry by network key. A
+            // network already live under any name was admitted, so its marker
+            // is stale: drop it rather than queue a join that can only fail.
+            if let Ok(key) = pending.network_key.parse::<EndpointId>()
+                && self.is_live_network_key(key)
+            {
+                if let Err(error) = config::remove_pending_join(&pending.network_key) {
+                    tracing::warn!(%error, "could not remove a stale pending join");
+                }
                 continue;
             }
             let me = Arc::clone(self);

@@ -1,7 +1,9 @@
 //! Network create + join handlers for `Daemon`: `create_network*`, the join
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
+use super::super::network_registry::RegistrationClaim;
 use super::super::*;
+use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 
 /// A cold resume should give every recently known peer an equal chance to win
@@ -219,6 +221,31 @@ fn reconnect_coordinator(
     })
 }
 
+/// What a queued join retries with, kept from the request that queued it.
+struct PendingJoinRetry {
+    key: EndpointId,
+    name: Option<String>,
+    hostname: Option<String>,
+    invite: Option<Vec<u8>>,
+    coordinator: Option<EndpointId>,
+    auto_accept_firewall: bool,
+    auto_accept_files: bool,
+    transport: Option<config::TransportMode>,
+}
+
+/// A network key held in [`NetworkRegistry::pending_join_retries`] while its
+/// retry loop runs. Dropping it releases the key, however the loop ends.
+struct PendingJoinRetryClaim {
+    claims: Arc<DashSet<EndpointId>>,
+    key: EndpointId,
+}
+
+impl Drop for PendingJoinRetryClaim {
+    fn drop(&mut self) {
+        self.claims.remove(&self.key);
+    }
+}
+
 /// A live mesh connection produced by the dial phase: the per-network state cell
 /// plus the cancellation token that `finalize_join` folds into the
 /// `NetworkHandle`.
@@ -372,54 +399,18 @@ impl NetworkRegistry {
                 });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
-                let me = Arc::clone(self);
-                let nk = network_key.to_string();
-                let nm = name.map(|s| s.to_string());
-                tokio::spawn(async move {
-                    let mut backoff = BACKOFF_INITIAL;
-                    loop {
-                        tokio::select! {
-                            _ = me.shutdown_token.cancelled() => return,
-                            _ = tokio::time::sleep(backoff) => {}
-                        }
-                        backoff = (backoff * 2).min(BACKOFF_MAX);
-                        if let Ok(key) = nk.parse::<EndpointId>()
-                            && config::destruction::load(key).ok().flatten().is_some()
-                        {
-                            let _ = config::remove_pending_join(&nk);
-                            return;
-                        }
-                        match me
-                            .join_network_inner(
-                                &nk,
-                                nm.as_deref(),
-                                hostname.clone(),
-                                invite.clone(),
-                                coordinator,
-                                auto_accept_firewall,
-                                auto_accept_files,
-                                true,
-                            )
-                            .await
-                        {
-                            Ok(TryJoin::Joined(resp)) => {
-                                let _ = config::remove_pending_join(&nk);
-                                if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
-                                    tracing::error!(net = %nk, error = %e, "could not save the network transport");
-                                }
-                                tracing::info!(net = %nk, "approval granted - joined");
-                                return;
-                            }
-                            Ok(TryJoin::Pending) => continue,
-                            Err(e) => {
-                                if me.record_join_denial(&nk, &e) {
-                                    return;
-                                }
-                                tracing::warn!(net = %nk, error = %e, "join retry failed");
-                            }
-                        }
-                    }
-                });
+                if let Ok(key) = network_key.parse::<EndpointId>() {
+                    self.spawn_pending_join_retry(PendingJoinRetry {
+                        key,
+                        name: name.map(|s| s.to_string()),
+                        hostname,
+                        invite,
+                        coordinator,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                        transport,
+                    });
+                }
                 IpcMessage::Ok {
                     message: "join request sent - waiting for coordinator approval (run `ray status` to check)"
                         .to_string(),
@@ -430,6 +421,101 @@ impl NetworkRegistry {
                 ipc_err(format!("{e:#}"))
             }
         }
+    }
+
+    /// Start the background retry for a join queued for approval, unless one is
+    /// already running for this network. The loop ends once the network is
+    /// live by any path, when it is destroyed or the join is denied, or at
+    /// shutdown. Returns the loop's handle, or `None` when one already runs.
+    fn spawn_pending_join_retry(
+        self: &Arc<Self>,
+        retry: PendingJoinRetry,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.pending_join_retries.insert(retry.key) {
+            return None;
+        }
+        let claim = PendingJoinRetryClaim {
+            claims: Arc::clone(&self.pending_join_retries),
+            key: retry.key,
+        };
+        let me = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            me.retry_pending_join(retry).await;
+            drop(claim);
+        }))
+    }
+
+    async fn retry_pending_join(self: Arc<Self>, retry: PendingJoinRetry) {
+        let PendingJoinRetry {
+            key,
+            name,
+            hostname,
+            invite,
+            coordinator,
+            auto_accept_firewall,
+            auto_accept_files,
+            transport,
+        } = retry;
+        let nk = key.to_string();
+        let mut backoff = BACKOFF_INITIAL;
+        loop {
+            if self.pending_join_landed(key) {
+                return;
+            }
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+            if config::destruction::load(key).ok().flatten().is_some() {
+                let _ = config::remove_pending_join(&nk);
+                return;
+            }
+            if self.pending_join_landed(key) {
+                return;
+            }
+            match self
+                .join_network_inner(
+                    &nk,
+                    name.as_deref(),
+                    hostname.clone(),
+                    invite.clone(),
+                    coordinator,
+                    auto_accept_firewall,
+                    auto_accept_files,
+                    true,
+                )
+                .await
+            {
+                Ok(TryJoin::Joined(resp)) => {
+                    let _ = config::remove_pending_join(&nk);
+                    if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
+                        tracing::error!(net = %nk, error = %e, "could not save the network transport");
+                    }
+                    tracing::info!(net = %nk, "approval granted - joined");
+                    return;
+                }
+                Ok(TryJoin::Pending) => continue,
+                Err(e) => {
+                    if self.record_join_denial(&nk, &e) {
+                        return;
+                    }
+                    tracing::warn!(net = %nk, error = %e, "join retry failed");
+                }
+            }
+        }
+    }
+
+    /// Whether a queued join's network is live now, by this retry or any other
+    /// path. Drops the restart marker when it is: the join is done.
+    fn pending_join_landed(&self, key: EndpointId) -> bool {
+        if !self.is_live_network_key(key) {
+            return false;
+        }
+        if let Err(error) = config::remove_pending_join(&key.to_string()) {
+            tracing::warn!(%error, "could not remove a landed pending join");
+        }
+        true
     }
 
     /// Record a terminal refusal for status and remove the restart retry marker.
@@ -467,6 +553,13 @@ impl NetworkRegistry {
     ) -> Result<TryJoin> {
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
+        // A fresh join claims its name the way a create or a restore does, and
+        // holds the claim until its handle is registered. A join saves the
+        // network's config before that, and a restore sweep landing in the gap
+        // would otherwise bring up a second live state for the same network. A
+        // restore (`initial == false`) runs under its caller's claim.
+        let mut registration = None;
+
         // A name given with `--name` (or a restore's saved one) is used as is, so
         // it must be free or this network's own: a restore, or a rejoin of a
         // network whose saved config the join then updates.
@@ -482,6 +575,9 @@ impl NetworkRegistry {
                     "network name '{a}' belongs to another network on this node; \
                      choose another --name"
                 ),
+            }
+            if initial {
+                registration = Some(self.claim_join_registration(a)?);
             }
         }
 
@@ -532,6 +628,9 @@ impl NetworkRegistry {
             None => self.unclaimed_network_name(&blob_name, Some(net_pubkey))?,
         };
         let display_name = display_name_owned.as_str();
+        if initial && registration.is_none() {
+            registration = Some(self.claim_join_registration(display_name)?);
+        }
         self.restore_errors.remove(display_name);
 
         if self.networks.contains_key(display_name) {
@@ -585,7 +684,17 @@ impl NetworkRegistry {
             return Ok(TryJoin::Pending);
         };
 
-        self.finalize_join(ctx, &data, mesh).await
+        let joined = self.finalize_join(ctx, &data, mesh).await;
+        drop(registration);
+        joined
+    }
+
+    /// Claim `name` for a fresh join, or refuse while a create, restore or
+    /// another join is bringing it up.
+    fn claim_join_registration(&self, name: &str) -> Result<RegistrationClaim> {
+        self.claim_registration(name).with_context(|| {
+            format!("network '{name}' is already being joined or restored; try again shortly")
+        })
     }
 
     /// Resolve a network's signed pkarr record, gate on mesh-protocol version,
@@ -917,6 +1026,12 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
     ) -> Result<bool> {
         let name = saved.name.as_str();
+        // Another path registered it meanwhile. `finalize_join` refuses too, but
+        // the route seeding before it would already touch the live network.
+        anyhow::ensure!(
+            !self.networks.contains_key(name),
+            "already in network '{name}'"
+        );
         self.check_destruction(name, net_pubkey, None).await?;
         let persisted_hostname = saved.persisted_hostname.clone();
         let auto_accept_firewall = saved.auto_accept_firewall;
@@ -969,6 +1084,8 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock,
             coordinator: None,
+            // Not known without the record. The restore loop reads it once the
+            // network is registered and flags the handle on a mismatch.
             mismatch: None,
         };
 
@@ -1075,6 +1192,14 @@ impl NetworkRegistry {
             ..
         } = ctx;
 
+        // Never replace a live handle: its tasks would keep running on a second
+        // state for the same network. Checked before the config write too, so a
+        // losing registration does not rewrite the live one's record pointer.
+        if self.networks.contains_key(display_name) {
+            cancel.cancel();
+            anyhow::bail!("already in network '{display_name}'");
+        }
+
         // Serialize the authority transition with every snapshot mutation. This
         // binds the durable key and provenance to one exact live generation.
         let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
@@ -1167,6 +1292,27 @@ impl NetworkRegistry {
             ));
         }
 
+        // A member network registered without a handshake (warm resume, or a
+        // restore whose coordinator did not answer) has no member accept
+        // handler yet, so none of its reconverge worker either. Start the
+        // worker here, owned by this handle, and wire it to the handler below.
+        let member_reconverge = (!role.is_coordinator()
+            && !self.protocol_router().is_registered(&net_pubkey))
+        .then(|| {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            tasks.push(spawn_reconverge_worker(
+                Arc::clone(&notify),
+                cancel.clone(),
+                Arc::clone(&state),
+                display_name.to_string(),
+                self.mesh_ctx(),
+                self.transport.endpoint.clone(),
+                net_pubkey,
+                self.current_device_cert(),
+            ));
+            notify
+        });
+
         let handle = NetworkHandle {
             name: display_name.to_string(),
             network_key: net_pubkey,
@@ -1178,7 +1324,15 @@ impl NetworkRegistry {
             invite_lock: Arc::clone(&invite_lock),
             incompatible: mismatch,
         };
-        self.networks.insert(display_name.to_string(), handle);
+        match self.networks.entry(display_name.to_string()) {
+            Entry::Occupied(_) => {
+                cancel.cancel();
+                anyhow::bail!("already in network '{display_name}'");
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(handle);
+            }
+        }
 
         // Expose coordinator authority only after its key, exact complete hash,
         // publisher, and Coordinator handle are all installed.
@@ -1192,7 +1346,7 @@ impl NetworkRegistry {
                 net_pubkey,
             ),
             NetworkRole::Member | NetworkRole::Direct => {
-                if !self.protocol_router().is_registered(&net_pubkey) {
+                if let Some(reconverge_notify) = member_reconverge {
                     self.protocol_router().register(
                         net_pubkey,
                         AcceptHandler::Member(Arc::new(MemberAcceptState {
@@ -1204,7 +1358,7 @@ impl NetworkRegistry {
                             endpoint: self.transport.endpoint.clone(),
                             registry: Arc::clone(self),
                             invite_lock: Arc::clone(&invite_lock),
-                            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+                            reconverge_notify,
                         })),
                     );
                 }
@@ -2385,3 +2539,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;
