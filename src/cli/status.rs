@@ -408,6 +408,14 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
         // running daemon as down sends the reader after the wrong problem. The
         // IPC layer already tells the two apart, so keep its answer rather than
         // flattening every failure into one message.
+        // JSON callers get no styled fallback: the error goes to stderr and the
+        // command exits non-zero, as every other `--json` command does.
+        Err(error) if json_enabled() => {
+            if connect_was_refused(&error) {
+                return Err(error.context("not authorized to query the rayfish service"));
+            }
+            return Err(error);
+        }
         Err(error) if connect_was_refused(&error) => {
             print_not_authorized();
             return Ok(());
