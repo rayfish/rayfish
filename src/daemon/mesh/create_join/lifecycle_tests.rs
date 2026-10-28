@@ -634,30 +634,33 @@ async fn a_warm_resume_records_an_incompatible_mesh_version() {
     .unwrap();
     dht::publish_record(&client, &record).await.unwrap();
 
-    let restore = registry
-        .spawn_member_restore(&config::load_network("home").unwrap().unwrap())
-        .unwrap();
-    let flagged = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(m) = registry
-                .networks
-                .get("home")
-                .and_then(|h| h.incompatible.clone())
-            {
-                return m;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    // The two steps a warm restore takes, run in turn so the check's result
+    // is awaited rather than polled for.
+    assert!(
+        registry
+            .warm_resume_member_network(&saved, network_key.public())
+            .await
+            .unwrap()
+    );
+    let flagged = tokio::time::timeout(
+        Duration::from_secs(10),
+        registry.warm_resume_mismatch("home", &network_key.public().to_string()),
+    )
     .await
-    .expect("the warm-resumed network is marked incompatible");
+    .expect("the record is read")
+    .expect("the version is incompatible");
+    let expected = MeshVersionMismatch {
+        network: old,
+        ours: transport::MESH_PROTOCOL_VERSION,
+    };
+    assert_eq!(flagged, expected);
     assert_eq!(
-        flagged,
-        MeshVersionMismatch {
-            network: old,
-            ours: transport::MESH_PROTOCOL_VERSION
-        }
+        registry
+            .networks
+            .get("home")
+            .and_then(|h| h.incompatible.clone()),
+        Some(expected),
+        "the warm-resumed network is marked incompatible"
     );
     daemon.shutdown_and_close().await;
-    restore.await.unwrap();
 }

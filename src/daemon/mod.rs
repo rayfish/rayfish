@@ -5448,24 +5448,6 @@ mod headless_tests {
         daemon.shutdown_and_close().await;
     }
 
-    /// A stopped node must be rebuildable in the same process, which is the
-    /// mobile disable/enable cycle (`Node::stop` then `Node::start`, both in one
-    /// app process).
-    ///
-    /// What makes this sharp: two `FsStore`s over the same directory do not
-    /// error, they *block*. redb waits for the lock on `blobs/blobs.db` rather
-    /// than returning `DatabaseAlreadyOpen`, so a rebuild that overlaps a store
-    /// the previous daemon has not released yet never returns at all, and on
-    /// Android that wedges the thread `Node::start` was called on for the life of
-    /// the process. Before `shutdown_and_close` shut the protocol router down,
-    /// nothing in it released the store: the release happened later, if at all,
-    /// when the router's accept task noticed the closed endpoint and dropped its
-    /// handlers. This asserts the router is shut down before the call returns
-    /// (which is what drives `BlobsProtocol::shutdown` -> `Store::shutdown`) and
-    /// then reopens the store immediately, with the daemon `Arc` still held.
-    ///
-    /// See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
-    /// only serializes tests and guards no data across the awaits.
     /// A mobile rebuild drops the old daemon. Nothing it built may keep its
     /// registry alive afterwards through a reference cycle.
     #[allow(clippy::await_holding_lock)]
@@ -5494,6 +5476,24 @@ mod headless_tests {
         );
     }
 
+    /// A stopped node must be rebuildable in the same process, which is the
+    /// mobile disable/enable cycle (`Node::stop` then `Node::start`, both in one
+    /// app process).
+    ///
+    /// What makes this sharp: two `FsStore`s over the same directory do not
+    /// error, they *block*. redb waits for the lock on `blobs/blobs.db` rather
+    /// than returning `DatabaseAlreadyOpen`, so a rebuild that overlaps a store
+    /// the previous daemon has not released yet never returns at all, and on
+    /// Android that wedges the thread `Node::start` was called on for the life of
+    /// the process. Before `shutdown_and_close` shut the protocol router down,
+    /// nothing in it released the store: the release happened later, if at all,
+    /// when the router's accept task noticed the closed endpoint and dropped its
+    /// handlers. This asserts the router is shut down before the call returns
+    /// (which is what drives `BlobsProtocol::shutdown` -> `Store::shutdown`) and
+    /// then reopens the store immediately, with the daemon `Arc` still held.
+    ///
+    /// See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
+    /// only serializes tests and guards no data across the awaits.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_and_close_releases_the_blob_store_for_a_rebuild() {

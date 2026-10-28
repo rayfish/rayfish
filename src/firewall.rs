@@ -334,10 +334,6 @@ impl FirewallConfig {
                     || info.dst_port == crate::forward::ssh_port()))
     }
 
-    /// Follow a network renamed on this node from `from` to `to`: rules scoped
-    /// to it and rules installed from its suggestions name it by its local name,
-    /// and without this a scoped rule would stop matching while the suggested
-    /// ones were never replaced again. Returns whether any rule named it.
     /// Replace the rules installed from network `net`'s suggestions with
     /// `new_rules`, leaving `Local` rules and other networks' rules untouched.
     pub fn replace_network_rules(&mut self, net: &str, new_rules: Vec<FirewallRule>) {
@@ -346,6 +342,10 @@ impl FirewallConfig {
         self.rules.extend(new_rules);
     }
 
+    /// Follow a network renamed on this node from `from` to `to`: rules scoped
+    /// to it and rules installed from its suggestions name it by its local name,
+    /// and without this a scoped rule would stop matching while the suggested
+    /// ones were never replaced again. Returns whether any rule named it.
     pub fn rename_network(&mut self, from: &str, to: &str) -> bool {
         let mut renamed = false;
         for rule in &mut self.rules {

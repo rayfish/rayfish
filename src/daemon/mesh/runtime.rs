@@ -911,7 +911,7 @@ impl NetworkRegistry {
     /// would. Retries an unreadable record on the restore backoff: an unknown
     /// version is not a healthy one. `None` once the record says the version
     /// is speakable, or when the network is gone or the daemon stops.
-    async fn warm_resume_mismatch(
+    pub(in crate::daemon::mesh) async fn warm_resume_mismatch(
         &self,
         name: &str,
         net_pubkey: &str,
