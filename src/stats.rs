@@ -4,6 +4,7 @@
 //! counters via `Family<DropLabels, Counter>`. A background logger prints
 //! 30-second interval deltas and a session summary on shutdown.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -301,9 +302,13 @@ impl PeerMetrics {
     pub fn spawn_collector(self: &Arc<Self>, peers: PeerTable, token: CancellationToken) {
         let metrics = Arc::clone(self);
         tokio::spawn(async move {
+            // Labels exported last tick, so a peer that has left the table
+            // stops exporting instead of freezing at its last values forever.
+            let mut exported = HashSet::new();
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        let mut live = HashSet::new();
                         for (ip, conn) in peers.all_connections() {
                             let label = PeerLabels {
                                 peer: ip.to_string(),
@@ -326,18 +331,73 @@ impl PeerMetrics {
                             metrics.lost_bytes.get_or_create(&label).set(stats.lost_bytes as i64);
                             let queued = peers.queued_bytes(&conn);
                             metrics.datagram_send_queue_bytes.get_or_create(&label).set(queued as i64);
+                            live.insert(label);
                         }
+                        metrics.prune(&exported, &live);
+                        exported = live;
                     }
                     _ = token.cancelled() => return,
                 }
             }
         });
     }
+
+    /// Drop every series for a peer in `exported` that is not in `live`.
+    fn prune(&self, exported: &HashSet<PeerLabels>, live: &HashSet<PeerLabels>) {
+        for label in exported.difference(live) {
+            self.forget(label);
+        }
+    }
+
+    fn forget(&self, label: &PeerLabels) {
+        let families = [
+            &self.rtt_us,
+            &self.bytes_tx,
+            &self.bytes_rx,
+            &self.lost_packets,
+            &self.lost_bytes,
+            &self.congestion_window_bytes,
+            &self.congestion_events,
+            &self.path_mtu_bytes,
+            &self.path_is_relay,
+            &self.datagram_send_queue_bytes,
+        ];
+        for family in families {
+            family.remove(label);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_departed_peer_stops_exporting() {
+        let metrics = PeerMetrics::default();
+        let stays = PeerLabels {
+            peer: "200::1".to_string(),
+        };
+        let leaves = PeerLabels {
+            peer: "200::2".to_string(),
+        };
+        for label in [&stays, &leaves] {
+            metrics.rtt_us.get_or_create(label).set(10);
+            metrics.bytes_tx.get_or_create(label).set(10);
+            metrics
+                .datagram_send_queue_bytes
+                .get_or_create(label)
+                .set(10);
+        }
+
+        let exported = HashSet::from([stays.clone(), leaves.clone()]);
+        metrics.prune(&exported, &HashSet::from([stays.clone()]));
+
+        assert!(metrics.rtt_us.get(&stays).is_some());
+        assert!(metrics.rtt_us.get(&leaves).is_none());
+        assert!(metrics.bytes_tx.get(&leaves).is_none());
+        assert!(metrics.datagram_send_queue_bytes.get(&leaves).is_none());
+    }
 
     #[test]
     fn test_record_rx() {

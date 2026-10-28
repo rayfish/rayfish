@@ -1475,9 +1475,13 @@ impl Daemon {
             // "22/tcp" still drops it and the failure looks like a dead network
             // rather than a firewall rule. Permit it through UFW or ip6tables on the mesh
             // interface and surface any remaining block with the `ray up` warnings.
-            if let Some(w) =
-                crate::hostfw::ensure_inbound_tcp(&dns_tun_name, crate::ssh::SSH_LISTEN_PORT)
-                    .warning(crate::ssh::SSH_LISTEN_PORT)
+            // The probe shells out to ufw/firewall-cmd/iptables: off the worker.
+            let tun_name = dns_tun_name.clone();
+            let port = crate::ssh::SSH_LISTEN_PORT;
+            if let Ok(Some(w)) = tokio::task::spawn_blocking(move || {
+                crate::hostfw::ensure_inbound_tcp(&tun_name, port).warning(port)
+            })
+            .await
             {
                 tracing::warn!("{w}");
                 warnings.push(w);

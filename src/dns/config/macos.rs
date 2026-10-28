@@ -324,8 +324,7 @@ fn write_service_config(tun_name: &str, mesh_v6: Ipv6Addr) -> Result<()> {
 /// Read the system's current default-resolver upstreams from `scutil --dns`,
 /// so a full-tunnel catch-all can forward non-`.ray` queries to them. Captured
 /// once, before we install our own config, so we never capture ourselves.
-/// `resolver #1` is macOS's primary (default) resolver; skip our magic IP.
-pub(super) fn capture_system_upstreams() -> Vec<std::net::Ipv4Addr> {
+pub(super) fn capture_system_upstreams() -> Vec<IpAddr> {
     let out = std::process::Command::new("scutil")
         .arg("--dns")
         .output()
@@ -333,33 +332,11 @@ pub(super) fn capture_system_upstreams() -> Vec<std::net::Ipv4Addr> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let magic = crate::dns::MAGIC_DNS_V4;
-    let mut ups = Vec::new();
-    let mut in_first = false;
-    for line in out.lines() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("resolver #") {
-            // Stop once we pass the first resolver block; take only #1.
-            if in_first {
-                break;
-            }
-            in_first = rest.trim() == "1";
-            continue;
-        }
-        if in_first
-            && t.starts_with("nameserver[")
-            && let Some(ip) = t.split(':').nth(1).and_then(|s| s.trim().parse().ok())
-            && ip != magic
-            && !ups.contains(&ip)
-        {
-            ups.push(ip);
-        }
-    }
-    ups
+    super::parse_scutil_dns_upstreams(&out)
 }
 
 pub struct MacosDynamicStoreDns {
-    captured: Vec<std::net::Ipv4Addr>,
+    captured: Vec<IpAddr>,
     /// The utun the resolver is scoped to (see [`write_dns_config`]).
     tun_name: String,
     /// This node's mesh IPv6, published as the service's address
@@ -397,7 +374,7 @@ impl DnsConfigurator for MacosDynamicStoreDns {
     }
 
     fn captured_upstreams(&self) -> Vec<IpAddr> {
-        self.captured.iter().copied().map(IpAddr::V4).collect()
+        self.captured.clone()
     }
 
     async fn revert(&self) -> Result<()> {

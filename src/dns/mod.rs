@@ -106,14 +106,33 @@ pub async fn remove_hostname_by_ip(
 ) {
     let mut t = table.write().await;
     if let Some(hosts) = t.get_mut(network) {
-        hosts.retain(|_, v6| {
-            if *v6 == ipv6 {
-                reverse.remove(&ipv6);
-                false
-            } else {
-                true
-            }
-        });
+        hosts.retain(|_, v6| *v6 != ipv6);
+    }
+    repoint_reverse(&t, reverse, ipv6);
+}
+
+/// Point the reverse entry for `ipv6` at whichever network still holds it, or
+/// drop it when none does. A peer in two networks has the same mesh address in
+/// both, so leaving one must not take its PTR away from the other.
+fn repoint_reverse(
+    table: &HashMap<String, HashMap<String, HostnameEntry>>,
+    reverse: &ReverseLookupTable,
+    ipv6: Ipv6Addr,
+) {
+    let holder = table
+        .iter()
+        .filter_map(|(network, hosts)| {
+            let (name, _) = hosts.iter().find(|(_, v6)| **v6 == ipv6)?;
+            Some((network, name))
+        })
+        .min();
+    match holder {
+        Some((network, name)) => {
+            reverse.insert(ipv6, (name.clone(), network.clone()));
+        }
+        None => {
+            reverse.remove(&ipv6);
+        }
     }
 }
 
@@ -128,12 +147,6 @@ pub async fn sync_network_hostnames(
     entries: &[(String, Ipv6Addr)],
 ) {
     let mut t = table.write().await;
-    // Drop reverse entries for the network's previous set before rebuilding.
-    if let Some(old) = t.get(network) {
-        for v6 in old.values() {
-            reverse.remove(v6);
-        }
-    }
     let mut hosts = HashMap::with_capacity(entries.len());
     for (name, v6) in entries {
         if !crate::hostname::is_valid_hostname(name) {
@@ -143,7 +156,16 @@ pub async fn sync_network_hostnames(
         hosts.insert(name.clone(), *v6);
         reverse.insert(*v6, (name.clone(), network.to_string()));
     }
-    t.insert(network.to_string(), hosts);
+    // Addresses the network no longer holds may still belong to another one.
+    let dropped: Vec<Ipv6Addr> = t
+        .insert(network.to_string(), hosts)
+        .into_iter()
+        .flat_map(HashMap::into_values)
+        .filter(|v6| !entries.iter().any(|(_, new)| new == v6))
+        .collect();
+    for v6 in dropped {
+        repoint_reverse(&t, reverse, v6);
+    }
 }
 
 /// Remove all hostnames for a network from both tables.
@@ -151,7 +173,7 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
     let mut t = table.write().await;
     if let Some(hosts) = t.remove(network) {
         for (_, ipv6) in hosts {
-            reverse.remove(&ipv6);
+            repoint_reverse(&t, reverse, ipv6);
         }
     }
 }
@@ -527,6 +549,40 @@ mod tests {
             reverse.get(&v6(1)).map(|e| e.0.clone()),
             Some("laptop".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn ptr_survives_leaving_one_of_two_networks() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let ip = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 7);
+        let name = |reverse: &ReverseLookupTable| reverse.get(&ip).map(|e| e.value().clone());
+
+        update_hostname(&table, &reverse, "alpha", "box", ip).await;
+        update_hostname(&table, &reverse, "beta", "box", ip).await;
+
+        remove_network(&table, &reverse, "beta").await;
+        assert_eq!(
+            name(&reverse),
+            Some(("box".to_string(), "alpha".to_string()))
+        );
+
+        update_hostname(&table, &reverse, "beta", "box", ip).await;
+        sync_network_hostnames(&table, &reverse, "beta", &[]).await;
+        assert_eq!(
+            name(&reverse),
+            Some(("box".to_string(), "alpha".to_string()))
+        );
+
+        update_hostname(&table, &reverse, "beta", "box", ip).await;
+        remove_hostname_by_ip(&table, &reverse, "beta", ip).await;
+        assert_eq!(
+            name(&reverse),
+            Some(("box".to_string(), "alpha".to_string()))
+        );
+
+        remove_hostname_by_ip(&table, &reverse, "alpha", ip).await;
+        assert_eq!(name(&reverse), None);
     }
 
     #[tokio::test]

@@ -11,7 +11,9 @@
 //! [`android_tun`], and everything else is a thin map from the core's
 //! `IpcMessage` results to the UniFFI records below.
 
-#[cfg(target_os = "android")]
+// Also built for Linux tests, which exercise the fd handling on a pipe.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod android_tun;
 mod diag;
 mod file_events;
@@ -635,12 +637,13 @@ fn saved_networks_status() -> Status {
     // Derive this device's stable identity-based fields off disk. Without a
     // persisted identity there are no saved networks to show either, so fall
     // back to the empty snapshot.
-    let (node_id, device_ipv6) = match identity::load_or_create() {
-        Ok(secret) => {
+    // Read only: a status poll must never be what mints this device's identity.
+    let (node_id, device_ipv6) = match identity::load_existing() {
+        Ok(Some(secret)) => {
             let id = secret.public();
             (id.to_string(), membership::derive_ipv6(&id).to_string())
         }
-        Err(_) => return empty,
+        Ok(None) | Err(_) => return empty,
     };
     // Same stable alphabetical order as the live snapshot below.
     let mut sorted = cfg.networks.clone();
@@ -1784,6 +1787,25 @@ mod device_name_tests {
             "Wrong password, or the backup is damaged"
         );
         assert_eq!(error_message(RayError::Network(String::new())), "");
+    }
+
+    #[test]
+    fn stopped_status_does_not_create_an_identity() {
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("rayfish-noid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = Node::new(dir.to_string_lossy().to_string());
+
+        let status = node.status();
+        assert!(!status.running);
+        assert!(status.node_id.is_empty());
+        assert!(
+            identity::load_existing().unwrap().is_none(),
+            "reading status minted an identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

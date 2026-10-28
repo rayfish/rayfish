@@ -71,6 +71,16 @@ pub(super) fn enable(_tun_name: &str) -> Result<()> {
     // reference), and record the token first: if anything below fails, `disable`
     // reads this file to give pf back, and a token we never wrote is a reference
     // count we could never release.
+    //
+    // A token from a run that never reached `disable` (a reboot, a SIGKILL)
+    // names a reference the kernel no longer holds. With pf down it cannot be
+    // live, since any live reference keeps pf up, so drop it and enable afresh
+    // instead of loading NAT into a pf that is off.
+    if snap.pf_token.is_some() && !pf_running() {
+        tracing::info!("exit node: pf is off, discarding a stale pf token from an earlier run");
+        snap.pf_token = None;
+        snap.save(&path)?;
+    }
     if snap.pf_token.is_none()
         && let Some(token) = pf_enable()?
     {
