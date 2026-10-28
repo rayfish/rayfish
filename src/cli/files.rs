@@ -472,6 +472,12 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             }
         }
         Some(FilesAction::Accept { id, output }) => {
+            // The daemon resolves a relative path against its own working
+            // directory, not the caller's, so send it absolute.
+            let output = output
+                .map(|dir| std::path::absolute(&dir).map(|p| p.to_string_lossy().to_string()))
+                .transpose()
+                .context("resolve the output directory")?;
             let output = output.or_else(|| {
                 dirs::download_dir()
                     .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))

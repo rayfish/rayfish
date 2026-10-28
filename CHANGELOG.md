@@ -81,6 +81,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   service. `ray uninstall` requires root.
 - The firewall pending picker opens only on a terminal.
 - Tab completion no longer creates or migrates config.
+- `ray files accept -o <dir>` resolves a relative directory against the
+  current directory.
+- A peer renamed to an invalid name no longer keeps answering PTR lookups.
 
 ### Security
 
