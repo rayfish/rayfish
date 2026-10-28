@@ -881,28 +881,21 @@ pub(crate) async fn ipc_apply(
         // spec's set; without it, merge into the live set (so `apply` never
         // silently drops subjects authored out-of-band - use --prune for that).
         let to_publish = if prune {
-            apply::suggested_firewall(net_firewall)
+            Ok(apply::suggested_firewall(net_firewall))
         } else {
-            let mut live = ipc_firewall_suggestions_get(net_name)
-                .await
-                .unwrap_or_default();
-            // Merge spec subjects over live (spec wins on conflict).
-            for (subj, rules) in net_firewall {
-                live.insert(
-                    subj.clone(),
-                    ray_proto::policy::HostSuggestions {
-                        allows: rules.allows.clone(),
-                        denies: rules.denies.clone(),
-                    },
-                );
-            }
-            live
+            merge_live_suggestions(ipc_firewall_suggestions_get(net_name).await, net_firewall)
         };
-        match ipc_firewall_suggest_set(net_name, to_publish).await {
-            Ok(msg) => println!("{}   {msg}", style::faint("→")),
+        match to_publish {
+            Ok(to_publish) => match ipc_firewall_suggest_set(net_name, to_publish).await {
+                Ok(msg) => println!("{}   {msg}", style::faint("→")),
+                Err(e) => {
+                    network_failures = true;
+                    eprintln!("{}   suggest failed: {e}", style::red("  !"));
+                }
+            },
             Err(e) => {
                 network_failures = true;
-                eprintln!("{}   suggest failed: {e}", style::red("  !"));
+                eprintln!("{}   suggest skipped: {e:#}", style::red("  !"));
             }
         }
 
@@ -1144,6 +1137,19 @@ pub(crate) async fn ipc_apply(
     anyhow::ensure!(!delivery_failures, "some invitations could not be queued");
     anyhow::ensure!(!invite_failures, "some invites could not be minted");
     Ok(())
+}
+
+/// The suggestion set `ray apply` publishes without `--prune`: the live set
+/// with the spec's subjects merged over it (spec wins on conflict), so
+/// subjects authored out-of-band survive. If the live set cannot be read the
+/// merge fails: publishing the spec alone would silently drop those subjects.
+fn merge_live_suggestions(
+    live: Result<ray_proto::SuggestedFirewall>,
+    spec: &apply::DeployNetwork,
+) -> Result<ray_proto::SuggestedFirewall> {
+    let mut live = live.context("reading the live suggestions to merge into")?;
+    live.extend(apply::suggested_firewall(spec));
+    Ok(live)
 }
 
 /// One private invitation planned by `ray apply --invite-missing`.
@@ -1665,6 +1671,27 @@ networks:
         ))
         .unwrap();
         (spec, invited)
+    }
+
+    /// Without `--prune`, a failed read of the live set must stop the publish
+    /// rather than replace the live set with the spec alone.
+    #[test]
+    fn merge_fails_when_live_suggestions_cannot_be_read() {
+        let spec: apply::DeployNetwork =
+            serde_yml::from_str("server:\n  allows:\n    bob: tcp:22\n").unwrap();
+        assert!(merge_live_suggestions(Err(anyhow::anyhow!("daemon down")), &spec).is_err());
+
+        let mut live = ray_proto::SuggestedFirewall::new();
+        live.insert(
+            "other".into(),
+            ray_proto::policy::HostSuggestions {
+                allows: [("*".to_string(), "icmp".to_string())].into(),
+                denies: Default::default(),
+            },
+        );
+        let merged = merge_live_suggestions(Ok(live), &spec).unwrap();
+        assert!(merged.contains_key("other"));
+        assert_eq!(merged["server"].allows["bob"], "tcp:22");
     }
 
     #[test]
