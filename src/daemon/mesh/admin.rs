@@ -50,6 +50,13 @@ impl NetworkRegistry {
             ));
         }
 
+        self.record_admin_grant(network, identity).await
+    }
+
+    /// Record a grant the peer has already saved: mark it coordinator, add it
+    /// to the local admin list, then publish. The admin list is written before
+    /// the publish result is checked, since the peer holds the key either way.
+    async fn record_admin_grant(&self, network: &str, identity: EndpointId) -> IpcMessage {
         // Publish the grantee as a coordinator in the signed group blob so
         // joiners can discover co-coordinators to dial.
         {
@@ -59,9 +66,6 @@ impl NetworkRegistry {
             let mut s = handle.state.write().unwrap();
             crate::membership::mark_coordinator(&mut s.members, &identity);
             s.refresh_snapshot();
-        }
-        if !self.store_and_publish_group(network).await {
-            return unsaved_snapshot_error(network);
         }
 
         // Record the grant locally (coordinator's record; not verifiable).
@@ -84,6 +88,9 @@ impl NetworkRegistry {
                     "peer saved the network key, but recording the grant failed: {error}"
                 ));
             }
+        }
+        if !self.store_and_publish_group(network).await {
+            return unsaved_snapshot_error(network);
         }
         IpcMessage::Ok {
             message: format!("granted network key to {}", identity.fmt_short()),
@@ -229,6 +236,38 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("different network"));
+    }
+
+    /// A grant the peer saved is recorded even when the snapshot cannot be
+    /// saved. The admin list used to skip it while the peer held the key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_grant_is_recorded_when_the_snapshot_cannot_be_saved() {
+        use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
+
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ConfigDir::set(dir.path());
+        let relay = Relay::start().await;
+        relay.configure();
+        let daemon = build_headless(false).await.unwrap();
+        create(&daemon, "home").await;
+        let grantee = SecretKey::generate().public();
+        {
+            let handle = daemon.registry.networks.get("home").unwrap();
+            let mut s = handle.state.write().unwrap();
+            // The recovery pointer goes to a network with no config, so the
+            // snapshot commit fails while "home" itself stays writable.
+            s.network_name = Some("elsewhere".to_string());
+        }
+
+        let reply = daemon.registry.record_admin_grant("home", grantee).await;
+        assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+        let net = config::load_network("home").unwrap().unwrap();
+        assert!(net.admins.contains(&grantee));
+        daemon.shutdown_and_close().await;
     }
 
     #[tokio::test]
