@@ -97,6 +97,7 @@ async fn startup_drops_a_pending_join_for_a_live_network() {
     config::add_pending_join(config::PendingJoinEntry {
         network_key: key.to_string(),
         name: Some("home".into()),
+        transport: None,
     })
     .unwrap();
     hold_live(&daemon.registry, "home", key);
@@ -275,6 +276,39 @@ async fn a_queued_join_has_one_retry_loop() {
     );
 }
 
+/// A second `ray join` for a network whose retry already runs is told so, and
+/// the saved entry keeps the running retry's options. A second `--tor` join
+/// used to report a fresh request while the running loop dropped its transport.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_second_queued_join_is_told_a_retry_runs() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+
+    let first = daemon.registry.queue_pending_join(retry_for(key));
+    let IpcMessage::Ok { message } = first else {
+        panic!("{first:?}");
+    };
+    assert!(
+        message.contains("waiting for coordinator approval"),
+        "{message}"
+    );
+    let second = daemon.registry.queue_pending_join(PendingJoinRetry {
+        transport: Some(config::TransportMode::Tor),
+        ..retry_for(key)
+    });
+    let IpcMessage::Ok { message } = second else {
+        panic!("{second:?}");
+    };
+    assert!(message.contains("already queued"), "{message}");
+    let saved = config::load().unwrap().pending_joins;
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].transport, None);
+    daemon.shutdown_and_close().await;
+}
+
 /// A retry stops once its network is live, and drops the restart marker.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
@@ -286,6 +320,7 @@ async fn a_queued_join_stops_retrying_once_the_network_is_live() {
     config::add_pending_join(config::PendingJoinEntry {
         network_key: key.to_string(),
         name: Some("home".into()),
+        transport: None,
     })
     .unwrap();
     hold_live(&daemon.registry, "home", key);

@@ -575,6 +575,10 @@ pub struct PendingJoinEntry {
     /// The local display name to use once admitted, if the user gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The transport asked for (`ray join --tor`), saved on the network once
+    /// admitted. Absent in entries written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<TransportMode>,
 }
 
 /// An unpair of this device from its primary that has not finished. See
@@ -1927,8 +1931,8 @@ fn settings_toml(config: &AppConfig) -> Result<String> {
 }
 
 /// Record a queued join so its background retry survives a daemon restart.
-/// Idempotent: a second call with the same key updates the stored name but
-/// does not duplicate the entry.
+/// Idempotent: a second call with the same key updates the stored name and
+/// transport but does not duplicate the entry.
 pub fn add_pending_join(entry: PendingJoinEntry) -> Result<()> {
     add_pending_join_in(&config_dir()?, entry)
 }
@@ -1941,6 +1945,7 @@ fn add_pending_join_in(dir: &Path, entry: PendingJoinEntry) -> Result<()> {
             .find(|e| e.network_key == entry.network_key)
         {
             existing.name = entry.name;
+            existing.transport = entry.transport;
         } else {
             cfg.pending_joins.push(entry);
         }
@@ -4009,6 +4014,7 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: Some("homelab".to_string()),
+                transport: Some(TransportMode::Tor),
             },
         )
         .unwrap();
@@ -4016,6 +4022,7 @@ name = "test"
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.pending_joins.len(), 1);
         assert_eq!(loaded.pending_joins[0].network_key, "abc123");
+        assert_eq!(loaded.pending_joins[0].transport, Some(TransportMode::Tor));
 
         // Adding the same key again does not duplicate it.
         add_pending_join_in(
@@ -4023,6 +4030,7 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: None,
+                transport: None,
             },
         )
         .unwrap();
@@ -4030,6 +4038,15 @@ name = "test"
 
         remove_pending_join_in(dir, "abc123").unwrap();
         assert!(load_in(dir).unwrap().pending_joins.is_empty());
+    }
+
+    /// A pending join saved before the transport was recorded still loads.
+    #[test]
+    fn a_pending_join_without_a_transport_loads() {
+        let entry: PendingJoinEntry =
+            toml::from_str("network_key = \"abc123\"\nname = \"homelab\"\n").unwrap();
+        assert_eq!(entry.name.as_deref(), Some("homelab"));
+        assert_eq!(entry.transport, None);
     }
 
     /// The temp file was named `.{fname}.tmp.{pid}`: one path per file per

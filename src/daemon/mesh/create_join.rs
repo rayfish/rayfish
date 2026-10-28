@@ -392,34 +392,52 @@ impl NetworkRegistry {
                 *resp
             }
             Ok(TryJoin::Pending) => {
-                // Persist so the retry resumes after a restart.
-                let _ = config::add_pending_join(config::PendingJoinEntry {
-                    network_key: network_key.to_string(),
-                    name: name.map(|s| s.to_string()),
-                });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
-                if let Ok(key) = network_key.parse::<EndpointId>() {
-                    self.spawn_pending_join_retry(PendingJoinRetry {
-                        key,
-                        name: name.map(|s| s.to_string()),
-                        hostname,
-                        invite,
-                        coordinator,
-                        auto_accept_firewall,
-                        auto_accept_files,
-                        transport,
-                    });
-                }
-                IpcMessage::Ok {
-                    message: "join request sent - waiting for coordinator approval (run `ray status` to check)"
-                        .to_string(),
-                }
+                let Ok(key) = network_key.parse::<EndpointId>() else {
+                    return ipc_err("invalid network key".to_string());
+                };
+                self.queue_pending_join(PendingJoinRetry {
+                    key,
+                    name: name.map(|s| s.to_string()),
+                    hostname,
+                    invite,
+                    coordinator,
+                    auto_accept_firewall,
+                    auto_accept_files,
+                    transport,
+                })
             }
             Err(e) => {
                 self.record_join_denial(network_key, &e);
                 ipc_err(format!("{e:#}"))
             }
+        }
+    }
+
+    /// Start the retry for a join the coordinator has queued, and record it so
+    /// the retry resumes after a restart. A retry already running for this
+    /// network keeps the options it was started with, so the caller is told
+    /// and the saved entry is left alone.
+    fn queue_pending_join(self: &Arc<Self>, retry: PendingJoinRetry) -> IpcMessage {
+        let entry = config::PendingJoinEntry {
+            network_key: retry.key.to_string(),
+            name: retry.name.clone(),
+            transport: retry.transport.clone(),
+        };
+        if self.spawn_pending_join_retry(retry).is_none() {
+            return IpcMessage::Ok {
+                message: "a join request for this network is already queued and keeps the options it was sent with (run `ray status` to check)"
+                    .to_string(),
+            };
+        }
+        if let Err(error) = config::add_pending_join(entry) {
+            tracing::warn!(%error, "could not save the pending join; it will not resume after a restart");
+        }
+        IpcMessage::Ok {
+            message:
+                "join request sent - waiting for coordinator approval (run `ray status` to check)"
+                    .to_string(),
         }
     }
 
@@ -1912,6 +1930,7 @@ mod tests {
         config::add_pending_join(config::PendingJoinEntry {
             network_key: network_key.clone(),
             name: Some("box".into()),
+            transport: None,
         })
         .unwrap();
         let outcome = timeout(

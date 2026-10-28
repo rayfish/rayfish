@@ -35,7 +35,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.ray` to a resolver that is not running.
 - Packets dropped for exceeding the TUN MTU are now counted and logged as warnings.
 - `ray create --tor` and `ray join --tor` now use Tor (after a daemon restart)
-  instead of silently ignoring the flag, and fail on builds without Tor.
+  instead of silently ignoring the flag, and fail on builds without Tor. A
+  `--tor` join still waiting for approval keeps Tor across a restart, and a
+  repeated `ray join` for a queued network says a request is already queued.
 - Members resumed at startup apply roster and firewall updates as soon as a
   peer pushes them, instead of waiting for the next poll.
 - Roster updates learned by polling now update `.ray` names and routes, an

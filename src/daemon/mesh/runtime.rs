@@ -1181,9 +1181,19 @@ impl NetworkRegistry {
             let me = Arc::clone(self);
             let key = pending.network_key.clone();
             let name = pending.name.clone();
+            let transport = pending.transport.clone();
             tokio::spawn(async move {
                 let _ = me
-                    .join_network(&key, name.as_deref(), None, None, None, false, false, None)
+                    .join_network(
+                        &key,
+                        name.as_deref(),
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                        transport,
+                    )
                     .await;
             });
         }
