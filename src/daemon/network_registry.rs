@@ -430,6 +430,12 @@ impl NetworkRegistry {
             })
     }
 
+    /// Whether a network with this key is live, under whatever local name.
+    /// `networks` is keyed by name, so a key lookup has to scan.
+    pub(crate) fn is_live_network_key(&self, key: EndpointId) -> bool {
+        self.networks.iter().any(|handle| handle.network_key == key)
+    }
+
     /// A live mesh connection to `peer`, registered or freshly dialed, sharing
     /// any dial to it already in flight. See [`MeshDialer`].
     pub(crate) async fn connect_mesh_peer(&self, peer: EndpointId) -> Result<DialedPeer> {

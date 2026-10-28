@@ -2289,3 +2289,6 @@ mod tests {
         daemon.shutdown_and_close().await;
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;

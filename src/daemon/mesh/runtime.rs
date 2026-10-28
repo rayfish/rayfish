@@ -1117,7 +1117,15 @@ impl NetworkRegistry {
 
         // Resume closed-network joins that were still awaiting approval at shutdown.
         for pending in &app_config.pending_joins {
-            if self.networks.contains_key(&pending.network_key) {
+            // `networks` is keyed by name, the pending entry by network key. A
+            // network already live under any name was admitted, so its marker
+            // is stale: drop it rather than queue a join that can only fail.
+            if let Ok(key) = pending.network_key.parse::<EndpointId>()
+                && self.is_live_network_key(key)
+            {
+                if let Err(error) = config::remove_pending_join(&pending.network_key) {
+                    tracing::warn!(%error, "could not remove a stale pending join");
+                }
                 continue;
             }
             let me = Arc::clone(self);
