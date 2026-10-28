@@ -431,7 +431,7 @@ async fn a_restart_during_cleanup_finishes_the_unpair() {
 
     device.start().await;
     // Gone before the daemon read the certificate, not just by now.
-    assert_eq!(device.daemon().registry.device_cert, None);
+    assert!(device.daemon().registry.device_cert.load().is_none());
     assert_eq!(device.cert().await, None);
     assert!(!device.has_network("home").await);
     assert!(!device.daemon().registry.networks.contains_key("home"));

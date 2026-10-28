@@ -587,11 +587,7 @@ impl Daemon {
             .collect();
         // Our own user identity: the cert's user id on a paired device, else our
         // own endpoint id (mirrors the `try_auto_accept_file` "own device" rule).
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or(my_id);
+        let own_user = self.registry.own_identity();
         // The exit peer we route internet traffic through (`ray exit-node use`),
         // matched the way the roster keys members: by device id, or by the user
         // identity a paired multi-device peer is stored under.

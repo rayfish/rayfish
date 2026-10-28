@@ -975,7 +975,6 @@ pub struct Daemon {
     connect: Arc<ConnectService>,
     /// Delegated machine enrollment and direct management protocol.
     management: Arc<ManagementService>,
-    device_cert: Option<control::DeviceCert>,
     /// Whether the VPN is currently active (TUN up, networks connected) or on
     /// standby. Toggled by the `Up`/`Down` IPC commands.
     active: Arc<AtomicBool>,
@@ -2616,6 +2615,32 @@ pub(crate) mod accept_handler_tests {
         endpoint.close().await;
     }
 
+    /// Pairing or unpairing at runtime changes which file senders count as our
+    /// own devices, without a restart.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn own_device_sender_follows_pairing_at_runtime() {
+        let env = TestConfigDir::new();
+        let (endpoint, registry) = test_registry(env.dir.path()).await;
+        let me = endpoint.id();
+        let files = FileService::new(
+            SecretKey::generate(),
+            Arc::clone(&registry.transport),
+            Arc::clone(&registry),
+            registry.device_user_map.clone(),
+            Arc::new(transfers::TransferRegistry::new()),
+        );
+        let user = SecretKey::from_bytes(&[9u8; 32]);
+        let sibling = SecretKey::generate().public();
+        registry.device_user_map.insert(sibling, user.public());
+        assert!(!files.is_own_device_sender(sibling));
+        crate::identity::store_device_cert(&control::DeviceCert::create(&user, &me, 0)).unwrap();
+        assert!(files.is_own_device_sender(sibling));
+        crate::identity::delete_device_cert().unwrap();
+        assert!(!files.is_own_device_sender(sibling));
+        endpoint.close().await;
+    }
+
     /// Serializes a test that points `RAYFISH_CONFIG_DIR` at a temp dir and
     /// restores it on drop, even if the test panics.
     struct TestConfigDir {
@@ -3971,7 +3996,6 @@ pub(crate) mod accept_handler_tests {
                 SecretKey::generate(),
                 Arc::clone(&registry.transport),
                 Arc::clone(&registry),
-                None,
                 registry.device_user_map.clone(),
                 Arc::new(transfers::TransferRegistry::new()),
             )),

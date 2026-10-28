@@ -643,7 +643,6 @@ async fn build_daemon_inner(
         key.clone(),
         Arc::clone(&transport),
         Arc::clone(&registry),
-        device_cert.clone(),
         device_user_map.clone(),
         Arc::clone(&transfers),
     ));
@@ -804,7 +803,6 @@ async fn build_daemon_inner(
         transfers,
         connect,
         management,
-        device_cert,
         active: Arc::clone(&active),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),

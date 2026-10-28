@@ -173,9 +173,10 @@ pub(crate) struct NetworkRegistry {
     /// The TUN interface name, shared with the daemon (which sets it once the TUN
     /// is up), for refreshing DNS search domains after a network is torn down.
     pub(crate) tun_name: Arc<ArcSwap<String>>,
-    /// This device's cert loaded at boot, the in-memory fallback for the paired
-    /// check when the on-disk cert read errors (see [`Self::current_device_cert`]).
-    pub(crate) device_cert: Option<control::DeviceCert>,
+    /// This device's cert as last read from disk (seeded at boot), the
+    /// in-memory fallback for the paired check when the on-disk cert read
+    /// errors (see [`Self::current_device_cert`]).
+    pub(crate) device_cert: ArcSwapOption<control::DeviceCert>,
     /// Daemon-wide shutdown token; each network's cancel is a child of it.
     pub(crate) shutdown_token: CancellationToken,
     /// Per-device firewall, threaded into the [`MeshCtx`] handler bundle.
@@ -389,7 +390,7 @@ impl NetworkRegistry {
             conn,
             dns,
             tun_name,
-            device_cert,
+            device_cert: ArcSwapOption::from(device_cert.map(Arc::new)),
             shutdown_token,
             firewall,
             device_user_map,
@@ -657,11 +658,18 @@ impl NetworkRegistry {
 
     /// This device's pairing cert. The on-disk cert is authoritative: a cleanly
     /// absent file (`Ok(None)`, e.g. after `unpair_self` deletes it) means
-    /// unpaired, so only a genuine read error falls back to the in-memory copy.
+    /// unpaired, so only a genuine read error falls back to the in-memory copy,
+    /// which every successful read refreshes so it follows pairing and unpairing
+    /// at runtime.
     pub(crate) fn current_device_cert(&self) -> Option<control::DeviceCert> {
         match identity::load_device_cert() {
-            Ok(cert) => cert,
-            Err(_) => self.device_cert.clone(),
+            Ok(cert) => {
+                if self.device_cert.load().as_deref() != cert.as_ref() {
+                    self.device_cert.store(cert.clone().map(Arc::new));
+                }
+                cert
+            }
+            Err(_) => self.device_cert.load().as_deref().cloned(),
         }
     }
 
