@@ -947,6 +947,24 @@ mod pending_connect_cap_tests {
         endpoint.close().await;
     }
 
+    /// A finished delivery does not leave its recipient's lock behind.
+    #[tokio::test]
+    async fn invite_delivery_locks_are_dropped_when_idle() {
+        use crate::daemon::invite_delivery::Mint;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        for seed in 1..=3 {
+            // No such network here, so each delivery fails at once.
+            let delivered = service
+                .deliver_locked("missing", eid(seed), Mint::Never)
+                .await;
+            assert!(delivered.is_err());
+        }
+        assert!(service.delivery_locks.is_empty());
+        endpoint.close().await;
+    }
+
     #[test]
     fn no_eviction_below_cap() {
         let pending = DashMap::new();
