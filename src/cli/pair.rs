@@ -38,6 +38,42 @@ impl DisplayOut for PairedDevicesOutput<'_> {
     }
 }
 
+/// `ray pair` on the primary: the ticket for the other device.
+#[derive(serde::Serialize)]
+struct PairingTicketOutput {
+    ticket: String,
+}
+
+impl DisplayOut for PairingTicketOutput {
+    fn print_human(&self) {
+        let ticket = &self.ticket;
+        println!("Pairing ticket: {ticket}");
+        println!();
+        qr2term::print_qr(ticket).ok();
+        println!();
+        println!("On the other device, run:");
+        println!("  ray pair {ticket}");
+        println!();
+        println!("Waiting for device to connect (this ticket expires in 5 minutes)...");
+    }
+}
+
+/// `ray pair <ticket>`: the user identity this device now holds a cert for.
+#[derive(serde::Serialize)]
+struct PairedOutput {
+    user_identity: String,
+}
+
+impl DisplayOut for PairedOutput {
+    fn print_human(&self) {
+        println!("Paired successfully!");
+        println!("  User identity: {}", self.user_identity);
+        println!("  Device certificate stored.");
+        println!();
+        println!("This device will present its certificate when joining networks.");
+    }
+}
+
 pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<()> {
     match (action, ticket) {
         // `ray pair <ticket>` shorthand
@@ -75,19 +111,10 @@ pub(crate) async fn ipc_pair_start() -> Result<()> {
     ipc::send(&mut stream, ipc::IpcMessage::StartPairing).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::PairingTicket { ticket } => {
-            println!("Pairing ticket: {}", ticket);
-            println!();
-            qr2term::print_qr(&ticket).ok();
-            println!();
-            println!("On the other device, run:");
-            println!("  ray pair {}", ticket);
-            println!();
-            println!("Waiting for device to connect (this ticket expires in 5 minutes)...");
-            // The daemon handles the pairing asynchronously via the accept loop.
-            // We could poll for completion, but the daemon logs when it happens.
-            // For now, just tell the user it's ready.
-        }
+        // The daemon handles the pairing asynchronously via the accept loop.
+        // We could poll for completion, but the daemon logs when it happens.
+        // For now, just tell the user it's ready.
+        ipc::IpcMessage::PairingTicket { ticket } => printout(&PairingTicketOutput { ticket })?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
@@ -109,13 +136,9 @@ pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
     .await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::PairingComplete { user_identity } => {
-            println!("Paired successfully!");
-            println!("  User identity: {}", user_identity);
-            println!("  Device certificate stored.");
-            println!();
-            println!("This device will present its certificate when joining networks.");
-        }
+        ipc::IpcMessage::PairingComplete { user_identity } => printout(&PairedOutput {
+            user_identity: user_identity.to_string(),
+        })?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
@@ -228,3 +251,26 @@ pub(crate) async fn cmd_pair_restore(
 // ---------------------------------------------------------------------------
 // Service install/uninstall
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_results_serialize_for_json() {
+        let ticket = PairingTicketOutput {
+            ticket: "ticket".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&ticket).unwrap(),
+            serde_json::json!({ "ticket": "ticket" })
+        );
+        let paired = PairedOutput {
+            user_identity: "identity".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&paired).unwrap(),
+            serde_json::json!({ "user_identity": "identity" })
+        );
+    }
+}
