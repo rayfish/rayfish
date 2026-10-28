@@ -22,6 +22,7 @@ use super::stack::Stack;
 use super::{Expose, LocalForward, Options, Target};
 use crate::daemon::Daemon;
 use crate::instance::UserInstance;
+use crate::listener::AcceptBackoff;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -231,11 +232,23 @@ async fn serve_local(
     slots: Arc<Semaphore>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
+    let mut backoff = AcceptBackoff::new();
     loop {
         tokio::select! {
             result = tasks.join_next(), if !tasks.is_empty() => log_connection(result),
             accepted = listener.accept() => {
-                let (mut client, _) = accepted?;
+                // A failed accept (EMFILE, ECONNABORTED) must not end this
+                // listener: `run` would then tear down every other one too.
+                let mut client = match accepted {
+                    Ok((client, _)) => {
+                        backoff.reset();
+                        client
+                    }
+                    Err(e) => {
+                        backoff.wait(&e, "rootless proxy").await;
+                        continue;
+                    }
+                };
                 let permit = match Arc::clone(&slots).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => continue,
