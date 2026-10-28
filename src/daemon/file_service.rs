@@ -293,8 +293,6 @@ pub(crate) struct PairingSession {
 /// to retry.
 pub(crate) const MAX_PENDING_FILES: usize = 256;
 
-/// Drop the oldest queued offer when `pending` is at `cap`, returning it.
-/// Offers are pushed in arrival order, so the oldest is the front.
 /// Whether a peer-supplied file name is a single plain path component. The
 /// name is joined onto the receiver's download directory by a root daemon, so
 /// anything that could climb out of it (`..`, separators of either platform,
@@ -310,6 +308,8 @@ fn is_safe_file_name(name: &str) -> bool {
     )
 }
 
+/// Drop the oldest queued offer when `pending` is at `cap`, returning it.
+/// Offers are pushed in arrival order, so the oldest is the front.
 pub(crate) fn evict_oldest_file(pending: &mut Vec<PendingFile>, cap: usize) -> Option<PendingFile> {
     if pending.len() < cap {
         return None;
