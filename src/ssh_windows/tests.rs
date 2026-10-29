@@ -188,7 +188,7 @@ async fn windows_ssh_exec_and_interactive_powershell_use_the_login_account() -> 
     );
 
     let mut command = client.channel_open_session().await?;
-    command.exec(true, "if ([string]::IsNullOrWhiteSpace($env:USERPROFILE) -or $env:USERPROFILE -match 'systemprofile') { exit 99 }; [Console]::WriteLine(('rayfish-' + 'exec-ok')); [Console]::WriteLine(('rayfish-unicode:' + [char]0x00e9 + [char]0x6f22)); [Console]::Error.WriteLine('rayfish-stderr-ok'); [Console]::WriteLine([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); exit 23").await?;
+    command.exec(true, "if ([string]::IsNullOrWhiteSpace($env:USERPROFILE) -or $env:USERPROFILE -match 'systemprofile') { exit 99 }; [Console]::WriteLine(('rayfish-' + 'exec-ok')); [Console]::WriteLine(('rayfish-unicode:' + [char]0x00e9 + [char]0x6f22)); Write-Output ('rayfish-output:' + [char]0x00e9 + [char]0x6f22); [Console]::Error.WriteLine(('rayfish-stderr:' + [char]0x00e9 + [char]0x6f22)); [Console]::WriteLine([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); exit 23").await?;
     let output = drain(&mut command).await?;
     let stdout = String::from_utf8(output.stdout).context("exec output is not UTF-8")?;
     anyhow::ensure!(
@@ -202,6 +202,12 @@ async fn windows_ssh_exec_and_interactive_powershell_use_the_login_account() -> 
         "SSH exec did not preserve Unicode output as UTF-8"
     );
     anyhow::ensure!(
+        stdout
+            .lines()
+            .any(|line| line.trim() == "rayfish-output:\u{00e9}\u{6f22}"),
+        "PowerShell output did not preserve Unicode as UTF-8"
+    );
+    anyhow::ensure!(
         stdout.lines().any(|line| line.trim() == expected_sid),
         "SSH exec ran under the wrong account token"
     );
@@ -212,7 +218,7 @@ async fn windows_ssh_exec_and_interactive_powershell_use_the_login_account() -> 
 
     let stderr = String::from_utf8(output.stderr).context("exec stderr is not UTF-8")?;
     anyhow::ensure!(
-        stderr.trim() == "rayfish-stderr-ok",
+        stderr.trim() == "rayfish-stderr:\u{00e9}\u{6f22}",
         "SSH exec did not forward clean, separate stderr"
     );
 

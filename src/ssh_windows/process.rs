@@ -773,9 +773,16 @@ fn command_line(shell: &Path, command: Option<&str>, terminal: bool) -> Result<V
                 "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); {command}"
             )
         } else {
-            // A pipe session has no console. Setting console code pages there
-            // fails with an invalid handle and writes an unrelated SSH error.
-            command.to_owned()
+            // Redirected streams have valid pipe handles but no console code
+            // page. Install UTF-8 readers/writers without invoking console APIs.
+            format!(
+                "$rayfishEncoding=[System.Text.UTF8Encoding]::new($false); \
+                 $rayfishOut=[System.IO.StreamWriter]::new([Console]::OpenStandardOutput(),$rayfishEncoding,4096,$true); \
+                 $rayfishOut.AutoFlush=$true; [Console]::SetOut($rayfishOut); \
+                 $rayfishErr=[System.IO.StreamWriter]::new([Console]::OpenStandardError(),$rayfishEncoding,4096,$true); \
+                 $rayfishErr.AutoFlush=$true; [Console]::SetError($rayfishErr); \
+                 [Console]::SetIn([System.IO.StreamReader]::new([Console]::OpenStandardInput(),$rayfishEncoding,$false,4096,$true)); {command}"
+            )
         };
         let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
         line.push_str(" -EncodedCommand ");
