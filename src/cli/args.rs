@@ -1257,9 +1257,11 @@ pub(crate) enum FilesAction {
         #[arg(add = complete::queued_sends())]
         id: u64,
     },
-    /// Cancel an outgoing transfer
+    /// Cancel a transfer in progress
     ///
-    /// Cancels a transfer that has already been offered or started.
+    /// Cancels an outgoing transfer that has been offered or started, or stops
+    /// an incoming one, including one waiting to resume. A stopped incoming
+    /// file goes back to the queue with what was downloaded.
     CancelTransfer {
         /// Transfer ID (from 'ray files')
         id: u64,

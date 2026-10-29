@@ -199,8 +199,33 @@ impl TransferRegistry {
 
     pub fn note_progress(&self, id: u64, transferred: u64) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
-            e.info.transferred = transferred.min(e.info.size);
+            let transferred = transferred.min(e.info.size);
+            // New bytes mean a resumed receive is moving again, so the note
+            // left by `note_retrying` no longer describes it.
+            if transferred > e.info.transferred {
+                e.info.error = None;
+            }
+            e.info.transferred = transferred;
             e.info.state = TransferState::Transferring;
+            self.changed();
+        }
+    }
+
+    /// A receive was interrupted and will be retried. It stays
+    /// `Transferring`, with the reason in `error`, so `ray files` shows it as
+    /// still under way rather than failed.
+    pub(crate) fn note_retrying(&self, id: u64, reason: &str) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
+            e.info.error = Some(format!("interrupted, retrying: {reason}"));
+            self.changed();
+        }
+    }
+
+    /// A receive gave up, with the reason shown next to the failure.
+    fn fail_receive(&self, id: u64, reason: String) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
+            finish_entry(e, false, None);
+            e.info.error = Some(reason);
             self.changed();
         }
     }
@@ -348,6 +373,12 @@ impl FinishGuard {
         self.armed = false;
         self.registry.finish_receive(self.id, destination);
     }
+
+    /// Mark the transfer failed for `reason` and disarm the guard.
+    pub(crate) fn fail(mut self, reason: String) {
+        self.armed = false;
+        self.registry.fail_receive(self.id, reason);
+    }
 }
 
 impl Drop for FinishGuard {
@@ -491,6 +522,30 @@ mod tests {
         registry.provider_started(hash(1), peer(1));
         assert!(changes.has_changed().unwrap());
         assert_eq!(registry.list()[0].state, TransferState::Transferring);
+    }
+    #[test]
+    fn a_retrying_receive_stays_in_progress_until_bytes_move() {
+        let registry = Arc::new(TransferRegistry::new());
+        let id = registry.register_receive("peer".into(), "file".into(), 100);
+        registry.note_progress(id, 40);
+        registry.note_retrying(id, "connection to sender lost");
+        let retrying = &registry.list()[0];
+        assert_eq!(retrying.state, TransferState::Transferring);
+        assert_eq!(
+            retrying.error.as_deref(),
+            Some("interrupted, retrying: connection to sender lost")
+        );
+        // Reconnecting reports the bytes already held; only new ones clear it.
+        registry.note_progress(id, 40);
+        assert!(registry.list()[0].error.is_some());
+        registry.note_progress(id, 41);
+        assert_eq!(registry.list()[0].error, None);
+
+        registry.note_retrying(id, "the transfer stalled");
+        FinishGuard::new(Arc::clone(&registry), id).fail("gave up".into());
+        let failed = &registry.list()[0];
+        assert_eq!(failed.state, TransferState::Failed);
+        assert_eq!(failed.error.as_deref(), Some("gave up"));
     }
     use iroh::SecretKey;
 

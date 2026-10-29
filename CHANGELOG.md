@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- An accepted file whose download is interrupted (the sender drops off, or the
+  laptop sleeps) now resumes by itself where it stopped, with no second
+  `ray files accept`. It shows as transferring with the reason in `ray files`,
+  keeps retrying for up to a day without progress, and stops at once if the
+  sender no longer has the file. `ray files cancel-transfer` stops it and puts
+  the offer back in the queue.
+
 ### Changed
 
 - Mesh SSH no longer limits the number of session channels on one connection.
