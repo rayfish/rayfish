@@ -114,9 +114,7 @@ pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>)
 }
 
 pub(crate) async fn ipc_pair_start() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::StartPairing).await?;
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = ipc_request(ipc::IpcMessage::StartPairing).await?;
     match resp {
         // The daemon handles the pairing asynchronously via the accept loop.
         // We could poll for completion, but the daemon logs when it happens.
@@ -132,16 +130,11 @@ pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
     let (endpoint_id, secret) = rayfish::control::decode_pairing_ticket(ticket)?;
     let secret = secret.to_vec();
 
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::PairWithDevice {
-            endpoint_id,
-            secret,
-        },
-    )
+    let resp = ipc_request(ipc::IpcMessage::PairWithDevice {
+        endpoint_id,
+        secret,
+    })
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::PairingComplete { user_identity } => printout(&PairedOutput {
             user_identity: user_identity.to_string(),
@@ -153,9 +146,7 @@ pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
 }
 
 pub(crate) async fn ipc_pair_list() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::ListPairedDevices).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::ListPairedDevices).await? {
         ipc::IpcMessage::PairedDevices { devices } => printout(&PairedDevicesOutput(&devices))?,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
@@ -197,16 +188,12 @@ pub(crate) async fn cmd_pair_backup(
     }
 
     let password = (!onepassword).then(backup_password).transpose()?;
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::BackupIdentity {
-            password,
-            onepassword,
-        },
-    )
-    .await?;
-    let (code, public_key) = match ipc::recv(&mut stream).await? {
+    let (code, public_key) = match ipc_request(ipc::IpcMessage::BackupIdentity {
+        password,
+        onepassword,
+    })
+    .await?
+    {
         ipc::IpcMessage::IdentityBackup { code, public_key } => (code, public_key),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),

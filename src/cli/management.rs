@@ -251,12 +251,6 @@ pub(crate) async fn ipc_delegated_leave_request(
     result_message(response)
 }
 
-pub(crate) async fn ipc_request(request: ipc::IpcMessage) -> Result<ipc::IpcMessage> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, request).await?;
-    ipc::recv(&mut stream).await
-}
-
 pub(crate) async fn ipc_management_overview(
     show_machines: bool,
 ) -> (Vec<ipc::ControllerInfo>, Vec<ipc::ManagedMachineInfo>) {

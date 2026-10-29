@@ -248,16 +248,12 @@ impl DisplayOut for AdminsOutput {
 }
 
 pub(crate) async fn ipc_connect(peer: &str, hostname: Option<String>) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Connect {
-            peer: peer.to_string(),
-            hostname,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Connect {
+        peer: peer.to_string(),
+        hostname,
+    })
+    .await?
+    {
         ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::Joined { name, my_ipv6, .. } => {
             println!(
@@ -285,9 +281,7 @@ pub(crate) async fn ipc_connections(action: Option<ConnectAction>) -> Result<()>
 }
 
 pub(crate) async fn ipc_connections_list() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::Connections).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Connections).await? {
         ipc::IpcMessage::PendingRequests { requests } => print_pending_requests(
             &requests,
             "no pending connection requests",
@@ -306,9 +300,7 @@ pub(crate) async fn ipc_connections_approve(id: &str) -> Result<()> {
 
 /// `ray mdns scan`: the rayfish nodes mDNS has seen on this LAN.
 pub(crate) async fn ipc_lan_peers() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::ListLanPeers).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::ListLanPeers).await? {
         ipc::IpcMessage::LanPeersList {
             peers,
             mdns_enabled,
@@ -325,17 +317,13 @@ pub(crate) async fn ipc_lan_peers() -> Result<()> {
 }
 
 pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Ping {
-            peer: peer.to_string(),
-            count,
-            interval_ms: interval,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Ping {
+        peer: peer.to_string(),
+        count,
+        interval_ms: interval,
+    })
+    .await?
+    {
         ipc::IpcMessage::PingResponse {
             peer_name,
             conn_type,
@@ -368,9 +356,7 @@ pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()
 }
 
 pub(crate) async fn ipc_netcheck() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::Netcheck).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Netcheck).await? {
         ipc::IpcMessage::NetcheckResponse {
             bound_port,
             port_is_fixed,
@@ -406,9 +392,7 @@ pub(crate) async fn ipc_admin(network: &str, action: AdminAction) -> Result<()> 
             network: network.to_string(),
         },
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(req).await? {
         ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::AdminListResponse { admins } => {
             printout(&AdminsOutput(

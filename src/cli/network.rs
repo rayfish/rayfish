@@ -16,18 +16,13 @@ pub(crate) async fn ipc_create(
     } else {
         None
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Create {
-            mode,
-            name,
-            hostname,
-            transport,
-        },
-    )
+    let resp = ipc_request(ipc::IpcMessage::Create {
+        mode,
+        name,
+        hostname,
+        transport,
+    })
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Created {
             name,
@@ -91,25 +86,20 @@ pub(crate) async fn ipc_join(
         ),
         Err(_) => (network_key.to_string(), None, None),
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Join {
-            network_key,
-            name: name.map(|s| s.to_string()),
-            hostname,
-            transport,
-            invite,
-            coordinator,
-            auto_accept_firewall,
-            auto_accept_files,
-        },
-    )
-    .await?;
     // Joining dials the coordinator and runs the handshake daemon-side, so this
     // can take a few seconds, show a spinner while we wait.
     let spinner = progress::spinner("joining…");
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = ipc_request(ipc::IpcMessage::Join {
+        network_key,
+        name: name.map(|s| s.to_string()),
+        hostname,
+        transport,
+        invite,
+        coordinator,
+        auto_accept_firewall,
+        auto_accept_files,
+    })
+    .await?;
     spinner.finish_and_clear();
     match resp {
         ipc::IpcMessage::Ok { message } => {

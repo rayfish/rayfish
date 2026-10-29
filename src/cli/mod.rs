@@ -16,6 +16,8 @@
 //! (`#[arg(add = complete::networks())]`), so the module itself is what's
 //! exported.
 
+use crate::ipc::{self, IpcMessage};
+
 mod alias;
 mod block;
 pub(crate) mod complete;
@@ -53,6 +55,13 @@ pub(crate) use pair::*;
 pub(crate) use service::*;
 pub(crate) use status::*;
 pub(crate) use update::*;
+
+/// Send one request to the daemon and return its reply.
+pub(crate) async fn ipc_request(request: IpcMessage) -> anyhow::Result<IpcMessage> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, request).await?;
+    ipc::recv(&mut stream).await
+}
 
 /// Validate an `on|off` argument client-side, before the daemon is dialled.
 ///

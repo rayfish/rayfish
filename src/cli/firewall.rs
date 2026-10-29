@@ -227,10 +227,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         };
         return ipc_firewall_test(req, probe).await;
     }
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
+    match ipc_request(req).await? {
         ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallState {
             default_inbound,
@@ -262,9 +259,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
 
 /// `ray firewall test`: send the request [`to_ipc`] built and print the verdict.
 async fn ipc_firewall_test(req: ipc::IpcMessage, probe: Probe) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(req).await? {
         ipc::IpcMessage::FirewallTestResult {
             peer_name,
             identity,
@@ -448,9 +443,7 @@ pub(crate) async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
         _ => None,
     };
     let req = ssh_to_ipc(action);
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = ipc_request(req).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallSshState {
@@ -630,15 +623,11 @@ fn rule_row(index: usize, r: &ipc::FirewallRuleView) -> Vec<layout::Cell> {
 /// `ray firewall pending`: fetch the queued suggestions, then either run the
 /// interactive picker (TTY) or print a static table (piped / `--json`).
 pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallPending {
-            network: network.to_string(),
-        },
-    )
+    let pending = ipc_request(ipc::IpcMessage::FirewallPending {
+        network: network.to_string(),
+    })
     .await?;
-    let rules = match ipc::recv(&mut stream).await? {
+    let rules = match pending {
         ipc::IpcMessage::FirewallPendingResponse { rules, .. } => rules,
         ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
         other => fail_unexpected(&other),
@@ -663,17 +652,13 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         println!("  {}", style::faint("no changes"));
         return Ok(());
     }
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallResolveSuggestions {
-            network: network.to_string(),
-            accept: resolution.accept,
-            deny: resolution.deny,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::FirewallResolveSuggestions {
+        network: network.to_string(),
+        accept: resolution.accept,
+        deny: resolution.deny,
+    })
+    .await?
+    {
         ipc::IpcMessage::Ok { message } => {
             println!("  {} {}", style::check(), style::value(&message));
         }
@@ -731,15 +716,11 @@ pub(crate) async fn ipc_firewall_suggest(
 ) -> Result<()> {
     use ray_proto::HostSuggestions;
 
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallSuggestions {
-            network: network.to_string(),
-        },
-    )
-    .await?;
-    let mut suggestions = match ipc::recv(&mut stream).await? {
+    let mut suggestions = match ipc_request(ipc::IpcMessage::FirewallSuggestions {
+        network: network.to_string(),
+    })
+    .await?
+    {
         ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => suggestions,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
@@ -1367,13 +1348,7 @@ fn membership_diff_for_apply(
 }
 
 async fn ipc_managed_machines_for_apply() -> Result<Vec<ipc::ManagedMachineInfo>> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::ManagedMachines { probe: true },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::ManagedMachines { probe: true }).await? {
         ipc::IpcMessage::ManagedMachinesResponse { machines } => Ok(machines),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected managed-machines response: {other:?}"),
@@ -1519,9 +1494,7 @@ pub(crate) fn resolve_host_identity(
 /// plus every network's roster. The identity is needed to resolve an alias that
 /// names the coordinator itself.
 pub(crate) async fn ipc_status_full() -> Result<(EndpointId, Vec<ipc::NetworkStatus>)> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Status).await? {
         ipc::IpcMessage::StatusResponse(NodeStatus {
             endpoint_id,
             networks,
@@ -1583,18 +1556,14 @@ fn resolve_identity_hosts(
 }
 
 pub(crate) async fn ipc_apply_create(name: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Create {
-            mode: ray_proto::GroupMode::Restricted,
-            name: Some(name.to_string()),
-            hostname: None,
-            transport: None,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Create {
+        mode: ray_proto::GroupMode::Restricted,
+        name: Some(name.to_string()),
+        hostname: None,
+        transport: None,
+    })
+    .await?
+    {
         ipc::IpcMessage::Created { name: n, .. } => {
             println!("{}   created '{n}'", style::faint("→"));
             Ok(())
@@ -1607,15 +1576,11 @@ pub(crate) async fn ipc_apply_create(name: &str) -> Result<()> {
 pub(crate) async fn ipc_firewall_suggestions_get(
     network: &str,
 ) -> Result<ray_proto::SuggestedFirewall> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallSuggestions {
-            network: network.to_string(),
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::FirewallSuggestions {
+        network: network.to_string(),
+    })
+    .await?
+    {
         ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => Ok(suggestions),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected suggestions response: {other:?}"),
@@ -1626,16 +1591,12 @@ pub(crate) async fn ipc_firewall_suggest_set(
     network: &str,
     suggestions: ray_proto::SuggestedFirewall,
 ) -> Result<String> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallSuggest {
-            network: network.to_string(),
-            suggestions,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::FirewallSuggest {
+        network: network.to_string(),
+        suggestions,
+    })
+    .await?
+    {
         ipc::IpcMessage::Ok { message } => Ok(message),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected suggest response: {other:?}"),
@@ -1643,18 +1604,14 @@ pub(crate) async fn ipc_firewall_suggest_set(
 }
 
 pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> Result<String> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::InviteCreate {
-            network: network.to_string(),
-            expires_secs: 7 * 24 * 3600,
-            hostname,
-            reusable: false,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::InviteCreate {
+        network: network.to_string(),
+        expires_secs: 7 * 24 * 3600,
+        hostname,
+        reusable: false,
+    })
+    .await?
+    {
         ipc::IpcMessage::InviteCreated { code, .. } => Ok(code),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected invite response: {other:?}"),

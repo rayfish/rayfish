@@ -136,9 +136,7 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
             id,
         },
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(req).await? {
         ipc::IpcMessage::InviteCreated {
             code,
             id,
@@ -235,15 +233,11 @@ fn print_invite_created(invite: &InviteCreatedOutput<'_>) {
 
 /// Render the invite ledger as JSON (when `--json`) or an aligned table.
 pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Requests {
-            network: network.to_string(),
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Requests {
+        network: network.to_string(),
+    })
+    .await?
+    {
         ipc::IpcMessage::PendingRequests { requests } => print_pending_requests(
             &requests,
             "no pending join requests",

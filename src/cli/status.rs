@@ -1264,9 +1264,7 @@ pub(crate) const REPORT_REPO_URL: &str = "https://github.com/rayfish/rayfish";
 /// issue so the user can attach it. The bundle is built daemon-side (logs are
 /// root-owned) and written to a path owned by the invoking user.
 pub(crate) async fn ipc_report() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::Report).await?;
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = ipc_request(ipc::IpcMessage::Report).await?;
     match resp {
         ipc::IpcMessage::ReportBundle {
             path,

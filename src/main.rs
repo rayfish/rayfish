@@ -2077,9 +2077,7 @@ async fn run() -> Result<()> {
 
 /// Send a mutating IPC request and print its `Ok`/`Error` reply.
 pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, msg).await?;
-    print_ok_reply(ipc::recv(&mut stream).await?)
+    print_ok_reply(ipc_request(msg).await?)
 }
 
 /// `ray mdns on|off|scan`. The two toggles are the `mdns` settings key under
@@ -2143,9 +2141,7 @@ async fn cmd_config(action: Option<ConfigAction>) -> Result<()> {
             // Before the connect, so a bad key reads the same whether or not the
             // daemon happens to be running (and the same as `set`/`unset`).
             let key = key.as_deref().map(parse_node_key);
-            let mut stream = ipc::connect().await?;
-            ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key }).await?;
-            match ipc::recv(&mut stream).await? {
+            match ipc_request(ipc::IpcMessage::ConfigGet { key }).await? {
                 ipc::IpcMessage::ConfigValues { rows } => {
                     let output = ConfigOutput {
                         values: rows

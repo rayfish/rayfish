@@ -209,16 +209,11 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
         // daemon refuses path sends from anyone but root, so this only helps
         // across the upgrade.
         Err(_) => {
-            let mut stream = ipc::connect().await?;
-            ipc::send(
-                &mut stream,
-                ipc::IpcMessage::SendFile {
-                    path: path.to_string_lossy().to_string(),
-                    peer: peer.to_string(),
-                },
-            )
-            .await?;
-            ipc::recv(&mut stream).await?
+            ipc_request(ipc::IpcMessage::SendFile {
+                path: path.to_string_lossy().to_string(),
+                peer: peer.to_string(),
+            })
+            .await?
         }
     };
     match resp {
@@ -300,9 +295,7 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
 /// absent row renders as the empty string, which is how every settings key
 /// spells unset.
 async fn config_row(key: NodeKey) -> Result<String> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key: Some(key) }).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::ConfigGet { key: Some(key) }).await? {
         ipc::IpcMessage::ConfigValues { rows } => {
             Ok(rows.into_iter().next().map(|(_, v)| v).unwrap_or_default())
         }

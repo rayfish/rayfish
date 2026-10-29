@@ -74,10 +74,7 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
         },
         ExitNodeAction::Status { network } => ipc::IpcMessage::ExitNodeStatus { network },
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
+    match ipc_request(req).await? {
         ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::ExitNodeState { networks } => printout(&ExitNodeOutput::new(&networks))?,
         ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
@@ -90,21 +87,16 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
 /// status first, then sends one `none` per active network. No-op with a friendly
 /// note when nothing is routed through an exit.
 async fn clear_all_exit_selections() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::ExitNodeStatus { network: None },
-    )
-    .await?;
-    let active: Vec<String> = match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::ExitNodeState { networks } => networks
-            .into_iter()
-            .filter(|n| n.using.is_some())
-            .map(|n| n.network)
-            .collect(),
-        ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
-        other => fail_unexpected(&other),
-    };
+    let active: Vec<String> =
+        match ipc_request(ipc::IpcMessage::ExitNodeStatus { network: None }).await? {
+            ipc::IpcMessage::ExitNodeState { networks } => networks
+                .into_iter()
+                .filter(|n| n.using.is_some())
+                .map(|n| n.network)
+                .collect(),
+            ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
+            other => fail_unexpected(&other),
+        };
     if active.is_empty() {
         println!("no exit node in use");
         return Ok(());
@@ -115,16 +107,12 @@ async fn clear_all_exit_selections() -> Result<()> {
     // would say so only about the network it got to.
     let mut failed = 0usize;
     for network in active {
-        let mut s = ipc::connect().await?;
-        ipc::send(
-            &mut s,
-            ipc::IpcMessage::ExitNodeUse {
-                network: network.clone(),
-                peer: None,
-            },
-        )
+        let reply = ipc_request(ipc::IpcMessage::ExitNodeUse {
+            network: network.clone(),
+            peer: None,
+        })
         .await?;
-        match ipc::recv(&mut s).await? {
+        match reply {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
             ipc::IpcMessage::Error { message } => {
                 print_error("exit-node", &format!("{network}: {message}"), None);
