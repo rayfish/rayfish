@@ -143,10 +143,13 @@ impl Resolver for UnderlayResolver {
         self.resolver.clear_cache();
     }
     fn reset(&self) -> Box<dyn Resolver> {
-        let resolver =
-            HickoryResolver::builder_with_config(self.config.clone(), UnderlayRuntime::default())
-                .build()
-                .unwrap_or_else(|_| self.resolver.clone());
+        let mut builder =
+            HickoryResolver::builder_with_config(self.config.clone(), UnderlayRuntime::default());
+        *builder.options_mut() = self.resolver.options().clone();
+        let resolver = builder.build().unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot reset control-plane DNS; retaining the existing resolver");
+            self.resolver.clone()
+        });
         Box::new(Self {
             resolver,
             config: self.config.clone(),
@@ -169,6 +172,83 @@ pub(super) fn resolver(nameservers: &[IpAddr]) -> anyhow::Result<DnsResolver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_peer_published_after_a_dns_miss_is_found_after_reset() {
+        use tokio::task::JoinSet;
+
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("local DNS binds");
+        let address = socket.local_addr().expect("bound socket has an address");
+        let mut server = JoinSet::new();
+        server.spawn(async move {
+            let mut query = [0; 512];
+            for negative in [true, false] {
+                let (_, peer) = socket
+                    .recv_from(&mut query)
+                    .await
+                    .expect("receive DNS query");
+                let mut end = 12;
+                while query[end] != 0 {
+                    end += usize::from(query[end]) + 1;
+                }
+                let mut response = query[..end + 5].to_vec();
+                response[2..4].copy_from_slice(if negative {
+                    &[0x85, 0x83]
+                } else {
+                    &[0x85, 0x80]
+                });
+                response[6..12].copy_from_slice(if negative {
+                    &[0, 0, 0, 1, 0, 0]
+                } else {
+                    &[0, 1, 0, 0, 0, 0]
+                });
+                response.extend_from_slice(&[0xc0, 0x0c]);
+                if negative {
+                    // SOA with a five-minute negative TTL, before the peer publishes.
+                    response.extend_from_slice(&[0, 6, 0, 1, 0, 0, 1, 44, 0, 22, 0, 0]);
+                    for value in [1u32, 300, 300, 300, 300] {
+                        response.extend_from_slice(&value.to_be_bytes());
+                    }
+                } else {
+                    response.extend_from_slice(&[0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 203, 0, 113, 1]);
+                }
+                socket
+                    .send_to(&response, peer)
+                    .await
+                    .expect("send DNS response");
+            }
+        });
+        let mut nameserver = NameServerConfig::udp(address.ip());
+        nameserver.connections[0].port = address.port();
+        let config = ResolverConfig::from_name_servers(vec![nameserver]);
+        let mut builder =
+            HickoryResolver::builder_with_config(config.clone(), UnderlayRuntime::default());
+        builder.options_mut().negative_max_ttl = Some(Duration::ZERO);
+        let resolver = UnderlayResolver {
+            resolver: builder.build().expect("test resolver config is valid"),
+            config,
+        }
+        .reset();
+        assert!(
+            resolver
+                .lookup_ipv4("new-peer.example.".to_owned())
+                .await
+                .is_err()
+        );
+        let found: Vec<_> = resolver
+            .lookup_ipv4("new-peer.example.".to_owned())
+            .await
+            .expect("a previously missing record must be queried again")
+            .collect();
+        assert_eq!(found, [Ipv4Addr::new(203, 0, 113, 1)]);
+        server
+            .join_next()
+            .await
+            .expect("DNS server task exists")
+            .expect("DNS server completed");
+    }
 
     #[tokio::test]
     async fn empty_replacement_cannot_use_a_fallback_after_reset() {

@@ -29,6 +29,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- After network changes, peer discovery retries DNS records that were missing
+  before a peer started, instead of caching the earlier miss.
 - Cached peer addresses expire after seven days, with up to eight paths per
   peer and 64 peers in both saved hints and the running lookup. Connected paths
   refresh hourly. Old hints without timestamps are discarded on upgrade.
