@@ -25,6 +25,8 @@ use tokio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[cfg(windows)]
+use tokio_util::codec::Framed;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 
 use iroh_blobs::provider::events::{
@@ -1119,7 +1121,7 @@ const MAX_LOG_STREAMS: usize = 8;
 /// can hold one of the [`MAX_IPC_CLIENTS`] slots. The `ray logs` stream is not
 /// covered: it runs after the request, gives its slot back first, holds one of
 /// the [`MAX_LOG_STREAMS`] slots instead and times out each frame on its own.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const IPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(unix)]
@@ -1694,48 +1696,6 @@ fn sweep_ipc_upload_orphans(dir: &Path) {
     }
 }
 
-#[cfg(all(test, windows))]
-mod windows_ipc_tests {
-    use super::{IpcMessage, is_internal_file_frame, is_ipc_upload_temp_name};
-
-    #[test]
-    fn only_rayfish_partial_upload_names_are_sweep_candidates() {
-        assert!(is_ipc_upload_temp_name("rayfish-ipc-upload-a.part"));
-        assert!(!is_ipc_upload_temp_name("rayfish-ipc-upload-a"));
-        assert!(!is_ipc_upload_temp_name("unrelated.part"));
-    }
-
-    #[test]
-    fn staged_and_chunk_frames_are_internal_only() {
-        assert!(is_internal_file_frame(&IpcMessage::SendFileStaged {
-            path: "x".into(),
-            filename: "x".into(),
-            peer: "p".into(),
-        }));
-        assert!(is_internal_file_frame(&IpcMessage::SendFileChunk {
-            data: vec![1],
-            done: false,
-        }));
-        assert!(!is_internal_file_frame(&IpcMessage::Status));
-    }
-}
-
-#[cfg(windows)]
-async fn recreate_named_pipe(name: &str, token: &CancellationToken) -> Option<NamedPipeServer> {
-    loop {
-        match create_named_pipe(name, false) {
-            Ok(pipe) => return Some(pipe),
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to recreate IPC named pipe; retrying");
-                tokio::select! {
-                    _ = token.cancelled() => return None,
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-                }
-            }
-        }
-    }
-}
-
 #[cfg(windows)]
 fn create_named_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
     let operator = crate::config::operator_sid()?;
@@ -1753,26 +1713,46 @@ fn create_named_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
 }
 
 #[cfg(windows)]
-async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Result<()> {
-    let identity = windows_identity::named_pipe_client_identity(stream.as_raw_handle() as HANDLE)?;
-    let peer = Some(PeerIdentity::Windows {
+struct IdentifiedRequest {
+    message: IpcMessage,
+    peer: PeerIdentity,
+}
+
+#[cfg(windows)]
+async fn read_windows_request(
+    framed: &mut Framed<NamedPipeServer, ipc::MsgpackCodec<IpcMessage>>,
+) -> Result<IdentifiedRequest> {
+    let message = tokio::time::timeout(IPC_IO_TIMEOUT, ipc::recv(framed))
+        .await
+        .context("timed out waiting for the IPC request")??;
+    // ImpersonateNamedPipeClient uses the last message read from the pipe.
+    // Capture the identity only after that read, and revert synchronously
+    // inside this call before the handler awaits any authorized work.
+    let identity =
+        windows_identity::named_pipe_client_identity(framed.get_ref().as_raw_handle() as HANDLE)?;
+    let peer = PeerIdentity::Windows {
         sid: identity.sid,
         is_local_system: identity.is_local_system,
         is_elevated_admin: identity.is_elevated_admin,
-    });
+    };
+    Ok(IdentifiedRequest { message, peer })
+}
+
+#[cfg(windows)]
+async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Result<()> {
     let mut framed = ipc::framed(stream);
-    // A request this build cannot decode gets the reason back, the same as on
-    // Unix. Dropping the connection instead leaves the client reporting a dead
-    // daemon, and `cmd_up` acts on that by trying to install the service.
-    let req = match ipc::recv(&mut framed).await {
-        Ok(req) => req,
+    // Decode and identity errors get a bounded reply instead of looking like
+    // a dead daemon to the client. No unidentified request reaches dispatch.
+    let IdentifiedRequest { message: req, peer } = match read_windows_request(&mut framed).await {
+        Ok(request) => request,
         Err(e) => {
             let msg = truncate(&format!("{e:#}"));
-            tracing::debug!(error = %msg, "undecodable IPC request");
+            tracing::debug!(error = %msg, "rejected IPC request");
             let _ = ipc::send(&mut framed, ipc_err(msg)).await;
             return Ok(());
         }
     };
+    let peer = Some(peer);
     if is_internal_file_frame(&req) {
         ipc::send(
             &mut framed,
@@ -2128,5 +2108,88 @@ mod tests {
         assert!(out.ends_with("... (truncated)"), "{out}");
         let kept = out.strip_suffix("... (truncated)").unwrap();
         assert_eq!(kept.len(), MAX_DECODE_ERROR_LEN - MAX_DECODE_ERROR_LEN % 3);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_ipc_tests {
+    use std::process;
+
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+    use super::{
+        IpcMessage, PeerIdentity, ipc, is_internal_file_frame, is_ipc_upload_temp_name,
+        read_windows_request, windows_identity,
+    };
+
+    #[test]
+    fn only_rayfish_partial_upload_names_are_sweep_candidates() {
+        assert!(is_ipc_upload_temp_name("rayfish-ipc-upload-a.part"));
+        assert!(!is_ipc_upload_temp_name("rayfish-ipc-upload-a"));
+        assert!(!is_ipc_upload_temp_name("unrelated.part"));
+    }
+
+    #[test]
+    fn staged_and_chunk_frames_are_internal_only() {
+        assert!(is_internal_file_frame(&IpcMessage::SendFileStaged {
+            path: "x".into(),
+            filename: "x".into(),
+            peer: "p".into(),
+        }));
+        assert!(is_internal_file_frame(&IpcMessage::SendFileChunk {
+            data: vec![1],
+            done: false,
+        }));
+        assert!(!is_internal_file_frame(&IpcMessage::Status));
+    }
+
+    #[tokio::test]
+    async fn reads_the_request_before_identifying_its_named_pipe_client() {
+        let name = format!(r"\\.\pipe\rayfish-test-auth-order-{}", process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        // Keep Tokio's default identification-only client token; the server
+        // needs to query identity, not perform work as the client.
+        let client = ClientOptions::new().open(&name).unwrap();
+        server.connect().await.unwrap();
+        let expected_sid = windows_identity::current_user_sid().unwrap();
+        let expected_admin = windows_identity::is_current_process_elevated_admin();
+        let mut server = ipc::framed(server);
+        let receive = read_windows_request(&mut server);
+        tokio::pin!(receive);
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+        let mut client = ipc::framed(client);
+        ipc::send(&mut client, IpcMessage::Status).await.unwrap();
+        let received = receive.await.unwrap();
+        assert!(matches!(received.message, IpcMessage::Status));
+        let PeerIdentity::Windows {
+            sid,
+            is_local_system,
+            is_elevated_admin,
+        } = received.peer;
+        assert!(
+            sid == expected_sid,
+            "The request did not preserve the client's SID."
+        );
+        assert_eq!(is_local_system, expected_sid == "S-1-5-18");
+        assert_eq!(is_elevated_admin, expected_admin);
+    }
+}
+
+#[cfg(windows)]
+async fn recreate_named_pipe(name: &str, token: &CancellationToken) -> Option<NamedPipeServer> {
+    loop {
+        match create_named_pipe(name, false) {
+            Ok(pipe) => return Some(pipe),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to recreate IPC named pipe; retrying");
+                tokio::select! {
+                    _ = token.cancelled() => return None,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            }
+        }
     }
 }

@@ -72,7 +72,14 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore Windows test cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-x86_64-pc-windows-msvc"
+          save-if: 'false'
+
+      - name: Restore Windows installer cache
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-package-x86_64-pc-windows-msvc"
           save-if: 'false'
@@ -97,7 +104,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'The installer definition did not compile.' }
 
       - name: Test Windows desktop behavior
-        run: cargo test -q -p ray-windows --locked --target x86_64-pc-windows-msvc
+        run: cargo test -q -p ray-windows --locked
+
+      - name: Test Windows pipe authentication
+        run: |
+          cargo test -q -p rayfish --lib --locked reads_the_request_before_identifying_its_named_pipe_client
+          cargo test -q -p rayfish --lib --locked read_client_identity_matches_the_process_and_reverts_the_thread_token
 
       - name: Build test MSI
         shell: pwsh
@@ -158,7 +170,7 @@ jobs:
           } finally {
             $service.Dispose()
           }
-          cargo test -q -p ray-windows --locked --target x86_64-pc-windows-msvc installed_service_smoke -- --ignored --test-threads=1 2>&1 | ConvertTo-SafeDiagnostic
+          cargo test -q -p ray-windows --locked installed_service_smoke -- --ignored --test-threads=1 2>&1 | ConvertTo-SafeDiagnostic
           if ($LASTEXITCODE -ne 0) { throw 'The installed-service IPC smoke test failed.' }
           try {
             $adapter = Get-NetAdapter -Name 'rayfish' -ErrorAction Stop | Select-Object -First 1
@@ -239,7 +251,7 @@ jobs:
             Get-Content -LiteralPath $installLog -Raw | ConvertTo-SafeDiagnostic |
               Set-Content -LiteralPath (Join-Path $bundle 'rayfish-install.txt')
           }
-          $test = Get-ChildItem -Path 'target\x86_64-pc-windows-msvc\debug\deps\rayfish_app-*.exe' -ErrorAction SilentlyContinue |
+          $test = Get-ChildItem -Path 'target\debug\deps\rayfish_app-*.exe', 'target\x86_64-pc-windows-msvc\debug\deps\rayfish_app-*.exe' -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($test) { Copy-Item -LiteralPath $test.FullName -Destination (Join-Path $bundle 'smoke-test.exe') }
           @{sourceCommit=$env:GITHUB_SHA; sourceRunId=$env:GITHUB_RUN_ID; smokeTestPresent=[bool]$test} |

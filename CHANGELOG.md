@@ -32,6 +32,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: the service reads a pipe request before checking its caller, avoiding
+  connection failures while preserving authorization checks.
 - Windows: Disconnect keeps the service and saved memberships alive instead of
   terminating the Wintun session. Standby blocks VPN traffic in both directions.
 - Windows: the app talks directly to the service over typed IPC, starts a stopped
