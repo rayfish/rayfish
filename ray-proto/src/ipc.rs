@@ -621,8 +621,9 @@ pub enum IpcMessage {
         #[serde(default)]
         lan_peers: Vec<LanPeerInfo>,
     },
-    /// Reply to `Ping`. `probes` holds one entry per probe in send order: the
-    /// measured round-trip in milliseconds, or `None` if that probe timed out.
+    /// Reply to `Ping`. `probes` holds one entry per probe attempt, in order:
+    /// the measured round-trip in milliseconds, or `None` if no reply was
+    /// observed. `probe_details` distinguishes timeouts from local failures.
     PingResponse {
         /// Resolved display name for the peer (hostname if known, else short id).
         peer_name: String,
@@ -631,6 +632,11 @@ pub enum IpcMessage {
         /// Network whose connection the probes traversed.
         network: String,
         probes: Vec<Option<f64>>,
+        /// Per-probe observations, in the same order as `probes`. Empty from
+        /// older daemons. The top-level path fields above remain a final
+        /// snapshot for compatibility; they must not label individual probes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        probe_details: Vec<PingProbeDetails>,
     },
     /// Reply to `Netcheck`. Local endpoint diagnostics. Fields the underlying
     /// iroh API does not reliably expose are left `None` rather than guessed.
@@ -1591,6 +1597,40 @@ pub struct ConnectionInfo {
     pub quality_issue: Option<ConnectionIssue>,
 }
 
+/// A locally observed selected QUIC path, not the route of a specific packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingSelectedPath {
+    pub conn_type: ConnType,
+    pub remote_addr: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PingProbeOutcome {
+    Reply,
+    Timeout,
+    SendFailed,
+    ReplyWaitFailed,
+    ConnectionClosed,
+    NoConnection,
+}
+
+/// Observations spanning one probe, including its send and reply wait. Even
+/// equal before/after snapshots do not prove the path stayed unchanged: a
+/// selected-path event may have switched away and back in between.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingProbeDetails {
+    pub outcome: PingProbeOutcome,
+    pub selected_path_before: Option<PingSelectedPath>,
+    pub selected_path_after: Option<PingSelectedPath>,
+    pub selection_changed: bool,
+    /// A lagged/overflowed event stream prevents a claim of stable selection.
+    pub path_history_incomplete: bool,
+    /// This probe used a different connection than the preceding probe that
+    /// obtained a connection handle (which may already have been closed).
+    pub connection_changed: bool,
+}
+
 #[derive(
     Debug,
     Clone,
@@ -1649,6 +1689,87 @@ pub enum ConnType {
 /// Public because a multi-frame reply has to size its own frames against it:
 /// [`IpcMessage::LogChunk`] carries as much as fits and no more.
 pub const MAX_FRAME_LEN: usize = 1_048_576;
+
+#[cfg(test)]
+mod ping_compatibility_tests {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    enum OldReply {
+        PingResponse {
+            peer_name: String,
+            conn_type: ConnType,
+            remote_addr: Option<String>,
+            network: String,
+            probes: Vec<Option<f64>>,
+        },
+    }
+
+    fn observations() -> Vec<PingProbeDetails> {
+        let direct = PingSelectedPath {
+            conn_type: ConnType::Direct,
+            remote_addr: "ip:192.0.2.1:41383".into(),
+        };
+        let relay = PingSelectedPath {
+            conn_type: ConnType::Relay,
+            remote_addr: "relay:https://relay.example/".into(),
+        };
+        vec![PingProbeDetails {
+            outcome: PingProbeOutcome::Reply,
+            selected_path_before: Some(direct),
+            selected_path_after: Some(relay),
+            selection_changed: true,
+            path_history_incomplete: false,
+            connection_changed: false,
+        }]
+    }
+
+    #[test]
+    fn old_ping_reply_has_no_per_probe_path_evidence() {
+        let old = OldReply::PingResponse {
+            peer_name: "peer".into(),
+            conn_type: ConnType::Relay,
+            remote_addr: Some("relay:https://relay.example/".into()),
+            network: "net".into(),
+            probes: vec![Some(7.0), None],
+        };
+        let encoded = rmp_serde::to_vec_named(&old).unwrap();
+        let IpcMessage::PingResponse {
+            probes,
+            probe_details,
+            ..
+        } = rmp_serde::from_slice(&encoded).unwrap()
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(probes, vec![Some(7.0), None]);
+        assert!(probe_details.is_empty());
+    }
+
+    #[test]
+    fn ping_observations_roundtrip_and_old_clients_ignore_them() {
+        let response = IpcMessage::PingResponse {
+            peer_name: "peer".into(),
+            conn_type: ConnType::Relay,
+            remote_addr: Some("relay:https://relay.example/".into()),
+            network: "net".into(),
+            probes: vec![Some(7.0)],
+            probe_details: observations(),
+        };
+        let encoded = rmp_serde::to_vec_named(&response).unwrap();
+        let IpcMessage::PingResponse { probe_details, .. } =
+            rmp_serde::from_slice(&encoded).unwrap()
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(probe_details, observations());
+        let OldReply::PingResponse {
+            probes, conn_type, ..
+        } = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(probes, vec![Some(7.0)]);
+        assert_eq!(conn_type, ConnType::Relay);
+    }
+}
 
 /// How many log bytes one [`IpcMessage::LogChunk`] carries.
 ///

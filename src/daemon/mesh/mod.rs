@@ -22,6 +22,7 @@ mod files;
 mod firewall;
 mod invite;
 mod join;
+mod ping;
 mod publish;
 mod reconverge;
 mod rename;

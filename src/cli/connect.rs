@@ -87,62 +87,117 @@ struct PingOutput {
     network: String,
     conn_type: &'static str,
     remote_addr: Option<String>,
+    /// Scope of the legacy path fields; per-probe evidence is below.
+    summary_path_scope: &'static str,
+    /// Legacy JSON name: counts probe attempts, including local send failures.
+    /// It is not a count of transmitted or lost network packets.
     sent: usize,
     received: usize,
     rtts_ms: Vec<Option<f64>>,
+    /// Each entry describes local path selection observations, not packet routes.
+    probe_details: Vec<ipc::PingProbeDetails>,
 }
 
-impl DisplayOut for PingOutput {
-    fn print_human(&self) {
-        let addr = self.remote_addr.as_deref().unwrap_or("?");
-        for (seq, probe) in self.rtts_ms.iter().enumerate() {
-            match probe {
-                Some(ms) => println!(
-                    "  {} pong from {} via {} {}  seq={seq} rtt={}",
-                    style::green("✓"),
-                    style::value(&self.peer),
-                    self.conn_type,
-                    style::faint(addr),
-                    style::latency(*ms),
-                ),
-                None => println!(
-                    "  {} no reply from {}  seq={seq} {}",
-                    style::red("✗"),
-                    style::value(&self.peer),
-                    style::faint("(timeout)"),
-                ),
-            }
-        }
+fn selected_path_text(path: &Option<ipc::PingSelectedPath>) -> String {
+    path.as_ref().map_or_else(
+        || "unknown".to_string(),
+        |path| format!("{} {}", path.conn_type, path.remote_addr),
+    )
+}
 
-        let loss = if self.sent > 0 {
+fn probe_path_text(detail: Option<&ipc::PingProbeDetails>) -> String {
+    let Some(detail) = detail else {
+        return "selected path not reported by daemon".to_string();
+    };
+    let before = selected_path_text(&detail.selected_path_before);
+    let after = selected_path_text(&detail.selected_path_after);
+    let mut parts = Vec::new();
+    if detail.path_history_incomplete {
+        parts.push(format!(
+            "selected-path history incomplete (before={before}; after={after})"
+        ));
+    } else if detail.selection_changed {
+        parts.push(format!(
+            "selected path changed during probe (before={before}; after={after})"
+        ));
+    } else {
+        parts.push(format!("selected={after}"));
+    }
+    if detail.connection_changed {
+        parts.push("connection changed".to_string());
+    }
+    parts.join("; ")
+}
+
+impl PingOutput {
+    fn probe_summary(&self) -> String {
+        let unanswered = if self.sent > 0 {
             (self.sent - self.received) as f64 * 100.0 / self.sent as f64
         } else {
             0.0
         };
+        format!(
+            "{} probes attempted, {} answered, {unanswered:.0}% unanswered",
+            self.sent, self.received
+        )
+    }
+
+    fn probe_line(&self, seq: usize, probe: Option<f64>) -> String {
+        let detail = self.probe_details.get(seq);
+        let path = probe_path_text(detail);
+        match probe {
+            Some(ms) => format!(
+                "  {} pong from {} seq={seq} rtt={}  {}",
+                style::green("✓"),
+                style::value(&self.peer),
+                style::latency(ms),
+                style::faint(&path),
+            ),
+            None => {
+                let reason = match detail.map(|detail| detail.outcome) {
+                    Some(ipc::PingProbeOutcome::Timeout) => "probe timed out",
+                    Some(ipc::PingProbeOutcome::SendFailed) => "send failed",
+                    Some(ipc::PingProbeOutcome::ReplyWaitFailed) => "reply wait failed",
+                    Some(ipc::PingProbeOutcome::ConnectionClosed) => "connection closed",
+                    Some(ipc::PingProbeOutcome::NoConnection) => "no live connection",
+                    _ => "no reply",
+                };
+                format!(
+                    "  {} no reply from {} seq={seq} ({reason})  {}",
+                    style::red("✗"),
+                    style::value(&self.peer),
+                    style::faint(&path)
+                )
+            }
+        }
+    }
+}
+
+impl DisplayOut for PingOutput {
+    fn print_human(&self) {
+        for (seq, probe) in self.rtts_ms.iter().enumerate() {
+            println!("{}", self.probe_line(seq, *probe));
+        }
+        println!(
+            "  {}",
+            style::faint("Selected paths are local observations, not per-packet route traces.")
+        );
+
         println!();
         println!("  --- {} ping statistics ---", self.peer);
         let rtts: Vec<f64> = self.rtts_ms.iter().filter_map(|p| *p).collect();
+        let summary = self.probe_summary();
         if rtts.is_empty() {
-            println!(
-                "  {} sent, {} received, {loss:.0}% loss",
-                self.sent, self.received
-            );
+            println!("  {summary}");
             println!(
                 "  {}",
-                style::faint(
-                    "no replies — the peer may be offline, firewalled, or on an \
-                     incompatible version (run ray update)"
-                )
+                style::faint("no replies received during this run; see per-probe results above")
             );
         } else {
             let min = rtts.iter().cloned().fold(f64::INFINITY, f64::min);
             let max = rtts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let avg = rtts.iter().sum::<f64>() / self.received as f64;
-            println!(
-                "  {} sent, {} received, {loss:.0}% loss, \
-                 rtt min/avg/max {min:.0}/{avg:.0}/{max:.0} ms",
-                self.sent, self.received
-            );
+            println!("  {summary}, rtt min/avg/max {min:.0}/{avg:.0}/{max:.0} ms");
         }
     }
 }
@@ -342,6 +397,7 @@ pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()
             remote_addr,
             network,
             probes,
+            probe_details,
         } => {
             let conn_str = match conn_type {
                 ipc::ConnType::Direct => "direct",
@@ -356,9 +412,11 @@ pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()
                 network,
                 conn_type: conn_str,
                 remote_addr,
+                summary_path_scope: "end_of_run",
                 sent,
                 received,
                 rtts_ms: probes,
+                probe_details,
             })?;
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
@@ -425,4 +483,123 @@ pub(crate) async fn ipc_admin(network: &str, action: AdminAction) -> Result<()> 
         other => fail_unexpected(&other),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ping_tests {
+    use super::*;
+
+    fn path(conn_type: ipc::ConnType, remote_addr: &str) -> Option<ipc::PingSelectedPath> {
+        Some(ipc::PingSelectedPath {
+            conn_type,
+            remote_addr: remote_addr.into(),
+        })
+    }
+
+    fn detail(selected: Option<ipc::PingSelectedPath>) -> ipc::PingProbeDetails {
+        ipc::PingProbeDetails {
+            outcome: ipc::PingProbeOutcome::Reply,
+            selected_path_before: selected.clone(),
+            selected_path_after: selected,
+            selection_changed: false,
+            path_history_incomplete: false,
+            connection_changed: false,
+        }
+    }
+
+    fn output(details: Vec<ipc::PingProbeDetails>) -> PingOutput {
+        PingOutput {
+            peer: "dual-a10".into(),
+            network: "net".into(),
+            conn_type: "relay",
+            remote_addr: Some("relay:https://final-relay.example/".into()),
+            summary_path_scope: "end_of_run",
+            sent: 3,
+            received: 3,
+            rtts_ms: vec![Some(7.0), Some(550.0), Some(78.0)],
+            probe_details: details,
+        }
+    }
+
+    #[test]
+    fn ping_does_not_relabel_earlier_replies_with_the_final_path() {
+        let output = output(vec![
+            detail(path(ipc::ConnType::Direct, "ip:192.0.2.1:41383")),
+            detail(path(
+                ipc::ConnType::Relay,
+                "relay:https://middle-relay.example/",
+            )),
+            detail(path(ipc::ConnType::Direct, "ip:[2001:db8::1]:41383")),
+        ]);
+        let first = output.probe_line(0, output.rtts_ms[0]);
+        let second = output.probe_line(1, output.rtts_ms[1]);
+        let third = output.probe_line(2, output.rtts_ms[2]);
+        assert!(first.contains("selected=direct ip:192.0.2.1:41383"));
+        assert!(second.contains("selected=relay relay:https://middle-relay.example/"));
+        assert!(third.contains("selected=direct ip:[2001:db8::1]:41383"));
+        for line in [&first, &second, &third] {
+            assert!(!line.contains("final-relay.example"));
+            assert!(!line.contains(" via "));
+        }
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["summary_path_scope"], "end_of_run");
+        assert_eq!(json["rtts_ms"], serde_json::json!([7.0, 550.0, 78.0]));
+        assert_eq!(
+            json["probe_details"][0]["selected_path_after"]["remote_addr"],
+            "ip:192.0.2.1:41383"
+        );
+    }
+
+    #[test]
+    fn ping_with_an_old_daemon_reports_path_unknown_instead_of_reusing_final_state() {
+        let output = output(vec![]);
+        let line = output.probe_line(0, Some(7.0));
+        assert!(line.contains("selected path not reported by daemon"));
+        assert!(!line.contains("final-relay.example"));
+        assert!(!line.contains("selected=relay"));
+    }
+
+    #[test]
+    fn ping_marks_changes_and_incomplete_history_even_for_equal_snapshots() {
+        let mut changed = detail(path(ipc::ConnType::Direct, "ip:192.0.2.1:41383"));
+        changed.selection_changed = true;
+        changed.connection_changed = true;
+        let label = probe_path_text(Some(&changed));
+        assert!(label.contains("selected path changed during probe"));
+        assert!(label.contains("connection changed"));
+        changed.path_history_incomplete = true;
+        assert!(probe_path_text(Some(&changed)).contains("history incomplete"));
+        assert_eq!(probe_path_text(Some(&detail(None))), "selected=unknown");
+    }
+
+    #[test]
+    fn ping_reports_closed_missing_and_failed_sends_without_calling_them_timeouts() {
+        for (outcome, expected) in [
+            (ipc::PingProbeOutcome::ConnectionClosed, "connection closed"),
+            (ipc::PingProbeOutcome::NoConnection, "no live connection"),
+            (ipc::PingProbeOutcome::SendFailed, "send failed"),
+            (ipc::PingProbeOutcome::ReplyWaitFailed, "reply wait failed"),
+            (ipc::PingProbeOutcome::Timeout, "probe timed out"),
+        ] {
+            let mut details = detail(None);
+            details.outcome = outcome;
+            let line = output(vec![details]).probe_line(0, None);
+            assert!(line.contains(expected), "{line}");
+        }
+    }
+
+    #[test]
+    fn ping_counts_unanswered_probe_attempts_without_claiming_packet_loss() {
+        let mut missing = detail(None);
+        missing.outcome = ipc::PingProbeOutcome::NoConnection;
+        let mut output = output(vec![missing; 3]);
+        output.received = 0;
+        output.rtts_ms = vec![None; 3];
+        let summary = output.probe_summary();
+        assert!(summary.contains("3 probes attempted, 0 answered, 100% unanswered"));
+        assert!(!summary.contains(" sent"));
+        assert!(!summary.contains("loss"));
+        output.received = 2;
+        assert!(output.probe_summary().contains("33% unanswered"));
+    }
 }
