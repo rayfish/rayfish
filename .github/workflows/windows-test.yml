@@ -34,6 +34,12 @@ jobs:
       - name: Install cargo-wix
         run: cargo install cargo-wix --version 0.3.9 --locked
 
+      - name: Validate installer definition
+        shell: pwsh
+        run: |
+          candle.exe -nologo -arch x64 "-dCargoTargetBinDir=$env:RUNNER_TEMP" -out "$env:RUNNER_TEMP\installer-check.wixobj" wix/main.wxs
+          if ($LASTEXITCODE -ne 0) { throw 'The installer definition did not compile.' }
+
       - name: Test Windows desktop behavior
         run: cargo test -q -p ray-windows --locked --target x86_64-pc-windows-msvc
 
