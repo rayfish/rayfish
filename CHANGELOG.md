@@ -32,6 +32,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: pending network joins show that coordinator approval is required instead
+  of claiming the PC is connected before admission.
 - Windows: Quit closes a hidden app window after the service finishes disconnecting.
 - Windows: the service reads a pipe request before checking its caller, avoiding
   connection failures while preserving authorization checks.

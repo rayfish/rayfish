@@ -256,6 +256,14 @@ impl Dashboard {
         self.dialog = Some(Dialog::Output);
     }
 
+    fn awaiting_approval(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.status.active
+                && snapshot.status.networks.is_empty()
+                && !snapshot.status.pending_networks.is_empty()
+        })
+    }
+
     pub fn form_succeeded(&mut self) {
         if self.submitted_form {
             self.dialog = None;
@@ -430,6 +438,8 @@ impl Dashboard {
                 )
             } else if self.snapshot.is_none() {
                 ("loading status", MUTED)
+            } else if self.awaiting_approval() {
+                ("awaiting approval", AMBER)
             } else if active {
                 ("connected", GREEN)
             } else {
@@ -785,11 +795,16 @@ impl Dashboard {
                     ui.horizontal(|ui| {
                         ui.label(heading(network, 16.0).color(MUTED));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(mono("Joining", 12.0).color(MUTED));
+                            ui.label(mono("Awaiting approval", 12.0).color(AMBER));
                             ui.spinner();
                         });
                     });
-                    ui.label(RichText::new("Waiting for membership confirmation.").color(FAINT));
+                    ui.label(
+                        RichText::new(
+                            "A network coordinator must approve this PC before it can connect.",
+                        )
+                        .color(MUTED),
+                    );
                 });
             }
         }
@@ -990,6 +1005,8 @@ impl Dashboard {
                         .is_some_and(|snapshot| snapshot.status.active);
                     let (state, color) = if self.status_error.is_some() {
                         ("status unavailable", AMBER)
+                    } else if self.awaiting_approval() {
+                        ("awaiting approval", AMBER)
                     } else if active {
                         ("connected", GREEN)
                     } else {
@@ -1621,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_membership_is_shown_as_joining_instead_of_no_networks() {
+    fn pending_membership_waits_for_approval_without_claiming_connectivity() {
         let ctx = Context::default();
         let mut app = Dashboard::new(&ctx).unwrap();
         let mut snapshot = crate::preview::fixture(false);
@@ -1630,8 +1647,18 @@ mod tests {
         render(&mut app, &ctx);
         let labels = render(&mut app, &ctx);
         assert!(labels.iter().any(|(text, _)| text == "example"));
-        assert!(labels.iter().any(|(text, _)| text == "Joining"));
+        assert!(labels.iter().any(|(text, _)| text == "Awaiting approval"));
+        assert!(labels.iter().any(|(text, _)| text == "awaiting approval"));
+        assert!(!labels.iter().any(|(text, _)| text == "connected"));
         assert!(!labels.iter().any(|(text, _)| text == "No networks yet."));
+        app.page = Page::Settings;
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "awaiting approval"));
+        assert!(!labels.iter().any(|(text, _)| text == "connected"));
+        app.snapshot.as_mut().unwrap().status.networks =
+            crate::preview::fixture(true).status.networks;
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "connected"));
     }
 
     #[test]
