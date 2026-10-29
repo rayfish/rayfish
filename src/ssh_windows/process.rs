@@ -598,8 +598,11 @@ impl Process {
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = u32::try_from(size_of::<STARTUPINFOEXW>())?;
         startup.lpAttributeList = attributes.pointer();
+        // Without this flag Windows duplicates a redirected parent's standard
+        // handles even when inheritance is disabled, bypassing ConPTY. Null
+        // standard handles let the pseudoconsole provide its own console I/O.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         if console.is_none() {
-            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
             startup.StartupInfo.hStdInput = input.0;
             startup.StartupInfo.hStdOutput = output.0;
             startup.StartupInfo.hStdError = handles[2];
