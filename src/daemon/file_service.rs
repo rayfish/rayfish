@@ -762,13 +762,12 @@ impl FileService {
         };
 
         match self.accept_file_for(id, output, recipient).await {
-            IpcMessage::Ok { message } => {
+            Ok(Done(message)) => {
                 tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted");
             }
-            IpcMessage::Error { message } => {
-                tracing::warn!(from = %from.fmt_short(), %message, "file auto-accept failed");
+            Err(error) => {
+                tracing::warn!(from = %from.fmt_short(), %error, "file auto-accept failed");
             }
-            _ => {}
         }
     }
 
@@ -782,7 +781,7 @@ impl FileService {
         id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let recipient = Recipient {
             owner: peer_cred,
             caller_chose_dir: true,
@@ -795,7 +794,7 @@ impl FileService {
         id: u64,
         output: Option<String>,
         recipient: Recipient,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let pending_file = {
             let mut pending = self.pending_files.lock().unwrap();
             match take_pending(&mut pending, id) {
@@ -804,7 +803,7 @@ impl FileService {
                     file
                 }
                 None => {
-                    return ipc_err(format!("no pending file with id {id}"));
+                    return op_err(format!("no pending file with id {id}"));
                 }
             }
         };
@@ -824,11 +823,11 @@ impl FileService {
         let peer = file.from;
         let response = self.receive_file(file, output, recipient).await;
         match response {
-            IpcMessage::Ok { .. } => {
+            Ok(_) => {
                 if let Some(file) = offer.file.as_ref()
                     && let Err(error) = self.record_completed_offer(file)
                 {
-                    return ipc_err(format!(
+                    return op_err(format!(
                         "file saved but could not record delivery confirmation: {error}; retry with `ray files accept {id}`"
                     ));
                 }
@@ -846,10 +845,7 @@ impl FileService {
                 tokio::spawn(async move { service.flush_outbox_for(peer).await });
                 response
             }
-            IpcMessage::Error { message } => {
-                ipc_err(format!("{message}; retry with `ray files accept {id}`"))
-            }
-            other => other,
+            Err(e) => op_err(format!("{e}; retry with `ray files accept {id}`")),
         }
     }
 
@@ -858,11 +854,11 @@ impl FileService {
         pending_file: &PendingFile,
         output: Option<String>,
         recipient: Recipient,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         // Checked again here, not only when the offer was queued: offers saved
         // by an older daemon were never validated.
         if !is_safe_file_name(&pending_file.filename) {
-            return ipc_err(format!("invalid file name '{}'", pending_file.filename));
+            return op_err(format!("invalid file name '{}'", pending_file.filename));
         }
         let blob_hash = pending_file.blob_hash;
         let peer_label = pending_file.from.fmt_short().to_string();
@@ -888,12 +884,12 @@ impl FileService {
             .set(&recv_tag, iroh_blobs::HashAndFormat::raw(blob_hash))
             .await
         {
-            return ipc_err(format!("blob store error: {e}"));
+            return op_err(format!("blob store error: {e}"));
         }
 
         let local = match self.transport.blob_store.remote().local(blob_hash).await {
             Ok(local) => local,
-            Err(e) => return ipc_err(format!("blob store error: {e}")),
+            Err(e) => return op_err(format!("blob store error: {e}")),
         };
         let downloaded = local.local_bytes();
         self.transfers.note_progress(transfer_id, downloaded);
@@ -905,8 +901,8 @@ impl FileService {
             );
             let conn = match tokio::time::timeout(OFFER_CONNECT_TIMEOUT, connect).await {
                 Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => return ipc_err(format!("cannot reach sender: {e}")),
-                Err(_) => return ipc_err("cannot reach sender: connection timed out"),
+                Ok(Err(e)) => return op_err(format!("cannot reach sender: {e}")),
+                Err(_) => return op_err("cannot reach sender: connection timed out"),
             };
 
             // `fetch` returns a `GetProgress`: awaiting it directly discards the
@@ -929,10 +925,10 @@ impl FileService {
                         .note_progress(transfer_id, downloaded.saturating_add(n)),
                     Some(GetProgressItem::Done(_)) => break,
                     Some(GetProgressItem::Error(e)) => {
-                        return ipc_err(format!("blob fetch failed: {e}"));
+                        return op_err(format!("blob fetch failed: {e}"));
                     }
                     None => {
-                        return ipc_err("blob fetch ended without a result".to_string());
+                        return op_err("blob fetch ended without a result".to_string());
                     }
                 }
             }
@@ -953,7 +949,7 @@ impl FileService {
             .await
         {
             Ok(dest) => dest,
-            Err(e) => return ipc_err(format!("write failed: {e}")),
+            Err(e) => return op_err(format!("write failed: {e}")),
         };
         #[cfg(not(unix))]
         let dest = {
@@ -962,7 +958,7 @@ impl FileService {
             // checks.
             let _ = recipient;
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                return ipc_err(format!("cannot create directory '{}': {e}", dir.display()));
+                return op_err(format!("cannot create directory '{}': {e}", dir.display()));
             }
             // Export straight from the blob store to the destination rather
             // than through `get_bytes`, which holds the whole file in memory.
@@ -974,7 +970,7 @@ impl FileService {
                 .export(blob_hash, &dest)
                 .await
             {
-                return ipc_err(format!("write failed: {e}"));
+                return op_err(format!("write failed: {e}"));
             }
             dest
         };
@@ -987,9 +983,7 @@ impl FileService {
         let destination = std::fs::canonicalize(&dest).unwrap_or(dest.clone());
         finish_guard.success(&destination);
 
-        IpcMessage::Ok {
-            message: format!("saved to {}", dest.display()),
-        }
+        Ok(Done(format!("saved to {}", dest.display())))
     }
 
     /// Write a fetched blob to `file_name` in `dir` for `recipient`, returning
@@ -1081,7 +1075,7 @@ impl FileService {
     /// The read happens daemon-side, so this only works for paths the daemon
     /// itself can see; IPC clients use `send_file_fd`. Kept for in-process
     /// callers (ray-mobile), where daemon and app share one privilege domain.
-    pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> IpcMessage {
+    pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> OpResult<Done> {
         self.send_file_named(path, None, peer).await
     }
 
@@ -1090,14 +1084,14 @@ impl FileService {
         path: &str,
         requested_filename: Option<&str>,
         peer: &str,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let file_path = Path::new(path);
         // Same guard the fd path applies: a FIFO or a character device would
         // stall or balloon the import.
         let size = match std::fs::metadata(file_path) {
             Ok(m) if m.is_file() => m.len(),
-            Ok(_) => return ipc_err(format!("not a regular file: '{}'", file_path.display())),
-            Err(e) => return ipc_err(format!("cannot read '{}': {e}", file_path.display())),
+            Ok(_) => return op_err(format!("not a regular file: '{}'", file_path.display())),
+            Err(e) => return op_err(format!("cannot read '{}': {e}", file_path.display())),
         };
         let filename = requested_filename
             .and_then(|name| Path::new(name).file_name())
@@ -1111,7 +1105,7 @@ impl FileService {
 
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
             Some(id) => id,
-            None => return ipc_err(format!("unknown peer '{peer}'")),
+            None => return op_err(format!("unknown peer '{peer}'")),
         };
         // `add_path` streams the file into the blob store a chunk at a time (and
         // reflinks instead of copying where the filesystem supports it). Reading
@@ -1127,7 +1121,7 @@ impl FileService {
             .await
         {
             Ok(t) => t,
-            Err(e) => return ipc_err(format!("blob store error: {e}")),
+            Err(e) => return op_err(format!("blob store error: {e}")),
         };
         self.queue_offer(peer_id, peer, filename, size, temp).await
     }
@@ -1142,14 +1136,14 @@ impl FileService {
         fd: OwnedFd,
         filename: &str,
         peer: &str,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let file = File::from(fd);
         // fstat before reading: an fd is attacker-chosen input, and reading a
         // FIFO or a device (/dev/zero) here would stall or balloon the daemon.
         let size = match file.metadata() {
             Ok(m) if m.is_file() => m.len(),
-            Ok(_) => return ipc_err("not a regular file"),
-            Err(e) => return ipc_err(format!("cannot stat file: {e}")),
+            Ok(_) => return op_err("not a regular file"),
+            Err(e) => return op_err(format!("cannot stat file: {e}")),
         };
         // The client names the file; keep only the basename so a hostile
         // client can't smuggle path components into the offer.
@@ -1160,7 +1154,7 @@ impl FileService {
 
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
             Some(id) => id,
-            None => return ipc_err(format!("unknown peer '{peer}'")),
+            None => return op_err(format!("unknown peer '{peer}'")),
         };
         // There is no path to hand `add_path` here, only the caller's fd, so feed
         // the store a chunk stream off the descriptor. Same reason as the path
@@ -1176,7 +1170,7 @@ impl FileService {
             .await
         {
             Ok(t) => t,
-            Err(e) => return ipc_err(format!("blob store error: {e}")),
+            Err(e) => return op_err(format!("blob store error: {e}")),
         };
         self.queue_offer(peer_id, peer, filename, size, temp).await
     }
@@ -1200,15 +1194,15 @@ impl FileService {
         filename: String,
         size: u64,
         temp: iroh_blobs::api::TempTag,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         if self.outbox.lock().unwrap().len() >= MAX_PENDING_FILES {
-            return ipc_err("file send queue is full; cancel a pending send first");
+            return op_err("file send queue is full; cancel a pending send first");
         }
         let hash = temp.hash();
         let offer_id = control::FileOfferId::new();
         let blob_tag = blob_tags::send_offer(&hash, &peer_id, offer_id);
         if let Err(e) = self.tag_blob(blob_tag.clone(), temp).await {
-            return ipc_err(e);
+            return op_err(e);
         }
 
         // Register the transfer now, before the peer can possibly learn the hash:
@@ -1238,7 +1232,7 @@ impl FileService {
                 drop(outbox);
                 self.transfers.fail_offer(transfer_id);
                 self.reclaim_blob(blob_tag);
-                return ipc_err("file send queue is full; cancel a pending send first");
+                return op_err("file send queue is full; cancel a pending send first");
             }
             outbox.push(entry);
         }
@@ -1249,7 +1243,7 @@ impl FileService {
                 .retain(|entry| entry.offer_id != offer_id);
             self.transfers.fail_offer(transfer_id);
             self.reclaim_blob(blob_tag);
-            return ipc_err(format!("could not save queued file offer: {error}"));
+            return op_err(format!("could not save queued file offer: {error}"));
         }
 
         // Kick delivery in the background either way: even a peer with no live
@@ -1268,7 +1262,7 @@ impl FileService {
                 peer
             )
         };
-        IpcMessage::Ok { message }
+        Ok(Done(message))
     }
 
     /// The peer finished pulling a blob we offered it: our copy has done its job,
@@ -1570,7 +1564,7 @@ impl FileService {
     }
 
     /// `ray files cancel <id>`: drop a queued send that hasn't been delivered.
-    pub(crate) fn cancel_send(&self, id: u64) -> IpcMessage {
+    pub(crate) fn cancel_send(&self, id: u64) -> OpResult<Done> {
         let removed = {
             let mut outbox = self.outbox.lock().unwrap();
             let i = outbox.iter().position(|e| e.id == id && !e.delivered);
@@ -1581,22 +1575,20 @@ impl FileService {
                 self.transfers.fail_offer(entry.transfer_id);
                 self.save_outbox();
                 self.reclaim_send(&entry);
-                IpcMessage::Ok {
-                    message: format!(
-                        "canceled queued send of {} to {}",
-                        entry.filename,
-                        entry.peer.fmt_short()
-                    ),
-                }
+                Ok(Done(format!(
+                    "canceled queued send of {} to {}",
+                    entry.filename,
+                    entry.peer.fmt_short()
+                )))
             }
-            None => ipc_err(format!("no queued send with id {id}")),
+            None => op_err(format!("no queued send with id {id}")),
         }
     }
 
     /// Cancel an outgoing transfer after its offer was delivered. A packet
     /// already in flight may finish, but this transfer cannot be revived and
     /// the local blob is released for GC.
-    pub(crate) fn cancel_transfer(&self, id: u64) -> IpcMessage {
+    pub(crate) fn cancel_transfer(&self, id: u64) -> OpResult<Done> {
         match self.transfers.cancel(id) {
             Some((hash, peer)) => {
                 let removed = {
@@ -1612,11 +1604,9 @@ impl FileService {
                 } else {
                     self.reclaim_send_if_unused(hash, peer);
                 }
-                IpcMessage::Ok {
-                    message: format!("canceled file transfer {id}"),
-                }
+                Ok(Done(format!("canceled file transfer {id}")))
             }
-            None => ipc_err(format!("no active outgoing transfer with id {id}")),
+            None => op_err(format!("no active outgoing transfer with id {id}")),
         }
     }
 
@@ -1638,7 +1628,7 @@ impl FileService {
 
     /// List pending file offers awaiting `ray files accept`, tagging each with
     /// whether it came from one of our own paired devices.
-    pub(crate) fn list_files(&self) -> IpcMessage {
+    pub(crate) fn list_files(&self) -> FileQueues {
         let pending = self.pending_files.lock().unwrap();
         let files = pending
             .iter()
@@ -1685,8 +1675,8 @@ impl FileService {
                 error: t.error,
             })
             .collect();
-        IpcMessage::FileList {
-            files,
+        FileQueues {
+            incoming: files,
             outbox,
             transfers,
         }
@@ -1694,10 +1684,10 @@ impl FileService {
 
     /// Decline a pending file offer: drop it from the queue without fetching the
     /// blob. Release any data retained from an unsuccessful receive.
-    pub(crate) fn reject_file(self: &Arc<Self>, id: u64) -> IpcMessage {
+    pub(crate) fn reject_file(self: &Arc<Self>, id: u64) -> OpResult<Done> {
         let mut pending = self.pending_files.lock().unwrap();
         let Some(file) = pending.iter().find(|file| file.id == id) else {
-            return ipc_err(format!("no pending file with id {id}"));
+            return op_err(format!("no pending file with id {id}"));
         };
         {
             let mut declines = self.declines.lock().unwrap();
@@ -1705,7 +1695,7 @@ impl FileService {
                 if let Some(index) = declines.iter().position(|entry| entry.delivered) {
                     declines.remove(index);
                 } else {
-                    return ipc_err("file decline queue is full; retry after peers reconnect");
+                    return op_err("file decline queue is full; retry after peers reconnect");
                 }
             }
             declines.push(FileDecision {
@@ -1720,7 +1710,7 @@ impl FileService {
                 .lock()
                 .unwrap()
                 .retain(|entry| entry.peer != file.from || entry.offer_id != file.offer_id);
-            return ipc_err(format!("could not save file decline: {error}"));
+            return op_err(format!("could not save file decline: {error}"));
         }
         let file =
             take_pending(&mut pending, id).expect("the offer remains locked until it is taken");
@@ -1736,9 +1726,11 @@ impl FileService {
         let service = Arc::clone(self);
         let peer = file.from;
         tokio::spawn(async move { service.flush_outbox_for(peer).await });
-        IpcMessage::Ok {
-            message: format!("declined {} from {}", file.filename, peer.fmt_short()),
-        }
+        Ok(Done(format!(
+            "declined {} from {}",
+            file.filename,
+            peer.fmt_short()
+        )))
     }
 
     fn record_completed_offer(&self, file: &PendingFile) -> Result<(), String> {
@@ -2352,7 +2344,7 @@ mod tests {
                 sender.accept_file_offer(conn).await;
             }
         );
-        assert!(matches!(response, IpcMessage::Ok { .. }));
+        assert!(response.is_ok());
         assert_eq!(
             std::fs::read(tmp.path().join("downloads/file.bin")).unwrap(),
             b"payload"
@@ -2398,9 +2390,10 @@ mod tests {
                 None,
             )
             .await;
-        let IpcMessage::Error { message } = response else {
+        let Err(error) = response else {
             panic!("confirmation failure must be reported")
         };
+        let message = error.to_string();
         assert!(message.contains("file saved but could not record delivery confirmation"));
         assert_eq!(
             std::fs::read(tmp.path().join("downloads/file.bin")).unwrap(),
@@ -2583,7 +2576,7 @@ mod tests {
                 None,
             )
             .await;
-        assert!(matches!(response, IpcMessage::Error { .. }));
+        assert!(response.is_err());
         assert!(!tmp.path().join("escaped.bin").exists());
     }
 
@@ -2936,9 +2929,10 @@ mod tests {
                 Some(other),
             )
             .await;
-        let IpcMessage::Error { message } = response else {
+        let Err(error) = response else {
             panic!("a directory owned by someone else must be refused");
         };
+        let message = error.to_string();
         assert!(message.contains("not owned by uid"), "{message}");
         assert!(!downloads.join("sub").exists());
         assert_eq!(service.pending_files.lock().unwrap().len(), 1);
@@ -2962,7 +2956,7 @@ mod tests {
                 Some(current_cred()),
             )
             .await;
-        let IpcMessage::Ok { message } = response else {
+        let Ok(Done(message)) = response else {
             panic!("the receive should land next to the link: {response:?}");
         };
         assert!(message.contains("file (1).bin"), "{message}");
@@ -2998,7 +2992,7 @@ mod tests {
                 Some((uid, gid)),
             )
             .await;
-        assert!(matches!(response, IpcMessage::Ok { .. }), "{response:?}");
+        assert!(response.is_ok(), "{response:?}");
         let saved = downloads.join("file.bin");
         assert_eq!(std::fs::read(&saved).unwrap(), b"payload");
         assert_eq!(std::fs::metadata(&saved).unwrap().uid(), uid);

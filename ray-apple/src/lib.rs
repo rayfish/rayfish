@@ -15,7 +15,7 @@ use rayfish::config::settings::GlobalKey;
 use rayfish::config::{DnsMode, QuicEngine};
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
-use rayfish::daemon::{DaemonState, Done, OpError, OpResult, build_headless};
+use rayfish::daemon::{DaemonState, Done, FileQueues, OpError, OpResult, build_headless};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
 use rayfish::ipc::{
@@ -440,7 +440,7 @@ impl Node {
             identity: identity.map(|id| id.to_string()),
             connection_requests,
         };
-        let files = incoming_files(state.list_files())?;
+        let files = incoming_files(state.list_files());
         let inbound = NodeInboundStatus {
             policy: settings.inbound.into(),
             blocked: settings.blocked.iter().map(ToString::to_string).collect(),
@@ -789,17 +789,16 @@ impl Node {
         uid: u32,
         gid: u32,
     ) -> Result<(), AppleError> {
-        expect_ok(
-            self.runtime.block_on(
-                self.state()?
-                    .accept_file(id, Some(directory), Some((uid, gid))),
-            ),
-            "file acceptance",
-        )
+        self.runtime.block_on(
+            self.state()?
+                .accept_file(id, Some(directory), Some((uid, gid))),
+        )?;
+        Ok(())
     }
 
     pub fn reject_file(&self, id: u64) -> Result<(), AppleError> {
-        expect_ok(self.state()?.reject_file(id), "file rejection")
+        self.state()?.reject_file(id)?;
+        Ok(())
     }
 
     pub fn create_network(
@@ -966,14 +965,9 @@ impl Node {
     }
 }
 
-fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError> {
-    let IpcMessage::FileList {
-        files, transfers, ..
-    } = response
-    else {
-        return Err(AppleError::Network("invalid file list response".into()));
-    };
-    Ok(files
+fn incoming_files(queues: FileQueues) -> Vec<IncomingFile> {
+    queues
+        .incoming
         .into_iter()
         .map(|file| IncomingFile {
             id: file.id,
@@ -984,7 +978,7 @@ fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError>
             state: IncomingFileState::Pending,
             destination: None,
         })
-        .chain(transfers.into_iter().filter_map(|file| {
+        .chain(queues.transfers.into_iter().filter_map(|file| {
             (!file.outgoing
                 && matches!(
                     file.state,
@@ -1006,7 +1000,7 @@ fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError>
                     .map(|path| path.to_string_lossy().into_owned()),
             })
         }))
-        .collect())
+        .collect()
 }
 
 /// The invitations in a status snapshot. An unreadable inbox shows none
@@ -1096,8 +1090,8 @@ mod tests {
     fn file_status_includes_offers_and_active_or_successful_receives() {
         use rayfish::ipc::{PendingFileInfo, TransferFileInfo};
 
-        let files = incoming_files(IpcMessage::FileList {
-            files: vec![PendingFileInfo {
+        let files = incoming_files(FileQueues {
+            incoming: vec![PendingFileInfo {
                 id: 1,
                 from: "sender".into(),
                 filename: "offer.txt".into(),
@@ -1152,8 +1146,7 @@ mod tests {
                     destination: None,
                 },
             ],
-        })
-        .unwrap();
+        });
         assert_eq!(files.len(), 3);
         assert!(matches!(files[0].state, IncomingFileState::Pending));
         assert_eq!(files[1].filename, "received.txt");

@@ -647,22 +647,22 @@ impl Daemon {
                 self.registry.remove_alias(&network, &alias)
             }
             IpcMessage::AliasList { network } => self.registry.list_aliases(&network),
-            IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
+            IpcMessage::SendFile { path, peer } => reply(self.send_file(&path, &peer).await),
             IpcMessage::SendFileStaged {
                 path,
                 filename,
                 peer,
-            } => {
+            } => reply(
                 self.files
                     .send_file_named(&path, Some(&filename), &peer)
-                    .await
-            }
+                    .await,
+            ),
             IpcMessage::SendFileFd { filename, peer } => {
                 #[cfg(unix)]
                 {
                     let mut fds = fds;
                     match fds.pop() {
-                        Some(fd) => self.files.send_file_fd(fd, &filename, &peer).await,
+                        Some(fd) => reply(self.files.send_file_fd(fd, &filename, &peer).await),
                         None => ipc_err("SendFileFd request carried no file descriptor"),
                     }
                 }
@@ -672,13 +672,13 @@ impl Daemon {
                     ipc_err("SendFileFd is unavailable on this platform")
                 }
             }
-            IpcMessage::CancelSend { id } => self.files.cancel_send(id),
-            IpcMessage::CancelTransfer { id } => self.files.cancel_transfer(id),
-            IpcMessage::ListFiles => self.list_files(),
+            IpcMessage::CancelSend { id } => reply(self.files.cancel_send(id)),
+            IpcMessage::CancelTransfer { id } => reply(self.files.cancel_transfer(id)),
+            IpcMessage::ListFiles => self.list_files().into(),
             IpcMessage::AcceptFile { id, output } => {
-                self.files.accept_file(id, output, peer_cred).await
+                reply(self.files.accept_file(id, output, peer_cred).await)
             }
-            IpcMessage::RejectFile { id } => self.files.reject_file(id),
+            IpcMessage::RejectFile { id } => reply(self.files.reject_file(id)),
             IpcMessage::StartPairing => self.start_pairing(),
             IpcMessage::PairWithDevice {
                 endpoint_id,

@@ -23,27 +23,27 @@ impl Daemon {
         self.registry.resolve_peer_flexible(name).await
     }
 
-    pub async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
+    pub async fn send_file(&self, path: &str, peer: &str) -> OpResult<Done> {
         self.files.send_file(path, peer).await
     }
 
-    pub fn list_files(&self) -> IpcMessage {
+    pub fn list_files(&self) -> FileQueues {
         self.files.list_files()
     }
 
     /// Decline a pending file offer (delegates to [`FileService`]).
-    pub fn reject_file(&self, id: u64) -> IpcMessage {
+    pub fn reject_file(&self, id: u64) -> OpResult<Done> {
         self.files.reject_file(id)
     }
 
     /// Drop a queued outbound send before it is delivered (delegates to
     /// [`FileService`]). Public for the `ray-mobile` FFI, matching how the CLI
     /// reaches it via `IpcMessage::CancelSend`.
-    pub fn cancel_send(&self, id: u64) -> IpcMessage {
+    pub fn cancel_send(&self, id: u64) -> OpResult<Done> {
         self.files.cancel_send(id)
     }
 
-    pub fn cancel_transfer(&self, id: u64) -> IpcMessage {
+    pub fn cancel_transfer(&self, id: u64) -> OpResult<Done> {
         self.files.cancel_transfer(id)
     }
 
@@ -54,7 +54,7 @@ impl Daemon {
         id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         self.files.accept_file(id, output, peer_cred).await
     }
 

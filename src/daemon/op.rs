@@ -163,3 +163,24 @@ impl From<ConnectOutcome> for IpcMessage {
         }
     }
 }
+
+/// Every file this node is receiving, sending or has just moved.
+#[derive(Debug)]
+pub struct FileQueues {
+    /// Offers waiting for `ray files accept`.
+    pub incoming: Vec<ray_proto::ipc::PendingFileInfo>,
+    /// Sends queued until their peer comes online.
+    pub outbox: Vec<ray_proto::ipc::OutboxFileInfo>,
+    /// In-flight and recently finished transfers.
+    pub transfers: Vec<ray_proto::ipc::TransferFileInfo>,
+}
+
+impl From<FileQueues> for IpcMessage {
+    fn from(queues: FileQueues) -> Self {
+        IpcMessage::FileList {
+            files: queues.incoming,
+            outbox: queues.outbox,
+            transfers: queues.transfers,
+        }
+    }
+}

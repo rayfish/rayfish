@@ -1032,7 +1032,8 @@ impl Node {
 
     pub fn send_file(&self, path: String, peer: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(self.runtime.block_on(state.send_file(&path, &peer)), "send")
+        self.runtime.block_on(state.send_file(&path, &peer))?;
+        Ok(())
     }
 
     /// Subscribe to file/transfer changes, including one initial reconciliation.
@@ -1048,23 +1049,19 @@ impl Node {
     /// Incoming file offers waiting to be accepted or declined.
     pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
         let state = self.state()?;
-        match state.list_files() {
-            IpcMessage::FileList { files, .. } => Ok(files
-                .into_iter()
-                .map(|f| FileOffer {
-                    id: f.id,
-                    from: f.from,
-                    filename: f.filename,
-                    size: f.size,
-                    mime_type: f.mime_type,
-                    own_device: f.own_device,
-                })
-                .collect()),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected files response: {other:?}"
-            ))),
-        }
+        Ok(state
+            .list_files()
+            .incoming
+            .into_iter()
+            .map(|f| FileOffer {
+                id: f.id,
+                from: f.from,
+                filename: f.filename,
+                size: f.size,
+                mime_type: f.mime_type,
+                own_device: f.own_device,
+            })
+            .collect())
     }
 
     /// Outbound sends still sitting in the daemon's outbox, waiting for their
@@ -1073,21 +1070,17 @@ impl Node {
     /// recipient's to accept or decline.
     pub fn list_queued_sends(&self) -> Result<Vec<QueuedSend>, RayError> {
         let state = self.state()?;
-        match state.list_files() {
-            IpcMessage::FileList { outbox, .. } => Ok(outbox
-                .into_iter()
-                .map(|e| QueuedSend {
-                    id: e.id,
-                    peer: e.peer,
-                    filename: e.filename,
-                    size: e.size,
-                })
-                .collect()),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected files response: {other:?}"
-            ))),
-        }
+        Ok(state
+            .list_files()
+            .outbox
+            .into_iter()
+            .map(|e| QueuedSend {
+                id: e.id,
+                peer: e.peer,
+                filename: e.filename,
+                size: e.size,
+            })
+            .collect())
     }
 
     /// Call off a queued send, by the id from [`Node::list_queued_sends`].
@@ -1095,13 +1088,15 @@ impl Node {
     /// left on this side to withdraw.
     pub fn cancel_send(&self, id: u64) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.cancel_send(id), "cancel")
+        state.cancel_send(id)?;
+        Ok(())
     }
 
     /// Cancel an outgoing transfer that has already been offered or started.
     pub fn cancel_transfer(&self, id: u64) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.cancel_transfer(id), "cancel")
+        state.cancel_transfer(id)?;
+        Ok(())
     }
 
     /// In-flight and recently finished transfers, both directions. Terminal entries
@@ -1137,16 +1132,15 @@ impl Node {
         } else {
             Some(output_dir)
         };
-        expect_ok(
-            self.runtime.block_on(state.accept_file(id, out, None)),
-            "files",
-        )
+        self.runtime.block_on(state.accept_file(id, out, None))?;
+        Ok(())
     }
 
     /// Decline a file offer without downloading it.
     pub fn reject_file_offer(&self, id: u64) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.reject_file(id), "files")
+        state.reject_file(id)?;
+        Ok(())
     }
 
     /// Incoming `ray connect` friend requests waiting for a decision.
