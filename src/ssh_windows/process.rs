@@ -739,6 +739,9 @@ impl Process {
             // This finite loop runs only on the dedicated cleanup worker.
             sleep(Duration::from_millis(10));
         }
+        // The child ends are closed, but their final bytes can still be in the
+        // pipe buffers. Leave disconnection to the async drain owner.
+        self.pipes.clear();
         self.profile.unload()?;
         Ok(())
     }

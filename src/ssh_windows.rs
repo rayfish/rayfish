@@ -10,6 +10,8 @@ mod authz;
 mod host_firewall;
 #[path = "ssh/key_store.rs"]
 mod key_store;
+#[path = "ssh_windows/limits.rs"]
+mod limits;
 #[path = "ssh_windows/login.rs"]
 mod login;
 #[path = "ssh_windows/process.rs"]
@@ -42,6 +44,7 @@ use tracing::{debug, warn};
 
 use crate::daemon::NetworkRegistry;
 use authz::{UserPolicy, resolve_user_policy_with_hostnames};
+use limits::{SessionTasks, SshLimits};
 use login::{LoginInfo, resolve_login};
 use process::{SessionSpec, TerminalSize, run_session};
 use protocol::server_config;
@@ -85,7 +88,7 @@ impl SshServer {
             MAX_CONNECTIONS,
             MAX_CONNECTIONS_PER_SOURCE,
         ));
-        let logons = Arc::new(Semaphore::new(MAX_LOGONS));
+        let limits = SshLimits::default();
         let bound = addrs
             .into_iter()
             .map(|addr| {
@@ -100,7 +103,7 @@ impl SshServer {
                 registry: Arc::clone(&self.registry),
                 authz: Arc::clone(&self.authz),
                 slots: Arc::clone(&slots),
-                logons: Arc::clone(&logons),
+                limits: limits.clone(),
                 cancel: cancel.child_token(),
             };
             listeners.spawn(accept_connections(listener, context));
@@ -120,7 +123,7 @@ struct ConnectionContext {
     registry: Arc<NetworkRegistry>,
     authz: SshAuthz,
     slots: Arc<slots::ConnectionSlots>,
-    logons: Arc<Semaphore>,
+    limits: SshLimits,
     cancel: CancellationToken,
 }
 
@@ -151,7 +154,7 @@ async fn accept_connections(listener: TcpListener, context: ConnectionContext) {
                 };
                 let policy = resolve_user_policy_with_hostnames(&context.authz, &user, &networks, &resolve);
                 let config = Arc::clone(&context.config);
-                let handler = SshHandler::new(policy, user, Arc::clone(&context.logons), context.cancel.child_token());
+                let handler = SshHandler::new(policy, user, context.limits.clone(), context.cancel.child_token());
                 connections.spawn(async move {
                     let (_total, _source) = (total, slot);
                     if let Err(error) = serve(config, stream, handler).await {
@@ -234,6 +237,7 @@ struct SshHandler {
     forwards: HashMap<(String, u32), CancellationToken>,
     forwarded: Arc<Semaphore>,
     logons: Arc<Semaphore>,
+    sessions: SessionTasks,
     cancel: CancellationToken,
     authenticated: Arc<AtomicBool>,
     tasks: TaskTracker,
@@ -249,13 +253,14 @@ impl SshHandler {
     fn new(
         policy: UserPolicy,
         peer: EndpointId,
-        logons: Arc<Semaphore>,
+        limits: SshLimits,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             policy: Arc::new(policy),
             peer,
-            logons,
+            logons: limits.logons,
+            sessions: SessionTasks::new(limits.sessions, MAX_CHANNELS),
             cancel,
             login: None,
             channels: HashMap::new(),
@@ -286,50 +291,53 @@ impl SshHandler {
             session.channel_failure(id)?;
             return Ok(());
         };
-        let Some(channel) = state.channel.take() else {
-            session.channel_failure(id)?;
-            return Ok(());
-        };
-        let spec = SessionSpec {
-            login,
-            command,
-            program,
-            terminal: state.terminal,
-            env: std::mem::take(&mut state.env),
-        };
-        let resize = state.resize.subscribe();
-        let cancel = state.cancel.clone();
-        let handle = session.handle();
-        self.tasks.spawn(async move {
-            let status = match run_session(channel, spec, resize, cancel.clone()).await {
-                Ok(status) => status,
-                Err(error) => {
-                    warn!(%error, "Windows SSH shell failed");
-                    if let Err(error) = handle
-                        .extended_data(
-                            id,
-                            1,
-                            b"Windows could not start the requested session.\r\n".as_slice(),
-                        )
-                        .await
-                    {
-                        debug!(?error, "reporting SSH session failure");
-                    }
-                    1
-                }
+        let started = self.sessions.spawn(&self.tasks, || {
+            let channel = state.channel.take()?;
+            let spec = SessionSpec {
+                login,
+                command,
+                program,
+                terminal: state.terminal,
+                env: std::mem::take(&mut state.env),
             };
-            cancel.cancel();
-            if let Err(error) = handle.exit_status_request(id, status).await {
-                debug!(?error, "reporting SSH process exit");
-            }
-            if let Err(error) = handle.eof(id).await {
-                debug!(?error, "ending SSH session output");
-            }
-            if let Err(error) = handle.close(id).await {
-                debug!(?error, "closing SSH session");
-            }
+            let resize = state.resize.subscribe();
+            let cancel = state.cancel.clone();
+            let handle = session.handle();
+            Some(async move {
+                let status = match run_session(channel, spec, resize, cancel.clone()).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        warn!(error = %format!("{error:#}"), "Windows SSH shell failed");
+                        if let Err(error) = handle
+                            .extended_data(
+                                id,
+                                1,
+                                b"Windows could not start the requested session.\r\n".as_slice(),
+                            )
+                            .await
+                        {
+                            debug!(?error, "reporting SSH session failure");
+                        }
+                        1
+                    }
+                };
+                cancel.cancel();
+                if let Err(error) = handle.exit_status_request(id, status).await {
+                    debug!(?error, "reporting SSH process exit");
+                }
+                if let Err(error) = handle.eof(id).await {
+                    debug!(?error, "ending SSH session output");
+                }
+                if let Err(error) = handle.close(id).await {
+                    debug!(?error, "closing SSH session");
+                }
+            })
         });
-        session.channel_success(id)?;
+        if started {
+            session.channel_success(id)?;
+        } else {
+            session.channel_failure(id)?;
+        }
         Ok(())
     }
 }
@@ -378,7 +386,7 @@ impl Handler for SshHandler {
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
-                debug!(%error, peer = %self.peer.fmt_short(), "Windows SSH account logon rejected")
+                debug!(error = %format!("{error:#}"), peer = %self.peer.fmt_short(), "Windows SSH account logon rejected")
             }
             Err(error) => warn!(%error, "Windows SSH account task failed"),
         }
@@ -739,6 +747,19 @@ async fn serve_test_connection(
     cancel: CancellationToken,
 ) -> Result<()> {
     use russh::keys::{Algorithm, PrivateKey};
+    use std::sync::Once;
+    static LOGGING: Once = Once::new();
+    LOGGING.call_once(|| {
+        // Other tests may have installed the process logger already.
+        if tracing_subscriber::fmt()
+            .with_env_filter("rayfish::ssh=debug")
+            .with_test_writer()
+            .try_init()
+            .is_err()
+        {
+            debug!("SSH test logging is already configured");
+        }
+    });
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
         .context("generating test host key")?;
     let mut policy = UserPolicy::default();
@@ -746,7 +767,7 @@ async fn serve_test_connection(
         policy.add(&[allowed_user.to_owned()]);
     }
     let peer = iroh::SecretKey::from([7; 32]).public();
-    let handler = SshHandler::new(policy, peer, Arc::new(Semaphore::new(MAX_LOGONS)), cancel);
+    let handler = SshHandler::new(policy, peer, SshLimits::default(), cancel);
     serve(Arc::new(server_config(key)), stream, handler).await
 }
 
