@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Windows: the desktop app uses native Windows controls for networks, devices,
+  requests, firewall rules, and settings, without requiring WebView2.
 - Mesh SSH no longer limits the number of session channels on one connection.
 - New installs default Magic DNS to `partial`: only `.ray` names resolve, and
   the host's search domains are left alone. Existing installs keep their mode.
