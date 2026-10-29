@@ -473,3 +473,12 @@ async fn windows_ssh_channel_close_kills_the_command_and_its_descendant() -> Res
         .await?;
     server.stop().await
 }
+
+#[test]
+fn only_an_unauthenticated_eof_is_an_expected_authentication_close() {
+    let eof = || russh::Error::IO(IoError::new(ErrorKind::UnexpectedEof, "peer closed"));
+    assert!(protocol_result(Err(eof()), false).is_ok());
+    assert!(protocol_result(Err(eof()), true).is_err());
+    let denied = russh::Error::IO(IoError::new(ErrorKind::PermissionDenied, "test refusal"));
+    assert!(protocol_result(Err(denied), false).is_err());
+}

@@ -22,6 +22,7 @@ mod protocol;
 mod slots;
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::os::windows::io::AsSocket;
 use std::path::PathBuf;
@@ -172,17 +173,25 @@ async fn accept_connections(listener: TcpListener, context: ConnectionContext) {
     }
 }
 
-async fn serve(config: Arc<Config>, stream: TcpStream, handler: SshHandler) -> Result<()> {
+async fn serve(config: Arc<Config>, stream: TcpStream, mut handler: SshHandler) -> Result<()> {
     let cancel = handler.cancel.clone();
+    // A completed protocol drops its handler and cancels channel work. Keep
+    // owner cancellation separate so that drop cannot race the protocol result.
+    handler.cancel = cancel.child_token();
     let tasks = handler.tasks.clone();
-    let result = serve_protocol(config, stream, handler).await;
+    let result = serve_protocol(config, stream, handler, cancel.clone()).await;
     cancel.cancel();
     tasks.close();
     tasks.wait().await;
     result
 }
 
-async fn serve_protocol(config: Arc<Config>, stream: TcpStream, handler: SshHandler) -> Result<()> {
+async fn serve_protocol(
+    config: Arc<Config>,
+    stream: TcpStream,
+    handler: SshHandler,
+    cancel: CancellationToken,
+) -> Result<()> {
     stream.set_nodelay(true).context("configuring SSH socket")?;
     let hangup = StdTcpStream::from(
         stream
@@ -191,19 +200,18 @@ async fn serve_protocol(config: Arc<Config>, stream: TcpStream, handler: SshHand
             .context("duplicating SSH socket")?,
     );
     let authenticated = Arc::clone(&handler.authenticated);
-    let cancel = handler.cancel.clone();
     let deadline = Instant::now() + LOGIN_GRACE;
     let mut running = tokio::select! {
         _ = cancel.cancelled() => return Ok(()),
         result = timeout_at(deadline, russh::server::run_stream(config, stream, handler)) => result.context("SSH version deadline")??,
     };
     tokio::select! {
-        result = &mut running => return result.context("running SSH protocol"),
+        result = &mut running => return protocol_result(result, authenticated.load(Ordering::Acquire)),
         _ = cancel.cancelled() => {},
         _ = tokio::time::sleep_until(deadline) => {
             if authenticated.load(Ordering::Acquire) {
                 tokio::select! {
-                    result = &mut running => return result.context("running SSH protocol"),
+                    result = &mut running => return protocol_result(result, authenticated.load(Ordering::Acquire)),
                     _ = cancel.cancelled() => {},
                 }
             }
@@ -212,13 +220,32 @@ async fn serve_protocol(config: Arc<Config>, stream: TcpStream, handler: SshHand
     cancel.cancel();
     // Shutdown wakes russh's owned protocol task, which drops the handler and
     // cancels every session and forward. The duplicate is never used for I/O.
-    hangup
-        .shutdown(Shutdown::Both)
-        .context("closing SSH socket")?;
+    let shutdown = hangup.shutdown(Shutdown::Both);
+    if let Err(error) = &shutdown
+        && error.kind() != ErrorKind::NotConnected
+    {
+        warn!(%error, "SSH socket shutdown failed");
+    }
     if let Err(error) = running.await {
         debug!(%error, "SSH protocol stopped after cancellation");
     }
-    Ok(())
+    match shutdown {
+        Err(error) if error.kind() != ErrorKind::NotConnected => {
+            Err(error).context("closing SSH socket")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn protocol_result(result: Result<(), russh::Error>, authenticated: bool) -> Result<()> {
+    // Clients close after none-auth rejection when no methods remain. Russh
+    // reports that expected unauthenticated close as an I/O EOF.
+    if !authenticated
+        && matches!(&result, Err(russh::Error::IO(error)) if error.kind() == ErrorKind::UnexpectedEof)
+    {
+        return Ok(());
+    }
+    result.context("running SSH protocol")
 }
 
 struct ChannelState {

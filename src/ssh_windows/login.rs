@@ -12,7 +12,7 @@ use std::slice;
 use anyhow::{Context, Result, bail, ensure};
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_TOKEN, ERROR_PATH_NOT_FOUND,
-    ERROR_SUCCESS, HANDLE, LUID, LocalFree,
+    ERROR_SUCCESS, HANDLE, LUID, LocalFree, MAX_PATH,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     NetApiBufferFree, NetUserGetInfo, UF_ACCOUNTDISABLE, UF_LOCKOUT, UF_NORMAL_ACCOUNT, USER_INFO_1,
@@ -70,7 +70,9 @@ impl LoginInfo {
             let sid = self.account.sid.to_string()?;
             let sid = wide(&sid)?;
             let name = wide(&self.name)?;
-            let mut path = vec![0u16; MAX_PROFILE_UNITS];
+            // CreateProfile's RPC buffer is limited to MAX_PATH even though
+            // the profile-directory query accepts a larger output buffer.
+            let mut path = vec![0u16; usize::try_from(MAX_PATH)?];
             // SAFETY: Both strings are terminated, the account SID was verified
             // against this token, and the output buffer has the declared size.
             // The caller invokes this only after its SSH account policy allows it.
