@@ -183,3 +183,41 @@ async fn eviction_releases_closed_state_and_preserves_outbound_midstream_trackin
     assert_eq!(evaluate(&firewall, Direction::In, ACK), Action::Allow);
     token.cancel();
 }
+
+#[tokio::test(start_paused = true)]
+async fn exit_replies_follow_tcp_close_and_reset_tracking() {
+    let local = Ipv4Addr::new(192, 0, 2, 1);
+    let remote = Ipv4Addr::new(203, 0, 113, 1);
+    for reset in [false, true] {
+        let firewall = firewall();
+        let outbound = tcp_pkt(local, 50000, remote, 443, SYN);
+        let reply = |flags| tcp_pkt(remote, 443, local, 50000, flags);
+        assert!(!firewall.admits_reply(&reply(SYN)));
+        assert_eq!(
+            firewall.evaluate_packet(Direction::Out, &outbound, &test_id(2), |_| false),
+            Action::Allow
+        );
+        assert!(firewall.admits_reply(&reply(SYN | ACK)));
+        let fin = tcp_pkt(local, 50000, remote, 443, FIN | ACK);
+        assert_eq!(
+            firewall.evaluate_packet(Direction::Out, &fin, &test_id(2), |_| false),
+            Action::Allow
+        );
+        advance(TCP_CLOSING_TIMEOUT).await;
+        assert!(
+            firewall.admits_reply(&reply(ACK)),
+            "half-close permits replies"
+        );
+        if reset {
+            assert!(firewall.admits_reply(&reply(RST | ACK)));
+        } else {
+            assert!(firewall.admits_reply(&reply(FIN | ACK)));
+            assert!(!firewall.admits_reply(&reply(SYN)));
+            advance(TCP_CLOSING_TIMEOUT).await;
+        }
+        assert!(
+            !firewall.admits_reply(&reply(ACK)),
+            "closed flows reject replies"
+        );
+    }
+}

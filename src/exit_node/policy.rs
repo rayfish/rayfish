@@ -19,6 +19,8 @@ pub fn is_transitable(destination: IpAddr) -> bool {
                 || ip.is_broadcast()
                 || ip.is_unspecified()
                 || ip.is_documentation()
+                || ip.octets()[..3] == [192, 0, 0]
+                || (ip.octets()[0] == 198 && ip.octets()[1] & 0xfe == 18)
                 || ip.octets()[0] == 0
                 || ip.octets()[0] >= 240)
         }

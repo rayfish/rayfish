@@ -297,4 +297,5 @@ check tcp_probe_errors
 check udp_receivers
 check bash "$ROOT/tests/test-e2e-cleanup.sh"
 check bash "$ROOT/tests/test-e2e-connect.sh"
+check bash "$ROOT/tests/test-e2e-invites.sh"
 check abandoned_udp_receiver

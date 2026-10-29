@@ -75,6 +75,8 @@ otel = [
 ray-proto = { path = "ray-proto", version = "0.1.21" }
 anyhow = "1"
 thiserror = "2"
+hickory-resolver = { version = "0.26.1", features = ["https-ring", "webpki-roots"] }
+n0-error = "1"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1"
 # `unstable-ext` is what `#[arg(add = ...)]` goes through, and is how the

@@ -299,7 +299,7 @@ fn fold(mut sum: u32) -> u16 {
     !(sum as u16)
 }
 
-fn icmpv4_checksum(msg: &[u8]) -> u16 {
+pub(crate) fn icmpv4_checksum(msg: &[u8]) -> u16 {
     fold(checksum_words(msg))
 }
 

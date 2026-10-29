@@ -247,7 +247,7 @@ pub fn restore_host_state() {
     crate::dns::config::emergency_restore_resolv_conf();
     crate::dns::config::emergency_withdraw_resolvconf();
     crate::exit_node::disable();
-    crate::exit_node::teardown_client_routing();
+    crate::exit_node::teardown_client_routing(None);
 }
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
@@ -477,7 +477,7 @@ async fn announce_handles_with(
         None,
         &ControlMsg::NetworkHandles {
             entries,
-            features: transport::FEATURE_IDLE_CLOSE,
+            features: transport::FEATURE_IDLE_CLOSE | transport::FEATURE_EXIT_IPV4,
             receive_mtu: peers.local_mtu(),
         },
     )
@@ -944,6 +944,11 @@ pub struct Daemon {
     /// Handles for the packet-forwarding tasks spawned by
     /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
+    /// NetworkExtension owns routes and DNS for an externally attached macOS TUN.
+    #[cfg(target_os = "macos")]
+    external_exit_tun: AtomicBool,
+    #[cfg(target_os = "macos")]
+    external_exit_staging: AtomicBool,
     /// Set when the data plane fails in a way only a restart repairs.
     pub(crate) fatal: Arc<FatalExit>,
     /// Serializes exit-node reconciles. `apply_exit_node` runs from the IPC

@@ -566,6 +566,14 @@ impl Daemon {
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeUse { network, peer } => {
+                // The packet tunnel installs the capture routes for a selection
+                // it makes itself, and never hears of one made here.
+                #[cfg(target_os = "macos")]
+                if self.external_exit_tun.load(Ordering::Acquire) {
+                    return ipc_err(
+                        "the Rayfish app owns exit routing here: select the exit node from its menu",
+                    );
+                }
                 let resp = self.registry.exit_node_use(&network, peer).await;
                 self.reconcile_exit_node(resp).await
             }
