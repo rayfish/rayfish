@@ -1195,7 +1195,7 @@ impl CoordinatorAcceptState {
         };
         let own_id = self.ctx.registry.transport.endpoint.id();
         let signed = target.and_then(|(key, hash)| {
-            dht::encode_network_record(&key, &hash, &[own_id])
+            sign_current_network_record(&self.state, &key, hash, &[own_id])
                 .ok()
                 .map(|packet| (hash, packet))
         });

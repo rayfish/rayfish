@@ -35,6 +35,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Coordinators synchronize newer membership before renewing published network
+  records, instead of republishing an unchanged stale roster.
 - Saved networks survive older signed roster updates, and fresh joins retain
   their signed admission across reconnects. Pending joins retry after restart
   and appear in CLI status while awaiting approval.

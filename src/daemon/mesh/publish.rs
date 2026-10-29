@@ -3,6 +3,7 @@
 //! Also holds the thin `Daemon` direct-connection (`ray connect`) handlers that
 //! delegate to `ConnectService`.
 
+use iroh::address_lookup::pkarr::PkarrError;
 use iroh_dns::pkarr::SignedPacket;
 
 use super::super::*;
@@ -10,6 +11,86 @@ use super::super::*;
 /// Renew records with enough margin for scheduler/network delay that a healthy
 /// coordinator never lets its five-minute pkarr lease expire.
 const RECORD_REPUBLISH_INTERVAL: Duration = Duration::from_secs((dht::RECORD_TTL / 2) as u64);
+
+/// Sign a durable current snapshot while the caller holds snapshot_commit.
+/// Remember its timestamp before publication can clear the authored marker.
+pub(crate) fn sign_current_network_record(
+    state: &SharedNetworkState,
+    key: &SecretKey,
+    hash: blake3::Hash,
+    seeds: &[EndpointId],
+) -> Result<SignedPacket> {
+    let packet = dht::encode_network_record(key, &hash, seeds)?;
+    anyhow::ensure!(
+        observe_current_record(state, hash, packet.timestamp().as_micros()),
+        "cannot sign a group snapshot that is no longer current"
+    );
+    Ok(packet)
+}
+
+fn has_authored_snapshot(state: &SharedNetworkState, network: &str) -> bool {
+    let durability_pending = state.read().unwrap().unconfirmed_durable_hash.is_some();
+    durability_pending || pending_authored_group_hash(state, network).is_some()
+}
+
+/// A clean publisher must learn the canonical roster before renewing its lease.
+/// Unpublished local mutations retain their existing publication priority.
+async fn synchronize_before_renewal(
+    client: &PkarrRelayClient,
+    state: &SharedNetworkState,
+    registry: &Arc<NetworkRegistry>,
+    network: &str,
+    network_key: EndpointId,
+) -> Result<bool> {
+    if has_authored_snapshot(state, network) {
+        return Ok(true);
+    }
+    let resolved = tokio::time::timeout(Duration::from_secs(15), client.resolve(network_key))
+        .await
+        .context("timed out checking the canonical network record")
+        .and_then(|result| result.map_err(anyhow::Error::new));
+    let packet = match resolved {
+        Ok(packet) => packet,
+        Err(_) if has_authored_snapshot(state, network) => return Ok(true),
+        Err(error) => {
+            if error.chain().any(|cause| {
+                matches!(cause.downcast_ref::<PkarrError>(),
+                    Some(PkarrError::HttpRequest { status, .. }) if status.as_u16() == 404)
+            }) {
+                // A genesis record or expired lease has no canonical successor.
+                return Ok(true);
+            }
+            return Err(error.context("could not check the canonical network record"));
+        }
+    };
+    if dht::destruction::is_destroyed(&packet) {
+        registry.schedule_destruction(network, packet);
+        return Ok(false);
+    }
+    let (hash, seeds) = dht::decode_network_record(&packet)?;
+    let timestamp = packet.timestamp().as_micros();
+    if has_authored_snapshot(state, network)
+        || observe_current_record(state, hash, timestamp)
+        || !record_is_newer(timestamp, state.read().unwrap().last_record_timestamp)
+    {
+        return Ok(true);
+    }
+    let outcome = fetch_and_apply_blob(
+        &registry.transport.endpoint,
+        &registry.transport.blob_store,
+        &registry.peers,
+        &registry.firewall,
+        registry,
+        state,
+        network,
+        hash,
+        &seeds,
+        timestamp,
+    )
+    .await;
+    Ok(outcome == ReconvergeOutcome::Applied
+        || outcome == ReconvergeOutcome::Superseded && has_authored_snapshot(state, network))
+}
 
 /// Re-import verified bytes to mint the permanent tag that protects membership
 /// snapshots from blob GC. Remote fetches populate the store without a tag.
@@ -227,6 +308,25 @@ pub(crate) fn spawn_network_publisher(
                     registry.schedule_destruction(&network_name, packet);
                     break;
                 }
+                match synchronize_before_renewal(
+                    &client,
+                    &state,
+                    &registry,
+                    &network_name,
+                    net_secret_key.public(),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    outcome => {
+                        if let Err(error) = outcome {
+                            tracing::warn!(%error, "deferring network record renewal");
+                        }
+                        retry = target
+                            .map(|hash| (hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        continue;
+                    }
+                }
                 // Decide and sign under the commit lock, publish after releasing
                 // it. The relay round trip can take seconds, and admissions and
                 // reconverges on this network queue on the same lock. Signing
@@ -261,7 +361,12 @@ pub(crate) fn spawn_network_publisher(
                         seed_peers.push(endpoint_id);
                         seed_peers.sort();
                         seed_peers.dedup();
-                        match dht::encode_network_record(&net_secret_key, &hash, &seed_peers) {
+                        match sign_current_network_record(
+                            &state,
+                            &net_secret_key,
+                            hash,
+                            &seed_peers,
+                        ) {
                             Ok(packet) => prepared = Some((hash, packet, seed_peers.len())),
                             Err(e) => {
                                 tracing::warn!(error = %e, "failed to build network record");
@@ -653,6 +758,10 @@ impl Daemon {
         self.connect.deliver_invite(network, recipient).await
     }
 }
+
+#[cfg(test)]
+#[path = "publish_renewal_tests.rs"]
+mod renewal_tests;
 
 #[cfg(test)]
 mod tests {
