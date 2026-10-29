@@ -3,7 +3,6 @@
 
 use super::super::network_registry::RegistrationClaim;
 use super::super::*;
-use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 
 /// A cold resume should give every recently known peer an equal chance to win
@@ -253,6 +252,8 @@ struct EstablishedMesh {
     state: SharedNetworkState,
     direct_exact_hash: Option<blake3::Hash>,
     direct_hash_published: Option<bool>,
+    /// `None` when the network registers without a handshake.
+    reconverge_worker: Option<JoinHandle<()>>,
     cancel: CancellationToken,
 }
 
@@ -714,7 +715,7 @@ impl NetworkRegistry {
             return Ok(TryJoin::Pending);
         };
 
-        let joined = self.finalize_join(ctx, &data, mesh).await;
+        let joined = self.finalize_join(ctx, mesh, None).await;
         drop(registration);
         joined
     }
@@ -861,11 +862,13 @@ impl NetworkRegistry {
                     state,
                     direct_exact_hash,
                     direct_hash_published,
+                    reconverge_worker,
                 }) => {
                     return Ok(Some(EstablishedMesh {
                         state,
                         direct_exact_hash,
                         direct_hash_published,
+                        reconverge_worker: Some(reconverge_worker),
                         cancel,
                     }));
                 }
@@ -974,11 +977,12 @@ impl NetworkRegistry {
                 state: self.member_state_from_blob(ctx, data),
                 direct_exact_hash: None,
                 direct_hash_published: None,
+                reconverge_worker: None,
                 cancel,
             }));
         }
 
-        let state = match self.connect_mesh_peer(coordinator_id).await {
+        let (state, reconverge_worker) = match self.connect_mesh_peer(coordinator_id).await {
             Ok(DialedPeer { conn, claim }) => match self
                 .run_join_handshake(ctx, data, conn, claim, false, &cancel)
                 .await
@@ -987,7 +991,8 @@ impl NetworkRegistry {
                     state,
                     direct_exact_hash: _,
                     direct_hash_published: _,
-                }) => state,
+                    reconverge_worker,
+                }) => (state, Some(reconverge_worker)),
                 Ok(JoinResult::Pending) => {
                     // Closed network: queued for live approval. Stop the just-
                     // spawned reconnect loop (nothing connected yet); caller
@@ -1001,7 +1006,7 @@ impl NetworkRegistry {
                     // reconnect loop recover rather than dropping the network.
                     tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator handshake failed on restore; registering from blob, reconnect loop will retry");
                     seed_from_blob = true;
-                    self.member_state_from_blob(ctx, data)
+                    (self.member_state_from_blob(ctx, data), None)
                 }
             },
             Err(e) => {
@@ -1010,7 +1015,7 @@ impl NetworkRegistry {
                 // returns.
                 tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator offline on restore; registering from blob, reconnect loop will retry");
                 seed_from_blob = true;
-                self.member_state_from_blob(ctx, data)
+                (self.member_state_from_blob(ctx, data), None)
             }
         };
 
@@ -1022,6 +1027,7 @@ impl NetworkRegistry {
             state,
             direct_exact_hash: None,
             direct_hash_published: None,
+            reconverge_worker,
             cancel,
         }))
     }
@@ -1119,43 +1125,23 @@ impl NetworkRegistry {
             mismatch: None,
         };
 
-        self.seed_route_map(name, &data.members);
-        let cancel = self.shutdown_token.child_token();
         let mesh = EstablishedMesh {
             state: self.member_state_from_blob(&ctx, &data),
             direct_exact_hash: None,
             direct_hash_published: None,
-            cancel: cancel.clone(),
+            reconverge_worker: None,
+            cancel: self.shutdown_token.child_token(),
         };
-        match self.finalize_join(ctx, &data, mesh).await? {
+        // Dial immediately and concurrently.  `seed_absent_members` remains
+        // the retry backstop for peers that lose this first race.
+        let dial = MemberDial {
+            my_hostname: Some(my_hostname.clone()),
+        };
+        match self.finalize_join(ctx, mesh, Some(dial)).await? {
             TryJoin::Joined(_) => {}
             TryJoin::Pending => return Ok(false),
         }
-
-        // Dial immediately and concurrently.  `seed_absent_members` remains
-        // the retry backstop for peers that lose this first race.
         self.seed_absent_members(name, &data.members);
-        let me = Arc::clone(self);
-        let network_name = name.to_string();
-        let members = data.members.clone();
-        let dial_cancel = cancel;
-        let dial_task = tokio::spawn(async move {
-            tokio::select! {
-                _ = dial_cancel.cancelled() => {}
-                _ = me.dial_all_members(
-                    &members,
-                    net_pubkey,
-                    &network_name,
-                    my_identity,
-                    Some(my_hostname),
-                ) => {}
-            }
-        });
-        if let Some(mut handle) = self.networks.get_mut(name) {
-            handle.tasks.push(dial_task);
-        } else {
-            dial_task.abort();
-        }
         tracing::info!(network = %name, %group_hash, "warm-resumed member network from cached verified roster");
         Ok(true)
     }
@@ -1215,19 +1201,21 @@ impl NetworkRegistry {
         }
     }
 
-    /// Register the accept handler, persist the network public key, seed the blob
-    /// store, spawn the membership poller, install the `NetworkHandle`, and sync
-    /// DNS. Runs once the dial phase produced a live mesh connection.
+    /// Persist the network public key, seed the blob store, then install the
+    /// network ([`Self::install_network`]) and apply its suggested firewall.
+    /// Runs once the dial phase produced a live mesh connection, or a cold
+    /// registration produced a state from the saved blob.
     async fn finalize_join(
         self: &Arc<Self>,
         ctx: JoinContext<'_>,
-        data: &crate::membership::GroupBlob,
         mesh: EstablishedMesh,
+        dial: Option<MemberDial>,
     ) -> Result<TryJoin> {
         let EstablishedMesh {
             state,
             direct_exact_hash,
             direct_hash_published,
+            reconverge_worker,
             cancel,
         } = mesh;
         let JoinContext {
@@ -1298,119 +1286,33 @@ impl NetworkRegistry {
         };
         drop(commit_guard);
 
-        let role = role_for_key_holder(held_key.is_some());
-        let mut tasks = Vec::new();
-        let dht_notify = if let Some(key) = held_key.as_ref() {
-            let notify = Arc::new(tokio::sync::Notify::new());
-            let initially_published = (finalized_config.last_group_hash == converged_hash
-                && finalized_config.last_group_hash_published)
-                .then_some(converged_hash)
-                .flatten();
-            tasks.extend(self.spawn_coordinator_background_tasks(
-                &self.mesh_ctx(),
-                display_name,
-                key,
-                &state,
-                &notify,
-                &cancel,
-                initially_published,
-            ));
-            Some(notify)
-        } else {
-            None
-        };
-
-        // Membership poller
-        if let Ok(poller_client) =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-        {
-            tasks.push(spawn_group_poller(
-                poller_client,
-                net_pubkey,
-                Arc::clone(&state),
-                self.transport.endpoint.clone(),
-                self.mesh_ctx(),
-                display_name.to_string(),
-                cancel.clone(),
-            ));
-        }
-
-        // A member network registered without a handshake (warm resume, or a
-        // restore whose coordinator did not answer) has no member accept
-        // handler yet, so none of its reconverge worker either. Start the
-        // worker here, owned by this handle, and wire it to the handler below.
-        let member_reconverge = (!role.is_coordinator()
-            && self
-                .protocol_router()
-                .is_some_and(|router| !router.is_registered(&net_pubkey)))
-        .then(|| {
-            let notify = Arc::new(tokio::sync::Notify::new());
-            tasks.push(spawn_reconverge_worker(
-                Arc::clone(&notify),
-                cancel.clone(),
-                Arc::clone(&state),
-                display_name.to_string(),
-                self.mesh_ctx(),
-                self.transport.endpoint.clone(),
-                net_pubkey,
-                self.current_device_cert(),
-            ));
-            notify
-        });
-
-        let handle = NetworkHandle {
-            name: display_name.to_string(),
-            network_key: net_pubkey,
-            role: role.clone(),
-            state: Arc::clone(&state),
-            dht_notify: dht_notify.clone(),
-            cancel: cancel.clone(),
-            tasks,
-            invite_lock: Arc::clone(&invite_lock),
-            incompatible: mismatch,
-        };
-        match self.networks.entry(display_name.to_string()) {
-            Entry::Occupied(slot) => {
-                drop(slot);
-                self.abandon_join(display_name, net_pubkey, &cancel);
-                anyhow::bail!("already in network '{display_name}'");
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(handle);
-            }
-        }
-
-        // Expose coordinator authority only after its key, exact complete hash,
-        // publisher, and Coordinator handle are all installed.
-        match role {
-            NetworkRole::Coordinator => self.register_coordinator_handler(
-                &self.mesh_ctx(),
-                display_name,
-                Arc::clone(&state),
-                Arc::clone(&invite_lock),
-                dht_notify,
-                net_pubkey,
-            ),
-            NetworkRole::Member | NetworkRole::Direct => {
-                if let Some(reconverge_notify) = member_reconverge
-                    && let Some(router) = self.protocol_router()
-                {
-                    router.register(
-                        net_pubkey,
-                        AcceptHandler::Member(Arc::new(MemberAcceptState {
-                            ctx: self.mesh_ctx(),
-                            network_name: display_name.to_string(),
-                            state: Arc::clone(&state),
-                            net_pubkey,
-                            my_identity: self.transport.identity.local_identity(),
-                            endpoint: self.transport.endpoint.clone(),
-                            registry: Arc::clone(self),
-                            invite_lock: Arc::clone(&invite_lock),
-                            reconverge_notify,
-                        })),
-                    );
-                }
-            }
+        let initially_published = (finalized_config.last_group_hash == converged_hash
+            && finalized_config.last_group_hash_published)
+            .then_some(converged_hash)
+            .flatten();
+        let installed = self
+            .install_network(NetworkInstall {
+                name: display_name,
+                network_key: net_pubkey,
+                state: Arc::clone(&state),
+                cancel: cancel.clone(),
+                invite_lock,
+                incompatible: mismatch,
+                // Exposes coordinator authority only now that the key and its
+                // exact complete hash are saved.
+                authority: held_key.map(|key| RecordAuthority {
+                    key,
+                    initially_published,
+                }),
+                poll_record: true,
+                reconverge_worker,
+                my_hostname: Some(my_hostname),
+                dial,
+            })
+            .await;
+        if !installed {
+            self.abandon_join(display_name, net_pubkey, &cancel);
+            anyhow::bail!("already in network '{display_name}'");
         }
         apply_suggested_firewall(
             &self.firewall,
@@ -1418,29 +1320,6 @@ impl NetworkRegistry {
             display_name,
             &state,
         );
-        self.refresh_search_domains().await;
-
-        // Register hostnames in DNS table
-        dns::update_hostname(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            display_name,
-            my_hostname,
-            derive_ipv6(&self.transport.identity.local_identity()),
-        )
-        .await;
-        for member in &data.members {
-            if let Some(ref h) = member.hostname {
-                dns::update_hostname(
-                    &self.dns.hostname_table,
-                    &self.dns.reverse_table,
-                    display_name,
-                    h,
-                    derive_ipv6(&member.identity),
-                )
-                .await;
-            }
-        }
 
         tracing::info!(network = %display_name, key = %net_pubkey, "joined network");
 

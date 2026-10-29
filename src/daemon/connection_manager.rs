@@ -86,6 +86,7 @@ impl ConnectionManager {
     }
 
     /// Whether a handler is registered for this network public key.
+    #[cfg(test)]
     pub(crate) fn is_registered(&self, net_pubkey: &EndpointId) -> bool {
         self.handlers.contains_key(net_pubkey)
     }

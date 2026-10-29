@@ -25,6 +25,8 @@ pub(crate) enum JoinResult {
         direct_exact_hash: Option<blake3::Hash>,
         /// Publication provenance for that exact signed hash.
         direct_hash_published: Option<bool>,
+        /// The worker behind the member accept handler this join registered.
+        reconverge_worker: JoinHandle<()>,
     },
     /// Queued for live approval on a closed network; the caller should retry.
     Pending,
@@ -289,7 +291,7 @@ pub(crate) async fn join_mesh_shared(
     // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this single
     // debounced task. The notify is shared with the member accept handler below.
     let reconverge_notify = Arc::new(tokio::sync::Notify::new());
-    spawn_reconverge_worker(
+    let reconverge_task = spawn_reconverge_worker(
         Arc::clone(&reconverge_notify),
         token.clone(),
         Arc::clone(&live_state),
@@ -303,7 +305,7 @@ pub(crate) async fn join_mesh_shared(
     // Register this network's member accept handler so the per-connection demux
     // dispatches coordinator broadcasts + other members' hellos to it. A node that
     // already holds the network key is overwritten with a coordinator handler by
-    // `finalize_join`.
+    // `install_network`.
     protocol_router.register(
         net_pubkey,
         AcceptHandler::Member(Arc::new(MemberAcceptState {
@@ -331,7 +333,7 @@ pub(crate) async fn join_mesh_shared(
     )
     .await;
     drop(dial_claim);
-    connect_to_roster_peers(
+    if let Err(error) = connect_to_roster_peers(
         &members,
         network_name,
         net_pubkey,
@@ -342,12 +344,19 @@ pub(crate) async fn join_mesh_shared(
         &protocol_router,
         &registry,
     )
-    .await?;
+    .await
+    {
+        // No network will own this state, so its worker must not keep
+        // reconverging it.
+        reconverge_task.abort();
+        return Err(error);
+    }
 
     Ok(JoinResult::Joined {
         state: live_state,
         direct_exact_hash: exact_group_hash,
         direct_hash_published: exact_hash_published,
+        reconverge_worker: reconverge_task,
     })
 }
 

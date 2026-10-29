@@ -664,3 +664,85 @@ async fn a_warm_resume_records_an_incompatible_mesh_version() {
     );
     daemon.shutdown_and_close().await;
 }
+
+fn member_install(name: &str, key: EndpointId, state: SharedNetworkState) -> NetworkInstall<'_> {
+    NetworkInstall {
+        name,
+        network_key: key,
+        state,
+        cancel: CancellationToken::new(),
+        invite_lock: Arc::new(AsyncMutex::new(())),
+        incompatible: None,
+        authority: None,
+        poll_record: false,
+        reconverge_worker: None,
+        my_hostname: None,
+        dial: None,
+    }
+}
+
+/// A handshake that fails after registering its member handler leaves that
+/// handler on a state no network owns. Registering the network from the blob
+/// used to keep it, because a handler was already there, so every trigger
+/// woke a worker reconverging the dead state.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_member_registered_from_the_blob_replaces_a_failed_handshakes_handler() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    registry
+        .conn
+        .register(key, member_handler(registry, "home", key));
+
+    let state = empty_state(key, "home");
+    assert!(
+        registry
+            .install_network(member_install("home", key, Arc::clone(&state)))
+            .await
+    );
+
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("a member accept handler is registered");
+    };
+    assert!(Arc::ptr_eq(&handler.state, &state));
+    daemon.shutdown_and_close().await;
+}
+
+/// Installing over a live network stops what it spawned and leaves the live
+/// handle and its handler alone.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn an_install_gives_way_to_a_live_network() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    let live_cancel = hold_live(registry, "home", key);
+    let live_handler = member_handler(registry, "home", key);
+    let AcceptHandler::Member(ref live_member) = live_handler else {
+        unreachable!("member_handler builds a member handler");
+    };
+    let live_handler_state = Arc::clone(&live_member.state);
+    registry.conn.register(key, live_handler);
+    let live_state = Arc::clone(&registry.networks.get("home").unwrap().state);
+
+    let install = member_install("home", key, empty_state(key, "home"));
+    let cancel = install.cancel.clone();
+    assert!(!registry.install_network(install).await);
+
+    assert!(cancel.is_cancelled());
+    assert!(!live_cancel.is_cancelled());
+    assert!(Arc::ptr_eq(
+        &registry.networks.get("home").unwrap().state,
+        &live_state
+    ));
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("the live handler stays registered");
+    };
+    assert!(Arc::ptr_eq(&handler.state, &live_handler_state));
+    daemon.shutdown_and_close().await;
+}

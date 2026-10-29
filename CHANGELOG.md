@@ -21,6 +21,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A member whose coordinator handshake failed partway through a restart now
+  picks up roster and firewall changes as they happen, instead of waiting for
+  the next poll.
 - Cached peer addresses expire after seven days, with up to eight paths per
   peer and 64 peers in both saved hints and the running lookup. Connected paths
   refresh hourly. Old hints without timestamps are discarded on upgrade.

@@ -1264,7 +1264,6 @@ impl NetworkRegistry {
         direct: bool,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<IpcMessage> {
-        let ctx = self.mesh_ctx();
         let name = match custom_name {
             Some(n) => {
                 anyhow::ensure!(
@@ -1360,14 +1359,6 @@ impl NetworkRegistry {
             exit_node_use: None,
         })?;
         drop(revoking);
-        dns::update_hostname(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            &name,
-            &my_hostname,
-            derive_ipv6(&self.transport.identity.local_identity()),
-        )
-        .await;
         let initial_record = self
             .publish_group_hash(
                 &name,
@@ -1377,45 +1368,28 @@ impl NetworkRegistry {
             )
             .await;
 
-        let cancel = self.shutdown_token.child_token();
-        let state = Arc::new(std::sync::RwLock::new(net_state));
-        let invite_lock = Arc::new(AsyncMutex::new(()));
-        let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let tasks = self.spawn_coordinator_background_tasks(
-            &ctx,
-            &name,
-            &net_secret_key,
-            &state,
-            &dht_notify,
-            &cancel,
-            initial_record.as_ref().map(|_| last_group_hash),
-        );
-
-        // Insert the handle first so register_coordinator_handler can update the role.
-        let handle = NetworkHandle {
-            name: name.clone(),
-            network_key: net_public_key,
-            role: NetworkRole::Coordinator,
-            state: Arc::clone(&state),
-            dht_notify: Some(Arc::clone(&dht_notify)),
-            cancel: cancel.clone(),
-            tasks,
-            invite_lock: Arc::clone(&invite_lock),
-            // A coordinator holds the network key and publishes the record, so
-            // the version it advertises is this build's by construction.
-            incompatible: None,
-        };
-        self.networks.insert(name.clone(), handle);
-
-        self.register_coordinator_handler(
-            &ctx,
-            &name,
-            state,
-            invite_lock,
-            Some(dht_notify),
-            net_public_key,
-        );
-        self.refresh_search_domains().await;
+        // The registration claim keeps every other path from installing it.
+        let installed = self
+            .install_network(NetworkInstall {
+                name: &name,
+                network_key: net_public_key,
+                state: Arc::new(std::sync::RwLock::new(net_state)),
+                cancel: self.shutdown_token.child_token(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                // A coordinator holds the network key and publishes the record,
+                // so the version it advertises is this build's by construction.
+                incompatible: None,
+                authority: Some(RecordAuthority {
+                    key: net_secret_key,
+                    initially_published: initial_record.map(|_| last_group_hash),
+                }),
+                poll_record: false,
+                reconverge_worker: None,
+                my_hostname: None,
+                dial: None,
+            })
+            .await;
+        anyhow::ensure!(installed, "network '{name}' is already active");
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
 
@@ -1569,37 +1543,6 @@ impl NetworkRegistry {
                 false
             }
         }
-    }
-
-    /// Spawn a coordinated network's background tasks: the pkarr network publisher
-    /// and the ephemeral stale-member pruner. Dead-peer cleanup/reconnect is
-    /// daemon-wide (the connection supervisor), so no per-network disconnect task.
-    /// Returns the task handles plus the daemon-wide disconnect sender (taken from
-    /// the supplied `ctx`) the caller uses to build peer readers.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_coordinator_background_tasks(
-        &self,
-        ctx: &MeshCtx,
-        name: &str,
-        net_secret_key: &SecretKey,
-        state: &SharedNetworkState,
-        dht_notify: &Arc<tokio::sync::Notify>,
-        cancel: &CancellationToken,
-        initially_published: Option<blake3::Hash>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        let pkarr_client =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-                .ok();
-        coordinator_tasks(
-            pkarr_client,
-            ctx,
-            name,
-            net_secret_key,
-            state,
-            dht_notify,
-            cancel,
-            initially_published,
-        )
     }
 
     /// Store a network's current blob snapshot, persist its recovery pointer,
@@ -2044,7 +1987,7 @@ fn record_is_published(network: &str) -> bool {
 /// by every path that makes a network coordinated, promotion included, so none
 /// of them ends up with only part of the set.
 #[allow(clippy::too_many_arguments)]
-fn coordinator_tasks(
+pub(super) fn coordinator_tasks(
     pkarr_client: Option<PkarrRelayClient>,
     ctx: &MeshCtx,
     name: &str,

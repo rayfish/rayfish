@@ -2,7 +2,6 @@
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
-use dashmap::mapref::entry::Entry;
 // The desktop-gated `start_ssh` binds SSH listeners on concrete IPs, and the
 // macOS exit-node helpers below match on underlay addresses. macOS without the
 // desktop feature (the ray-mobile host build) still needs the import.
@@ -327,127 +326,37 @@ impl NetworkRegistry {
             )
             .await;
 
-        let cancel = self.shutdown_token.child_token();
-        let state = Arc::new(RwLock::new(net_state));
-        let invite_lock = Arc::new(AsyncMutex::new(()));
-        let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let ctx = self.mesh_ctx();
-        let tasks = self.spawn_coordinator_background_tasks(
-            &ctx,
-            name,
-            &net_secret_key,
-            &state,
-            &dht_notify,
-            &cancel,
-            restored_record.as_ref().map(|_| last_group_hash),
-        );
-
-        // Register the network from its restored local state before dialing
-        // peers, so `ray status` / IPC sees it the instant the local restore
-        // finishes. `dial_all_members` awaits a handshake per peer; when it gated
-        // this insert, a freshly (re)started daemon answered `status` with "no
-        // active networks" until every dial resolved.
-        //
         // Never replace a handle another path registered meanwhile: the old
         // handle's tasks would keep running on a second state for the same
         // network, and its publisher would sign that state's roster over the
         // live one's.
-        let handle = NetworkHandle {
-            name: name.to_string(),
-            network_key: net_public_key,
-            role: NetworkRole::Coordinator,
-            state: Arc::clone(&state),
-            dht_notify: Some(Arc::clone(&dht_notify)),
-            cancel: cancel.clone(),
-            tasks,
-            invite_lock: Arc::clone(&invite_lock),
-            // A coordinator holds the network key and publishes a version this
-            // build supports, including the rollout compatibility version.
-            incompatible: None,
-        };
-        match self.networks.entry(name.to_string()) {
-            Entry::Occupied(_) => {
-                cancel.cancel();
-                return Ok(ipc_err(format!("network '{name}' already active")));
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(handle);
-            }
-        }
-
-        self.register_coordinator_handler(
-            &ctx,
-            name,
-            Arc::clone(&state),
-            Arc::clone(&invite_lock),
-            Some(Arc::clone(&dht_notify)),
-            net_public_key,
-        );
-
-        // Register hostnames in DNS table
-        {
-            let members_snapshot: Vec<_> = {
-                let s = state.read().unwrap();
-                s.members
-                    .all()
-                    .into_iter()
-                    .filter_map(|m| {
-                        m.hostname
-                            .as_ref()
-                            .map(|h| (h.clone(), derive_ipv6(&m.identity)))
-                    })
-                    .collect()
-            };
-            for (hostname, ipv6) in members_snapshot {
-                dns::update_hostname(
-                    &self.dns.hostname_table,
-                    &self.dns.reverse_table,
-                    name,
-                    &hostname,
-                    ipv6,
-                )
-                .await;
-            }
-        }
-
-        let members_to_dial: Vec<Member> = state
-            .read()
-            .unwrap()
-            .members
-            .all()
-            .into_iter()
-            .cloned()
-            .collect();
-        // Seed the route map from the restored roster so the data path can re-dial
-        // any member that has since been idle-closed, before the first reconverge
-        // (self excluded).
-        self.seed_route_map(name, &members_to_dial);
-        self.refresh_search_domains().await;
-
-        // Full mesh: proactively dial every known member in the background so a
-        // restarting coordinator/co-coordinator reconnects to peers that haven't
-        // (yet) dialed in, without blocking restore on peer connectivity. Track
-        // the task on the handle and stop it with the network token so leave/nuke
-        // cannot let a stale restore dial recreate routes after teardown.
-        let me = Arc::clone(self);
-        let network_name = name.to_string();
-        let dial_cancel = cancel.clone();
-        let dial_task = tokio::spawn(async move {
-            tokio::select! {
-                _ = dial_cancel.cancelled() => {}
-                _ = me.dial_all_members(
-                    &members_to_dial,
-                    net_public_key,
-                    &network_name,
-                    me.transport.identity.local_identity(),
-                    persisted_hostname,
-                ) => {}
-            }
-        });
-        if let Some(mut handle) = self.networks.get_mut(name) {
-            handle.tasks.push(dial_task);
-        } else {
-            dial_task.abort();
+        let installed = self
+            .install_network(NetworkInstall {
+                name,
+                network_key: net_public_key,
+                state: Arc::new(RwLock::new(net_state)),
+                cancel: self.shutdown_token.child_token(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                // A coordinator holds the network key and publishes a version
+                // this build supports, including the rollout compatibility
+                // version.
+                incompatible: None,
+                authority: Some(RecordAuthority {
+                    key: net_secret_key,
+                    initially_published: restored_record.map(|_| last_group_hash),
+                }),
+                poll_record: false,
+                reconverge_worker: None,
+                my_hostname: None,
+                // Full mesh: a restarting coordinator reconnects to peers that
+                // have not dialed in yet, without blocking restore on them.
+                dial: Some(MemberDial {
+                    my_hostname: persisted_hostname,
+                }),
+            })
+            .await;
+        if !installed {
+            return Ok(ipc_err(format!("network '{name}' already active")));
         }
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network restored (coordinator)");

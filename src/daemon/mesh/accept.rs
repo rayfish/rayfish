@@ -2118,11 +2118,6 @@ impl ProtocolRouter {
         self.conn_mngr.register(net_pubkey, handler);
     }
 
-    /// Whether a handler is registered for this network public key.
-    pub(crate) fn is_registered(&self, net_pubkey: &EndpointId) -> bool {
-        self.conn_mngr.is_registered(net_pubkey)
-    }
-
     /// In-flight `ray ping` probe map (nonce → oneshot), owned by the driver.
     pub(crate) fn pending_pongs(&self) -> &Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>> {
         &self.conn_mngr.pending_pongs

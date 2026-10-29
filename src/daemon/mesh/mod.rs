@@ -20,6 +20,7 @@ pub(super) mod diagnostics;
 mod exit_node;
 mod files;
 mod firewall;
+mod install;
 mod invite;
 mod join;
 mod publish;
@@ -39,6 +40,7 @@ pub(crate) use coordinator::*;
 pub(crate) use create_join::{ensure_transport_supported, save_network_transport};
 // Device-side cert-refresh helper, reached by both control readers.
 pub(crate) use files::{resolve_download_target, store_refreshed_cert};
+pub(crate) use install::*;
 pub(crate) use join::*;
 pub(crate) use publish::*;
 pub(crate) use reconverge::*;
