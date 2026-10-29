@@ -216,7 +216,6 @@ impl ConnectService {
                 state
                     .members
                     .all()
-                    .iter()
                     .any(|member| member.matches_identity(recipient))
             })
         })

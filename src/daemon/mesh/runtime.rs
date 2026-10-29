@@ -52,7 +52,6 @@ fn kick_targets(
 ) -> Option<(Vec<EndpointId>, bool, String)> {
     let rows: Vec<&Member> = members
         .all()
-        .into_iter()
         .filter(|m| {
             m.identity == candidate
                 || m.identity == candidate_user
@@ -388,7 +387,6 @@ impl NetworkRegistry {
             let other_coordinators = state
                 .members
                 .all()
-                .iter()
                 .any(|member| member.identity != my_id && member.is_coordinator);
             (is_coord, others, other_coordinators)
         };
@@ -465,7 +463,6 @@ impl NetworkRegistry {
             );
             let mut seeds: Vec<EndpointId> = members
                 .all()
-                .iter()
                 .filter(|member| member.is_coordinator)
                 .map(|member| member.identity)
                 .collect();
@@ -2280,7 +2277,7 @@ mod coordinator_restore_tests {
 
         let restored = materialize_coordinator_roster(restored(source), me, None);
 
-        assert_eq!(restored.approved.all(), vec![&approved]);
+        assert_eq!(restored.approved.all().collect::<Vec<_>>(), vec![&approved]);
         assert_eq!(restored.reusable_keys.get(&key_hash), Some(&key));
         assert_eq!(restored.nullifiers, BTreeSet::from([nullified]));
     }

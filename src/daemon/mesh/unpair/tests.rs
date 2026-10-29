@@ -224,7 +224,7 @@ async fn listed(primary: &Node, device: EndpointId, cert: control::DeviceCert) {
             create(&daemon, "home").await;
             let handle = daemon.registry.networks.get("home").unwrap();
             let mut state = handle.state.write().unwrap();
-            let template = state.members.all()[0].clone();
+            let template = state.members.all().next().unwrap().clone();
             state.members.add(Member {
                 identity: device,
                 is_coordinator: false,
@@ -812,7 +812,7 @@ async fn a_pairing_waits_for_a_network_being_destroyed() {
     {
         let handle = registry.networks.get("work").unwrap();
         let mut state = handle.state.write().unwrap();
-        let template = state.members.all()[0].clone();
+        let template = state.members.all().next().unwrap().clone();
         state.members.add(Member {
             identity: member.id(),
             is_coordinator: false,

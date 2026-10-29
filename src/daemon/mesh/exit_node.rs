@@ -213,7 +213,6 @@ impl NetworkRegistry {
         state
             .members
             .all()
-            .into_iter()
             .find(|m| m.matches_identity(id))
             .cloned()
     }

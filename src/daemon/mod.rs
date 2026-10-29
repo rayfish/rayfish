@@ -544,12 +544,12 @@ impl NetworkState {
     /// Snapshot the current member roster as an owned `Vec` (the members map is
     /// the single source of truth; callers take a copy to release the lock).
     pub(crate) fn roster(&self) -> Vec<Member> {
-        self.members.all().into_iter().cloned().collect()
+        self.members.all().cloned().collect()
     }
 
     /// Snapshot the current approved-but-not-yet-joined entries as an owned `Vec`.
     fn approved_snapshot(&self) -> Vec<ApprovedEntry> {
-        self.approved.all().into_iter().cloned().collect()
+        self.approved.all().cloned().collect()
     }
 
     /// Hostnames currently claimed by other members (excluding `except`), used to
@@ -557,7 +557,6 @@ impl NetworkState {
     fn taken_hostnames(&self, except: EndpointId) -> Vec<String> {
         self.members
             .all()
-            .iter()
             .filter(|m| m.identity != except)
             .filter_map(|m| m.hostname.clone())
             .collect()

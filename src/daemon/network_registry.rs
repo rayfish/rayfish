@@ -750,15 +750,10 @@ impl NetworkRegistry {
                 standing.user_identity = standing.user_identity.or(member.user_identity);
             }
             standing.known = standing.known
-                || state
-                    .members
-                    .all()
-                    .iter()
-                    .any(|m| m.user_identity == Some(remote))
+                || state.members.all().any(|m| m.user_identity == Some(remote))
                 || state
                     .approved
                     .all()
-                    .iter()
                     .any(|e| e.identity == remote || e.user_identity == Some(remote));
         }
         // The paired primary need not share a roster with this device yet.
@@ -1673,12 +1668,7 @@ impl NetworkRegistry {
             }
             for entry in self.networks.iter() {
                 let state = entry.value().state.read().unwrap();
-                if let Some(m) = state
-                    .members
-                    .all()
-                    .iter()
-                    .find(|m| derive_ipv6(&m.identity) == v6)
-                {
+                if let Some(m) = state.members.all().find(|m| derive_ipv6(&m.identity) == v6) {
                     return Some(m.identity);
                 }
             }

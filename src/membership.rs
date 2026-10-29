@@ -4,7 +4,7 @@
 //! into `200::/7`, so they are never carried on the wire: every node computes
 //! every other node's address itself. See [`derive_ipv6`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Result, bail};
@@ -195,10 +195,11 @@ impl Member {
 /// existing `crate::membership::GroupMode` paths keep working.
 pub use ray_proto::GroupMode;
 
-/// Active members of a network, keyed by [`EndpointId`].
+/// Active members of a network, keyed by [`EndpointId`]. Ordered by identity,
+/// which is the canonical order the group blob encodes them in.
 #[derive(Debug, Clone)]
 pub struct MemberList {
-    members: HashMap<EndpointId, Member>,
+    members: BTreeMap<EndpointId, Member>,
 }
 
 impl Default for MemberList {
@@ -210,7 +211,7 @@ impl Default for MemberList {
 impl MemberList {
     pub fn new() -> Self {
         Self {
-            members: HashMap::new(),
+            members: BTreeMap::new(),
         }
     }
 
@@ -234,8 +235,8 @@ impl MemberList {
         self.members.contains_key(identity)
     }
 
-    pub fn all(&self) -> Vec<&Member> {
-        self.members.values().collect()
+    pub fn all(&self) -> impl ExactSizeIterator<Item = &Member> {
+        self.members.values()
     }
 
     /// Resolve a firewall `--peer` **literal** against this roster: a mesh IPv6
@@ -327,7 +328,7 @@ pub struct ApprovedEntry {
 /// connected yet. Any peer holding this list can welcome them.
 #[derive(Debug, Clone)]
 pub struct ApprovedList {
-    entries: HashMap<EndpointId, ApprovedEntry>,
+    entries: BTreeMap<EndpointId, ApprovedEntry>,
 }
 
 impl Default for ApprovedList {
@@ -339,7 +340,7 @@ impl Default for ApprovedList {
 impl ApprovedList {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
         }
     }
 
@@ -355,8 +356,8 @@ impl ApprovedList {
         self.entries.remove(identity)
     }
 
-    pub fn all(&self) -> Vec<&ApprovedEntry> {
-        self.entries.values().collect()
+    pub fn all(&self) -> impl ExactSizeIterator<Item = &ApprovedEntry> {
+        self.entries.values()
     }
 
     pub fn from_entries(entries: Vec<ApprovedEntry>) -> Self {
@@ -528,10 +529,10 @@ impl GroupBlob {
     }
 }
 
-/// Produces a deterministic msgpack encoding of a group blob.
-/// Members and approved entries are sorted by identity string to ensure
-/// identical output regardless of HashMap iteration order; the suggested
-/// firewall is a `BTreeMap`, so it is already canonically ordered.
+/// Produces a deterministic msgpack encoding of a group blob. Every collection
+/// in it is ordered by key, so equal contents always encode to equal bytes.
+/// Identities order by their raw bytes, which is also their lowercase-hex
+/// string order, the order older builds sorted by.
 pub fn canonical_group_bytes(
     members: &MemberList,
     approved: &ApprovedList,
@@ -540,15 +541,9 @@ pub fn canonical_group_bytes(
     reusable_keys: &BTreeMap<String, ReusableKey>,
     nullifiers: &BTreeSet<EndpointId>,
 ) -> Vec<u8> {
-    let mut sorted_members: Vec<Member> = members.all().into_iter().cloned().collect();
-    sorted_members.sort_by_key(|m| m.identity.to_string());
-
-    let mut sorted_approved: Vec<ApprovedEntry> = approved.all().into_iter().cloned().collect();
-    sorted_approved.sort_by_key(|a| a.identity.to_string());
-
     let data = GroupBlob {
-        members: sorted_members,
-        approved: sorted_approved,
+        members: members.all().cloned().collect(),
+        approved: approved.all().cloned().collect(),
         suggested_firewall: suggested_firewall.clone(),
         name: name.map(|s| s.to_string()),
         reusable_keys: reusable_keys.clone(),
@@ -883,6 +878,48 @@ mod tests {
             });
         }
         list
+    }
+
+    /// The roster is encoded in key order. Older builds cloned it out of a
+    /// `HashMap` and sorted by the hex identity string; both must give the
+    /// same bytes, or every node would see a different blob hash.
+    #[test]
+    fn canonical_bytes_match_the_string_sorted_encoding() {
+        let seeds: Vec<u8> = (0..=255).step_by(3).collect();
+        let members = make_member_list(&seeds);
+        let mut approved = ApprovedList::new();
+        for &seed in seeds.iter().rev() {
+            approved.approve(ApprovedEntry {
+                identity: test_id(seed.wrapping_add(1)),
+                hostname: Some(format!("host-{seed}")),
+                user_identity: None,
+                device_cert: None,
+            });
+        }
+        let mut sorted_members: Vec<Member> = members.all().cloned().collect();
+        sorted_members.sort_by_key(|m| m.identity.to_string());
+        let mut sorted_approved: Vec<ApprovedEntry> = approved.all().cloned().collect();
+        sorted_approved.sort_by_key(|a| a.identity.to_string());
+        let string_sorted = rmp_serde::to_vec(&GroupBlob {
+            members: sorted_members,
+            approved: sorted_approved,
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some("lab".into()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            canonical_group_bytes(
+                &members,
+                &approved,
+                &SuggestedFirewall::default(),
+                Some("lab"),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            ),
+            string_sorted
+        );
     }
 
     #[test]
@@ -1274,7 +1311,7 @@ mod tests {
         }
         let members = make_member_list(&[1, 2]);
         let old = ShortBlob {
-            members: members.all().into_iter().cloned().collect(),
+            members: members.all().cloned().collect(),
             approved: vec![],
         };
         let bytes = rmp_serde::to_vec(&old).unwrap();

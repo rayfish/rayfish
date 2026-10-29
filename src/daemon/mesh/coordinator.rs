@@ -788,7 +788,6 @@ pub(crate) fn spawn_stale_member_pruner(
                 let s = state.read().unwrap();
                 s.members
                     .all()
-                    .into_iter()
                     .filter(|m| {
                         should_prune(
                             m,

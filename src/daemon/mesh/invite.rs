@@ -68,7 +68,6 @@ impl NetworkRegistry {
                 .unwrap()
                 .members
                 .all()
-                .into_iter()
                 .cloned()
                 .collect();
             let me = self.transport.endpoint.id();
