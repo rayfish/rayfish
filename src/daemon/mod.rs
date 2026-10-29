@@ -274,7 +274,8 @@ pub(crate) use mesh_dialer::{DialClaim, DialedPeer, MESH_DIAL_TIMEOUT, MeshDiale
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
 pub(crate) use network_registry::{
-    DialTarget, NameOwner, NetworkRegistry, finish_interrupted_rename, missing_networks,
+    DialTarget, NameOwner, NetworkRegistry, RegistryHandles, finish_interrupted_rename,
+    missing_networks,
 };
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -2279,23 +2280,21 @@ pub(crate) mod accept_handler_tests {
         ));
         let (disconnect_tx, _disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(1);
         let (placeholder_tx, _placeholder_rx) = mpsc::channel::<Bytes>(1);
-        Arc::new(NetworkRegistry::new(
-            Arc::new(DashMap::new()),
+        Arc::new(NetworkRegistry::new(RegistryHandles {
             transport,
-            PeerTable::new(),
-            Arc::new(ConnectionManager::new()),
+            peers: PeerTable::new(),
+            conn: Arc::new(ConnectionManager::new()),
             dns,
-            Arc::new(arc_swap::ArcSwap::from_pointee(String::from("test"))),
-            None,
-            CancellationToken::new(),
-            SharedFirewall::new(firewall::FirewallConfig::default()),
-            peers::DeviceUserMap::new(),
-            Arc::new(arc_swap::ArcSwap::from_pointee(placeholder_tx)),
-            Arc::new(DashSet::new()),
+            tun_name: Arc::new(arc_swap::ArcSwap::from_pointee(String::from("test"))),
+            device_cert: None,
+            shutdown_token: CancellationToken::new(),
+            firewall: SharedFirewall::new(firewall::FirewallConfig::default()),
+            device_user_map: peers::DeviceUserMap::new(),
+            tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(placeholder_tx)),
             disconnect_tx,
-            false,
-            Duration::from_secs(config::DEFAULT_IDLE_TIMEOUT_SECS),
-        ))
+            on_demand: false,
+            idle_timeout: Duration::from_secs(config::DEFAULT_IDLE_TIMEOUT_SECS),
+        }))
     }
 
     #[cfg(feature = "desktop")]

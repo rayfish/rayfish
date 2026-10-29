@@ -381,27 +381,44 @@ pub(crate) fn networks_joined_with_certificate(
         .collect()
 }
 
+/// The daemon-wide handles [`NetworkRegistry::new`] shares with the rest of
+/// the daemon. Named fields, because several have the same shape and a
+/// positional list made them easy to swap. See the matching registry fields.
+pub(crate) struct RegistryHandles {
+    pub(crate) transport: Arc<Transport>,
+    pub(crate) peers: PeerTable,
+    pub(crate) conn: Arc<ConnectionManager>,
+    pub(crate) dns: Arc<DnsService>,
+    pub(crate) tun_name: Arc<ArcSwap<String>>,
+    pub(crate) device_cert: Option<control::DeviceCert>,
+    pub(crate) shutdown_token: CancellationToken,
+    pub(crate) firewall: SharedFirewall,
+    pub(crate) device_user_map: peers::DeviceUserMap,
+    pub(crate) tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
+    pub(crate) disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    pub(crate) on_demand: bool,
+    pub(crate) idle_timeout: Duration,
+}
+
 impl NetworkRegistry {
-    #[allow(clippy::too_many_arguments)] // one clone per shared daemon handle
-    pub(crate) fn new(
-        networks: Arc<DashMap<String, NetworkHandle>>,
-        transport: Arc<Transport>,
-        peers: PeerTable,
-        conn: Arc<ConnectionManager>,
-        dns: Arc<DnsService>,
-        tun_name: Arc<ArcSwap<String>>,
-        device_cert: Option<control::DeviceCert>,
-        shutdown_token: CancellationToken,
-        firewall: SharedFirewall,
-        device_user_map: peers::DeviceUserMap,
-        tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
-        pruned_peers: Arc<DashSet<(String, EndpointId)>>,
-        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-        on_demand: bool,
-        idle_timeout: Duration,
-    ) -> Self {
+    pub(crate) fn new(handles: RegistryHandles) -> Self {
+        let RegistryHandles {
+            transport,
+            peers,
+            conn,
+            dns,
+            tun_name,
+            device_cert,
+            shutdown_token,
+            firewall,
+            device_user_map,
+            tun_tx,
+            disconnect_tx,
+            on_demand,
+            idle_timeout,
+        } = handles;
         Self {
-            networks,
+            networks: Arc::new(DashMap::new()),
             transport,
             peers,
             mesh_dialer: MeshDialer::default(),
@@ -413,7 +430,7 @@ impl NetworkRegistry {
             firewall,
             device_user_map,
             tun_tx,
-            pruned_peers,
+            pruned_peers: Arc::new(DashSet::new()),
             route_map: peers::RosterRouteMap::new(),
             reachability: peers::Reachability::new(),
             disconnect_tx,

@@ -609,32 +609,25 @@ async fn build_daemon_inner(
     // ProtocolRouter (which delegates the mesh ALPN to it) and the
     // NetworkRegistry (which re-registers a network's handler on promotion).
     let conn = Arc::new(ConnectionManager::new());
-    // Networks map is shared with the NetworkRegistry service (M5 seam): both
-    // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
-    let networks = Arc::new(DashMap::new());
     // Daemon-wide disconnect channel: every per-connection data reader reports
     // peer drops here, drained by the single connection supervisor. Built here
-    // (before the registry) so the registry and the Daemon literal share the
-    // one sender.
+    // (before the registry) so the supervisor can own the receiver.
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
-    let pruned_peers = Arc::new(DashSet::new());
-    let registry = Arc::new(NetworkRegistry::new(
-        Arc::clone(&networks),
-        Arc::clone(&transport),
-        peers.clone(),
-        Arc::clone(&conn),
-        Arc::clone(&dns),
-        Arc::clone(&tun_name),
-        device_cert.clone(),
-        token.clone(),
-        shared_firewall.clone(),
-        device_user_map.clone(),
-        Arc::clone(&tun_tx),
-        Arc::clone(&pruned_peers),
-        disconnect_tx.clone(),
+    let registry = Arc::new(NetworkRegistry::new(RegistryHandles {
+        transport: Arc::clone(&transport),
+        peers: peers.clone(),
+        conn: Arc::clone(&conn),
+        dns: Arc::clone(&dns),
+        tun_name: Arc::clone(&tun_name),
+        device_cert: device_cert.clone(),
+        shutdown_token: token.clone(),
+        firewall: shared_firewall.clone(),
+        device_user_map: device_user_map.clone(),
+        tun_tx: Arc::clone(&tun_tx),
+        disconnect_tx,
         on_demand,
-        app_config.idle_timeout(),
-    ));
+        idle_timeout: app_config.idle_timeout(),
+    }));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
     // calling NetworkRegistry directly (was the reauth_tx hand-off channel), so it
