@@ -327,7 +327,7 @@ impl MeshConnection {
                         return;
                     };
                     // The reachability wall for the control plane, mirroring
-                    // what `resolve_inbound_by_id` does for datagrams: a frame
+                    // what `resolve_inbound` does for datagrams: a frame
                     // is dispatched to a network's handler on the strength of
                     // the network id it names, and that id is public, so the
                     // sender has to be someone this network's roster accounts

@@ -8,7 +8,7 @@
 //! only the work the data plane does, so a regression (or the gain from the
 //! zero-copy hand-off) is visible and stable run-to-run.
 //!
-//! Five groups:
+//! Six groups:
 //! - `handoff` — the packet ownership transfer that the zero-copy change
 //!   touched. `copy` reproduces the old allocate-and-copy (`Bytes::copy_from_slice`
 //!   on TX, `Vec::to_vec` on RX); `zerocopy` is the current pooled
@@ -20,6 +20,9 @@
 //! - `writer_resolve` — resolving the swappable TUN sender once per inbound
 //!   datagram: `load_full` (two atomic refcount ops) against the `arc_swap`
 //!   `Cache` the peer reader now uses.
+//! - `derive_ipv6` — the peer's mesh address, which the inbound reader used to
+//!   derive per datagram and now derives once per connection. `display_alloc` is
+//!   the old `to_string()` shape; `stack_hex` is the current derivation.
 //! - `firewall` — `parse_packet_info` + `evaluate_packet`, the unavoidable
 //!   per-packet work run once per direction on every packet. A regression guard.
 
@@ -268,6 +271,29 @@ fn bench_writer_resolve(c: &mut Criterion) {
     group.finish();
 }
 
+/// Deriving a peer's mesh IPv6 from its identity. `display_alloc` reproduces the
+/// old derivation, which hashed `identity.to_string()` and so allocated twice;
+/// `stack_hex` is the current `derive_ipv6`, which hex-encodes on the stack.
+fn bench_derive_ipv6(c: &mut Criterion) {
+    let id = iroh::SecretKey::from([7u8; 32]).public();
+
+    let mut group = c.benchmark_group("derive_ipv6");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("display_alloc", |b| {
+        b.iter(|| {
+            let hash = blake3::hash(black_box(&id).to_string().as_bytes());
+            black_box(hash.as_bytes()[0])
+        });
+    });
+
+    group.bench_function("stack_hex", |b| {
+        b.iter(|| black_box(rayfish::membership::derive_ipv6(black_box(&id))));
+    });
+
+    group.finish();
+}
+
 /// `parse_packet_info` + `evaluate_packet`: the per-packet work that runs
 /// regardless of the hand-off strategy, once per direction on every packet.
 fn bench_firewall(c: &mut Criterion) {
@@ -348,6 +374,7 @@ criterion_group!(
     bench_tun_ingress,
     bench_apple_tun_ingress,
     bench_writer_resolve,
+    bench_derive_ipv6,
     bench_firewall
 );
 criterion_main!(benches);

@@ -31,7 +31,7 @@ use crate::daemon::NetworkRegistry;
 use crate::dns;
 use crate::exit_node::{ExitClient, ExitContext, is_transitable};
 use crate::firewall::{self, Direction, SharedFirewall};
-use crate::membership::is_overlay_ip;
+use crate::membership::{derive_ipv6, is_overlay_ip};
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
 use frag_verdicts::FragmentVerdicts;
@@ -994,12 +994,11 @@ pub fn spawn_peer_reader(
         device_user_map,
         exit,
     } = ctx;
-    // A peer's v6 mesh address is the 120-bit blake3 of its identity and never
-    // collides, so it is fixed per-identity and derived once here. The v4 address
-    // can carry a collision suffix, so it is resolved per datagram from the peer's
-    // roster entry (see `resolve_inbound_by_id`) rather than captured at spawn —
-    // the reader starts when the connection opens, before the join handshake
-    // assigns the peer's collision-aware v4.
+    // A peer's mesh address is a pure function of its identity, so it is derived
+    // once here rather than per datagram. The arrival network is still resolved
+    // per datagram (see `PeerTable::resolve_inbound`): the reader starts when the
+    // connection opens, and the networks it may carry change while it runs.
+    let peer_ipv6 = derive_ipv6(&peer_id);
     use tracing::Instrument as _;
     // Tag every event from this reader (drops, connection-lost) with the peer so
     // the report bundle's logs are correlatable per peer. The connection carries
@@ -1062,14 +1061,12 @@ pub fn spawn_peer_reader(
                     stats.record_drop(DropReason::Malformed);
                     continue;
                 };
-                // Resolve the peer's mesh IPv6 + arrival network from the handle in one
-                // pass, which also enforces the in-band reachability wall: it returns
+                // Resolve the arrival network from the handle in one lookup,
+                // which also enforces the in-band reachability wall: it returns
                 // `None` unless the handle maps to a network *we* currently share with
                 // this peer per our own roster. So the peer's handle table alone can't
                 // smuggle a datagram into a network we don't agree it belongs to.
-                let Some((peer_ipv6, network)) =
-                    peers.resolve_inbound_by_id(&peer_id, &conn, handle)
-                else {
+                let Some(network) = peers.resolve_inbound(&peer_ipv6, &conn, handle) else {
                     stats.record_drop(DropReason::Spoof);
                     continue;
                 };
