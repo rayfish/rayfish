@@ -5,18 +5,42 @@ mod app;
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod backend;
-#[cfg(windows)]
-mod controls;
-#[cfg(any(windows, test))]
-#[cfg_attr(not(windows), allow(dead_code))]
 mod forms;
-#[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod model;
+#[cfg(any(not(windows), test))]
+#[cfg_attr(windows, allow(dead_code))]
+mod preview;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod ui;
+mod window;
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("rayfish-app is only available on Windows");
+    use std::path::PathBuf;
+
+    let args = std::env::args().collect::<Vec<_>>();
+    if let Some(index) = args.iter().position(|arg| arg == "--preview-screenshot")
+        && let Some(path) = args.get(index + 1)
+    {
+        let page = if args.iter().any(|arg| arg == "--settings") {
+            ui::Page::Settings
+        } else if args.iter().any(|arg| arg == "--devices") {
+            ui::Page::Devices
+        } else {
+            ui::Page::Networks
+        };
+        if let Err(error) = preview::run(
+            PathBuf::from(path),
+            args.iter().any(|arg| arg == "--populated"),
+            page,
+        ) {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!("rayfish-app is only available on Windows");
+    }
 }
 
 #[cfg(windows)]

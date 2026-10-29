@@ -8,6 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Windows: the installer creates a desktop shortcut with the Rayfish icon.
 - The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
   and DNS through the packet tunnel, or restore a direct connection.
 
@@ -16,8 +17,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Windows: the desktop app uses native Windows controls for networks, devices,
-  requests, firewall rules, and settings, without requiring WebView2.
+- Windows: the desktop app follows the macOS app's layout, dark theme, fonts,
+  and network cards, without requiring WebView2.
 - While an exit node is selected, the LAN, Docker networks and other VPNs stay
   reachable directly, and SSH sessions to the client's own address keep
   working. Only new connections to the internet outside the tunnel are

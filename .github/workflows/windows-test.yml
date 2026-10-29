@@ -1,0 +1,50 @@
+name: Windows test installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-package-x86_64-pc-windows-msvc"
+          save-if: 'false'
+
+      - name: Install WiX 3
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX candle.exe was not found after installation.'
+          }
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build test MSI
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
+          ./scripts/build-windows-msi.ps1 -Version $version -ReleaseIdentity $version -Channel stable -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+
+      - name: Upload test installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: ray-windows-x86_64-msi
+          path: ${{ runner.temp }}/ray-windows-x86_64.msi*
+          if-no-files-found: error
+          retention-days: 7

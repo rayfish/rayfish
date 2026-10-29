@@ -20,6 +20,8 @@
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer Rayfish version is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="Rayfish.exe" SourceFile="$(var.CargoTargetBinDir)\rayfish-app.exe" />
+    <Property Id="ARPPRODUCTICON" Value="Rayfish.exe" />
     <Feature Id="ProductFeature" Title="Rayfish" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentGroupRef Id="FontLicenseComponents" />
@@ -43,6 +45,7 @@
         </Directory>
       </Directory>
       <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
     </Directory>
   </Fragment>
 
@@ -74,7 +77,11 @@
       <Component Id="RayfishAppExecutable" Guid="*">
         <File Id="RayfishAppExe" Source="$(var.CargoTargetBinDir)\rayfish-app.exe" KeyPath="yes">
           <Shortcut Id="RayfishStartMenuShortcut" Directory="ProgramMenuFolder"
-                    Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+                    Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
+                    Icon="Rayfish.exe" IconIndex="0" />
+          <Shortcut Id="RayfishDesktopShortcut" Directory="DesktopFolder"
+                    Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
+                    Icon="Rayfish.exe" IconIndex="0" />
         </File>
       </Component>
       <Component Id="ReleaseIdentityRegistry" Guid="*" Win64="yes">

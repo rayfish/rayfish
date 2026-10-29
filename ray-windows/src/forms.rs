@@ -36,6 +36,16 @@ impl Field {
 }
 
 impl FormKind {
+    pub fn submit_label(self) -> &'static str {
+        match self {
+            Self::Create => "Create network",
+            Self::Join => "Join network",
+            Self::Connect => "Send request",
+            Self::Rename => "Save name",
+            Self::Firewall => "Add rule",
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Create => "Create a network",

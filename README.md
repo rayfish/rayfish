@@ -74,9 +74,9 @@ an existing standalone setup and stops its old daemon.
 
 On Windows there is no daemonless mode. The MSI installs a LocalSystem service
 that owns the Wintun adapter and keeps the VPN running. The desktop window, tray
-icon, and `ray.exe` are clients of that service. The desktop app uses native
-Windows controls and does not require WebView2. Closing the window leaves the
-app in the tray and does not stop the service or disconnect the VPN.
+icon, and `ray.exe` are clients of that service. The desktop app uses Rayfish's
+dark theme and bundled fonts without requiring WebView2. Closing the window
+leaves the app in the tray and does not stop the service or disconnect the VPN.
 
 ## Quick start
 
