@@ -2726,21 +2726,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c480823ed7c2c5d0f09c41020cb6b7c28029ce60ec42dc942158dcf22f8e0a4d"
 dependencies = [
  "async-trait",
+ "bytes",
  "cfg-if",
  "data-encoding",
  "futures-channel",
  "futures-io",
  "futures-util",
+ "h2",
  "hickory-proto",
+ "http",
  "idna",
  "ipnet",
  "jni 0.22.4",
  "rand 0.10.2",
+ "rustls",
  "thiserror 2.0.20",
  "tinyvec",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2782,11 +2788,14 @@ dependencies = [
  "parking_lot",
  "rand 0.10.2",
  "resolv-conf",
+ "rustls",
  "smallvec",
  "system-configuration 0.7.0",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

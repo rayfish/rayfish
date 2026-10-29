@@ -29,6 +29,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Relay and peer-discovery lookups keep HTTPS DNS fallback when plain DNS is blocked.
 - After network changes, peer discovery retries DNS records that were missing
   before a peer started, instead of caching the earlier miss.
 - Cached peer addresses expire after seven days, with up to eight paths per

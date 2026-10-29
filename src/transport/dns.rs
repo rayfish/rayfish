@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use hickory_resolver::Resolver as HickoryResolver;
-use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::config::{CLOUDFLARE, GOOGLE, NameServerConfig, ResolverConfig};
 use hickory_resolver::net::runtime::{
     RuntimeProvider, TokioRuntimeProvider, iocompat::AsyncIoTokioAsStd,
 };
@@ -157,14 +157,30 @@ impl Resolver for UnderlayResolver {
     }
 }
 
-pub(super) fn resolver(nameservers: &[IpAddr]) -> anyhow::Result<DnsResolver> {
+pub(super) fn resolver(
+    nameservers: &[IpAddr],
+    allow_fallback: bool,
+) -> anyhow::Result<DnsResolver> {
     let mut config = ResolverConfig::default();
     for ip in nameservers {
         config.add_name_server(NameServerConfig::udp_and_tcp(*ip));
     }
+    if allow_fallback {
+        for group in [&CLOUDFLARE, &GOOGLE] {
+            // Each provider's primary IPv4 and IPv6 addresses, over HTTPS.
+            for server in group.https().take(2) {
+                config.add_name_server(server);
+            }
+        }
+    }
     let mut builder =
         HickoryResolver::builder_with_config(config.clone(), UnderlayRuntime::default());
     builder.options_mut().negative_max_ttl = Some(Duration::ZERO);
+    if allow_fallback {
+        // Race at most four configured servers and four encrypted fallbacks.
+        // Dropped port-53 packets must not hold every slot until the outer timeout.
+        builder.options_mut().num_concurrent_reqs = 8;
+    }
     let resolver = builder.build()?;
     Ok(DnsResolver::custom(UnderlayResolver { resolver, config }))
 }
@@ -172,6 +188,57 @@ pub(super) fn resolver(nameservers: &[IpAddr]) -> anyhow::Result<DnsResolver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "run tests/transport-dns-fallback.sh"]
+    async fn public_discovery_dns_survives_blocked_plain_dns() {
+        use std::env;
+
+        use iroh::dns::{DNS_TIMEOUT, NameserverConfig as IrohNameserverConfig};
+
+        assert_eq!(env::var("RAYFISH_BLOCK_PLAIN_DNS_TEST").as_deref(), Ok("1"));
+        let primary = [
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        ];
+        let stock = DnsResolver::builder()
+            .add_nameserver_configs(primary.into_iter().map(IrohNameserverConfig::udp))
+            .build();
+        assert!(
+            stock
+                .lookup_ipv4("example.com", Duration::from_secs(10))
+                .await
+                .expect("the stock resolver reaches its encrypted fallback")
+                .next()
+                .is_some()
+        );
+        let strict = resolver(&primary, false).expect("explicit replacement builds");
+        assert!(
+            strict
+                .lookup_ipv4("example.com", Duration::from_secs(2))
+                .await
+                .is_err(),
+            "explicit replacement cannot reach a public fallback"
+        );
+        let underlay = resolver(&primary, true).expect("underlay resolver builds");
+        assert!(
+            underlay
+                .lookup_ipv4("example.com", DNS_TIMEOUT)
+                .await
+                .expect("underlay DNS must retain encrypted fallback")
+                .next()
+                .is_some()
+        );
+        underlay.reset();
+        assert!(
+            underlay
+                .lookup_ipv4("example.org", DNS_TIMEOUT)
+                .await
+                .expect("encrypted fallback survives a network reset")
+                .next()
+                .is_some()
+        );
+    }
 
     #[tokio::test]
     async fn a_peer_published_after_a_dns_miss_is_found_after_reset() {
@@ -252,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_replacement_cannot_use_a_fallback_after_reset() {
-        let resolver = resolver(&[]).expect("an empty resolver config is valid");
+        let resolver = resolver(&[], false).expect("an empty resolver config is valid");
         assert!(
             resolver
                 .lookup_ipv4("example.com", Duration::from_secs(1))

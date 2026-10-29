@@ -361,7 +361,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
     // every server. Otherwise the platform owns an empty resolver list.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if !nameservers.is_empty() || dns_replace {
-        builder = builder.dns_resolver(dns::resolver(nameservers)?);
+        builder = builder.dns_resolver(dns::resolver(nameservers, !dns_replace)?);
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     // Without an override, empty means the platform owns resolver selection
