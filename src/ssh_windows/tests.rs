@@ -3,7 +3,7 @@
 use std::ffi::OsStr;
 use std::io::Error as IoError;
 
-use russh::client::{self, Msg as ClientMsg};
+use russh::client::{self, AuthResult, Msg as ClientMsg};
 use russh::keys::PublicKeyOrCertificate;
 use russh::{ChannelMsg, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -188,12 +188,18 @@ async fn windows_ssh_exec_and_interactive_powershell_use_the_login_account() -> 
     );
 
     let mut command = client.channel_open_session().await?;
-    command.exec(true, "if ([string]::IsNullOrWhiteSpace($env:USERPROFILE) -or $env:USERPROFILE -match 'systemprofile') { exit 99 }; [Console]::WriteLine(('rayfish-' + 'exec-ok')); [Console]::Error.WriteLine('rayfish-stderr-ok'); [Console]::WriteLine([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); exit 23").await?;
+    command.exec(true, "if ([string]::IsNullOrWhiteSpace($env:USERPROFILE) -or $env:USERPROFILE -match 'systemprofile') { exit 99 }; [Console]::WriteLine(('rayfish-' + 'exec-ok')); [Console]::WriteLine(('rayfish-unicode:' + [char]0x00e9 + [char]0x6f22)); [Console]::Error.WriteLine('rayfish-stderr-ok'); [Console]::WriteLine([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); exit 23").await?;
     let output = drain(&mut command).await?;
     let stdout = String::from_utf8(output.stdout).context("exec output is not UTF-8")?;
     anyhow::ensure!(
         stdout.contains("rayfish-exec-ok"),
         "the SSH exec command did not run"
+    );
+    anyhow::ensure!(
+        stdout
+            .lines()
+            .any(|line| line.trim() == "rayfish-unicode:\u{00e9}\u{6f22}"),
+        "SSH exec did not preserve Unicode output as UTF-8"
     );
     anyhow::ensure!(
         stdout.lines().any(|line| line.trim() == expected_sid),
@@ -204,9 +210,10 @@ async fn windows_ssh_exec_and_interactive_powershell_use_the_login_account() -> 
         "SSH exec did not preserve its exit status"
     );
 
+    let stderr = String::from_utf8(output.stderr).context("exec stderr is not UTF-8")?;
     anyhow::ensure!(
-        String::from_utf8_lossy(&output.stderr).contains("rayfish-stderr-ok"),
-        "SSH exec did not forward stderr separately"
+        stderr.trim() == "rayfish-stderr-ok",
+        "SSH exec did not forward clean, separate stderr"
     );
 
     let mut terminal = client.channel_open_session().await?;
@@ -250,13 +257,21 @@ async fn windows_ssh_denies_unlisted_users_and_unapproved_peers() -> Result<()> 
         } else {
             &user
         };
+        let denied = client.authenticate_none(account).await?;
         anyhow::ensure!(
-            !client.authenticate_none(account).await?.success(),
-            "an unauthorized SSH login was accepted"
+            matches!(denied, AuthResult::Failure { remaining_methods, partial_success: false } if remaining_methods.is_empty()),
+            "the unauthorized SSH login did not receive a complete rejection"
         );
-        client
-            .disconnect(Disconnect::ByApplication, "test complete", "en")
-            .await?;
+        // None is the server's only authentication method. Russh closes its
+        // client task after that method is rejected, before another disconnect
+        // message can be sent. Require that exact reason, not any socket error.
+        anyhow::ensure!(
+            matches!(
+                timeout(DEADLINE, client).await?,
+                Err(russh::Error::NoAuthMethod)
+            ),
+            "the rejected SSH connection ended for an unexpected reason"
+        );
         server.stop().await?;
     }
     Ok(())

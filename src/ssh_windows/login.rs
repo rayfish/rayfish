@@ -11,7 +11,8 @@ use std::slice;
 
 use anyhow::{Context, Result, bail, ensure};
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_NO_TOKEN, HANDLE, LUID, LocalFree,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_TOKEN, ERROR_PATH_NOT_FOUND,
+    ERROR_SUCCESS, HANDLE, LUID, LocalFree,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     NetApiBufferFree, NetUserGetInfo, UF_ACCOUNTDISABLE, UF_LOCKOUT, UF_NORMAL_ACCOUNT, USER_INFO_1,
@@ -30,6 +31,9 @@ use windows_sys::Win32::Security::{
     TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
     TOKEN_SOURCE, TOKEN_USER, TokenGroups, TokenPrimary, TokenUser, WinBuiltinAdministratorsSid,
     WinLocalSystemSid,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, RegCloseKey, RegOpenKeyExW,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
@@ -80,7 +84,7 @@ impl LoginInfo {
             };
             // Another authorized session may have created this SID's profile.
             // Re-read by token; never infer a home from an account-name path.
-            self.home = profile_directory(self.token_handle())?;
+            self.home = profile_directory(self.token_handle(), &self.account.sid)?;
             ensure!(
                 self.home.is_some(),
                 "Windows could not create the requested user profile (HRESULT {result:08x})."
@@ -194,7 +198,7 @@ pub(super) fn resolve_login(user: &str) -> Result<LoginInfo> {
         matches,
         "Windows logged on a different account than requested."
     );
-    let home = profile_directory(token.as_raw_handle())?;
+    let home = profile_directory(token.as_raw_handle(), &account.sid)?;
     let shell = system_shell()?;
     Ok(LoginInfo {
         name: account.name.clone(),
@@ -609,34 +613,69 @@ fn check_lsa_status(status: i32, operation: &str) -> Result<()> {
     Ok(())
 }
 
-fn profile_directory(token: HANDLE) -> Result<Option<PathBuf>> {
-    let mut length = 0;
-    // SAFETY: Null output probes the required UTF-16 buffer length for this token.
-    unsafe {
-        GetUserProfileDirectoryW(token, null_mut(), &mut length);
+fn profile_directory(token: HANDLE, sid: &Sid) -> Result<Option<PathBuf>> {
+    // A fresh local account can fail the userenv length probe without setting
+    // a useful length or error. Only a missing registration for the verified
+    // token SID means its profile may be created after authorization.
+    if !profile_registered(sid)? {
+        return Ok(None);
     }
-    if length == 0 {
-        let error = IoError::last_os_error();
-        if matches!(error.raw_os_error(), Some(2 | 3 | 1168)) {
-            return Ok(None);
-        }
-        return Err(error).context("finding the Windows user profile");
-    }
-    ensure!(
-        usize::try_from(length)? <= MAX_PROFILE_UNITS,
-        "The Windows user profile path is too long."
-    );
-    let mut path = vec![0u16; usize::try_from(length)?];
-    // SAFETY: The output buffer is writable for the length returned by the probe.
+    let mut path = vec![0u16; MAX_PROFILE_UNITS];
+    let mut length = u32::try_from(path.len())?;
+    // SAFETY: The live primary token was checked against sid, and the writable
+    // buffer has the full declared capacity. No zero-length probe is needed.
     if unsafe { GetUserProfileDirectoryW(token, path.as_mut_ptr(), &mut length) } == 0 {
         return Err(IoError::last_os_error()).context("reading the Windows user profile");
     }
+    ensure!(
+        length > 0 && usize::try_from(length)? <= path.len() && path.contains(&0),
+        "Windows returned an invalid user profile path size."
+    );
     let path = PathBuf::from(wide_os_string(&path));
     ensure!(
         path.is_absolute(),
         "Windows returned a relative user profile path."
     );
     Ok(Some(path))
+}
+
+struct ProfileRegistration(HKEY);
+
+impl Drop for ProfileRegistration {
+    fn drop(&mut self) {
+        // SAFETY: RegOpenKeyExW transferred this live registry handle.
+        unsafe {
+            RegCloseKey(self.0);
+        }
+    }
+}
+
+fn profile_registered(sid: &Sid) -> Result<bool> {
+    let sid = sid.to_string()?;
+    let path = wide(&format!(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}"
+    ))?;
+    let mut key = null_mut();
+    // SAFETY: The terminated key name derives from the verified token's SID.
+    // This lookup only opens the canonical machine registration for reading.
+    let result = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    match result {
+        ERROR_SUCCESS => {
+            let _registration = ProfileRegistration(key);
+            Ok(true)
+        }
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(false),
+        error => Err(IoError::from_raw_os_error(i32::try_from(error)?))
+            .context("reading the Windows user profile registration"),
+    }
 }
 
 fn computer_name() -> Result<String> {
@@ -712,7 +751,9 @@ fn wide_string(value: &[u16]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::Security::{TOKEN_TYPE, TokenType};
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, SECURITY_MAX_SID_SIZE, TOKEN_TYPE, TokenType, WinNullSid,
+    };
 
     use super::*;
 
@@ -722,6 +763,28 @@ mod tests {
             return;
         }
         assert!(resolve_login("example-user").is_err());
+    }
+
+    #[test]
+    fn an_unregistered_sid_has_no_profile_registration() {
+        // The well-known Null SID cannot own a Windows login profile.
+        let mut length = SECURITY_MAX_SID_SIZE;
+        let mut sid = Sid {
+            words: vec![0; usize::try_from(length).unwrap().div_ceil(size_of::<u64>())],
+        };
+        // SAFETY: The aligned SID buffer has the declared maximum capacity.
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    WinNullSid,
+                    null_mut(),
+                    sid.words.as_mut_ptr().cast(),
+                    &mut length,
+                )
+            },
+            0
+        );
+        assert!(!profile_registered(&sid).unwrap());
     }
 
     #[test]
@@ -769,6 +832,12 @@ mod tests {
         let name = std::env::var("RAYFISH_SSH_TEST_USER")
             .expect("The SYSTEM smoke test supplies a disposable local user.");
         let mut login = resolve_login(&name).unwrap();
+        if !profile_registered(&login.account.sid).unwrap() {
+            assert!(
+                login.home.is_none(),
+                "Resolving a fresh account must not create its profile."
+            );
+        }
         assert!(login.matches_account(&name).unwrap());
         let information = token_information(login.token_handle(), TokenType).unwrap();
         // SAFETY: TokenType returned a properly aligned TOKEN_TYPE value.
@@ -777,6 +846,7 @@ mod tests {
             TokenPrimary
         );
         login.prepare_profile().unwrap();
+        assert!(profile_registered(&login.account.sid).unwrap());
         assert!(login.home().unwrap().is_absolute());
         assert!(login.home().unwrap().is_dir());
         assert!(login.shell.is_absolute());

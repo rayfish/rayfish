@@ -768,9 +768,15 @@ fn command_line(shell: &Path, command: Option<&str>, terminal: bool) -> Result<V
         if !terminal {
             line.push_str(" -NonInteractive");
         }
-        let script = format!(
-            "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); {command}"
-        );
+        let script = if terminal {
+            format!(
+                "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); {command}"
+            )
+        } else {
+            // A pipe session has no console. Setting console code pages there
+            // fails with an invalid handle and writes an unrelated SSH error.
+            command.to_owned()
+        };
         let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
         line.push_str(" -EncodedCommand ");
         line.push_str(&STANDARD.encode(bytes));
