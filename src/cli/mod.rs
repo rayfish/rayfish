@@ -19,6 +19,7 @@
 use crate::ipc::{self, IpcMessage};
 
 mod alias;
+mod args;
 mod block;
 pub(crate) mod complete;
 mod connect;
@@ -35,10 +36,12 @@ mod network;
 mod open;
 mod pair;
 mod service;
+mod startup;
 mod status;
 mod update;
 
 pub(crate) use alias::*;
+pub(crate) use args::*;
 pub(crate) use block::*;
 pub(crate) use connect::*;
 pub(crate) use exit_node::*;
@@ -53,6 +56,7 @@ pub(crate) use network::*;
 pub(crate) use open::*;
 pub(crate) use pair::*;
 pub(crate) use service::*;
+pub(crate) use startup::*;
 pub(crate) use status::*;
 pub(crate) use update::*;
 
