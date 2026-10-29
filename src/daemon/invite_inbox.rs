@@ -314,11 +314,11 @@ impl ConnectService {
     pub(super) async fn settle_accept(
         &self,
         invitation: &ReceivedInvitation,
-        reply: IpcMessage,
+        joined: OpResult<JoinOutcome>,
     ) -> IpcMessage {
-        // `Ok` is a closed network that queued the join; its retry loop now
-        // holds the secret, so a second accept must not start another.
-        if matches!(reply, IpcMessage::Joined { .. } | IpcMessage::Ok { .. }) {
+        // A queued join's retry loop now holds the secret, so a second accept
+        // must not start another.
+        if joined.is_ok() {
             let saved = self
                 .edit_inbox(|inbox| {
                     // An entry that aged out during the join is gone; the join stands.
@@ -332,11 +332,11 @@ impl ConnectService {
                 tracing::warn!(error = %e, "joined, but could not mark the invitation accepted");
             }
         }
-        match reply {
-            IpcMessage::Error { message } if crate::invite::is_dead_invite(&message) => {
+        match joined {
+            Err(e) if crate::invite::is_dead_invite(e.message()) => {
                 self.drop_dead_invitation(invitation).await
             }
-            reply => reply,
+            joined => reply(joined),
         }
     }
 

@@ -766,8 +766,12 @@ impl NetworkRegistry {
         };
         let networks = networks_joined_with_certificate(&cfg.networks, cert.user_identity);
         for name in &networks {
-            if self.networks.contains_key(name) {
-                self.leave_network(name).await;
+            // The only failure is the network going away meanwhile, which is
+            // what this wants anyway; the saved config goes next either way.
+            if self.networks.contains_key(name)
+                && let Err(error) = self.leave_network(name).await
+            {
+                tracing::debug!(network = %name, %error, "network left before unpair could");
             }
             if let Err(error) = config::delete_network(name) {
                 return ipc_err(format!("could not remove network '{name}': {error}"));
@@ -847,7 +851,7 @@ impl NetworkRegistry {
     /// [`Self::announce_leave`] dials any coordinator no live link reaches.
     /// `teardown_network_runtime` then closes only the links left sharing no
     /// network at all.
-    pub(crate) async fn leave_network(self: &Arc<Self>, name: &str) -> IpcMessage {
+    pub(crate) async fn leave_network(self: &Arc<Self>, name: &str) -> OpResult<Done> {
         // Announce the leave while the peer entries still list this network
         // (before teardown drops them), and let it land before tearing down.
         if let Some(net_pubkey) = self.networks.get(name).map(|h| h.network_key) {
@@ -856,11 +860,9 @@ impl NetworkRegistry {
 
         if self.remove_network_locally(name).await {
             tracing::info!(network = %name, "left network");
-            IpcMessage::Ok {
-                message: format!("left network '{}'", name),
-            }
+            Ok(Done(format!("left network '{name}'")))
         } else {
-            ipc_err(format!("network '{}' not found", name))
+            Err(OpError::msg(format!("network '{name}' not found")))
         }
     }
 
@@ -1136,16 +1138,15 @@ impl NetworkRegistry {
 
     /// Look up an active network we coordinate, returning its public key and
     /// invite lock, or an error response if it's absent or we're only a member.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn coordinator_handle(
         &self,
         network: &str,
-    ) -> std::result::Result<(EndpointId, Arc<AsyncMutex<()>>), IpcMessage> {
+    ) -> OpResult<(EndpointId, Arc<AsyncMutex<()>>)> {
         let Some(handle) = self.networks.get(network) else {
-            return Err(ipc_err(format!("network '{network}' not active")));
+            return Err(OpError::msg(format!("network '{network}' not active")));
         };
         if !handle.role.is_coordinator() {
-            return Err(ipc_err(format!(
+            return Err(OpError::msg(format!(
                 "only the coordinator of '{network}' can manage invites/requests"
             )));
         }
@@ -1255,7 +1256,7 @@ impl NetworkRegistry {
     /// Mint a new network: generate its keypair, build the initial roster, seal +
     /// publish the blob, persist config, spawn coordinator tasks, and register the
     /// coordinator accept handler. `direct`/`pre_approve` back the `ray connect`
-    /// 2-peer path. Takes a `&MeshCtx` for the task spawn + handler registration.
+    /// 2-peer path.
     pub(crate) async fn create_network_inner(
         self: &Arc<Self>,
         mode: GroupMode,
@@ -1263,22 +1264,22 @@ impl NetworkRegistry {
         hostname: Option<String>,
         direct: bool,
         pre_approve: Option<(EndpointId, Option<String>)>,
-    ) -> Result<IpcMessage> {
+    ) -> Result<CreatedNetwork> {
         let name = match custom_name {
             Some(n) => {
                 anyhow::ensure!(
                     crate::hostname::is_valid_hostname(&n),
                     "invalid network name '{n}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
                 );
-                if self.networks.contains_key(&n) {
-                    return Ok(ipc_err(format!("network '{n}' already active")));
-                }
-                if self.name_owner(&n)? != NameOwner::Free {
-                    return Ok(ipc_err(format!(
-                        "network name '{n}' belongs to a saved network that is not active \
-                         (see `ray status`); choose another name"
-                    )));
-                }
+                anyhow::ensure!(
+                    !self.networks.contains_key(&n),
+                    "network '{n}' already active"
+                );
+                anyhow::ensure!(
+                    self.name_owner(&n)? == NameOwner::Free,
+                    "network name '{n}' belongs to a saved network that is not active \
+                     (see `ray status`); choose another name"
+                );
                 n
             }
             None => self.unclaimed_network_name(&network_name::generate_name(), None)?,
@@ -1289,7 +1290,7 @@ impl NetworkRegistry {
         // coordinator state for it, whose publisher then republishes its stale
         // roster over every admission this one makes.
         let Some(_registration) = self.claim_registration(&name) else {
-            return Ok(ipc_err(format!("network '{name}' is already being set up")));
+            anyhow::bail!("network '{name}' is already being set up");
         };
 
         let net_secret_key = SecretKey::generate();
@@ -1393,7 +1394,7 @@ impl NetworkRegistry {
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
 
-        Ok(IpcMessage::Created {
+        Ok(CreatedNetwork {
             name,
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),

@@ -266,33 +266,11 @@ impl Daemon {
         mode: GroupMode,
         name: Option<String>,
         hostname: Option<String>,
-    ) -> IpcMessage {
-        match self
+    ) -> OpResult<CreatedNetwork> {
+        Ok(self
+            .registry
             .create_network_inner(mode, name, hostname, false, None)
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => ipc_err(format!("{e:#}")),
-        }
-    }
-
-    /// Create a network and register it as coordinator.
-    ///
-    /// `direct` marks an auto-minted 2-peer `ray connect` network (persisted so
-    /// `ray status` can tag it). `pre_approve` adds a peer to the `ApprovedList`
-    /// before the blob is signed/published, so the named peer can be welcomed
-    /// without a separate `ray accept` round-trip, used by `approve_connection`.
-    pub(crate) async fn create_network_inner(
-        &self,
-        mode: GroupMode,
-        custom_name: Option<String>,
-        hostname: Option<String>,
-        direct: bool,
-        pre_approve: Option<(EndpointId, Option<String>)>,
-    ) -> Result<IpcMessage> {
-        self.registry
-            .create_network_inner(mode, custom_name, hostname, direct, pre_approve)
-            .await
+            .await?)
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
@@ -308,7 +286,7 @@ impl Daemon {
         coordinator: Option<EndpointId>,
         auto_accept_firewall: bool,
         auto_accept_files: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<JoinOutcome> {
         self.registry
             .join_network(
                 network_key,
@@ -333,16 +311,14 @@ pub(crate) fn ensure_transport_supported(transport: Option<&config::TransportMod
     Ok(())
 }
 
-/// Save the transport asked for at create or join on the network `resp`
-/// registered. The endpoint is built at startup from the saved networks (see
-/// `bootstrap`), so the saved choice is what turns Tor on.
+/// Save the transport asked for at create or join on network `name`. The
+/// endpoint is built at startup from the saved networks (see `bootstrap`), so
+/// the saved choice is what turns Tor on.
 pub(crate) fn save_network_transport(
-    resp: &IpcMessage,
+    name: &str,
     transport: Option<&config::TransportMode>,
 ) -> Result<()> {
-    let (Some(transport), IpcMessage::Created { name, .. } | IpcMessage::Joined { name, .. }) =
-        (transport, resp)
-    else {
+    let Some(transport) = transport else {
         return Ok(());
     };
     config::update_network(name, |net| {
@@ -371,7 +347,7 @@ impl NetworkRegistry {
         auto_accept_files: bool,
         // `--tor`: saved on the network once admitted, now or after approval.
         transport: Option<config::TransportMode>,
-    ) -> IpcMessage {
+    ) -> OpResult<JoinOutcome> {
         match self
             .join_network_inner(
                 network_key,
@@ -385,33 +361,37 @@ impl NetworkRegistry {
             )
             .await
         {
-            Ok(TryJoin::Joined(resp)) => {
+            Ok(TryJoin::Joined(joined)) => {
                 let _ = config::remove_pending_join(network_key);
-                if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
-                    return ipc_err(format!("joined, but could not save the transport: {e:#}"));
+                if let Err(e) = save_network_transport(&joined.name, transport.as_ref()) {
+                    return Err(OpError::msg(format!(
+                        "joined, but could not save the transport: {e:#}"
+                    )));
                 }
-                *resp
+                Ok(JoinOutcome::Joined(joined))
             }
             Ok(TryJoin::Pending) => {
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
                 let Ok(key) = network_key.parse::<EndpointId>() else {
-                    return ipc_err("invalid network key".to_string());
+                    return Err(OpError::msg("invalid network key"));
                 };
-                self.queue_pending_join(PendingJoinRetry {
-                    key,
-                    name: name.map(|s| s.to_string()),
-                    hostname,
-                    invite,
-                    coordinator,
-                    auto_accept_firewall,
-                    auto_accept_files,
-                    transport,
-                })
+                Ok(JoinOutcome::Queued(self.queue_pending_join(
+                    PendingJoinRetry {
+                        key,
+                        name: name.map(|s| s.to_string()),
+                        hostname,
+                        invite,
+                        coordinator,
+                        auto_accept_firewall,
+                        auto_accept_files,
+                        transport,
+                    },
+                )))
             }
             Err(e) => {
                 self.record_join_denial(network_key, &e);
-                ipc_err(format!("{e:#}"))
+                Err(e.into())
             }
         }
     }
@@ -420,26 +400,25 @@ impl NetworkRegistry {
     /// the retry resumes after a restart. A retry already running for this
     /// network keeps the options it was started with, so the caller is told
     /// and the saved entry is left alone.
-    fn queue_pending_join(self: &Arc<Self>, retry: PendingJoinRetry) -> IpcMessage {
+    fn queue_pending_join(self: &Arc<Self>, retry: PendingJoinRetry) -> Done {
         let entry = config::PendingJoinEntry {
             network_key: retry.key.to_string(),
             name: retry.name.clone(),
             transport: retry.transport.clone(),
         };
         if self.spawn_pending_join_retry(retry).is_none() {
-            return IpcMessage::Ok {
-                message: "a join request for this network is already queued and keeps the options it was sent with (run `ray status` to check)"
+            return Done(
+                "a join request for this network is already queued and keeps the options it was sent with (run `ray status` to check)"
                     .to_string(),
-            };
+            );
         }
         if let Err(error) = config::add_pending_join(entry) {
             tracing::warn!(%error, "could not save the pending join; it will not resume after a restart");
         }
-        IpcMessage::Ok {
-            message:
-                "join request sent - waiting for coordinator approval (run `ray status` to check)"
-                    .to_string(),
-        }
+        Done(
+            "join request sent - waiting for coordinator approval (run `ray status` to check)"
+                .to_string(),
+        )
     }
 
     /// Start the background retry for a join queued for approval, unless one is
@@ -506,9 +485,9 @@ impl NetworkRegistry {
                 )
                 .await
             {
-                Ok(TryJoin::Joined(resp)) => {
+                Ok(TryJoin::Joined(joined)) => {
                     let _ = config::remove_pending_join(&nk);
-                    if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
+                    if let Err(e) = save_network_transport(&joined.name, transport.as_ref()) {
                         tracing::error!(net = %nk, error = %e, "could not save the network transport");
                     }
                     tracing::info!(net = %nk, "approval granted - joined");
@@ -1323,10 +1302,10 @@ impl NetworkRegistry {
 
         tracing::info!(network = %display_name, key = %net_pubkey, "joined network");
 
-        Ok(TryJoin::Joined(Box::new(IpcMessage::Joined {
+        Ok(TryJoin::Joined(JoinedNetwork {
             name: display_name.to_string(),
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
-        })))
+        }))
     }
 
     /// Fetch the complete GroupBlob used to restore a coordinated network. A
@@ -2175,11 +2154,8 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
-        assert!(
-            matches!(&created, IpcMessage::Error { message } if message.contains("saved network")),
-            "{created:?}"
-        );
+            .expect_err("a saved inactive network's name is refused");
+        assert!(created.to_string().contains("saved network"), "{created:#}");
         let other = SecretKey::generate().public();
         let joined = daemon
             .registry
@@ -2370,7 +2346,7 @@ mod tests {
 
         open_tx.send(true).unwrap();
         let created = create.await.unwrap().unwrap();
-        assert!(matches!(created, IpcMessage::Created { .. }), "{created:?}");
+        assert_eq!(created.name, "lab");
         assert!(registry.networks.contains_key("lab"));
         assert!(!registry.restoring.contains("lab"), "the claim is released");
         daemon.shutdown_and_close().await;
@@ -2451,12 +2427,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _config = TempConfigDir::new();
         config::save_network(&config::empty_network_config("onion")).unwrap();
-        let created = IpcMessage::Created {
-            name: "onion".into(),
-            network_key: SecretKey::generate().public(),
-            my_ipv6: Ipv6Addr::LOCALHOST,
-        };
-        save_network_transport(&created, Some(&config::TransportMode::Tor)).unwrap();
+        save_network_transport("onion", Some(&config::TransportMode::Tor)).unwrap();
         assert_eq!(
             config::load_network("onion").unwrap().unwrap().transport,
             Some(config::TransportMode::Tor)

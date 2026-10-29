@@ -213,7 +213,7 @@ impl ConnectService {
             )
             .await
         {
-            Ok(IpcMessage::Created {
+            Ok(CreatedNetwork {
                 name, network_key, ..
             }) => {
                 self.pending_connects.remove(&peer);
@@ -223,7 +223,6 @@ impl ConnectService {
                     message: format!("approved — direct connection '{name}' created"),
                 }
             }
-            Ok(other) => other,
             Err(e) => ipc_err(format!("failed to create direct network: {e:#}")),
         }
     }
@@ -327,13 +326,13 @@ impl ConnectService {
                 None,
             )
             .await;
-        if let IpcMessage::Joined { name, .. } = &resp {
-            let _ = config::update_network(name, |net| {
+        if let Ok(JoinOutcome::Joined(joined)) = &resp {
+            let _ = config::update_network(&joined.name, |net| {
                 net.direct = true;
                 Ok(())
             });
         }
-        resp
+        reply(resp)
     }
 
     /// Retry a pending connect request on a backoff until approved/denied.

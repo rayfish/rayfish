@@ -180,7 +180,7 @@ async fn create(daemon: &Daemon, name: &str) {
             Some("test-node".to_string()),
         )
         .await;
-    assert!(matches!(result, IpcMessage::Created { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
 }
 
 /// Give `device` the certificate `primary_key` signs for it and "home", a
@@ -793,7 +793,7 @@ async fn leaving_a_network_waits_for_a_pairing_that_lifts_a_revocation() {
         .unwrap()
         .expect("the pairing lifted the revocation");
     let result = leaving.await.unwrap();
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert!(!primary.has_network("work").await);
     assert!(!primary.nullifies("home", device.id()));
     device.stop().await;

@@ -156,7 +156,7 @@ pub(in crate::daemon::mesh) async fn create(daemon: &Daemon, name: &str) -> conf
             Some("test-node".to_string()),
         )
         .await;
-    assert!(matches!(result, IpcMessage::Created { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     config::load_network(name).unwrap().unwrap()
 }
 
@@ -326,10 +326,11 @@ async fn rename_moves_live_state_filed_under_the_name() {
         .pruned_peers
         .insert(("home".to_string(), user));
     assert!(daemon.registry.exit_server.allows("home", &user));
-    let code = match daemon.invite_create("home", 3600, None, false).await {
-        IpcMessage::InviteCreated { code, .. } => code,
-        other => panic!("{other:?}"),
-    };
+    let code = daemon
+        .invite_create("home", 3600, None, false)
+        .await
+        .unwrap()
+        .code;
 
     let rename = IpcMessage::RenameNetwork {
         network: "home".to_string(),
@@ -961,7 +962,7 @@ async fn leave_dials_a_coordinator_with_no_live_link() {
     })
     .await
     .unwrap();
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(left, Some(net_pubkey));
     assert!(!daemon.registry.networks.contains_key("home"));
     assert!(config::load_network("home").unwrap().is_none());

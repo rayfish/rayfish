@@ -675,9 +675,8 @@ impl ManagementService {
             )
             .await
         {
-            IpcMessage::InviteCreated { code, .. } => code,
-            IpcMessage::Error { message } => return ipc_err(message),
-            other => return ipc_err(format!("unexpected invite response: {other:?}")),
+            Ok(invite) => invite.code,
+            Err(e) => return e.into(),
         };
         match self
             .send_request(
@@ -1209,22 +1208,20 @@ impl ManagementService {
                     )
                     .await
                 {
-                    IpcMessage::Joined { name, .. } => ManagementResult::Applied {
-                        message: format!("managed machine joined '{name}'"),
+                    Ok(JoinOutcome::Joined(joined)) => ManagementResult::Applied {
+                        message: format!("managed machine joined '{}'", joined.name),
                     },
-                    IpcMessage::Ok { message } => ManagementResult::Applied { message },
-                    IpcMessage::Error { message } => ManagementResult::Error { message },
-                    other => ManagementResult::Error {
-                        message: format!("unexpected join response: {other:?}"),
+                    Ok(JoinOutcome::Queued(Done(message))) => ManagementResult::Applied { message },
+                    Err(e) => ManagementResult::Error {
+                        message: e.to_string(),
                     },
                 }
             }
             ManagementAction::Leave { network_name } => {
                 match self.registry.leave_network(network_name.as_ref()).await {
-                    IpcMessage::Ok { message } => ManagementResult::Applied { message },
-                    IpcMessage::Error { message } => ManagementResult::Error { message },
-                    other => ManagementResult::Error {
-                        message: format!("unexpected leave response: {other:?}"),
+                    Ok(Done(message)) => ManagementResult::Applied { message },
+                    Err(e) => ManagementResult::Error {
+                        message: e.to_string(),
                     },
                 }
             }

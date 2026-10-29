@@ -225,12 +225,11 @@ impl NetworkRegistry {
         self: &Arc<Self>,
         name: &str,
         mode: GroupMode,
-    ) -> Result<IpcMessage> {
-        {
-            if self.networks.contains_key(name) {
-                return Ok(ipc_err(format!("network '{name}' already active")));
-            }
-        }
+    ) -> Result<CreatedNetwork> {
+        anyhow::ensure!(
+            !self.networks.contains_key(name),
+            "network '{name}' already active"
+        );
 
         let my_ip = self.transport.identity.local_ipv6();
 
@@ -296,9 +295,10 @@ impl NetworkRegistry {
         // Another path may have registered this network while the roster was
         // resolving. Its state is the live one, so neither rewrite its config
         // nor sign a record of ours.
-        if self.networks.contains_key(name) {
-            return Ok(ipc_err(format!("network '{name}' already active")));
-        }
+        anyhow::ensure!(
+            !self.networks.contains_key(name),
+            "network '{name}' already active"
+        );
         let restored_hash_was_published = source_published && last_group_hash == source_hash;
 
         // Replace only the blob-derived projection on the latest saved config.
@@ -355,13 +355,11 @@ impl NetworkRegistry {
                 }),
             })
             .await;
-        if !installed {
-            return Ok(ipc_err(format!("network '{name}' already active")));
-        }
+        anyhow::ensure!(installed, "network '{name}' already active");
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network restored (coordinator)");
 
-        Ok(IpcMessage::Created {
+        Ok(CreatedNetwork {
             name: name.to_string(),
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
@@ -411,10 +409,10 @@ impl NetworkRegistry {
                 return ipc_err(format!("cannot leave network '{name}': {error:#}"));
             }
             return match self.leave_network(name).await {
-                IpcMessage::Ok { .. } => IpcMessage::Ok {
+                Ok(_) => IpcMessage::Ok {
                     message: format!("left network '{name}'; other coordinators keep it running"),
                 },
-                response => response,
+                Err(e) => e.into(),
             };
         }
 
@@ -749,42 +747,29 @@ impl NetworkRegistry {
                 )
                 .await
             {
-                // The reply is boxed (`TryJoin::Joined`), so the two Joined cases
-                // are told apart inside the arm rather than by pattern.
-                Ok(TryJoin::Joined(resp)) => match *resp {
-                    IpcMessage::Joined {
-                        ref name, my_ipv6, ..
-                    } => {
-                        // Registered, but possibly only from the blob because the
-                        // record advertises a mesh version we don't speak. That is
-                        // not the end of the restore: stay in the loop so a
-                        // coordinator republish promotes it.
-                        match self.incompatible_registration(name) {
-                            Some(m) => {
-                                self.restore_errors.insert(
-                                    name.clone(),
-                                    format!(
-                                        "runs mesh protocol v{}, this build speaks v{}",
-                                        m.network, m.ours
-                                    ),
-                                );
-                                tracing::warn!(network = %name, ip = %my_ipv6, attempt, network_version = m.network, our_version = m.ours, "registered member network as version-incompatible; waiting for the coordinator to republish");
-                            }
-                            None => {
-                                self.restore_errors.remove(name);
-                                tracing::info!(network = %name, ip = %my_ipv6, attempt, "restored member network");
-                                return;
-                            }
+                Ok(TryJoin::Joined(JoinedNetwork { ref name, my_ipv6 })) => {
+                    // Registered, but possibly only from the blob because the
+                    // record advertises a mesh version we don't speak. That is
+                    // not the end of the restore: stay in the loop so a
+                    // coordinator republish promotes it.
+                    match self.incompatible_registration(name) {
+                        Some(m) => {
+                            self.restore_errors.insert(
+                                name.clone(),
+                                format!(
+                                    "runs mesh protocol v{}, this build speaks v{}",
+                                    m.network, m.ours
+                                ),
+                            );
+                            tracing::warn!(network = %name, ip = %my_ipv6, attempt, network_version = m.network, our_version = m.ours, "registered member network as version-incompatible; waiting for the coordinator to republish");
+                        }
+                        None => {
+                            self.restore_errors.remove(name);
+                            tracing::info!(network = %name, ip = %my_ipv6, attempt, "restored member network");
+                            return;
                         }
                     }
-                    // Not reachable today (a reconnect handshake only ever returns
-                    // `Admitted`), and that is exactly why it must not be a silent
-                    // `return`: a saved network that never registers is invisible
-                    // except as a faint `inactive` marker in `ray status`.
-                    ref other => {
-                        tracing::warn!(network = %name, attempt, response = ?other, retry_in = ?delay, "unexpected response restoring network, retrying");
-                    }
-                },
+                }
                 // Queued for live approval on a closed network. `TryJoin::Pending`
                 // and `dial_reconnect` both document that the caller retries until
                 // `ray accept` lets us in, so retry: settling here strands the
@@ -974,16 +959,10 @@ impl NetworkRegistry {
         let mode = net.group_mode;
         Some(tokio::spawn(async move {
             match me.restore_coordinator_network(&name, mode).await {
-                Ok(IpcMessage::Created { .. }) => {
-                    tracing::info!(network = %name, "restored coordinator network");
-                }
-                Ok(IpcMessage::Error { message }) => {
-                    tracing::warn!(network = %name, error = %message, "failed to restore network");
-                }
+                Ok(_) => tracing::info!(network = %name, "restored coordinator network"),
                 Err(e) => {
-                    tracing::warn!(network = %name, error = %e, "failed to restore network");
+                    tracing::warn!(network = %name, error = %format!("{e:#}"), "failed to restore network");
                 }
-                _ => {}
             }
             drop(claim);
         }))
@@ -2140,7 +2119,7 @@ impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// leave a network (close connections, tear down runtime, forget config).
     #[tracing::instrument(skip(self), fields(net = name))]
-    pub async fn leave_network(&self, name: &str) -> IpcMessage {
+    pub async fn leave_network(&self, name: &str) -> OpResult<Done> {
         self.registry.leave_network(name).await
     }
 }

@@ -225,14 +225,11 @@ impl Daemon {
                     .await;
                 joining.remove(&key);
                 match result {
-                    IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
+                    Ok(_) => {
                         tracing::info!(network = %net_name, "paired network join queued or complete");
                     }
-                    IpcMessage::Error { message } => {
-                        tracing::warn!(network = %net_name, error = %message, "paired network join failed");
-                    }
-                    other => {
-                        tracing::warn!(network = %net_name, response = ?other, "paired network join: unexpected response");
+                    Err(e) => {
+                        tracing::warn!(network = %net_name, error = %e, "paired network join failed");
                     }
                 }
             });

@@ -501,11 +501,14 @@ impl Daemon {
                 if let Err(e) = ensure_transport_supported(transport.as_ref()) {
                     return ipc_err(format!("{e:#}"));
                 }
-                let resp = self.create_network(mode, name, hostname).await;
-                if let Err(e) = save_network_transport(&resp, transport.as_ref()) {
+                let created = match self.create_network(mode, name, hostname).await {
+                    Ok(created) => created,
+                    Err(e) => return e.into(),
+                };
+                if let Err(e) = save_network_transport(&created.name, transport.as_ref()) {
                     return ipc_err(format!("created, but could not save the transport: {e:#}"));
                 }
-                resp
+                created.into()
             }
             IpcMessage::Join {
                 network_key,
@@ -520,20 +523,22 @@ impl Daemon {
                 if let Err(e) = ensure_transport_supported(transport.as_ref()) {
                     return ipc_err(format!("{e:#}"));
                 }
-                self.registry
-                    .join_network(
-                        &network_key,
-                        name.as_deref(),
-                        hostname,
-                        invite,
-                        coordinator,
-                        auto_accept_firewall,
-                        auto_accept_files,
-                        transport,
-                    )
-                    .await
+                reply(
+                    self.registry
+                        .join_network(
+                            &network_key,
+                            name.as_deref(),
+                            hostname,
+                            invite,
+                            coordinator,
+                            auto_accept_firewall,
+                            auto_accept_files,
+                            transport,
+                        )
+                        .await,
+                )
             }
-            IpcMessage::Leave { name } => self.leave_network(&name).await,
+            IpcMessage::Leave { name } => reply(self.leave_network(&name).await),
             IpcMessage::RenameNetwork { network, new_name } => {
                 let resp = self.registry.rename_network(&network, &new_name).await;
                 // The live SSH allow-lists are filed under the network's name.
@@ -631,7 +636,7 @@ impl Daemon {
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
             IpcMessage::SetHostname { network, hostname } => {
-                self.set_hostname(&network, &hostname).await
+                reply(self.set_hostname(&network, &hostname).await)
             }
             IpcMessage::AliasSet {
                 network,
@@ -782,11 +787,11 @@ impl Daemon {
                 expires_secs,
                 hostname,
                 reusable,
-            } => {
+            } => reply(
                 self.registry
                     .invite_create(&network, expires_secs, hostname, reusable)
-                    .await
-            }
+                    .await,
+            ),
             IpcMessage::InviteList { network } => self.registry.invite_list(&network).await,
             IpcMessage::InviteRevoke { network, id } => {
                 self.registry.invite_revoke(&network, &id).await

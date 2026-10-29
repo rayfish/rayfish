@@ -603,8 +603,8 @@ pub(crate) async fn commit_current_snapshot(
 /// The IPC reply for a change that reached live state but whose snapshot could
 /// not be stored or its recovery pointer saved. The publisher keeps retrying,
 /// so the change is not lost, but it is not published yet either.
-pub(crate) fn unsaved_snapshot_error(network: &str) -> IpcMessage {
-    ipc_err(format!(
+pub(crate) fn unsaved_snapshot_error(network: &str) -> OpError {
+    OpError::msg(format!(
         "could not save the updated roster for '{network}'; it is not published yet and will be retried"
     ))
 }

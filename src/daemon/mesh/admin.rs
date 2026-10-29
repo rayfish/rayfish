@@ -90,7 +90,7 @@ impl NetworkRegistry {
             }
         }
         if !self.store_and_publish_group(network).await {
-            return unsaved_snapshot_error(network);
+            return unsaved_snapshot_error(network).into();
         }
         IpcMessage::Ok {
             message: format!("granted network key to {}", identity.fmt_short()),

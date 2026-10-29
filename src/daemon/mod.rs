@@ -209,6 +209,8 @@ pub(crate) enum ReportRequester {
 // with the `use crate::{firewall, dns, …}` aliases above.
 mod ipc_dispatch;
 mod mesh;
+mod op;
+pub use op::*;
 mod report;
 use report::*;
 
@@ -1343,11 +1345,13 @@ impl Daemon {
     // -----------------------------------------------------------------------
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
-    pub async fn set_hostname(&self, network: &str, hostname: &str) -> IpcMessage {
+    pub async fn set_hostname(&self, network: &str, hostname: &str) -> OpResult<Done> {
         use crate::hostname;
 
         if !hostname::is_valid_hostname(hostname) {
-            return ipc_err("invalid hostname (lowercase ASCII, 1-63 chars)".to_string());
+            return Err(OpError::msg(
+                "invalid hostname (lowercase ASCII, 1-63 chars)",
+            ));
         }
 
         let (is_coord, state, dht_notify) = match self.registry.networks.get(network) {
@@ -1357,7 +1361,7 @@ impl Daemon {
                 h.dht_notify.clone(),
             ),
             None => {
-                return ipc_err(format!("network '{}' not found", network));
+                return Err(OpError::msg(format!("network '{network}' not found")));
             }
         };
 
@@ -1388,7 +1392,7 @@ impl Daemon {
             };
             Ok(())
         }) {
-            return ipc_err(format!("could not save hostname: {error:#}"));
+            return Err(OpError::msg(format!("could not save hostname: {error:#}")));
         }
 
         // Update our own member entry.
@@ -1438,9 +1442,7 @@ impl Daemon {
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
-        IpcMessage::Ok {
-            message: format!("hostname set to {} ({})", new_hostname, dns_name),
-        }
+        Ok(Done(format!("hostname set to {new_hostname} ({dns_name})")))
     }
 
     /// Fast-path a member's rename to its connected peers via `MeshHello` (only
@@ -3421,14 +3423,14 @@ pub(crate) mod accept_handler_tests {
                 crate::invite::INVITE_REJECTED
             ),
         ] {
-            let reply = connect.settle_accept(&entry, ipc_err(kept)).await;
+            let reply = connect.settle_accept(&entry, Err(OpError::msg(kept))).await;
             assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
             assert_eq!(invitations_of(&connect).await.len(), 1);
         }
-        let revoked = ipc_err(format!(
+        let revoked = Err(OpError::msg(format!(
             "join denied: {}: invite revoked",
             crate::invite::INVITE_REJECTED
-        ));
+        )));
         let reply = connect.settle_accept(&entry, revoked).await;
         assert!(
             matches!(&reply, IpcMessage::Error { message } if message.contains("revoked or has expired")),
@@ -4743,7 +4745,7 @@ pub(crate) mod accept_handler_tests {
             .hostname
             .clone();
         let reply = daemon.set_hostname("test-net", "renamed").await;
-        assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+        assert!(reply.is_err(), "{reply:?}");
         assert_eq!(
             state.read().unwrap().members.get(&me).unwrap().hostname,
             before

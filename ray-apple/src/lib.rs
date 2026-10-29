@@ -15,7 +15,7 @@ use rayfish::config::settings::GlobalKey;
 use rayfish::config::{DnsMode, QuicEngine};
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{DaemonState, OpError, build_headless};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
 use rayfish::ipc::{ConnectionIssue, InvitationStatus, IpcMessage, TransferFileState};
@@ -52,6 +52,12 @@ pub enum AppleError {
     AlreadyStarted,
     #[error("{0}")]
     Network(String),
+}
+
+impl From<OpError> for AppleError {
+    fn from(error: OpError) -> Self {
+        Self::Network(error.to_string())
+    }
 }
 
 impl AppleError {
@@ -823,16 +829,9 @@ impl Node {
         hostname: Option<String>,
     ) -> Result<(), AppleError> {
         let state = self.state()?;
-        match self
-            .runtime
-            .block_on(state.create_network(GroupMode::default(), name, hostname))
-        {
-            IpcMessage::Created { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid create response".to_owned(),
-            )),
-        }
+        self.runtime
+            .block_on(state.create_network(GroupMode::default(), name, hostname))?;
+        Ok(())
     }
 
     pub fn join_network(&self, code: String, hostname: Option<String>) -> Result<(), AppleError> {
@@ -845,7 +844,7 @@ impl Node {
             ),
             Err(_) => (code, None, None),
         };
-        match self.runtime.block_on(state.join_network(
+        self.runtime.block_on(state.join_network(
             &network_key,
             None,
             hostname,
@@ -853,45 +852,30 @@ impl Node {
             coordinator,
             false,
             true,
-        )) {
-            IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid join response".to_owned(),
-            )),
-        }
+        ))?;
+        Ok(())
     }
 
     /// Mint a single-use invite that expires after seven days.
     pub fn create_invite(&self, network: String) -> Result<String, AppleError> {
         let state = self.state()?;
-        match self
-            .runtime
-            .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false))
-        {
-            IpcMessage::InviteCreated { code, .. } => Ok(code),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid invite response".to_owned(),
-            )),
-        }
+        let invite =
+            self.runtime
+                .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false))?;
+        Ok(invite.code)
     }
 
     pub fn leave_network(&self, network: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.leave_network(&network)),
-            "leave",
-        )
+        self.runtime.block_on(state.leave_network(&network))?;
+        Ok(())
     }
 
     pub fn set_hostname(&self, network: String, hostname: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.set_hostname(&network, &hostname)),
-            "hostname",
-        )
+        self.runtime
+            .block_on(state.set_hostname(&network, &hostname))?;
+        Ok(())
     }
 
     pub fn accept_request(&self, network: String, id: String) -> Result<(), AppleError> {

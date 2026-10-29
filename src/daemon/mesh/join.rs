@@ -32,11 +32,9 @@ pub(crate) enum JoinResult {
     Pending,
 }
 
-/// Outcome of one `join_network_inner` attempt. The reply is boxed because
-/// `IpcMessage` is far larger than the `Pending` case, and this enum is returned
-/// through the whole join/retry path.
+/// Outcome of one `join_network_inner` attempt.
 pub(crate) enum TryJoin {
-    Joined(Box<IpcMessage>),
+    Joined(JoinedNetwork),
     Pending,
 }
 

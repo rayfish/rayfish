@@ -288,9 +288,7 @@ async fn a_second_queued_join_is_told_a_retry_runs() {
     let key = SecretKey::generate().public();
 
     let first = daemon.registry.queue_pending_join(retry_for(key));
-    let IpcMessage::Ok { message } = first else {
-        panic!("{first:?}");
-    };
+    let Done(message) = first;
     assert!(
         message.contains("waiting for coordinator approval"),
         "{message}"
@@ -299,9 +297,7 @@ async fn a_second_queued_join_is_told_a_retry_runs() {
         transport: Some(config::TransportMode::Tor),
         ..retry_for(key)
     });
-    let IpcMessage::Ok { message } = second else {
-        panic!("{second:?}");
-    };
+    let Done(message) = second;
     assert!(message.contains("already queued"), "{message}");
     let saved = config::load().unwrap().pending_joins;
     assert_eq!(saved.len(), 1);
