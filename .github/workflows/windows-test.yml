@@ -82,7 +82,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-package-x86_64-pc-windows-msvc"
-          save-if: 'false'
+          save-if: 'true'
 
       - name: Install WiX 3
         shell: pwsh
