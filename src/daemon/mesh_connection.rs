@@ -231,8 +231,14 @@ impl MeshConnection {
                 ControlMsg::Close if frame.net.is_none() => {
                     // Quinn accepts bidirectional streams in ID order, and this
                     // loop finishes each frame before accepting the next stream.
-                    // The ack is a barrier for frames on earlier streams.
-                    let _ = control::send_msg(&mut send, None, &ControlMsg::CloseAck).await;
+                    // Mark our inbound drain before acknowledging the peer's
+                    // outbound drain. Retirement waits for both directions.
+                    self.ctx.peers.received_close(&self.conn);
+                    if let Err(error) =
+                        control::send_msg(&mut send, None, &ControlMsg::CloseAck).await
+                    {
+                        tracing::debug!(%error, "failed to acknowledge mesh close");
+                    }
                     continue;
                 }
                 ControlMsg::CloseAck => continue,

@@ -2077,7 +2077,22 @@ mod welcome_delivery_tests {
             )
             .await
             .unwrap();
-            server_peers.add(derive_ipv6(&client_id), new_server, client_id, "joined");
+            server_peers.add(
+                derive_ipv6(&client_id),
+                new_server.clone(),
+                client_id,
+                "joined",
+            );
+            let (mut send, mut recv) = new_server.accept_bi().await.unwrap();
+            assert!(matches!(
+                control::recv_msg(&mut recv).await.unwrap(),
+                ControlMsg::Close
+            ));
+            control::send_msg(&mut send, None, &ControlMsg::CloseAck)
+                .await
+                .unwrap();
+            send.stopped().await.unwrap();
+            server_peers.received_close(&new_server);
         });
         let (mut send, mut recv) = new_client.open_bi().await.unwrap();
         control::send_msg(
@@ -2111,6 +2126,14 @@ mod welcome_delivery_tests {
                 control::send_msg(&mut send, None, &ControlMsg::CloseAck)
                     .await
                     .unwrap();
+                let (mut send, mut recv) = client.open_bi().await.unwrap();
+                control::send_msg(&mut send, None, &ControlMsg::Close)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    control::recv_msg(&mut recv).await.unwrap(),
+                    ControlMsg::CloseAck
+                ));
             }
         });
         join_reply.await.unwrap();

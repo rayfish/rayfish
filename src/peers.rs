@@ -7,17 +7,18 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
 use iroh::EndpointId;
-use iroh::endpoint::{Connection, VarInt};
+use iroh::endpoint::Connection;
 use smol_str::SmolStr;
-use tokio::time::timeout;
 
 use crate::audit::AuditLog;
-use crate::control::{self, ControlMsg};
 use crate::membership;
 
 mod device_user_map;
 mod reachability;
+mod retirement;
 mod roster_routes;
+
+use retirement::RetiringConnections;
 
 pub use device_user_map::DeviceUserMap;
 pub use reachability::Reachability;
@@ -34,41 +35,6 @@ static ACTIVITY_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// Milliseconds since [`ACTIVITY_EPOCH`]. Wraps far past any process lifetime.
 fn now_ms() -> u64 {
     ACTIVITY_EPOCH.elapsed().as_millis() as u64
-}
-
-const REPLACED_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
-
-async fn close_replaced_after_ack(conn: Connection, reason: &'static [u8]) {
-    let acknowledged = timeout(REPLACED_CLOSE_TIMEOUT, async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        control::send_msg(&mut send, None, &ControlMsg::Close).await?;
-        anyhow::ensure!(
-            matches!(control::recv_msg(&mut recv).await?, ControlMsg::CloseAck),
-            "peer did not acknowledge mesh close"
-        );
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .is_ok_and(|result| result.is_ok());
-    if !acknowledged {
-        tracing::debug!(peer = %conn.remote_id().fmt_short(), "mesh close acknowledgement unavailable; closing after timeout or error");
-    }
-    conn.close(
-        VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
-        reason,
-    );
-}
-
-fn retire_replaced_connection(conn: Connection, reason: &'static [u8]) {
-    // PeerTable::add is synchronous, so the close exchange runs after it returns.
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn(close_replaced_after_ack(conn, reason));
-    } else {
-        conn.close(
-            VarInt::from_u32(crate::forward::REPLACED_CONNECTION_CODE),
-            reason,
-        );
-    }
 }
 
 /// A `DashMap` using ahash instead of the default SipHash. Used for the
@@ -119,6 +85,7 @@ pub struct PeerTable {
     version_incompatible: Arc<DashSet<EndpointId>>,
     /// Actual local TUN limit, shared with readers across TUN reattachments.
     local_mtu: Arc<AtomicU16>,
+    retiring: RetiringConnections,
 }
 
 /// A single peer's identity, its one shared connection, and the network-handle
@@ -252,7 +219,7 @@ impl PeerEntry {
     /// The lowest TLS session ID wins. Both ends rank every physical connection
     /// identically even when concurrent handshakes register in opposite orders.
     /// A closed connection never wins over a live replacement.
-    fn install_connection(&mut self, conn: &Connection) -> bool {
+    fn install_connection(&mut self, conn: &Connection, retiring: &RetiringConnections) -> bool {
         if self.active.matches(conn) {
             self.active.last_active.store(now_ms(), Ordering::Relaxed);
             return false;
@@ -260,11 +227,11 @@ impl PeerEntry {
         if self.active.conn.close_reason().is_none()
             && self.active.selection_id <= connection_selection_id(conn)
         {
-            retire_replaced_connection(conn.clone(), b"noncanonical");
+            retiring.retire(conn, b"noncanonical");
             return false;
         }
         let old = std::mem::replace(&mut self.active, ActiveConnection::new(conn.clone()));
-        retire_replaced_connection(old.conn, b"replaced");
+        retiring.retire(&old.conn, b"replaced");
         true
     }
 
@@ -331,6 +298,7 @@ impl PeerTable {
             audit: None,
             version_incompatible: Arc::new(DashSet::default()),
             local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            retiring: RetiringConnections::default(),
         }
     }
 
@@ -343,6 +311,7 @@ impl PeerTable {
             audit: Some(audit),
             version_incompatible: Arc::new(DashSet::default()),
             local_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            retiring: RetiringConnections::default(),
         }
     }
 
@@ -398,10 +367,10 @@ impl PeerTable {
     /// `network` with it. The connection is per-identity: if the peer already
     /// has an entry, `network` is unioned into its set and the stored connection
     /// is selected by the shared TLS session ID (lowest wins). A dead connection
-    /// is always replaced; re-adding the selected connection is a no-op. Replacing a connection
-    /// closes the old one so its task exits and cannot reclaim the route with a
-    /// late control frame. Assigns an outbound handle for `network` if one isn't
-    /// already held.
+    /// is always replaced; re-adding the selected connection is a no-op. A
+    /// replaced connection drains before closing and cannot reclaim the route
+    /// with a late control frame. Assigns an outbound handle for `network` if one
+    /// isn't already held.
     ///
     /// Returns `true` if `conn` is genuinely new to the peer (first shared
     /// network, or a reconnect that replaced a different connection) — the
@@ -425,17 +394,17 @@ impl PeerTable {
         {
             use dashmap::mapref::entry::Entry;
             let entry = self.peers.entry(ipv6);
-            // Check after taking the entry lock. A replaced connection can have a
-            // queued control frame already entering this method, but the close
-            // marks every clone before that frame can acquire this lock.
-            if conn.close_reason().is_some() {
+            // Retirement is marked while holding this entry lock, before the
+            // async drain starts. Check the marker first: cleanup closes QUIC
+            // before removing it, so the second check covers a completed drain.
+            if self.retiring.contains(&conn) || conn.close_reason().is_some() {
                 return false;
             }
             match entry {
                 Entry::Occupied(mut o) => {
                     let e = o.get_mut();
                     first_ever = false;
-                    conn_changed = e.install_connection(&conn);
+                    conn_changed = e.install_connection(&conn, &self.retiring);
                     e.endpoint_id = endpoint_id;
                     if !e.out_handles.contains_key(&net) {
                         let h = next_free_handle(&e.out_handles);
@@ -456,6 +425,15 @@ impl PeerTable {
             audit.log_connect(ipv6, &endpoint_id.to_string());
         }
         conn_changed
+    }
+
+    /// Called only by the sequential receive loop after all streams preceding
+    /// the peer's Close have been handled. Also starts our outbound drain if the
+    /// peer requested retirement first.
+    pub(crate) fn received_close(&self, conn: &Connection) {
+        let entry = self.peers.entry(membership::derive_ipv6(&conn.remote_id()));
+        self.retiring.received_close(conn);
+        drop(entry);
     }
 
     /// The peer's mesh IPv6, resolved from its endpoint id. Used by the
@@ -913,6 +891,7 @@ impl PeerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::endpoint::VarInt;
 
     #[test]
     fn test_peer_table_empty_lookup() {
@@ -1063,7 +1042,7 @@ mod tests {
     /// Establish one real mesh connection between two fresh endpoints and return
     /// `(server, client, server_side_conn, client_side_conn)`. `dial` re-uses the
     /// given client to open an additional connection to the same server.
-    async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+    pub(super) async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
         let server = loopback_endpoint().await;
         let client = loopback_endpoint().await;
         let (conn_server, conn_client) = dial(&server, &client).await;
@@ -1670,6 +1649,61 @@ mod tests {
         p[24..40].copy_from_slice(&dst.octets());
         p[40] = 128; // ICMPv6 type = echo request
         p
+    }
+
+    #[tokio::test]
+    async fn retiring_connection_cannot_reclaim_a_route() {
+        let (server, client, first, _c1) = connected_pair().await;
+        let (second, _c2) = dial(&server, &client).await;
+        let (winner, retiring) =
+            if connection_selection_id(&first) < connection_selection_id(&second) {
+                (first, second)
+            } else {
+                (second, first)
+            };
+        let table = PeerTable::new();
+        let peer = client.id();
+        let ip = membership::derive_ipv6(&peer);
+        assert!(table.add(ip, retiring.clone(), peer, "net-a"));
+        assert!(table.add(ip, winner.clone(), peer, "net-a"));
+        winner.close(VarInt::from_u32(0), b"test disconnect");
+        assert!(
+            !table.add(ip, retiring.clone(), peer, "net-b"),
+            "a connection already scheduled for retirement must not reclaim the route"
+        );
+        assert_eq!(
+            table.conn_for_ip(&ip).unwrap().stable_id(),
+            winner.stable_id()
+        );
+        assert!(!table.shares_network_v6(&ip, "net-b"));
+        table.remove(&ip);
+        assert!(
+            !table.add(ip, retiring, peer, "net-b"),
+            "removing a peer must not forget its pending connection retirement"
+        );
+        assert!(table.conn_for_ip(&ip).is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_duplicate_cannot_reclaim_a_route() {
+        let (server, client, first, _c1) = connected_pair().await;
+        let (second, _c2) = dial(&server, &client).await;
+        let (winner, rejected) =
+            if connection_selection_id(&first) < connection_selection_id(&second) {
+                (first, second)
+            } else {
+                (second, first)
+            };
+        let table = PeerTable::new();
+        let peer = client.id();
+        let ip = membership::derive_ipv6(&peer);
+        assert!(table.add(ip, winner.clone(), peer, "net-a"));
+        assert!(!table.add(ip, rejected.clone(), peer, "net-a"));
+        winner.close(VarInt::from_u32(0), b"test disconnect");
+        assert!(
+            !table.add(ip, rejected, peer, "net-b"),
+            "a rejected duplicate must remain ineligible while it drains"
+        );
     }
 
     #[test]

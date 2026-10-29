@@ -338,7 +338,9 @@ pub enum ControlMsg {
         msg_kind: String,
     },
     /// Retire this physical mesh connection after the receiver processes all
-    /// control streams opened before this one. The peer replies on this stream.
+    /// control streams opened before this one. The peer replies on this stream
+    /// and sends its own Close. Closing waits for both the reply and the peer's
+    /// Close to reach the sequential receive loop, with a bounded timeout.
     Close,
     CloseAck,
 }
