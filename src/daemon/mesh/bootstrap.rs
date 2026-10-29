@@ -604,7 +604,7 @@ async fn build_daemon_inner(
             #[cfg(any(target_os = "android", target_os = "ios"))]
             relay_map: transport::configured_relay_map(&app_config.relay)?,
         },
-    ));
+    )?);
     // The per-peer connection driver is built once here and shared by the
     // ProtocolRouter (which delegates the mesh ALPN to it) and the
     // NetworkRegistry (which re-registers a network's handler on promotion).

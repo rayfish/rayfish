@@ -1576,17 +1576,7 @@ impl NetworkRegistry {
         packet: &SignedPacket,
         commit: &AsyncMutex<()>,
     ) -> bool {
-        let client = match dht::create_pkarr_client(
-            &self.transport.endpoint,
-            &self.transport.pkarr_relay_url,
-        ) {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to build pkarr client for network record");
-                return false;
-            }
-        };
-        match publish_signed_record(&client, commit, network, hash, packet).await {
+        match publish_signed_record(&self.transport.pkarr, commit, network, hash, packet).await {
             Ok(marked) => {
                 if marked {
                     self.records_published.send_replace(());
@@ -1853,12 +1843,7 @@ impl NetworkRegistry {
     /// left untouched ([`should_promote`]). No `refresh_alpns` is needed: the mesh
     /// ALPN is static and promotion adds no network, so the advertised set and the
     /// DNS search domains are unchanged.
-    pub(crate) fn promote_to_coordinator(
-        self: &Arc<Self>,
-        network: &str,
-        key: SecretKey,
-        pkarr_client: PkarrRelayClient,
-    ) -> bool {
+    pub(crate) fn promote_to_coordinator(self: &Arc<Self>, network: &str, key: SecretKey) -> bool {
         let state;
         let invite_lock;
         let notify;
@@ -1872,7 +1857,6 @@ impl NetworkRegistry {
             }
             notify = Arc::new(Notify::new());
             let tasks = coordinator_tasks(
-                Some(pkarr_client),
                 self,
                 network,
                 &key,
@@ -2026,13 +2010,12 @@ fn record_is_published(network: &str) -> bool {
         .is_ok_and(|net| net.is_none_or(|net| net.last_group_hash_published))
 }
 
-/// Every task a coordinated network runs: the pkarr network publisher (when a
-/// relay client could be built) and the ephemeral stale-member pruner. Shared
+/// Every task a coordinated network runs: the pkarr network publisher and the
+/// ephemeral stale-member pruner. Shared
 /// by every path that makes a network coordinated, promotion included, so none
 /// of them ends up with only part of the set.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn coordinator_tasks(
-    pkarr_client: Option<PkarrRelayClient>,
     registry: &Arc<NetworkRegistry>,
     name: &str,
     net_secret_key: &SecretKey,
@@ -2041,10 +2024,8 @@ pub(super) fn coordinator_tasks(
     cancel: &CancellationToken,
     initially_published: Option<blake3::Hash>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let mut tasks = Vec::new();
-    if let Some(pkarr_client) = pkarr_client {
-        tasks.push(spawn_network_publisher(
-            pkarr_client,
+    vec![
+        spawn_network_publisher(
             net_secret_key.clone(),
             Arc::clone(state),
             Arc::clone(registry),
@@ -2052,16 +2033,15 @@ pub(super) fn coordinator_tasks(
             initially_published,
             Arc::clone(dht_notify),
             cancel.clone(),
-        ));
-    }
-    tasks.push(spawn_stale_member_pruner(
-        registry.clone(),
-        name.to_string(),
-        Arc::clone(state),
-        Some(Arc::clone(dht_notify)),
-        cancel.clone(),
-    ));
-    tasks
+        ),
+        spawn_stale_member_pruner(
+            registry.clone(),
+            name.to_string(),
+            Arc::clone(state),
+            Some(Arc::clone(dht_notify)),
+            cancel.clone(),
+        ),
+    ]
 }
 
 #[cfg(test)]

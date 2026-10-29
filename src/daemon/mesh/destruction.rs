@@ -169,14 +169,11 @@ impl NetworkRegistry {
         self.teardown_network_runtime(name).await;
         drop(revoking);
         let publication = async {
-            let client = dht::create_pkarr_client(
-                &self.transport.endpoint,
-                &self.transport.pkarr_relay_url,
-            )?;
+            let client = &self.transport.pkarr;
             if let Some(key) = &key {
-                destruction::publish(&client, &destruction::encode_index(key, &packet)?).await?;
+                destruction::publish(client, &destruction::encode_index(key, &packet)?).await?;
             }
-            destruction::publish(&client, &packet).await
+            destruction::publish(client, &packet).await
         }
         .await;
         removal?;
@@ -200,12 +197,9 @@ impl NetworkRegistry {
         if packet.is_none()
             && let Some(key) = key
         {
-            let client = dht::create_pkarr_client(
-                &self.transport.endpoint,
-                &self.transport.pkarr_relay_url,
-            )?;
+            let client = &self.transport.pkarr;
             packet =
-                destruction::resolve(&client, destruction::discovery_key(key).public(), network)
+                destruction::resolve(client, destruction::discovery_key(key).public(), network)
                     .await?;
         }
         if let Some(packet) = packet {
@@ -223,14 +217,11 @@ impl NetworkRegistry {
                 _ = tick.tick() => {},
             }
             let result = async {
-                let client = dht::create_pkarr_client(
-                    &self.transport.endpoint,
-                    &self.transport.pkarr_relay_url,
-                )?;
+                let client = &self.transport.pkarr;
                 for packet in config::destruction::all()? {
                     tokio::select! {
                         _ = self.shutdown_token.cancelled() => return Ok(()),
-                        result = destruction::publish(&client, &packet) => {
+                        result = destruction::publish(client, &packet) => {
                             if let Err(error) = result {
                                 tracing::debug!(%error, "will retry destruction record");
                             }

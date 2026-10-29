@@ -4,7 +4,6 @@
 //! peer-cleanup-adjacent helpers that drive reconvergence live here.
 
 use std::net::Ipv6Addr;
-use url::Url;
 
 use super::super::*;
 
@@ -131,14 +130,10 @@ pub(crate) fn apply_suggested_firewall(
 /// and a stale one must not undo a fresher record we already applied. Same floor,
 /// same reason, as the mesh path.
 pub(crate) async fn resolve_signed(
-    endpoint: &Endpoint,
-    relay_url: &Url,
+    client: &PkarrRelayClient,
     net_pubkey: EndpointId,
 ) -> Option<(blake3::Hash, Vec<EndpointId>, u64)> {
-    let client = dht::create_pkarr_client(endpoint, relay_url).ok()?;
-    let packet = dht::resolve_network_packet(&client, net_pubkey)
-        .await
-        .ok()?;
+    let packet = dht::resolve_network_packet(client, net_pubkey).await.ok()?;
     let ts = packet.timestamp().as_micros();
     let (hash, seeds) = dht::decode_network_record(&packet).ok()?;
     Some((hash, seeds, ts))
@@ -301,7 +296,7 @@ pub(crate) async fn reconverge_and_apply(
         return;
     }
     let Some((hash, seeds, timestamp)) =
-        resolve_signed(endpoint, &registry.transport.pkarr_relay_url, net_pubkey).await
+        resolve_signed(&registry.transport.pkarr, net_pubkey).await
     else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
@@ -811,7 +806,6 @@ pub(crate) async fn apply_roster_to_dns(
 }
 
 pub(crate) fn spawn_group_poller(
-    client: PkarrRelayClient,
     net_pubkey: EndpointId,
     state: SharedNetworkState,
     endpoint: Endpoint,
@@ -848,13 +842,14 @@ pub(crate) fn spawn_group_poller(
             // no-op when the flag already matches.
             registry.sync_exit_offers().await;
 
-            let packet = match dht::resolve_network_packet(&client, net_pubkey).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(error = %e, "group poll failed");
-                    continue;
-                }
-            };
+            let packet =
+                match dht::resolve_network_packet(&registry.transport.pkarr, net_pubkey).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "group poll failed");
+                        continue;
+                    }
+                };
             if dht::destruction::is_destroyed(&packet) {
                 registry.schedule_destruction(&network_name, packet);
                 break;

@@ -1788,9 +1788,6 @@ impl MemberAcceptState {
             "admin grant key does not match network public key"
         );
         let key = SecretKey::from(secret_key);
-        let pkarr_client =
-            dht::create_pkarr_client(&self.endpoint, &self.registry.transport.pkarr_relay_url)
-                .context("cannot accept admin grant without a network publisher")?;
         let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         let previous_authority = {
@@ -1845,7 +1842,7 @@ impl MemberAcceptState {
         // nothing, so no detached duplicate publisher survives teardown.
         let promoted = self
             .registry
-            .promote_to_coordinator(&self.network_name, key, pkarr_client);
+            .promote_to_coordinator(&self.network_name, key);
         anyhow::ensure!(
             promoted
                 || self

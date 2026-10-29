@@ -861,7 +861,6 @@ async fn member_poller_learns_destruction_without_a_broadcast() {
         handle.role = NetworkRole::Member;
         handle.state.write().unwrap().network_secret_key = None;
         let poller = spawn_group_poller(
-            dht::create_pkarr_client(&daemon.transport.endpoint, &relay.url).unwrap(),
             key.public(),
             Arc::clone(&handle.state),
             daemon.transport.endpoint.clone(),

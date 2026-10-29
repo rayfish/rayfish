@@ -207,17 +207,12 @@ async fn a_promoted_member_prunes_stale_members() {
         state.network_secret_key = Some(network_key.clone());
         state.refresh_snapshot();
     }
-    let client = dht::create_pkarr_client(
-        &registry.transport.endpoint,
-        &registry.transport.pkarr_relay_url,
-    )
-    .unwrap();
 
     // The pruner needs no transport. Stopping it first keeps the endpoint's
     // own timers from spinning once the clock is paused.
     daemon.shutdown_and_close().await;
     tokio::time::pause();
-    assert!(registry.promote_to_coordinator("home", network_key, client));
+    assert!(registry.promote_to_coordinator("home", network_key));
     // The pruner's first sweep runs a minute after it starts. Advance the
     // clock by hand: auto-advance waits on blocking-pool work in real time.
     // Let the pruner start its timer first, or the advance happens before it.
@@ -622,11 +617,7 @@ async fn a_warm_resume_records_an_incompatible_mesh_version() {
         old,
     )
     .unwrap();
-    let client = dht::create_pkarr_client(
-        &registry.transport.endpoint,
-        &registry.transport.pkarr_relay_url,
-    )
-    .unwrap();
+    let client = registry.transport.pkarr.clone();
     dht::publish_record(&client, &record).await.unwrap();
 
     // The two steps a warm restore takes, run in turn so the check's result

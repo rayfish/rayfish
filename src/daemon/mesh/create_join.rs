@@ -725,9 +725,8 @@ impl NetworkRegistry {
             self.forget_destroyed_key(&packet).await?;
             anyhow::bail!("network has been destroyed");
         }
-        let pkarr_client =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
-        let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
+        let pkarr_client = &self.transport.pkarr;
+        let record = dht::resolve_network_packet(pkarr_client, net_pubkey)
             .await
             .with_context(|| {
                 format!(
@@ -1321,28 +1320,19 @@ impl NetworkRegistry {
         cached_is_published: bool,
         persisted_peers: &[EndpointId],
     ) -> Result<RestoredGroupBlob> {
-        let resolved = match dht::create_pkarr_client(
-            &self.transport.endpoint,
-            &self.transport.pkarr_relay_url,
-        ) {
-            Ok(client) => match dht::resolve_network_packet(&client, net_pubkey).await {
-                Ok(packet) => {
-                    if dht::destruction::is_destroyed(&packet) {
-                        self.forget_destroyed_key(&packet).await?;
-                        anyhow::bail!("network has been destroyed");
-                    }
-                    Some(
-                        dht::decode_network_record(&packet)
-                            .context("decode signed pkarr record for roster restore")?,
-                    )
+        let resolved = match dht::resolve_network_packet(&self.transport.pkarr, net_pubkey).await {
+            Ok(packet) => {
+                if dht::destruction::is_destroyed(&packet) {
+                    self.forget_destroyed_key(&packet).await?;
+                    anyhow::bail!("network has been destroyed");
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, "network record unavailable during roster restore");
-                    None
-                }
-            },
+                Some(
+                    dht::decode_network_record(&packet)
+                        .context("decode signed pkarr record for roster restore")?,
+                )
+            }
             Err(e) => {
-                tracing::debug!(error = %e, "pkarr client unavailable during roster restore");
+                tracing::debug!(error = %e, "network record unavailable during roster restore");
                 None
             }
         };

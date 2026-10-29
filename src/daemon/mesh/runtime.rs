@@ -483,11 +483,10 @@ impl NetworkRegistry {
             );
             (key, bytes, seeds)
         };
-        let client =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
+        let client = &self.transport.pkarr;
         anyhow::ensure!(
             dht::destruction::resolve(
-                &client,
+                client,
                 dht::destruction::discovery_key(&key).public(),
                 key.public(),
             )
@@ -496,7 +495,7 @@ impl NetworkRegistry {
             "network has already been destroyed"
         );
         self.transport.blob_store.blobs().add_slice(&bytes).await?;
-        dht::publish_network(&client, &key, &blake3::hash(&bytes), &seeds).await?;
+        dht::publish_network(client, &key, &blake3::hash(&bytes), &seeds).await?;
         // The publisher must stop before it can overwrite this final roster.
         cancel.cancel();
         Ok(())
@@ -875,9 +874,8 @@ impl NetworkRegistry {
     /// all, which says nothing about the version.
     async fn record_mesh_version(&self, net_pubkey: &str) -> Result<Option<u32>> {
         let net_pubkey: EndpointId = net_pubkey.parse().context("invalid network key")?;
-        let client =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
-        let record = dht::resolve_network_packet(&client, net_pubkey).await?;
+        let client = &self.transport.pkarr;
+        let record = dht::resolve_network_packet(client, net_pubkey).await?;
         Ok(dht::mesh_version_from_record(&record))
     }
 

@@ -246,17 +246,20 @@ pub(crate) fn sample_registry(
 ) -> Arc<NetworkRegistry> {
     use crate::endpoint_hints::WarmLookup;
 
-    let transport = Arc::new(Transport::new(
-        endpoint,
-        identity,
-        blob_store,
-        Arc::new(ForwardMetrics::default()),
-        TransportBootstrap {
-            lan_peers: Arc::new(LanPeers::new()),
-            warm_lookup: WarmLookup::default(),
-            pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
-        },
-    ));
+    let transport = Arc::new(
+        Transport::new(
+            endpoint,
+            identity,
+            blob_store,
+            Arc::new(ForwardMetrics::default()),
+            TransportBootstrap {
+                lan_peers: Arc::new(LanPeers::new()),
+                warm_lookup: WarmLookup::default(),
+                pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
+            },
+        )
+        .expect("test endpoint is open"),
+    );
     let hostname_table = dns::new_hostname_table();
     let reverse_table = dns::new_reverse_table();
     let dns_resolver = Arc::new(crate::dns::resolver::Resolver::new(
@@ -1026,7 +1029,7 @@ async fn blocking_uses_the_dialing_endpoint_not_the_claimed_identity() {
 async fn offline_connect_service(dir: &std::path::Path) -> (Endpoint, ConnectService) {
     let (endpoint, mut registry) = test_registry(dir).await;
     let mut transport = (*registry.transport).clone();
-    transport.pkarr_relay_url = "http://127.0.0.1:1/pkarr".parse().unwrap();
+    transport.set_pkarr_relay("http://127.0.0.1:1/pkarr".parse().unwrap());
     Arc::get_mut(&mut registry).unwrap().transport = Arc::new(transport);
     let connect = ConnectService::new(registry);
     (endpoint, connect)
@@ -1044,7 +1047,7 @@ async fn approved_connect_retries_after_join_failure() {
     lookup.add_endpoint_info(receiver.addr());
     let mut registry = registry_on(&dialer, &env.dir.path().join("blobs")).await;
     let mut transport = (*registry.transport).clone();
-    transport.pkarr_relay_url = "http://127.0.0.1:1/pkarr".parse().unwrap();
+    transport.set_pkarr_relay("http://127.0.0.1:1/pkarr".parse().unwrap());
     Arc::get_mut(&mut registry).unwrap().transport = Arc::new(transport);
     let connect = Arc::new(ConnectService::new(registry));
     connect.outgoing_connects.insert(receiver.id());

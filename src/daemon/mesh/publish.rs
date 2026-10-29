@@ -189,7 +189,6 @@ async fn destruction_proof(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_network_publisher(
-    client: PkarrRelayClient,
     net_secret_key: SecretKey,
     state: SharedNetworkState,
     registry: Arc<NetworkRegistry>,
@@ -222,7 +221,9 @@ pub(crate) fn spawn_network_publisher(
                 if state.read().map(|s| s.destroyed).unwrap_or(true) {
                     break;
                 }
-                let proof = match destruction_proof(&client, &net_secret_key).await {
+                let proof = match destruction_proof(&registry.transport.pkarr, &net_secret_key)
+                    .await
+                {
                     Ok(proof) => proof,
                     Err(error) => {
                         tracing::warn!(%error, "cannot verify network destruction status");
@@ -285,8 +286,14 @@ pub(crate) fn spawn_network_publisher(
                 drop(commit_guard);
 
                 if let Some((hash, packet, seed_count)) = prepared {
-                    match publish_signed_record(&client, &commit, &network_name, hash, &packet)
-                        .await
+                    match publish_signed_record(
+                        &registry.transport.pkarr,
+                        &commit,
+                        &network_name,
+                        hash,
+                        &packet,
+                    )
+                    .await
                     {
                         Ok(true) => {
                             tracing::info!(peers = seed_count, "published network record");

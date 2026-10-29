@@ -180,7 +180,7 @@ pub(crate) async fn join_mesh_shared(
     let (mut admitted_blob, direct, mut record_ts) = match perform_join_handshake(
         &initial_conn,
         ep,
-        &registry.transport.pkarr_relay_url,
+        &registry.transport.pkarr,
         network_name,
         &registry.transport.blob_store,
         &registry.peers,
@@ -607,7 +607,7 @@ async fn connect_to_roster_peers(
 async fn perform_join_handshake(
     initial_conn: &Connection,
     ep: &Endpoint,
-    relay_url: &url::Url,
+    pkarr: &PkarrRelayClient,
     network_name: &str,
     blob_store: &FsStore,
     peers: &PeerTable,
@@ -755,7 +755,7 @@ async fn perform_join_handshake(
         // second resolve/fetch fails, retain the complete blob already verified
         // by `join_network_inner`; the config roster is a lossy display cache and
         // must never become publishable after a later promotion.
-        let (blob, record_ts) = match resolve_signed(ep, relay_url, net_pubkey).await {
+        let (blob, record_ts) = match resolve_signed(pkarr, net_pubkey).await {
             Some((signed, seeds, ts)) => {
                 match fetch_verified_blob(ep, blob_store, peers, signed, network_name, &seeds).await
                 {

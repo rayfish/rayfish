@@ -71,15 +71,10 @@ impl NetworkRegistry {
             my_hostname,
             dial,
         } = install;
-        let pkarr_client =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-                .ok();
-
         let mut tasks = Vec::new();
         let dht_notify = authority.as_ref().map(|authority| {
             let notify = Arc::new(Notify::new());
             tasks.extend(coordinator_tasks(
-                pkarr_client.clone(),
                 self,
                 name,
                 &authority.key,
@@ -90,9 +85,8 @@ impl NetworkRegistry {
             ));
             notify
         });
-        if poll_record && let Some(client) = pkarr_client {
+        if poll_record {
             tasks.push(spawn_group_poller(
-                client,
                 network_key,
                 Arc::clone(&state),
                 self.transport.endpoint.clone(),
