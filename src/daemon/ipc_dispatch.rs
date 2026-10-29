@@ -542,7 +542,7 @@ impl Daemon {
                 peer,
                 confirm,
             } => self.registry.kick_member(&network, &peer, confirm).await,
-            IpcMessage::Status => self.status(),
+            IpcMessage::Status => IpcMessage::StatusResponse(self.status()),
             IpcMessage::Report => self.build_report(peer.as_ref()).await,
             IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
@@ -667,11 +667,16 @@ impl Daemon {
                 reply(self.files.accept_file(id, output, peer_cred).await)
             }
             IpcMessage::RejectFile { id } => reply(self.files.reject_file(id)),
-            IpcMessage::StartPairing => self.start_pairing(),
+            IpcMessage::StartPairing => reply_with(self.start_pairing(), |ticket| {
+                IpcMessage::PairingTicket { ticket }
+            }),
             IpcMessage::PairWithDevice {
                 endpoint_id,
                 secret,
-            } => self.pair_with_device(endpoint_id, secret).await,
+            } => reply_with(
+                self.pair_with_device(endpoint_id, secret).await,
+                |user_identity| IpcMessage::PairingComplete { user_identity },
+            ),
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
             IpcMessage::BackupIdentity {
                 password,
@@ -703,7 +708,7 @@ impl Daemon {
                     Err(error) => ipc_err(error.to_string()),
                 }
             }
-            IpcMessage::Unpair { device } => self.unpair(&device).await,
+            IpcMessage::Unpair { device } => reply(self.unpair(&device).await),
             IpcMessage::MachineEnrollmentCreate {
                 expires_in,
                 reusable,
@@ -719,7 +724,11 @@ impl Daemon {
             IpcMessage::ControllerRevoke { identity } => {
                 self.management.revoke_controller(identity.as_ref()).await
             }
-            IpcMessage::ManagedMachines { probe } => self.management.list_machines(probe).await,
+            IpcMessage::ManagedMachines { probe } => {
+                reply_with(self.management.list_machines(probe).await, |machines| {
+                    IpcMessage::ManagedMachinesResponse { machines }
+                })
+            }
             IpcMessage::ManagedMachineConfirm { machine } => {
                 self.management.confirm_machine(machine).await
             }

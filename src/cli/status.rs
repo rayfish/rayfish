@@ -493,7 +493,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
     ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::StatusResponse {
+        ipc::IpcMessage::StatusResponse(ipc::NodeStatus {
             endpoint_id,
             mdns_enabled,
             auto_update,
@@ -511,7 +511,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
             connection_errors,
             lan_peers,
             ..
-        } => {
+        }) => {
             let (controllers, managed_machines) = ipc_management_overview(show_machines).await;
             let output = StatusOutput {
                 json: StatusJson {

@@ -759,10 +759,10 @@ impl NetworkRegistry {
     pub(crate) async fn leave_certificate_networks(
         self: &Arc<Self>,
         cert: &control::DeviceCert,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let cfg = match config::load() {
             Ok(cfg) => cfg,
-            Err(error) => return ipc_err(format!("could not read saved networks: {error}")),
+            Err(error) => return op_err(format!("could not read saved networks: {error}")),
         };
         let networks = networks_joined_with_certificate(&cfg.networks, cert.user_identity);
         for name in &networks {
@@ -774,21 +774,22 @@ impl NetworkRegistry {
                 tracing::debug!(network = %name, %error, "network left before unpair could");
             }
             if let Err(error) = config::delete_network(name) {
-                return ipc_err(format!("could not remove network '{name}': {error}"));
+                return op_err(format!("could not remove network '{name}': {error}"));
             }
         }
         match crate::identity::delete_device_cert() {
             Ok(()) => tracing::info!(left = networks.len(), "unpaired this device"),
             Err(e) => {
                 tracing::warn!(error = %e, "unpair: failed to delete device cert");
-                return ipc_err(format!(
+                return op_err(format!(
                     "left certificate-joined networks but failed to delete device cert: {e}"
                 ));
             }
         }
-        IpcMessage::Ok {
-            message: format!("unpaired this device (left {} network(s))", networks.len()),
-        }
+        Ok(Done(format!(
+            "unpaired this device (left {} network(s))",
+            networks.len()
+        )))
     }
 
     /// Tear down a network's runtime: cancel its tasks, drop its peers + `.ray`

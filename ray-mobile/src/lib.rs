@@ -9,7 +9,7 @@
 //!
 //! No platform specifics leak into the core: the fd handling lives in
 //! [`android_tun`], and everything else is a thin map from the core's
-//! `IpcMessage` results to the UniFFI records below.
+//! typed results to the UniFFI records below.
 
 // Also built for Linux tests, which exercise the fd handling on a pipe.
 #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
@@ -86,7 +86,7 @@ use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
 use rayfish::identity;
 use rayfish::invite;
-use rayfish::ipc::{self, IpcMessage};
+use rayfish::ipc;
 use rayfish::keybackup;
 use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
@@ -511,10 +511,7 @@ impl Node {
 
     /// This node's endpoint id, read from a fresh `status()` snapshot.
     fn node_id(state: &Arc<DaemonState>) -> String {
-        match state.status() {
-            IpcMessage::StatusResponse { endpoint_id, .. } => endpoint_id.to_string(),
-            _ => String::new(),
-        }
+        state.status().endpoint_id.to_string()
     }
 }
 
@@ -759,7 +756,7 @@ impl Node {
     }
 
     /// Join an existing network by invite code (or a bare room id / network
-    /// pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+    /// pubkey). Maps the core's join result to a [`NetworkInfo`].
     pub fn join(&self, code: String) -> Result<NetworkInfo, RayError> {
         let state = self.state()?;
 
@@ -1258,13 +1255,9 @@ impl Node {
     /// scan and call `pair`.
     pub fn start_pairing(&self) -> Result<String, RayError> {
         let state = self.state()?;
-        match state.start_pairing() {
-            IpcMessage::PairingTicket { ticket } => Ok(ticket),
-            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
-            other => Err(RayError::PairFailed(format!(
-                "unexpected pairing response: {other:?}"
-            ))),
-        }
+        state
+            .start_pairing()
+            .map_err(|error| RayError::PairFailed(error.to_string()))
     }
 
     /// Pair this device with a primary device using a scanned/pasted pairing
@@ -1275,17 +1268,10 @@ impl Node {
         let (endpoint, secret) = control::decode_pairing_ticket(&ticket)
             .map_err(|e| RayError::BadCode(e.to_string()))?;
 
-        let result = self
-            .runtime
-            .block_on(state.pair_with_device(endpoint, secret.to_vec()));
-
-        match result {
-            IpcMessage::PairingComplete { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
-            other => Err(RayError::PairFailed(format!(
-                "unexpected pair response: {other:?}"
-            ))),
-        }
+        self.runtime
+            .block_on(state.pair_with_device(endpoint, secret.to_vec()))
+            .map(drop)
+            .map_err(|error| RayError::PairFailed(error.to_string()))
     }
 
     /// Unpair this device from its primary: leave every network it joined under
@@ -1294,13 +1280,10 @@ impl Node {
     /// no cert returns an error. Requires [`Node::start`].
     pub fn unpair(&self) -> Result<(), RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.unpair_self()) {
-            IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
-            other => Err(RayError::PairFailed(format!(
-                "unexpected unpair response: {other:?}"
-            ))),
-        }
+        self.runtime
+            .block_on(state.unpair_self())
+            .map(drop)
+            .map_err(|error| RayError::PairFailed(error.to_string()))
     }
 
     /// Whether this device has an identity on disk yet.
@@ -1566,7 +1549,7 @@ impl Node {
             return saved_networks_status();
         };
 
-        let IpcMessage::StatusResponse {
+        let ipc::NodeStatus {
             endpoint_id,
             active,
             networks,
@@ -1574,13 +1557,7 @@ impl Node {
             inactive_networks,
             identity,
             ..
-        } = state.status()
-        else {
-            // Not the reply we asked for. Fall back to the saved networks rather
-            // than a blank snapshot: an empty list is indistinguishable from
-            // having joined none, which is the worst thing to show here.
-            return saved_networks_status();
-        };
+        } = state.status();
 
         let mut detail = Vec::with_capacity(networks.len() + inactive_networks.len());
         let mut flat_peers = Vec::new();

@@ -40,7 +40,7 @@ use clap_complete::{CompleteEnv, Shell};
 use crate::Cli;
 use crate::*;
 
-use ipc::{IpcMessage, NetworkStatus, NodeKey};
+use ipc::{IpcMessage, NetworkStatus, NodeKey, NodeStatus};
 
 use super::files::format_size;
 
@@ -481,11 +481,11 @@ fn network_names() -> Vec<String> {
 /// place to explain that the daemon is down.
 fn status() -> Option<(Vec<NetworkStatus>, Vec<String>)> {
     ask(IpcMessage::Status, |reply| match reply {
-        IpcMessage::StatusResponse {
+        IpcMessage::StatusResponse(NodeStatus {
             networks,
             pending_networks,
             ..
-        } => Some((networks, pending_networks)),
+        }) => Some((networks, pending_networks)),
         _ => None,
     })
 }

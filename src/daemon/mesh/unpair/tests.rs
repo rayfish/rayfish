@@ -113,7 +113,7 @@ impl Node {
         handle.state.read().unwrap().nullifiers.contains(&device)
     }
 
-    async fn unpair_self(&self) -> IpcMessage {
+    async fn unpair_self(&self) -> OpResult<Done> {
         let daemon = self.daemon();
         self.run(async move { daemon.unpair_self().await }).await
     }
@@ -241,10 +241,8 @@ async fn listed(primary: &Node, device: EndpointId, cert: control::DeviceCert) {
 /// primary's id and the secret.
 async fn ticket(primary: &Node) -> (EndpointId, [u8; 32]) {
     let daemon = primary.daemon();
-    match primary.run(async move { daemon.start_pairing() }).await {
-        IpcMessage::PairingTicket { ticket } => control::decode_pairing_ticket(&ticket).unwrap(),
-        other => panic!("{other:?}"),
-    }
+    let ticket = primary.run(async move { daemon.start_pairing() }).await;
+    control::decode_pairing_ticket(&ticket.unwrap()).unwrap()
 }
 
 /// Pair `device` with `primary` for real. Returns the certificate it stored.
@@ -254,10 +252,7 @@ async fn pair(primary: &Node, device: &Node) -> control::DeviceCert {
     let result = device
         .run(async move { daemon.pair_with_device(primary_id, secret.to_vec()).await })
         .await;
-    assert!(
-        matches!(result, IpcMessage::PairingComplete { .. }),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     device
         .cert()
         .await
@@ -335,7 +330,7 @@ async fn an_offline_primary_records_the_unpair_once_it_is_back() {
     relay.fail.store(true, Ordering::Relaxed);
 
     let result = device.unpair_self().await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(device.cert().await, None);
     assert!(!device.has_network("home").await);
     assert_eq!(device.settings().await.pending_unpairs, waiting(&cert));
@@ -378,7 +373,7 @@ async fn a_primary_records_an_unpair_after_its_roster_dropped_the_device() {
     introduce(&device, &primary);
 
     let result = device.unpair_self().await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     device
         .eventually("the primary to confirm", |cfg| {
             cfg.pending_unpairs.is_empty()
@@ -524,7 +519,7 @@ async fn pairing_again_cancels_the_unpair_request() {
     let cert = hold_certificate(&device, &primary.key).await;
     relay.fail.store(true, Ordering::Relaxed);
     let result = device.unpair_self().await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(device.settings().await.pending_unpairs, waiting(&cert));
 
     relay.fail.store(false, Ordering::Relaxed);
@@ -610,10 +605,7 @@ async fn pairing_again_completes_once_the_revocation_is_lifted() {
     assert_eq!(device.cert().await, None);
     drop(revoking);
     let result = pairing.await.unwrap();
-    assert!(
-        matches!(result, IpcMessage::PairingComplete { .. }),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     let renewed = device
         .cert()
         .await
@@ -648,7 +640,7 @@ async fn pairing_again_is_refused_until_the_lifted_revocation_is_published() {
     let result = device
         .run(async move { daemon.pair_with_device(primary_id, secret.to_vec()).await })
         .await;
-    assert!(matches!(result, IpcMessage::Error { .. }), "{result:?}");
+    assert!(result.is_err(), "{result:?}");
     assert_eq!(device.cert().await, None);
     let settings = primary.settings().await;
     assert!(revoked(&settings, device.id()));
@@ -687,7 +679,7 @@ async fn pairing_again_is_refused_while_a_network_is_not_running() {
     let result = device
         .run(async move { daemon.pair_with_device(primary_id, secret.to_vec()).await })
         .await;
-    assert!(matches!(result, IpcMessage::Error { .. }), "{result:?}");
+    assert!(result.is_err(), "{result:?}");
     assert_eq!(device.cert().await, None);
     let settings = primary.settings().await;
     assert!(revoked(&settings, device.id()));
@@ -923,7 +915,7 @@ async fn unpaired_from_shared_network(primary: &Node, device: &Node) -> Endpoint
         .network_key;
     introduce(device, primary);
     let result = device.unpair_self().await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     device
         .eventually("the primary to confirm", |cfg| {
             cfg.pending_unpairs.is_empty()
@@ -1050,7 +1042,7 @@ async fn an_offline_device_is_told_once_it_is_back() {
     let result = primary
         .run(async move { daemon.unpair(&target).await })
         .await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     let settings = primary.settings().await;
     assert!(revoked(&settings, device.id()));
     assert_eq!(settings.pending_unpair_notices, [notice(device.id(), 0)]);
@@ -1107,7 +1099,7 @@ async fn a_notice_stays_until_the_device_confirms_or_pairs_again() {
     let result = primary
         .run(async move { daemon.unpair(&target).await })
         .await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     let revoked = ControlMsg::PairingRevoked {
         generation: cert.generation,
     };
@@ -1176,7 +1168,7 @@ async fn an_older_device_is_told_with_the_bare_notice() {
     let result = primary
         .run(async move { daemon.unpair(&target).await })
         .await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(next_told(&mut told).await, ControlMsg::Unpaired);
     accept.abort();
     device.close().await;
@@ -1341,7 +1333,7 @@ async fn an_unanswered_request_stays_pending() {
         .add_endpoint_info(primary.addr());
 
     let result = device.unpair_self().await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     let request = tokio::time::timeout(Duration::from_secs(15), received.recv())
         .await
         .unwrap()
@@ -1406,7 +1398,7 @@ async fn an_older_primary_gets_the_earlier_request_and_the_unpair_stays() {
         .add_endpoint_info(primary.addr());
 
     let result = device.unpair_self().await;
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     let (alpn, msg) = tokio::time::timeout(Duration::from_secs(15), received.recv())
         .await
         .unwrap()

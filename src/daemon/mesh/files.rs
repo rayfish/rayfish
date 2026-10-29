@@ -60,7 +60,7 @@ impl Daemon {
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// mint a pairing ticket for this device (delegates to [`FileService`]).
-    pub fn start_pairing(&self) -> IpcMessage {
+    pub fn start_pairing(&self) -> OpResult<String> {
         self.files.start_pairing()
     }
 
@@ -71,13 +71,13 @@ impl Daemon {
         self: &Arc<Self>,
         endpoint_id: EndpointId,
         secret: Vec<u8>,
-    ) -> IpcMessage {
+    ) -> OpResult<EndpointId> {
         // A request this device saved when it last unpaired would revoke the
         // pairing made here: the lock keeps an attempt at it from running
         // while the pairing completes, which then cancels it.
         let _guard = self.registry.unpair_lock.lock().await;
         if let Err(message) = self.registry.finish_cleanups_locked().await {
-            return ipc_err(format!("an earlier unpair has not finished: {message}"));
+            return op_err(format!("an earlier unpair has not finished: {message}"));
         }
         let addr: iroh::EndpointAddr = endpoint_id.into();
         tracing::info!(primary = %endpoint_id.fmt_short(), "dialing primary device for pairing");
@@ -94,14 +94,14 @@ impl Daemon {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "pairing: could not connect to primary device");
-                return ipc_err(format!("failed to connect to primary device: {e}"));
+                return op_err(format!("failed to connect to primary device: {e}"));
             }
             Err(_) => {
                 tracing::warn!(
                     timeout_secs = PAIR_CONNECT_TIMEOUT.as_secs(),
                     "pairing: timed out connecting to primary device"
                 );
-                return ipc_err(
+                return op_err(
                     "timed out reaching the primary device. Make sure it is online and \
                               that you opened pairing on it (run `ray pair` there)."
                         .to_string(),
@@ -111,14 +111,14 @@ impl Daemon {
         let (mut send, mut recv) = match conn.open_bi().await {
             Ok(pair) => pair,
             Err(e) => {
-                return ipc_err(format!("failed to open stream: {e}"));
+                return op_err(format!("failed to open stream: {e}"));
             }
         };
 
         let secret_arr: [u8; 32] = match secret.try_into() {
             Ok(a) => a,
             Err(_) => {
-                return ipc_err("invalid secret length".to_string());
+                return op_err("invalid secret length".to_string());
             }
         };
 
@@ -127,13 +127,13 @@ impl Daemon {
             device_pubkey: self.transport.endpoint.id(),
         };
         if let Err(e) = control::send_framed(&mut send, &request).await {
-            return ipc_err(format!("failed to send pair request: {e}"));
+            return op_err(format!("failed to send pair request: {e}"));
         }
 
         let response: control::PairMsg = match control::recv_framed(&mut recv).await {
             Ok(response) => response,
             Err(e) => {
-                return ipc_err(format!("failed to read pair response: {e:#}"));
+                return op_err(format!("failed to read pair response: {e:#}"));
             }
         };
 
@@ -143,10 +143,10 @@ impl Daemon {
                     || cert.device_key != self.transport.endpoint.id()
                     || cert.user_identity != endpoint_id
                 {
-                    return ipc_err("received invalid device certificate".to_string());
+                    return op_err("received invalid device certificate".to_string());
                 }
                 if let Err(e) = identity::store_device_cert(&cert) {
-                    return ipc_err(format!("failed to store device certificate: {e}"));
+                    return op_err(format!("failed to store device certificate: {e}"));
                 }
                 self.registry.paired_again(cert.user_identity);
                 // Until the primary hears the cert is saved, an unpair request
@@ -166,11 +166,9 @@ impl Daemon {
                 self.queue_shared_networks(networks, endpoint_id);
                 self.registry.poll_nudge.notify_waiters();
                 tracing::info!("pairing complete; device certificate stored");
-                IpcMessage::PairingComplete {
-                    user_identity: cert.user_identity,
-                }
+                Ok(cert.user_identity)
             }
-            _ => ipc_err("unexpected pairing response".to_string()),
+            _ => op_err("unexpected pairing response".to_string()),
         }
     }
 
@@ -296,22 +294,22 @@ impl Daemon {
     /// told to wipe its own cert until it confirms, after a restart too (see
     /// `mesh::unpair`). Networks this node does not coordinate rely on that
     /// local unpair.
-    pub(crate) async fn unpair(self: &Arc<Self>, device: &str) -> IpcMessage {
+    pub(crate) async fn unpair(self: &Arc<Self>, device: &str) -> OpResult<Done> {
         // Only the primary holds the user identity secret that signs both the
         // certs and their revocation. A secondary carries a device cert.
         if self.current_device_cert().is_some() {
-            return ipc_err("only your primary device can unpair a device".to_string());
+            return op_err("only your primary device can unpair a device".to_string());
         }
         let own_user = self.transport.endpoint.id();
 
         let target = match self.resolve_peer_flexible(device).await {
             Some(id) => id,
             None => {
-                return ipc_err(format!("could not resolve device '{device}'"));
+                return op_err(format!("could not resolve device '{device}'"));
             }
         };
         if target == own_user {
-            return ipc_err("that is your primary device, not a paired secondary".to_string());
+            return op_err("that is your primary device, not a paired secondary".to_string());
         }
 
         // Save the revocation and the notice, then write the authoritative
@@ -320,11 +318,11 @@ impl Daemon {
         match self.registry.nullify_device(target, true).await {
             Ok(display) => {
                 self.registry.notice_nudge.notify_one();
-                IpcMessage::Ok {
-                    message: format!("unpaired '{display}' and nullified its device certificate"),
-                }
+                Ok(Done(format!(
+                    "unpaired '{display}' and nullified its device certificate"
+                )))
             }
-            Err(message) => ipc_err(message),
+            Err(message) => op_err(message),
         }
     }
 
@@ -335,7 +333,7 @@ impl Daemon {
     /// record the revocation until it confirms. Each step is saved first, so a
     /// restart finishes it. Used by the phone's "unpair this device" control. A
     /// device with no cert (a primary) has nothing to unpair.
-    pub async fn unpair_self(&self) -> IpcMessage {
+    pub async fn unpair_self(&self) -> OpResult<Done> {
         self.registry.unpair_self().await
     }
 }

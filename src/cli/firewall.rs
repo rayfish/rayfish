@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 
 use crate::*;
 use firewall::Action;
-use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
+use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey, NodeStatus};
 
 #[derive(serde::Serialize)]
 struct FirewallStateOutput<'a> {
@@ -1522,11 +1522,11 @@ pub(crate) async fn ipc_status_full() -> Result<(EndpointId, Vec<ipc::NetworkSta
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::StatusResponse {
+        ipc::IpcMessage::StatusResponse(NodeStatus {
             endpoint_id,
             networks,
             ..
-        } => Ok((endpoint_id, networks)),
+        }) => Ok((endpoint_id, networks)),
         other => anyhow::bail!("unexpected status response: {other:?}"),
     }
 }

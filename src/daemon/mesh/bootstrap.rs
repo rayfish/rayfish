@@ -1350,7 +1350,10 @@ mod embedded_ipc_tests {
             request(&path, IpcMessage::Status)
         );
         for response in [first, second] {
-            assert!(matches!(response, IpcMessage::StatusResponse { .. }));
+            assert!(matches!(
+                response,
+                IpcMessage::StatusResponse(NodeStatus { .. })
+            ));
         }
         assert_eq!(config::load().unwrap().operator_uid, None);
         let response = request(

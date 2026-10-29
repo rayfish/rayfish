@@ -32,7 +32,10 @@ mod recovery_tests;
 
 impl Daemon {
     /// Inventory for embedders, including machines outside the local networks.
-    pub async fn list_managed_machines(&self, probe: bool) -> IpcMessage {
+    pub async fn list_managed_machines(
+        &self,
+        probe: bool,
+    ) -> OpResult<Vec<ipc::ManagedMachineInfo>> {
         self.management.list_machines(probe).await
     }
 }
@@ -594,25 +597,26 @@ impl ManagementService {
     }
 
     /// Lists enrolled machines and optionally probes their current status.
-    pub(crate) async fn list_machines(&self, probe: bool) -> IpcMessage {
+    pub(crate) async fn list_machines(
+        &self,
+        probe: bool,
+    ) -> OpResult<Vec<ipc::ManagedMachineInfo>> {
         let machines = match config::load() {
             Ok(settings) => settings.managed_machines,
-            Err(error) => return ipc_err(format!("failed to load managed machines: {error}")),
+            Err(error) => return op_err(format!("failed to load managed machines: {error}")),
         };
         if !probe {
-            return IpcMessage::ManagedMachinesResponse {
-                machines: machines
-                    .into_iter()
-                    .map(|machine| ipc::ManagedMachineInfo {
-                        identity: machine.identity,
-                        hostname: machine.hostname,
-                        enrolled_at: machine.enrolled_at,
-                        last_seen: machine.last_seen,
-                        state: ipc::ManagedMachineState::Unknown,
-                        networks: Vec::new(),
-                    })
-                    .collect(),
-            };
+            return Ok(machines
+                .into_iter()
+                .map(|machine| ipc::ManagedMachineInfo {
+                    identity: machine.identity,
+                    hostname: machine.hostname,
+                    enrolled_at: machine.enrolled_at,
+                    last_seen: machine.last_seen,
+                    state: ipc::ManagedMachineState::Unknown,
+                    networks: Vec::new(),
+                })
+                .collect());
         }
         let results = join_all(machines.into_iter().map(|machine| async move {
             let status = tokio::time::timeout(
@@ -644,7 +648,7 @@ impl ManagementService {
             info
         }))
         .await;
-        IpcMessage::ManagedMachinesResponse { machines: results }
+        Ok(results)
     }
 
     /// Asks an enrolled machine to join a network controlled by this node.

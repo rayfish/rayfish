@@ -1786,9 +1786,9 @@ impl FileService {
     /// Mint a pairing ticket for this device. Only a primary (holding no cert of
     /// its own) may mint device certs; a secondary is refused so a new device
     /// can't be bound to the wrong identity.
-    pub(crate) fn start_pairing(&self) -> IpcMessage {
+    pub(crate) fn start_pairing(&self) -> OpResult<String> {
         if self.current_device_cert().is_some() {
-            return ipc_err(
+            return op_err(
                 "this device is already paired; add new devices from your primary device"
                     .to_string(),
             );
@@ -1808,7 +1808,7 @@ impl FileService {
         });
 
         tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
-        IpcMessage::PairingTicket { ticket }
+        Ok(ticket)
     }
 
     /// `PAIR_ALPN`: complete a device-pairing handshake. Verifies the dialer's

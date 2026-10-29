@@ -20,9 +20,7 @@ use rayfish::daemon::{
 };
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
-use rayfish::ipc::{
-    ConnectionIssue, InvitationInfo, InvitationStatus, IpcMessage, TransferFileState,
-};
+use rayfish::ipc::{self, ConnectionIssue, InvitationInfo, InvitationStatus, TransferFileState};
 use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
@@ -383,30 +381,20 @@ impl Node {
     /// The stable mesh address that the packet tunnel assigns to this device.
     pub fn ipv6_address(&self) -> Result<String, AppleError> {
         let state = self.state()?;
-        let IpcMessage::StatusResponse { endpoint_id, .. } = state.status() else {
-            return Err(AppleError::Network(
-                "node returned an invalid status response".to_owned(),
-            ));
-        };
-        Ok(membership::derive_ipv6(&endpoint_id).to_string())
+        Ok(membership::derive_ipv6(&state.status().endpoint_id).to_string())
     }
 
     /// A UI-ready snapshot of the running node.
     pub fn status(&self) -> Result<NodeStatus, AppleError> {
         let state = self.state()?;
-        let IpcMessage::StatusResponse {
+        let ipc::NodeStatus {
             endpoint_id,
             active,
             networks,
             identity,
             mdns_enabled: mdns_active,
             ..
-        } = state.status()
-        else {
-            return Err(AppleError::Network(
-                "node returned an invalid status response".to_owned(),
-            ));
-        };
+        } = state.status();
         let pending_requests = networks
             .iter()
             .filter(|network| network.pending_requests > 0)
@@ -548,26 +536,21 @@ impl Node {
     /// Probe enrolled machines separately so an offline machine cannot delay status.
     pub fn machines(&self) -> Result<Vec<ManagedMachine>, AppleError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.list_managed_machines(true)) {
-            IpcMessage::ManagedMachinesResponse { machines } => Ok(machines
-                .into_iter()
-                .map(|machine| ManagedMachine {
-                    identity: machine.identity.to_string(),
-                    hostname: machine.hostname.to_string(),
-                    ipv6: membership::derive_ipv6(&machine.identity).to_string(),
-                    state: <&str>::from(machine.state).to_owned(),
-                    networks: machine
-                        .networks
-                        .into_iter()
-                        .map(|name| name.to_string())
-                        .collect(),
-                })
-                .collect()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "invalid machine inventory response".to_owned(),
-            )),
-        }
+        let machines = self.runtime.block_on(state.list_managed_machines(true))?;
+        Ok(machines
+            .into_iter()
+            .map(|machine| ManagedMachine {
+                identity: machine.identity.to_string(),
+                hostname: machine.hostname.to_string(),
+                ipv6: membership::derive_ipv6(&machine.identity).to_string(),
+                state: <&str>::from(machine.state).to_owned(),
+                networks: machine
+                    .networks
+                    .into_iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            })
+            .collect())
     }
 
     /// Persist an embedder-owned setting using the same keys as `ray config`.
@@ -1217,10 +1200,7 @@ mod tests {
 
                 // A self-dial fails immediately, providing an offline inventory
                 // entry without relying on an external machine or a network.
-                let IpcMessage::StatusResponse { endpoint_id, .. } = node.state().unwrap().status()
-                else {
-                    panic!("expected node status");
-                };
+                let endpoint_id = node.state().unwrap().status().endpoint_id;
                 config::update_settings(|settings| {
                     settings.managed_machines.push(config::ManagedMachine {
                         identity: endpoint_id,

@@ -373,7 +373,7 @@ mod connection_quality_tests {
 impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// snapshot the daemon's status (identity, networks, peers).
-    pub fn status(&self) -> IpcMessage {
+    pub fn status(&self) -> NodeStatus {
         let hostname_snapshot = self.dns.hostname_table.try_read().ok();
         let my_id = self.transport.endpoint.id();
         let saved = config::load().ok();
@@ -489,7 +489,7 @@ impl Daemon {
             }
         }
 
-        IpcMessage::StatusResponse {
+        NodeStatus {
             endpoint_id: self.transport.endpoint.id(),
             mdns_enabled: self.mdns.enabled(),
             auto_update: self.auto_update,

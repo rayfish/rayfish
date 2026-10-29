@@ -1833,14 +1833,11 @@ mod tests {
             );
             assert!(daemon.registry.record_join_denial(&network_key, &error));
             assert!(config::load().unwrap().pending_joins.is_empty());
-            let IpcMessage::StatusResponse {
+            let NodeStatus {
                 inactive_networks,
                 pending_networks,
                 ..
-            } = daemon.status()
-            else {
-                panic!("expected status");
-            };
+            } = daemon.status();
             assert!(pending_networks.is_empty());
             assert!(inactive_networks.iter().any(|network| network.name == "box"
                 && network.reason.as_deref() == Some(error.to_string().as_str())));

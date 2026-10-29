@@ -490,7 +490,9 @@ pub(crate) async fn daemon_version() -> Option<String> {
     let mut stream = ipc::connect().await.ok()?;
     ipc::send(&mut stream, ipc::IpcMessage::Status).await.ok()?;
     match ipc::recv(&mut stream).await.ok()? {
-        ipc::IpcMessage::StatusResponse { daemon_version, .. } if !daemon_version.is_empty() => {
+        ipc::IpcMessage::StatusResponse(ipc::NodeStatus { daemon_version, .. })
+            if !daemon_version.is_empty() =>
+        {
             Some(daemon_version)
         }
         _ => None,

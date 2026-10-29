@@ -77,7 +77,7 @@ use crate::forward;
 use crate::identity;
 use crate::ipc::{
     self, FirewallRuleView, InactiveNetwork, IpcMessage, LanPeerInfo, MeshVersionMismatch,
-    NetworkRole, NetworkStatus, PeerState, PeerStatus, ipc_err,
+    NetworkRole, NetworkStatus, NodeStatus, PeerState, PeerStatus, ipc_err,
 };
 use crate::membership::{
     ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IrohIdentityProvider, Member, MemberList,
@@ -4786,9 +4786,7 @@ pub(crate) mod accept_handler_tests {
         for expected in [2, 1, 0] {
             let requests = daemon.registry.list_requests("test-net").unwrap();
             assert_eq!(requests.len(), expected);
-            let IpcMessage::StatusResponse { networks, .. } = daemon.status() else {
-                panic!("expected status");
-            };
+            let networks = daemon.status().networks;
             let network = networks.iter().find(|net| net.name == "test-net").unwrap();
             assert_eq!(network.pending_requests, expected);
             if expected > 0 {
@@ -5247,7 +5245,7 @@ mod headless_tests {
         assert!(Arc::strong_count(&daemon) >= 1);
 
         // The embedding `status()` API answers without a socket ever being bound.
-        assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
+        daemon.status();
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -5573,21 +5571,14 @@ mod headless_tests {
         }
 
         // The same sighting is listed in `ray status`, with its addresses.
-        match daemon.status() {
-            IpcMessage::StatusResponse { lan_peers, .. } => {
-                assert_eq!(lan_peers.len(), 1);
-                assert_eq!(lan_peers[0].endpoint_id, peer);
-                assert_eq!(lan_peers[0].addrs, vec![addr.to_string()]);
-            }
-            other => panic!("expected StatusResponse, got {other:?}"),
-        }
+        let lan_peers = daemon.status().lan_peers;
+        assert_eq!(lan_peers.len(), 1);
+        assert_eq!(lan_peers[0].endpoint_id, peer);
+        assert_eq!(lan_peers[0].addrs, vec![addr.to_string()]);
 
         // An expiry clears it from both.
         daemon.transport.lan_peers.expired(&peer);
-        match daemon.status() {
-            IpcMessage::StatusResponse { lan_peers, .. } => assert!(lan_peers.is_empty()),
-            other => panic!("expected StatusResponse, got {other:?}"),
-        }
+        assert!(daemon.status().lan_peers.is_empty());
     }
 
     /// In-memory TUN writer that records every written packet into a shared
@@ -5750,10 +5741,7 @@ mod headless_tests {
                 writer1,
             )
             .await;
-        assert!(matches!(
-            daemon.status(),
-            IpcMessage::StatusResponse { active: true, .. }
-        ));
+        assert!(daemon.status().active);
 
         #[cfg(all(target_os = "macos", feature = "desktop"))]
         assert!(daemon.app_ssh_helper.load(Ordering::SeqCst));
@@ -5767,10 +5755,7 @@ mod headless_tests {
         // 2. Toggle: detach, then re-attach reader2 + writer2. This is the path
         //    that used to silently break before the fresh-channel-per-attach fix.
         daemon.detach_tun();
-        assert!(matches!(
-            daemon.status(),
-            IpcMessage::StatusResponse { active: false, .. }
-        ));
+        assert!(!daemon.status().active);
         let writer2 = FakeTunWriter {
             mtu: Some(1280),
             ..Default::default()
