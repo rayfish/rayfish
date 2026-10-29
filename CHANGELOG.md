@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Windows: embedded mesh SSH supports local-account PowerShell terminals,
+  command execution, and TCP forwarding. SFTP uses the Windows OpenSSH helper
+  when installed.
 - Windows: the installer creates a desktop shortcut with the Rayfish icon.
 - The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
   and DNS through the packet tunnel, or restore a direct connection.

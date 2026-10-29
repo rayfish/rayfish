@@ -19,6 +19,7 @@ pub fn new_authz() -> SshAuthz {
     derive(serde::Serialize, serde::Deserialize)
 )]
 pub(super) struct UserPolicy {
+    #[cfg(any(unix, test))]
     local_uid: Option<u32>,
     matched: bool,
     any: bool,
@@ -27,6 +28,7 @@ pub(super) struct UserPolicy {
 }
 
 impl UserPolicy {
+    #[cfg(any(unix, test))]
     pub(super) fn local(uid: u32) -> Self {
         Self {
             local_uid: Some(uid),
@@ -50,11 +52,16 @@ impl UserPolicy {
         self.matched
     }
 
+    #[cfg(any(unix, test))]
     pub(super) fn permits(&self, name: &str, uid: u32) -> bool {
         if let Some(local_uid) = self.local_uid {
             return local_uid == 0 || local_uid == uid;
         }
-        self.any || self.users.contains(name) || (self.nonroot && uid != 0)
+        self.permits_account(uid == 0, |user| user == name)
+    }
+
+    pub(super) fn permits_account(&self, privileged: bool, matches: impl Fn(&str) -> bool) -> bool {
+        self.any || self.users.iter().any(|user| matches(user)) || (self.nonroot && !privileged)
     }
 }
 
@@ -80,7 +87,7 @@ pub(super) fn auth_banner(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn resolve_user_policy(
     authz: &SshAuthz,
     user: &EndpointId,

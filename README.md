@@ -78,6 +78,11 @@ icon, and `ray.exe` are clients of that service. The desktop app uses Rayfish's
 dark theme and bundled fonts without requiring WebView2. Closing the window
 leaves the app in the tray and does not stop the service or disconnect the VPN.
 
+Windows mesh SSH runs PowerShell and commands as a local Windows account.
+Enable it with `ray ssh on`, then grant a peer access with
+`ray ssh allow <network> <peer> -u <windows-user>`. Domain accounts are not
+supported. SFTP requires the Windows OpenSSH SFTP helper.
+
 ## Quick start
 
 Create a private network and invite another device:

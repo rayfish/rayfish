@@ -3,9 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use russh::keys::{Algorithm, PrivateKey};
 use tracing::{info, warn};
+
+use super::key_store::load_or_generate_host_key;
 
 const DEFAULT_HOST_KEY_PATHS: [&str; 2] = [
     "/etc/ssh/ssh_host_ed25519_key",
@@ -105,21 +107,4 @@ pub(super) fn parse_sftp_subsystem(dump: &str) -> Option<String> {
         let binary = Path::new(command.first()?);
         (binary.is_absolute() && binary.is_file()).then(|| command.join(" "))
     })
-}
-
-fn load_or_generate_host_key() -> Result<PrivateKey> {
-    use russh::keys::ssh_key::LineEnding;
-
-    let path = crate::config::config_dir()?.join("ssh_host_key");
-    if path.exists() {
-        let pem = std::fs::read_to_string(&path).context("reading ssh host key")?;
-        return PrivateKey::from_openssh(&pem).context("parsing ssh host key");
-    }
-    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
-        .context("generating ssh host key")?;
-    let pem = key
-        .to_openssh(LineEnding::LF)
-        .context("encoding ssh host key")?;
-    crate::config::write_file(&path, pem.as_bytes(), true)?;
-    Ok(key)
 }
