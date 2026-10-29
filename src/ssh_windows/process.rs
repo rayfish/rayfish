@@ -776,7 +776,7 @@ fn command_line(shell: &Path, command: Option<&str>, terminal: bool) -> Result<V
             // Redirected streams have valid pipe handles but no console code
             // page. Install UTF-8 readers/writers without invoking console APIs.
             format!(
-                "$rayfishEncoding=[System.Text.UTF8Encoding]::new($false); \
+                "$ProgressPreference='SilentlyContinue'; $rayfishEncoding=[System.Text.UTF8Encoding]::new($false); \
                  $rayfishOut=[System.IO.StreamWriter]::new([Console]::OpenStandardOutput(),$rayfishEncoding,4096,$true); \
                  $rayfishOut.AutoFlush=$true; [Console]::SetOut($rayfishOut); \
                  $rayfishErr=[System.IO.StreamWriter]::new([Console]::OpenStandardError(),$rayfishEncoding,4096,$true); \

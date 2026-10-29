@@ -41,7 +41,7 @@ jobs:
             }
             foreach ($root in ($roots | Sort-Object { $_.Value.Length } -Descending)) {
               if (-not $root.Value) { continue }
-              foreach ($value in @($root.Value, $root.Value.Replace('\', '/'))) {
+              foreach ($value in @($root.Value.Replace('\', '\\'), $root.Value, $root.Value.Replace('\', '/'))) {
                 $text = [regex]::Replace($text, [regex]::Escape($value), $root.Label, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
               }
             }
@@ -142,7 +142,7 @@ jobs:
           try {
             $catalog = @(& $executable 'ssh::' --ignored --list)
             if ($LASTEXITCODE -ne 0) { throw 'The native SSH test catalog could not be listed.' }
-            foreach ($required in @('windows_ssh_exec_and_interactive_powershell_use_the_login_account', 'windows_ssh_denies_unlisted_users_and_unapproved_peers', 'windows_ssh_channel_close_kills_the_command_and_its_descendant', 'windows_ssh_direct_and_reverse_forwarding_carry_real_tcp_bytes')) {
+            foreach ($required in @('windows_ssh_exec_and_interactive_powershell_use_the_login_account', 'windows_ssh_interactive_powershell_uses_the_login_account', 'windows_ssh_denies_unlisted_users_and_unapproved_peers', 'windows_ssh_channel_close_kills_the_command_and_its_descendant', 'windows_ssh_direct_and_reverse_forwarding_carry_real_tcp_bytes')) {
               if (-not ($catalog -match [regex]::Escape($required))) { throw 'An expected native SSH protocol test is missing.' }
             }
             $process = Start-Process -FilePath $executable -ArgumentList @('ssh::', '--ignored', '--nocapture', '--test-threads=1') -Wait -PassThru -NoNewWindow -RedirectStandardOutput $settings.stdout -RedirectStandardError $settings.stderr
