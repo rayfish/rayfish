@@ -3,6 +3,7 @@
 
 use super::super::*;
 use dashmap::mapref::entry::Entry;
+use std::future::Future;
 // The desktop-gated `start_ssh` binds SSH listeners on concrete IPs, and the
 // macOS exit-node helpers below match on underlay addresses. macOS without the
 // desktop feature (the ray-mobile host build) still needs the import.
@@ -11,7 +12,7 @@ use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::sync::PoisonError;
 use std::sync::RwLock;
-use tokio::sync::MutexGuard as AsyncMutexGuard;
+use tokio::sync::{MutexGuard as AsyncMutexGuard, Semaphore};
 #[cfg(target_os = "linux")]
 use tokio::time::MissedTickBehavior;
 
@@ -86,6 +87,52 @@ const RESTORE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Minimum spacing between two peer-triggered sweeps. See
 /// [`NetworkRegistry::run_restore_supervisor`].
 const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
+const MAX_PENDING_RESUME_ATTEMPTS: usize = 4;
+
+/// Resume only persisted join requests. A successful Pending response installs
+/// the ordinary approval retry, so this startup owner stops at that handoff.
+async fn resume_pending_join<Check, Join, Attempt>(
+    network_key: &str,
+    shutdown: &CancellationToken,
+    mut still_pending: Check,
+    mut join: Join,
+) where
+    Check: FnMut() -> Result<bool>,
+    Join: FnMut() -> Attempt,
+    Attempt: Future<Output = IpcMessage>,
+{
+    let mut backoff = BACKOFF_INITIAL;
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        match still_pending() {
+            Ok(false) => return,
+            Ok(true) => {
+                // Only the idempotent join is retried. Shutdown can abandon a
+                // handshake; its network tasks share the registry's token.
+                let response = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    response = join() => response,
+                };
+                match response {
+                    IpcMessage::Error { message } => {
+                        tracing::warn!(net = %network_key, error = %message, retry_in = ?backoff, "pending join resume failed, retrying");
+                    }
+                    _ => return,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(net = %network_key, %error, retry_in = ?backoff, "could not read pending join state, retrying");
+            }
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {},
+        }
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
 
 /// The saved-network fields a member restore works from, read off the config
 /// once when the restore is spawned. The retry loop and the warm-resume path
@@ -1116,17 +1163,46 @@ impl NetworkRegistry {
         }
 
         // Resume closed-network joins that were still awaiting approval at shutdown.
+        let pending_attempts = Arc::new(Semaphore::new(MAX_PENDING_RESUME_ATTEMPTS));
         for pending in &app_config.pending_joins {
-            if self.networks.contains_key(&pending.network_key) {
+            if self
+                .networks
+                .iter()
+                .any(|network| network.network_key.to_string() == pending.network_key)
+            {
                 continue;
             }
             let me = Arc::clone(self);
             let key = pending.network_key.clone();
             let name = pending.name.clone();
+            let attempts = Arc::clone(&pending_attempts);
             tokio::spawn(async move {
-                let _ = me
-                    .join_network(&key, name.as_deref(), None, None, None, false, false)
-                    .await;
+                resume_pending_join(
+                    &key,
+                    &me.shutdown_token,
+                    || {
+                        let saved = config::load()?;
+                        Ok(saved
+                            .pending_joins
+                            .iter()
+                            .any(|pending| pending.network_key == key)
+                            && !me
+                                .networks
+                                .iter()
+                                .any(|network| network.network_key.to_string() == key))
+                    },
+                    || async {
+                        let _permit = match attempts.acquire().await {
+                            Ok(permit) => permit,
+                            Err(error) => {
+                                return ipc_err(format!("pending join queue closed: {error}"));
+                            }
+                        };
+                        me.join_network(&key, name.as_deref(), None, None, None, false, false)
+                            .await
+                    },
+                )
+                .await;
             });
         }
 
@@ -2445,5 +2521,130 @@ mod kick_target_tests {
         let (members, _laptop, _phone) = roster();
         let stranger = id(9);
         assert!(kick_targets(&members, stranger, stranger).is_none());
+    }
+}
+
+#[cfg(test)]
+mod pending_join_resume_tests {
+    use std::sync::atomic::AtomicBool;
+
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::advance;
+
+    use super::*;
+
+    async fn attempt(replies: mpsc::Sender<oneshot::Sender<IpcMessage>>) -> IpcMessage {
+        let (reply, response) = oneshot::channel();
+        replies.send(reply).await.unwrap();
+        response.await.unwrap()
+    }
+
+    fn queued() -> IpcMessage {
+        IpcMessage::Ok {
+            message: "waiting for approval".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_resume_retries_then_hands_off_once() {
+        let cancel = CancellationToken::new();
+        let (replies, mut attempts) = mpsc::channel(1);
+        let resume = resume_pending_join(
+            "test-network",
+            &cancel,
+            || Ok(true),
+            || attempt(replies.clone()),
+        );
+        tokio::pin!(resume);
+        assert!(futures::poll!(&mut resume).is_pending());
+        attempts
+            .try_recv()
+            .unwrap()
+            .send(IpcMessage::Error {
+                message: "temporary discovery failure".into(),
+            })
+            .unwrap();
+        assert!(futures::poll!(&mut resume).is_pending());
+
+        advance(BACKOFF_INITIAL - Duration::from_nanos(1)).await;
+        assert!(futures::poll!(&mut resume).is_pending());
+        assert!(attempts.try_recv().is_err());
+        advance(Duration::from_nanos(1)).await;
+        assert!(futures::poll!(&mut resume).is_pending());
+        attempts.try_recv().unwrap().send(queued()).unwrap();
+        assert!(futures::poll!(&mut resume).is_ready());
+        assert!(attempts.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removed_pending_marker_stops_retries() {
+        let saved = AtomicBool::new(true);
+        let cancel = CancellationToken::new();
+        let (replies, mut attempts) = mpsc::channel(1);
+        let resume = resume_pending_join(
+            "test-network",
+            &cancel,
+            || Ok(saved.load(Ordering::Relaxed)),
+            || attempt(replies.clone()),
+        );
+        tokio::pin!(resume);
+        assert!(futures::poll!(&mut resume).is_pending());
+        attempts
+            .try_recv()
+            .unwrap()
+            .send(IpcMessage::Error {
+                message: "coordinator denied the join".into(),
+            })
+            .unwrap();
+        assert!(futures::poll!(&mut resume).is_pending());
+        saved.store(false, Ordering::Relaxed);
+        advance(BACKOFF_INITIAL).await;
+        assert!(futures::poll!(&mut resume).is_ready());
+        assert!(attempts.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unreadable_config_is_retried_without_a_blind_join() {
+        let readable = AtomicBool::new(false);
+        let cancel = CancellationToken::new();
+        let (replies, mut attempts) = mpsc::channel(1);
+        let resume = resume_pending_join(
+            "test-network",
+            &cancel,
+            || {
+                anyhow::ensure!(
+                    readable.load(Ordering::Relaxed),
+                    "config is temporarily unavailable"
+                );
+                Ok(true)
+            },
+            || attempt(replies.clone()),
+        );
+        tokio::pin!(resume);
+        assert!(futures::poll!(&mut resume).is_pending());
+        assert!(attempts.try_recv().is_err());
+        readable.store(true, Ordering::Relaxed);
+        advance(BACKOFF_INITIAL).await;
+        assert!(futures::poll!(&mut resume).is_pending());
+        attempts.try_recv().unwrap().send(queued()).unwrap();
+        assert!(futures::poll!(&mut resume).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_an_inflight_resume() {
+        let cancel = CancellationToken::new();
+        let (replies, mut attempts) = mpsc::channel(1);
+        let resume = resume_pending_join(
+            "test-network",
+            &cancel,
+            || Ok(true),
+            || attempt(replies.clone()),
+        );
+        tokio::pin!(resume);
+        assert!(futures::poll!(&mut resume).is_pending());
+        let reply = attempts.try_recv().unwrap();
+        cancel.cancel();
+        assert!(futures::poll!(&mut resume).is_ready());
+        assert!(reply.is_closed());
     }
 }

@@ -256,6 +256,23 @@ fn adopt_blob(state: &mut NetworkState, data: crate::membership::GroupBlob, sign
     state.converged_hash = Some(signed);
 }
 
+/// Retain the timestamp of a verified renewal only while its hash still names
+/// the live roster. Different hashes advance the floor after successful apply.
+pub(crate) fn observe_current_record(
+    state: &SharedNetworkState,
+    hash: blake3::Hash,
+    record_ts: u64,
+) -> bool {
+    let mut live = state.write().unwrap();
+    if live.needs_reconverge(hash) {
+        return false;
+    }
+    if record_is_newer(record_ts, live.last_record_timestamp) {
+        live.last_record_timestamp = Some(record_ts);
+    }
+    true
+}
+
 /// Our own primary nullified this device's `cert` in a verified blob: tear
 /// ourselves out on a separate task, so teardown does not wait on the caller,
 /// unless the device has paired again by the time that task runs.
@@ -315,7 +332,7 @@ pub(crate) async fn reconverge_and_apply(
         tracing::debug!(network = %network_name, "reconverge: keeping a durably authored snapshot until its publication is confirmed");
         return;
     }
-    if !state.read().unwrap().needs_reconverge(signed) {
+    if observe_current_record(state, signed, record_ts) {
         // A prior apply may have reached live state while its config write failed.
         // Retry the durable pointer even though no blob reconvergence is needed;
         // the stored verified bytes make this safe and stale pointers stay
@@ -396,6 +413,9 @@ pub(crate) async fn reconverge_and_apply(
     let roster = {
         let mut s = state.write().unwrap();
         if s.destroyed {
+            return;
+        }
+        if !record_is_newer(record_ts, s.last_record_timestamp) {
             return;
         }
         if current_group_hash(&s) != generation {
@@ -734,6 +754,7 @@ pub(crate) fn spawn_group_poller(
                     continue;
                 }
             };
+            let record_ts = packet.timestamp().as_micros();
 
             if pending_authored_group_hash(&state, &network_name)
                 .is_some_and(|pending| pending != remote_hash)
@@ -742,19 +763,11 @@ pub(crate) fn spawn_group_poller(
                 continue;
             }
 
-            // Through the same method as the trigger-driven path, so the two
-            // cannot answer "have we converged on this record" differently. They
-            // did: this one open-coded the comparison against the snapshot hash,
-            // our own re-encoding, and was missed when the other moved off it.
-            // This is the hotter of the two and has no timestamp floor to damp it,
-            // so a member whose bytes differ from the publisher's refetched the
-            // whole roster, re-materialized the suggested firewall and nudged the
-            // exit reconcile once a minute, forever.
-            let (needs_reconverge, current_hash) = {
-                let s = state.read().unwrap();
-                (s.needs_reconverge(remote_hash), s.converged_hash)
-            };
-            if !needs_reconverge {
+            // Compare the exact signed generation, since local re-encoding can
+            // differ from the publisher's complete roster. Renewals advance the
+            // replay floor without fetching the same blob again.
+            let current_hash = state.read().unwrap().converged_hash;
+            if observe_current_record(&state, remote_hash, record_ts) {
                 persist_group_hash_if_needed(&state, &blob_store, &network_name, remote_hash, true)
                     .await;
                 continue;
@@ -773,6 +786,7 @@ pub(crate) fn spawn_group_poller(
                     &network_name,
                     remote_hash,
                     &seed_peers,
+                    record_ts,
                 )
                 .await,
                 ReconvergeOutcome::Departed
@@ -816,7 +830,12 @@ pub(crate) async fn fetch_and_apply_blob(
     network_name: &str,
     remote_hash: blake3::Hash,
     seed_peers: &[EndpointId],
+    record_ts: u64,
 ) -> ReconvergeOutcome {
+    if !record_is_newer(record_ts, state.read().unwrap().last_record_timestamp) {
+        tracing::debug!(network = %network_name, "reconverge: ignoring an older signed record");
+        return ReconvergeOutcome::Superseded;
+    }
     if !confirm_pending_snapshot_durability(state, blob_store, network_name).await {
         tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
         return ReconvergeOutcome::Superseded;
@@ -884,6 +903,9 @@ pub(crate) async fn fetch_and_apply_blob(
         if s.destroyed {
             return ReconvergeOutcome::Departed;
         }
+        if !record_is_newer(record_ts, s.last_record_timestamp) {
+            return ReconvergeOutcome::Superseded;
+        }
         if current_group_hash(&s) != generation {
             tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
             return ReconvergeOutcome::Superseded;
@@ -909,6 +931,7 @@ pub(crate) async fn fetch_and_apply_blob(
         // The hash the network agreed on, not our re-encoding of it. See
         // `converged_hash`.
         adopt_blob(&mut s, data, remote_hash);
+        s.last_record_timestamp = Some(record_ts);
     }
 
     // Revoke the removed peer's network route immediately. If this was the last
@@ -947,8 +970,114 @@ pub(crate) use crate::membership::now_secs;
 mod reconverge_tests {
     use super::*;
     use iroh::{Endpoint, SecretKey};
+    use std::ffi::OsString;
 
     const TEST_ALPN: &[u8] = b"rayfish/revoke-test";
+
+    struct ConfigEnv(Option<OsString>);
+
+    impl Drop for ConfigEnv {
+        fn drop(&mut self) {
+            // SAFETY: the test holds CONFIG_ENV_LOCK until this guard drops.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                    None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes the process-wide config override
+    async fn older_signed_roster_preserves_membership_and_saved_network() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv(std::env::var_os("RAYFISH_CONFIG_DIR"));
+        // SAFETY: CONFIG_ENV_LOCK serializes every test using this override.
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", directory.path()) };
+        let daemon = build_headless(false).await.unwrap();
+        let key = SecretKey::generate();
+        let coordinator = SecretKey::generate().public();
+        let me = daemon.transport.endpoint.id();
+        let state = state_with_members(vec![member(me, false), member(coordinator, true)]);
+        state.write().unwrap().last_record_timestamp = Some(20);
+        config::save_network(&config::NetworkConfig {
+            network_public_key: Some(key.public()),
+            ..config::empty_network_config("test-network")
+        })
+        .unwrap();
+
+        let provider = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        daemon
+            .transport
+            .warm_lookup
+            .add_endpoint_info(provider.addr());
+        let provider_id = provider.id();
+        let router = iroh::protocol::Router::builder(provider)
+            .accept(
+                iroh_blobs::protocol::ALPN,
+                BlobsProtocol::new(&daemon.transport.blob_store, None),
+            )
+            .spawn();
+        let old_state = state_with_members(vec![member(coordinator, true)]);
+        old_state.write().unwrap().refresh_snapshot();
+        let bytes = old_state
+            .read()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .msgpack_bytes
+            .clone();
+        daemon
+            .transport
+            .blob_store
+            .blobs()
+            .add_slice(&bytes)
+            .await
+            .unwrap();
+        let packet =
+            dht::encode_network_record(&key, &blake3::hash(&bytes), &[provider_id]).unwrap();
+        let (hash, seeds) = dht::decode_network_record(&packet).unwrap();
+        let apply = |record_ts| {
+            fetch_and_apply_blob(
+                &daemon.transport.endpoint,
+                &daemon.transport.blob_store,
+                &daemon.registry.peers,
+                &daemon.registry.firewall,
+                &daemon.registry,
+                &state,
+                "test-network",
+                hash,
+                &seeds,
+                record_ts,
+            )
+        };
+
+        assert_eq!(apply(19).await, ReconvergeOutcome::Superseded);
+        assert!(state.read().unwrap().members.is_member(&me));
+        assert!(config::load_network("test-network").unwrap().is_some());
+        assert_eq!(state.read().unwrap().last_record_timestamp, Some(20));
+
+        // A genuinely newer removal must still forget the saved network.
+        assert_eq!(apply(21).await, ReconvergeOutcome::Departed);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while config::load_network("test-network").unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the confirmed kick deletes the saved network");
+        router.shutdown().await.unwrap();
+        daemon.shutdown_and_close().await;
+    }
 
     fn member(identity: EndpointId, is_coordinator: bool) -> Member {
         Member {

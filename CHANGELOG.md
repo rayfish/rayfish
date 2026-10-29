@@ -35,6 +35,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Saved networks survive older signed roster updates, and fresh joins retain
+  their signed admission across reconnects. Pending joins retry after restart
+  and appear in CLI status while awaiting approval.
 - Windows: pending network joins show that coordinator approval is required instead
   of claiming the PC is connected before admission.
 - Windows: Quit closes a hidden app window after the service finishes disconnecting.
