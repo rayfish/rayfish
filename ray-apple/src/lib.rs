@@ -15,7 +15,9 @@ use rayfish::config::settings::GlobalKey;
 use rayfish::config::{DnsMode, QuicEngine};
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
-use rayfish::daemon::{DaemonState, Done, FileQueues, OpError, OpResult, build_headless};
+use rayfish::daemon::{
+    DaemonState, Done, FileQueues, FirewallView, OpError, OpResult, build_headless,
+};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
 use rayfish::ipc::{
@@ -305,19 +307,15 @@ impl Node {
 
     fn edit_blocked(&self, peer: &str, remove: bool) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove)),
-            "block list",
-        )
+        self.runtime
+            .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove))?;
+        Ok(())
     }
 
     fn set_global(&self, key: GlobalKey, value: &str) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.config_set(key, value)),
-            "setting",
-        )
+        self.runtime.block_on(state.config_set(key, value))?;
+        Ok(())
     }
 }
 
@@ -578,10 +576,8 @@ impl Node {
         let state = self.state()?;
         if matches!(key, GlobalSetting::Ssh) {
             return self.runtime.block_on(async {
-                expect_ok(
-                    state.ssh_config_set(if enabled { "on" } else { "off" }),
-                    "SSH setting",
-                )
+                state.ssh_config_set(if enabled { "on" } else { "off" })?;
+                Ok(())
             });
         }
         if matches!(key, GlobalSetting::Mdns) {
@@ -625,11 +621,9 @@ impl Node {
             })
             .map_err(AppleError::network)?;
         }
-        expect_ok(
-            self.runtime
-                .block_on(state.set_file_auto_accept(&peer, allow)),
-            "file auto-accept",
-        )
+        self.runtime
+            .block_on(state.set_file_auto_accept(&peer, allow))?;
+        Ok(())
     }
 
     pub fn set_ssh_rule(
@@ -639,26 +633,21 @@ impl Node {
         users: Vec<String>,
         allow: bool,
     ) -> Result<(), AppleError> {
-        expect_ok(
-            self.runtime.block_on(
-                self.state()?
-                    .firewall_ssh_allow(&network, &peer, users, allow),
-            ),
-            "SSH access",
-        )
+        self.runtime.block_on(
+            self.state()?
+                .firewall_ssh_allow(&network, &peer, users, allow),
+        )?;
+        Ok(())
     }
 
     pub fn firewall_show(&self) -> Result<FirewallState, AppleError> {
-        let IpcMessage::FirewallState {
+        let FirewallView {
             default_inbound,
             default_outbound,
             disabled,
             rules,
             ..
-        } = self.state()?.firewall_show()
-        else {
-            return Err(AppleError::Network("invalid firewall response".to_owned()));
-        };
+        } = self.state()?.firewall_show();
         Ok(FirewallState {
             default_inbound: default_inbound.to_string(),
             default_outbound: default_outbound.to_string(),
@@ -690,29 +679,26 @@ impl Node {
         let action: Action = action.parse().map_err(AppleError::network)?;
         let protocol: Protocol = protocol.parse().map_err(AppleError::network)?;
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.firewall_add(
-                direction,
-                action,
-                protocol,
-                port.as_deref(),
-                peer.as_deref(),
-                network.as_deref(),
-            )),
-            "firewall rule",
-        )
+        self.runtime.block_on(state.firewall_add(
+            direction,
+            action,
+            protocol,
+            port.as_deref(),
+            peer.as_deref(),
+            network.as_deref(),
+        ))?;
+        Ok(())
     }
 
     pub fn firewall_remove(&self, index: u32) -> Result<(), AppleError> {
-        expect_ok(
-            self.state()?.firewall_remove(index as usize),
-            "firewall rule",
-        )
+        self.state()?.firewall_remove(index as usize)?;
+        Ok(())
     }
 
     pub fn firewall_set_default_inbound(&self, action: String) -> Result<(), AppleError> {
         let action: Action = action.parse().map_err(AppleError::network)?;
-        expect_ok(self.state()?.firewall_default(action), "firewall default")
+        self.state()?.firewall_default(action)?;
+        Ok(())
     }
 
     pub fn connect_peer(
@@ -1024,16 +1010,6 @@ fn invitations(listed: OpResult<Vec<InvitationInfo>>) -> Vec<Invitation> {
     }
 }
 
-fn expect_ok(response: IpcMessage, operation: &str) -> Result<(), AppleError> {
-    match response {
-        IpcMessage::Ok { .. } => Ok(()),
-        IpcMessage::Error { message } => Err(AppleError::Network(message)),
-        _ => Err(AppleError::Network(format!(
-            "node returned an invalid {operation} response"
-        ))),
-    }
-}
-
 /// The `ray config` value a toggle writes for `key`.
 fn toggle_value(key: GlobalSetting, enabled: bool) -> &'static str {
     match (key, enabled) {
@@ -1066,23 +1042,10 @@ mod tests {
     }
 
     #[test]
-    fn command_results_preserve_daemon_errors_and_reject_other_responses() {
-        assert!(
-            expect_ok(
-                IpcMessage::Ok {
-                    message: "done".into()
-                },
-                "leave"
-            )
-            .is_ok()
-        );
+    fn command_errors_keep_the_daemon_message() {
         assert!(matches!(
-            expect_ok(IpcMessage::Error { message: "denied".into() }, "leave"),
-            Err(AppleError::Network(message)) if message == "denied"
-        ));
-        assert!(matches!(
-            expect_ok(IpcMessage::Status, "leave"),
-            Err(AppleError::Network(message)) if message == "node returned an invalid leave response"
+            AppleError::from(OpError::msg("denied")),
+            AppleError::Network(message) if message == "denied"
         ));
     }
 

@@ -1,6 +1,7 @@
 //! Firewall IPC handlers for [`Daemon`]: per-device firewall rules and
 //! coordinator-suggested rules. Split out of `daemon/mod.rs`.
 
+use super::super::ipc_dispatch::save_global;
 use super::super::*;
 
 /// Persist firewall config to disk, logging (not failing) on a write error. The
@@ -25,7 +26,7 @@ impl NetworkRegistry {
         port: Option<&str>,
         peer: Option<&str>,
         network: Option<&str>,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         // A port spec may be a comma-separated list (e.g. `80,443` or
         // `22,8000-9000`): each item is its own range and becomes its own rule,
         // since a FirewallRule carries a single contiguous PortRange. `None` (no
@@ -34,7 +35,7 @@ impl NetworkRegistry {
             Some(s) => match firewall::parse_port_list(s) {
                 Ok(ranges) => ranges.into_iter().map(Some).collect(),
                 Err(e) => {
-                    return ipc_err(e.to_string());
+                    return op_err(e.to_string());
                 }
             },
             None => vec![None],
@@ -57,7 +58,7 @@ impl NetworkRegistry {
                     firewall::PeerFilter::Identity(id)
                 }
                 None => {
-                    return ipc_err(format!(
+                    return op_err(format!(
                         "unknown peer '{s}' (try a hostname, mesh IP, short id, or identity)"
                     ));
                 }
@@ -106,10 +107,10 @@ impl NetworkRegistry {
             }
             None => format!("{count} {plural} added"),
         };
-        IpcMessage::Ok { message }
+        Ok(Done(message))
     }
 
-    pub fn firewall_remove(&self, index: usize) -> IpcMessage {
+    pub fn firewall_remove(&self, index: usize) -> OpResult<Done> {
         // The bound is checked inside the edit: checked first, a concurrent
         // removal could shrink the list before this one ran.
         let removed = self.firewall.try_edit(
@@ -123,18 +124,14 @@ impl NetworkRegistry {
             },
             save_firewall_warn,
         );
-        match removed {
-            Ok(()) => IpcMessage::Ok {
-                message: "rule removed".to_string(),
-            },
-            Err(message) => ipc_err(message),
-        }
+        removed.map_err(OpError::msg)?;
+        Ok(Done("rule removed".to_string()))
     }
 
-    pub fn firewall_show(&self) -> IpcMessage {
+    pub fn firewall_show(&self) -> FirewallView {
         let config = self.firewall.get_config();
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
-        IpcMessage::FirewallState {
+        FirewallView {
             default_inbound: config.default_inbound,
             default_outbound: config.default_outbound,
             reject: config.reject,
@@ -450,7 +447,7 @@ impl NetworkRegistry {
     /// outbound default stays `Allow`, you always initiate freely). `allow`
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
-    pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
+    pub fn firewall_default(&self, action: firewall::Action) -> OpResult<Done> {
         self.firewall_config_set(FirewallKey::DefaultIn, &action.to_string())
     }
 
@@ -470,7 +467,7 @@ impl NetworkRegistry {
     /// restart. A rejected value never reaches the swap. Parsing and validation belong to
     /// the registry (`settings::apply_firewall`); this method owns the live swap,
     /// the persist, and the per-key confirmation message.
-    pub(crate) fn firewall_config_set(&self, key: FirewallKey, value: &str) -> IpcMessage {
+    pub(crate) fn firewall_config_set(&self, key: FirewallKey, value: &str) -> OpResult<Done> {
         let applied: Result<String> = self.firewall.try_edit(
             |config| {
                 settings::apply_firewall(config, key, value)?;
@@ -478,10 +475,7 @@ impl NetworkRegistry {
             },
             save_firewall_warn,
         );
-        match applied {
-            Ok(message) => IpcMessage::Ok { message },
-            Err(e) => ipc_err(e.to_string()),
-        }
+        applied.map(Done).map_err(|e| OpError::msg(e.to_string()))
     }
 
     /// Render one firewall settings key from the live config.
@@ -523,21 +517,21 @@ impl Daemon {
         port: Option<&str>,
         peer: Option<&str>,
         network: Option<&str>,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         self.registry
             .firewall_add(direction, action, protocol, port, peer, network)
             .await
     }
 
-    pub fn firewall_remove(&self, index: usize) -> IpcMessage {
+    pub fn firewall_remove(&self, index: usize) -> OpResult<Done> {
         self.registry.firewall_remove(index)
     }
 
-    pub fn firewall_show(&self) -> IpcMessage {
+    pub fn firewall_show(&self) -> FirewallView {
         self.registry.firewall_show()
     }
 
-    pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
+    pub fn firewall_default(&self, action: firewall::Action) -> OpResult<Done> {
         self.registry.firewall_default(action)
     }
 
@@ -548,7 +542,7 @@ impl Daemon {
     /// is active. The key is served here, not by the generic `config_apply` path,
     /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
     /// on its own leaves the node advertising SSH with nothing listening.
-    pub fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+    pub fn ssh_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
         // There is no Windows SSH server to start, so turning it on would write
         // `ssh_enabled = true` and open its port for a listener that never
         // arrives. Rejected before anything is persisted, so the config and the
@@ -557,27 +551,13 @@ impl Daemon {
         // platform can be turned back off here.
         #[cfg(windows)]
         if settings::parse_bool(value, false).unwrap_or(false) {
-            return ipc_err(
+            return op_err(
                 "the embedded SSH server is not available on Windows; nothing was changed",
             );
         }
         // The registry parses and writes the field; everything below is the side
         // effects it deliberately does not do.
-        let mut parse_err = None;
-        let saved = config::update_settings(|cfg| {
-            if let Err(e) = settings::apply_global(cfg, GlobalKey::Ssh, value, false) {
-                parse_err = Some(e.to_string());
-                anyhow::bail!("rejected");
-            }
-            Ok(())
-        });
-        if let Some(e) = parse_err {
-            return ipc_err(e);
-        }
-        let app_config = match saved {
-            Ok(cfg) => cfg,
-            Err(e) => return ipc_err(format!("failed to persist ssh setting: {e}")),
-        };
+        let app_config = save_global(GlobalKey::Ssh, value, false)?;
         let enabled = app_config.ssh_enabled;
         // Open/close the configured port at the packet layer.
         self.registry.firewall.set_ssh_passthrough(
@@ -642,27 +622,13 @@ impl Daemon {
             message.push_str("\n\n");
             message.push_str(&warning);
         }
-        IpcMessage::Ok { message }
+        Ok(Done(message))
     }
 
     /// Change the port peers dial for mesh SSH without restarting its internal
     /// listener. The packet rewrite and managed firewall rule change together.
-    pub fn ssh_port_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mut parse_err = None;
-        let saved = config::update_settings(|cfg| {
-            if let Err(e) = settings::apply_global(cfg, GlobalKey::SshPort, value, false) {
-                parse_err = Some(e.to_string());
-                anyhow::bail!("rejected");
-            }
-            Ok(())
-        });
-        if let Some(e) = parse_err {
-            return ipc_err(e);
-        }
-        let app_config = match saved {
-            Ok(cfg) => cfg,
-            Err(e) => return ipc_err(format!("failed to persist ssh-port setting: {e}")),
-        };
+    pub fn ssh_port_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
+        let app_config = save_global(GlobalKey::SshPort, value, false)?;
         self.registry.firewall.set_ssh_passthrough(
             app_config.ssh_enabled,
             app_config.ssh_port,
@@ -682,12 +648,10 @@ impl Daemon {
             self.stop_v4_bridge();
             self.start_v4_bridge();
         }
-        IpcMessage::Ok {
-            message: format!(
-                "mesh SSH port set to {}. Connect with `ssh -p {} <user>@<host>.ray`.",
-                app_config.ssh_port, app_config.ssh_port
-            ),
-        }
+        Ok(Done(format!(
+            "mesh SSH port set to {}. Connect with `ssh -p {} <user>@<host>.ray`.",
+            app_config.ssh_port, app_config.ssh_port
+        )))
     }
 
     /// Write the `pf-passthrough` setting and make the live pf anchor follow it.
@@ -696,49 +660,33 @@ impl Daemon {
     /// stake: a write that waited for the next restart would leave the mesh dead
     /// for the rest of the session on a host whose other VPN is already
     /// default-denying.
-    pub(crate) fn pf_passthrough_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mut parse_err = None;
-        let saved = config::update_settings(|cfg| {
-            if let Err(e) = settings::apply_global(cfg, GlobalKey::PfPassthrough, value, false) {
-                parse_err = Some(e.to_string());
-                anyhow::bail!("rejected");
-            }
-            Ok(())
-        });
-        if let Some(e) = parse_err {
-            return ipc_err(e);
-        }
-        let enabled = match saved {
-            Ok(cfg) => cfg.pf_passthrough,
-            Err(e) => return ipc_err(format!("failed to persist pf-passthrough setting: {e}")),
-        };
+    pub(crate) fn pf_passthrough_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
+        let enabled = save_global(GlobalKey::PfPassthrough, value, false)?.pf_passthrough;
         // Reflect immediately if the data plane is up (else activate() loads it).
         #[cfg(all(target_os = "macos", feature = "desktop"))]
         if self.active.load(Ordering::SeqCst) {
             if enabled {
                 let tun = self.tun_name.load().as_str().to_owned();
                 if let Err(e) = crate::hostfw::install_tun_passthrough(&tun) {
-                    return ipc_err(format!("failed to load the pf passthrough anchor: {e:#}"));
+                    return op_err(format!("failed to load the pf passthrough anchor: {e:#}"));
                 }
             } else {
                 crate::hostfw::remove_tun_passthrough();
             }
         }
-        IpcMessage::Ok {
-            message: format!(
-                "pf passthrough {}. {}",
-                if enabled { "on" } else { "off" },
-                if enabled {
-                    "Mesh traffic is passed ahead of any other VPN's pf ruleset, so the \
+        Ok(Done(format!(
+            "pf passthrough {}. {}",
+            if enabled { "on" } else { "off" },
+            if enabled {
+                "Mesh traffic is passed ahead of any other VPN's pf ruleset, so the \
                      mesh keeps working while that VPN is connected. Nothing leaves this \
                      host in the clear: the rule matches the mesh interface only, and what \
                      the daemon sends on is still routed by the table that VPN owns."
-                } else {
-                    "Another VPN whose ruleset ends in a catch-all block will drop mesh \
+            } else {
+                "Another VPN whose ruleset ends in a catch-all block will drop mesh \
                      traffic on this host while it is connected."
-                }
-            ),
-        }
+            }
+        )))
     }
 
     /// Write the `v4-bridge` setting and make the running bridge follow it.
@@ -746,22 +694,8 @@ impl Daemon {
     /// A plain config write would leave the listeners up until the next restart,
     /// which is the `ssh` bug in a second place, so this key gets its own setter
     /// for the same reason that one does.
-    pub(crate) fn v4_bridge_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mut parse_err = None;
-        let saved = config::update_settings(|cfg| {
-            if let Err(e) = settings::apply_global(cfg, GlobalKey::V4Bridge, value, false) {
-                parse_err = Some(e.to_string());
-                anyhow::bail!("rejected");
-            }
-            Ok(())
-        });
-        if let Some(e) = parse_err {
-            return ipc_err(e);
-        }
-        let enabled = match saved {
-            Ok(cfg) => cfg.v4_bridge,
-            Err(e) => return ipc_err(format!("failed to persist v4-bridge setting: {e}")),
-        };
+    pub(crate) fn v4_bridge_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
+        let enabled = save_global(GlobalKey::V4Bridge, value, false)?.v4_bridge;
         // Reflect immediately if the data plane is up (else activate() starts it).
         #[cfg(feature = "desktop")]
         if self.active.load(Ordering::SeqCst) {
@@ -771,20 +705,18 @@ impl Daemon {
                 self.stop_v4_bridge();
             }
         }
-        IpcMessage::Ok {
-            message: format!(
-                "IPv4 listener bridge {}. {}",
-                if enabled { "on" } else { "off" },
-                if enabled {
-                    "A service listening on 0.0.0.0 now answers at this node's mesh \
+        Ok(Done(format!(
+            "IPv4 listener bridge {}. {}",
+            if enabled { "on" } else { "off" },
+            if enabled {
+                "A service listening on 0.0.0.0 now answers at this node's mesh \
                      address, for the peers the firewall allows. Services bound to \
                      127.0.0.1 are not bridged."
-                } else {
-                    "Services that listen on IPv4 only are no longer reachable over \
+            } else {
+                "Services that listen on IPv4 only are no longer reachable over \
                      the mesh."
-                }
-            ),
-        }
+            }
+        )))
     }
 
     /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
@@ -798,11 +730,11 @@ impl Daemon {
         peer: &str,
         users: Vec<String>,
         allow: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let app_config = match config::load() {
             Ok(c) => c,
             Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
+                return op_err(format!("failed to load config: {e}"));
             }
         };
         let ssh_enabled = app_config.ssh_enabled;
@@ -824,7 +756,7 @@ impl Daemon {
             match self.registry.resolve_peer_in_network(network, peer) {
                 Some(id) => self.registry.device_user_map.resolve(&id).to_string(),
                 None => {
-                    return ipc_err(format!("could not resolve peer: {peer}"));
+                    return op_err(format!("could not resolve peer: {peer}"));
                 }
             }
         };
@@ -846,8 +778,8 @@ impl Daemon {
             Ok(())
         }) {
             Ok(Some(net)) => net,
-            Ok(None) => return ipc_err(format!("no such network: {network}")),
-            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
+            Ok(None) => return op_err(format!("no such network: {network}")),
+            Err(e) => return op_err(format!("failed to persist network config: {e}")),
         };
         // Push the change to any live listener.
         #[cfg(feature = "desktop")]
@@ -872,7 +804,7 @@ impl Daemon {
                  Start the server with `ray firewall ssh on`.",
             );
         }
-        IpcMessage::Ok { message: detail }
+        Ok(Done(detail))
     }
 
     /// Report the SSH server state + per-network allow lists.
@@ -1080,7 +1012,7 @@ mod edit_race_tests {
                     let (registry, start) = (&registry, &start);
                     scope.spawn(move || {
                         start.wait();
-                        matches!(registry.firewall_remove(0), IpcMessage::Ok { .. })
+                        registry.firewall_remove(0).is_ok()
                     })
                 })
                 .collect();

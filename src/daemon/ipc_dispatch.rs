@@ -203,9 +203,9 @@ impl Daemon {
     }
 
     /// Persist an exact peer's file auto-accept permission and apply it now.
-    pub async fn set_file_auto_accept(self: &Arc<Self>, peer: &str, allow: bool) -> IpcMessage {
+    pub async fn set_file_auto_accept(self: &Arc<Self>, peer: &str, allow: bool) -> OpResult<Done> {
         if peer.trim().is_empty() || peer.contains(',') || peer.starts_with('-') {
-            return ipc_err("a single peer name or identity is required");
+            return op_err("a single peer name or identity is required");
         }
         self.config_apply(
             NodeKey::Global(GlobalKey::FileAutoAcceptPeers),
@@ -218,7 +218,7 @@ impl Daemon {
 
     /// `ray config set <key> <value>` for an embedder, with the same live
     /// effects as the CLI.
-    pub async fn config_set(self: &Arc<Self>, key: GlobalKey, value: &str) -> IpcMessage {
+    pub async fn config_set(self: &Arc<Self>, key: GlobalKey, value: &str) -> OpResult<Done> {
         self.config_apply(NodeKey::Global(key), value, false, false)
             .await
     }
@@ -230,13 +230,13 @@ impl Daemon {
         key: GlobalKey,
         peer: &str,
         remove: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         if !key.is_peer_list() {
-            return ipc_err(format!("{} is not a peer list", key.name()));
+            return op_err(format!("{} is not a peer list", key.name()));
         }
         match settings::peer_list_edit(peer, remove) {
             Ok(value) => self.config_set(key, &value).await,
-            Err(e) => ipc_err(e.to_string()),
+            Err(e) => op_err(e.to_string()),
         }
     }
 
@@ -259,7 +259,7 @@ impl Daemon {
         value: &str,
         replace: bool,
         reset: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let resolved_value;
         let value =
             if matches!(key, NodeKey::Global(k) if k.is_peer_list()) && !value.trim().is_empty() {
@@ -273,7 +273,7 @@ impl Daemon {
                         Ok(peer) => peer,
                         Err(_) => match self.registry.resolve_peer_flexible(name).await {
                             Some(peer) => peer,
-                            None => return ipc_err(format!("unknown peer '{name}'")),
+                            None => return op_err(format!("unknown peer '{name}'")),
                         },
                     };
                     identities.push(format!("{}{peer}", if remove { "-" } else { "" }));
@@ -316,31 +316,24 @@ impl Daemon {
                 | GlobalKey::Blocked),
             ) => k,
         };
-        let app_config = match save_global(key, value, replace) {
-            Ok(cfg) => cfg,
-            Err(response) => return response,
-        };
+        let app_config = save_global(key, value, replace)?;
         if key == GlobalKey::FileAutoAcceptPeers {
             self.files.drain_auto_acceptable().await;
         }
         if key == GlobalKey::Blocked {
             self.connect.drop_blocked(&app_config.blocked).await;
         }
-        IpcMessage::Ok {
-            message: global_set_message(&app_config, key, reset),
-        }
+        Ok(Done(global_set_message(&app_config, key, reset)))
     }
 
-    async fn mdns_config_set(&self, value: &str) -> IpcMessage {
+    async fn mdns_config_set(&self, value: &str) -> OpResult<Done> {
         let mut requested = AppConfig::default();
         if let Err(error) = settings::apply_global(&mut requested, GlobalKey::Mdns, value, false) {
-            return ipc_err(error.to_string());
+            return op_err(error.to_string());
         }
         match self.set_mdns_enabled(requested.mdns_enabled).await {
-            Ok(()) => IpcMessage::Ok {
-                message: global_set_message(&requested, GlobalKey::Mdns, false),
-            },
-            Err(error) => ipc_err(error.to_string()),
+            Ok(()) => Ok(Done(global_set_message(&requested, GlobalKey::Mdns, false))),
+            Err(error) => op_err(error.to_string()),
         }
     }
 
@@ -351,18 +344,15 @@ impl Daemon {
 
     /// Apply `ray dns on|off` immediately. Unlike the other settings, DNS owns
     /// host state that must be restored before the command reports success.
-    async fn dns_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mode = match save_global(GlobalKey::Dns, value, false) {
-            Ok(cfg) => cfg.dns_mode,
-            Err(response) => return response,
-        };
+    async fn dns_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
+        let mode = save_global(GlobalKey::Dns, value, false)?.dns_mode;
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.resolver.set_short_names(mode.short_names());
         if !mode.enabled() {
             self.dns.revert(&tun_name).await;
-            return IpcMessage::Ok {
-                message: "DNS disabled and Rayfish's system DNS configuration removed.".to_string(),
-            };
+            return Ok(Done(
+                "DNS disabled and Rayfish's system DNS configuration removed.".to_string(),
+            ));
         }
         self.registry.refresh_search_domains().await;
         let state = if mode == config::DnsMode::Partial {
@@ -371,9 +361,9 @@ impl Daemon {
             "DNS enabled."
         };
         if !self.active.load(Ordering::SeqCst) {
-            return IpcMessage::Ok {
-                message: format!("{state} It will be configured when Rayfish is up."),
-            };
+            return Ok(Done(format!(
+                "{state} It will be configured when Rayfish is up."
+            )));
         }
         let mut warnings = Vec::new();
         self.dns.configure(&tun_name, &mut warnings).await;
@@ -382,7 +372,7 @@ impl Daemon {
             message.push(' ');
             message.push_str(&warnings.join(" "));
         }
-        IpcMessage::Ok { message }
+        Ok(Done(message))
     }
 
     /// Read node config rows for `ray config get` from the daemon's own config.
@@ -417,7 +407,7 @@ impl Daemon {
         network: &str,
         key: NetworkKey,
         value: &str,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let mut validation_error = None;
         let updated = config::update_network(network, |net| {
             settings::apply_network(net, key, value).inspect_err(|e| {
@@ -426,11 +416,11 @@ impl Daemon {
         });
         let net = match updated {
             Ok(Some(net)) => net,
-            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Ok(None) => return op_err(format!("network '{network}' not found")),
             Err(_) if validation_error.is_some() => {
-                return ipc_err(validation_error.unwrap());
+                return op_err(validation_error.unwrap());
             }
-            Err(e) => return ipc_err(format!("failed to save config: {e}")),
+            Err(e) => return op_err(format!("failed to save config: {e}")),
         };
         // Run the live re-materialization the key implies, then confirm.
         match key {
@@ -442,9 +432,7 @@ impl Daemon {
             // beyond the write.
             NetworkKey::AutoAcceptFiles | NetworkKey::EphemeralTtl => {}
         }
-        IpcMessage::Ok {
-            message: net_set_message(&net, network, key),
-        }
+        Ok(Done(net_set_message(&net, network, key)))
     }
 
     /// Read one or every per-network setting.
@@ -571,7 +559,7 @@ impl Daemon {
                 port,
                 peer,
                 network,
-            } => {
+            } => reply(
                 self.registry
                     .firewall_add(
                         direction,
@@ -581,10 +569,10 @@ impl Daemon {
                         peer.as_deref(),
                         network.as_deref(),
                     )
-                    .await
-            }
-            IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
-            IpcMessage::FirewallShow => self.registry.firewall_show(),
+                    .await,
+            ),
+            IpcMessage::FirewallRemove { index } => reply(self.registry.firewall_remove(index)),
+            IpcMessage::FirewallShow => self.registry.firewall_show().into(),
             IpcMessage::FirewallTest {
                 peer,
                 direction,
@@ -618,7 +606,7 @@ impl Daemon {
                 peer,
                 users,
                 allow,
-            } => self.firewall_ssh_allow(&network, &peer, users, allow).await,
+            } => reply(self.firewall_ssh_allow(&network, &peer, users, allow).await),
             IpcMessage::FirewallSshShow => self.firewall_ssh_show(),
             IpcMessage::ExitNodeAllow {
                 network,
@@ -773,14 +761,14 @@ impl Daemon {
                 key,
                 value,
                 replace,
-            } => self.config_apply(key, &value, replace, false).await,
-            IpcMessage::ConfigUnset { key } => self.config_apply(key, "", false, true).await,
+            } => reply(self.config_apply(key, &value, replace, false).await),
+            IpcMessage::ConfigUnset { key } => reply(self.config_apply(key, "", false, true).await),
             IpcMessage::ConfigGet { key } => self.config_get(key),
             IpcMessage::NetConfigSet {
                 network,
                 key,
                 value,
-            } => self.net_config_apply(&network, key, &value).await,
+            } => reply(self.net_config_apply(&network, key, &value).await),
             IpcMessage::NetConfigGet { network, key } => self.net_config_get(&network, key),
             IpcMessage::InviteCreate {
                 network,
@@ -844,15 +832,10 @@ impl Daemon {
     }
 }
 
-/// Validate and persist one plain global key. A rejected value is reported
-/// as-is, ahead of any save failure, so the user sees why the value was wrong
-/// rather than a generic write error.
-#[allow(clippy::result_large_err)]
-fn save_global(
-    key: GlobalKey,
-    value: &str,
-    replace: bool,
-) -> std::result::Result<AppConfig, IpcMessage> {
+/// Validate and persist one global key. A rejected value is reported as-is,
+/// ahead of any save failure, so the user sees why the value was wrong rather
+/// than a generic write error.
+pub(super) fn save_global(key: GlobalKey, value: &str, replace: bool) -> OpResult<AppConfig> {
     let mut set_err = None;
     let saved = config::update_settings(|cfg| {
         if let Err(e) = config::config_set(cfg, key, value, replace) {
@@ -862,9 +845,9 @@ fn save_global(
         Ok(())
     });
     if let Some(e) = set_err {
-        return Err(ipc_err(e));
+        return op_err(e);
     }
-    saved.map_err(|e| ipc_err(format!("failed to save config: {e}")))
+    saved.map_err(|e| OpError::msg(format!("failed to save config: {e}")))
 }
 
 /// Host listeners, exit routing and service updates belong to the system instance.

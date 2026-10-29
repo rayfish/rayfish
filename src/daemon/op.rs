@@ -184,3 +184,25 @@ impl From<FileQueues> for IpcMessage {
         }
     }
 }
+
+/// The firewall's posture and rules, as `ray firewall show` prints them.
+#[derive(Debug)]
+pub struct FirewallView {
+    pub default_inbound: crate::firewall::Action,
+    pub default_outbound: crate::firewall::Action,
+    pub reject: bool,
+    pub disabled: bool,
+    pub rules: Vec<ray_proto::ipc::FirewallRuleView>,
+}
+
+impl From<FirewallView> for IpcMessage {
+    fn from(view: FirewallView) -> Self {
+        IpcMessage::FirewallState {
+            default_inbound: view.default_inbound,
+            default_outbound: view.default_outbound,
+            reject: view.reject,
+            disabled: view.disabled,
+            rules: view.rules,
+        }
+    }
+}

@@ -80,7 +80,7 @@ use rayfish::config::QuicEngine as CoreQuicEngine;
 use rayfish::config::settings::GlobalKey;
 use rayfish::control;
 use rayfish::daemon::transfers;
-use rayfish::daemon::{DaemonState, Done, JoinOutcome, OpError, build_headless};
+use rayfish::daemon::{DaemonState, Done, FirewallView, JoinOutcome, OpError, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
@@ -498,19 +498,15 @@ impl Node {
 
     fn edit_blocked(&self, peer: &str, remove: bool) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove)),
-            "block list",
-        )
+        self.runtime
+            .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove))?;
+        Ok(())
     }
 
     fn set_global(&self, key: GlobalKey, value: &str) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.config_set(key, value)),
-            "settings",
-        )
+        self.runtime.block_on(state.config_set(key, value))?;
+        Ok(())
     }
 
     /// This node's endpoint id, read from a fresh `status()` snapshot.
@@ -528,16 +524,6 @@ impl Node {
 impl From<OpError> for RayError {
     fn from(error: OpError) -> Self {
         Self::Network(error.to_string())
-    }
-}
-
-fn expect_ok(response: IpcMessage, what: &str) -> Result<(), RayError> {
-    match response {
-        IpcMessage::Ok { .. } => Ok(()),
-        IpcMessage::Error { message } => Err(RayError::Network(message)),
-        other => Err(RayError::Network(format!(
-            "unexpected {what} response: {other:?}"
-        ))),
     }
 }
 
@@ -924,18 +910,13 @@ impl Node {
     /// Current firewall posture and rules.
     pub fn firewall_show(&self) -> Result<FirewallStateInfo, RayError> {
         let state = self.state()?;
-        let IpcMessage::FirewallState {
+        let FirewallView {
             default_inbound,
             default_outbound,
             disabled,
             rules,
             ..
-        } = state.firewall_show()
-        else {
-            return Err(RayError::Network(
-                "unexpected firewall response".to_string(),
-            ));
-        };
+        } = state.firewall_show();
         Ok(FirewallStateInfo {
             default_inbound: default_inbound.to_string(),
             default_outbound: default_outbound.to_string(),
@@ -976,13 +957,15 @@ impl Node {
             peer.as_deref(),
             network.as_deref(),
         ));
-        expect_ok(result, "firewall")
+        result?;
+        Ok(())
     }
 
     /// Remove the rule at the given index (as shown by firewall_show).
     pub fn firewall_remove(&self, index: u32) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.firewall_remove(index as usize), "firewall")
+        state.firewall_remove(index as usize)?;
+        Ok(())
     }
 
     /// Set the inbound default action ("allow" or "deny"). The outbound default
@@ -990,7 +973,8 @@ impl Node {
     pub fn firewall_set_default_inbound(&self, action: String) -> Result<(), RayError> {
         let state = self.state()?;
         let action: Action = action.parse().map_err(RayError::Network)?;
-        expect_ok(state.firewall_default(action), "firewall")
+        state.firewall_default(action)?;
+        Ok(())
     }
 
     // --- Notifications: pending file offers, connect requests, join requests ---

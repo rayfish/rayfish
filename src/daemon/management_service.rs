@@ -1102,13 +1102,12 @@ impl ManagementService {
         let enable_note = if grants.is_empty() {
             None
         } else {
-            match owner.ssh_config_set("on") {
-                IpcMessage::Ok { message } => message
-                    .split_once("\n\n")
-                    .map(|(_, warning)| warning.to_string()),
-                IpcMessage::Error { message } => return Err(message),
-                other => return Err(format!("unexpected SSH enable response: {other:?}")),
-            }
+            let Done(message) = owner
+                .ssh_config_set("on")
+                .map_err(|error| error.to_string())?;
+            message
+                .split_once("\n\n")
+                .map(|(_, warning)| warning.to_string())
         };
         let count = grants.len();
         config::update_network(network_name.as_ref(), |network| {

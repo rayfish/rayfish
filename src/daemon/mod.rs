@@ -5261,14 +5261,18 @@ mod headless_tests {
         let second = SecretKey::from([42; 32]).public();
         assert!(!daemon.files.should_auto_accept_file(first));
         assert!(!daemon.files.should_auto_accept_file(second));
-        assert!(matches!(
-            daemon.set_file_auto_accept(&first.to_string(), true).await,
-            IpcMessage::Ok { .. }
-        ));
-        assert!(matches!(
-            daemon.set_file_auto_accept(&second.to_string(), true).await,
-            IpcMessage::Ok { .. }
-        ));
+        assert!(
+            daemon
+                .set_file_auto_accept(&first.to_string(), true)
+                .await
+                .is_ok()
+        );
+        assert!(
+            daemon
+                .set_file_auto_accept(&second.to_string(), true)
+                .await
+                .is_ok()
+        );
         assert_eq!(
             config::load().unwrap().file_auto_accept_peers,
             vec![first, second]
@@ -5280,22 +5284,23 @@ mod headless_tests {
                 .files
                 .should_auto_accept_file(SecretKey::from([43; 32]).public())
         );
-        assert!(matches!(
-            daemon.set_file_auto_accept("unknown-peer", true).await,
-            IpcMessage::Error { .. }
-        ));
-        assert!(matches!(
-            daemon.set_file_auto_accept("", true).await,
-            IpcMessage::Error { .. }
-        ));
+        assert!(
+            daemon
+                .set_file_auto_accept("unknown-peer", true)
+                .await
+                .is_err()
+        );
+        assert!(daemon.set_file_auto_accept("", true).await.is_err());
         assert_eq!(
             config::load().unwrap().file_auto_accept_peers,
             vec![first, second]
         );
-        assert!(matches!(
-            daemon.set_file_auto_accept(&first.to_string(), false).await,
-            IpcMessage::Ok { .. }
-        ));
+        assert!(
+            daemon
+                .set_file_auto_accept(&first.to_string(), false)
+                .await
+                .is_ok()
+        );
         assert_eq!(config::load().unwrap().file_auto_accept_peers, vec![second]);
         assert!(!daemon.files.should_auto_accept_file(first));
         assert!(daemon.files.should_auto_accept_file(second));
@@ -5318,19 +5323,19 @@ mod headless_tests {
         let msg = daemon
             .config_set(GlobalKey::Blocked, &peer.to_string())
             .await;
-        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert!(msg.is_ok(), "{msg:?}");
         assert_eq!(config::load_inbound().unwrap().blocked, vec![peer]);
 
         let msg = daemon
             .config_set(GlobalKey::Blocked, &format!("-{peer}"))
             .await;
-        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert!(msg.is_ok(), "{msg:?}");
         assert!(config::load_inbound().unwrap().blocked.is_empty());
 
         let msg = daemon
             .config_set(GlobalKey::Inbound, config::InboundPolicy::Known.as_ref())
             .await;
-        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert!(msg.is_ok(), "{msg:?}");
         assert_eq!(
             config::load_inbound().unwrap().inbound,
             config::InboundPolicy::Known
@@ -5340,25 +5345,26 @@ mod headless_tests {
         // "clear" or "remove", so a stray comma cannot empty the list.
         daemon
             .config_set(GlobalKey::Blocked, &peer.to_string())
-            .await;
+            .await
+            .unwrap();
         for bad in [",", " ", "-x", "a,b"] {
             let msg = daemon.edit_peer_list(GlobalKey::Blocked, bad, false).await;
-            assert!(matches!(msg, IpcMessage::Error { .. }), "{bad:?}: {msg:?}");
+            assert!(msg.is_err(), "{bad:?}: {msg:?}");
         }
         assert_eq!(config::load_inbound().unwrap().blocked, vec![peer]);
         let msg = daemon
             .edit_peer_list(GlobalKey::Blocked, &peer.to_string(), true)
             .await;
-        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert!(msg.is_ok(), "{msg:?}");
         assert!(config::load_inbound().unwrap().blocked.is_empty());
         let msg = daemon
             .edit_peer_list(GlobalKey::Inbound, &peer.to_string(), false)
             .await;
-        assert!(matches!(msg, IpcMessage::Error { .. }), "{msg:?}");
+        assert!(msg.is_err(), "{msg:?}");
 
         let msg = daemon.config_set(GlobalKey::Blocked, "no-such-peer").await;
         assert!(
-            matches!(&msg, IpcMessage::Error { message } if message.contains("unknown peer")),
+            matches!(&msg, Err(error) if error.message().contains("unknown peer")),
             "{msg:?}"
         );
     }
@@ -5388,7 +5394,7 @@ mod headless_tests {
             .net_config_apply("gaming", NetworkKey::AutoAcceptFiles, "off")
             .await;
         assert!(
-            matches!(&msg, IpcMessage::Error { message } if message.contains("not found")),
+            matches!(&msg, Err(error) if error.message().contains("not found")),
             "{msg:?}"
         );
 
@@ -5400,14 +5406,14 @@ mod headless_tests {
         let msg = daemon
             .net_config_apply("gaming", NetworkKey::AutoAcceptFiles, "off")
             .await;
-        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+        assert!(msg.is_ok(), "{msg:?}");
 
         let msg = daemon
             .net_config_apply("gaming", NetworkKey::EphemeralTtl, "3599")
             .await;
         assert!(
-            matches!(&msg, IpcMessage::Error { message }
-                if message == "ttl must be at least 3600 seconds (1 hour)"),
+            matches!(&msg, Err(error)
+                if error.message() == "ttl must be at least 3600 seconds (1 hour)"),
             "validation errors must not be mislabeled as save failures: {msg:?}"
         );
     }
@@ -5667,10 +5673,7 @@ mod headless_tests {
             }
 
             if enabled {
-                assert!(matches!(
-                    daemon.v4_bridge_config_set("off"),
-                    IpcMessage::Ok { .. }
-                ));
+                assert!(daemon.v4_bridge_config_set("off").is_ok());
                 assert!(
                     token
                         .as_ref()
@@ -5678,10 +5681,7 @@ mod headless_tests {
                         .is_cancelled()
                 );
                 assert!(daemon.v4_bridge_token.lock().unwrap().is_none());
-                assert!(matches!(
-                    daemon.v4_bridge_config_set("on"),
-                    IpcMessage::Ok { .. }
-                ));
+                assert!(daemon.v4_bridge_config_set("on").is_ok());
                 token = daemon.v4_bridge_token.lock().unwrap().clone();
                 assert!(!token.as_ref().expect("the bridge restarted").is_cancelled());
             }
