@@ -612,14 +612,13 @@ impl NetworkRegistry {
         // when that best-effort message is missed. `finalize_removal` revokes the
         // local route before publishing and closes the transport after the notice
         // when no other authorized network shares it.
-        let ctx = self.mesh_ctx();
         for member_id in &targets {
-            remove_member_roster_only(&ctx, network, &state, *member_id).await;
+            remove_member_roster_only(self, network, &state, *member_id).await;
         }
         // One finalize for the whole set: it publishes the snapshot once and
         // sends every removed member its own `KickedFromNetwork`, so a person and
         // their devices leave on the same record rather than on N republished ones.
-        finalize_removal(&ctx, network, &state, &dht_notify, &targets).await;
+        finalize_removal(self, network, &state, &dht_notify, &targets).await;
 
         for member_id in &targets {
             tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");

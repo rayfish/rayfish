@@ -217,7 +217,7 @@ async fn a_promoted_member_prunes_stale_members() {
     // own timers from spinning once the clock is paused.
     daemon.shutdown_and_close().await;
     tokio::time::pause();
-    assert!(registry.promote_to_coordinator(&registry.mesh_ctx(), "home", network_key, client));
+    assert!(registry.promote_to_coordinator("home", network_key, client));
     // The pruner's first sweep runs a minute after it starts. Advance the
     // clock by hand: auto-advance waits on blocking-pool work in real time.
     // Let the pruner start its timer first, or the advance happens before it.
@@ -367,7 +367,6 @@ async fn a_fresh_join_refuses_a_network_live_under_another_name() {
 
 fn member_handler(registry: &Arc<NetworkRegistry>, name: &str, key: EndpointId) -> AcceptHandler {
     AcceptHandler::Member(Arc::new(MemberAcceptState {
-        ctx: registry.mesh_ctx(),
         network_name: name.to_string(),
         state: empty_state(key, name),
         net_pubkey: key,

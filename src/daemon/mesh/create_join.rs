@@ -1142,7 +1142,7 @@ impl NetworkRegistry {
             conn,
             &self.transport.endpoint,
             ctx.display_name,
-            self.mesh_ctx(),
+            Arc::clone(self),
             JoinParams {
                 my_hostname: Some(ctx.my_hostname.to_string()),
                 net_pubkey: ctx.net_pubkey,
@@ -1155,7 +1155,6 @@ impl NetworkRegistry {
                 dial_claim,
             },
             cancel.clone(),
-            Arc::clone(self),
             Arc::clone(&ctx.invite_lock),
             self.protocol_router()
                 .context("the daemon is shutting down")?,
@@ -1517,7 +1516,6 @@ impl NetworkRegistry {
         my_identity: EndpointId,
         my_hostname: Option<String>,
     ) {
-        let ctx = self.mesh_ctx();
         let m = member;
         // Bounded inside the dialer, so a dead peer with a stale discovery
         // record can't stall restore for iroh's full internal handshake
@@ -1557,7 +1555,7 @@ impl NetworkRegistry {
                 let Some(router) = self.protocol_router() else {
                     return;
                 };
-                register_dialed_peer(&ctx, &router, peer_conn, m.identity, network_name).await;
+                register_dialed_peer(self, &router, peer_conn, m.identity, network_name).await;
                 // Registered: later callers find the connection in the peer table.
                 drop(claim);
                 // Eager-connect reachability: a successful dial marks the peer

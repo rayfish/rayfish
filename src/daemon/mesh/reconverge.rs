@@ -288,22 +288,20 @@ pub(crate) struct SignedGroupRecord {
 /// exclusively from the network-key-signed record, never from the peer message.
 pub(crate) async fn reconverge_and_apply(
     endpoint: &Endpoint,
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     net_pubkey: EndpointId,
     network_name: &str,
     state: &SharedNetworkState,
     device_cert: &Option<control::DeviceCert>,
 ) {
-    if !confirm_pending_snapshot_durability(state, &ctx.blob_store, network_name).await {
+    if !confirm_pending_snapshot_durability(state, &registry.transport.blob_store, network_name)
+        .await
+    {
         tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
         return;
     }
-    let Some((hash, seeds, timestamp)) = resolve_signed(
-        endpoint,
-        &ctx.registry.transport.pkarr_relay_url,
-        net_pubkey,
-    )
-    .await
+    let Some((hash, seeds, timestamp)) =
+        resolve_signed(endpoint, &registry.transport.pkarr_relay_url, net_pubkey).await
     else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
@@ -313,7 +311,15 @@ pub(crate) async fn reconverge_and_apply(
         seeds,
         timestamp,
     };
-    apply_group_record(endpoint, ctx, network_name, state, device_cert, &record).await;
+    apply_group_record(
+        endpoint,
+        registry,
+        network_name,
+        state,
+        device_cert,
+        &record,
+    )
+    .await;
 }
 
 /// Outcome of applying a signed group record.
@@ -345,15 +351,14 @@ pub(crate) enum ReconvergeOutcome {
 /// verified in `fetch_verified_blob`.
 pub(crate) async fn apply_group_record(
     endpoint: &Endpoint,
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     network_name: &str,
     state: &SharedNetworkState,
     device_cert: &Option<control::DeviceCert>,
     record: &SignedGroupRecord,
 ) -> ReconvergeOutcome {
-    let blob_store = &ctx.blob_store;
-    let registry = &ctx.registry;
-    let my_identity = ctx.identity.local_identity();
+    let blob_store = &registry.transport.blob_store;
+    let my_identity = registry.transport.identity.local_identity();
     if !confirm_pending_snapshot_durability(state, blob_store, network_name).await {
         tracing::debug!(network = %network_name, "reconverge: waiting for the current snapshot durability retry");
         return ReconvergeOutcome::Superseded;
@@ -423,7 +428,7 @@ pub(crate) async fn apply_group_record(
     let Some(data) = fetch_verified_blob(
         endpoint,
         blob_store,
-        &ctx.peers,
+        &registry.peers,
         record.hash,
         network_name,
         &record.seeds,
@@ -434,7 +439,7 @@ pub(crate) async fn apply_group_record(
         return ReconvergeOutcome::Unfetched;
     };
     commit_group_blob(
-        ctx,
+        registry,
         network_name,
         state,
         device_cert,
@@ -450,7 +455,7 @@ pub(crate) async fn apply_group_record(
 /// group hash read before the fetch, so a mutation that landed meanwhile
 /// discards this result instead of being overwritten by it.
 async fn commit_group_blob(
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     network_name: &str,
     state: &SharedNetworkState,
     device_cert: &Option<control::DeviceCert>,
@@ -458,19 +463,20 @@ async fn commit_group_blob(
     generation: blake3::Hash,
     data: crate::membership::GroupBlob,
 ) -> ReconvergeOutcome {
-    let MeshCtx {
+    let NetworkRegistry {
         peers,
-        blob_store,
+        transport,
         firewall,
-        hostname_table,
-        reverse_table,
+        dns,
         device_user_map,
         pruned_peers,
         route_map,
-        registry,
         ..
-    } = ctx;
-    let my_identity = ctx.identity.local_identity();
+    } = &**registry;
+    let blob_store = &transport.blob_store;
+    let hostname_table = &dns.hostname_table;
+    let reverse_table = &dns.reverse_table;
+    let my_identity = registry.transport.identity.local_identity();
     // Self-unpair: if our own device cert is nullified in this (verified, signed)
     // blob and the blob is coordinated by our *own* primary, the primary has
     // revoked this device. Tear ourselves out (delete the cert + leave every
@@ -809,11 +815,11 @@ pub(crate) fn spawn_group_poller(
     net_pubkey: EndpointId,
     state: SharedNetworkState,
     endpoint: Endpoint,
-    ctx: MeshCtx,
+    registry: Arc<NetworkRegistry>,
     network_name: String,
     token: CancellationToken,
 ) -> JoinHandle<()> {
-    let registry = Arc::clone(&ctx.registry);
+    let registry = Arc::clone(&registry);
     tokio::spawn(async move {
         // `interval` fires its first tick immediately, so the poller does an
         // at-start resolve (catching a blob that changed while we were offline or
@@ -871,7 +877,7 @@ pub(crate) fn spawn_group_poller(
             let device_cert = crate::identity::load_device_cert().ok().flatten();
             if apply_group_record(
                 &endpoint,
-                &ctx,
+                &registry,
                 &network_name,
                 &state,
                 &device_cert,

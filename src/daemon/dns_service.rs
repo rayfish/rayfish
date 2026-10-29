@@ -43,7 +43,7 @@ fn search_domains_for_mode(
 const UPSTREAM_REFRESH_TICK: Duration = Duration::from_secs(15);
 
 pub(crate) struct DnsService {
-    /// `.ray` forward lookup table (hostname → IP). Cloned into `MeshCtx` and the
+    /// `.ray` forward lookup table (hostname → IP). Shared with the
     /// resolver; the roster is the single source of truth that writes it.
     pub(crate) hostname_table: dns::HostnameTable,
     /// `.ray` reverse lookup table (IP → hostname).

@@ -331,94 +331,6 @@ async fn connect_pair(endpoint: &Endpoint, addr: iroh::EndpointAddr) -> Result<C
     Ok(connecting.await?)
 }
 
-/// Node-wide shared handles, cloned into every per-network accept handler and
-/// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
-/// channel sender, or a small wrapper), so the whole bundle is cloned by value
-/// instead of threaded as a dozen separate arguments/struct fields. Built once
-/// per daemon via [`Daemon::mesh_ctx`]; a new daemon-wide dependency is one
-/// field here rather than one parameter at every call site.
-#[derive(Clone)]
-pub(crate) struct MeshCtx {
-    identity: IrohIdentityProvider,
-    peers: PeerTable,
-    tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
-    stats: Arc<ForwardMetrics>,
-    blob_store: FsStore,
-    firewall: SharedFirewall,
-    hostname_table: dns::HostnameTable,
-    reverse_table: dns::ReverseLookupTable,
-    device_user_map: peers::DeviceUserMap,
-    /// Peers removed from a network's roster (via `ray kick` or a stale-entry
-    /// prune during reconverge), keyed by `(network, transport id)`. A member
-    /// closes such a peer's connection but can't see its own close code, so the
-    /// connection supervisor would re-dial the removed peer (which still lists it)
-    /// and re-form the link. The supervisor consumes an entry here to skip that
-    /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
-    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
-    /// IP -> roster member map (no connection required), populated wherever the
-    /// roster is applied so the on-demand data path can resolve an unconnected
-    /// destination to the peer to lazily dial. See [`peers::RosterRouteMap`].
-    pub(crate) route_map: peers::RosterRouteMap,
-    /// Daemon-wide disconnect channel. Every [`MeshConnection`] reports its peer's
-    /// drop here when its demux loop ends, and a single
-    /// [`NetworkRegistry::run_connection_supervisor`] consumes it. Under one mesh
-    /// connection per identity a drop tears the peer down across every shared
-    /// network at once, so this is node-wide rather than per-network. The channel
-    /// keeps disconnect handling serial (one check-then-act at a time).
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-    /// The network-owning service. Control readers reach it through the ctx to
-    /// run network ops directly (e.g. the unpair a primary's notice asks for, or
-    /// a self-nullify during reconverge) instead of signalling the daemon loop.
-    registry: Arc<NetworkRegistry>,
-}
-
-impl MeshCtx {
-    /// Build the per-peer data-plane bundle for `forward::spawn_peer_reader`,
-    /// combining this context's shared handles with the caller's `token`. Called
-    /// by [`MeshConnection`], which owns the reader for the connection's lifetime.
-    pub(crate) fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
-        forward::ForwardCtx {
-            firewall: self.firewall.clone(),
-            tun_tx: Arc::clone(&self.tun_tx),
-            token,
-            stats: Arc::clone(&self.stats),
-            device_user_map: self.device_user_map.clone(),
-            exit: crate::exit_node::ExitContext {
-                server: self.registry.exit_server.clone(),
-                client: self.registry.exit_client.clone(),
-                my_v6: derive_ipv6(&self.identity.local_identity()),
-            },
-        }
-    }
-
-    /// Register a peer's connection for `network` in the peer table: add its route
-    /// (and, on the first shared network, its audit connect event). The
-    /// connection's single data reader is not started here; [`MeshConnection`] owns
-    /// it for the connection's lifetime. Returns whether the stored connection is
-    /// new (the first shared network, or a reconnect that replaced a different
-    /// connection), which the dial side uses to decide whether to drive a fresh
-    /// control demux.
-    pub(crate) fn register_peer_conn(
-        &self,
-        conn: &Connection,
-        peer_id: EndpointId,
-        network: &str,
-    ) -> bool {
-        let ipv6 = derive_ipv6(&peer_id);
-        // A fresh invite or approval can legitimately return a previously
-        // removed identity at once. Its successful authenticated registration
-        // supersedes the old one-shot reconnect suppression.
-        self.pruned_peers.remove(&(network.to_string(), peer_id));
-        // Keep the roster route map current with every peer we connect to, so a
-        // later idle teardown can re-dial it on demand (reconverge covers the
-        // roster-wide sync + removals; this is the incremental add).
-        self.route_map.sync_add(network, ipv6, peer_id);
-        // The peer table selects the lowest shared TLS session ID, so both ends
-        // keep the same physical connection regardless of who initiated it.
-        self.peers.add(ipv6, conn.clone(), peer_id, network)
-    }
-}
-
 /// Announce our outbound handle table to a peer over `conn` so it can decode the
 /// datagrams we tag for each shared network. Full snapshot (idempotent replace on
 /// the receiver); connection-level (`net = None`). Resolves each local network
@@ -1130,8 +1042,6 @@ impl Daemon {
         self.active.load(Ordering::SeqCst)
     }
 
-    /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
-    /// handlers and background tasks. Every field is a cheap `Clone`.
     /// Part of the embedding API (used by `ray-mobile`): the host OS observed a
     /// network change (Wi-Fi/cellular switch, roam, airplane mode). On desktop,
     /// netwatch sees route changes itself; on Android its route monitor is a
@@ -2260,10 +2170,10 @@ pub(crate) mod accept_handler_tests {
 
     /// The live state and context behind a handler, whichever role it is. Lets a
     /// test seat members and device bindings on a handler it just built.
-    fn handler_parts(h: &AcceptHandler) -> (&SharedNetworkState, &MeshCtx) {
+    fn handler_parts(h: &AcceptHandler) -> (&SharedNetworkState, &Arc<NetworkRegistry>) {
         match h {
-            AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
-            AcceptHandler::Member(s) => (&s.state, &s.ctx),
+            AcceptHandler::Coordinator(s) => (&s.state, &s.registry),
+            AcceptHandler::Member(s) => (&s.state, &s.registry),
         }
     }
 
@@ -2315,13 +2225,13 @@ pub(crate) mod accept_handler_tests {
     #[tokio::test]
     async fn knows_sender_resolves_a_device_to_its_roster_user() {
         let h = sample_coordinator_handler().await;
-        let (state, ctx) = handler_parts(&h);
+        let (state, registry) = handler_parts(&h);
         let user = SecretKey::from_bytes(&[11u8; 32]).public();
         let device = SecretKey::from_bytes(&[12u8; 32]).public();
         state.write().unwrap().members.add(seated(user));
         // Unmapped, the device key is a stranger.
         assert!(!h.knows_sender(device));
-        ctx.device_user_map.insert(device, user);
+        registry.device_user_map.insert(device, user);
         assert!(h.knows_sender(device));
     }
 
@@ -2336,32 +2246,6 @@ pub(crate) mod accept_handler_tests {
         assert!(!h.knows_sender(stranger));
     }
 
-    /// Throwaway [`MeshCtx`] for accept-handler tests: a fresh blob store and
-    /// dummy handles, none of which the constructed handlers exercise here.
-    fn sample_mesh_ctx(
-        identity: IrohIdentityProvider,
-        blob_store: FsStore,
-        registry: Arc<NetworkRegistry>,
-    ) -> MeshCtx {
-        let (tun_tx, _) = tokio::sync::mpsc::channel(1);
-        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
-        MeshCtx {
-            identity,
-            peers: PeerTable::new(),
-            tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(tun_tx)),
-            stats: Arc::new(ForwardMetrics::default()),
-            blob_store,
-            firewall: SharedFirewall::new(crate::firewall::FirewallConfig::default()),
-            hostname_table: dns::new_hostname_table(),
-            reverse_table: dns::new_reverse_table(),
-            device_user_map: peers::DeviceUserMap::new(),
-            pruned_peers: Arc::new(DashSet::new()),
-            route_map: peers::RosterRouteMap::new(),
-            disconnect_tx,
-            registry,
-        }
-    }
-
     async fn sample_coordinator_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
@@ -2373,7 +2257,7 @@ pub(crate) mod accept_handler_tests {
             blob_store.clone(),
         );
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id), blob_store, registry),
+            registry,
             network_name: "test-net".to_string(),
             state: make_network_state(),
             dht_notify: None,
@@ -2616,11 +2500,6 @@ pub(crate) mod accept_handler_tests {
             blob_store.clone(),
         );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(my_id),
-                blob_store.clone(),
-                Arc::clone(&registry),
-            ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             net_pubkey: SecretKey::from_bytes(&[1u8; 32]).public(),
@@ -3956,15 +3835,16 @@ pub(crate) mod accept_handler_tests {
             IrohIdentityProvider::new(local.id()),
             store.clone(),
         );
-        let ctx = sample_mesh_ctx(IrohIdentityProvider::new(local.id()), store, registry);
         let peer_id = conn.remote_id();
-        ctx.pruned_peers
+        registry
+            .pruned_peers
             .insert(("test-network".to_string(), peer_id));
 
-        ctx.register_peer_conn(&conn, peer_id, "test-network");
+        registry.register_peer_conn(&conn, peer_id, "test-network");
 
         assert!(
-            !ctx.pruned_peers
+            !registry
+                .pruned_peers
                 .contains(&("test-network".to_string(), peer_id))
         );
         conn.close(VarInt::from_u32(0), b"test done");
@@ -4193,14 +4073,15 @@ pub(crate) mod accept_handler_tests {
             },);
             let outgoing = outgoing.unwrap();
             let handler = sample_coordinator_handler().await;
-            let (state, ctx) = handler_parts(&handler);
+            let (state, registry) = handler_parts(&handler);
             let mut member = seated(client.id());
             member.hostname = Some("member".to_string());
             state.write().unwrap().members.add(member);
             let ip = derive_ipv6(&client.id());
             // The first network has already registered and announced itself.
             // The coordinator's hello adds a second network to this connection.
-            ctx.peers
+            registry
+                .peers
                 .add(ip, incoming.clone(), client.id(), "other-net");
             let net_key = state.read().unwrap().network_public_key;
             let (mut send, recv) = outgoing.open_bi().await.unwrap();
@@ -4239,15 +4120,15 @@ pub(crate) mod accept_handler_tests {
             let registered = handler
                 .handle_frame(&incoming, reply, client.id(), frame.msg)
                 .await;
-            assert!(ctx.peers.shares_network_v6(&ip, "other-net"));
-            assert!(ctx.peers.shares_network_v6(&ip, "test-net"));
+            assert!(registry.peers.shares_network_v6(&ip, "other-net"));
+            assert!(registry.peers.shares_network_v6(&ip, "test-net"));
             assert_eq!(
                 registered,
                 Some(ip),
                 "the demux must announce handles for the registered network even if Welcome fails"
             );
             assert_eq!(
-                ctx.hostname_table.read().await["test-net"]["member"],
+                registry.dns.hostname_table.read().await["test-net"]["member"],
                 ip,
                 "a failed reply must not skip the peer's DNS refresh"
             );
@@ -4282,10 +4163,8 @@ pub(crate) mod accept_handler_tests {
             sample_member_handler().await,
         ] {
             let (registry, state) = match &handler {
-                AcceptHandler::Coordinator(s) => {
-                    (Arc::clone(&s.ctx.registry), Arc::clone(&s.state))
-                }
-                AcceptHandler::Member(s) => (Arc::clone(&s.ctx.registry), Arc::clone(&s.state)),
+                AcceptHandler::Coordinator(s) => (Arc::clone(&s.registry), Arc::clone(&s.state)),
+                AcceptHandler::Member(s) => (Arc::clone(&s.registry), Arc::clone(&s.state)),
             };
             // Hold the network key (recording needs it) and list the sender.
             let sender = SecretKey::from_bytes(&[9u8; 32]).public();
@@ -4364,18 +4243,9 @@ pub(crate) mod accept_handler_tests {
     /// coordinator handler for each of `networks` backed by `registry`.
     fn serve_coordinator(
         coord_ep: &Endpoint,
-        blob_store: &FsStore,
         registry: &Arc<NetworkRegistry>,
         networks: Vec<ServedNetwork>,
     ) -> tokio::task::JoinHandle<()> {
-        let coord_id = coord_ep.id();
-        let mesh_ctx = || {
-            sample_mesh_ctx(
-                IrohIdentityProvider::new(coord_id),
-                blob_store.clone(),
-                Arc::clone(registry),
-            )
-        };
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
             registry: Arc::downgrade(registry),
@@ -4386,7 +4256,7 @@ pub(crate) mod accept_handler_tests {
             connmgr.register(
                 network.key,
                 AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                    ctx: mesh_ctx(),
+                    registry: Arc::clone(registry),
                     network_name: network.name.to_string(),
                     state: network.state,
                     dht_notify: None,
@@ -4484,7 +4354,6 @@ pub(crate) mod accept_handler_tests {
         let coord_addr = coord_ep.addr();
         let accept = serve_coordinator(
             &coord_ep,
-            &blob_store,
             &registry,
             vec![ServedNetwork {
                 key: net_pubkey,
@@ -4624,7 +4493,6 @@ pub(crate) mod accept_handler_tests {
         );
         let accept = serve_coordinator(
             &coord_ep,
-            &coord_blobs,
             &coord_reg,
             vec![ServedNetwork {
                 key: net_pubkey,
@@ -4834,7 +4702,6 @@ pub(crate) mod accept_handler_tests {
         );
         let accepting = serve_coordinator(
             &coordinator,
-            &store,
             &registry,
             vec![ServedNetwork {
                 key: network_key,
@@ -4914,7 +4781,6 @@ pub(crate) mod accept_handler_tests {
 
         let accept = serve_coordinator(
             &coord_ep,
-            &blob_store,
             &registry,
             vec![
                 ServedNetwork {

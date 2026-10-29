@@ -22,7 +22,7 @@ use super::*;
 /// per-connection demux state (the QUIC `conn`, the peer identity, the
 /// control-plane rate `gate`) and carries the daemon-wide dispatch it needs to
 /// route frames: `manager` for the per-network handler registry and the ping
-/// map, `ctx` for the shared handles, `token` for shutdown.
+/// map, `registry` for the shared handles, `token` for shutdown.
 ///
 /// `pre_registered` records whether the peer was already registered before the
 /// demux started (the dial side registers first, then drives; the accept side
@@ -33,7 +33,7 @@ pub(crate) struct MeshConnection {
     conn: Connection,
     peer_id: EndpointId,
     manager: Arc<ConnectionManager>,
-    ctx: MeshCtx,
+    registry: Arc<NetworkRegistry>,
     token: CancellationToken,
     gate: crate::ratelimit::ControlGate,
     nacks: NackGate,
@@ -240,7 +240,7 @@ impl MeshConnection {
     pub(crate) fn new(
         conn: Connection,
         manager: Arc<ConnectionManager>,
-        ctx: MeshCtx,
+        registry: Arc<NetworkRegistry>,
         token: CancellationToken,
         pre_registered: bool,
     ) -> Self {
@@ -248,7 +248,7 @@ impl MeshConnection {
             peer_id: conn.remote_id(),
             conn,
             manager,
-            ctx,
+            registry,
             token,
             gate: crate::ratelimit::ControlGate::new(),
             nacks: NackGate::default(),
@@ -267,7 +267,7 @@ impl MeshConnection {
         // Feed the warm-start cache from the authenticated connection.  A later
         // restart can try its selected relay or direct path immediately instead
         // of waiting for discovery to rediscover it.
-        self.ctx.registry.remember_connection_hints(&self.conn);
+        self.registry.remember_connection_hints(&self.conn);
         // A connection to this peer now exists (either side dialed): let the
         // composition-root hook flush anything queued for it (send outbox).
         self.manager.notify_peer_connected(self.peer_id);
@@ -277,8 +277,8 @@ impl MeshConnection {
         let reader = forward::spawn_peer_reader(
             self.conn.clone(),
             self.peer_id,
-            self.ctx.peers.clone(),
-            self.ctx.forward_ctx(self.token.clone()),
+            self.registry.peers.clone(),
+            self.registry.forward_ctx(self.token.clone()),
         );
         // Whether this connection ever became a registered member (see struct docs).
         let mut registered = self.pre_registered;
@@ -304,7 +304,7 @@ impl MeshConnection {
         let (registered_tx, mut registered_rx) = mpsc::unbounded_channel::<()>();
         let mut lanes = SerialLanes::new({
             let conn = self.conn.clone();
-            let peers = self.ctx.peers.clone();
+            let peers = self.registry.peers.clone();
             let manager = Arc::clone(&self.manager);
             let peer_id = self.peer_id;
             move |frame: LaneFrame| {
@@ -380,17 +380,17 @@ impl MeshConnection {
             // re-dial it (the destination is not a roster member), so a reaped
             // exit link blackholes until the next reconverge. Keep it warm.
             // Checked only when on-demand, so other nodes skip the lookups.
-            let sleep_for = (self.ctx.registry.on_demand
+            let sleep_for = (self.registry.on_demand
                 && !self.is_exit_peer()
                 && self
-                    .ctx
+                    .registry
                     .peers
                     .supports_idle_close(&self.peer_id, &self.conn))
             .then(|| {
-                self.ctx.peers.idle_remaining(
+                self.registry.peers.idle_remaining(
                     &self.peer_id,
                     &self.conn,
-                    self.ctx.registry.idle_timeout,
+                    self.registry.idle_timeout,
                 )
             })
             .flatten();
@@ -429,12 +429,12 @@ impl MeshConnection {
                     }
                 } => {
                     let still_idle = self
-                        .ctx
+                        .registry
                         .peers
                         .idle_remaining(
                             &self.peer_id,
                             &self.conn,
-                            self.ctx.registry.idle_timeout,
+                            self.registry.idle_timeout,
                         )
                         .is_some_and(|d| d.is_zero());
                     if !still_idle {
@@ -443,7 +443,7 @@ impl MeshConnection {
                     tracing::info!(peer = %self.peer_id.fmt_short(), "closing idle connection (on-demand teardown)");
                     self.conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
                     reader.abort();
-                    self.ctx.stats.record_idle_teardown();
+                    self.registry.transport.stats.record_idle_teardown();
                     registered |= drain_lanes(lanes, &mut registered_rx).await;
                     // We close, so our own loop only ever sees `LocallyClosed`, never
                     // our IDLE_CODE. Report `Idle` explicitly so the supervisor removes
@@ -560,7 +560,7 @@ impl MeshConnection {
                         tracing::debug!(peer = %self.peer_id.fmt_short(), "ignoring an unpair notice that names no pairing");
                         continue;
                     }
-                    let registry = Arc::clone(&self.ctx.registry);
+                    let registry = Arc::clone(&self.registry);
                     let sender = self.peer_id;
                     tokio::spawn(async move {
                         registry.on_unpaired_notice(sender, revoked).await;
@@ -580,8 +580,8 @@ impl MeshConnection {
                     // `nullify_device` rejects a requester that is not one of our
                     // paired devices, so a stranger is a no-op. Off the demux loop:
                     // republish + prune is heavy.
-                    if self.ctx.registry.current_device_cert().is_none() {
-                        let registry = Arc::clone(&self.ctx.registry);
+                    if self.registry.current_device_cert().is_none() {
+                        let registry = Arc::clone(&self.registry);
                         let requester = self.peer_id;
                         tokio::spawn(async move {
                             if let Err(reason) = registry.nullify_device(requester, false).await {
@@ -614,7 +614,7 @@ impl MeshConnection {
                 // is plainly reachable, since its traffic just arrived. Nudge the
                 // supervisor to retry now rather than at its next tick.
                 // Joining remains pending until the handler is restored.
-                self.ctx.registry.nudge_restore();
+                self.registry.nudge_restore();
                 bounded(
                     &token,
                     INLINE_STEP_TIMEOUT,
@@ -653,7 +653,7 @@ impl MeshConnection {
     fn apply_announcement(&self, announcement: &PeerAnnouncement) {
         self.manager
             .apply_network_handles(&self.conn, self.peer_id, &announcement.entries);
-        self.ctx
+        self.registry
             .peers
             .note_receive_mtu(&self.peer_id, &self.conn, announcement.receive_mtu);
         // The handle announcement is the one control message both ends send
@@ -661,7 +661,7 @@ impl MeshConnection {
         // capability (the MeshHello handshake is one-way). Gate the
         // per-connection idle timer on it: a peer that does not advertise
         // support is held open, never idle-closed.
-        self.ctx.peers.note_idle_support_by_id(
+        self.registry.peers.note_idle_support_by_id(
             &self.peer_id,
             &self.conn,
             announcement.features & crate::transport::FEATURE_IDLE_CLOSE != 0,
@@ -670,12 +670,11 @@ impl MeshConnection {
 
     /// Whether this peer is the selected exit node.
     fn is_exit_peer(&self) -> bool {
-        self.ctx
-            .registry
+        self.registry
             .exit_client
             .selection()
             .and_then(|s| {
-                self.ctx
+                self.registry
                     .peers
                     .ipv6_for_id(&self.peer_id)
                     .map(|v6| v6 == s.ipv6)
@@ -705,7 +704,7 @@ impl MeshConnection {
         let ipv6 = crate::membership::derive_ipv6(&self.peer_id);
         tracing::warn!(peer = %self.peer_id.fmt_short(), ip = %ipv6, reason = ?reason, "peer connection lost");
         let _ = self
-            .ctx
+            .registry
             .disconnect_tx
             .send(forward::DisconnectEvent {
                 endpoint_id: self.peer_id,

@@ -760,7 +760,6 @@ async fn both_roles_accept_network_signed_proof_with_stale_roster() {
             })
             .unwrap();
             AcceptHandler::Member(Arc::new(MemberAcceptState {
-                ctx: daemon.registry.mesh_ctx(),
                 network_name: "doomed".to_string(),
                 state: Arc::clone(&handle.state),
                 net_pubkey: key.public(),
@@ -866,7 +865,7 @@ async fn member_poller_learns_destruction_without_a_broadcast() {
             key.public(),
             Arc::clone(&handle.state),
             daemon.transport.endpoint.clone(),
-            daemon.registry.mesh_ctx(),
+            Arc::clone(&daemon.registry),
             "missed-notice".to_string(),
             handle.cancel.clone(),
         );

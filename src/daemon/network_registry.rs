@@ -179,13 +179,18 @@ pub(crate) struct NetworkRegistry {
     pub(crate) device_cert: ArcSwapOption<control::DeviceCert>,
     /// Daemon-wide shutdown token; each network's cancel is a child of it.
     pub(crate) shutdown_token: CancellationToken,
-    /// Per-device firewall, threaded into the [`MeshCtx`] handler bundle.
+    /// Per-device firewall, threaded into each peer reader.
     pub(crate) firewall: SharedFirewall,
-    /// Transport-key -> user-identity map, threaded into the [`MeshCtx`] bundle.
+    /// Transport-key -> user-identity map.
     pub(crate) device_user_map: peers::DeviceUserMap,
-    /// Sender to the single TUN writer, threaded into peer readers via [`MeshCtx`].
+    /// Sender to the single TUN writer, threaded into each peer reader.
     pub(crate) tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
-    /// Roster-pruned peers to skip on reconnect (see [`MeshCtx::pruned_peers`]).
+    /// Peers removed from a network's roster (via `ray kick` or a stale-entry
+    /// prune during reconverge), keyed by `(network, transport id)`. A member
+    /// closes such a peer's connection but can't see its own close code, so the
+    /// connection supervisor would re-dial the removed peer (which still lists it)
+    /// and re-form the link. The supervisor consumes an entry here to skip that
+    /// one reconnect.
     pub(crate) pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// IP -> roster member map (no connection required), so the on-demand data
     /// path can turn a destination IP into the peer to lazily dial. Populated
@@ -209,8 +214,8 @@ pub(crate) struct NetworkRegistry {
     /// How long a connection may sit with no traffic (either direction) before an
     /// on-demand node idle-closes it. Read by each [`MeshConnection`]'s idle timer.
     pub(crate) idle_timeout: Duration,
-    /// Per-network exit-node allow policy, threaded into peer readers via the
-    /// [`MeshCtx`] forward context and populated on `activate()` from config.
+    /// Per-network exit-node allow policy, threaded into peer readers via
+    /// [`Self::forward_ctx`] and populated on `activate()` from config.
     pub(crate) exit_server: crate::exit_node::ExitServer,
     /// Client-side exit-node selection: the peer this node routes its non-mesh
     /// traffic through. Read by the forwarding loop (outbound) and peer readers
@@ -564,26 +569,49 @@ impl NetworkRegistry {
         self.protocol_router.get().and_then(Weak::upgrade)
     }
 
-    /// Build the [`MeshCtx`] handler bundle from the registry's own handles. This
-    /// is the same bundle `Daemon::mesh_ctx` produces; relocating the builder
-    /// here lets the network methods (create/join/coordinator spawn) assemble it
-    /// themselves instead of taking it as a threaded-in argument.
-    pub(crate) fn mesh_ctx(self: &Arc<Self>) -> MeshCtx {
-        MeshCtx {
-            identity: self.transport.identity.clone(),
-            peers: self.peers.clone(),
-            tun_tx: Arc::clone(&self.tun_tx),
-            stats: Arc::clone(&self.transport.stats),
-            blob_store: self.transport.blob_store.clone(),
+    /// Build the per-peer data-plane bundle for `forward::spawn_peer_reader`,
+    /// combining the registry's shared handles with the caller's `token`. Called
+    /// by [`MeshConnection`], which owns the reader for the connection's lifetime.
+    pub(crate) fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
+        forward::ForwardCtx {
             firewall: self.firewall.clone(),
-            hostname_table: Arc::clone(&self.dns.hostname_table),
-            reverse_table: Arc::clone(&self.dns.reverse_table),
+            tun_tx: Arc::clone(&self.tun_tx),
+            token,
+            stats: Arc::clone(&self.transport.stats),
             device_user_map: self.device_user_map.clone(),
-            pruned_peers: Arc::clone(&self.pruned_peers),
-            route_map: self.route_map.clone(),
-            disconnect_tx: self.disconnect_tx.clone(),
-            registry: Arc::clone(self),
+            exit: crate::exit_node::ExitContext {
+                server: self.exit_server.clone(),
+                client: self.exit_client.clone(),
+                my_v6: derive_ipv6(&self.transport.identity.local_identity()),
+            },
         }
+    }
+
+    /// Register a peer's connection for `network` in the peer table: add its route
+    /// (and, on the first shared network, its audit connect event). The
+    /// connection's single data reader is not started here; [`MeshConnection`] owns
+    /// it for the connection's lifetime. Returns whether the stored connection is
+    /// new (the first shared network, or a reconnect that replaced a different
+    /// connection), which the dial side uses to decide whether to drive a fresh
+    /// control demux.
+    pub(crate) fn register_peer_conn(
+        &self,
+        conn: &Connection,
+        peer_id: EndpointId,
+        network: &str,
+    ) -> bool {
+        let ipv6 = derive_ipv6(&peer_id);
+        // A fresh invite or approval can legitimately return a previously
+        // removed identity at once. Its successful authenticated registration
+        // supersedes the old one-shot reconnect suppression.
+        self.pruned_peers.remove(&(network.to_string(), peer_id));
+        // Keep the roster route map current with every peer we connect to, so a
+        // later idle teardown can re-dial it on demand (reconverge covers the
+        // roster-wide sync + removals; this is the incremental add).
+        self.route_map.sync_add(network, ipv6, peer_id);
+        // The peer table selects the lowest shared TLS session ID, so both ends
+        // keep the same physical connection regardless of who initiated it.
+        self.peers.add(ipv6, conn.clone(), peer_id, network)
     }
 
     /// Record authenticated paths without blocking an async worker on fsync.
@@ -1767,14 +1795,11 @@ impl NetworkRegistry {
 
     /// Register (or replace) `network`'s accept handler with a
     /// [`CoordinatorAcceptState`], so any node holding the network key admits
-    /// fresh joiners instead of dropping their `JoinRequest`s. The daemon-wide
-    /// `ctx` (identical for every network) is supplied by the caller: the daemon
-    /// passes `self.mesh_ctx()`, a promoting control reader passes its own `ctx`.
+    /// fresh joiners instead of dropping their `JoinRequest`s.
     /// Also flips the stored role so `ray status` reports Coordinator at once.
     #[allow(clippy::too_many_arguments)] // the params are the handler's own fields
     pub(crate) fn register_coordinator_handler(
-        &self,
-        ctx: &MeshCtx,
+        self: &Arc<Self>,
         network: &str,
         state: SharedNetworkState,
         invite_lock: Arc<AsyncMutex<()>>,
@@ -1784,7 +1809,7 @@ impl NetworkRegistry {
         self.conn.register(
             network_key,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                ctx: ctx.clone(),
+                registry: Arc::clone(self),
                 network_name: network.to_string(),
                 state,
                 dht_notify,
@@ -1804,8 +1829,7 @@ impl NetworkRegistry {
     /// ALPN is static and promotion adds no network, so the advertised set and the
     /// DNS search domains are unchanged.
     pub(crate) fn promote_to_coordinator(
-        &self,
-        ctx: &MeshCtx,
+        self: &Arc<Self>,
         network: &str,
         key: SecretKey,
         pkarr_client: PkarrRelayClient,
@@ -1824,7 +1848,7 @@ impl NetworkRegistry {
             notify = Arc::new(Notify::new());
             let tasks = coordinator_tasks(
                 Some(pkarr_client),
-                ctx,
+                self,
                 network,
                 &key,
                 &handle.state,
@@ -1839,14 +1863,7 @@ impl NetworkRegistry {
             invite_lock = Arc::clone(&handle.invite_lock);
             network_key = handle.network_key;
         } // DashMap ref dropped before connection-handler registration.
-        self.register_coordinator_handler(
-            ctx,
-            network,
-            state,
-            invite_lock,
-            Some(notify),
-            network_key,
-        );
+        self.register_coordinator_handler(network, state, invite_lock, Some(notify), network_key);
         tracing::info!(
             network,
             "promoted to coordinator accept handler and publisher"
@@ -1991,7 +2008,7 @@ fn record_is_published(network: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn coordinator_tasks(
     pkarr_client: Option<PkarrRelayClient>,
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     name: &str,
     net_secret_key: &SecretKey,
     state: &SharedNetworkState,
@@ -2005,7 +2022,7 @@ pub(super) fn coordinator_tasks(
             pkarr_client,
             net_secret_key.clone(),
             Arc::clone(state),
-            Arc::clone(&ctx.registry),
+            Arc::clone(registry),
             name.to_string(),
             initially_published,
             Arc::clone(dht_notify),
@@ -2013,7 +2030,7 @@ pub(super) fn coordinator_tasks(
         ));
     }
     tasks.push(spawn_stale_member_pruner(
-        ctx.clone(),
+        registry.clone(),
         name.to_string(),
         Arc::clone(state),
         Some(Arc::clone(dht_notify)),

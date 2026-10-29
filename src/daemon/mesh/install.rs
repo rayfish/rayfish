@@ -71,7 +71,6 @@ impl NetworkRegistry {
             my_hostname,
             dial,
         } = install;
-        let ctx = self.mesh_ctx();
         let pkarr_client =
             dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
                 .ok();
@@ -81,7 +80,7 @@ impl NetworkRegistry {
             let notify = Arc::new(Notify::new());
             tasks.extend(coordinator_tasks(
                 pkarr_client.clone(),
-                &ctx,
+                self,
                 name,
                 &authority.key,
                 &state,
@@ -97,7 +96,7 @@ impl NetworkRegistry {
                 network_key,
                 Arc::clone(&state),
                 self.transport.endpoint.clone(),
-                ctx.clone(),
+                Arc::clone(self),
                 name.to_string(),
                 cancel.clone(),
             ));
@@ -116,7 +115,7 @@ impl NetworkRegistry {
                     cancel.clone(),
                     Arc::clone(&state),
                     name.to_string(),
-                    ctx.clone(),
+                    Arc::clone(self),
                     self.transport.endpoint.clone(),
                     network_key,
                     self.current_device_cert(),
@@ -149,7 +148,6 @@ impl NetworkRegistry {
 
         if authority.is_some() {
             self.register_coordinator_handler(
-                &ctx,
                 name,
                 Arc::clone(&state),
                 Arc::clone(&invite_lock),
@@ -160,7 +158,6 @@ impl NetworkRegistry {
             self.conn.register(
                 network_key,
                 AcceptHandler::Member(Arc::new(MemberAcceptState {
-                    ctx: ctx.clone(),
                     network_name: name.to_string(),
                     state: Arc::clone(&state),
                     net_pubkey: network_key,

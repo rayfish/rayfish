@@ -614,8 +614,8 @@ async fn build_daemon_inner(
     let networks = Arc::new(DashMap::new());
     // Daemon-wide disconnect channel: every per-connection data reader reports
     // peer drops here, drained by the single connection supervisor. Built here
-    // (before the registry) so both the registry's MeshCtx builder and the
-    // Daemon literal share the one sender.
+    // (before the registry) so the registry and the Daemon literal share the
+    // one sender.
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
     let pruned_peers = Arc::new(DashSet::new());
     let registry = Arc::new(NetworkRegistry::new(
@@ -705,8 +705,7 @@ async fn build_daemon_inner(
     // support. No separate reaper task.
 
     // Install the daemon-wide mesh dispatch context and spawn the protocol Router
-    // *before* building the Daemon. The dispatch is built from the registry (the
-    // single `MeshCtx` builder), and the Router only needs the services
+    // *before* building the Daemon. The dispatch holds the registry, and the Router only needs the services
     // (registry/files/connect/blobs), not the Daemon struct, so ordering it here
     // lets `router` be a plain owned field instead of a set-after-construction
     // `Option`. Dispatch must be installed before the accept loop starts handing

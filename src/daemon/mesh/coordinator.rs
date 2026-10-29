@@ -505,9 +505,7 @@ impl NetworkRegistry {
             {
                 continue;
             }
-            let conn_changed = self
-                .mesh_ctx()
-                .register_peer_conn(&conn, peer_id, &t.network);
+            let conn_changed = self.register_peer_conn(&conn, peer_id, &t.network);
             if conn_changed
                 && self
                     .peers
@@ -678,7 +676,7 @@ const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 
 /// [`finalize_removal`] so several removals collapse into one publish. Shared by
 /// the manual kick handler and the ephemeral pruner.
 pub(crate) async fn remove_member_roster_only(
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     network: &str,
     state: &SharedNetworkState,
     member_id: EndpointId,
@@ -689,8 +687,8 @@ pub(crate) async fn remove_member_roster_only(
         s.approved.remove(&member_id);
     }
     dns::remove_hostname_by_ip(
-        &ctx.hostname_table,
-        &ctx.reverse_table,
+        &registry.dns.hostname_table,
+        &registry.dns.reverse_table,
         network,
         derive_ipv6(&member_id),
     )
@@ -703,7 +701,7 @@ pub(crate) async fn remove_member_roster_only(
 /// [`remove_member_roster_only`] edits. Other members drop removed peers when they
 /// reconverge from the freshly published record (`prune_departed_peers`).
 pub(crate) async fn finalize_removal(
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     network: &str,
     state: &SharedNetworkState,
     dht_notify: &Option<Arc<tokio::sync::Notify>>,
@@ -715,20 +713,21 @@ pub(crate) async fn finalize_removal(
     // Revoke local authorization before any publication or broadcast I/O. The
     // roster has already been edited, so new hellos are rejected; removing the
     // route here also stops data on an existing connection immediately.
-    for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
-        let resolved = ctx.device_user_map.resolve(&pid);
+    for (pid, ip, conn) in registry.peers.peers_for_network_with_conn(network) {
+        let resolved = registry.device_user_map.resolve(&pid);
         if removed_members
             .iter()
             .any(|removed| *removed == pid || *removed == resolved)
         {
             let close_after_notice =
-                revoke_peer_network(&ctx.peers, &ctx.pruned_peers, network, pid, ip).is_some();
+                revoke_peer_network(&registry.peers, &registry.pruned_peers, network, pid, ip)
+                    .is_some();
             removed_connections.push((conn, close_after_notice));
         }
     }
 
-    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
-    broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
+    update_snapshot_and_publish(state, &registry.transport.blob_store, dht_notify).await;
+    broadcast_member_sync(registry, net_pubkey, network, None).await;
     for (conn, close_after_notice) in removed_connections {
         // Authoritative, network-scoped kick: tell the removed member in-band so
         // it can confirm against the signed record and leave just this network (a
@@ -757,7 +756,7 @@ pub(crate) async fn finalize_removal(
 /// config each tick so `ray ephemeral` takes effect without a restart. Reuses
 /// the exact kick teardown, batched into one publish per sweep.
 pub(crate) fn spawn_stale_member_pruner(
-    ctx: MeshCtx,
+    registry: Arc<NetworkRegistry>,
     network: String,
     state: SharedNetworkState,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
@@ -782,8 +781,8 @@ pub(crate) fn spawn_stale_member_pruner(
             };
             let Some(ttl) = ttl else { continue };
             let now = crate::membership::now_secs();
-            let me = ctx.identity.local_identity();
-            let connected: std::collections::HashSet<EndpointId> = ctx
+            let me = registry.transport.identity.local_identity();
+            let connected: std::collections::HashSet<EndpointId> = registry
                 .peers
                 .peers_for_network_with_conn(&network)
                 .into_iter()
@@ -812,10 +811,10 @@ pub(crate) fn spawn_stale_member_pruner(
                 continue;
             }
             for id in &removed_members {
-                remove_member_roster_only(&ctx, &network, &state, *id).await;
+                remove_member_roster_only(&registry, &network, &state, *id).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
-            finalize_removal(&ctx, &network, &state, &dht_notify, &removed_members).await;
+            finalize_removal(&registry, &network, &state, &dht_notify, &removed_members).await;
         }
     })
 }

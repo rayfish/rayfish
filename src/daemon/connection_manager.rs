@@ -18,11 +18,11 @@ use std::sync::Weak;
 
 use super::*;
 
-/// Daemon-wide dispatch context the driver needs: the registry each
-/// connection's [`MeshCtx`] is built from (it carries `tun_tx` + the disconnect
-/// sender a [`MeshConnection`] uses to report a drop) plus the cancellation
-/// token. Set once after construction via a `OnceLock`, because the
-/// router/connection-manager are built before the daemon that owns the ctx.
+/// Daemon-wide dispatch context the driver needs: the registry (it carries
+/// `tun_tx` + the disconnect sender a [`MeshConnection`] uses to report a drop)
+/// plus the cancellation token. Set once after construction via a `OnceLock`,
+/// because the router/connection-manager are built before the daemon that owns
+/// the registry.
 ///
 /// The registry is held weakly: it owns this manager, so a strong reference
 /// here would keep both alive after the daemon is dropped, which leaks a whole
@@ -126,7 +126,7 @@ impl ConnectionManager {
         MeshConnection::new(
             conn,
             Arc::clone(&self),
-            registry.mesh_ctx(),
+            registry,
             mesh.token.clone(),
             pre_registered,
         )

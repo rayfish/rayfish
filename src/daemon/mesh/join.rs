@@ -142,13 +142,9 @@ pub(crate) async fn join_mesh_shared(
     initial_conn: Connection,
     ep: &Endpoint,
     network_name: &str,
-    ctx: MeshCtx,
+    registry: Arc<NetworkRegistry>,
     params: JoinParams,
     token: CancellationToken,
-    // The network-owning service: the per-peer control reader calls
-    // `registry.promote_to_coordinator` on itself after persisting an
-    // `AdminGrant` key (was the `promote_tx` hand-off to the daemon loop).
-    registry: Arc<NetworkRegistry>,
     // Guards the single-use invite ledger. Shared with the NetworkHandle so the
     // member accept handler's `InviteShare`/`InviteUsed` handling (a co-coordinator
     // learning of invites it didn't mint) is serialized with mint/redeem.
@@ -157,15 +153,6 @@ pub(crate) async fn join_mesh_shared(
     // per-connection demux dispatches control frames (incl. ping/pong).
     protocol_router: Arc<ProtocolRouter>,
 ) -> Result<JoinResult> {
-    // A whole-bundle clone for the debounced reconverge worker, which forwards
-    // the ctx straight to `reconverge_and_apply`.
-    let worker_ctx = ctx.clone();
-    let MeshCtx {
-        identity,
-        peers,
-        blob_store,
-        ..
-    } = ctx;
     let JoinParams {
         my_hostname,
         net_pubkey,
@@ -177,7 +164,7 @@ pub(crate) async fn join_mesh_shared(
         initial,
         dial_claim,
     } = params;
-    let my_identity = identity.local_identity();
+    let my_identity = registry.transport.identity.local_identity();
     let join_certificate_issuer = if initial
         && invite_secret.is_none()
         && !group_blob
@@ -195,8 +182,8 @@ pub(crate) async fn join_mesh_shared(
         ep,
         &registry.transport.pkarr_relay_url,
         network_name,
-        &blob_store,
-        &peers,
+        &registry.transport.blob_store,
+        &registry.peers,
         net_pubkey,
         my_identity,
         initial,
@@ -226,8 +213,8 @@ pub(crate) async fn join_mesh_shared(
         if let Some(DirectAdmission { record, .. }) = direct {
             let data = fetch_verified_blob(
                 ep,
-                &blob_store,
-                &peers,
+                &registry.transport.blob_store,
+                &registry.peers,
                 record.hash,
                 network_name,
                 &record.seeds,
@@ -279,7 +266,7 @@ pub(crate) async fn join_mesh_shared(
         suggested_firewall,
         reusable_keys,
         nullifiers,
-        &blob_store,
+        &registry.transport.blob_store,
         direct_key.as_ref(),
         record_ts,
         exact_group_hash,
@@ -294,7 +281,7 @@ pub(crate) async fn join_mesh_shared(
         token.clone(),
         Arc::clone(&live_state),
         network_name.to_string(),
-        worker_ctx.clone(),
+        registry.clone(),
         ep.clone(),
         net_pubkey,
         device_cert.clone(),
@@ -307,7 +294,6 @@ pub(crate) async fn join_mesh_shared(
     protocol_router.register(
         net_pubkey,
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx: worker_ctx.clone(),
             network_name: network_name.to_string(),
             state: Arc::clone(&live_state),
             net_pubkey,
@@ -323,7 +309,7 @@ pub(crate) async fn join_mesh_shared(
     // rest of the roster the same way (one connection per peer identity).
     crate::spawn_path_logger(initial_conn.clone(), remote_id.fmt_short().to_string());
     register_dialed_peer(
-        &worker_ctx,
+        &registry,
         &protocol_router,
         initial_conn,
         remote_id,
@@ -338,9 +324,8 @@ pub(crate) async fn join_mesh_shared(
         my_identity,
         remote_id,
         &device_cert,
-        &worker_ctx,
-        &protocol_router,
         &registry,
+        &protocol_router,
     )
     .await
     {
@@ -363,19 +348,19 @@ pub(crate) async fn join_mesh_shared(
 /// can decode our tagged datagrams. Shared by the coordinator connection and each
 /// roster peer.
 pub(crate) async fn register_dialed_peer(
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     router: &Arc<ProtocolRouter>,
     conn: Connection,
     peer_id: EndpointId,
     network_name: &str,
 ) {
-    let conn_changed = ctx.register_peer_conn(&conn, peer_id, network_name);
+    let conn_changed = registry.register_peer_conn(&conn, peer_id, network_name);
     if conn_changed {
         let router = Arc::clone(router);
         let dconn = conn.clone();
         tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
     }
-    announce_network_handles(&ctx.peers, &conn, derive_ipv6(&peer_id)).await;
+    announce_network_handles(&registry.peers, &conn, derive_ipv6(&peer_id)).await;
 }
 
 /// Persist this network's membership to config after a successful handshake.
@@ -572,9 +557,8 @@ async fn connect_to_roster_peers(
     my_identity: EndpointId,
     skip_id: EndpointId,
     device_cert: &Option<control::DeviceCert>,
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     router: &Arc<ProtocolRouter>,
-    registry: &NetworkRegistry,
 ) -> Result<()> {
     for member in members {
         if member.identity == my_identity || member.identity == skip_id {
@@ -599,7 +583,7 @@ async fn connect_to_roster_peers(
                     tracing::warn!(peer = %member.identity.fmt_short(), error = %error, "mesh peer hello did not complete");
                     continue;
                 }
-                register_dialed_peer(ctx, router, conn, member.identity, network_name).await;
+                register_dialed_peer(registry, router, conn, member.identity, network_name).await;
                 drop(claim);
                 tracing::info!(peer_ip = %derive_ipv6(&member.identity), "connected to mesh peer");
             }
@@ -808,7 +792,7 @@ pub(crate) fn spawn_reconverge_worker(
     token: CancellationToken,
     live_state: SharedNetworkState,
     network_name: String,
-    ctx_w: MeshCtx,
+    registry_w: Arc<NetworkRegistry>,
     endpoint_w: Endpoint,
     net_pubkey_w: EndpointId,
     device_cert_w: Option<control::DeviceCert>,
@@ -830,7 +814,7 @@ pub(crate) fn spawn_reconverge_worker(
                     // not reflect yet (its delivery missed every coordinator).
                     // Otherwise idle until the next real trigger.
                     if !has_pending_hostname(&network_name)
-                        && !ctx_w.registry.exit_offer_out_of_sync(&network_name)
+                        && !registry_w.exit_offer_out_of_sync(&network_name)
                     {
                         continue;
                     }
@@ -849,7 +833,7 @@ pub(crate) fn spawn_reconverge_worker(
             }
             reconverge_and_apply(
                 &endpoint_w,
-                &ctx_w,
+                &registry_w,
                 net_pubkey_w,
                 &network_name,
                 &live_state,

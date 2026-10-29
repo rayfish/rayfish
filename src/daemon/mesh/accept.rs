@@ -4,7 +4,7 @@
 //! queues joiners; `MemberAcceptState` welcomes approved members), the
 //! `AcceptHandler` enum the router dispatches through, and the `ProtocolRouter`
 //! that fans incoming connections out by ALPN (mesh handlers plus the
-//! `blobs`/`files`/`pair`/`connect` arms). `MeshCtx` and the roster-projection
+//! `blobs`/`files`/`pair`/`connect` arms). The roster-projection
 //! helpers stay in `daemon/mod.rs` since they are shared infrastructure.
 
 use std::fmt;
@@ -286,7 +286,7 @@ pub(crate) fn check_hello_identity(
 }
 
 pub(crate) struct CoordinatorAcceptState {
-    pub(crate) ctx: MeshCtx,
+    pub(crate) registry: Arc<NetworkRegistry>,
     pub(crate) network_name: String,
     pub(crate) state: SharedNetworkState,
     pub(crate) dht_notify: Option<Arc<tokio::sync::Notify>>,
@@ -388,8 +388,7 @@ impl CoordinatorAcceptState {
             // (roster + republish) without disturbing the networks it still shares
             // with us over the same connection.
             ControlMsg::LeaveNetwork => {
-                self.ctx
-                    .registry
+                self.registry
                     .handle_member_leave(&self.network_name, peer_id)
                     .await;
                 None
@@ -438,7 +437,7 @@ impl CoordinatorAcceptState {
                 .await;
                 return None;
             }
-            self.ctx
+            self.registry
                 .device_user_map
                 .insert(remote_id, cert.user_identity);
         }
@@ -482,8 +481,11 @@ impl CoordinatorAcceptState {
                 // A device cert signed by this coordinator's own owner identity is
                 // one of our own paired devices: admit directly (no approval step).
                 // The same for a device of any seated member: see `member_admits`.
-                let admits = owner_admits(device_cert.as_ref(), self.ctx.identity.local_identity())
-                    || member_admits(device_cert.as_ref(), &self.state.read().unwrap().members);
+                let admits =
+                    owner_admits(
+                        device_cert.as_ref(),
+                        self.registry.transport.identity.local_identity(),
+                    ) || member_admits(device_cert.as_ref(), &self.state.read().unwrap().members);
                 if admits {
                     return self
                         .admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
@@ -505,7 +507,7 @@ impl CoordinatorAcceptState {
                         if let Some(dropped) =
                             evict_oldest_pending(&mut s.pending, remote_id, MAX_PENDING_JOINS)
                         {
-                            self.ctx.stats.record_pending_join_eviction();
+                            self.registry.transport.stats.record_pending_join_eviction();
                             tracing::warn!(
                                 evicted = %dropped.fmt_short(),
                                 "pending-join queue full; evicted oldest request"
@@ -595,7 +597,6 @@ impl CoordinatorAcceptState {
         // cannot reproduce the exact signed grant yet, make this attempt fail so
         // the restore/join supervisor retries it.
         let record = self
-            .ctx
             .registry
             .current_signed_record(&self.network_name)
             .await;
@@ -665,7 +666,7 @@ impl CoordinatorAcceptState {
             // stream. Its membership is already known, so keep the reconnect.
             tracing::debug!(peer = %remote_id.fmt_short(), error = %e, "failed to reply Welcome to registered member; continuing reconnect");
         }
-        self.ctx
+        self.registry
             .register_peer_conn(conn, remote_id, &self.network_name);
 
         // Hand this (re)connecting member our current signed record over the mesh
@@ -711,22 +712,24 @@ impl CoordinatorAcceptState {
             changed
         };
         if let Some(user_identity) = user_identity {
-            self.ctx.device_user_map.insert(remote_id, user_identity);
+            self.registry
+                .device_user_map
+                .insert(remote_id, user_identity);
         } else {
-            self.ctx.device_user_map.remove(&remote_id);
+            self.registry.device_user_map.remove(&remote_id);
         }
 
         let Some(desired) = valid_claim(remote_id, hostname) else {
             if cert_changed {
-                commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
-                drop(commit_guard);
-                broadcast_member_sync(
-                    &self.ctx.registry,
-                    self.net_pubkey(),
-                    &self.network_name,
-                    None,
+                commit_current_snapshot(
+                    &self.state,
+                    &self.registry.transport.blob_store,
+                    &self.dht_notify,
                 )
                 .await;
+                drop(commit_guard);
+                broadcast_member_sync(&self.registry, self.net_pubkey(), &self.network_name, None)
+                    .await;
             }
             return Some(peer_ip);
         };
@@ -753,21 +756,26 @@ impl CoordinatorAcceptState {
             }
         }
         if changed || cert_changed {
-            commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+            commit_current_snapshot(
+                &self.state,
+                &self.registry.transport.blob_store,
+                &self.dht_notify,
+            )
+            .await;
         }
         drop(commit_guard);
 
         // Re-assert this peer's DNS entry (idempotent).
         dns::remove_hostname_by_ip(
-            &self.ctx.hostname_table,
-            &self.ctx.reverse_table,
+            &self.registry.dns.hostname_table,
+            &self.registry.dns.reverse_table,
             &self.network_name,
             derive_ipv6(&remote_id),
         )
         .await;
         dns::update_hostname(
-            &self.ctx.hostname_table,
-            &self.ctx.reverse_table,
+            &self.registry.dns.hostname_table,
+            &self.registry.dns.reverse_table,
             &self.network_name,
             &final_hostname,
             derive_ipv6(&remote_id),
@@ -776,13 +784,8 @@ impl CoordinatorAcceptState {
 
         if changed || cert_changed {
             tracing::info!(peer = %remote_id.fmt_short(), network = %self.network_name, hostname = %final_hostname, "peer membership changed; republishing blob + broadcasting MemberSync");
-            broadcast_member_sync(
-                &self.ctx.registry,
-                self.net_pubkey(),
-                &self.network_name,
-                None,
-            )
-            .await;
+            broadcast_member_sync(&self.registry, self.net_pubkey(), &self.network_name, None)
+                .await;
         }
         Some(peer_ip)
     }
@@ -880,11 +883,11 @@ impl CoordinatorAcceptState {
                     let secret_hash = crate::invite::hash_secret(&secret);
                     let members = self.state.read().unwrap().roster();
                     gossip_to_coordinators(
-                        &self.ctx.peers,
+                        &self.registry.peers,
                         &self.network_name,
                         self.net_pubkey(),
                         &members,
-                        self.ctx.identity.local_identity(),
+                        self.registry.transport.identity.local_identity(),
                         &ControlMsg::InviteUsed {
                             secret_hash: secret_hash.into_bytes(),
                         },
@@ -1021,8 +1024,8 @@ impl CoordinatorAcceptState {
 
         if let Some(ref h) = final_hostname {
             dns::update_hostname(
-                &self.ctx.hostname_table,
-                &self.ctx.reverse_table,
+                &self.registry.dns.hostname_table,
+                &self.registry.dns.reverse_table,
                 &self.network_name,
                 h,
                 derive_ipv6(&remote_id),
@@ -1032,7 +1035,7 @@ impl CoordinatorAcceptState {
 
         let net_pubkey = self.net_pubkey();
         broadcast_control_msg(
-            &self.ctx.peers,
+            &self.registry.peers,
             net_pubkey,
             &self.network_name,
             &ControlMsg::MemberApproved {
@@ -1076,11 +1079,11 @@ impl CoordinatorAcceptState {
         // Register the peer's route + start its single data reader (the accept-side
         // demux already owns this connection's control loop).
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
-        self.ctx
+        self.registry
             .register_peer_conn(conn, remote_id, &self.network_name);
 
         broadcast_member_sync(
-            &self.ctx.registry,
+            &self.registry,
             net_pubkey,
             &self.network_name,
             Some(derive_ipv6(&remote_id)),
@@ -1138,8 +1141,12 @@ impl CoordinatorAcceptState {
             s.members.add(tentative_member.clone());
             (displaced_member, removed_approved, removed_pending)
         };
-        let committed =
-            commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+        let committed = commit_current_snapshot(
+            &self.state,
+            &self.registry.transport.blob_store,
+            &self.dht_notify,
+        )
+        .await;
         if !committed {
             {
                 let mut s = self.state.write().unwrap();
@@ -1153,8 +1160,12 @@ impl CoordinatorAcceptState {
                     s.refresh_snapshot();
                 }
             }
-            let rollback_durable =
-                commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
+            let rollback_durable = commit_current_snapshot(
+                &self.state,
+                &self.registry.transport.blob_store,
+                &self.dht_notify,
+            )
+            .await;
             if rollback_durable {
                 return AdmissionCommit::Denied;
             }
@@ -1175,7 +1186,13 @@ impl CoordinatorAcceptState {
                         published: false,
                     });
             }
-            if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await {
+            if !commit_current_snapshot(
+                &self.state,
+                &self.registry.transport.blob_store,
+                &self.dht_notify,
+            )
+            .await
+            {
                 if let Some(notify) = &self.dht_notify {
                     notify.notify_one();
                 }
@@ -1196,7 +1213,7 @@ impl CoordinatorAcceptState {
             let s = self.state.read().unwrap();
             s.network_secret_key.clone().zip(s.converged_hash)
         };
-        let own_id = self.ctx.registry.transport.endpoint.id();
+        let own_id = self.registry.transport.endpoint.id();
         let signed = target.and_then(|(key, hash)| {
             dht::encode_network_record(&key, &hash, &[own_id])
                 .ok()
@@ -1205,8 +1222,7 @@ impl CoordinatorAcceptState {
         drop(commit_guard);
         let published = match &signed {
             Some((hash, packet)) => {
-                self.ctx
-                    .registry
+                self.registry
                     .publish_signed_group_record(
                         &self.network_name,
                         *hash,
@@ -1326,7 +1342,6 @@ struct Admission {
 }
 
 pub(crate) struct MemberAcceptState {
-    pub(crate) ctx: MeshCtx,
     pub(crate) network_name: String,
     pub(crate) state: SharedNetworkState,
     /// This network's public key, so an `AdminGrant` can be checked against it and
@@ -1519,7 +1534,7 @@ impl MemberAcceptState {
         let device_cert = crate::identity::load_device_cert().ok().flatten();
         let outcome = apply_group_record(
             &self.endpoint,
-            &self.ctx,
+            &self.registry,
             &self.network_name,
             &self.state,
             &device_cert,
@@ -1580,9 +1595,11 @@ impl MemberAcceptState {
             }
         };
         if let Some(user_identity) = binding {
-            self.ctx.device_user_map.insert(transport_id, user_identity);
+            self.registry
+                .device_user_map
+                .insert(transport_id, user_identity);
         } else {
-            self.ctx.device_user_map.remove(&transport_id);
+            self.registry.device_user_map.remove(&transport_id);
         }
         // A cert that earned no binding (revoked on this network) is not written
         // to the roster either, matching the coordinator's `handle_member_hello`.
@@ -1617,15 +1634,15 @@ impl MemberAcceptState {
                     }
                 }
                 dns::update_hostname(
-                    &self.ctx.hostname_table,
-                    &self.ctx.reverse_table,
+                    &self.registry.dns.hostname_table,
+                    &self.registry.dns.reverse_table,
                     &self.network_name,
                     h,
                     derive_ipv6(&peer_identity),
                 )
                 .await;
             }
-            self.ctx
+            self.registry
                 .register_peer_conn(conn, peer_identity, &self.network_name);
             return Some(member_ip);
         }
@@ -1662,7 +1679,7 @@ impl MemberAcceptState {
         if let Some(pending) = pending
             && !persist_group_hash_locked(
                 &self.state,
-                &self.ctx.blob_store,
+                &self.registry.transport.blob_store,
                 &self.network_name,
                 pending.hash,
                 pending.published,
@@ -1699,13 +1716,19 @@ impl MemberAcceptState {
             )
         };
         if let Some(bytes) = snap_bytes {
-            let _ = self.ctx.blob_store.blobs().add_slice(&bytes).await;
+            let _ = self
+                .registry
+                .transport
+                .blob_store
+                .blobs()
+                .add_slice(&bytes)
+                .await;
         }
         drop(commit_guard);
         if let Some(ref h) = final_hostname {
             dns::update_hostname(
-                &self.ctx.hostname_table,
-                &self.ctx.reverse_table,
+                &self.registry.dns.hostname_table,
+                &self.registry.dns.reverse_table,
                 &self.network_name,
                 h,
                 derive_ipv6(&peer_identity),
@@ -1734,10 +1757,10 @@ impl MemberAcceptState {
             tracing::warn!(peer = %peer_identity.fmt_short(), %error, "failed to deliver Welcome");
             return None;
         }
-        self.ctx
+        self.registry
             .register_peer_conn(conn, peer_identity, &self.network_name);
         broadcast_member_sync(
-            &self.ctx.registry,
+            &self.registry,
             self.net_pubkey,
             &self.network_name,
             Some(derive_ipv6(&peer_identity)),
@@ -1796,7 +1819,7 @@ impl MemberAcceptState {
         // The promoted roster must be recoverable before this node can author a
         // record. In particular, do not let the lazy publisher race ahead of the
         // blob-store write and recovery-pointer update.
-        if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await {
+        if !commit_current_snapshot(&self.state, &self.registry.transport.blob_store, &None).await {
             restore_authority();
             anyhow::bail!("promoted roster could not be durably committed");
         }
@@ -1808,7 +1831,9 @@ impl MemberAcceptState {
         .and_then(|net| net.context("admin grant arrived after network config was deleted"));
         if let Err(error) = key_saved {
             restore_authority();
-            if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await {
+            if !commit_current_snapshot(&self.state, &self.registry.transport.blob_store, &None)
+                .await
+            {
                 tracing::error!(network = %self.network_name, "could not persist rolled-back admin grant");
             }
             return Err(error);
@@ -1818,9 +1843,9 @@ impl MemberAcceptState {
         // grants installs one notify-driven publisher in NetworkHandle.tasks and
         // swaps the accept handler. Losers observe the Coordinator role and do
         // nothing, so no detached duplicate publisher survives teardown.
-        let promoted =
-            self.registry
-                .promote_to_coordinator(&self.ctx, &self.network_name, key, pkarr_client);
+        let promoted = self
+            .registry
+            .promote_to_coordinator(&self.network_name, key, pkarr_client);
         anyhow::ensure!(
             promoted
                 || self
@@ -1855,11 +1880,11 @@ impl AcceptHandler {
     /// roster shapes that do key a member by user identity, and it costs one map
     /// read.
     pub(crate) fn knows_sender(&self, peer_id: EndpointId) -> bool {
-        let (state, ctx) = match self {
-            AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
-            AcceptHandler::Member(s) => (&s.state, &s.ctx),
+        let (state, registry) = match self {
+            AcceptHandler::Coordinator(s) => (&s.state, &s.registry),
+            AcceptHandler::Member(s) => (&s.state, &s.registry),
         };
-        let user_id = ctx.device_user_map.resolve(&peer_id);
+        let user_id = registry.device_user_map.resolve(&peer_id);
         let s = state.read().unwrap();
         [peer_id, user_id]
             .iter()
@@ -1884,8 +1909,8 @@ impl AcceptHandler {
 
     fn registry(&self) -> &Arc<NetworkRegistry> {
         match self {
-            AcceptHandler::Coordinator(s) => &s.ctx.registry,
-            AcceptHandler::Member(s) => &s.ctx.registry,
+            AcceptHandler::Coordinator(s) => &s.registry,
+            AcceptHandler::Member(s) => &s.registry,
         }
     }
 
@@ -2811,7 +2836,6 @@ mod signed_record_fast_path_tests {
     async fn an_unfetched_record_does_not_advance_the_floor() {
         let fx = MemberFixture::start().await;
         let handler = MemberAcceptState {
-            ctx: fx.ctx(),
             network_name: NETWORK.to_string(),
             state: Arc::clone(&fx.state),
             net_pubkey: fx.key.public(),
@@ -2836,7 +2860,7 @@ mod signed_record_fast_path_tests {
         };
         let retry = apply_group_record(
             &fx.daemon.transport.endpoint,
-            &handler.ctx,
+            &handler.registry,
             NETWORK,
             &fx.state,
             &None,

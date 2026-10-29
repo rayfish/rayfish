@@ -67,8 +67,8 @@ impl MemberFixture {
         }
     }
 
-    pub(in crate::daemon::mesh) fn ctx(&self) -> MeshCtx {
-        self.daemon.registry.mesh_ctx()
+    pub(in crate::daemon::mesh) fn registry(&self) -> Arc<NetworkRegistry> {
+        Arc::clone(&self.daemon.registry)
     }
 
     /// The live roster with `edit` applied, as the verified blob a coordinator
@@ -90,7 +90,8 @@ impl MemberFixture {
                 &s.nullifiers,
             )
         };
-        self.ctx()
+        self.registry()
+            .transport
             .blob_store
             .blobs()
             .add_slice(&bytes)
@@ -139,13 +140,13 @@ fn laptop(identity: EndpointId) -> Member {
 #[allow(clippy::await_holding_lock)]
 async fn applying_a_record_publishes_dns_and_routes() {
     let fx = MemberFixture::start().await;
-    let ctx = fx.ctx();
+    let registry = fx.registry();
     let peer = SecretKey::generate().public();
     let (blob, hash) = fx.blob_with(|m| m.add(laptop(peer))).await;
     let record = fx.newer_record(hash);
 
     let outcome = commit_group_blob(
-        &ctx,
+        &registry,
         NETWORK,
         &fx.state,
         &None,
@@ -158,7 +159,9 @@ async fn applying_a_record_publishes_dns_and_routes() {
     assert_eq!(outcome, ReconvergeOutcome::Applied);
     let v6 = derive_ipv6(&peer);
     assert_eq!(
-        ctx.hostname_table
+        registry
+            .dns
+            .hostname_table
             .read()
             .await
             .get(NETWORK)
@@ -166,7 +169,7 @@ async fn applying_a_record_publishes_dns_and_routes() {
             .copied(),
         Some(v6)
     );
-    assert!(ctx.route_map.resolve_v6(&v6).is_some());
+    assert!(registry.route_map.resolve_v6(&v6).is_some());
     assert_eq!(
         fx.state.read().unwrap().last_record_timestamp,
         Some(record.timestamp)
@@ -194,7 +197,7 @@ async fn an_older_record_is_refused_on_every_path() {
 
     let outcome = apply_group_record(
         &fx.daemon.transport.endpoint,
-        &fx.ctx(),
+        &fx.registry(),
         NETWORK,
         &fx.state,
         &None,
@@ -228,7 +231,7 @@ async fn a_blob_without_us_departs_instead_of_adopting() {
     let record = fx.newer_record(hash);
 
     let outcome = commit_group_blob(
-        &fx.ctx(),
+        &fx.registry(),
         NETWORK,
         &fx.state,
         &None,

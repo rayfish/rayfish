@@ -33,7 +33,6 @@ async fn rejected_join_certificates_and_destroyed_networks_explain_the_refusal()
     let key = state.read().unwrap().network_public_key;
     let accepting = serve_coordinator(
         &coordinator,
-        &store,
         &registry,
         vec![ServedNetwork {
             key,
@@ -110,7 +109,7 @@ async fn unavailable_network_returns_a_retryable_error_instead_of_dropping_the_j
         IrohIdentityProvider::new(server.id()),
         store.clone(),
     );
-    let accepting = serve_coordinator(&server, &store, &registry, Vec::new());
+    let accepting = serve_coordinator(&server, &registry, Vec::new());
     let connection = client.connect(server.addr(), &alpn).await.unwrap();
     let reply = mesh_request_reply(
         &connection,
@@ -151,11 +150,6 @@ async fn member_replies_to_join_and_invalid_admin_grant() {
     let state = make_network_state();
     state.write().unwrap().members.add(seated(client.id()));
     let key = state.read().unwrap().network_public_key;
-    let ctx = sample_mesh_ctx(
-        IrohIdentityProvider::new(server.id()),
-        store.clone(),
-        Arc::clone(&registry),
-    );
     let manager = Arc::new(ConnectionManager::new());
     manager.set_mesh_dispatch(MeshDispatch {
         registry: Arc::downgrade(&registry),
@@ -165,7 +159,6 @@ async fn member_replies_to_join_and_invalid_admin_grant() {
     manager.register(
         key,
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx,
             network_name: "test-net".to_string(),
             state: Arc::clone(&state),
             net_pubkey: key,
@@ -286,7 +279,6 @@ async fn coordinator_acknowledges_repeated_grants_with_a_durable_key() {
     .unwrap();
     let accepting = serve_coordinator(
         &server,
-        &store,
         &registry,
         vec![ServedNetwork {
             key,
