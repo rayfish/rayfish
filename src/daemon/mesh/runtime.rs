@@ -2098,17 +2098,12 @@ impl Daemon {
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.revert(&tun_name).await;
 
-        #[cfg(target_os = "windows")]
-        if let Err(e) = tun::unroute_peer_range(&tun_name).await {
-            tracing::warn!(error = %format!("{e:#}"), "failed to remove Windows TUN routes");
-        }
+        // Windows keeps Wintun and its overlay route alive in standby. The
+        // forwarding gates drop traffic in both directions; removing the route
+        // would let mesh addresses fall back to the physical default route.
 
-        // A link that will not go down keeps the address and the `200::/7` route,
-        // so the host still routes the overlay into a TUN whose writer is now
-        // dropping everything: peer traffic black-holes instead of failing fast.
-        // Ours to clean up, and pf rules outlive the process: an anchor still
-        // passing an interface that no longer exists is harmless but is state we
-        // left behind.
+        // Remove the macOS packet-filter exception when entering standby,
+        // including paths where lowering the interface fails.
         #[cfg(target_os = "macos")]
         crate::hostfw::remove_tun_passthrough();
 

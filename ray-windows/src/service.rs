@@ -43,7 +43,7 @@ fn open_service(access: u32) -> Result<Option<ServiceHandle>> {
     Ok(Some(ServiceHandle(service)))
 }
 
-fn stopped(service: &ServiceHandle) -> Result<bool> {
+fn status(service: &ServiceHandle) -> Result<SERVICE_STATUS_PROCESS> {
     // SAFETY: SERVICE_STATUS_PROCESS contains only integer fields; zero is valid.
     let mut status: SERVICE_STATUS_PROCESS = unsafe { zeroed() };
     let mut needed = 0;
@@ -61,12 +61,12 @@ fn stopped(service: &ServiceHandle) -> Result<bool> {
     if queried == 0 {
         return Err(IoError::last_os_error()).context("reading Rayfish Windows service state");
     }
-    Ok(status.dwCurrentState == SERVICE_STOPPED)
+    Ok(status)
 }
 
 pub(crate) fn is_stopped() -> Result<bool> {
     match open_service(SERVICE_QUERY_STATUS)? {
-        Some(service) => stopped(&service),
+        Some(service) => Ok(status(&service)?.dwCurrentState == SERVICE_STOPPED),
         None => Ok(true),
     }
 }
@@ -75,7 +75,7 @@ pub(crate) fn ensure_running() -> Result<()> {
     let service = open_service(SERVICE_QUERY_STATUS | SERVICE_START)?.context(
         "The Rayfish Windows service is not installed. Repair the Rayfish installation.",
     )?;
-    if stopped(&service)? {
+    if status(&service)?.dwCurrentState == SERVICE_STOPPED {
         // SAFETY: The service handle grants SERVICE_START. No arguments are supplied.
         if unsafe { StartServiceW(service.0, 0, null_mut()) } == 0 {
             let error = IoError::last_os_error();
@@ -85,4 +85,11 @@ pub(crate) fn ensure_running() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn process_id() -> Result<u32> {
+    let service =
+        open_service(SERVICE_QUERY_STATUS)?.context("The Rayfish service is not installed.")?;
+    Ok(status(&service)?.dwProcessId)
 }

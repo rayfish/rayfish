@@ -8,6 +8,7 @@ use crate::config::QuicEngine;
 use crate::firewall::{Action, FirewallConfig, FirewallRule, PeerFilter, Protocol, RuleOrigin};
 use crate::membership::derive_ipv6;
 use crate::tun::{TUN_MTU, TunRead, TunWrite, UnreadablePacket};
+use futures::FutureExt;
 use iroh::Endpoint;
 use iroh::endpoint::{QuicTransportConfig, presets};
 use smol_str::SmolStr;
@@ -24,12 +25,18 @@ enum Input {
     Processed(oneshot::Sender<()>),
 }
 
-struct FakeTunReader(mpsc::Receiver<Input>);
+struct FakeTunReader {
+    input: mpsc::Receiver<Input>,
+    read_started: mpsc::Sender<()>,
+}
 
 impl TunRead for FakeTunReader {
     async fn read_packet(&mut self) -> Result<Bytes> {
+        // Only two read entries are needed for completion barriers. Tests not
+        // observing the monitor deliberately discard further notifications.
+        let _ = self.read_started.try_send(());
         loop {
-            match self.0.recv().await {
+            match self.input.recv().await {
                 Some(Input::Packet(packet)) => return Ok(packet),
                 Some(Input::Error(error)) => return Err(error),
                 // The loop asks for its next packet only after processing the
@@ -65,6 +72,9 @@ struct Harness {
     table: PeerTable,
     firewall: SharedFirewall,
     stats: Arc<ForwardMetrics>,
+    active: Arc<AtomicBool>,
+    reads_started: mpsc::Receiver<()>,
+    dial_completed: mpsc::Sender<(EndpointId, bool)>,
     input: Option<mpsc::Sender<Input>>,
     output: mpsc::Receiver<Bytes>,
     tun_tx: mpsc::Sender<Bytes>,
@@ -76,6 +86,15 @@ struct Harness {
 
 impl Harness {
     async fn new(engine: QuicEngine, peer_count: usize, config: FirewallConfig) -> Self {
+        Self::prepared(engine, peer_count, config, |_, _, _| {}).await
+    }
+
+    async fn prepared(
+        engine: QuicEngine,
+        peer_count: usize,
+        config: FirewallConfig,
+        before_start: impl FnOnce(Ipv6Addr, &[Peer], &mut PendingDials),
+    ) -> Self {
         let endpoint = test_endpoint(engine).await;
         let local_ipv6 = derive_ipv6(&endpoint.id());
         let table = PeerTable::new().with_engine(engine);
@@ -84,12 +103,14 @@ impl Harness {
         let stats = Arc::new(ForwardMetrics::default());
         let token = CancellationToken::new();
         let (input, packets) = mpsc::channel(16);
+        let (read_started, reads_started) = mpsc::channel(2);
+        let active = Arc::new(AtomicBool::new(true));
         let (tun_tx, tun_rx) = mpsc::channel(16);
         let (written, output) = mpsc::channel(16);
         let writer = spawn_tun_writer(
             FakeTunWriter(written),
             tun_rx,
-            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&active),
             Arc::clone(&stats),
         );
         let mut peers = Vec::new();
@@ -137,9 +158,16 @@ impl Harness {
                 ipv6,
             });
         }
+        let mut pending = PendingDials::new();
+        before_start(local_ipv6, &peers, &mut pending);
+        let dial_completed = pending.notify.clone();
         let forwarder = tokio::spawn(
             MeshForwarder {
-                tun: FakeTunReader(packets),
+                tun: FakeTunReader {
+                    input: packets,
+                    read_started,
+                },
+                active: Arc::clone(&active),
                 local_ipv6,
                 peers: table.clone(),
                 firewall: firewall.clone(),
@@ -152,7 +180,7 @@ impl Harness {
                 tun_tx: tun_tx.clone(),
                 dialer: None,
             }
-            .run(),
+            .run_with_pending(pending),
         );
         Self {
             endpoint,
@@ -161,6 +189,9 @@ impl Harness {
             table,
             firewall,
             stats,
+            active,
+            reads_started,
+            dial_completed,
             input: Some(input),
             output,
             tun_tx,
@@ -361,6 +392,108 @@ fn packet(
     let checksum = if checksum == 0 { 0xffff } else { checksum };
     packet[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
     Bytes::from(packet)
+}
+
+#[tokio::test]
+async fn standby_drops_outbound_packets_and_the_same_reader_resumes() {
+    for engine in ENGINES {
+        let h = Harness::new(engine, 1, policy(Action::Allow, vec![])).await;
+        h.active.store(false, Ordering::Release);
+        let blocked = packet(6, h.local_ipv6, h.peers[0].ipv6, 50000, 443, 2, 60);
+        h.inject(blocked).await;
+        assert_eq!(h.stats.packets_tx.get(), 0);
+        assert!(
+            h.peers[0]
+                .remote_conn
+                .read_datagram()
+                .now_or_never()
+                .is_none()
+        );
+        assert!(!h.forwarder.as_ref().unwrap().is_finished());
+
+        h.active.store(true, Ordering::Release);
+        let resumed = packet(6, h.local_ipv6, h.peers[0].ipv6, 50001, 8443, 2, 60);
+        h.inject(resumed.clone()).await;
+        h.receive_peer(0, &resumed).await;
+        assert_eq!(h.stats.packets_tx.get(), 1);
+        h.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_lazy_dial_completion_drops_its_backlog_during_standby() {
+    for engine in ENGINES {
+        let mut h = Harness::prepared(
+            engine,
+            1,
+            policy(Action::Allow, vec![]),
+            |local, peers, pending| {
+                let peer = &peers[0];
+                pending.in_flight.insert(peer.endpoint.id());
+                assert!(pending.buffered.push(
+                    peer.endpoint.id(),
+                    packet(6, local, peer.ipv6, 50000, 443, 2, 60)
+                ));
+            },
+        )
+        .await;
+        h.active.store(false, Ordering::Release);
+        timeout(DEADLINE, h.reads_started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        h.dial_completed
+            .send((h.peers[0].endpoint.id(), true))
+            .await
+            .unwrap();
+        // The next read begins only after the completion branch has drained
+        // the saved packets. No sleep or absence-by-timeout assertion is used.
+        timeout(DEADLINE, h.reads_started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.stats.packets_tx.get(), 0);
+        assert!(
+            h.peers[0]
+                .remote_conn
+                .read_datagram()
+                .now_or_never()
+                .is_none()
+        );
+
+        h.active.store(true, Ordering::Release);
+        let resumed = packet(6, h.local_ipv6, h.peers[0].ipv6, 50001, 8443, 2, 60);
+        h.inject(resumed.clone()).await;
+        h.receive_peer(0, &resumed).await;
+        assert_eq!(
+            h.stats.packets_tx.get(),
+            1,
+            "old backlog must never flush after reactivation"
+        );
+        h.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn standby_does_not_hide_a_genuine_tun_read_failure() {
+    let mut h = Harness::new(QuicEngine::Standalone, 0, policy(Action::Allow, vec![])).await;
+    h.active.store(false, Ordering::Release);
+    h.input
+        .as_ref()
+        .unwrap()
+        .send(Input::Error(
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "example adapter removed")
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let error = timeout(DEADLINE, h.forwarder.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("example adapter removed"));
+    h.shutdown().await;
 }
 
 #[tokio::test]

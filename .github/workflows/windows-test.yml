@@ -12,6 +12,62 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Prepare diagnostic sanitizer
+        if: always()
+        shell: pwsh
+        run: |
+          @'
+          function ConvertTo-SafeDiagnostic {
+            param([Parameter(ValueFromPipeline=$true)][AllowEmptyString()][string]$Text)
+            process {
+              $text = [regex]::Replace($Text, '\x1B\[[0-?]*[ -/]*[@-~]', '')
+              $roots = @(
+                @{Value=$env:GITHUB_WORKSPACE; Label='<workspace>'},
+                @{Value=$env:RUNNER_TEMP; Label='<temp>'},
+                @{Value=$env:RUNNER_WORKSPACE; Label='<runner-workspace>'},
+                @{Value=$env:USERPROFILE; Label='<user-profile>'},
+                @{Value=(Join-Path $env:WINDIR 'System32\config\systemprofile'); Label='<service-profile>'}
+              )
+              foreach ($root in ($roots | Sort-Object { $_.Value.Length } -Descending)) {
+                if (-not $root.Value) { continue }
+                foreach ($value in @($root.Value, $root.Value.Replace('\', '/'))) {
+                  $text = [regex]::Replace($text, [regex]::Escape($value), $root.Label, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                }
+              }
+              foreach ($identity in @(@{Value=$env:COMPUTERNAME; Label='<host>'}, @{Value=$env:USERNAME; Label='<user>'})) {
+                if ($identity.Value) {
+                  $pattern = '(?<![\w-])' + [regex]::Escape($identity.Value) + '(?![\w-])'
+                  $text = [regex]::Replace($text, $pattern, $identity.Label, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                }
+              }
+              $text = [regex]::Replace($text, '(?<!\w)(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*(?:%[\w.-]+)?(?!\w)', [Text.RegularExpressions.MatchEvaluator]{
+                param($candidate)
+                $address = $null
+                $value = $candidate.Value.Split('%')[0]
+                if ([Net.IPAddress]::TryParse($value, [ref]$address) -and $address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) { return '<ipv6>' }
+                if ($value.EndsWith(':') -and [Net.IPAddress]::TryParse($value.Substring(0, $value.Length - 1), [ref]$address) -and $address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) { return '<ipv6>:' }
+                return $candidate.Value
+              }, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+              $octet = '(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)'
+              $text = [regex]::Replace($text, "(?<![\w.])$octet(?:\.$octet){3}(?!\w|\.\d)", '<ipv4>')
+              [regex]::Replace($text, '(\[<ipv6>\]|<ipv[46]>)(?::\d{1,5})?', [Text.RegularExpressions.MatchEvaluator]{
+                param($candidate)
+                if ($candidate.Value.Contains('<ipv6>')) { return '<ipv6>' }
+                return '<ipv4>'
+              })
+            }
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'safe-diagnostics.ps1')
+          . (Join-Path $env:RUNNER_TEMP 'safe-diagnostics.ps1')
+          $v4 = [Net.IPAddress]::Loopback.ToString()
+          $v6 = [Net.IPAddress]::IPv6Loopback.ToString()
+          $sample = "2026-01-02T03:04:05Z ipv4=$v4 ipv6=[$v6]:1234 UnexpectedEof ExitCode=1067"
+          $expected = '2026-01-02T03:04:05Z ipv4=<ipv4> ipv6=<ipv6> UnexpectedEof ExitCode=1067'
+          if ((ConvertTo-SafeDiagnostic $sample) -ne $expected) { throw 'Diagnostic address redaction failed.' }
+          foreach ($value in @($env:COMPUTERNAME, $env:USERNAME, $env:USERPROFILE, $env:GITHUB_WORKSPACE, $env:RUNNER_TEMP)) {
+            if ($value -and (ConvertTo-SafeDiagnostic $value) -eq $value) { throw 'Diagnostic identity or path redaction failed.' }
+          }
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -73,7 +129,10 @@ jobs:
       - name: Test installed service IPC
         shell: pwsh
         timeout-minutes: 10
+        env:
+          RUST_BACKTRACE: '1'
         run: |
+          . (Join-Path $env:RUNNER_TEMP 'safe-diagnostics.ps1')
           $msiPath = Join-Path $env:RUNNER_TEMP 'ray-windows-x86_64.msi'
           $installLog = Join-Path $env:RUNNER_TEMP 'rayfish-install.log'
           $arguments = @('/i', "`"$msiPath`"", '/qn', '/norestart', '/L*v', "`"$installLog`"")
@@ -84,9 +143,9 @@ jobs:
             }
           } catch {
             if (Test-Path -LiteralPath $installLog) {
-              Get-Content -LiteralPath $installLog -Tail 80
+              Get-Content -LiteralPath $installLog -Tail 80 | ConvertTo-SafeDiagnostic
             }
-            throw
+            throw (ConvertTo-SafeDiagnostic $_.Exception.Message)
           }
           $service = Get-Service -Name rayfish -ErrorAction Stop
           try {
@@ -99,8 +158,102 @@ jobs:
           } finally {
             $service.Dispose()
           }
-          cargo test -q -p ray-windows --locked --target x86_64-pc-windows-msvc installed_service_smoke -- --ignored --test-threads=1
+          cargo test -q -p ray-windows --locked --target x86_64-pc-windows-msvc installed_service_smoke -- --ignored --test-threads=1 2>&1 | ConvertTo-SafeDiagnostic
           if ($LASTEXITCODE -ne 0) { throw 'The installed-service IPC smoke test failed.' }
+          try {
+            $adapter = Get-NetAdapter -Name 'rayfish' -ErrorAction Stop | Select-Object -First 1
+            $route = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '200::/7' -InterfaceIndex $adapter.ifIndex -PolicyStore ActiveStore -ErrorAction Stop |
+              Select-Object -First 1
+          } catch {
+            throw 'The installed service did not retain its tunnel and mesh route in standby.'
+          }
+          if ($adapter.Status -ne 'Up' -or -not $route) {
+            throw 'The installed service did not retain its tunnel and mesh route in standby.'
+          }
+
+      - name: Collect service failure diagnostics
+        if: failure()
+        continue-on-error: true
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'safe-diagnostics.ps1')
+          $diagnostics = Join-Path $env:RUNNER_TEMP 'windows-service-diagnostics'
+          New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
+          function Save-Diagnostic($name, [scriptblock]$read) {
+            try {
+              & $read | Out-String -Width 240 | ConvertTo-SafeDiagnostic | Tee-Object -FilePath (Join-Path $diagnostics "$name.txt")
+            } catch {
+              "${name}: $($_.Exception.Message)" | ConvertTo-SafeDiagnostic | Tee-Object -FilePath (Join-Path $diagnostics "$name.txt")
+            }
+          }
+          Save-Diagnostic 'service' {
+            Get-CimInstance Win32_Service -Filter "Name='rayfish'" -OperationTimeoutSec 15 |
+              Select-Object Name, State, Status, StartMode, ProcessId, ExitCode, ServiceSpecificExitCode, PathName |
+              Format-List
+          }
+          $since = (Get-Date).AddMinutes(-20)
+          Save-Diagnostic 'service-events' {
+            Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Service Control Manager'; StartTime=$since} -MaxEvents 100 |
+              Where-Object Message -Match 'rayfish' | Select-Object -First 20 TimeCreated, Id, LevelDisplayName, Message | Format-List
+          }
+          Save-Diagnostic 'application-events' {
+            Get-WinEvent -FilterHashtable @{LogName='Application'; Level=1,2,3; StartTime=$since} -MaxEvents 100 |
+              Where-Object Message -Match 'rayfish|ray\.exe|wintun' | Select-Object -First 20 TimeCreated, Id, ProviderName, Message | Format-List
+          }
+          $logRoots = @(
+            @{Name='system-profile'; Path=(Join-Path $env:WINDIR 'System32\config\systemprofile\AppData\Roaming\rayfish\logs')},
+            @{Name='programdata'; Path=(Join-Path $env:PROGRAMDATA 'rayfish\logs')},
+            @{Name='current-user'; Path=(Join-Path $env:APPDATA 'rayfish\logs')}
+          )
+          foreach ($root in $logRoots) {
+            try {
+              if (-not (Test-Path -LiteralPath $root.Path)) { continue }
+              $destination = Join-Path $diagnostics $root.Name
+              New-Item -ItemType Directory -Force -Path $destination | Out-Null
+              $logs = Get-ChildItem -LiteralPath $root.Path -File |
+                Where-Object { $_.Name -eq 'panic.log' -or $_.Name -like 'rayfish.log*' } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 4
+              foreach ($log in $logs) {
+                $safeLog = Join-Path $destination "$($log.Name).txt"
+                Get-Content -LiteralPath $log.FullName -Raw | ConvertTo-SafeDiagnostic | Set-Content -LiteralPath $safeLog
+                Write-Output "$($root.Name)/$($log.Name)"
+                Get-Content -LiteralPath $safeLog -Tail 120
+              }
+            } catch {
+              $_.Exception.Message | ConvertTo-SafeDiagnostic | Write-Warning
+            }
+          }
+
+      - name: Preserve compiled test bundle
+        if: always()
+        shell: pwsh
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'safe-diagnostics.ps1')
+          $bundle = Join-Path $env:RUNNER_TEMP 'windows-test-debug'
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+          Get-Item -Path "$env:RUNNER_TEMP\ray-windows-x86_64.msi*", "$env:RUNNER_TEMP\windows-service-diagnostics" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $bundle -Recurse
+          $installLog = Join-Path $env:RUNNER_TEMP 'rayfish-install.log'
+          if (Test-Path -LiteralPath $installLog) {
+            Get-Content -LiteralPath $installLog -Raw | ConvertTo-SafeDiagnostic |
+              Set-Content -LiteralPath (Join-Path $bundle 'rayfish-install.txt')
+          }
+          $test = Get-ChildItem -Path 'target\x86_64-pc-windows-msvc\debug\deps\rayfish_app-*.exe' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($test) { Copy-Item -LiteralPath $test.FullName -Destination (Join-Path $bundle 'smoke-test.exe') }
+          @{sourceCommit=$env:GITHUB_SHA; sourceRunId=$env:GITHUB_RUN_ID; smokeTestPresent=[bool]$test} |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $bundle 'build.json')
+
+      - name: Upload compiled test bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-test-debug
+          path: ${{ runner.temp }}/windows-test-debug
+          if-no-files-found: warn
+          compression-level: 1
+          retention-days: 3
 
       - name: Upload test installer
         uses: actions/upload-artifact@v7

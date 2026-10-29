@@ -32,6 +32,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: Disconnect keeps the service and saved memberships alive instead of
+  terminating the Wintun session. Standby blocks VPN traffic in both directions.
 - Windows: the app talks directly to the service over typed IPC, starts a stopped
   service, and shows connection errors without replacing saved networks with an
   empty list.

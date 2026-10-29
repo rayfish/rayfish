@@ -528,15 +528,20 @@ fn wintun_library_path() -> PathBuf {
 const WINDOWS_PEER_ROUTES: [(&str, &str); 1] = [("200::/7", "::")];
 
 #[cfg(target_os = "windows")]
-fn windows_link_args(tun_name: &str, up: bool) -> [String; 5] {
-    let state = if up { "enabled" } else { "disabled" };
-    [
+fn windows_link_args(tun_name: &str, up: bool) -> Option<[String; 5]> {
+    // Disabling a live Wintun adapter terminates its session and reader. Standby
+    // keeps that session open, pins overlay traffic to the adapter, withdraws
+    // DNS, and gates forwarding instead of allowing a physical-route fallback.
+    if !up {
+        return None;
+    }
+    Some([
         "interface".to_owned(),
         "set".to_owned(),
         "interface".to_owned(),
         format!("name={tun_name}"),
-        format!("admin={state}"),
-    ]
+        "admin=enabled".to_owned(),
+    ])
 }
 
 #[cfg(target_os = "windows")]
@@ -931,9 +936,9 @@ pub async fn set_link_up(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, true).await
 }
 
-/// Bring the TUN interface administratively down (standby). The underlying file
-/// descriptor stays open, so the device can be brought back up without
-/// recreating it.
+/// Put the owned TUN on standby without closing its session. Windows keeps its
+/// adapter up and gates forwarding, because disabling Wintun ends the reader;
+/// the other desktop platforms can lower the link without losing the device.
 #[cfg(not(embedded_tun))]
 pub async fn set_link_down(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, false).await
@@ -989,7 +994,9 @@ async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let args = windows_link_args(tun_name, up);
+        let Some(args) = windows_link_args(tun_name, up) else {
+            return Ok(());
+        };
         let output = crate::windows_process::WindowsProcessRunner::default()
             .output("netsh.exe", args)
             .await
@@ -1274,8 +1281,8 @@ mod tests {
     /// touching the machine's routing table at large.
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_link_args_cover_up_down_and_name_boundary() {
-        let up = super::windows_link_args("Rayfish Tunnel", true);
+    fn windows_link_args_enable_the_adapter_but_preserve_its_session_on_standby() {
+        let up = super::windows_link_args("Rayfish Tunnel", true).unwrap();
         assert_eq!(
             up,
             [
@@ -1287,9 +1294,17 @@ mod tests {
             ]
         );
 
-        let down = super::windows_link_args("O'Brien", false);
-        assert_eq!(down[3], "name=O'Brien");
-        assert_eq!(down[4], "admin=disabled");
+        let quoted = super::windows_link_args("O'Brien", true).unwrap();
+        assert_eq!(quoted[3], "name=O'Brien");
+        assert!(super::windows_link_args("Rayfish Tunnel", false).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_standby_does_not_require_disabling_an_adapter() {
+        super::set_link_down("nonexistent-test-adapter")
+            .await
+            .unwrap();
     }
 
     #[cfg(target_os = "windows")]

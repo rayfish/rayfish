@@ -1208,11 +1208,13 @@ impl Daemon {
             // idle-closes.
             let dialer = Some(Arc::clone(&self.registry));
             let local_ipv6 = self.transport.identity.local_ipv6();
+            let active = Arc::clone(&self.active);
             let fatal = Arc::clone(&self.fatal);
             let shutdown = self.shutdown_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = (forward::MeshForwarder {
                     tun: reader,
+                    active,
                     local_ipv6,
                     peers,
                     firewall,

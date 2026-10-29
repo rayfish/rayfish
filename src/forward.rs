@@ -532,10 +532,30 @@ pub(crate) struct MeshForwarder<R> {
     pub peers: PeerTable,
     pub firewall: SharedFirewall,
     pub token: CancellationToken,
+    pub active: Arc<AtomicBool>,
     pub stats: Arc<ForwardMetrics>,
     pub resolver: Arc<dns::resolver::Resolver>,
     pub tun_tx: mpsc::Sender<Bytes>,
     pub dialer: Option<Arc<NetworkRegistry>>,
+}
+
+struct PendingDials {
+    buffered: LazyDialBuffers,
+    in_flight: HashSet<EndpointId>,
+    completed: mpsc::Receiver<(EndpointId, bool)>,
+    notify: mpsc::Sender<(EndpointId, bool)>,
+}
+
+impl PendingDials {
+    fn new() -> Self {
+        let (notify, completed) = mpsc::channel(64);
+        Self {
+            buffered: LazyDialBuffers::default(),
+            in_flight: HashSet::new(),
+            completed,
+            notify,
+        }
+    }
 }
 
 /// Main TUN read loop. Reads outgoing packets from the TUN device and sends each
@@ -552,12 +572,17 @@ pub(crate) struct MeshForwarder<R> {
 /// dial itself runs off-loop, so a slow handshake never blocks forwarding.
 impl<R: crate::tun::TunRead> MeshForwarder<R> {
     pub(crate) async fn run(self) -> Result<()> {
+        self.run_with_pending(PendingDials::new()).await
+    }
+
+    async fn run_with_pending(self, pending: PendingDials) -> Result<()> {
         let Self {
             mut tun,
             local_ipv6,
             peers,
             firewall,
             token,
+            active,
             stats,
             resolver,
             tun_tx,
@@ -567,9 +592,12 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
         // `LazyDialBuffers` bounds retained bytes and packets both per peer and for
         // the whole daemon, so an offline route cannot make the forwarding task grow
         // without limit during a dial timeout.
-        let mut buffered = LazyDialBuffers::default();
-        let mut in_flight: HashSet<EndpointId> = HashSet::new();
-        let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
+        let PendingDials {
+            mut buffered,
+            mut in_flight,
+            completed: mut done_rx,
+            notify: done_tx,
+        } = pending;
         let dns_queries = Arc::new(Semaphore::new(DNS_QUERIES_MAX_IN_FLIGHT));
         // Client-side exit-node selection (cheap Arc-backed clone), consulted for
         // internet-bound packets. Default (no selection) when there is no registry.
@@ -578,6 +606,7 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             .map(|r| r.exit_client.clone())
             .unwrap_or_default();
         let ctx = SendCtx {
+            active: &active,
             firewall: &firewall,
             peers: &peers,
             stats: &stats,
@@ -606,6 +635,11 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     continue;
                 }
             };
+            // Standby drains the owned TUN instead of closing its reader. A
+            // pinned or stale OS route must not bypass the data-plane gate.
+            if !active.load(Ordering::Acquire) {
+                continue;
+            }
             let n = pkt.len();
             if n == 0 {
                 continue;
@@ -684,6 +718,7 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     ..info
                 };
                 let ctx = SendCtx {
+                    active: &active,
                     firewall: &firewall,
                     peers: &peers,
                     stats: &stats,
@@ -800,6 +835,11 @@ async fn flush_or_drop(
     connected: bool,
     pkts: VecDeque<Bytes>,
 ) {
+    // A completed dial may arrive after Down. Its retained packets must not
+    // bypass the standby gate merely because the control-plane dial succeeded.
+    if !ctx.active.load(Ordering::Acquire) {
+        return;
+    }
     if !connected {
         for _ in &pkts {
             ctx.stats.record_drop(DropReason::NoPeer);
@@ -861,6 +901,7 @@ enum Admission {
 /// Forwarding state for outbound admission, membership checks, counters, and
 /// injecting reject or PMTU replies into the TUN.
 pub(crate) struct SendCtx<'a> {
+    pub active: &'a Arc<AtomicBool>,
     pub firewall: &'a SharedFirewall,
     pub peers: &'a PeerTable,
     pub stats: &'a Arc<ForwardMetrics>,
@@ -878,6 +919,9 @@ async fn prepare_datagrams(
     pkt: Bytes,
     admission: Admission,
 ) -> Option<fragment::Encoded> {
+    if !ctx.active.load(Ordering::Acquire) {
+        return None;
+    }
     let n = pkt.len();
     if info.dst_ip.is_ipv4() && route.refuses_exit_ipv4() {
         ctx.stats.record_drop(DropReason::NoPeer);
@@ -990,7 +1034,9 @@ async fn send_routed(
         return false;
     };
     if let Some(slot) = &route.scheduler {
-        let sender = slot.get_or_init(|| fq_codel::Sender::spawn(route, Arc::clone(ctx.stats)));
+        let sender = slot.get_or_init(|| {
+            fq_codel::Sender::spawn(route, Arc::clone(ctx.active), Arc::clone(ctx.stats))
+        });
         sender.enqueue(info, route.handle, encoded, n);
     } else {
         let datagrams = encoded.datagrams();
@@ -1005,7 +1051,7 @@ async fn send_routed(
 /// is full; QUIC datagrams are intentionally unreliable and the forwarding path
 /// never waits for capacity.
 fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes], packets: &[(usize, usize)]) {
-    if batch.is_empty() {
+    if batch.is_empty() || !ctx.active.load(Ordering::Acquire) {
         return;
     }
     match route.conn.send_many_datagrams(batch) {
@@ -1407,6 +1453,7 @@ mod tests {
         let token = CancellationToken::new();
         let forwarder = MeshForwarder {
             tun: Reader(reader),
+            active: Arc::new(AtomicBool::new(true)),
             local_ipv6,
             peers: PeerTable::default(),
             firewall: SharedFirewall::new(firewall::FirewallConfig::default()),
@@ -1556,6 +1603,7 @@ mod tests {
         let fw = inbound_fw(Action::Allow, vec![]);
         let stats = Arc::new(ForwardMetrics::default());
         let ctx = SendCtx {
+            active: &Arc::new(AtomicBool::new(true)),
             firewall: &fw,
             peers: &peers,
             stats: &stats,
@@ -1671,6 +1719,7 @@ mod tests {
             ..Default::default()
         });
         let ctx = SendCtx {
+            active: &Arc::new(AtomicBool::new(true)),
             firewall: &sender_fw,
             peers: &sender_peers,
             stats: &send_stats,

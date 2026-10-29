@@ -8,9 +8,11 @@
 //! This controls our queue, not queues already built in a router or Wi-Fi link.
 
 use std::collections::VecDeque;
-use std::future::ready;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::{Future, poll_fn, ready};
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::task::Poll;
 use std::time::Duration;
 
 use ahash::RandomState;
@@ -41,15 +43,21 @@ pub(crate) struct Sender {
     hash: RandomState,
     backlog: Arc<AtomicUsize>,
     stats: Arc<ForwardMetrics>,
+    active: Arc<AtomicBool>,
 }
 
 impl Sender {
-    pub(super) fn spawn(route: &PeerRoute, stats: Arc<ForwardMetrics>) -> Self {
+    pub(super) fn spawn(
+        route: &PeerRoute,
+        active: Arc<AtomicBool>,
+        stats: Arc<ForwardMetrics>,
+    ) -> Self {
         let (ingress, rx) = channel(INGRESS_CAPACITY);
         tokio::spawn(run_sender(
             route.conn.clone(),
             route.activity_clock(),
             rx,
+            Arc::clone(&active),
             Arc::clone(&stats),
         ));
         Self {
@@ -57,10 +65,14 @@ impl Sender {
             hash: RandomState::new(),
             backlog: Arc::new(AtomicUsize::new(0)),
             stats,
+            active,
         }
     }
 
     pub(super) fn enqueue(&self, info: &PacketInfo, handle: u16, encoded: Encoded, ip_len: usize) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
         let bytes = encoded.datagrams().iter().map(|p| p.len()).sum::<usize>();
         let Ok(permit) =
             Arc::clone(&BUDGET).try_acquire_many_owned((bytes + PACKET_OVERHEAD) as u32)
@@ -104,6 +116,7 @@ async fn run_sender(
     conn: Connection,
     activity: ActivityClock,
     mut rx: Receiver<Packet>,
+    active: Arc<AtomicBool>,
     stats: Arc<ForwardMetrics>,
 ) {
     let mut queue = Queue::new(Arc::clone(&stats));
@@ -128,14 +141,22 @@ async fn run_sender(
             let Ok(packet) = rx.try_recv() else { break };
             queue.enqueue(packet);
         }
+        if !active.load(Ordering::Acquire) {
+            queue.clear();
+            continue;
+        }
         for _ in 0..SEND_BATCH {
             let Some(packet) = queue.dequeue(Instant::now()) else {
                 break;
             };
-            match send_packet(&conn, &mut rx, &mut queue, &packet).await {
-                Ok(()) => {
+            match send_packet(&conn, &mut rx, &mut queue, &packet, &active).await {
+                Ok(SendOutcome::Sent) => {
                     stats.record_tx(packet.ip_len);
                     activity.touch();
+                }
+                Ok(SendOutcome::Standby) => {
+                    queue.clear();
+                    break;
                 }
                 Err(reason) => {
                     stats.record_drop(reason);
@@ -158,21 +179,30 @@ async fn run_sender(
     }
 }
 
+enum SendOutcome {
+    Sent,
+    Standby,
+}
+
 async fn send_packet(
     conn: &Connection,
     rx: &mut Receiver<Packet>,
     queue: &mut Queue,
     packet: &Packet,
-) -> Result<(), DropReason> {
+    active: &AtomicBool,
+) -> Result<SendOutcome, DropReason> {
+    if !active.load(Ordering::Acquire) {
+        return Ok(SendOutcome::Standby);
+    }
     let frames = packet.encoded.datagrams();
     if conn.datagram_send_buffer_space() >= packet.bytes {
         return match conn.send_many_datagrams(frames) {
-            Ok(n) if n == frames.len() => Ok(()),
+            Ok(n) if n == frames.len() => Ok(SendOutcome::Sent),
             _ => Err(DropReason::SendFailure),
         };
     }
     for frame in frames {
-        let send = conn.send_datagram_wait(frame.clone());
+        let send = while_active(active, conn.send_datagram_wait(frame.clone()));
         tokio::pin!(send);
         let mut incoming_batch = 0;
         loop {
@@ -180,6 +210,7 @@ async fn send_packet(
                 biased;
                 _ = conn.closed() => return Err(DropReason::NoPeer),
                 result = &mut send => {
+                    let Some(result) = result else { return Ok(SendOutcome::Standby); };
                     result.map_err(|_| DropReason::SendFailure)?;
                     break;
                 },
@@ -197,7 +228,19 @@ async fn send_packet(
             }
         }
     }
-    Ok(())
+    Ok(SendOutcome::Sent)
+}
+
+async fn while_active<T>(active: &AtomicBool, send: impl Future<Output = T>) -> Option<T> {
+    let mut send = pin!(send);
+    poll_fn(|cx| {
+        if !active.load(Ordering::Acquire) {
+            Poll::Ready(None)
+        } else {
+            send.as_mut().poll(cx).map(Some)
+        }
+    })
+    .await
 }
 
 struct Packet {
@@ -285,6 +328,17 @@ impl Queue {
             max_packet: QUANTUM as usize,
             stats,
         }
+    }
+
+    fn clear(&mut self) {
+        for flow in &mut self.flows {
+            *flow = Flow::default();
+        }
+        self.new.clear();
+        self.old.clear();
+        self.bytes = 0;
+        self.packets = 0;
+        self.max_packet = QUANTUM as usize;
     }
 
     fn enqueue(&mut self, packet: Packet) {
@@ -418,7 +472,9 @@ impl Queue {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::cell::Cell;
     use std::net::Ipv6Addr;
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     fn packet(bucket: usize, bytes: usize, arrived: Instant) -> Packet {
@@ -438,6 +494,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_sends_drop_their_packet_on_standby_before_transport_capacity_returns() {
+        let active = AtomicBool::new(true);
+        let transmitted = Cell::new(0);
+        let retained = packet(0, 60, Instant::now());
+        let backlog = Arc::clone(&retained.backlog);
+        let (capacity, ready) = oneshot::channel();
+        let send = async {
+            ready.await.unwrap();
+            transmitted.set(transmitted.get() + retained.ip_len);
+            drop(retained);
+        };
+        let guarded = while_active(&active, send);
+        tokio::pin!(guarded);
+        assert!(futures::poll!(guarded.as_mut()).is_pending());
+        active.store(false, Ordering::Release);
+        capacity.send(()).unwrap();
+        assert!(guarded.await.is_none());
+        assert_eq!(transmitted.get(), 0);
+        assert_eq!(backlog.load(Ordering::Relaxed), 0);
+
+        active.store(true, Ordering::Release);
+        assert!(
+            while_active(&active, async {
+                transmitted.set(60);
+            })
+            .await
+            .is_some()
+        );
+        assert_eq!(transmitted.get(), 60);
+    }
+
+    #[tokio::test]
     async fn ingress_overflow_and_close_release_packet_budget() {
         let stats = Arc::new(ForwardMetrics::default());
         let (ingress, mut rx) = channel(2);
@@ -446,6 +534,7 @@ mod tests {
             hash: RandomState::new(),
             backlog: Arc::new(AtomicUsize::new(0)),
             stats: Arc::clone(&stats),
+            active: Arc::new(AtomicBool::new(true)),
         };
         let info = PacketInfo {
             src_ip: Ipv6Addr::LOCALHOST.into(),
@@ -630,11 +719,9 @@ mod tests {
         let route = peers.lookup_v6(&b_ip).unwrap();
         assert!(route.scheduler.is_some());
         let stats = Arc::new(ForwardMetrics::default());
-        let sender = route
-            .scheduler
-            .as_ref()
-            .unwrap()
-            .get_or_init(|| Sender::spawn(&route, Arc::clone(&stats)));
+        let sender = route.scheduler.as_ref().unwrap().get_or_init(|| {
+            Sender::spawn(&route, Arc::new(AtomicBool::new(true)), Arc::clone(&stats))
+        });
         let info = PacketInfo {
             src_ip: derive_ipv6(&a.id()).into(),
             dst_ip: b_ip.into(),
@@ -668,9 +755,71 @@ mod tests {
         assert_eq!(stats.packets_tx.get(), 1);
         assert_eq!(stats.bytes_tx.get(), 11);
         assert_eq!(sender.queued_bytes(), 0);
+
+        // Admit a packet while active, then enter standby before its worker
+        // starts. Releasing its budget proves the queue was drained, so the
+        // transmission counter can be checked without a timing assumption.
+        let active = Arc::new(AtomicBool::new(true));
+        let queued_stats = Arc::new(ForwardMetrics::default());
+        let (ingress, rx) = channel(INGRESS_CAPACITY);
+        let controlled = Sender {
+            ingress,
+            hash: RandomState::new(),
+            backlog: Arc::new(AtomicUsize::new(0)),
+            stats: Arc::clone(&queued_stats),
+            active: Arc::clone(&active),
+        };
+        controlled.enqueue(
+            &info,
+            route.handle,
+            Encoded::Whole(Bytes::from_static(b"before standby")),
+            14,
+        );
+        active.store(false, Ordering::Release);
+        let worker = tokio::spawn(run_sender(
+            route.conn.clone(),
+            route.activity_clock(),
+            rx,
+            Arc::clone(&active),
+            Arc::clone(&queued_stats),
+        ));
+        timeout(Duration::from_secs(5), async {
+            while controlled.queued_bytes() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(queued_stats.packets_tx.get(), 0);
+        active.store(true, Ordering::Release);
+        controlled.enqueue(
+            &info,
+            route.handle,
+            Encoded::Whole(Bytes::from_static(b"after standby")),
+            13,
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), recv.read_datagram())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"after standby"[..]
+        );
+        assert_eq!(queued_stats.packets_tx.get(), 1);
+        drop(controlled);
+        timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(send.close_reason().is_none());
+
         // Dropping a sender stops its worker without closing the peer connection.
         let stopped_stats = Arc::new(ForwardMetrics::default());
-        let standalone = Sender::spawn(&route, Arc::clone(&stopped_stats));
+        let standalone = Sender::spawn(
+            &route,
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&stopped_stats),
+        );
         let backlog = Arc::clone(&standalone.backlog);
         standalone.enqueue(
             &info,

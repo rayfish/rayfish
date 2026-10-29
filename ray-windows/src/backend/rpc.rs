@@ -330,12 +330,21 @@ mod tests {
                 Err(error) => panic!("The installed service refused direct IPC: {error:#}"),
             }
         }
+        let service_pid = crate::service::process_id().unwrap();
+        assert!(
+            service_pid != 0,
+            "The ready service has no running process."
+        );
         client.run(IpcMessage::Down, &cancelled).unwrap();
         let standby =
             Status::from_response(client.read(IpcMessage::Status, &cancelled).unwrap()).unwrap();
         assert!(
             !standby.active,
             "The installed service did not enter standby before Up."
+        );
+        assert!(
+            crate::service::process_id().unwrap() == service_pid,
+            "The service restarted while entering standby."
         );
         client
             .run(IpcMessage::Up { hostname: None }, &cancelled)
@@ -346,6 +355,10 @@ mod tests {
             active.active,
             "Up did not activate the installed VPN service."
         );
+        assert!(
+            crate::service::process_id().unwrap() == service_pid,
+            "The service restarted while activating the VPN."
+        );
         client.run(IpcMessage::Down, &cancelled).unwrap();
         let inactive =
             Status::from_response(client.read(IpcMessage::Status, &cancelled).unwrap()).unwrap();
@@ -353,11 +366,19 @@ mod tests {
             !inactive.active,
             "Down did not put the installed VPN service on standby."
         );
+        assert!(
+            crate::service::process_id().unwrap() == service_pid,
+            "The service restarted while disconnecting the VPN."
+        );
         let refreshed =
             Status::from_response(client.read(IpcMessage::Status, &cancelled).unwrap()).unwrap();
         assert!(
             !refreshed.active,
             "A read-only status request reactivated the VPN."
+        );
+        assert!(
+            crate::service::process_id().unwrap() == service_pid,
+            "The service restarted after a read-only status request."
         );
     }
 
