@@ -183,6 +183,16 @@ jobs:
             throw 'The installed service did not retain its tunnel and mesh route in standby.'
           }
 
+      - name: Test real Windows tunnel DNS packets
+        shell: pwsh
+        timeout-minutes: 10
+        env:
+          RAYFISH_WINDOWS_INSTALL_TEST: '1'
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'safe-diagnostics.ps1')
+          cargo test -q -p rayfish --test windows_tunnel --locked -- --ignored --nocapture --test-threads=1 2>&1 | ConvertTo-SafeDiagnostic
+          if ($LASTEXITCODE -ne 0) { throw 'The installed service did not pass the Windows tunnel packet test.' }
+
       - name: Collect service failure diagnostics
         if: failure()
         continue-on-error: true
