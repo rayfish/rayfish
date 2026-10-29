@@ -76,13 +76,6 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use dashmap::mapref::entry::Entry;
 use iroh::EndpointId;
-use nom::Parser;
-use nom::bytes::complete::{tag, take_while1};
-use nom::character::complete::char;
-use nom::combinator::all_consuming;
-use nom::error::Error as NomError;
-use nom::multi::separated_list1;
-use nom::sequence::preceded;
 use ray_proto::SuggestedFirewall;
 use ray_proto::ipc::{FirewallRuleView, MachineHostname};
 use serde::{Deserialize, Serialize};
@@ -117,18 +110,14 @@ pub enum PeerFilter {
 /// Parse the terms of a wildcard exclusion. `ray apply` expands group and alias
 /// names before validating the resulting hostnames.
 pub fn parse_excluded_peer_terms(selector: &str) -> Result<Option<Vec<&str>>> {
-    if !selector.starts_with("*-") {
+    let Some(terms) = selector.strip_prefix("*-") else {
         return Ok(None);
-    }
-    let (_, exclusions) = all_consuming(preceded(
-        tag("*-"),
-        separated_list1(
-            char::<&str, NomError<&str>>(','),
-            take_while1(|character: char| character != ','),
-        ),
-    ))
-    .parse(selector)
-    .map_err(|_| anyhow::anyhow!("invalid excluded-peer selector '{selector}'"))?;
+    };
+    let exclusions: Vec<&str> = terms.split(',').collect();
+    anyhow::ensure!(
+        exclusions.iter().all(|term| !term.is_empty()),
+        "invalid excluded-peer selector '{selector}'"
+    );
     Ok(Some(exclusions))
 }
 

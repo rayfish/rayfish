@@ -1486,6 +1486,7 @@ fn excluded_peers_allow_other_members_and_follow_roster_changes() {
 fn malformed_excluded_peer_selector_is_rejected() {
     assert!(parse_excluded_peers("*-").is_err());
     assert!(parse_excluded_peers("*-a,").is_err());
+    assert!(parse_excluded_peers("*-a,,b").is_err());
     assert!(parse_excluded_peers("*-A").is_err());
 }
 
