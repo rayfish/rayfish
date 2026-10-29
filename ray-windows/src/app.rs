@@ -210,7 +210,7 @@ impl WindowsApp {
         self.next_refresh = Instant::now() + REFRESH_INTERVAL;
         if update.quit {
             self.quitting = true;
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+            request_close(ctx);
             return;
         }
         match update.snapshot {
@@ -235,6 +235,9 @@ impl WindowsApp {
 
 impl eframe::App for WindowsApp {
     fn update(&mut self, ctx: &UiContext, _frame: &mut eframe::Frame) {
+        if self.quitting {
+            return;
+        }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
@@ -243,6 +246,9 @@ impl eframe::App for WindowsApp {
             Ok(Some(update)) => self.updated(update, ctx),
             Ok(None) => {}
             Err(error) => self.dashboard.error = Some(format!("{error:#}")),
+        }
+        if self.quitting {
+            return;
         }
         while let Ok(event) = self.events.try_recv() {
             let result = match event {
@@ -330,9 +336,17 @@ impl eframe::App for WindowsApp {
     }
 }
 
+fn request_close(ctx: &UiContext) {
+    ctx.send_viewport_cmd(ViewportCommand::Close);
+    // Close becomes an input event for the next eframe update. A hidden root
+    // needs another native paint to consume it and finish the event loop.
+    wake_ui(ctx);
+}
+
 fn wake_ui(ctx: &UiContext) {
     ctx.request_repaint();
-    let title = wide("Rayfish");
+    let title = ctx.input(|input| input.viewport().title.clone());
+    let title = wide(title.as_deref().unwrap_or("Rayfish"));
     // SAFETY: The title is terminated, and PostMessage validates the handle.
     // Hidden windows do not receive the normal repaint used by eframe to
     // deliver updates. An explicit paint also processes tray commands and
@@ -398,46 +412,4 @@ pub(crate) fn show_error(message: &str) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::mem::zeroed;
-
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW,
-    };
-
-    use super::*;
-
-    #[test]
-    fn tray_and_worker_updates_wake_a_hidden_window() {
-        let class = wide("STATIC");
-        let title = wide("Rayfish");
-        // SAFETY: STATIC is a system window class. The strings and message
-        // buffer outlive these calls, and the test destroys the window it owns.
-        unsafe {
-            let window = CreateWindowExW(
-                0,
-                class.as_ptr(),
-                title.as_ptr(),
-                0,
-                0,
-                0,
-                100,
-                100,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null(),
-            );
-            assert!(!window.is_null());
-            assert_eq!(IsWindowVisible(window), 0);
-            wake_ui(&UiContext::default());
-            let mut message: MSG = zeroed();
-            assert_ne!(
-                PeekMessageW(&mut message, window, WM_PAINT, WM_PAINT, PM_REMOVE),
-                0
-            );
-            assert_eq!(IsWindowVisible(window), 0);
-            assert_ne!(DestroyWindow(window), 0);
-        }
-    }
-}
+mod tests;

@@ -37,3 +37,6 @@ winresource = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+winit = { version = "0.30.13", default-features = false }
