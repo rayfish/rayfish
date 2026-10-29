@@ -154,14 +154,37 @@ impl Resolver for UnderlayResolver {
     }
 }
 
-pub(super) fn resolver(nameservers: &[Ipv4Addr]) -> anyhow::Result<DnsResolver> {
+pub(super) fn resolver(nameservers: &[IpAddr]) -> anyhow::Result<DnsResolver> {
     let mut config = ResolverConfig::default();
     for ip in nameservers {
-        config.add_name_server(NameServerConfig::udp_and_tcp(IpAddr::V4(*ip)));
+        config.add_name_server(NameServerConfig::udp_and_tcp(*ip));
     }
     let mut builder =
         HickoryResolver::builder_with_config(config.clone(), UnderlayRuntime::default());
     builder.options_mut().negative_max_ttl = Some(Duration::ZERO);
     let resolver = builder.build()?;
     Ok(DnsResolver::custom(UnderlayResolver { resolver, config }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_replacement_cannot_use_a_fallback_after_reset() {
+        let resolver = resolver(&[]).expect("an empty resolver config is valid");
+        assert!(
+            resolver
+                .lookup_ipv4("example.com", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        resolver.reset();
+        assert!(
+            resolver
+                .lookup_ipv6("example.com", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
 }

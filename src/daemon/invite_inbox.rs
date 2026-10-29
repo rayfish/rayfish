@@ -208,8 +208,8 @@ impl ConnectService {
         Ok(out)
     }
 
-    /// Handle an `InviteOffer` from `remote`, already past the inbound gate.
-    /// `true` acks it with `Pending`; `false` closes without a reply.
+    /// Whether an offer can be acknowledged, used by the local callers.
+    #[cfg(test)]
     pub(super) async fn receive_offer(
         &self,
         remote: EndpointId,
@@ -217,11 +217,22 @@ impl ConnectService {
         network: NetworkName,
         code: InviteCode,
     ) -> bool {
-        // Only a network's own coordinator may hand out its code here; anyone
-        // else is forwarding a credential that is not theirs to offer.
+        self.receive_offer_result(remote, class, network, code)
+            .await
+            .is_ok()
+    }
+
+    /// Store an offer or return the reason the sender must stop offering it.
+    pub(super) async fn receive_offer_result(
+        &self,
+        remote: EndpointId,
+        class: Inbound,
+        network: NetworkName,
+        code: InviteCode,
+    ) -> Result<(), String> {
         match code.decode() {
             Ok(decoded) if decoded.coordinator == remote => {}
-            _ => return false,
+            _ => return Err("invalid invitation or coordinator".to_string()),
         }
         let offer = ReceivedInvitation::new(
             network,
@@ -230,16 +241,18 @@ impl ConnectService {
             now_secs(),
             class == Inbound::Stranger,
         );
-        match self
-            .edit_inbox(|inbox| inbox.receive(offer, now_secs()))
-            .await
-        {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::debug!(peer = %remote.fmt_short(), error = %e, "invitation refused");
-                false
+        self.edit_inbox(|inbox| {
+            if inbox
+                .invitations
+                .iter()
+                .any(|entry| entry.id == offer.id && entry.status == InvitationStatus::Declined)
+            {
+                anyhow::bail!("recipient declined the invitation");
             }
-        }
+            inbox.receive(offer, now_secs()).map(|_| ())
+        })
+        .await
+        .map_err(|error| error.to_string())
     }
 
     pub(super) async fn list_invitations(&self) -> IpcMessage {

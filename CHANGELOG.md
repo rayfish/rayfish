@@ -8,9 +8,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- iOS 18: a Rayfish control turns the VPN on and off from Control Center,
-  the Lock Screen or the Action button.
-
 - The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
   and DNS through the packet tunnel, or restore a direct connection.
 
@@ -24,10 +21,119 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   working. Only new connections to the internet outside the tunnel are
   blocked.
 
+- Mesh SSH no longer limits the number of session channels on one connection.
+- New installs default Magic DNS to `partial`: only `.ray` names resolve, and
+  the host's search domains are left alone. Existing installs keep their mode.
+  Run `ray config set dns on` for short names.
+- macOS: turning DNS on in the app selects `partial` rather than `on`.
+
+### Fixed
+
+- Cached peer addresses expire after seven days, with up to eight paths per
+  peer and 64 peers in both saved hints and the running lookup. Connected paths
+  refresh hourly. Old hints without timestamps are discarded on upgrade.
+  Cache write failures do not prevent startup or restore rejected addresses.
+- Completed SSH commands release their session state and forwarded agent sockets
+  on reused connections.
+- Status no longer counts denied join requests as waiting for approval.
+- Windows: `.ray` names resolve in `partial` DNS mode.
+- With `dns off`, joining or leaving a network no longer routes `.ray` to
+  Rayfish on Linux and Windows.
+- Windows: joining or leaving a network while Rayfish is down no longer routes
+  `.ray` to a resolver that is not running.
+- Packets dropped for exceeding the TUN MTU are now counted and logged as warnings.
+- `ray ping` records selected-path observations for each probe, reports path
+  changes and reconnects, and stops labeling all replies with the final path.
+  The display distinguishes observations from packet routes and reports unknown
+  paths rather than guessing. Local failures and unanswered probes are no longer
+  described as packet loss. Probes use the current connection and bound the
+  send/reply exchange to one second.
+
 ### Security
 
 - An exit node no longer forwards unsolicited inbound connections from the
   internet to the clients using it, and clients drop them too.
+
+## [0.5.11] - 2026-10-27
+
+### Added
+
+- Linux: `ray rootless` runs without administrator privileges, with private state,
+  authenticated SOCKS5 and HTTP proxies (including HTTPS through CONNECT),
+  TCP forwarding and explicit service exposure.
+  Startup prints connection instructions. Commands automatically use your running
+  rootless instance; `--system` selects the system daemon and `--rootless` selects
+  your private instance explicitly.
+
+- macOS connection logs include startup timings to help diagnose slow connections.
+- iOS 18: a Rayfish control turns the VPN on and off from Control Center,
+  the Lock Screen or the Action button.
+
+### Changed
+
+- The mesh protocol is now version 7, so that a device is told which pairing
+  an unpair ends. Peers on versions 6 and 5 still connect.
+- macOS: Install shell command shows a green confirmation when it succeeds and
+  highlights the error when it fails.
+
+### Fixed
+
+- A peer whose old public address now reaches a different device (a home NAT
+  that reassigned its port) no longer stays unreachable, even across restarts.
+  The stale address is forgotten when the dial reaches the wrong device, and the
+  peer is reached through the relay again within about a minute.
+- Linux: IPv6-only hosts keep configured and system DNS servers for relay
+  and discovery lookups, with IPv6 public fallbacks when needed.
+- Denied network join requests stop retrying, including after restart, and show
+  the coordinator denial in status. Invalid credentials and unavailable networks
+  receive explicit replies.
+- Rejected direct connections stop retrying. Refused and declined invitations
+  report their outcome to the sender.
+- Admin grants succeed only after the recipient confirms the key was saved.
+- File offers acknowledge receipt, and declining a file tells its sender why the
+  transfer stopped. File transfers require peers using file protocol version 3.
+
+- SSH connections denied by the mesh firewall fail immediately instead of hanging.
+- Mesh SSH: `ssh -A` exits when its command finishes, instead of hanging once
+  the remote side has used the forwarded agent. A `-L` forward to a target that
+  refuses the connection now reports "connect failed".
+- TCP replies remain allowed after closing the write half of a connection.
+  Tracking expires after both sides close, while resets remove it immediately.
+
+- Linux rootless mode preserves GUI instance selection, reports SOCKS failures
+  and adapts TCP traffic to smaller mesh paths. Network changes leave host DNS
+  untouched, and private instances do not expose peer metrics.
+
+- Direct connections keep retrying after approval if joining the network fails
+  temporarily.
+- illumos: remove stale tunnel interfaces after shutdown and before restarting
+  after a crash.
+- Unpairing no longer depends on the device and its primary being connected at
+  that moment, which on-demand mode makes rare. A device that unpairs itself,
+  such as a phone in the Android app, keeps asking its primary to revoke it,
+  across restarts, until the primary confirms that the revocation is saved.
+  `ray unpair <device>` keeps telling the device to delete its certificate until
+  the device confirms, so a device that was offline gets the message later. An
+  unpair interrupted by a restart is finished at the next start. A missed
+  message used to leave the device's certificate unrevoked, or still on the
+  device. A device paired again keeps the new pairing when a message about the
+  earlier one arrives late. Pairing a device again now completes only once the
+  primary's networks have stopped listing it as revoked, so that joining them
+  right away does not undo the new pairing; if that takes longer than 10
+  seconds, or one of those networks is not running, the pairing fails and can
+  be tried again. A primary on an older release gets the earlier one-shot
+  request.
+
+### Security
+
+- Mesh SSH: unix-socket forwarding (`ssh -L` and `-R` to a socket path) and
+  agent forwarding now act as the login account instead of as root. Before, a
+  peer allowed to log in as an ordinary account could reach root-only sockets
+  and gain root on the host. Non-root accounts can no longer reverse-forward
+  privileged ports, and sessions, forwards and connections are capped.
+- Mesh SSH: a forward into this host's own SSH port (`ssh -J`, or `ssh -L`
+  to it) is no longer taken for a local login by root. Before, any peer
+  allowed an ordinary login could reach a root shell that way.
 
 ## [0.5.10] - 2026-10-19
 
@@ -2938,7 +3044,8 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.10...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.11...HEAD
+[0.5.11]: https://github.com/rayfish/rayfish/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/rayfish/rayfish/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/rayfish/rayfish/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/rayfish/rayfish/compare/v0.5.7...v0.5.8

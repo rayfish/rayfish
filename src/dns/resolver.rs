@@ -68,6 +68,9 @@ pub struct Resolver {
     /// outside `.ray` can be declined instead of forwarded. See
     /// [`Resolver::set_defer_off_mesh`].
     defer_off_mesh: AtomicBool,
+    /// Whether a `<host>.<network>` name outside `.ray` may be claimed. Off
+    /// until [`Resolver::set_short_names`] turns it on, so a resolver nobody
+    /// configured answers `.ray` names only.
     short_names: AtomicBool,
 }
 
@@ -104,7 +107,7 @@ impl Resolver {
             tunnel_upstreams: ArcSwapOption::empty(),
             overlay_forwards: DashMap::new(),
             defer_off_mesh: AtomicBool::new(false),
-            short_names: AtomicBool::new(true),
+            short_names: AtomicBool::new(false),
         }
     }
 
@@ -143,6 +146,13 @@ impl Resolver {
         self.defer_off_mesh.load(Ordering::Relaxed)
     }
 
+    /// Whether a name outside `.ray` may be claimed. See [`Self::set_short_names`].
+    pub fn short_names(&self) -> bool {
+        self.short_names.load(Ordering::Relaxed)
+    }
+
+    /// Allow or refuse names outside `.ray`. Only [`crate::config::DnsMode::On`],
+    /// which installs the matching search domains, turns this on.
     pub fn set_short_names(&self, enabled: bool) {
         self.short_names.store(enabled, Ordering::Relaxed);
     }
@@ -706,9 +716,67 @@ mod tests {
         assert!(response_has_aaaa(&resp, "200::7".parse().unwrap()));
     }
 
-    /// A network named `dev` must not swallow `zed.dev`. The roster holds a
-    /// `box` peer and no `zed`, so the lookup misses and falls back to the real
-    /// internet, while `box.dev` still resolves to its mesh IP.
+    /// With short names off, the default, `box.dev` is not ours even though the
+    /// roster holds it: only `.ray` names are answered locally.
+    #[tokio::test]
+    async fn bare_network_names_are_not_answered_by_default() {
+        let table = crate::dns::new_hostname_table();
+        let reverse = crate::dns::new_reverse_table();
+        crate::dns::update_hostname(&table, &reverse, "dev", "box", "200::7".parse().unwrap())
+            .await;
+
+        let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
+        let up = fake_upstream(upstream_answer).await;
+        let r = Resolver::new(table, reverse);
+        r.set_upstream_addrs([up]);
+
+        let peer_ip: std::net::Ipv6Addr = "200::7".parse().unwrap();
+        let resp = r
+            .resolve(&build_aaaa_query("box.dev"))
+            .await
+            .expect("forwarded, not claimed");
+        assert!(!response_has_aaaa(&resp, peer_ip));
+        for name in ["box.ray", "box.dev.ray"] {
+            let resp = r
+                .resolve(&build_aaaa_query(name))
+                .await
+                .expect("local answer");
+            assert!(
+                response_has_aaaa(&resp, peer_ip),
+                "{name} must resolve locally"
+            );
+        }
+    }
+
+    /// `On` is the only mode that answers short names, and it must still do so.
+    #[tokio::test]
+    async fn short_names_resolve_only_when_enabled() {
+        let table = crate::dns::new_hostname_table();
+        let reverse = crate::dns::new_reverse_table();
+        crate::dns::update_hostname(&table, &reverse, "dev", "box", "200::7".parse().unwrap())
+            .await;
+        let r = Resolver::new(table, reverse);
+        r.set_short_names(true);
+        let peer_ip: std::net::Ipv6Addr = "200::7".parse().unwrap();
+        let resp = r
+            .resolve(&build_aaaa_query("box.dev"))
+            .await
+            .expect("claimed under On");
+        assert!(response_has_aaaa(&resp, peer_ip));
+    }
+
+    #[test]
+    fn a_resolver_starts_with_short_names_off() {
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        assert!(!r.short_names());
+        r.set_short_names(true);
+        assert!(r.short_names());
+        r.set_short_names(false);
+        assert!(!r.short_names());
+    }
+
+    /// A network named `dev` must not swallow `zed.dev`: with short names on, a
+    /// name the roster does not hold still falls through to the real DNS.
     #[tokio::test]
     async fn unknown_bare_network_name_falls_back_upstream() {
         let table = crate::dns::new_hostname_table();
@@ -720,6 +788,7 @@ mod tests {
         let up = fake_upstream(upstream_answer).await;
         let r = Resolver::new(table, reverse);
         r.set_upstream_addrs([up]);
+        r.set_short_names(true);
 
         let resp = r
             .resolve(&build_a_query("zed.dev"))

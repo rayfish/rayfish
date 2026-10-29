@@ -256,13 +256,18 @@ fn adopt_blob(state: &mut NetworkState, data: crate::membership::GroupBlob, sign
     state.converged_hash = Some(signed);
 }
 
-/// Our own primary nullified this device in a verified blob: tear ourselves
-/// out on a separate task, so teardown does not wait on the caller.
-fn spawn_self_unpair(registry: &Arc<NetworkRegistry>, network_name: &str) {
+/// Our own primary nullified this device's `cert` in a verified blob: tear
+/// ourselves out on a separate task, so teardown does not wait on the caller,
+/// unless the device has paired again by the time that task runs.
+fn spawn_self_unpair(
+    registry: &Arc<NetworkRegistry>,
+    network_name: &str,
+    cert: control::DeviceCert,
+) {
     tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
     let registry = Arc::clone(registry);
     tokio::spawn(async move {
-        let _ = registry.unpair_self().await;
+        registry.unpair_nullified(cert).await;
     });
 }
 
@@ -318,7 +323,7 @@ pub(crate) async fn reconverge_and_apply(
         persist_group_hash_if_needed(state, blob_store, network_name, signed, true).await;
         // Already converged on the signed hash. Even so, check whether we have
         // been nullified in the blob we already hold (e.g. we applied it while
-        // still offline-blocked from ever receiving `ControlMsg::Unpaired`): if so,
+        // still offline-blocked from ever receiving the primary's notice): if so,
         // tear ourselves out. Otherwise keep driving any unconfirmed local rename
         // (the drain no-ops unless `pending_hostname` is set).
         let (roster, nullifiers) = {
@@ -328,7 +333,7 @@ pub(crate) async fn reconverge_and_apply(
         if let Some(cert) = device_cert
             && self_is_nullified(cert, &roster, &nullifiers)
         {
-            spawn_self_unpair(registry, network_name);
+            spawn_self_unpair(registry, network_name, cert.clone());
             return;
         }
         drain_pending_rename(&roster, network_name, my_identity, device_cert, registry).await;
@@ -362,14 +367,15 @@ pub(crate) async fn reconverge_and_apply(
     // Self-unpair: if our own device cert is nullified in this (verified, signed)
     // blob and the blob is coordinated by our *own* primary, the primary has
     // revoked this device. Tear ourselves out (delete the cert + leave every
-    // network) even if we never received the best-effort `ControlMsg::Unpaired`
-    // (e.g. we were offline at unpair time). This rides the signed blob the group
+    // network) even if the primary's notice has not reached us yet (e.g. we
+    // were offline at unpair time). This rides the signed blob the group
     // poller already fetches, so it needs no live mesh link. The
     // own-primary-coordinator gate stops a foreign network's coordinator from
     // forcing a global deauth by listing our key.
-    let self_nullified = device_cert
+    let nullified = device_cert
         .as_ref()
-        .is_some_and(|cert| self_is_nullified(cert, &data.members, &data.nullifiers));
+        .filter(|cert| self_is_nullified(cert, &data.members, &data.nullifiers))
+        .cloned();
     let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let commit_guard = commit.lock().await;
     // A local author may have refreshed live state before its blob and recovery
@@ -396,9 +402,9 @@ pub(crate) async fn reconverge_and_apply(
             tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
             return;
         }
-        if self_nullified {
+        if let Some(cert) = nullified {
             drop(s);
-            spawn_self_unpair(registry, network_name);
+            spawn_self_unpair(registry, network_name, cert);
             return;
         }
         // What the network agreed on, which is not our re-encoding of it unless
@@ -843,12 +849,12 @@ pub(crate) async fn fetch_and_apply_blob(
 
     // Self-unpair: our own primary listed this device in the signed blob's
     // nullifiers (`ray unpair`). Tear ourselves out even though we never
-    // received `ControlMsg::Unpaired` (we were offline/severed). Rides the
+    // received the primary's notice (we were offline/severed). Rides the
     // signed blob, so it needs no live mesh link. See `self_is_nullified`.
-    let self_nullified = crate::identity::load_device_cert()
+    let nullified = crate::identity::load_device_cert()
         .ok()
         .flatten()
-        .is_some_and(|cert| self_is_nullified(&cert, &data.members, &data.nullifiers));
+        .filter(|cert| self_is_nullified(cert, &data.members, &data.nullifiers));
 
     let new_member_ids: std::collections::HashSet<EndpointId> =
         data.members.iter().map(|m| m.identity).collect();
@@ -882,9 +888,9 @@ pub(crate) async fn fetch_and_apply_blob(
             tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
             return ReconvergeOutcome::Superseded;
         }
-        if self_nullified {
+        if let Some(cert) = nullified {
             drop(s);
-            spawn_self_unpair(registry, network_name);
+            spawn_self_unpair(registry, network_name, cert);
             return ReconvergeOutcome::Departed;
         }
         if self_removed {

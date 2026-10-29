@@ -8,6 +8,10 @@ use super::super::*;
 /// unreachable primary hangs the pairing call forever.
 const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long a device spends telling its primary the new certificate is saved,
+/// and then waiting for the primary to close the pairing connection.
+const PAIR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Daemon {
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
         self.registry.resolve_peer_name(name).await
@@ -68,6 +72,13 @@ impl Daemon {
         endpoint_id: EndpointId,
         secret: Vec<u8>,
     ) -> IpcMessage {
+        // A request this device saved when it last unpaired would revoke the
+        // pairing made here: the lock keeps an attempt at it from running
+        // while the pairing completes, which then cancels it.
+        let _guard = self.registry.unpair_lock.lock().await;
+        if let Err(message) = self.registry.finish_cleanups_locked().await {
+            return ipc_err(format!("an earlier unpair has not finished: {message}"));
+        }
         let addr: iroh::EndpointAddr = endpoint_id.into();
         tracing::info!(primary = %endpoint_id.fmt_short(), "dialing primary device for pairing");
         // `Endpoint::connect` has no built-in timeout: if a path to the primary
@@ -76,7 +87,7 @@ impl Daemon {
         // hangs indefinitely. Bound it so pairing fails fast with a clear message.
         let conn = match tokio::time::timeout(
             PAIR_CONNECT_TIMEOUT,
-            self.transport.endpoint.connect(addr, PAIR_ALPN),
+            connect_pair(&self.transport.endpoint, addr),
         )
         .await
         {
@@ -122,7 +133,7 @@ impl Daemon {
         let response: control::PairMsg = match control::recv_framed(&mut recv).await {
             Ok(response) => response,
             Err(e) => {
-                return ipc_err(format!("failed to read pair response: {e}"));
+                return ipc_err(format!("failed to read pair response: {e:#}"));
             }
         };
 
@@ -136,6 +147,13 @@ impl Daemon {
                 }
                 if let Err(e) = identity::store_device_cert(&cert) {
                     return ipc_err(format!("failed to store device certificate: {e}"));
+                }
+                self.registry.paired_again(cert.user_identity);
+                // Until the primary hears the cert is saved, an unpair request
+                // about the earlier pairing still revokes. A primary on version
+                // 2 does not ask.
+                if conn.alpn() == PAIR_ALPN {
+                    confirm_certificate_saved(&conn, cert.generation).await;
                 }
                 // Auto-join every network the primary shared. Each join attaches the
                 // freshly stored cert (see current_device_cert) so the coordinator,
@@ -229,7 +247,7 @@ impl Daemon {
         let request_cert = cert.clone();
         let addr: iroh::EndpointAddr = primary.into();
         let sync = async {
-            let conn = self.transport.endpoint.connect(addr, PAIR_ALPN).await?;
+            let conn = connect_pair(&self.transport.endpoint, addr).await?;
             if conn.remote_id() != primary {
                 anyhow::bail!("connected to an unexpected primary");
             }
@@ -272,12 +290,15 @@ impl Daemon {
 
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
     ///
-    /// Records the device key as a durable nullifier (`revoked_devices`), then, on
-    /// every network this node coordinates, adds it to the signed blob's nullifier
-    /// set, removes certificate-joined memberships, and republishes. Independent
-    /// memberships remain. Best-effort tells the device to wipe its own cert.
-    /// Other nodes reject the revoked cert when they receive the signed blob.
-    /// Networks this node does not coordinate rely on the device's local unpair.
+    /// Records the device key as a durable nullifier (`revoked_devices`), and in
+    /// the same write that the device has yet to be told
+    /// (`pending_unpair_notices`). Then, on every network this node coordinates,
+    /// adds it to the signed blob's nullifier set, removes certificate-joined
+    /// memberships, and republishes. Independent memberships remain. Other nodes
+    /// reject the revoked cert when they receive the signed blob. The device is
+    /// told to wipe its own cert until it confirms, after a restart too (see
+    /// `mesh::unpair`). Networks this node does not coordinate rely on that
+    /// local unpair.
     pub(crate) async fn unpair(self: &Arc<Self>, device: &str) -> IpcMessage {
         // Only the primary holds the user identity secret that signs both the
         // certs and their revocation. A secondary carries a device cert.
@@ -296,71 +317,51 @@ impl Daemon {
             return ipc_err("that is your primary device, not a paired secondary".to_string());
         }
 
-        // Best-effort: ask the device to wipe its own cert while the link is still
-        // up (nullifying below severs it). A spurious notice to a non-secondary is
-        // a no-op on the receiver (`is_unpaired_by`), so it is safe to send before
-        // the paired-device check inside `nullify_device`.
-        self.send_unpaired_notice(target).await;
-
-        // Write the authoritative nullifier across every network we coordinate.
-        match self.registry.nullify_device(target).await {
-            Ok(display) => IpcMessage::Ok {
-                message: format!("unpaired '{display}' and nullified its device certificate"),
-            },
+        // Save the revocation and the notice, then write the authoritative
+        // nullifier across every network we coordinate. The notice loop tells
+        // the device from there.
+        match self.registry.nullify_device(target, true).await {
+            Ok(display) => {
+                self.registry.notice_nudge.notify_one();
+                IpcMessage::Ok {
+                    message: format!("unpaired '{display}' and nullified its device certificate"),
+                }
+            }
             Err(message) => ipc_err(message),
         }
     }
 
-    /// Best-effort `ControlMsg::Unpaired` to a device over any shared live mesh
-    /// connection, asking it to wipe its own cert. Never blocks unpair on success
-    /// the authoritative revocation is the signed pkarr record.
-    async fn send_unpaired_notice(&self, target: EndpointId) {
-        self.send_control_once(target, &ControlMsg::Unpaired).await;
-    }
-
-    /// Best-effort `msg` to `target` over the first shared live mesh connection
-    /// found. Stops after that one attempt whether or not the send succeeded.
-    async fn send_control_once(&self, target: EndpointId, msg: &ControlMsg) {
-        for entry in self.registry.networks.iter() {
-            let net = entry.key().clone();
-            for (pid, _ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
-                if pid != target {
-                    continue;
-                }
-                if let Ok((mut send, _recv)) = conn.open_bi().await {
-                    let _ = control::send_msg(&mut send, None, msg).await;
-                    let _ = send.finish();
-                }
-                return;
-            }
-        }
-    }
-
-    /// Best-effort `ControlMsg::RequestUnpair` to our primary over a shared live
-    /// mesh connection, asking it to write the authoritative nullifier for this
-    /// device. Sent while the link is up, before we tear ourselves down. If it is
-    /// not delivered (we are offline from the primary) the primary keeps a stale
-    /// roster entry until someone runs `ray unpair` on it; the local teardown still
-    /// happens either way. A device with no cert (a primary) has no primary to ask.
-    async fn request_primary_nullify(&self) {
-        let Some(cert) = self.registry.current_device_cert() else {
-            return;
-        };
-        self.send_control_once(cert.user_identity, &ControlMsg::RequestUnpair)
-            .await;
-    }
-
-    /// Unpair *this* device from its primary. First asks the primary to write the
-    /// authoritative nullifier (`request_primary_nullify`, best-effort while the
-    /// link is up), then locally deletes the stored device cert and leaves networks
-    /// first joined with that certificate, closing each
-    /// connection with the leave code so coordinators prune us and every peer drops
-    /// us right away (rather than waiting on the revocation floor). Used by the
-    /// phone's "unpair this device" control. A device with no cert (a primary) has
-    /// nothing to unpair.
+    /// Unpair *this* device from its primary ([`NetworkRegistry::unpair_self`]):
+    /// leave the networks first joined with the primary's certificate, closing
+    /// each link with the leave code so coordinators prune us and every peer
+    /// drops us right away, delete the certificate, and ask the primary to
+    /// record the revocation until it confirms. Each step is saved first, so a
+    /// restart finishes it. Used by the phone's "unpair this device" control. A
+    /// device with no cert (a primary) has nothing to unpair.
     pub async fn unpair_self(&self) -> IpcMessage {
-        self.request_primary_nullify().await;
         self.registry.unpair_self().await
+    }
+}
+
+/// Tell the primary, over the pairing connection, that the certificate it just
+/// sent, at `generation`, is saved (`PairMsg::CertificateSaved`), then wait for
+/// the primary to close the connection, so closing first does not reset the
+/// message. The pairing is complete either way: a primary that does not hear
+/// it only keeps revoking on an unpair request about the earlier pairing.
+async fn confirm_certificate_saved(conn: &Connection, generation: u64) {
+    let sent = async {
+        let (mut send, _recv) = conn.open_bi().await?;
+        let saved = control::PairMsg::CertificateSaved { generation };
+        control::send_framed(&mut send, &saved).await
+    };
+    match tokio::time::timeout(PAIR_CONFIRM_TIMEOUT, sent).await {
+        Ok(Ok(())) => {
+            let _ = tokio::time::timeout(PAIR_CONFIRM_TIMEOUT, conn.closed()).await;
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(error = %format!("{error:#}"), "could not tell the primary the certificate is saved");
+        }
+        Err(_) => tracing::debug!("timed out telling the primary the certificate is saved"),
     }
 }
 
@@ -387,17 +388,6 @@ pub(crate) fn store_refreshed_cert(cert: &control::DeviceCert) {
             Err(e) => tracing::warn!(error = %e, "failed to store refreshed device cert"),
         }
     }
-}
-
-/// Returns true when `sender` is this device's primary (it signed our cert), so
-/// the caller can also tear the device out of the mesh. The cert deletion itself
-/// is deferred to [`Daemon::unpair_self`] (called by the caller) so the
-/// leave-all runs first while the cert still identifies our networks.
-pub(crate) fn is_unpaired_by(sender: EndpointId) -> bool {
-    matches!(
-        crate::identity::load_device_cert(),
-        Ok(Some(cert)) if cert.user_identity == sender
-    )
 }
 
 /// (gid, home) for a uid via the passwd db, or None if it can't be resolved.

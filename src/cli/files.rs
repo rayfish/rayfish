@@ -7,7 +7,6 @@ use ipc::{GlobalKey, NetworkKey, NodeKey};
 struct FilesOutput<'a> {
     pending: Vec<PendingFileRow<'a>>,
     queued: Vec<QueuedFileRow<'a>>,
-    #[serde(skip)]
     transfers: &'a [ipc::TransferFileInfo],
 }
 
@@ -137,7 +136,10 @@ fn transfers_table(transfers: &[ipc::TransferFileInfo]) -> String {
                 String::new()
             };
             let progress = format!("{} / {}", format_size(t.transferred), format_size(t.size));
-            let state = format!("({state})");
+            let state = match &t.error {
+                Some(error) => format!("({state}: {error})"),
+                None => format!("({state})"),
+            };
             vec![
                 layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
                 layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
@@ -522,6 +524,7 @@ mod tests {
     fn transfers_table_shows_progress_and_state() {
         style::set_plain(true);
         let transfers = [ipc::TransferFileInfo {
+            error: None,
             id: 7,
             outgoing: true,
             peer: "laptop".to_string(),
@@ -536,5 +539,25 @@ mod tests {
         assert!(row.contains("1 KiB / 2 KiB"), "{out}");
         assert!(row.contains("notes.txt (transferring)"), "{out}");
         assert!(row.contains("ray files cancel-transfer 7"), "{out}");
+    }
+    #[test]
+    fn declined_transfer_displays_the_reason() {
+        style::set_plain(true);
+        let transfers = [ipc::TransferFileInfo {
+            error: Some("recipient declined the file".into()),
+            id: 8,
+            outgoing: true,
+            peer: "receiver".into(),
+            filename: "notes.txt".into(),
+            size: 12,
+            transferred: 0,
+            state: ipc::TransferFileState::Failed,
+            destination: None,
+        }];
+        let output = transfers_table(&transfers);
+        assert!(output.contains("failed: recipient declined the file"));
+        assert!(!output.contains("cancel-transfer"));
+        let json = serde_json::to_value(FilesOutput::new(&[], &[], &transfers)).unwrap();
+        assert_eq!(json["transfers"][0]["error"], "recipient declined the file");
     }
 }

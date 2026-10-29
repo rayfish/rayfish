@@ -21,6 +21,7 @@
 #                 member is offline, health sweep (tests/e2e/churn)
 #   exit-node     3-peer internet-gateway test: forwarding/NAT, full-tunnel egress,
 #                 SO_MARK loop prevention, deny path (tests/e2e/exit-node)
+#   rootless      local ordinary-user mesh proxies, no TUN (tests/e2e/rootless)
 #   bench         throughput / latency benchmark        (tests/bench)
 #   all           every scenario above except bench: provision, run, then tear
 #                 each fleet down before the next (one fleet live at a time)
@@ -47,11 +48,25 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# This scenario owns local temporary state and never provisions a backend.
+if [[ "${1:-}" == rootless ]]; then
+  case "${2:-run}" in
+    run)
+      if [[ "${E2E_BACKEND:-}" == docker ]]; then
+        exec bash "$ROOT/tests/e2e/rootless/docker.sh"
+      fi
+      exec python3 "$ROOT/tests/e2e/rootless/run.py"
+      ;;
+    provision|teardown) exit 0 ;;
+    *) echo "unknown rootless action: $2" >&2; exit 2 ;;
+  esac
+fi
+
 # Exported: the `all` path re-invokes this script per scenario, and a plain shell
 # variable would silently drop back to digitalocean halfway through.
 export E2E_BACKEND="${E2E_BACKEND:-digitalocean}"
 
-usage(){ sed -n '2,38p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+usage(){ sed -n '2,39p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
 # Scenarios the docker backend cannot run faithfully (see tests/e2e/README.md).
 DOCKER_UNSUPPORTED=(exit-node reliability bench)
@@ -127,7 +142,7 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 # dispatcher per scenario (provision-if-needed + run, then teardown). Prints a
 # pass/fail summary and exits non-zero if any scenario failed.
 if [[ "$scenario" == all ]]; then
-  all_scenarios=(device-cert connect firewall closed-net apply invites dns ssh operator v4bridge reliability restore-offline unpair churn exit-node)
+  all_scenarios=(rootless device-cert connect firewall closed-net apply invites dns ssh operator v4bridge reliability restore-offline unpair churn exit-node)
   passed=(); failed=(); skipped=()
   hint="check 'doctl compute droplet list'"
   [[ "$E2E_BACKEND" == "docker" ]] && hint="check 'docker ps -a'"

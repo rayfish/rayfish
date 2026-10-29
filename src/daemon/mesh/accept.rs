@@ -36,10 +36,31 @@ async fn send_welcome(
     Ok(())
 }
 
+async fn send_admin_grant_result(
+    mut send: iroh::endpoint::SendStream,
+    network_pubkey: EndpointId,
+    result: Result<()>,
+) {
+    let error = result.err().map(|error| format!("{error:#}"));
+    if let Err(error) = control::send_msg(
+        &mut send,
+        Some(network_pubkey),
+        &ControlMsg::AdminGrantResult {
+            network_pubkey,
+            error,
+        },
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not deliver admin grant result");
+    }
+}
+
 /// Upper bound on a closed network's in-memory pending-join queue. Keyed by peer
 /// identity, so repeat requests from one peer don't grow it; this caps a flood
 /// across *distinct* identities (an attacker would need a fresh key per slot).
-/// At the cap, the oldest unanswered request is evicted to admit a newer one.
+/// Includes denials awaiting delivery on the joiner's next retry. At the cap,
+/// the oldest entry is evicted to admit a newer one.
 ///
 /// Sustained control-message floods on a single connection are guarded by
 /// [`ControlGate`](crate::ratelimit::ControlGate). The bounded queue below
@@ -143,12 +164,14 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         // Coordinator authority. Each is checked again in its own arm.
         ControlMsg::MemberApproved { .. }
         | ControlMsg::AdminGrant { .. }
+        | ControlMsg::AdminGrantResult { .. }
         | ControlMsg::InviteShare { .. }
         | ControlMsg::InviteUsed { .. }
         | ControlMsg::KickedFromNetwork
         | ControlMsg::Welcome { .. }
         | ControlMsg::JoinApproved { .. }
         | ControlMsg::JoinPending
+        | ControlMsg::JoinUnavailable { .. }
         | ControlMsg::JoinDenied { .. } => false,
 
         // Cheap to send, a DHT resolve plus a blob fetch to honor.
@@ -164,10 +187,14 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         | ControlMsg::Ping { .. }
         | ControlMsg::Pong { .. }
         | ControlMsg::Unpaired
+        | ControlMsg::PairingRevoked { .. }
         | ControlMsg::CertRefresh { .. }
         | ControlMsg::RequestUnpair
         | ControlMsg::NotSupported { .. }
-        | ControlMsg::FileOffer { .. } => false,
+        | ControlMsg::FileOffer { .. }
+        | ControlMsg::FileOfferReply { .. }
+        | ControlMsg::FileDeclined { .. }
+        | ControlMsg::FileCompleted { .. } => false,
     }
 }
 
@@ -321,6 +348,29 @@ impl CoordinatorAcceptState {
                         .await
                 }
             }
+            ControlMsg::AdminGrant {
+                network_pubkey,
+                secret_key,
+            } => {
+                let valid = network_pubkey == self.net_pubkey()
+                    && admin_grant_key_valid(secret_key, self.net_pubkey());
+                let result = if !valid {
+                    Err(anyhow::anyhow!(
+                        "admin grant key does not match network public key"
+                    ))
+                } else {
+                    config::load_network(&self.network_name).and_then(|net| {
+                        anyhow::ensure!(
+                            net.and_then(|net| net.network_secret_key)
+                                .is_some_and(|key| key.to_bytes() == secret_key),
+                            "network coordinator key is not durably saved"
+                        );
+                        Ok(())
+                    })
+                };
+                send_admin_grant_result(send, self.net_pubkey(), result).await;
+                None
+            }
             ControlMsg::InviteShare {
                 id,
                 secret_hash,
@@ -365,7 +415,8 @@ impl CoordinatorAcceptState {
         // user-identity binding so paired devices resolve.
         if let Some(ref cert) = device_cert {
             if !cert.verify() || cert.device_key != remote_id {
-                tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
+                self.deny(conn, send, "invalid device certificate".to_string())
+                    .await;
                 return None;
             }
             // Reject a cert nullified on this network (`ray unpair`). This one check
@@ -379,7 +430,12 @@ impl CoordinatorAcceptState {
                 .nullifiers
                 .contains(&cert.device_key)
             {
-                tracing::warn!(peer = %remote_id.fmt_short(), "rejecting nullified device certificate");
+                self.deny(
+                    conn,
+                    send,
+                    "device certificate has been revoked".to_string(),
+                )
+                .await;
                 return None;
             }
             self.ctx
@@ -438,25 +494,58 @@ impl CoordinatorAcceptState {
                 // (oldest-evicted) so a peer churning fresh identities can't grow
                 // it without limit. Still no per-peer concurrent-stream cap, the
                 // control-flood rate limiter covers sustained message floods.
-                {
+                let denied = {
                     let mut s = self.state.write().unwrap();
-                    if let Some(dropped) =
-                        evict_oldest_pending(&mut s.pending, remote_id, MAX_PENDING_JOINS)
+                    if s.pending
+                        .get(&remote_id)
+                        .is_some_and(|request| request.denied)
                     {
-                        self.ctx.stats.record_pending_join_eviction();
-                        tracing::warn!(
-                            evicted = %dropped.fmt_short(),
-                            "pending-join queue full; evicted oldest request"
+                        true
+                    } else {
+                        if let Some(dropped) =
+                            evict_oldest_pending(&mut s.pending, remote_id, MAX_PENDING_JOINS)
+                        {
+                            self.ctx.stats.record_pending_join_eviction();
+                            tracing::warn!(
+                                evicted = %dropped.fmt_short(),
+                                "pending-join queue full; evicted oldest request"
+                            );
+                        }
+                        s.pending.insert(
+                            remote_id,
+                            PendingJoin {
+                                denied: false,
+                                hostname,
+                                device_cert,
+                                requested_at: Instant::now(),
+                            },
                         );
+                        false
                     }
-                    s.pending.insert(
-                        remote_id,
-                        PendingJoin {
-                            hostname,
-                            device_cert,
-                            requested_at: Instant::now(),
-                        },
-                    );
+                };
+                if denied {
+                    let mut send = send;
+                    let response = ControlMsg::JoinDenied {
+                        reason: "operator denied the join request".to_string(),
+                    };
+                    match send_welcome(&mut send, self.net_pubkey(), &response).await {
+                        Ok(()) => {
+                            // Retain the decision until delivery, then allow a later
+                            // explicit join to request approval again.
+                            let mut state = self.state.write().unwrap();
+                            if state
+                                .pending
+                                .get(&remote_id)
+                                .is_some_and(|request| request.denied)
+                            {
+                                state.pending.remove(&remote_id);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(peer = %remote_id.fmt_short(), %error, "could not deliver join denial")
+                        }
+                    }
+                    return None;
                 }
                 tracing::info!(peer = %remote_id.fmt_short(), "join queued for approval");
                 let mut send = send;
@@ -838,16 +927,17 @@ impl CoordinatorAcceptState {
         }
     }
 
-    /// Reply on the joiner's stream that the join was refused, then wait for the
-    /// joiner to close so the JoinDenied flushes before `conn` is dropped.
-    async fn deny(&self, conn: &Connection, mut send: iroh::endpoint::SendStream, reason: String) {
-        let _ = control::send_msg(
+    /// Finish delivering the refusal before this network's next frame runs.
+    async fn deny(&self, _conn: &Connection, mut send: iroh::endpoint::SendStream, reason: String) {
+        if let Err(error) = send_welcome(
             &mut send,
-            Some(self.net_pubkey()),
+            self.net_pubkey(),
             &ControlMsg::JoinDenied { reason },
         )
-        .await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        .await
+        {
+            tracing::debug!(%error, "could not deliver join denial");
+        }
     }
 
     /// Admit a non-member peer into the network: settle its hostname, add it to
@@ -1262,6 +1352,21 @@ impl MemberAcceptState {
         msg: ControlMsg,
     ) -> Option<Ipv6Addr> {
         match msg {
+            ControlMsg::JoinRequest { .. } => {
+                let mut send = send;
+                if let Err(error) = control::send_msg(
+                    &mut send,
+                    Some(self.net_pubkey),
+                    &ControlMsg::JoinUnavailable {
+                        reason: "peer is not a coordinator for this network".to_string(),
+                    },
+                )
+                .await
+                {
+                    tracing::debug!(%error, "could not reply to join sent to a member");
+                }
+                None
+            }
             ControlMsg::MeshHello {
                 identity,
                 hostname,
@@ -1315,8 +1420,8 @@ impl MemberAcceptState {
                 network_pubkey,
                 secret_key,
             } => {
-                self.handle_admin_grant(peer_id, network_pubkey, secret_key)
-                    .await;
+                let result = self.handle_admin_grant(network_pubkey, secret_key).await;
+                send_admin_grant_result(send, self.net_pubkey, result).await;
                 None
             }
             ControlMsg::InviteShare {
@@ -1461,7 +1566,17 @@ impl MemberAcceptState {
         ) {
             HelloIdentity::Accept(binding) => binding,
             HelloIdentity::Reject => {
-                tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
+                let mut send = send;
+                let reason = "invalid device certificate or identity claim".to_string();
+                if let Err(error) = send_welcome(
+                    &mut send,
+                    self.net_pubkey,
+                    &ControlMsg::JoinDenied { reason },
+                )
+                .await
+                {
+                    tracing::debug!(%error, "could not deliver hello refusal");
+                }
                 return None;
             }
         };
@@ -1514,6 +1629,18 @@ impl MemberAcceptState {
             self.ctx
                 .register_peer_conn(conn, peer_identity, &self.network_name);
             return Some(member_ip);
+        }
+        let mut send = send;
+        if let Err(error) = send_welcome(
+            &mut send,
+            self.net_pubkey,
+            &ControlMsg::JoinDenied {
+                reason: "peer is not a member of this network".to_string(),
+            },
+        )
+        .await
+        {
+            tracing::debug!(%error, "could not deliver hello refusal");
         }
         None
     }
@@ -1625,31 +1752,23 @@ impl MemberAcceptState {
     /// and signal the daemon loop to swap in the coordinator accept handler.
     async fn handle_admin_grant(
         &self,
-        peer_id: EndpointId,
         network_pubkey: EndpointId,
         secret_key: [u8; 32],
-    ) {
-        if network_pubkey != self.net_pubkey {
-            tracing::warn!(peer = %peer_id.fmt_short(), "admin grant for a different network; ignoring");
-            return;
-        }
+    ) -> Result<()> {
+        anyhow::ensure!(
+            network_pubkey == self.net_pubkey,
+            "admin grant is for a different network"
+        );
         // Self-authenticating: only adopt a key whose public half equals the
         // network pubkey (defeats a forged AdminGrant from a non-coordinator).
-        if !admin_grant_key_valid(secret_key, self.net_pubkey) {
-            tracing::warn!(peer = %peer_id.fmt_short(), "admin grant key does not match network pubkey; ignoring");
-            return;
-        }
+        anyhow::ensure!(
+            admin_grant_key_valid(secret_key, self.net_pubkey),
+            "admin grant key does not match network public key"
+        );
         let key = SecretKey::from(secret_key);
-        let pkarr_client = match dht::create_pkarr_client(
-            &self.endpoint,
-            &self.registry.transport.pkarr_relay_url,
-        ) {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::warn!(network = %self.network_name, error = %e, "cannot accept admin grant without a network publisher");
-                return;
-            }
-        };
+        let pkarr_client =
+            dht::create_pkarr_client(&self.endpoint, &self.registry.transport.pkarr_relay_url)
+                .context("cannot accept admin grant without a network publisher")?;
         let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
         let previous_authority = {
@@ -1680,38 +1799,39 @@ impl MemberAcceptState {
         // blob-store write and recovery-pointer update.
         if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await {
             restore_authority();
-            tracing::warn!(
-                network = %self.network_name,
-                "promoted roster was not durably committed; rolled back admin grant"
-            );
-            return;
+            anyhow::bail!("promoted roster could not be durably committed");
         }
-        let key_saved = match config::update_network(&self.network_name, |net| {
+        let key_saved = config::update_network(&self.network_name, |net| {
             net.network_secret_key = Some(key.clone());
             Ok(())
-        }) {
-            Ok(Some(_)) => true,
-            Ok(None) => {
-                tracing::warn!(network = %self.network_name, "admin grant arrived after network config was deleted");
-                false
-            }
-            Err(e) => {
-                tracing::warn!(network = %self.network_name, error = %e, "failed to persist admin grant");
-                false
-            }
-        };
-        if !key_saved {
+        })
+        .context("failed to persist admin grant")
+        .and_then(|net| net.context("admin grant arrived after network config was deleted"));
+        if let Err(error) = key_saved {
             restore_authority();
-            commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await;
-            return;
+            if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &None).await {
+                tracing::error!(network = %self.network_name, "could not persist rolled-back admin grant");
+            }
+            return Err(error);
         }
         drop(commit_guard);
         // The registry owns the exactly-once transition: the winner of concurrent
         // grants installs one notify-driven publisher in NetworkHandle.tasks and
         // swaps the accept handler. Losers observe the Coordinator role and do
         // nothing, so no detached duplicate publisher survives teardown.
-        self.registry
-            .promote_to_coordinator(&self.ctx, &self.network_name, key, pkarr_client);
+        let promoted =
+            self.registry
+                .promote_to_coordinator(&self.ctx, &self.network_name, key, pkarr_client);
+        anyhow::ensure!(
+            promoted
+                || self
+                    .registry
+                    .networks
+                    .get(&self.network_name)
+                    .is_some_and(|handle| handle.role.is_coordinator()),
+            "network is no longer active on this peer"
+        );
+        Ok(())
     }
 }
 
@@ -1753,6 +1873,13 @@ impl AcceptHandler {
         match self {
             AcceptHandler::Coordinator(s) => &s.network_name,
             AcceptHandler::Member(s) => &s.network_name,
+        }
+    }
+
+    fn network_key(&self) -> EndpointId {
+        match self {
+            Self::Coordinator(state) => state.net_pubkey(),
+            Self::Member(state) => state.net_pubkey,
         }
     }
 
@@ -1826,6 +1953,26 @@ impl AcceptHandler {
             Self::Member(s) => s.state.read().map(|s| s.destroyed).unwrap_or(true),
         };
         if destroyed {
+            let reply = match msg {
+                ControlMsg::JoinRequest { .. } | ControlMsg::MeshHello { .. } => {
+                    Some(ControlMsg::JoinDenied {
+                        reason: "network has been destroyed".to_string(),
+                    })
+                }
+                ControlMsg::AdminGrant { .. } => Some(ControlMsg::AdminGrantResult {
+                    network_pubkey: self.network_key(),
+                    error: Some("network has been destroyed".to_string()),
+                }),
+                _ => None,
+            };
+            if let Some(reply) = reply {
+                let mut send = send;
+                if let Err(error) =
+                    control::send_msg(&mut send, Some(self.network_key()), &reply).await
+                {
+                    tracing::debug!(%error, "could not reply for destroyed network");
+                }
+            }
             return None;
         }
         match self {
@@ -1996,6 +2143,7 @@ impl ProtocolRouter {
                 FilesProtocol(Arc::clone(&self.files)),
             )
             .accept(daemon::PAIR_ALPN, PairProtocol(Arc::clone(&self.files)))
+            .accept(daemon::PAIR_V2_ALPN, PairProtocol(Arc::clone(&self.files)))
             .accept(
                 transport::CONNECT_ALPN,
                 ConnectProtocol(Arc::clone(&self.connect)),
@@ -2557,6 +2705,7 @@ mod pending_cap_tests {
 
     fn pending_at(t: Instant) -> PendingJoin {
         PendingJoin {
+            denied: false,
             hostname: None,
             device_cert: None,
             requested_at: t,

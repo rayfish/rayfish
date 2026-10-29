@@ -687,8 +687,8 @@ pub(super) fn parse_resolv_nameserver_ips(contents: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// The IPv4 half of [`parse_resolv_nameserver_ips`]: what the overlay checks
-/// and the daemon's own lookups read.
+/// The IPv4 half of [`parse_resolv_nameserver_ips`], used to identify other
+/// resolver services by their IPv4 addresses.
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
     parse_resolv_nameserver_ips(contents)
@@ -713,15 +713,22 @@ pub(super) fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
 /// host on iroh's own system-defaults reader. `Some(vec![])` is the different
 /// answer "we read the host's configuration and it holds nothing we can use",
 /// which is a host the daemon must still work on.
-pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
+/// A missing or unreadable resolv.conf also uses that empty set, so desktop
+/// startup can use public fallbacks without depending on the file.
+pub(crate) fn system_nameservers() -> Option<Vec<IpAddr>> {
     #[cfg(target_os = "linux")]
-    let found = Some(parse_resolv_nameservers(
-        &std::fs::read_to_string("/etc/resolv.conf").ok()?,
+    let found = Some(parse_resolv_nameserver_ips(
+        &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
     ));
     #[cfg(target_os = "macos")]
-    let found = Some(macos::capture_system_upstreams());
+    let found = Some(
+        macos::capture_system_upstreams()
+            .into_iter()
+            .map(IpAddr::V4)
+            .collect::<Vec<_>>(),
+    );
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let found: Option<Vec<Ipv4Addr>> = None;
+    let found: Option<Vec<IpAddr>> = None;
 
     // Nothing inside an overlay range is a resolver we can lean on: ours would
     // ask itself, and another VPN's answers only for as long as that VPN is up.
@@ -730,7 +737,10 @@ pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
     Some(
         found?
             .into_iter()
-            .filter(|ip| !crate::membership::is_cgnat_range(*ip))
+            .filter(|ip| {
+                !crate::membership::is_overlay_ip(*ip)
+                    && !matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(*v4))
+            })
             .collect(),
     )
 }

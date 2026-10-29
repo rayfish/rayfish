@@ -73,6 +73,8 @@ const ROOT: Groups = &[
         &[
             "up",
             "down",
+            #[cfg(target_os = "linux")]
+            "rootless",
             "start",
             "stop",
             "restart",

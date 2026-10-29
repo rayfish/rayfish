@@ -13,6 +13,9 @@ use std::path::PathBuf;
 /// The appender retains the 7 most recent daily files (see `main::init_tracing`),
 /// so logs older than ~a week are pruned automatically.
 pub fn log_dir() -> PathBuf {
+    if let Some(instance) = crate::instance::user_instance() {
+        return instance.directory.join("logs");
+    }
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         PathBuf::from("/var/log/rayfish")

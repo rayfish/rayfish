@@ -182,6 +182,118 @@ echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
   || fail "root should be denied when only 'deploy' is allowed: $OUT"
 
 # ---------------------------------------------------------------------------
+step "5f. forwards run with the login account's rights, not the daemon's"
+# The daemon is root. A forward it opened or bound as root would hand a
+# non-root login root's view of the host: SO_PEERCRED uid 0 at the ray IPC
+# socket, root-only sockets, privileged ports, and root's own mesh SSH login.
+DEPLOY_UID="$(on "$A" 'id -u deploy')"
+SSH_BASE="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
+  -o ConnectTimeout=8 -o PreferredAuthentications=none,publickey"
+# Probe servers on srv-a: one reports the connecting uid, one sits in a
+# directory only root can enter.
+# `on` gives the remote no stdin, so the script travels base64 in the command.
+PROBE="$(base64 -w0 <<'PY'
+import os, socket, struct, sys, threading
+def serve(path, reply):
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(path)
+    os.chmod(path, 0o777)
+    s.listen(8)
+    while True:
+        c, _ = s.accept()
+        cred = c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        c.sendall(reply(struct.unpack("3i", cred)[1]).encode())
+        c.close()
+threading.Thread(target=serve, args=("/tmp/e2e-fwd/peercred.sock",
+    lambda uid: "uid=%d\n" % uid), daemon=True).start()
+serve("/root/e2e-fwd/secret.sock", lambda uid: "root-secret\n")
+PY
+)"
+on "$A" "rm -rf /tmp/e2e-fwd /root/e2e-fwd && mkdir -p /tmp/e2e-fwd /root/e2e-fwd \
+  && chmod 1777 /tmp/e2e-fwd && chmod 700 /root/e2e-fwd \
+  && echo $PROBE | base64 -d > /root/e2e-probe.py"
+on "$A" 'nohup python3 /root/e2e-probe.py >/dev/null 2>&1 &' >/dev/null
+retry_until 15 "on '$A' 'test -S /root/e2e-fwd/secret.sock'" >/dev/null \
+  || fail "probe sockets did not come up on srv-a"
+
+# Open `-L <lport>:<target>` from srv-b as <user>, read what the target says,
+# then drop the tunnel. `-E` doubles as a marker for pkill; the bracket keeps
+# the pattern from matching the remote shell that runs pkill.
+fwd_read(){ # <lport> <target> <user> [ssh-port]
+  local lport="$1" target="$2" user="$3" port="${4:-22}"
+  on "$B" "ssh -p $port $SSH_BASE -E /tmp/e2e-fwd-$lport.log -f -N \
+      -L 127.0.0.1:$lport:$target $user@$A_IP 2>&1 \
+    && python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\",$lport),5); \
+      s.settimeout(5); print(s.recv(100).decode().strip())' 2>&1; \
+    pkill -f '/tmp/e2e-fw[d]-$lport.log' || true"
+}
+
+OUT="$(fwd_read 15001 /tmp/e2e-fwd/peercred.sock deploy)"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -qx "uid=$DEPLOY_UID" \
+  && pass "a forwarded unix socket sees the login uid ($DEPLOY_UID), not the daemon's" \
+  || fail "forwarded socket peer was not deploy (want uid=$DEPLOY_UID): $OUT"
+
+OUT="$(fwd_read 15002 /root/e2e-fwd/secret.sock deploy)"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -q root-secret \
+  && fail "non-root login reached a root-only socket through -L" \
+  || pass "non-root login cannot forward to a root-only socket"
+
+OUT="$(on "$B" "ssh $SSH_BASE -E /tmp/e2e-fwd-rev.log -o ExitOnForwardFailure=yes -f -N \
+    -R /tmp/e2e-fwd/rev.sock:127.0.0.1:22 deploy@$A_IP 2>&1 && echo started")"
+OWNER="$(on "$A" 'stat -c %U /tmp/e2e-fwd/rev.sock 2>&1')"
+on "$B" "pkill -f '/tmp/e2e-fw[d]-rev.log' || true"
+echo "   a| reverse socket owner: $OWNER"
+[[ "$OWNER" == deploy ]] \
+  && pass "a reverse-forwarded socket is bound as the login account" \
+  || fail "reverse-forwarded socket owner is '$OWNER', want deploy ($OUT)"
+
+OUT="$(on "$B" "timeout 20 ssh $SSH_BASE -o ExitOnForwardFailure=yes -N \
+    -R 127.0.0.1:81:127.0.0.1:22 deploy@$A_IP 2>&1; echo rc=\$?")"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -qi 'forwarding failed' \
+  && pass "non-root login cannot bind a privileged port with -R" \
+  || fail "privileged -R port was not refused for deploy: $OUT"
+
+# `timeout`: a client left waiting on an agent channel must fail, not hang.
+OUT="$(on "$B" "eval \$(ssh-agent -s) >/dev/null; timeout 20 ssh $SSH_BASE -A deploy@$A_IP \
+    'stat -c %U \"\$SSH_AUTH_SOCK\"; ssh-add -l >/dev/null 2>&1; echo agent-rc=\$?' 2>&1; \
+    echo ssh-rc=\$?; ssh-agent -k >/dev/null")"
+echo "$OUT" | sed 's/^/   b| /'
+# ssh-add exits 1 for an empty agent it reached and 2 when it reached nothing.
+echo "$OUT" | grep -qx deploy && echo "$OUT" | grep -qx 'agent-rc=1' \
+  && pass "agent socket is owned by the login account and reaches the agent" \
+  || fail "agent forwarding: want owner deploy and agent-rc=1: $OUT"
+echo "$OUT" | grep -qx 'ssh-rc=0' \
+  && pass "the client exits once its agent connection closes" \
+  || fail "ssh -A did not exit after the agent connection closed: $OUT"
+
+# A -L into this host's own mesh SSH port is dialed by the daemon. Taking that
+# connection for self-SSH would trust the daemon's socket and log in as root.
+on "$A" 'ray config set ssh-port 2222' >/dev/null
+SINCE="$(on "$A" 'date +%s')"
+OUT="$(on "$B" "ssh -p 2222 $SSH_BASE -E /tmp/e2e-fwd-self.log -f -N \
+    -L 127.0.0.1:15003:[$A_IP]:2222 deploy@$A_IP 2>&1; \
+    ssh -p 15003 $SSH_BASE root@127.0.0.1 whoami 2>&1; \
+    pkill -f '/tmp/e2e-fw[d]-self.log' || true")"
+REFUSED="$(on "$A" "journalctl -u rayfish --since @$SINCE --no-pager \
+  | grep -c 'self-SSH from a socket the daemon holds'")"
+on "$A" 'ray config set ssh-port 22' >/dev/null
+echo "$OUT" | sed 's/^/   b| /'
+# The daemon drops the connection before the handshake, so the client sees a
+# closed connection; the log line is what shows the tunnel got that far.
+if echo "$OUT" | grep -qx root; then
+  fail "a -L into srv-a's own SSH port logged in as root"
+elif [[ "${REFUSED:-0}" -ge 1 ]]; then
+  pass "a -L into the host's own SSH port is refused, not taken as root"
+else
+  fail "the self-SSH tunnel never reached the self listener: $OUT"
+fi
+
+on "$A" "pkill -f '/root/e2e-prob[e].py'; rm -rf /tmp/e2e-fwd /root/e2e-fwd /root/e2e-probe.py" || true
+
+# ---------------------------------------------------------------------------
 step "6. ray firewall ssh deny srv-b — access revoked"
 on "$A" "ray firewall ssh deny $NET srv-b" | strip | sed 's/^/   a| /'
 OUT="$(ssh_try "$B" "$A_IP" whoami meshtest)"

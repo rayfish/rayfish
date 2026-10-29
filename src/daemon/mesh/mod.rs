@@ -22,11 +22,13 @@ mod files;
 mod firewall;
 mod invite;
 mod join;
+mod ping;
 mod publish;
 mod reconverge;
 mod rename;
 mod runtime;
 mod select;
+mod unpair;
 
 // The join handshake (`join`) and the background-task / reconvergence modules
 // (split out of the former `background.rs`: `publish`, `reconverge`,
@@ -35,18 +37,23 @@ mod select;
 // `pub(crate) use mesh::*`).
 pub(crate) use accept::*;
 pub(crate) use coordinator::*;
-// Device-side unpair wipe + cert-refresh helpers, reached by both control readers.
-pub(crate) use files::{is_unpaired_by, resolve_download_target, store_refreshed_cert};
+// Device-side cert-refresh helper, reached by both control readers.
+pub(crate) use files::{resolve_download_target, store_refreshed_cert};
 pub(crate) use join::*;
 pub(crate) use publish::*;
 pub(crate) use reconverge::*;
 pub(crate) use rename::*;
+// The pairing's confirmation, saved by the pairing accept arm, and the mesh
+// versions whose unpair notice names none, read by the control demux.
+pub(crate) use unpair::{predates_pairing_generations, save_certificate_saved};
 // The saved-network parameter group the member-restore loop hands to
 // `warm_resume_member_network` in `create_join`.
 pub(crate) use runtime::SavedMemberNetwork;
 pub(crate) use select::*;
 // `run_daemon` is the public process entry point (called by `ray daemon`).
 pub use bootstrap::run_daemon;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub use bootstrap::run_rootless;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use bootstrap::build_headless;
 #[cfg(unix)]

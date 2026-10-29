@@ -6,6 +6,11 @@ enum RayfishLog {
     static let app = Logger(subsystem: "com.rayfish.app", category: "app")
     static let tunnel = Logger(subsystem: "com.rayfish.app", category: "tunnel")
     static let ipc = Logger(subsystem: "com.rayfish.app", category: "ipc")
+
+    static func startup(_ stage: String, since started: UInt64, logger: Logger) {
+        let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        logger.info("Startup: \(stage, privacy: .public) at \(elapsedMs) ms")
+    }
 }
 
 // NetworkExtension retains sessions created by preference loads. Reuse the

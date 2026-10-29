@@ -7,7 +7,7 @@ settings:
   base:
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: "0.5.10"
+    MARKETING_VERSION: "0.5.12"
     CURRENT_PROJECT_VERSION: "1"
     # Shared with Android (android/app/build.gradle.kts). Not a secret: it only
     # authorizes sending events to the project. Empty turns crash reporting off.

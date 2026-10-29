@@ -371,6 +371,9 @@ impl NetworkRegistry {
                             }
                             Ok(TryJoin::Pending) => continue,
                             Err(e) => {
+                                if me.record_join_denial(&nk, &e) {
+                                    return;
+                                }
                                 tracing::warn!(net = %nk, error = %e, "join retry failed");
                             }
                         }
@@ -381,8 +384,25 @@ impl NetworkRegistry {
                         .to_string(),
                 }
             }
-            Err(e) => ipc_err(format!("{e:#}")),
+            Err(e) => {
+                self.record_join_denial(network_key, &e);
+                ipc_err(format!("{e:#}"))
+            }
         }
+    }
+
+    /// Record a terminal refusal for status and remove the restart retry marker.
+    fn record_join_denial(&self, network_key: &str, error: &anyhow::Error) -> bool {
+        let Some(denial) = error.downcast_ref::<JoinDenied>() else {
+            return false;
+        };
+        self.restore_errors
+            .insert(denial.network.clone(), denial.to_string());
+        tracing::error!("{denial}");
+        if let Err(error) = config::remove_pending_join(network_key) {
+            tracing::error!(%error, "could not remove denied pending join");
+        }
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -442,18 +462,19 @@ impl NetworkRegistry {
         // If our own primary has nullified this device in the signed blob
         // (`ray unpair`), tear ourselves out instead of trying (and failing) to
         // join. This is the reliable teardown path when the device was offline at
-        // unpair time (so it never got `ControlMsg::Unpaired`) and the coordinator
+        // unpair time (so it never got the primary's notice) and the coordinator
         // now rejects its cert at the mesh handshake: the blob is fetched from the
         // record's seed peers, needs no mesh admission, and this runs on every
-        // startup restore + reconnect. Spawn `unpair_self` (delete the cert +
-        // leave every network) so it runs off this join path.
+        // startup restore + reconnect. Spawn the unpair (delete the cert + leave
+        // every network) so it runs off this join path; it keeps a pairing that
+        // completes first.
         if let Some(cert) = self.current_device_cert()
             && self_is_nullified(&cert, &data.members, &data.nullifiers)
         {
             tracing::warn!(network = %network_key, "this device is nullified by its primary in the signed blob; unpairing self");
             let registry = Arc::clone(self);
             tokio::spawn(async move {
-                let _ = registry.unpair_self().await;
+                registry.unpair_nullified(cert).await;
             });
             anyhow::bail!("this device has been unpaired by its primary");
         }
@@ -470,6 +491,7 @@ impl NetworkRegistry {
             None => self.unclaimed_network_name(&blob_name, Some(net_pubkey))?,
         };
         let display_name = display_name_owned.as_str();
+        self.restore_errors.remove(display_name);
 
         if self.networks.contains_key(display_name) {
             anyhow::bail!("already in network '{display_name}'");
@@ -672,8 +694,11 @@ impl NetworkRegistry {
                     pending = true;
                 }
                 Err(e) => {
-                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
                     cancel.cancel();
+                    if e.is::<JoinDenied>() {
+                        return Err(e);
+                    }
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
                     last_err = e;
                 }
             }
@@ -1407,6 +1432,7 @@ impl NetworkRegistry {
                 if let Err(error) = send_mesh_hello(
                     &peer_conn,
                     net_pubkey,
+                    network_name,
                     &ControlMsg::MeshHello {
                         identity: my_identity,
                         hostname: my_hostname.clone(),
@@ -1548,14 +1574,16 @@ mod tests {
     }
 
     #[test]
-    fn a_v5_record_is_speakable_by_v6() {
-        assert!(mesh_version_is_speakable(Some(5), 6));
-        assert!(
-            gate_mesh_version(Some(5), 6, VersionGate::Refuse)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!mesh_version_is_speakable(Some(4), 6));
+    fn v5_and_v6_records_are_speakable_by_v7() {
+        for older in [5, 6] {
+            assert!(mesh_version_is_speakable(Some(older), 7));
+            assert!(
+                gate_mesh_version(Some(older), 7, VersionGate::Refuse)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(!mesh_version_is_speakable(Some(4), 7));
     }
 
     fn id(seed: u8) -> EndpointId {
@@ -1567,6 +1595,17 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn pending_join_reuses_a_shared_connection_and_reaches_both_coordinators() {
+        join_two_coordinators(false).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn denied_join_stops_even_if_another_coordinator_queued_it() {
+        join_two_coordinators(true).await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn join_two_coordinators(deny: bool) {
         use iroh::RelayMode;
         use iroh::endpoint::presets;
         use std::ffi::OsString;
@@ -1626,7 +1665,14 @@ mod tests {
                     control::recv_msg(&mut recv).await.unwrap(),
                     ControlMsg::JoinRequest { .. }
                 ));
-                control::send_msg(&mut send, Some(id(90)), &ControlMsg::JoinPending)
+                let reply = if deny && index == 1 {
+                    ControlMsg::JoinDenied {
+                        reason: "operator denied the join request".into(),
+                    }
+                } else {
+                    ControlMsg::JoinPending
+                };
+                control::send_msg(&mut send, Some(id(90)), &reply)
                     .await
                     .unwrap();
                 let _ = timeout(Duration::from_secs(5), connection.closed()).await;
@@ -1666,14 +1712,46 @@ mod tests {
             coordinator: None,
             mismatch: None,
         };
+        let network_key = id(90).to_string();
+        config::add_pending_join(config::PendingJoinEntry {
+            network_key: network_key.clone(),
+            name: Some("box".into()),
+        })
+        .unwrap();
         let outcome = timeout(
             Duration::from_secs(15),
             daemon.registry.dial_fresh_join(&context, &data),
         )
         .await
-        .unwrap()
         .unwrap();
-        assert!(outcome.is_none());
+        if deny {
+            let error = match outcome {
+                Err(error) => error,
+                Ok(_) => panic!("an explicit denial must terminate the join"),
+            };
+            assert_eq!(
+                error.to_string(),
+                "coordinator denied joining to box: operator denied the join request"
+            );
+            assert!(daemon.registry.record_join_denial(&network_key, &error));
+            assert!(config::load().unwrap().pending_joins.is_empty());
+            let IpcMessage::StatusResponse {
+                inactive_networks,
+                pending_networks,
+                ..
+            } = daemon.status()
+            else {
+                panic!("expected status");
+            };
+            assert!(pending_networks.is_empty());
+            assert!(inactive_networks.iter().any(|network| network.name == "box"
+                && network.reason.as_deref() == Some(error.to_string().as_str())));
+        } else {
+            assert!(outcome.unwrap().is_none());
+            let error = anyhow::anyhow!("coordinator offline");
+            assert!(!daemon.registry.record_join_denial(&network_key, &error));
+            assert_eq!(config::load().unwrap().pending_joins.len(), 1);
+        }
         for server in servers {
             server.await.unwrap();
         }

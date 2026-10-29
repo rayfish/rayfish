@@ -14,8 +14,6 @@
 //! One [`ControlGate`] lives per listener task (each task owns exactly one
 //! peer's connection), so there is no shared state and no locking.
 
-use std::time::Duration;
-
 use ratelimit::Ratelimiter;
 
 /// Burst of control messages absorbed instantly before throttling kicks in.
@@ -51,7 +49,7 @@ impl ControlGate {
 
     /// Build a gate with explicit parameters (used by tests).
     pub fn with_params(capacity: u64, refill_per_sec: u64, strike_limit: u32) -> Self {
-        let limiter = Ratelimiter::builder(refill_per_sec, Duration::from_secs(1))
+        let limiter = Ratelimiter::builder(refill_per_sec)
             .max_tokens(capacity)
             .initial_available(capacity)
             .build()

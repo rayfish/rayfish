@@ -3,6 +3,7 @@
 //! speaks the wire protocol directly. Neither endpoint needs a TUN or a network.
 
 use super::*;
+use crate::endpoint_hints::{self, EndpointHint};
 use iroh::RelayMode;
 use iroh::endpoint::presets;
 use std::ffi::OsString;
@@ -23,7 +24,16 @@ impl TestConfig {
             settings.mdns_enabled = false;
             settings.dns_mode = config::DnsMode::Off;
             settings.default_hostname = Some("managed-test".to_string());
-            settings.endpoint_hints = vec![peer.addr()];
+            settings.endpoint_hints = peer
+                .addr()
+                .addrs
+                .into_iter()
+                .map(|addr| EndpointHint {
+                    peer: peer.id(),
+                    addr,
+                    last_success: endpoint_hints::now().unwrap(),
+                })
+                .collect();
             Ok(())
         })
         .unwrap();

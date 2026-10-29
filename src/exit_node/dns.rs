@@ -38,7 +38,7 @@ pub(super) fn tunnel_upstreams(
             servers = configured_servers;
         }
     } else if carries.carries_v4() {
-        servers.extend(PUBLIC_FALLBACK_DNS.into_iter().map(IpAddr::V4));
+        servers.extend(PUBLIC_FALLBACK_DNS.into_iter().filter(|ip| ip.is_ipv4()));
     } else {
         servers.extend(PUBLIC_FALLBACK_DNS_V6.into_iter().map(IpAddr::V6));
     }

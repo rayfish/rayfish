@@ -15,7 +15,7 @@ settings:
   base:
     DEVELOPMENT_TEAM: ""
     PRODUCT_BUNDLE_IDENTIFIER: com.rayfish.app
-    MARKETING_VERSION: "0.5.10"
+    MARKETING_VERSION: "0.5.12"
     CURRENT_PROJECT_VERSION: "14"
     RAYFISH_APP_PROFILE: Rayfish
     RAYFISH_TUNNEL_PROFILE: "Rayfish tunnel"

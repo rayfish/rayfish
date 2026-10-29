@@ -183,7 +183,9 @@ tcp_listeners(){ (
 
   # Occupying the port proves that a detached Python bind failure is counted,
   # even though the remote shell that launched it exits successfully.
-  python3 -c 'import socket, sys, time; s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); s.bind(("::",int(sys.argv[1]))); s.listen(); open(sys.argv[2],"w").write("1"); time.sleep(30)' "$port" "$TEST_TMP/tcp-held-ready" &
+  # Match the HTTP server's address reuse so its TIME_WAIT connections do not
+  # prevent the fixture from binding after shutdown.
+  python3 -c 'import socket, sys, time; s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("::",int(sys.argv[1]))); s.listen(); open(sys.argv[2],"w").write("1"); time.sleep(30)' "$port" "$TEST_TMP/tcp-held-ready" &
   held_pid=$!
   end=$((SECONDS + 5))
   while [[ ! -f "$TEST_TMP/tcp-held-ready" ]] && (( SECONDS < end )); do sleep 0.05; done

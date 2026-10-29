@@ -1,6 +1,6 @@
 [package]
 name = "ray-proto"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]

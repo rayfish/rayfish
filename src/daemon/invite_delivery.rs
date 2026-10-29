@@ -33,6 +33,7 @@ impl DeliveryOutcome {
 enum Reply {
     /// Stored the offer and acked it.
     Stored,
+    Refused(String),
     /// Shares no ALPN with us: it predates invite delivery.
     TooOld,
 }
@@ -105,11 +106,8 @@ impl ConnectService {
             }
         };
         let delivery = invite.delivery.context("delivery invite missing")?;
-        if delivery.delivered {
-            return Ok(DeliveryOutcome::Done(format!(
-                "invite {} already delivered; awaiting the recipient",
-                invite.id
-            )));
+        if let Some(reason) = &delivery.refusal {
+            anyhow::bail!("invitation to {network} refused: {reason}");
         }
         let offer = control::ConnectMsg::InviteOffer {
             network: ipc::NetworkName::new(network.to_string()),
@@ -131,15 +129,21 @@ impl ConnectService {
             };
             let (mut send, mut recv) = conn.open_bi().await?;
             control::send_framed(&mut send, &offer).await?;
-            // Never echo a peer reply: only the ack shape matters.
+            // A refusal is terminal; a missing acknowledgment can be retried.
             match control::recv_framed::<control::ConnectMsg>(&mut recv).await? {
                 control::ConnectMsg::Pending => Ok(Reply::Stored),
+                control::ConnectMsg::Denied { reason } => Ok(Reply::Refused(reason)),
                 _ => anyhow::bail!("recipient did not acknowledge"),
             }
         })
         .await;
         match reply {
             Ok(Ok(Reply::Stored)) => {}
+            Ok(Ok(Reply::Refused(reason))) => {
+                let _guard = invite_lock.lock().await;
+                InviteStore::load(network)?.mark_refused(&invite.id, reason.clone())?;
+                anyhow::bail!("invitation to {network} refused: {reason}");
+            }
             Ok(Ok(Reply::TooOld)) => {
                 {
                     let _guard = invite_lock.lock().await;
@@ -168,7 +172,7 @@ impl ConnectService {
                 )));
             }
         }
-        {
+        if !delivery.delivered {
             let _guard = invite_lock.lock().await;
             InviteStore::load(network)?.mark_delivered(&invite.id)?;
         }
@@ -221,7 +225,7 @@ impl ConnectService {
             match InviteStore::load(&network) {
                 Ok(store) => queued.extend(
                     store
-                        .pending_deliveries()
+                        .deliveries_to_check()
                         .into_iter()
                         .map(|recipient| (network.clone(), recipient)),
                 ),

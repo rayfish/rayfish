@@ -14,11 +14,14 @@
 use super::*;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use futures::future::BoxFuture;
+use iroh::TransportAddr;
+use iroh::endpoint::PathEvent;
 use iroh_dns::pkarr::SignedPacket;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
 
 /// Upper bound on a single on-demand dial. The first packets of a flow wait at
 /// most this long for the connection; past it the buffered packets are dropped and
@@ -36,9 +39,11 @@ const LEAVE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// past it the restore carries on in the background.
 const RENAME_RESTORE_WAIT: Duration = Duration::from_secs(10);
 
-/// Keep the persisted hint set small and bounded.  A hint is only a speed-up;
-/// the endpoint id in the QUIC certificate remains the authentication boundary.
-const MAX_WARM_ENDPOINT_HINTS: usize = 64;
+/// How long re-authorizing a device that pairs again waits for the records
+/// that no longer nullify it to be published, before the pairing is refused
+/// ([`NetworkRegistry::reauth_device_locked`]). A failed publish is retried
+/// after five seconds, so this leaves room for a second attempt.
+const REAUTHORIZATION_PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
 /// Finish a `ray rename` that a crash interrupted, from the intent it saved
 /// before anything moved ([`config::rename_network`]): move the network's file
@@ -262,6 +267,30 @@ pub(crate) struct NetworkRegistry {
     /// The cost of a missed nudge is one tick of staleness, which is what the
     /// poll was for anyway.
     pub(crate) poll_nudge: Arc<Notify>,
+    /// Wakes [`Self::run_unpair_requests`] when this device saves an unpair, or
+    /// finds the primary of one reachable.
+    pub(crate) unpair_nudge: Arc<Notify>,
+    /// Held while this device pairs or unpairs itself, and across each attempt
+    /// at its saved unpairs, so none of them sees another half done: a request
+    /// sent while a pairing with its primary completes would revoke that
+    /// pairing, and a pairing must not start before an unpair's cleanup ends.
+    pub(crate) unpair_lock: AsyncMutex<()>,
+    /// Wakes [`Self::run_unpair_notices`] when `ray unpair` saves a device to
+    /// tell.
+    pub(crate) notice_nudge: Arc<Notify>,
+    /// Held across each revocation of a device and each re-authorization of a
+    /// device that paired again, so neither runs in the middle of the other: a
+    /// revocation still under way when the device pairs again would put back
+    /// the nullifiers the re-authorization clears. Creating, renaming, leaving
+    /// and destroying a network hold it too, until the network is saved, saved
+    /// under its new name, or gone. A re-authorization checks that every
+    /// network this node coordinates runs, then clears the device from each
+    /// and waits for their records, and a network that stopped or appeared in
+    /// between would keep a record that still nullifies the device.
+    pub(crate) revocation_lock: AsyncMutex<()>,
+    /// Signalled each time a network's record is confirmed published here, for
+    /// a caller waiting until one is ([`Self::reauth_device_locked`]).
+    pub(crate) records_published: tokio::sync::watch::Sender<()>,
 }
 
 /// One saved network the restore supervisor found missing from the live map,
@@ -322,7 +351,7 @@ pub(crate) fn missing_networks(
         .collect()
 }
 
-fn networks_joined_with_certificate(
+pub(crate) fn networks_joined_with_certificate(
     saved: &[config::NetworkConfig],
     primary: EndpointId,
 ) -> Vec<String> {
@@ -382,6 +411,11 @@ impl NetworkRegistry {
             restore_errors: Arc::new(DashMap::new()),
             restore_nudge: Arc::new(Notify::new()),
             poll_nudge: Arc::new(Notify::new()),
+            unpair_nudge: Arc::new(Notify::new()),
+            unpair_lock: AsyncMutex::new(()),
+            notice_nudge: Arc::new(Notify::new()),
+            revocation_lock: AsyncMutex::new(()),
+            records_published: tokio::sync::watch::Sender::default(),
         }
     }
 
@@ -540,65 +574,82 @@ impl NetworkRegistry {
         }
     }
 
-    /// Remember a path that a peer has just completed an authenticated QUIC
-    /// handshake over.  The in-memory lookup makes it available immediately;
-    /// the compact on-disk cache survives the next daemon restart.  Neither is
-    /// authoritative: stale hints fall through to iroh discovery, and TLS pins
-    /// the endpoint id before a connection can be accepted.
-    fn remember_endpoint_hint(&self, peer: EndpointId, addr: iroh::TransportAddr) {
-        if peer == self.transport.identity.local_identity()
-            || !matches!(
-                addr,
-                iroh::TransportAddr::Ip(_) | iroh::TransportAddr::Relay(_)
-            )
-        {
+    /// Record authenticated paths without blocking an async worker on fsync.
+    async fn remember_endpoint_hints(&self, peer: EndpointId, addrs: Vec<TransportAddr>) {
+        if peer == self.transport.identity.local_identity() || addrs.is_empty() {
             return;
         }
-        let hint = iroh::EndpointAddr::from_parts(peer, [addr]);
-        self.transport.warm_lookup.add_endpoint_info(hint.clone());
-        if let Err(e) = config::update_settings(|cfg| {
-            if let Some(index) = cfg.endpoint_hints.iter().position(|h| h.id == peer) {
-                // Move a refreshed entry to the tail so the bounded vector is a
-                // simple LRU.  Retain every prior path for that identity: a
-                // direct candidate and its relay are useful fallbacks for each
-                // other after a network change.
-                let mut existing = cfg.endpoint_hints.remove(index);
-                existing.addrs.extend(hint.addrs);
-                cfg.endpoint_hints.push(existing);
-            } else {
-                cfg.endpoint_hints.push(hint);
+        let lookup = self.transport.warm_lookup.clone();
+        let result = tokio::task::spawn_blocking(move || lookup.remember(peer, addrs)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(peer = %peer.fmt_short(), %error, "failed to persist endpoint hint");
             }
-            // Every entry is appended or refreshed at the tail, so trimming from
-            // the front evicts the least-recently useful peer hint.
-            let overflow = cfg
-                .endpoint_hints
-                .len()
-                .saturating_sub(MAX_WARM_ENDPOINT_HINTS);
-            if overflow != 0 {
-                cfg.endpoint_hints.drain(..overflow);
+            Err(error) => {
+                tracing::warn!(peer = %peer.fmt_short(), %error, "endpoint hint task failed");
             }
-            Ok(())
-        }) {
-            tracing::debug!(peer = %peer.fmt_short(), error = %e, "failed to persist warm endpoint hint");
         }
     }
 
-    /// Capture the paths available now and keep listening for a relay-to-direct
-    /// upgrade.  This runs once per established mesh connection and exits with
-    /// that connection's path-event stream.
-    pub(crate) fn remember_connection_hints(self: &Arc<Self>, conn: &Connection) {
-        let peer = conn.remote_id();
-        for path in conn.paths().iter() {
-            self.remember_endpoint_hint(peer, path.remote_addr().clone());
+    /// Forget `peer`'s direct-address hints, in memory and on disk, after a dial
+    /// reached a different endpoint at one of them. Its relay hint stays. See
+    /// [`transport::is_wrong_peer`].
+    pub(crate) async fn forget_direct_hints(&self, peer: EndpointId) {
+        let lookup = self.transport.warm_lookup.clone();
+        match tokio::task::spawn_blocking(move || lookup.forget_direct_hints(peer)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(peer = %peer.fmt_short(), %error, "failed to forget stale endpoint hints");
+            }
+            Err(error) => {
+                tracing::warn!(peer = %peer.fmt_short(), %error, "endpoint hint task failed");
+            }
         }
+    }
+
+    /// Refresh paths while this authenticated connection remains alive. The
+    /// worker handles its errors and exits on connection close or daemon shutdown.
+    pub(crate) fn remember_connection_hints(self: &Arc<Self>, conn: &Connection) {
         let this = Arc::clone(self);
+        let mut events = conn.path_events();
+        // Take the snapshot before spawning: a short connection may close
+        // before its hint worker first runs.
+        let paths: Vec<_> = conn
+            .paths()
+            .iter()
+            .map(|path| path.remote_addr().clone())
+            .collect();
         let conn = conn.clone();
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut events = conn.path_events();
-            while let Some(event) = events.next().await {
-                if let iroh::endpoint::PathEvent::Opened { remote_addr, .. } = event {
-                    this.remember_endpoint_hint(peer, remote_addr);
+            let peer = conn.remote_id();
+            if this.shutdown_token.is_cancelled() {
+                return;
+            }
+            this.remember_endpoint_hints(peer, paths).await;
+            let period = crate::endpoint_hints::REFRESH_INTERVAL;
+            let mut refresh = interval_at(TokioInstant::now() + period, period);
+            refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = this.shutdown_token.cancelled() => break,
+                    _ = conn.closed() => break,
+                    _ = refresh.tick() => {
+                        let paths = conn
+                            .paths()
+                            .iter()
+                            .map(|path| path.remote_addr().clone())
+                            .collect();
+                        this.remember_endpoint_hints(peer, paths).await;
+                    }
+                    event = events.next() => match event {
+                        Some(PathEvent::Opened { remote_addr, .. }) => {
+                            this.remember_endpoint_hints(peer, vec![remote_addr]).await;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
                 }
             }
         });
@@ -682,15 +733,14 @@ impl NetworkRegistry {
         Ok(())
     }
 
-    /// Unpair *this* device from its primary, locally: leave only networks whose
-    /// first join used this primary's certificate, then delete the stored cert.
-    /// Called by the phone's unpair control, the IPC path, and the device-side
-    /// `ControlMsg::Unpaired` / self-nullify handlers (was the `self_unpair_tx`
-    /// hand-off to the daemon loop). A device with no cert (a primary) is a no-op.
-    pub(crate) async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
-        let Some(cert) = self.current_device_cert() else {
-            return ipc_err("this device is not paired to a primary".to_string());
-        };
+    /// The local cleanup of an unpair from `cert`'s primary: leave only networks
+    /// whose first join used that primary's certificate, then delete the stored
+    /// cert. Part of [`Self::unpair_self`], which saves the unpair first and
+    /// makes this cleanup durable before it asks the primary to record it.
+    pub(crate) async fn leave_certificate_networks(
+        self: &Arc<Self>,
+        cert: &control::DeviceCert,
+    ) -> IpcMessage {
         let cfg = match config::load() {
             Ok(cfg) => cfg,
             Err(error) => return ipc_err(format!("could not read saved networks: {error}")),
@@ -722,7 +772,9 @@ impl NetworkRegistry {
     /// entries, unregister its accept handler, and refresh DNS search domains.
     /// Returns whether the network was actually active. The mesh ALPN set is
     /// static, so (unlike the old `refresh_alpns`) only the search domains need
-    /// updating here.
+    /// updating here. A caller that stops a network this node coordinates holds
+    /// [`Self::revocation_lock`] until the network is gone or saved under its
+    /// new name.
     pub(crate) async fn teardown_network_runtime(&self, name: &str) -> bool {
         self.teardown_network_runtime_closing(name, forward::LEAVE_CODE, b"leave")
             .await
@@ -836,9 +888,9 @@ impl NetworkRegistry {
     /// Send `LeaveNetwork` to the peer at `ip`, dialing it first when no link is up.
     ///
     /// A named, boxed future rather than an `async fn`: the dial spawns the new
-    /// link's control loop, and an `Unpaired` arriving on that loop leaves networks
-    /// through here again (`unpair_self`), so the loop's future type would
-    /// otherwise contain itself.
+    /// link's control loop, and an unpair notice arriving on that loop leaves
+    /// networks through here again (`unpair_self`), so the loop's future type
+    /// would otherwise contain itself.
     fn deliver_leave(
         self: &Arc<Self>,
         ip: Ipv6Addr,
@@ -855,7 +907,7 @@ impl NetworkRegistry {
                 .peers
                 .conn_for_ip(&ip)
                 .context("the link closed before the leave was sent")?;
-            send_leave(&conn, net_pubkey).await
+            send_confirmed(&conn, Some(net_pubkey), &ControlMsg::LeaveNetwork).await
         })
     }
 
@@ -869,6 +921,10 @@ impl NetworkRegistry {
     }
 
     async fn remove_network_locally(&self, name: &str) -> bool {
+        // Stopped and deleted under [`Self::revocation_lock`]: a pairing that
+        // lifts a revocation meanwhile would skip the network, yet share it with
+        // the device until it is deleted.
+        let _revoking = self.revocation_lock.lock().await;
         let was_active = self.teardown_network_runtime(name).await;
         let removed_from_config = match config::delete_network(name) {
             Ok(removed) => removed,
@@ -942,6 +998,12 @@ impl NetworkRegistry {
                 "network '{from}' is still being restored; try again once it is up"
             ));
         };
+        // Stopped and moved under [`Self::revocation_lock`]: a pairing that
+        // lifts a revocation meanwhile would skip the network, which then comes
+        // back under the new name from a record that still nullifies the device.
+        // Once moved, the network is saved and not running, which such a
+        // pairing refuses.
+        let revoking = self.revocation_lock.lock().await;
         // The network's invite ledger moves with the name. Its invites are
         // redeemed and delivered under its invite lock, so hold that across the
         // move: a write already under way would otherwise land under the old
@@ -959,6 +1021,7 @@ impl NetworkRegistry {
             };
             config::rename_network(from, to)
         };
+        drop(revoking);
         drop(claim);
         let net = match renamed {
             Ok(Some(net)) => net,
@@ -1237,6 +1300,11 @@ impl NetworkRegistry {
         let mut net_state =
             self.build_initial_roster(&name, &my_hostname, mode, &net_secret_key, pre_approve)?;
 
+        // Sealed and saved under [`Self::revocation_lock`]: the seal copies the
+        // device revocations saved here into the network, and a pairing that
+        // lifts one in between would find the network neither saved nor running,
+        // and leave it nullifying the device.
+        let revoking = self.revocation_lock.lock().await;
         let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
 
         let member_entries = to_member_entries(net_state.members.all());
@@ -1271,6 +1339,7 @@ impl NetworkRegistry {
             exit_allow: vec![],
             exit_node_use: None,
         })?;
+        drop(revoking);
         dns::update_hostname(
             &self.dns.hostname_table,
             &self.dns.reverse_table,
@@ -1469,7 +1538,12 @@ impl NetworkRegistry {
             }
         };
         match publish_signed_record(&client, commit, network, hash, packet).await {
-            Ok(marked) => marked,
+            Ok(marked) => {
+                if marked {
+                    self.records_published.send_replace(());
+                }
+                marked
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to publish network record");
                 false
@@ -1816,26 +1890,62 @@ impl NetworkRegistry {
         true
     }
 
-    /// Clear a re-paired device's nullifier (the inverse of `unpair`). Invoked
-    /// directly by the pairing accept arm when it re-authorizes a device: drops
-    /// it from the durable `revoked_devices` seed and from every coordinated
-    /// network's blob nullifier set, republishing so the device's fresh cert is
-    /// honored mesh wide again. Non-coordinated networks clear on their own
-    /// coordinator's next reseal. Best-effort; a persist/publish failure is
-    /// logged, not surfaced.
-    pub(crate) async fn reauth_device(self: &Arc<Self>, device: EndpointId) {
-        // Drop from the durable nullifier seed so a later reseal won't re-add it.
+    /// Clear the nullifier of a device that pairs again, before it gets the new
+    /// certificate (the inverse of `unpair`): drop it from the durable
+    /// `revoked_devices` seed and from every coordinated network's blob
+    /// nullifier set, wait, at most [`REAUTHORIZATION_PUBLISH_WAIT`], until each
+    /// network that changed has its new record published, and only then tell
+    /// the members. The device joins the networks shared with it as soon as it
+    /// has the certificate, reading the record first, and the earlier record
+    /// still nullifies its key. A nullifier names no pairing, so the device
+    /// would take that for a revocation of the new one. Non-coordinated
+    /// networks clear on their own coordinator's next reseal.
+    ///
+    /// Returns whether a revocation was lifted. If a record is not published in
+    /// time, the revocation is put back, so that the next attempt lifts it and
+    /// waits again, and an error is returned. A coordinated network that is not
+    /// running, while its restore is in progress or after one failed, publishes
+    /// nothing, and the device is told of every saved network, so a revoked
+    /// device gets an error then, before anything changes. The caller holds
+    /// [`Self::revocation_lock`], which keeps the networks this node
+    /// coordinates from stopping or appearing until this returns.
+    pub(crate) async fn reauth_device_locked(
+        self: &Arc<Self>,
+        device: EndpointId,
+    ) -> Result<bool, String> {
+        // Before anything changes, so that no publication after it is missed.
+        let mut published = self.records_published.subscribe();
         let hex = device.to_string();
+        let settings =
+            config::load().map_err(|e| format!("could not read the nullifier seed: {e:#}"))?;
+        if settings.revoked_devices.contains(&hex) {
+            let stopped: Vec<&str> = settings
+                .networks
+                .iter()
+                .filter(|net| {
+                    net.network_secret_key.is_some() && !self.networks.contains_key(&net.name)
+                })
+                .map(|net| net.name.as_str())
+                .collect();
+            if !stopped.is_empty() {
+                return Err(format!(
+                    "networks this node coordinates are not running, and their records still nullify the device: {}",
+                    stopped.join(", ")
+                ));
+            }
+        }
+        // Drop from the durable nullifier seed so a later reseal won't re-add it.
+        let mut lifted = false;
         // No-op when the device was not in the seed: `update_settings` skips the
         // write when the callback changes nothing.
-        if let Err(e) = config::update_settings(|cfg| {
+        config::update_settings(|cfg| {
             if let Some(pos) = cfg.revoked_devices.iter().position(|d| *d == hex) {
                 cfg.revoked_devices.remove(pos);
+                lifted = true;
             }
             Ok(())
-        }) {
-            tracing::warn!(error = %e, "reauth: failed to clear device from nullifier seed");
-        }
+        })
+        .map_err(|e| format!("could not clear the device from the nullifier seed: {e:#}"))?;
         // Collect coordinated networks (clone the handles) before awaiting.
         let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
         for entry in self.networks.iter() {
@@ -1854,23 +1964,60 @@ impl NetworkRegistry {
                 ));
             }
         }
-        let mut changed = false;
+        let mut changed = Vec::new();
+        let mut failure = None;
         for (net, state, dht_notify) in nets {
             let removed = {
                 let mut s = state.write().unwrap();
                 s.nullifiers.remove(&device)
             };
-            if removed {
-                changed = true;
-                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-                let net_pubkey = state.read().unwrap().network_public_key;
-                broadcast_member_sync(self, net_pubkey, &net, None).await;
+            if !removed {
+                continue;
+            }
+            lifted = true;
+            // A network destroyed meanwhile leaves no record to wait for.
+            if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await
+                && !state.read().unwrap().destroyed
+            {
+                failure = Some(format!(
+                    "could not save network '{net}' without the device's nullifier"
+                ));
+                break;
+            }
+            changed.push((net, state));
+        }
+        // Each network's own publisher publishes its record.
+        let deadline = tokio::time::Instant::now() + REAUTHORIZATION_PUBLISH_WAIT;
+        while failure.is_none() && !changed.iter().all(|(net, _)| record_is_published(net)) {
+            if !matches!(
+                tokio::time::timeout_at(deadline, published.changed()).await,
+                Ok(Ok(()))
+            ) {
+                failure = Some("the networks' records were not published in time".to_string());
             }
         }
-        if changed {
+        if let Some(message) = failure {
+            if let Err(error) = self.revoke_device_locked(device, |_| {}).await {
+                tracing::warn!(device = %device.fmt_short(), %error, "could not put back the revocation a failed re-authorization lifted");
+            }
+            return Err(message);
+        }
+        for (net, state) in changed {
+            let net_pubkey = state.read().unwrap().network_public_key;
+            broadcast_member_sync(self, net_pubkey, &net, None).await;
+        }
+        if lifted {
             tracing::info!(device = %device.fmt_short(), "re-authorized device (cleared nullifier)");
         }
+        Ok(lifted)
     }
+}
+
+/// Whether `network`'s current record is published, which its publisher marks
+/// once the relay took it. A network no longer saved here is not waited for.
+fn record_is_published(network: &str) -> bool {
+    config::load_network(network)
+        .is_ok_and(|net| net.is_none_or(|net| net.last_group_hash_published))
 }
 
 #[cfg(test)]

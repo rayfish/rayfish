@@ -67,6 +67,7 @@ pub mod daemon;
 pub mod deeplink;
 pub mod dht;
 pub mod dns;
+pub mod endpoint_hints;
 pub mod exit_node;
 pub mod firewall;
 pub mod forward;
@@ -77,9 +78,12 @@ pub mod identity;
 // management commands. Desktop-only: Android has no `ray` service to install.
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 pub mod init_system;
+pub mod instance;
 pub mod invite;
 pub mod ipc;
 pub mod keybackup;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub mod rootless;
 // Kernel notification of listen()/close on the host's TCP sockets, which is
 // what keeps `v4bridge` off a poll. Internal to that one caller, and desktop
 // for the same reason it is.

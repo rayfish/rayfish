@@ -432,7 +432,7 @@ impl Daemon {
         // which resolves the *calling user's* config directory and so finds an
         // empty one wherever the daemon's is root-owned, turning every failed
         // restore into a network that simply is not mentioned.
-        let inactive_networks: Vec<InactiveNetwork> = saved
+        let mut inactive_networks: Vec<InactiveNetwork> = saved
             .as_ref()
             .map(|c| {
                 c.networks
@@ -451,6 +451,20 @@ impl Daemon {
             })
             .unwrap_or_default();
 
+        for error in self.registry.restore_errors.iter() {
+            if !self.registry.networks.contains_key(error.key())
+                && !inactive_networks
+                    .iter()
+                    .any(|network| network.name == *error.key())
+            {
+                inactive_networks.push(InactiveNetwork {
+                    name: error.key().clone(),
+                    reason: Some(error.value().clone()),
+                    saved: None,
+                });
+            }
+        }
+
         IpcMessage::StatusResponse {
             endpoint_id: self.transport.endpoint.id(),
             mdns_enabled: self.mdns.enabled(),
@@ -465,6 +479,19 @@ impl Daemon {
             bytes_tx: self.stats.bytes_tx.get(),
             pending_files: self.files.pending_files.lock().unwrap().len(),
             pending_connects: self.connect.pending_connects.len(),
+            connection_errors: {
+                let mut errors: Vec<_> = self
+                    .connect
+                    .connection_errors
+                    .iter()
+                    .map(|entry| ipc::ConnectionErrorInfo {
+                        peer: *entry.key(),
+                        message: entry.value().clone(),
+                    })
+                    .collect();
+                errors.sort_by_key(|error| error.peer);
+                errors
+            },
             pending_networks,
             inactive_networks,
             // Only the neighbours you could still link up with: peers already on
@@ -546,7 +573,7 @@ impl Daemon {
                 roster,
                 count,
                 s.pending_suggestions.len(),
-                s.pending.len(),
+                s.pending.values().filter(|request| !request.denied).count(),
                 s.network_secret_key.as_ref().map(|_| s.mode),
             )
         };
@@ -923,47 +950,31 @@ impl Daemon {
                 }
             }
         };
-        let conn = route.conn;
         let network = route.network.to_string();
-        let count = count.clamp(1, 100);
-        let mut probes: Vec<Option<f64>> = Vec::with_capacity(count as usize);
-
-        for seq in 0..count {
-            if seq > 0 {
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            }
-            let nonce: u64 = rand::random();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.protocol_router.pending_pongs().insert(nonce, tx);
-            let sent = Instant::now();
-            let sent_ok = match conn.open_bi().await {
-                Ok((mut send, _)) => {
-                    control::send_msg(&mut send, None, &control::ControlMsg::Ping { nonce })
-                        .await
-                        .is_ok()
-                }
-                Err(_) => false,
-            };
-            let rtt = if sent_ok {
-                match tokio::time::timeout(Duration::from_secs(1), rx).await {
-                    Ok(Ok(())) => Some(sent.elapsed().as_secs_f64() * 1000.0),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            // Drop the slot whether or not the Pong arrived (timeout / send error).
-            self.protocol_router.pending_pongs().remove(&nonce);
-            probes.push(rtt);
-        }
-
-        let info = self.gather_conn_info(&conn);
+        drop(route);
+        let run = super::ping::run_probes(
+            count,
+            interval_ms,
+            self.protocol_router.pending_pongs(),
+            || self.registry.peers.lookup_v6(&ip).map(|route| route.conn),
+        )
+        .await;
+        // Keep the old end-of-run fields for older clients, but new clients
+        // label each probe exclusively from its own selected-path observation.
+        let info = self
+            .registry
+            .peers
+            .lookup_v6(&ip)
+            .map(|route| self.gather_conn_info(&route.conn));
         IpcMessage::PingResponse {
             peer_name: display,
-            conn_type: info.conn_type,
-            remote_addr: info.remote_addr,
+            conn_type: info
+                .as_ref()
+                .map_or(ipc::ConnType::Unknown, |info| info.conn_type.clone()),
+            remote_addr: info.and_then(|info| info.remote_addr),
             network,
-            probes,
+            probes: run.probes,
+            probe_details: run.details,
         }
     }
 

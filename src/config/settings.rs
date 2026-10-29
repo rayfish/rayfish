@@ -76,7 +76,7 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
         GlobalKey::Dns => {
             cfg.dns_mode = if value.trim().is_empty() {
-                DnsMode::On
+                DnsMode::default()
             } else {
                 value
                     .trim()
@@ -610,19 +610,23 @@ mod tests {
     }
 
     #[test]
-    fn dns_toggle_defaults_on_and_round_trips() {
+    fn dns_toggle_defaults_to_partial_and_round_trips() {
         let mut cfg = AppConfig::default();
+        assert_eq!(cfg.dns_mode, DnsMode::Partial);
         apply_global(&mut cfg, GlobalKey::Dns, "off", false).unwrap();
         assert_eq!(cfg.dns_mode, DnsMode::Off);
         assert_eq!(render_global(&cfg, GlobalKey::Dns), "off");
         apply_global(&mut cfg, GlobalKey::Dns, "partial", false).unwrap();
         assert_eq!(cfg.dns_mode, DnsMode::Partial);
         assert_eq!(render_global(&cfg, GlobalKey::Dns), "partial");
+        apply_global(&mut cfg, GlobalKey::Dns, "on", false).unwrap();
+        assert_eq!(cfg.dns_mode, DnsMode::On);
+        assert_eq!(render_global(&cfg, GlobalKey::Dns), "on");
         for value in ["1", "yes", "true", "0", "no", "false"] {
             assert!(apply_global(&mut cfg, GlobalKey::Dns, value, false).is_err());
         }
         apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
-        assert_eq!(cfg.dns_mode, DnsMode::On);
+        assert_eq!(cfg.dns_mode, DnsMode::Partial);
     }
 
     #[test]

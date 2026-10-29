@@ -1,6 +1,6 @@
 [package]
 name = "rayfish"
-version = "0.5.10"
+version = "0.5.12"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
@@ -55,6 +55,11 @@ desktop = [
     "dep:uzers",
     "dep:rpassword",
     "dep:self-replace",
+    "dep:smoltcp",
+    "dep:base64",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
 ]
 tor = ["dep:iroh-tor-transport"]
 # Export tracing spans to an OpenTelemetry collector over OTLP/HTTP. Activated at
@@ -67,7 +72,7 @@ otel = [
 ]
 
 [dependencies]
-ray-proto = { path = "ray-proto", version = "0.1.20" }
+ray-proto = { path = "ray-proto", version = "0.1.21" }
 anyhow = "1"
 thiserror = "2"
 hickory-resolver = "0.26.1"
@@ -84,7 +89,7 @@ ahash = "0.8"
 clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 # Token-bucket rate limiter guarding inbound control streams against floods
 # (src/ratelimit.rs). One per control-listener task; no shared state.
-ratelimit = "0.10"
+ratelimit = "2.0.0"
 dashmap = "6"
 dirs = "6.0.0"
 futures = "0.3"
@@ -163,12 +168,13 @@ semver = "1"
 # Embedded mesh SSH server (`ray firewall ssh on`): pure-Rust async SSH on tokio.
 # Use the `ring` crypto backend (already in the tree via iroh) instead of the
 # default `aws-lc-rs`, whose C build breaks cross-compilation (`just cross`).
-russh = { version = "0.61.2", default-features = false, features = ["ring", "flate2"], optional = true }
+russh = { version = "0.64.1", default-features = false, features = ["ring", "flate2"], optional = true }
 # Build the mesh SSH listener socket with SO_REUSEADDR/SO_REUSEPORT so binding
 # a specific mesh IP's port 22 coexists with a host sshd on 0.0.0.0:22.
 socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 criterion = "0.5"
 tempfile = "3"
 proptest = "1"
@@ -193,6 +199,11 @@ harness = false
 tun-rs = { version = "2", features = ["async", "async_framed"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+base64 = { version = "0.22", optional = true }
+hyper = { version = "1", features = ["client", "server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv6", "socket-tcp"], optional = true }
 rtnetlink = "0.21.0"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Watch /etc/resolv.conf for trampling (NetworkManager/dhclient) in direct mode
@@ -241,6 +252,8 @@ iroh = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af
 iroh-base = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af273fcdc7d61daf6fc" }
 iroh-dns = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af273fcdc7d61daf6fc" }
 iroh-relay = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af273fcdc7d61daf6fc" }
-# netwatch's socket configuration hook is merged upstream but not yet released.
-# https://github.com/n0-computer/net-tools/pull/182
-netwatch = { git = "https://github.com/n0-computer/net-tools", rev = "d73b994abce8f683d7d6dcc163eee5eaefb952f5" }
+# illumos forks, until upstream support lands. The netwatch fork carries the
+# configure-socket hook (n0-computer/net-tools#182) plus illumos support.
+netdev = { git = "https://github.com/extrowerk/netdev.git", branch = "illumos" }
+netwatch = { git = "https://github.com/extrowerk/net-tools", branch = "illumos-0.19" }
+tun-rs = { git = "https://github.com/extrowerk/tun-rs", branch = "illumos" }

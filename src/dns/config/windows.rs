@@ -170,13 +170,17 @@ pub(super) fn next_managed_suffixes(
         .collect()
 }
 
+/// The NRPT namespaces routed to our resolver: always `ray`, then the search
+/// domains and bare network names, which only [`crate::config::DnsMode::On`]
+/// hands in. Like Linux's `~ray`, routing `.ray` does not depend on there being
+/// search domains, or `partial` mode would get no rule at all.
 #[cfg(windows)]
 pub(super) fn windows_nrpt_domains(
     rayfish_domains: &[String],
     network_names: &[String],
 ) -> Vec<String> {
-    let mut domains = rayfish_domains.to_vec();
-    for name in network_names {
+    let mut domains = vec![DNS_DOMAIN.to_string()];
+    for name in rayfish_domains.iter().chain(network_names) {
         if !domains.contains(name) {
             domains.push(name.clone());
         }
@@ -412,18 +416,30 @@ pub(super) async fn set_search_domains_windows(
         .iter()
         .filter_map(|d| d.network_name().map(str::to_owned))
         .collect();
+    let nrpt_domains = windows_nrpt_domains(&rayfish_domains, &network_names);
+    reconcile_windows_dns(&rayfish_domains, &nrpt_domains).await
+}
+
+/// Remove every NRPT rule and search suffix of ours. Not
+/// `set_search_domains_windows(&[])`, which still routes `.ray`.
+#[cfg(windows)]
+pub(super) async fn clear_search_domains_windows() -> Result<()> {
+    reconcile_windows_dns(&[], &[]).await
+}
+
+#[cfg(windows)]
+async fn reconcile_windows_dns(rayfish_domains: &[String], nrpt_domains: &[String]) -> Result<()> {
     let _transaction = WINDOWS_DNS_TRANSACTION.lock().await;
     let snapshot_text = powershell_text(windows_dns_snapshot_script()).await?;
     let snapshot: WindowsDnsSnapshot =
         serde_json::from_str(&snapshot_text).context("parse Windows DNS snapshot")?;
     let transaction_id = next_windows_dns_transaction_id();
-    let nrpt_domains = windows_nrpt_domains(&rayfish_domains, &network_names);
-    let managed_suffixes = next_managed_suffixes(&snapshot, &rayfish_domains);
-    let expected_suffixes = expected_suffixes_after(&snapshot, &rayfish_domains);
-    let touched_displays = touched_rule_displays(&snapshot, &nrpt_domains);
+    let managed_suffixes = next_managed_suffixes(&snapshot, rayfish_domains);
+    let expected_suffixes = expected_suffixes_after(&snapshot, rayfish_domains);
+    let touched_displays = touched_rule_displays(&snapshot, nrpt_domains);
     let mutation = powershell_status(&windows_dns_reconcile_script(
-        &nrpt_domains,
-        &rayfish_domains,
+        nrpt_domains,
+        rayfish_domains,
         &managed_suffixes,
         &transaction_id,
     ))

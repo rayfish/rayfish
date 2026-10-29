@@ -643,15 +643,30 @@ pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
 /// out the host's default IPv6 route. `200::/7` is the whole range, magic DNS
 /// (`dns::MAGIC_DNS_V6`) included, so nothing else needs a host route.
 /// Idempotent, safe to call on every `up` cycle.
+///
+/// The route carries `RTAX_MTU` taken from the TUN's live MTU, so TCP over the
+/// overlay is sized for the device rather than for whatever the kernel would
+/// otherwise assume. `RTAX_ADVMSS` is left unset: the kernel derives it from
+/// the route MTU, which it also lowers if the device MTU drops later, where a
+/// fixed value would keep advertising the old size. A TUN has no ICMP layer: a packet
+/// too large for it is dropped without an ICMPv6 Packet Too Big, so a mismatch
+/// shows up as a connection that carries headers and then stalls.
 #[cfg(target_os = "linux")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     use rtnetlink::RouteMessageBuilder;
+    use rtnetlink::packet_route::route::{RouteAttribute, RouteMetric};
 
     with_tun_link(tun_name, async |handle, index| {
-        let route = RouteMessageBuilder::<Ipv6Addr>::new()
+        let mtu = tun_link_mtu(&handle, index).await;
+        let mut route = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(OVERLAY, OVERLAY_LEN)
             .output_interface(index)
             .build();
+        route
+            .attributes
+            .push(RouteAttribute::Metrics(vec![RouteMetric::Mtu(u32::from(
+                mtu,
+            ))]));
         handle
             .route()
             .add(route)
@@ -661,6 +676,95 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
             .context("add 200::/7 route via netlink")
     })
     .await
+}
+
+/// The largest TCP MSS in an `mtu`-byte IPv6 packet: the MTU less the 40-byte
+/// IPv6 header and the 20-byte TCP header.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const fn mss_for_mtu(mtu: u16) -> u16 {
+    mtu.saturating_sub(40 + 20)
+}
+
+/// The MTU configured on link `index`, read back rather than assumed:
+/// `configure_mtu` can fall back, and an operator can change it later.
+///
+/// Clamped to the range the mesh carries. When it cannot be read, falls back to
+/// [`MIN_TUN_MTU`], which fits any TUN we create; guessing high would bring the
+/// stall back.
+#[cfg(target_os = "linux")]
+async fn tun_link_mtu(handle: &rtnetlink::Handle, index: u32) -> u16 {
+    use futures::TryStreamExt;
+    use rtnetlink::packet_route::link::LinkAttribute;
+
+    let link = handle
+        .link()
+        .get()
+        .match_index(index)
+        .execute()
+        .try_next()
+        .await
+        .context("query the TUN link")
+        .and_then(|link| link.context("TUN link not found"));
+    let mtu = link.and_then(|link| {
+        link.attributes
+            .into_iter()
+            .find_map(|attribute| match attribute {
+                LinkAttribute::Mtu(mtu) => Some(mtu),
+                _ => None,
+            })
+            .context("TUN link has no MTU attribute")
+    });
+    match mtu {
+        Ok(mtu) => u16::try_from(mtu)
+            .unwrap_or(TUN_MTU)
+            .clamp(MIN_TUN_MTU, TUN_MTU),
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                mtu = MIN_TUN_MTU,
+                "could not read the TUN MTU; sizing the overlay route for the minimum"
+            );
+            MIN_TUN_MTU
+        }
+    }
+}
+
+#[cfg(target_os = "illumos")]
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+    // Same range as the Linux version: 200::/7 covers all mesh addresses.
+    const PREFIX: &str = "200::/7";
+
+    // The gateway is the interface's own IPv6 address (point-to-point).
+    let ifc = tokio::process::Command::new("/sbin/ifconfig")
+        .args([tun_name, "inet6"])
+        .output()
+        .await?;
+    let text = String::from_utf8_lossy(&ifc.stdout);
+    let gw = text
+        .split_whitespace()
+        .skip_while(|w| *w != "inet6")
+        .nth(1)
+        .map(|a| a.split('/').next().unwrap_or(a).to_owned())
+        .ok_or_else(|| anyhow::anyhow!("no inet6 address on {tun_name}"))?;
+
+    // Idempotent: drop any stale route first, ignore the result.
+    let _ = tokio::process::Command::new("/sbin/route")
+        .args(["delete", "-inet6", PREFIX, &gw])
+        .output()
+        .await;
+
+    let out = tokio::process::Command::new("/sbin/route")
+        .args(["add", "-inet6", PREFIX, &gw, "-interface"])
+        .output()
+        .await?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "route add {PREFIX} via {tun_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -868,6 +972,20 @@ async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
                 .context("set TUN link state via netlink")
         })
         .await?;
+    }
+    #[cfg(target_os = "illumos")]
+    {
+        // The TUN is IPv6-only, so only the inet6 stream exists; a plain
+        // `ifconfig tunN up` would address the unplumbed IPv4 side and fail.
+        let state = if up { "up" } else { "down" };
+        let status = std::process::Command::new("/sbin/ifconfig")
+            .args([tun_name, "inet6", state])
+            .status()
+            .context("run ifconfig")?;
+        anyhow::ensure!(
+            status.success(),
+            "ifconfig inet6 {state} failed with {status}"
+        );
     }
     #[cfg(target_os = "windows")]
     {
@@ -1121,6 +1239,13 @@ mod tests {
         .unwrap();
         assert_eq!(mtu, 1500);
         assert_eq!(attempts, [1500]);
+    }
+
+    #[test]
+    fn mss_follows_the_tun_mtu() {
+        assert_eq!(super::mss_for_mtu(super::MIN_TUN_MTU), 1220);
+        assert_eq!(super::mss_for_mtu(super::TUN_MTU), 1440);
+        assert_eq!(super::mss_for_mtu(0), 0);
     }
 
     /// Pin the split-default `route` arguments, which no CI host runs.

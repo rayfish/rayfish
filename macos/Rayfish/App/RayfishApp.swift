@@ -719,7 +719,7 @@ private struct EmptyState: View {
 private struct SettingsView: View {
     @ObservedObject var controller: TunnelController
     let updater: SPUUpdater?
-    @State private var shellCommandMessage: String?
+    @State private var shellCommandResult: Result<URL, Error>?
     @State private var automaticUpdatesEnabled = false
     @State private var engineNeedsReconnect = false
     var body: some View {
@@ -864,13 +864,19 @@ private struct SettingsView: View {
                         .foregroundColor(RayfishTheme.muted)
                     Spacer()
                     Button("Install shell command") {
-                        do {
-                            let config = try ShellCommandInstaller.install()
-                            shellCommandMessage = "Installed in \(config.lastPathComponent). Open a new terminal to use ray."
-                        } catch { shellCommandMessage = error.localizedDescription }
+                        shellCommandResult = Result { try ShellCommandInstaller.install() }
                     }
                 }
-                if let shellCommandMessage { Text(shellCommandMessage).foregroundColor(RayfishTheme.muted) }
+                switch shellCommandResult {
+                case let .success(config)?:
+                    Label("Installed in ~/\(config.lastPathComponent). Open a new terminal to use ray.", systemImage: "checkmark.circle.fill")
+                        .foregroundColor(RayfishTheme.green)
+                case let .failure(error)?:
+                    Label(error.localizedDescription, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(RayfishTheme.amber)
+                case nil:
+                    EmptyView()
+                }
             }.padding(18).rayfishCard()
             VStack(alignment: .leading, spacing: 10) {
                 Text("Existing installation").font(RayfishTheme.heading(15))

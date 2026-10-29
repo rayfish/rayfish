@@ -6,9 +6,9 @@
 //!   `blob_store.remote().fetch(..)` and reports bytes as they land.
 //! - **Send:** `send_file` returns as soon as the *offer* is delivered; the peer
 //!   pulls the bytes whenever it accepts (immediately on auto-accept, minutes or
-//!   never on a manual one). So the sender learns the real outcome only from
-//!   iroh-blobs *provider* events, which fire when a peer actually reads the blob
-//!   out of our store. `TransferCompleted` is the authoritative "they got it".
+//!   never on a manual one). Provider events report reads from our blob store.
+//!   A recipient also confirms completion by offer identity, including when it
+//!   already has the bytes cached, and reports an explicit decline.
 //!
 //! Provider events are keyed by blob hash *and* the resolved peer endpoint id, not
 //! by transfer. The roster (group blob) fetches ride the same blobs ALPN, so a
@@ -37,7 +37,7 @@ pub enum TransferState {
     Offered,
     /// Bytes are moving.
     Transferring,
-    /// Every byte transferred. For a send this means the peer actually pulled it.
+    /// The recipient has every byte, fetched or already cached.
     Done,
     /// The transfer failed or was aborted.
     Failed,
@@ -53,6 +53,7 @@ pub struct TransferInfo {
     pub transferred: u64,
     pub state: TransferState,
     pub destination: Option<PathBuf>,
+    pub error: Option<String>,
 }
 
 struct Entry {
@@ -151,6 +152,7 @@ impl TransferRegistry {
                     transferred: 0,
                     state: TransferState::Offered,
                     destination: None,
+                    error: None,
                 },
                 send: Some(SendKey { hash, peer }),
                 finished_at: None,
@@ -176,6 +178,7 @@ impl TransferRegistry {
                     transferred: 0,
                     state: TransferState::Transferring,
                     destination: None,
+                    error: None,
                 },
                 send: None,
                 finished_at: None,
@@ -220,15 +223,11 @@ impl TransferRegistry {
         }
     }
 
-    /// `fail_offer` addressed by `(hash, peer)` instead of registry id, for the
-    /// send outbox: a canceled queued send registered its transfer at enqueue
-    /// (see `register_send`'s ordering contract) and only knows the blob and
-    /// peer. Touches only the still-`Offered` entry, never a moving transfer.
-    pub fn fail_offer_by(&self, hash: Hash, peer: EndpointId) {
-        if let Some(e) = self.entries.lock().unwrap().values_mut().find(|e| {
-            e.send == Some(SendKey { hash, peer }) && e.info.state == TransferState::Offered
-        }) {
-            finish_entry(e, false, Some(FailureKind::Offer));
+    /// A recipient's explicit refusal is terminal and cannot be revived by a pull.
+    pub(crate) fn decline_offer(&self, id: u64, reason: String) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(&id) {
+            finish_entry(entry, false, Some(FailureKind::Offer));
+            entry.info.error = Some(reason);
             self.changed();
         }
     }

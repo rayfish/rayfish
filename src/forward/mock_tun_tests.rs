@@ -601,7 +601,7 @@ async fn outbound_mtu_limits_drop_oversize_and_fragment_valid_packets() {
 async fn tcp_conntrack_admits_real_replies_but_honors_denies_and_flow_close() {
     for engine in ENGINES {
         for close_flag in [1, 4] {
-            // FIN and RST both close a tracked flow.
+            // A FIN closes only our write half; a reset closes the whole flow.
             let mut h = Harness::new(engine, 1, policy(Action::Allow, vec![])).await;
             let peer = h.peers[0].ipv6;
             let reply = packet(6, peer, h.local_ipv6, 443, 50000, 0x12, 60);
@@ -634,10 +634,25 @@ async fn tcp_conntrack_admits_real_replies_but_honors_denies_and_flow_close() {
             let close = packet(6, h.local_ipv6, peer, 50000, 443, close_flag, 60);
             h.inject(close.clone()).await;
             h.receive_peer(0, &close).await;
-            h.inject_peer(0, &reply);
-            h.dropped(DropReason::Firewall, 3).await;
-            assert_eq!(h.stats.packets_rx.get(), 1);
-            assert!(h.output.try_recv().is_err());
+            if close_flag == 1 {
+                let data = packet(6, peer, h.local_ipv6, 443, 50000, 0x10, 60);
+                h.inject_peer(0, &data);
+                assert_eq!(h.receive_tun().await, data);
+                let peer_fin = packet(6, peer, h.local_ipv6, 443, 50000, 0x11, 60);
+                h.inject_peer(0, &peer_fin);
+                assert_eq!(h.receive_tun().await, peer_fin);
+                let final_ack = packet(6, h.local_ipv6, peer, 50000, 443, 0x10, 60);
+                h.inject(final_ack.clone()).await;
+                h.receive_peer(0, &final_ack).await;
+                h.inject_peer(0, &peer_fin);
+                assert_eq!(h.receive_tun().await, peer_fin);
+                assert_eq!(h.stats.packets_rx.get(), 4);
+            } else {
+                h.inject_peer(0, &reply);
+                h.dropped(DropReason::Firewall, 3).await;
+                assert_eq!(h.stats.packets_rx.get(), 1);
+                assert!(h.output.try_recv().is_err());
+            }
             h.shutdown().await;
         }
     }
@@ -698,6 +713,52 @@ async fn an_unreadable_tun_packet_does_not_stop_forwarding() {
         h.receive_peer(0, &packet).await;
         assert_eq!(h.stats.packets_tx.get(), 1);
         assert_eq!(h.stats.total_drops(), 1);
+        h.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn denied_ssh_sends_reset_in_both_directions_without_general_reject() {
+    for engine in ENGINES {
+        let mut h = Harness::new(engine, 1, policy(Action::Deny, vec![])).await;
+        assert!(!h.firewall.reject_enabled());
+        let peer = h.peers[0].ipv6;
+        let outbound = packet(6, h.local_ipv6, peer, 50000, SSH_PORT, 2, 60);
+        h.inject(outbound).await;
+        let reset = h.receive_tun().await;
+        let info = firewall::parse_packet_info(&reset).expect("TCP reset");
+        assert_eq!(info.src_ip, IpAddr::V6(peer));
+        assert_eq!(info.dst_ip, IpAddr::V6(h.local_ipv6));
+        assert_eq!(info.src_port, SSH_PORT);
+        assert_eq!(info.dst_port, 50000);
+        assert_eq!(reset[53], 0x14, "RST and ACK refuse the SYN");
+        assert_eq!(h.stats.packets_tx.get(), 0);
+
+        let inbound = packet(6, peer, h.local_ipv6, 50001, SSH_PORT, 2, 60);
+        h.inject_peer(0, &inbound);
+        let expected = crate::reject::build_reject(
+            &inbound,
+            &firewall::parse_packet_info(&inbound).expect("inbound SYN"),
+        )
+        .expect("SYN has a reset reply");
+        h.receive_peer(0, &expected).await;
+        assert_eq!(h.stats.packets_rx.get(), 0);
+        assert!(h.output.try_recv().is_err());
+
+        h.firewall.update(policy(
+            Action::Allow,
+            vec![rule(
+                Direction::In,
+                Action::Allow,
+                SSH_PORT,
+                PeerFilter::Any,
+                None,
+            )],
+        ));
+        h.inject_peer(0, &inbound);
+        let accepted = h.receive_tun().await;
+        let info = firewall::parse_packet_info(&accepted).expect("allowed SYN");
+        assert_eq!(info.tcp_flags, 2, "an allowed SSH SYN reaches the host");
         h.shutdown().await;
     }
 }

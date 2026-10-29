@@ -100,6 +100,9 @@ pub struct Delivery {
     /// skips it; a manual delivery tries again in case it has upgraded.
     #[serde(default)]
     pub unsupported: bool,
+    /// The recipient refused the invitation. Kept for status and to stop retries.
+    #[serde(default)]
+    pub refusal: Option<String>,
 }
 
 /// How a coordinator's join denial starts when the presented invite is
@@ -135,7 +138,7 @@ struct InviteFile {
 /// A flattened, display-ready view of an invite (used for `ray invite list`).
 pub struct InviteView {
     pub id: String,
-    /// One of `pending`, `redeemed`, `revoked`, `expired`.
+    /// `pending`, `redeemed`, `revoked`, `expired`, or a refusal with its reason.
     pub status: String,
     pub created: u64,
     pub expires: u64,
@@ -405,6 +408,7 @@ impl InviteStore {
             code: InviteCode::encode(&network_key, &coordinator, &secret),
             delivered: false,
             unsupported: false,
+            refusal: None,
         };
         let invite = Invite::new(&secret, DELIVERY_TTL, None, Some(delivery));
         self.invites.push(invite.clone());
@@ -425,6 +429,23 @@ impl InviteStore {
         self.save()
     }
 
+    pub fn mark_refused(&mut self, id: &str, reason: String) -> Result<()> {
+        self.delivery_mut(id)?.refusal = Some(reason);
+        self.save()
+    }
+
+    /// Includes delivered offers until the recipient joins or refuses them.
+    pub fn deliveries_to_check(&self) -> Vec<EndpointId> {
+        let now = now_secs();
+        self.invites
+            .iter()
+            .filter(|invite| invite.is_live(now))
+            .filter_map(|invite| invite.delivery.as_ref())
+            .filter(|delivery| !delivery.unsupported && delivery.refusal.is_none())
+            .map(|delivery| delivery.recipient)
+            .collect()
+    }
+
     fn delivery_mut(&mut self, id: &str) -> Result<&mut Delivery> {
         self.invites
             .iter_mut()
@@ -441,7 +462,7 @@ impl InviteStore {
             .iter()
             .filter(|i| i.is_live(now))
             .filter_map(|i| i.delivery.as_ref())
-            .filter(|d| !d.delivered && !d.unsupported)
+            .filter(|d| !d.delivered && !d.unsupported && d.refusal.is_none())
             .map(|d| d.recipient)
             .collect()
     }
@@ -567,7 +588,17 @@ impl InviteStore {
                     }
                     InviteStatus::Revoked => ("revoked".to_string(), None),
                     InviteStatus::Pending if now >= i.expires => ("expired".to_string(), None),
-                    InviteStatus::Pending => ("pending".to_string(), None),
+                    InviteStatus::Pending => {
+                        let status = match i
+                            .delivery
+                            .as_ref()
+                            .and_then(|delivery| delivery.refusal.as_deref())
+                        {
+                            Some(reason) => format!("refused: {reason}"),
+                            None => "pending".to_string(),
+                        };
+                        (status, None)
+                    }
                 };
                 InviteView {
                     id: i.id.clone(),
@@ -615,6 +646,31 @@ mod tests {
         assert!(store.pending_deliveries().is_empty());
         assert_eq!(store.list().len(), 1);
         assert!(!format!("{first:?}").contains(first.delivery.unwrap().code.as_str()));
+    }
+
+    #[test]
+    fn refused_delivery_survives_reload_and_stops_retries() {
+        let (mut store, _dir) = temp_store();
+        let recipient = test_id(4);
+        let invite = store
+            .delivery_for(recipient, test_id(5), test_id(6))
+            .unwrap();
+        store.mark_delivered(&invite.id).unwrap();
+        assert_eq!(store.deliveries_to_check(), [recipient]);
+        store
+            .mark_refused(&invite.id, "recipient declined the invitation".into())
+            .unwrap();
+        let mut store = InviteStore::from_path(store.path.clone()).unwrap();
+        assert!(store.deliveries_to_check().is_empty());
+        assert!(store.pending_deliveries().is_empty());
+        assert!(store.list()[0].status.contains("recipient declined"));
+        assert_eq!(
+            store
+                .delivery_for(recipient, test_id(5), test_id(6))
+                .unwrap()
+                .id,
+            invite.id
+        );
     }
 
     #[test]

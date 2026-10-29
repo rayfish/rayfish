@@ -57,17 +57,23 @@
 //!
 //! Explicit rules always win (first-match). Established return traffic only
 //! bypasses the *default* action, never an explicit rule.
+//!
+//! A TCP write-half-close keeps return traffic allowed. After both FINs, a fixed
+//! closing window admits final acknowledgments and retransmissions; RST removes
+//! tracking immediately. This is a flow tracker, not TCP sequence validation:
+//! after eviction, permitted outbound traffic can create a fresh entry.
 
 #[cfg(test)]
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::peers::FastDashMap;
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
+use dashmap::mapref::entry::Entry;
 use iroh::EndpointId;
 use nom::Parser;
 use nom::bytes::complete::{tag, take_while1};
@@ -79,6 +85,7 @@ use nom::sequence::preceded;
 use ray_proto::SuggestedFirewall;
 use ray_proto::ipc::{FirewallRuleView, MachineHostname};
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 mod packet;
@@ -264,9 +271,10 @@ pub struct FirewallConfig {
     /// "Fail fast" REJECT mode. When `true`, a denied packet gets a synthetic
     /// reply (TCP RST or ICMP unreachable, see [`crate::reject`]) so the initiator
     /// fails immediately instead of hanging; when `false` (the default), denied
-    /// packets are silently dropped (stealthy, no reply). Opt-in via
+    /// packets other than SSH are silently dropped. Denied TCP connections to
+    /// port 22 or the configured mesh SSH port always receive a reset. Opt-in via
     /// `ray firewall reject on`; `#[serde(default)]` keeps existing
-    /// `firewall.toml` files on the silent-drop posture.
+    /// `firewall.toml` files on the silent-drop posture for other traffic.
     #[serde(default)]
     pub reject: bool,
     /// Global kill switch. When `true`, the firewall stops enforcing: every packet
@@ -318,6 +326,13 @@ impl Default for FirewallConfig {
 }
 
 impl FirewallConfig {
+    fn rejects_denied(&self, info: &PacketInfo) -> bool {
+        self.reject
+            || (info.protocol == 6
+                && (info.dst_port == crate::forward::SSH_PORT
+                    || info.dst_port == crate::forward::ssh_port()))
+    }
+
     /// Follow a network renamed on this node from `from` to `to`: rules scoped
     /// to it and rules installed from its suggestions name it by its local name,
     /// and without this a scoped rule would stop matching while the suggested
@@ -340,6 +355,8 @@ impl FirewallConfig {
 
 /// How long an idle TCP flow stays "established" (return traffic still allowed).
 const TCP_FLOW_TIMEOUT: Duration = Duration::from_secs(300);
+/// Keep final ACKs and retransmitted FINs admissible for a fixed closing window.
+const TCP_CLOSING_TIMEOUT: Duration = Duration::from_secs(30);
 /// UDP is connectionless: use a short window so return traffic for a recent
 /// outbound query/datagram is allowed, but stale entries expire quickly.
 const UDP_FLOW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -378,6 +395,56 @@ impl Flow {
     }
 }
 
+/// One-sided TCP close still permits data from the other side. Once both FINs
+/// arrive, a fixed grace period admits the final ACK and retransmissions.
+#[derive(Clone, Copy)]
+enum FlowState {
+    Active { last_seen: Instant },
+    HalfClosed { last_seen: Instant, fin: Direction },
+    Closing { since: Instant },
+}
+
+impl FlowState {
+    fn active(&self, protocol: u8, now: Instant) -> bool {
+        let (seen, timeout) = match self {
+            Self::Active { last_seen } | Self::HalfClosed { last_seen, .. } => (
+                *last_seen,
+                if protocol == 6 {
+                    TCP_FLOW_TIMEOUT
+                } else {
+                    UDP_FLOW_TIMEOUT
+                },
+            ),
+            Self::Closing { since } => (*since, TCP_CLOSING_TIMEOUT),
+        };
+        now.saturating_duration_since(seen) < timeout
+    }
+
+    fn record(&mut self, direction: Direction, info: &PacketInfo, now: Instant) {
+        if info.protocol == 6 && direction == Direction::Out && info.tcp_flags & 0x02 != 0 {
+            // A new handshake can reuse the tuple of a previously closed connection.
+            *self = Self::Active { last_seen: now };
+            return;
+        }
+        let fin = info.protocol == 6 && info.tcp_flags & 0x01 != 0;
+        match self {
+            Self::Active { last_seen } if !fin => *last_seen = now,
+            Self::Active { .. } => {
+                *self = Self::HalfClosed {
+                    last_seen: now,
+                    fin: direction,
+                }
+            }
+            Self::HalfClosed { fin: first, .. } if fin && *first != direction => {
+                *self = Self::Closing { since: now };
+            }
+            Self::HalfClosed { last_seen, .. } => *last_seen = now,
+            // Closing traffic must not keep an otherwise closed connection alive.
+            Self::Closing { .. } => {}
+        }
+    }
+}
+
 /// What decided a [`Verdict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecidedBy {
@@ -409,7 +476,7 @@ pub struct SharedFirewall {
     inner: Arc<ArcSwap<FirewallConfig>>,
     /// Stateful connection tracker: outbound-initiated flows whose return
     /// traffic is allowed in even under a deny default.
-    conntrack: Arc<FastDashMap<Flow, Instant>>,
+    conntrack: Arc<FastDashMap<Flow, FlowState>>,
 }
 
 impl SharedFirewall {
@@ -500,6 +567,11 @@ impl SharedFirewall {
         self.inner.load().reject
     }
 
+    /// Denied SSH always fails fast, including when general REJECT mode is off.
+    pub(crate) fn rejects_denied(&self, info: &PacketInfo) -> bool {
+        self.inner.load().rejects_denied(info)
+    }
+
     /// Stateful evaluation of a fully-parsed packet against the peer's shared
     /// networks. Rules keep their configured order across networks, so an
     /// explicit deny cannot be bypassed by choosing another transport handle.
@@ -535,8 +607,8 @@ impl SharedFirewall {
             shares_network,
         ) {
             let action = rule.action;
-            if direction == Direction::Out && action.is_allow() {
-                self.track_outbound(&flow, info);
+            if action.is_allow() {
+                self.track_packet(direction, &flow, info);
             }
             return action;
         }
@@ -545,7 +617,7 @@ impl SharedFirewall {
             Direction::Out => {
                 let default = Self::default_for(&config, Direction::Out);
                 if default.is_allow() {
-                    self.track_outbound(&flow, info);
+                    self.track_packet(Direction::Out, &flow, info);
                 }
                 default
             }
@@ -561,7 +633,7 @@ impl SharedFirewall {
                 // the rules/default. Without this, a request and reply share a
                 // flow (ICMP has no ports) and a recent outbound ping would
                 // wrongly whitelist the peer's inbound pings.
-                if self.rescue_reply(flow, info) {
+                if conntrack_eligible(info) && self.track_packet(Direction::In, &flow, info) {
                     Action::Allow
                 } else {
                     Self::default_for(&config, Direction::In)
@@ -575,17 +647,8 @@ impl SharedFirewall {
     /// conntrack alone: an allow rule for the gateway peer must not let a flow
     /// started on the gateway's side reach a local port.
     pub fn admits_reply(&self, info: &PacketInfo) -> bool {
-        self.inner.load().disabled || self.rescue_reply(Flow::of(Direction::In, info), info)
-    }
-
-    /// Whether an inbound `flow` answers one we opened, refreshing it if so.
-    fn rescue_reply(&self, flow: Flow, info: &PacketInfo) -> bool {
-        if conntrack_eligible(info) && self.flow_active(&flow) {
-            self.conntrack.insert(flow, Instant::now());
-            true
-        } else {
-            false
-        }
+        self.inner.load().disabled
+            || self.track_packet(Direction::In, &Flow::of(Direction::In, info), info)
     }
 
     /// How [`Self::evaluate_packet`] would decide `info` as a new packet, and
@@ -626,7 +689,7 @@ impl SharedFirewall {
                     index,
                     rule: rule.clone(),
                 },
-                reject: config.reject && rule.action.is_deny(),
+                reject: config.rejects_denied(info) && rule.action.is_deny(),
                 return_traffic: false,
             };
         }
@@ -634,46 +697,54 @@ impl SharedFirewall {
         Verdict {
             action,
             decided_by: DecidedBy::Default,
-            reject: config.reject && action.is_deny(),
+            reject: config.rejects_denied(info) && action.is_deny(),
             return_traffic: direction == Direction::In
                 && action.is_deny()
                 && conntrack_eligible(info),
         }
     }
 
-    /// Records or refreshes an outbound flow. TCP FIN/RST evict the flow
-    /// immediately so a closed connection stops whitelisting return traffic.
-    fn track_outbound(&self, flow: &Flow, info: &PacketInfo) {
-        if flow.proto == 6 {
-            let fin = info.tcp_flags & 0x01 != 0;
-            let rst = info.tcp_flags & 0x04 != 0;
-            if fin || rst {
-                self.conntrack.remove(flow);
-                return;
+    /// Only outbound traffic opens a flow. Admission and updates share one entry
+    /// guard, so a packet cannot recreate state concurrently removed by a reset.
+    fn track_packet(&self, direction: Direction, flow: &Flow, info: &PacketInfo) -> bool {
+        if (direction == Direction::In && !conntrack_eligible(info))
+            || (direction == Direction::Out
+                && is_icmp(flow.proto)
+                && !is_icmp_echo_request(flow.proto, info.icmp_type))
+        {
+            return false;
+        }
+        match self.conntrack.entry(*flow) {
+            Entry::Occupied(mut entry) => {
+                let now = Instant::now();
+                let active = entry.get().active(flow.proto, now);
+                if flow.proto == 6 && info.tcp_flags & 0x04 != 0 {
+                    entry.remove();
+                    return direction == Direction::Out || active;
+                }
+                if direction == Direction::In
+                    && (!active
+                        || (matches!(entry.get(), FlowState::Closing { .. })
+                            && info.tcp_flags & 0x02 != 0))
+                {
+                    return false;
+                }
+                if !active && flow.proto == 6 && info.tcp_flags & 0x01 != 0 {
+                    return false;
+                }
+                entry.get_mut().record(direction, info, now);
+                true
+            }
+            Entry::Vacant(entry) => {
+                if direction == Direction::In || (flow.proto == 6 && info.tcp_flags & 0x05 != 0) {
+                    return false;
+                }
+                entry.insert(FlowState::Active {
+                    last_seen: Instant::now(),
+                });
+                true
             }
         }
-        // ICMP: only an echo-request *we* send opens a flow whose reply we then
-        // expect back. An outbound echo-reply (we answered someone's ping) or
-        // any other ICMP type must not whitelist the peer's inbound traffic.
-        if is_icmp(flow.proto) && !is_icmp_echo_request(flow.proto, info.icmp_type) {
-            return;
-        }
-        self.conntrack.insert(*flow, Instant::now());
-    }
-
-    /// True if `flow` is a tracked, non-expired outbound-initiated connection.
-    fn flow_active(&self, flow: &Flow) -> bool {
-        let timeout = if flow.proto == 6 {
-            TCP_FLOW_TIMEOUT
-        } else {
-            UDP_FLOW_TIMEOUT
-        };
-        if let Some(ts) = self.conntrack.get(flow)
-            && ts.elapsed() < timeout
-        {
-            return true;
-        }
-        false
     }
 
     /// Periodically evicts idle flows so the tracker doesn't grow unbounded.
@@ -685,10 +756,7 @@ impl SharedFirewall {
                     _ = token.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         let now = Instant::now();
-                        self.conntrack.retain(|flow, ts| {
-                            let timeout = if flow.proto == 6 { TCP_FLOW_TIMEOUT } else { UDP_FLOW_TIMEOUT };
-                            now.duration_since(*ts) < timeout
-                        });
+                        self.conntrack.retain(|flow, state| state.active(flow.proto, now));
                     }
                 }
             }
@@ -2152,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_fin_evicts_flow_so_return_traffic_stops() {
+    fn tcp_half_close_keeps_return_traffic_allowed() {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
@@ -2187,18 +2255,17 @@ mod tests {
             Action::Allow
         );
 
-        // We close with FIN. Flow should be evicted.
+        // Closing our write half must still allow the peer to send its reply.
         let fin = tcp_pkt(me, 50000, peer, 443, FIN | ACK);
         assert_eq!(
             fw.evaluate_packet(Direction::Out, &fin, &peer_id, |_| false),
             Action::Allow
         );
 
-        // Now return traffic from the closed flow is denied again.
         let after = tcp_pkt(peer, 443, me, 50000, ACK);
         assert_eq!(
             fw.evaluate_packet(Direction::In, &after, &peer_id, |_| false),
-            Action::Deny
+            Action::Allow
         );
     }
 
@@ -3081,7 +3148,7 @@ mod tests {
         assert_eq!(verdict.action, Action::Deny);
         assert_eq!(verdict.decided_by, DecidedBy::Default);
         assert!(verdict.return_traffic);
-        assert!(!verdict.reject);
+        assert!(verdict.reject);
 
         let web = probe(Direction::Out, Protocol::Tcp, Some(443));
         let verdict = fw.explain(Direction::Out, &web, &peer, |_| false);
@@ -3138,6 +3205,18 @@ mod tests {
         let elsewhere = fw.explain(Direction::In, &info, &peer, |net| net == "work");
         assert_eq!(elsewhere.decided_by, DecidedBy::Default);
         assert_eq!(elsewhere.action, Action::Deny);
+    }
+
+    #[test]
+    fn explain_reports_ssh_reject_without_general_reject() {
+        let peer = test_id(1);
+        let fw = SharedFirewall::new(FirewallConfig::default());
+        let ssh = probe(Direction::In, Protocol::Tcp, Some(22));
+        assert!(fw.explain(Direction::In, &ssh, &peer, |_| false).reject);
+        let https = probe(Direction::In, Protocol::Tcp, Some(443));
+        assert!(!fw.explain(Direction::In, &https, &peer, |_| false).reject);
+        let udp = probe(Direction::In, Protocol::Udp, Some(22));
+        assert!(!fw.explain(Direction::In, &udp, &peer, |_| false).reject);
     }
 
     #[test]
@@ -3236,4 +3315,6 @@ mod tests {
             assert!(probe_packet(Direction::In, protocol, port, LOCAL_V6, PEER_V6).is_err());
         }
     }
+
+    mod conntrack;
 }

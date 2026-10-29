@@ -111,7 +111,7 @@ impl DnsService {
         // Android's VpnService and iOS NetworkExtension configure DNS. Desktop
         // backend detection is permanently unsupported there; retrying it only
         // creates a timer and a misleading warning.
-        if cfg!(embedded_tun) {
+        if cfg!(embedded_tun) || crate::instance::is_rootless() {
             return;
         }
         if !config::load().map(|c| c.dns_mode.enabled()).unwrap_or(true) {
@@ -450,12 +450,35 @@ impl DnsService {
     /// the data plane comes up) it still tries the manager path, which is what
     /// it always did, and the list is remembered for whatever gets adopted next.
     pub(crate) async fn set_search_domains(&self, network_names: &[String], tun_name: &str) {
+        if crate::instance::is_rootless() {
+            return;
+        }
         let mode = config::load().map(|c| c.dns_mode).unwrap_or_default();
+        self.set_search_domains_for_mode(network_names, mode, tun_name)
+            .await;
+    }
+
+    /// [`Self::set_search_domains`] with the mode already read. `Off` stops
+    /// before the OS: an empty list is not a no-op there, since the Linux and
+    /// Windows set paths always route `.ray`.
+    async fn set_search_domains_for_mode(
+        &self,
+        network_names: &[String],
+        mode: config::DnsMode,
+        tun_name: &str,
+    ) {
         let domains = search_domains_for_mode(network_names, mode);
         *self.search_domains.lock().unwrap() = domains.clone();
+        if !mode.enabled() {
+            return;
+        }
         let configurator = self.configurator.lock().unwrap().clone();
         let result = match configurator.as_ref() {
             Some(c) => c.set_search_domains(&domains, tun_name).await,
+            // Windows routes `.ray` on every set, and with no backend held
+            // nothing serves it, so lookups would time out. `configure`
+            // installs the cached list when it adopts one.
+            None if cfg!(windows) => return,
             None => dns_config::set_manager_search_domains(&domains, tun_name).await,
         };
         match result {
@@ -541,6 +564,9 @@ impl DnsService {
     /// re-assert watcher, restore the captured configurator, and clear the TUN's
     /// search domains. Idempotent (no-op if never configured).
     pub(crate) async fn revert(&self, tun_name: &str) {
+        if crate::instance::is_rootless() {
+            return;
+        }
         self.shutdown_background();
 
         // Revert system DNS (extract the configurator before reverting so the
@@ -647,6 +673,53 @@ mod tests {
         dns.shutdown_background();
         assert!(token.is_cancelled());
         assert!(dns.configure_retry.lock().unwrap().is_none());
+    }
+
+    /// With DNS off, a join or leave must not reach the OS. The Linux and
+    /// Windows set paths route `.ray` even for an empty list, so passing one
+    /// through would undo `off`.
+    #[tokio::test]
+    async fn off_mode_leaves_the_os_search_domains_alone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl dns_config::DnsConfigurator for Recorder {
+            async fn apply(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn revert(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            async fn set_search_domains(
+                &self,
+                _domains: &[dns_config::SearchDomain],
+                _tun_name: &str,
+            ) -> anyhow::Result<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let dns = service();
+        let recorder = Arc::new(Recorder::default());
+        *dns.configurator.lock().unwrap() =
+            Some(Arc::clone(&recorder) as Arc<dyn dns_config::DnsConfigurator>);
+        let networks = vec!["example-net".to_string()];
+
+        dns.set_search_domains_for_mode(&networks, config::DnsMode::Off, "tun0")
+            .await;
+        assert_eq!(recorder.calls.load(Ordering::Relaxed), 0);
+
+        dns.set_search_domains_for_mode(&networks, config::DnsMode::Partial, "tun0")
+            .await;
+        assert_eq!(recorder.calls.load(Ordering::Relaxed), 1);
     }
 
     /// Declining is only safe with somebody to decline *to*. Both halves of

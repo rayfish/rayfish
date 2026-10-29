@@ -65,6 +65,12 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Test rootless mesh
+        run: tests/e2e.sh rootless
+
+      - name: Test rootless mesh without container privileges
+        run: E2E_BACKEND=docker tests/e2e.sh rootless
+
   docker-e2e:
     runs-on: ubuntu-24.04
     env:

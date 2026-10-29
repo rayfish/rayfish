@@ -439,6 +439,11 @@ impl Daemon {
         peer: Option<PeerIdentity>,
         fds: Vec<IpcOwnedFd>,
     ) -> IpcMessage {
+        if crate::instance::is_rootless() && !rootless_request_supported(&req) {
+            return ipc_err(
+                "this operation is unavailable in rootless mode; use the SOCKS5 proxy or explicit port exposure",
+            );
+        }
         let peer_cred = peer.as_ref().and_then(PeerIdentity::unix_cred);
         match req {
             IpcMessage::Create {
@@ -791,9 +796,55 @@ fn save_global(
     saved.map_err(|e| ipc_err(format!("failed to save config: {e}")))
 }
 
+/// Host listeners, exit routing and service updates belong to the system instance.
+fn rootless_request_supported(req: &IpcMessage) -> bool {
+    match req {
+        IpcMessage::SetOperator { .. }
+        | IpcMessage::ExitNodeAllow { .. }
+        | IpcMessage::ExitNodeUse { .. }
+        | IpcMessage::FirewallSshAllow { .. } => false,
+        IpcMessage::ConfigSet { key, .. } | IpcMessage::ConfigUnset { key } => !matches!(
+            key,
+            NodeKey::Global(
+                GlobalKey::Ssh
+                    | GlobalKey::SshPort
+                    | GlobalKey::V4Bridge
+                    | GlobalKey::AutoUpdate
+                    | GlobalKey::PfPassthrough
+                    | GlobalKey::DownloadUser
+                    | GlobalKey::Dns
+            )
+        ),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rootless_rejects_host_network_mutations() {
+        for key in [
+            GlobalKey::Ssh,
+            GlobalKey::V4Bridge,
+            GlobalKey::AutoUpdate,
+            GlobalKey::Dns,
+            GlobalKey::DownloadUser,
+        ] {
+            assert!(!rootless_request_supported(&IpcMessage::ConfigSet {
+                key: NodeKey::Global(key),
+                value: "on".into(),
+                replace: false
+            }));
+        }
+        assert!(!rootless_request_supported(&IpcMessage::ExitNodeUse {
+            network: "mesh".into(),
+            peer: None
+        }));
+        assert!(rootless_request_supported(&IpcMessage::Status));
+        assert!(rootless_request_supported(&IpcMessage::Down));
+    }
 
     #[test]
     fn invitation_listing_is_open_but_answers_need_authorization() {

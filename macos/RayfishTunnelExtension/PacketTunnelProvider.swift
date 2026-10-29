@@ -11,29 +11,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         options: [String: NSObject]?,
         completionHandler: @escaping (Error?) -> Void
     ) {
+        let started = DispatchTime.now().uptimeNanoseconds
         RayfishLog.tunnel.info("Starting tunnel build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown", privacy: .public)")
         var startingNode: Node?
         do {
             let directory = try stateDirectory()
             let node = Node(configDir: directory.path)
             startingNode = node
+            RayfishLog.startup("node created", since: started, logger: RayfishLog.tunnel)
             if let legacy = try LegacyDaemon.discover() {
                 RayfishLog.tunnel.info("Checking legacy daemon migration")
                 try legacy.migrateIfNeeded(to: directory) { source in
                     try node.migrateLegacyState(source: source.path)
                 }
             }
+            RayfishLog.startup("legacy migration checked", since: started, logger: RayfishLog.tunnel)
             guard let owner = TunnelOwner.uid(in: (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration) else {
                 throw ProviderError.missingOwner
             }
             try node.start(ownerUid: owner)
+            RayfishLog.startup("Rust node started", since: started, logger: RayfishLog.tunnel)
             try node.prepareExitNode()
             let status = try node.status()
+            RayfishLog.startup("node status read", since: started, logger: RayfishLog.tunnel)
             let exitSelected = status.exitNodes.contains { $0.using != nil }
             let settings = networkSettings(address: status.mesh.ipv6, dnsEnabled: status.services.dnsEnabled,
                                            exitSelected: exitSelected)
+            RayfishLog.startup("applying network settings", since: started, logger: RayfishLog.tunnel)
             setTunnelNetworkSettings(settings) { [weak self] error in
+                RayfishLog.startup("network settings callback received", since: started, logger: RayfishLog.tunnel)
                 if let error {
+                    RayfishLog.startup("network settings failed", since: started, logger: RayfishLog.tunnel)
                     node.stop()
                     RayfishLog.tunnel.error("Network settings failed: \(error.localizedDescription, privacy: .public)")
                     completionHandler(error)
@@ -46,18 +54,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 do {
                     try node.activate()
+                    RayfishLog.startup("packet forwarding activated", since: started, logger: RayfishLog.tunnel)
                     self.node = node
                     self.appliedDNS = status.services.dnsEnabled
                     self.appliedExit = exitSelected
                     RayfishLog.tunnel.info("Tunnel is ready")
                     completionHandler(nil)
                 } catch {
+                    RayfishLog.startup("tunnel activation failed", since: started, logger: RayfishLog.tunnel)
                     node.stop()
                     RayfishLog.tunnel.error("Tunnel activation failed: \(error.localizedDescription, privacy: .public)")
                     completionHandler(error)
                 }
             }
         } catch {
+            RayfishLog.startup("tunnel startup failed", since: started, logger: RayfishLog.tunnel)
             startingNode?.stop()
             RayfishLog.tunnel.error("Tunnel startup failed: \(error.localizedDescription, privacy: .public)")
             completionHandler(error)

@@ -228,6 +228,7 @@ struct StatusPending {
 
 #[derive(serde::Serialize)]
 struct StatusJson<'a> {
+    rootless: bool,
     endpoint: String,
     mdns: bool,
     lan_peers: Vec<StatusLanPeer<'a>>,
@@ -237,6 +238,7 @@ struct StatusJson<'a> {
     daemon_version: &'a str,
     networks: &'a [ipc::NetworkStatus],
     inactive_networks: &'a [ipc::InactiveNetwork],
+    connection_errors: &'a [ipc::ConnectionErrorInfo],
     controllers: &'a [ipc::ControllerInfo],
     traffic: StatusTraffic,
     pending: StatusPending,
@@ -262,6 +264,9 @@ struct StatusOutput<'a> {
 
 impl DisplayOut for StatusOutput<'_> {
     fn print_human(&self) {
+        if self.json.rootless {
+            println!("Rootless userspace instance");
+        }
         let endpoint_id = self.endpoint_id;
         let mdns_enabled = self.json.mdns;
         let auto_update = self.json.auto_update;
@@ -332,6 +337,14 @@ impl DisplayOut for StatusOutput<'_> {
         for net in inactive_networks {
             println!();
             print!("{}", inactive_network_block(net, with_ips));
+        }
+
+        for error in self.json.connection_errors {
+            println!(
+                "\n  {}: {}",
+                style::value(&error.peer.fmt_short().to_string()),
+                style::red(&error.message)
+            );
         }
 
         print_nearby(lan_peers, with_ips);
@@ -453,12 +466,14 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
             pending_files,
             pending_connects,
             inactive_networks,
+            connection_errors,
             lan_peers,
             ..
         } => {
             let (controllers, managed_machines) = ipc_management_overview(show_machines).await;
             let output = StatusOutput {
                 json: StatusJson {
+                    rootless: rayfish::instance::is_rootless(),
                     endpoint: endpoint_id.to_string(),
                     mdns: mdns_enabled,
                     lan_peers: lan_peers
@@ -476,6 +491,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
                     daemon_version: &daemon_version,
                     networks: &networks,
                     inactive_networks: &inactive_networks,
+                    connection_errors: &connection_errors,
                     controllers: &controllers,
                     traffic: StatusTraffic {
                         packets_rx,

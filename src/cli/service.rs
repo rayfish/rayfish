@@ -167,6 +167,11 @@ pub(crate) async fn cmd_up(
     #[cfg(windows)]
     drop(operator_claim);
 
+    anyhow::ensure!(
+        !rayfish::instance::is_rootless(),
+        "rootless instance is not running; start it with ray rootless"
+    );
+
     // No daemon reachable, install and start the system service (needs root).
     #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
@@ -478,6 +483,9 @@ pub(crate) async fn cmd_restart() -> Result<()> {
 /// standby). Does not disable or uninstall the unit. Requires root.
 #[allow(unreachable_code)]
 pub(crate) async fn cmd_stop() -> Result<()> {
+    if rayfish::instance::is_rootless() {
+        return ipc_mutate(ipc::IpcMessage::Shutdown).await;
+    }
     require_root()?;
     if !service_unit_exists() {
         eprintln!("rayfish service is not installed. Nothing to stop.");

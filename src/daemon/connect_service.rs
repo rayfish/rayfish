@@ -65,6 +65,11 @@ pub(crate) fn evict_oldest_connect(
     Some(oldest)
 }
 
+struct ConnectDecision {
+    reply: control::ConnectMsg,
+    rejection: Option<Instant>,
+}
+
 pub(crate) struct ConnectService {
     /// `ray connect` requests received on `CONNECT_ALPN`, awaiting approval.
     /// Keyed by the requester's transport endpoint id.
@@ -77,6 +82,10 @@ pub(crate) struct ConnectService {
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
     pub(crate) outgoing_connects: DashSet<EndpointId>,
+    /// Rejected requests remain terminal when a cooperative requester polls.
+    rejected_connects: DashMap<EndpointId, Instant>,
+    connect_decision_lock: Mutex<()>,
+    pub(crate) connection_errors: DashMap<EndpointId, String>,
     /// Foundation handles (endpoint, LAN sightings) for the connect handshake.
     pub(super) transport: Arc<Transport>,
     /// The network-owning service, for minting/joining the 2-peer direct network
@@ -97,6 +106,9 @@ impl ConnectService {
             pending_connects: DashMap::new(),
             approved_connects: DashMap::new(),
             outgoing_connects: DashSet::new(),
+            rejected_connects: DashMap::new(),
+            connect_decision_lock: Mutex::new(()),
+            connection_errors: DashMap::new(),
             transport,
             registry,
             inbox_lock: AsyncMutex::new(()),
@@ -214,6 +226,7 @@ impl ConnectService {
             Ok(peer) => peer,
             Err(message) => return ipc_err(message),
         };
+        self.connection_errors.remove(&peer);
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
             return IpcMessage::Ok {
                 message: format!("already connected to this peer on '{name}'"),
@@ -253,23 +266,27 @@ impl ConnectService {
         peer: EndpointId,
         hostname: Option<String>,
     ) -> Result<control::ConnectMsg> {
-        let conn = transport::connect_to_peer_with_alpn(
-            &self.transport.endpoint,
-            peer,
-            transport::CONNECT_ALPN,
-        )
-        .await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        control::send_framed(
-            &mut send,
-            &control::ConnectMsg::Request {
-                from_identity: self.registry.own_identity(),
-                from_endpoint: self.transport.endpoint.id(),
-                hostname,
-            },
-        )
-        .await?;
-        control::recv_framed::<control::ConnectMsg>(&mut recv).await
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let conn = transport::connect_to_peer_with_alpn(
+                &self.transport.endpoint,
+                peer,
+                transport::CONNECT_ALPN,
+            )
+            .await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            control::send_framed(
+                &mut send,
+                &control::ConnectMsg::Request {
+                    from_identity: self.registry.own_identity(),
+                    from_endpoint: self.transport.endpoint.id(),
+                    hostname,
+                },
+            )
+            .await?;
+            control::recv_framed::<control::ConnectMsg>(&mut recv).await
+        })
+        .await
+        .context("connect request timed out")?
     }
 
     /// Join a direct network the remote peer minted for us (flags it `direct` in
@@ -320,23 +337,23 @@ impl ConnectService {
                     Ok(control::ConnectMsg::Approved {
                         room_id,
                         coordinator,
-                    }) => {
-                        match me.join_direct(room_id, coordinator, hostname.clone()).await {
-                            IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
-                                tracing::info!(peer = %peer.fmt_short(), "direct connect join ok");
-                            }
-                            IpcMessage::Error { message } => {
-                                tracing::warn!(peer = %peer.fmt_short(), error = %message, "direct connect join failed");
-                            }
-                            other => {
-                                tracing::warn!(peer = %peer.fmt_short(), response = ?other, "direct connect join: unexpected response");
-                            }
+                    }) => match me.join_direct(room_id, coordinator, hostname.clone()).await {
+                        IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
+                            tracing::info!(peer = %peer.fmt_short(), "direct connect join ok");
+                            me.connection_errors.remove(&peer);
+                            me.outgoing_connects.remove(&peer);
+                            return;
                         }
-                        me.outgoing_connects.remove(&peer);
-                        return;
-                    }
+                        IpcMessage::Error { message } => {
+                            tracing::warn!(peer = %peer.fmt_short(), error = %message, "direct connect join failed");
+                        }
+                        other => {
+                            tracing::warn!(peer = %peer.fmt_short(), response = ?other, "direct connect join: unexpected response");
+                        }
+                    },
                     Ok(control::ConnectMsg::Denied { reason }) => {
                         tracing::warn!(reason, peer = %peer.fmt_short(), "connect request denied");
+                        me.record_connection_error(peer, format!("connection denied: {reason}"));
                         me.outgoing_connects.remove(&peer);
                         return;
                     }
@@ -386,7 +403,7 @@ impl ConnectService {
     /// Drop a pending request without blocking the requester. The app Reject
     /// buttons use this: they have no way to unblock, so they must not block.
     pub(crate) fn reject_connection(&self, selector: &str) -> IpcMessage {
-        if let Err(message) = self.take_pending(selector) {
+        if let Err(message) = self.reject_pending_with(selector, || {}) {
             return ipc_err(message);
         }
         IpcMessage::Ok {
@@ -397,12 +414,20 @@ impl ConnectService {
     /// `ray connect deny`: drop a pending request by hostname or endpoint
     /// prefix and block the requester, so it cannot simply ask again.
     pub(crate) async fn deny_connection(&self, selector: &str) -> IpcMessage {
-        let req = match self.take_pending(selector) {
+        let req = match self.reject_pending_with(selector, || {}) {
             Ok(req) => req,
             Err(message) => return ipc_err(message),
         };
+        let rejection = self
+            .rejected_connects
+            .get(&req.from_endpoint)
+            .map(|entry| *entry.value());
         if let Err(e) = self.block(req.from_endpoint).await {
             return ipc_err(format!("request dropped, but blocking failed: {e:#}"));
+        }
+        if let Some(rejection) = rejection {
+            self.rejected_connects
+                .remove_if(&req.from_endpoint, |_, remembered| *remembered == rejection);
         }
         IpcMessage::Ok {
             message: format!(
@@ -410,6 +435,131 @@ impl ConnectService {
                 req.from_endpoint.fmt_short(),
                 req.from_endpoint
             ),
+        }
+    }
+
+    fn connect_reply(
+        &self,
+        from_endpoint: EndpointId,
+        hostname: Option<String>,
+        stranger: bool,
+    ) -> Result<ConnectDecision, String> {
+        let _decision = self
+            .connect_decision_lock
+            .lock()
+            .map_err(|_| "connection decision lock poisoned".to_string())?;
+        // Recheck inside the decision lock: a block may have completed after
+        // the stream handler passed its gate but before it reached this queue.
+        if self.admitted(from_endpoint).is_none() {
+            return Ok(ConnectDecision {
+                reply: control::ConnectMsg::Denied {
+                    reason: "recipient refuses connections from this peer".to_string(),
+                },
+                rejection: None,
+            });
+        }
+        let already = self
+            .approved_connects
+            .get(&from_endpoint)
+            .map(|r| *r.value());
+        let rejection = self
+            .rejected_connects
+            .get(&from_endpoint)
+            .map(|entry| *entry.value());
+        let reply = if rejection.is_some() {
+            control::ConnectMsg::Denied {
+                reason: "operator declined the connection request".to_string(),
+            }
+        } else if let Some((room_id, coordinator)) = already {
+            control::ConnectMsg::Approved {
+                room_id,
+                coordinator,
+            }
+        } else {
+            if stranger {
+                evict_oldest_connect(
+                    &self.pending_connects,
+                    from_endpoint,
+                    inbound::MAX_STRANGER_CONNECTS,
+                    |p| p.stranger,
+                );
+            }
+            evict_oldest_connect(
+                &self.pending_connects,
+                from_endpoint,
+                MAX_PENDING_CONNECTS,
+                |_| true,
+            );
+            self.pending_connects.insert(
+                from_endpoint,
+                PendingConnect {
+                    from_endpoint,
+                    hostname,
+                    requested_at: Instant::now(),
+                    stranger,
+                },
+            );
+            tracing::info!(endpoint = %from_endpoint.fmt_short(), "connect request received");
+            control::ConnectMsg::Pending
+        };
+        Ok(ConnectDecision { reply, rejection })
+    }
+
+    fn reject_pending_with(
+        &self,
+        selector: &str,
+        after_removed: impl FnOnce(),
+    ) -> Result<PendingConnect, String> {
+        let _decision = self
+            .connect_decision_lock
+            .lock()
+            .map_err(|_| "connection decision lock poisoned".to_string())?;
+        let request = self.take_pending(selector)?;
+        after_removed();
+        self.remember_rejection(request.from_endpoint);
+        Ok(request)
+    }
+
+    fn record_connection_error(&self, peer: EndpointId, message: String) {
+        self.connection_errors.insert(peer, message);
+        while self.connection_errors.len() > MAX_PENDING_CONNECTS {
+            let evicted = self
+                .connection_errors
+                .iter()
+                .find(|entry| *entry.key() != peer)
+                .map(|entry| *entry.key());
+            let Some(evicted) = evicted else { break };
+            self.connection_errors.remove(&evicted);
+        }
+    }
+
+    fn remember_rejection(&self, peer: EndpointId) {
+        if self.rejected_connects.len() >= MAX_PENDING_CONNECTS {
+            let oldest = self
+                .rejected_connects
+                .iter()
+                .min_by_key(|entry| *entry.value())
+                .map(|entry| *entry.key());
+            if let Some(oldest) = oldest {
+                self.rejected_connects.remove(&oldest);
+            }
+        }
+        self.rejected_connects.insert(peer, Instant::now());
+    }
+
+    async fn send_denial(conn: &Connection, reason: &str) {
+        if let Ok(Ok((mut send, _recv))) =
+            tokio::time::timeout(CONNECT_READ_TIMEOUT, conn.accept_bi()).await
+            && control::send_framed(
+                &mut send,
+                &control::ConnectMsg::Denied {
+                    reason: reason.to_string(),
+                },
+            )
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
         }
     }
 
@@ -475,11 +625,11 @@ impl ConnectService {
     /// own message.
     ///
     /// The inbound gate runs first, on the authenticated `remote_id`: a blocked
-    /// or refused dialer is closed before anything is read or written.
+    /// or refused dialer receives a terminal denial without queuing its request.
     pub(crate) async fn accept_connect_request(&self, conn: Connection) {
         let remote_id = conn.remote_id();
         if self.admitted(remote_id).is_none() {
-            conn.close(0u32.into(), b"");
+            Self::send_denial(&conn, "recipient refuses connections from this peer").await;
             return;
         }
         // One deadline covers opening the stream and reading it: a dialer
@@ -506,7 +656,17 @@ impl ConnectService {
                 // Gate again: a block or policy change made while this dialer
                 // held its stream open must apply to what it sends.
                 let Some(class) = self.admitted(remote_id) else {
-                    conn.close(0u32.into(), b"");
+                    if control::send_framed(
+                        &mut send,
+                        &control::ConnectMsg::Denied {
+                            reason: "recipient refuses connections from this peer".to_string(),
+                        },
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                    }
                     return;
                 };
                 let stranger = class == inbound::Inbound::Stranger;
@@ -519,20 +679,20 @@ impl ConnectService {
                     return;
                 }
                 if let control::ConnectMsg::InviteOffer { network, code } = request {
-                    if !self.receive_offer(remote_id, class, network, code).await {
-                        conn.close(0u32.into(), b"");
-                        return;
-                    }
-                    if control::send_framed(&mut send, &control::ConnectMsg::Pending)
+                    let reply = match self
+                        .receive_offer_result(remote_id, class, network, code)
                         .await
-                        .is_ok()
                     {
+                        Ok(()) => control::ConnectMsg::Pending,
+                        Err(reason) => control::ConnectMsg::Denied { reason },
+                    };
+                    if control::send_framed(&mut send, &reply).await.is_ok() {
                         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                     }
                     return;
                 }
                 if let control::ConnectMsg::Request {
-                    from_identity,
+                    from_identity: _,
                     from_endpoint,
                     hostname,
                 } = request
@@ -548,49 +708,30 @@ impl ConnectService {
                             },
                         )
                         .await;
+                        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                         return;
                     }
-                    // Already approved? Reply with the minted room id so
-                    // a re-dialing requester joins it (idempotent).
-                    let already = self
-                        .approved_connects
-                        .get(&from_endpoint)
-                        .map(|r| *r.value());
-                    let reply = if let Some((room_id, coordinator)) = already {
-                        control::ConnectMsg::Approved {
-                            room_id,
-                            coordinator,
-                        }
-                    } else {
-                        if stranger {
-                            evict_oldest_connect(
-                                &self.pending_connects,
-                                from_endpoint,
-                                inbound::MAX_STRANGER_CONNECTS,
-                                |p| p.stranger,
-                            );
-                        }
-                        evict_oldest_connect(
-                            &self.pending_connects,
-                            from_endpoint,
-                            MAX_PENDING_CONNECTS,
-                            |_| true,
-                        );
-                        self.pending_connects.insert(
-                            from_endpoint,
-                            PendingConnect {
-                                from_endpoint,
-                                hostname,
-                                requested_at: Instant::now(),
-                                stranger,
-                            },
-                        );
-                        tracing::info!(identity = %from_identity.fmt_short(), endpoint = %from_endpoint.fmt_short(), "connect request received");
-                        control::ConnectMsg::Pending
-                    };
+                    let ConnectDecision { reply, rejection } =
+                        match self.connect_reply(from_endpoint, hostname, stranger) {
+                            Ok(decision) => decision,
+                            Err(error) => {
+                                tracing::warn!(%error, "could not decide connect request");
+                                return;
+                            }
+                        };
                     if let Err(e) = control::send_framed(&mut send, &reply).await {
                         tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to send connect reply");
                         return;
+                    }
+                    if let Some(rejection) = rejection {
+                        let delivered =
+                            tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                        if matches!(delivered, Ok(Ok(None)))
+                            || matches!(delivered, Ok(Ok(Some(code))) if code == VarInt::from_u32(0))
+                        {
+                            self.rejected_connects
+                                .remove_if(&remote_id, |_, remembered| *remembered == rejection);
+                        }
                     }
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 } else {
@@ -626,6 +767,55 @@ mod pending_connect_cap_tests {
             requested_at: t,
             stranger: false,
         }
+    }
+
+    #[tokio::test]
+    async fn rejection_and_concurrent_poll_make_one_atomic_decision() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let store = FsStore::load(tmp.path().join("blobs")).await.unwrap();
+        let registry = crate::daemon::accept_handler_tests::sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            store,
+        );
+        let service = ConnectService::new(registry);
+        let requester = eid(42);
+        service
+            .pending_connects
+            .insert(requester, queued_at(requester, Instant::now()));
+        thread::scope(|scope| {
+            let (removed_tx, removed_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let rejecting_service = &service;
+            let rejecting = scope.spawn(move || {
+                rejecting_service.reject_pending_with(&requester.to_string(), || {
+                    removed_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            });
+            removed_rx.recv().unwrap();
+            assert!(service.pending_connects.is_empty());
+            assert!(service.rejected_connects.is_empty());
+            assert!(service.connect_decision_lock.try_lock().is_err());
+            let polling = scope.spawn(|| service.connect_reply(requester, None, true));
+            release_tx.send(()).unwrap();
+            rejecting.join().unwrap().unwrap();
+            let decision = polling.join().unwrap().unwrap();
+            assert!(matches!(decision.reply, control::ConnectMsg::Denied { .. }));
+            assert!(service.pending_connects.is_empty());
+        });
+        endpoint.close().await;
     }
 
     #[test]

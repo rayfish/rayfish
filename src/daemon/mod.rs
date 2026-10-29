@@ -219,6 +219,8 @@ use report::*;
 pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
 pub use mesh::run_daemon;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub use mesh::run_rootless;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
 #[cfg(unix)]
@@ -239,6 +241,9 @@ pub use mesh::{CleanupOutcome, cleanup_after_exit};
 /// - Remove the client full-tunnel rules, which would otherwise outlive the TUN
 ///   they point at.
 pub fn restore_host_state() {
+    if crate::instance::is_rootless() {
+        return;
+    }
     crate::dns::config::emergency_restore_resolv_conf();
     crate::dns::config::emergency_withdraw_resolvconf();
     crate::exit_node::disable();
@@ -302,10 +307,27 @@ use mdns::MdnsDiscovery;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
+/// ALPN for the device-pairing protocol. The trailing number is its protocol
 /// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-const PAIR_ALPN: &[u8] = b"rayfish/pair/2";
+/// Version 3 adds the unpair exchange (`PairMsg::UnpairRequest`).
+const PAIR_ALPN: &[u8] = b"rayfish/pair/3";
+
+/// The previous pairing protocol version, still served and offered so pairing
+/// and the network list keep working between builds. A connection that
+/// negotiates it is refused the version 3 messages, and it tells a device that
+/// its primary cannot record an unpair yet.
+const PAIR_V2_ALPN: &[u8] = b"rayfish/pair/2";
+
+/// Dial `addr` for the pairing protocol, offering version 2 as well so that a
+/// primary on an older build still answers. The caller checks the negotiated
+/// ALPN before sending a version 3 message.
+async fn connect_pair(endpoint: &Endpoint, addr: iroh::EndpointAddr) -> Result<Connection> {
+    let options =
+        iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![PAIR_V2_ALPN.to_vec()]);
+    let connecting = endpoint.connect_with_opts(addr, PAIR_ALPN, options).await?;
+    Ok(connecting.await?)
+}
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
@@ -343,7 +365,7 @@ pub(crate) struct MeshCtx {
     /// keeps disconnect handling serial (one check-then-act at a time).
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     /// The network-owning service. Control readers reach it through the ctx to
-    /// run network ops directly (e.g. `unpair_self` on a `ControlMsg::Unpaired` or
+    /// run network ops directly (e.g. the unpair a primary's notice asks for, or
     /// a self-nullify during reconverge) instead of signalling the daemon loop.
     registry: Arc<NetworkRegistry>,
 }
@@ -586,13 +608,14 @@ pub(crate) struct NetworkState {
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
     pending_suggestions: Vec<firewall::FirewallRule>,
-    /// Peers awaiting live operator approval on a closed network (coordinator
+    /// Join requests and undelivered denials on a closed network (coordinator
     /// only, in-memory, never persisted or published).
     pending: HashMap<EndpointId, PendingJoin>,
 }
 
-/// A join request held pending live approval on a closed network.
+/// A join request and its undelivered operator decision on a closed network.
 pub(crate) struct PendingJoin {
+    pub(crate) denied: bool,
     pub(crate) hostname: Option<String>,
     pub(crate) device_cert: Option<control::DeviceCert>,
     pub(crate) requested_at: Instant,
@@ -1093,6 +1116,19 @@ impl Daemon {
             elapsed_ms = started.elapsed().as_millis(),
             "shutdown: router stopped, blob store released, endpoint closed"
         );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "desktop"))]
+    pub(crate) async fn rootless_resolve(&self, name: &str) -> Option<Ipv6Addr> {
+        self.registry
+            .resolve_peer_name(name.trim_end_matches('.'))
+            .await
+            .map(|id| derive_ipv6(&id))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "desktop"))]
+    pub(crate) fn rootless_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
@@ -1796,18 +1832,23 @@ async fn open_and_send(conn: &Connection, net: Option<EndpointId>, msg: &Control
     control::send_msg(&mut send, net, msg).await
 }
 
-/// Send `ControlMsg::LeaveNetwork` on a fresh stream and wait until the peer has
-/// acknowledged all of it. `ray leave` tears the network down right after, which
-/// closes every link sharing no other network, and a close discards whatever is
-/// still unsent (the same wait as `send_welcome`).
-async fn send_leave(conn: &Connection, net_pubkey: EndpointId) -> Result<()> {
+/// Send one control message on a fresh stream and wait until the peer has
+/// acknowledged all of it. For a sender about to close the link: `ray leave`
+/// tears the network down right after, which closes every link sharing no other
+/// network, and a close discards whatever is still unsent (the same wait as
+/// `send_welcome`).
+async fn send_confirmed(
+    conn: &Connection,
+    net: Option<EndpointId>,
+    msg: &ControlMsg,
+) -> Result<()> {
     let (mut send, _recv) = conn.open_bi().await.context("open control stream")?;
-    control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::LeaveNetwork).await?;
+    control::send_msg(&mut send, net, msg).await?;
     // A reader that took the frame but not the FIN stops the stream with code 0.
-    if let Some(code) = send.stopped().await.context("await leave delivery")?
+    if let Some(code) = send.stopped().await.context("await delivery")?
         && code != VarInt::from_u32(0)
     {
-        anyhow::bail!("peer stopped the leave stream: {code}");
+        anyhow::bail!("peer stopped the stream: {code}");
     }
     Ok(())
 }
@@ -2042,7 +2083,7 @@ mod absent_member_tests {
 }
 
 #[cfg(test)]
-mod accept_handler_tests {
+pub(crate) mod accept_handler_tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
@@ -2099,6 +2140,7 @@ mod accept_handler_tests {
             state.pending.insert(
                 identity,
                 PendingJoin {
+                    denied: false,
                     hostname: None,
                     device_cert: None,
                     requested_at: Instant::now(),
@@ -2309,11 +2351,13 @@ mod accept_handler_tests {
 
     /// Throwaway [`NetworkRegistry`] for accept-handler tests: empty networks map
     /// and dummy foundation handles, none of which the constructed handlers touch.
-    fn sample_registry(
+    pub(crate) fn sample_registry(
         endpoint: Endpoint,
         identity: IrohIdentityProvider,
         blob_store: FsStore,
     ) -> Arc<NetworkRegistry> {
+        use crate::endpoint_hints::WarmLookup;
+
         let transport = Arc::new(Transport::new(
             endpoint,
             identity,
@@ -2321,7 +2365,7 @@ mod accept_handler_tests {
             Arc::new(ForwardMetrics::default()),
             TransportBootstrap {
                 lan_peers: Arc::new(LanPeers::new()),
-                warm_lookup: iroh::address_lookup::memory::MemoryLookup::new(),
+                warm_lookup: WarmLookup::default(),
                 pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
             },
         ));
@@ -2901,7 +2945,10 @@ mod accept_handler_tests {
         .unwrap();
         let reply = control::recv_framed::<control::ConnectMsg>(&mut recv).await;
         server.await.unwrap();
-        assert!(reply.is_err(), "{reply:?}");
+        assert!(
+            matches!(reply, Ok(control::ConnectMsg::Denied { .. })),
+            "{reply:?}"
+        );
         assert!(connect.pending_connects.is_empty());
         receiver.close().await;
         dialer.close().await;
@@ -3007,12 +3054,15 @@ mod accept_handler_tests {
                 control::recv_framed::<control::ConnectMsg>(&mut recv).await
             }
         };
-        // The blocked endpoint gets no reply bytes, whatever it claims to be.
+        // The blocked endpoint receives a refusal, whatever it claims to be.
         let refused = ask(&blocked, allowed.id()).await;
         // A different endpoint claiming the blocked key is judged on itself.
         let admitted = ask(&allowed, blocked.id()).await;
         server.await.unwrap();
-        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            matches!(refused, Ok(control::ConnectMsg::Denied { .. })),
+            "{refused:?}"
+        );
         assert_eq!(admitted.unwrap(), control::ConnectMsg::Pending);
         assert!(connect.pending_connects.contains_key(&allowed.id()));
         assert!(!connect.pending_connects.contains_key(&blocked.id()));
@@ -3030,6 +3080,65 @@ mod accept_handler_tests {
         Arc::get_mut(&mut registry).unwrap().transport = Arc::new(transport);
         let connect = ConnectService::new(registry);
         (endpoint, connect)
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn approved_connect_retries_after_join_failure() {
+        use iroh::address_lookup::memory::MemoryLookup;
+
+        let env = TestConfigDir::new();
+        let lookup = MemoryLookup::new();
+        let dialer = loopback_endpoint(lookup.clone()).await;
+        let receiver = loopback_endpoint(MemoryLookup::new()).await;
+        lookup.add_endpoint_info(receiver.addr());
+        let mut registry = registry_on(&dialer, &env.dir.path().join("blobs")).await;
+        let mut transport = (*registry.transport).clone();
+        transport.pkarr_relay_url = "http://127.0.0.1:1/pkarr".parse().unwrap();
+        Arc::get_mut(&mut registry).unwrap().transport = Arc::new(transport);
+        let connect = Arc::new(ConnectService::new(registry));
+        connect.outgoing_connects.insert(receiver.id());
+        connect.spawn_connect_retry(receiver.id(), None);
+
+        let retried = tokio::time::timeout(Duration::from_secs(10), async {
+            for attempt in 0..2 {
+                let conn = receiver.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                assert!(matches!(
+                    control::recv_framed::<control::ConnectMsg>(&mut recv)
+                        .await
+                        .unwrap(),
+                    control::ConnectMsg::Request { .. }
+                ));
+                assert!(connect.outgoing_connects.contains(&receiver.id()));
+                let reply = if attempt == 0 {
+                    control::ConnectMsg::Approved {
+                        room_id: SecretKey::from_bytes(&[26; 32]).public(),
+                        coordinator: receiver.id(),
+                    }
+                } else {
+                    control::ConnectMsg::Denied {
+                        reason: "request withdrawn".into(),
+                    }
+                };
+                control::send_framed(&mut send, &reply).await.unwrap();
+                conn.closed().await;
+            }
+        })
+        .await;
+        connect.registry.shutdown_token.cancel();
+        receiver.close().await;
+        dialer.close().await;
+        assert!(
+            retried.is_ok(),
+            "an approved request must retry a failed join"
+        );
+        assert!(
+            connect
+                .connection_errors
+                .get(&receiver.id())
+                .is_some_and(|error| error.contains("request withdrawn"))
+        );
     }
 
     fn sample_net() -> ipc::NetworkName {
@@ -4496,6 +4605,144 @@ mod accept_handler_tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_counts_only_join_requests_waiting_for_approval() {
+        let _env = TestConfigDir::new();
+        let daemon = build_headless(false).await.unwrap();
+        let state = make_network_state();
+        let network_key = state.read().unwrap().network_public_key;
+        for seed in [2, 3] {
+            state.write().unwrap().pending.insert(
+                SecretKey::from_bytes(&[seed; 32]).public(),
+                PendingJoin {
+                    denied: false,
+                    hostname: Some(format!("joining-peer-{seed}")),
+                    device_cert: None,
+                    requested_at: Instant::now(),
+                },
+            );
+        }
+        daemon.registry.networks.insert(
+            "test-net".into(),
+            NetworkHandle {
+                name: "test-net".into(),
+                network_key,
+                role: NetworkRole::Coordinator,
+                state,
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
+            },
+        );
+        for expected in [2, 1, 0] {
+            let IpcMessage::PendingRequests { requests } =
+                daemon.registry.list_requests("test-net")
+            else {
+                panic!("expected pending requests");
+            };
+            assert_eq!(requests.len(), expected);
+            let IpcMessage::StatusResponse { networks, .. } = daemon.status() else {
+                panic!("expected status");
+            };
+            let network = networks.iter().find(|net| net.name == "test-net").unwrap();
+            assert_eq!(network.pending_requests, expected);
+            if expected > 0 {
+                assert!(matches!(
+                    daemon
+                        .registry
+                        .deny_request("test-net", &requests[0].short_id),
+                    IpcMessage::Ok { .. }
+                ));
+            }
+        }
+        daemon.shutdown_and_close().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn denied_request_is_delivered_on_retry_instead_of_being_queued_again() {
+        use iroh::address_lookup::memory::MemoryLookup;
+
+        let env = TestConfigDir::new();
+        let alpn = transport::mesh_alpn();
+        let coordinator = loopback_endpoint_on(MemoryLookup::new(), vec![alpn.clone()]).await;
+        let joiner = loopback_endpoint_on(MemoryLookup::new(), vec![alpn.clone()]).await;
+        let store = FsStore::load(env.dir.path().join("blobs")).await.unwrap();
+        let registry = sample_registry(
+            coordinator.clone(),
+            IrohIdentityProvider::new(coordinator.id()),
+            store.clone(),
+        );
+        let state = make_network_state();
+        let network_key = state.read().unwrap().network_public_key;
+        registry.networks.insert(
+            "test-net".into(),
+            NetworkHandle {
+                name: "test-net".into(),
+                network_key,
+                role: NetworkRole::Coordinator,
+                state: Arc::clone(&state),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
+            },
+        );
+        let accepting = serve_coordinator(
+            &coordinator,
+            &store,
+            &registry,
+            vec![ServedNetwork {
+                key: network_key,
+                name: "test-net",
+                state: Arc::clone(&state),
+            }],
+        );
+        let connection = joiner.connect(coordinator.addr(), &alpn).await.unwrap();
+        for attempt in 0..2 {
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            control::send_msg(
+                &mut send,
+                Some(network_key),
+                &ControlMsg::JoinRequest {
+                    invite_secret: None,
+                    hostname: Some("joining-peer".into()),
+                    device_cert: None,
+                },
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(5), control::recv_msg(&mut recv))
+                .await
+                .unwrap()
+                .unwrap();
+            // Consume FIN so the handler knows the decision reached the joiner.
+            assert!(recv.read_to_end(0).await.unwrap().is_empty());
+            if attempt == 1 {
+                assert!(matches!(reply, ControlMsg::JoinDenied { .. }), "{reply:?}");
+            } else {
+                assert!(matches!(reply, ControlMsg::JoinPending), "{reply:?}");
+                assert!(matches!(
+                    registry.deny_request("test-net", "joining-peer"),
+                    IpcMessage::Ok { .. }
+                ));
+                let IpcMessage::PendingRequests { requests } = registry.list_requests("test-net")
+                else {
+                    panic!("expected pending requests");
+                };
+                assert!(requests.is_empty());
+            }
+        }
+        accepting.abort();
+        joiner.close().await;
+        coordinator.close().await;
+        store.shutdown().await.unwrap();
+    }
+
     /// Pairing sends one join per shared network over a single connection to
     /// the primary. A frame that is slow on one network (here: waiting on that
     /// network's snapshot commit) must not hold up another network's frame on
@@ -4649,6 +4896,9 @@ mod accept_handler_tests {
         // No blob entry yet: not satisfied.
         assert!(!super::rename_satisfied("alice", None));
     }
+
+    include!("mesh_request_replies_tests.rs");
+    include!("protocol_replies_tests.rs");
 
     #[test]
     fn promote_is_idempotent_decision() {

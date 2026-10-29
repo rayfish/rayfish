@@ -1161,6 +1161,9 @@ impl Daemon {
     /// `activate` when `ssh_enabled`, and from the `ssh on` IPC while active.
     #[cfg(feature = "desktop")]
     pub(crate) fn start_ssh(self: &Arc<Self>) {
+        if crate::instance::is_rootless() {
+            return;
+        }
         let mut guard = self.ssh_token.lock().unwrap();
         if guard.is_some() {
             return;
@@ -1197,6 +1200,9 @@ impl Daemon {
     /// binds this node's mesh address, which goes down with the TUN.
     #[cfg(feature = "desktop")]
     pub(crate) fn start_v4_bridge(self: &Arc<Self>) {
+        if crate::instance::is_rootless() {
+            return;
+        }
         let mut guard = self.v4_bridge_token.lock().unwrap();
         if guard.is_some() {
             return;
@@ -1272,6 +1278,12 @@ impl Daemon {
         // standby would otherwise route from whatever the roster looked like
         // when it went down.
         self.registry.poll_nudge.notify_waiters();
+
+        if crate::instance::is_rootless() {
+            return IpcMessage::Ok {
+                message: "rootless userspace networking up".into(),
+            };
+        }
 
         // Non-fatal problems hit while activating. The daemon stays up, but we
         // return these to the client so `ray up` can tell the user something is
@@ -1459,6 +1471,9 @@ impl Daemon {
     /// `activate` and by any `ray exit-node` change made while up. Returns a
     /// user-facing warning if either half could not be put in place.
     pub(crate) async fn apply_exit_node(&self) -> Option<String> {
+        if crate::instance::is_rootless() {
+            return None;
+        }
         // One reconcile at a time (see `Daemon::exit_reconcile`): the kernel
         // enable's snapshot-then-write is not safe to interleave.
         let started = tokio::time::Instant::now();
@@ -2051,6 +2066,12 @@ impl Daemon {
         if !self.active.swap(false, Ordering::SeqCst) {
             return IpcMessage::Ok {
                 message: "already on standby".into(),
+            };
+        }
+
+        if crate::instance::is_rootless() {
+            return IpcMessage::Ok {
+                message: "rootless userspace networking on standby".into(),
             };
         }
 

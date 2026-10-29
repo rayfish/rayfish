@@ -375,8 +375,12 @@ pub(super) fn nft_table_exists_with(
 
 /// The largest TCP MSS that fits the 1280-byte TUN: its MTU less the IPv6 and
 /// TCP headers.
+///
+/// Fixed rather than read from the device. It is a ceiling that only ever
+/// lowers an MSS, and 1280 is IPv6's minimum link MTU, so it fits any TUN. On a
+/// wider TUN it costs some segment size, never delivery.
 #[cfg(target_os = "linux")]
-pub(super) const TUN_MSS: u16 = crate::tun::MIN_TUN_MTU - 40 - 20;
+pub(super) const TUN_MSS: u16 = crate::tun::mss_for_mtu(crate::tun::MIN_TUN_MTU);
 
 /// The nftables ruleset masquerading overlay traffic out of `tun_name`'s host.
 ///

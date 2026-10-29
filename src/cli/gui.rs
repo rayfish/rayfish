@@ -137,7 +137,7 @@ fn prepare_ray_args(mut args: Vec<String>, json: bool) -> Result<Vec<String>> {
         .iter()
         .find(|arg| !arg.starts_with('-'))
         .map(String::as_str);
-    if matches!(command, Some("gui" | "daemon")) {
+    if matches!(command, Some("gui" | "daemon" | "rootless")) {
         anyhow::bail!("the GUI cannot run `{}`", command.unwrap());
     }
     // Appended, not prepended: `--json` is declared per-command now, so the
@@ -151,6 +151,8 @@ fn prepare_ray_args(mut args: Vec<String>, json: bool) -> Result<Vec<String>> {
 }
 
 fn run_ray_command(exe: &std::path::Path, args: Vec<String>) -> Result<RunResponse> {
+    #[cfg(target_os = "linux")]
+    let args = inherit_instance(args, rayfish::instance::is_rootless());
     let mut child = ProcessCommand::new(exe)
         .args(&args)
         .stdout(Stdio::piped())
@@ -183,6 +185,17 @@ fn run_ray_command(exe: &std::path::Path, args: Vec<String>) -> Result<RunRespon
         stderr: clamp_output(String::from_utf8_lossy(&output.stderr).into_owned()),
         timed_out,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn inherit_instance(mut args: Vec<String>, rootless: bool) -> Vec<String> {
+    if !args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--rootless" | "--system"))
+    {
+        args.insert(0, if rootless { "--rootless" } else { "--system" }.into());
+    }
+    args
 }
 
 fn clamp_output(mut text: String) -> String {
@@ -319,6 +332,26 @@ fn respond_bytes(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commands_inherit_the_gui_instance_without_overriding_explicit_selectors() {
+        let args = || vec!["status".into(), "--json".into()];
+        assert_eq!(
+            inherit_instance(args(), false),
+            ["--system", "status", "--json"]
+        );
+        assert_eq!(
+            inherit_instance(args(), true),
+            ["--rootless", "status", "--json"]
+        );
+        for selector in ["--rootless", "--system"] {
+            let args = vec!["status".into(), selector.into()];
+            for rootless in [false, true] {
+                assert_eq!(inherit_instance(args.clone(), rootless), args);
+            }
+        }
+    }
+
     #[test]
     fn prepare_args_strips_binary_name_and_appends_json() {
         let args = prepare_ray_args(vec!["ray".into(), "status".into()], true).unwrap();
@@ -345,6 +378,7 @@ mod tests {
     fn prepare_args_blocks_hidden_process_commands() {
         assert!(prepare_ray_args(vec!["daemon".into()], false).is_err());
         assert!(prepare_ray_args(vec!["--json".into(), "gui".into()], false).is_err());
+        assert!(prepare_ray_args(vec!["rootless".into()], false).is_err());
     }
 
     #[test]

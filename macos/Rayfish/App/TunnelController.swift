@@ -69,12 +69,14 @@ final class TunnelController: ObservableObject {
     func startup() async {
         guard !didStart else { return }
         didStart = true
+        let started = DispatchTime.now().uptimeNanoseconds
         startNetworkMonitoring()
         Task { await notifications.requestAuthorization() }
         refreshLaunchAtLogin()
         RayfishLog.app.info("Starting Rayfish build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown", privacy: .public)")
         do {
             let manager = try await TunnelPreferences.load()
+            RayfishLog.startup("initial preferences loaded", since: started, logger: RayfishLog.app)
             let needsImport = LegacyDaemon.isInstalled
                 && !UserDefaults.standard.bool(forKey: Self.migrationCompletedKey)
             let reconnectAfterUpdate = UserDefaults.standard.bool(forKey: Self.reconnectAfterUpdateKey)
@@ -168,6 +170,8 @@ final class TunnelController: ObservableObject {
     func connect() async {
         wantsConnection = true
         guard !isLoading, !isQuitting else { return }
+        let started = DispatchTime.now().uptimeNanoseconds
+        RayfishLog.app.info("Starting VPN connection attempt")
         isLoading = true
         error = nil
         activity = "Activating the Rayfish network extension..."
@@ -178,6 +182,7 @@ final class TunnelController: ObservableObject {
                 self?.activity = "Enable Rayfish Tunnel in System Settings > General > Login Items & Extensions > Network Extensions to continue."
             }
             try await installer.install()
+            RayfishLog.startup("extension activated", since: started, logger: RayfishLog.app)
             guard !isQuitting else { return }
             activity = "Connecting..."
             if let current = try await TunnelPreferences.load(),
@@ -185,13 +190,16 @@ final class TunnelController: ObservableObject {
                    || current.connection.status == .reasserting,
                TunnelOwner.uid(in: (current.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration) != getuid() {
                 try await stopTunnel()
+                RayfishLog.startup("previous tunnel stopped", since: started, logger: RayfishLog.app)
             }
             let manager = try await TunnelPreferences.configured()
+            RayfishLog.startup("tunnel preferences configured", since: started, logger: RayfishLog.app)
             guard !isQuitting else { return }
             if manager.connection.status != .connected && manager.connection.status != .connecting
                 && manager.connection.status != .reasserting {
                 try manager.connection.startVPNTunnel()
             }
+            RayfishLog.startup("waiting for VPN connection", since: started, logger: RayfishLog.app)
             var observedConnecting = false
             connectionStatus = .connecting
             for _ in 0..<180 {
@@ -206,7 +214,9 @@ final class TunnelController: ObservableObject {
                 connectionStatus = current
                 observedConnecting = observedConnecting || current == .connecting || current == .reasserting
                 if isConnected {
+                    RayfishLog.startup("VPN connected", since: started, logger: RayfishLog.app)
                     let response = try await TunnelIPC.request(ProviderRequest(action: .status))
+                    RayfishLog.startup("initial status received", since: started, logger: RayfishLog.app)
                     status = response.status
                     if status?.needsTCPHelper == true {
                         try SSHHelper.register(openSettings: true)
@@ -214,6 +224,7 @@ final class TunnelController: ObservableObject {
                     }
                     refreshMachines()
                     UserDefaults.standard.set(true, forKey: Self.migrationCompletedKey)
+                    RayfishLog.startup("connection ready", since: started, logger: RayfishLog.app)
                     return
                 }
                 if connectionStatus == .disconnected || connectionStatus == .invalid {
@@ -224,6 +235,7 @@ final class TunnelController: ObservableObject {
             }
             throw TunnelIPCError.timedOut
         } catch {
+            RayfishLog.startup("connection attempt failed", since: started, logger: RayfishLog.app)
             self.error = error.localizedDescription
             connectionStatus = (try? await TunnelPreferences.load())?.connection.status ?? .disconnected
             scheduleReconnect()

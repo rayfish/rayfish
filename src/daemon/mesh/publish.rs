@@ -283,6 +283,7 @@ pub(crate) fn spawn_network_publisher(
                             tracing::info!(peers = seed_count, "published network record");
                             last_publish = Some((hash, Instant::now()));
                             retry = None;
+                            registry.records_published.send_replace(());
                         }
                         outcome => {
                             if let Err(e) = outcome {

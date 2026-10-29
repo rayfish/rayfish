@@ -1,6 +1,6 @@
 //! Synthesis of "fail fast" REJECT replies for firewall-denied packets.
 //!
-//! When the firewall denies a packet and `reject` mode is enabled (opt-in,
+//! When the firewall denies SSH traffic, or `reject` mode is enabled (opt-in,
 //! default off, see [`crate::firewall::FirewallConfig`]), the data path builds a
 //! reply here instead of silently dropping: a TCP RST for TCP, or an ICMP
 //! destination-unreachable for UDP / everything else. The reply has its src/dst

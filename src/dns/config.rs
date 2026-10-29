@@ -268,6 +268,13 @@ pub async fn detect_and_configure(
         return Ok(Box::new(configurator));
     }
 
+    #[cfg(target_os = "illumos")]
+    {
+        let configurator = IllumosResolvConf::new().await;
+        configurator.apply().await?;
+        return Ok(Box::new(configurator));
+    }
+
     #[allow(unreachable_code)]
     {
         anyhow::bail!("DNS configuration not supported on this platform");
@@ -367,6 +374,50 @@ pub fn restore_stale_backups() {
             }
         }
     }
+    // illumos: a hard kill leaves our resolv.conf in place with the backup
+    // beside it. Put the host's file back so the next start captures it.
+    #[cfg(target_os = "illumos")]
+    {
+        let path = std::path::Path::new("/etc/resolv.conf");
+        let backup = std::path::Path::new("/etc/resolv.conf.before-rayfish");
+        if exists_no_follow(backup) {
+            match std::fs::read_to_string(path) {
+                Ok(current) => {
+                    if current.lines().any(|l| l.trim() == "# Managed by rayfish.") {
+                        tracing::info!("restoring stale DNS backup from previous crash");
+                        match restore_resolv_backup(backup, path) {
+                            Ok(()) => {
+                                let _ = std::fs::remove_file(backup);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to restore DNS backup; keeping it");
+                            }
+                        }
+                    } else {
+                        // Something else rewrote the file (zone reboot, another
+                        // program): the backup is stale, leave the live file alone.
+                        let _ = std::fs::remove_file(backup);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // The live file is gone: the backup is all that is left.
+                    tracing::info!("resolv.conf is missing; restoring the DNS backup");
+                    match restore_resolv_backup(backup, path) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(backup);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to restore DNS backup; keeping it");
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Unreadable is not evidence that it was replaced.
+                    tracing::warn!(error = %e, "cannot read /etc/resolv.conf; keeping the DNS backup");
+                }
+            }
+        }
+    }
 }
 
 /// What a stale direct-mode backup found at startup is for.
@@ -442,7 +493,15 @@ pub async fn clear_search_domains(tun_name: &str) {
     // resolved never held it.
     #[cfg(target_os = "linux")]
     revert_resolved_link(tun_name).await;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    // Windows likewise: its set path always routes `.ray` too.
+    #[cfg(windows)]
+    {
+        let _ = tun_name;
+        if let Err(e) = clear_search_domains_windows().await {
+            tracing::warn!(error = %e, "failed to clear search domains");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     if let Err(e) = set_manager_search_domains(&[], tun_name).await {
         tracing::warn!(error = %e, "failed to clear search domains");
     }
@@ -483,6 +542,10 @@ use windows::*;
 mod freebsd;
 #[cfg(target_os = "freebsd")]
 use freebsd::FreeBsdLocalUnbound;
+#[cfg(target_os = "illumos")]
+mod illumos;
+#[cfg(target_os = "illumos")]
+use illumos::IllumosResolvConf;
 
 // ---------------------------------------------------------------------------
 // macOS: SCDynamicStore
@@ -553,7 +616,7 @@ pub fn remove_dns_config() {
 }
 
 mod linux_backend;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "illumos"))]
 mod resolv_file;
 #[cfg(target_os = "linux")]
 pub(crate) use linux_backend::nm_quiet_remove;
@@ -566,6 +629,8 @@ pub use linux_backend::{
 };
 #[cfg(target_os = "linux")]
 use resolv_file::{backup_resolv_file, exists_no_follow, restore_resolv_backup, write_resolv_file};
+#[cfg(target_os = "illumos")]
+use resolv_file::{exists_no_follow, restore_resolv_backup};
 
 /// No-op on non-Linux: only the direct `/etc/resolv.conf` takeover has artifacts
 /// to restore.
@@ -1256,14 +1321,15 @@ mod tests {
             &["corp.ray".to_owned(), "ray".to_owned()],
             &["corp".to_owned(), "other".to_owned()],
         );
-        assert_eq!(nrpt_domains, ["corp.ray", "ray", "corp", "other"]);
+        assert_eq!(nrpt_domains, ["ray", "corp.ray", "corp", "other"]);
+        assert_eq!(windows_nrpt_domains(&[], &[]), ["ray"]);
         let match_domains = windows_dns_reconcile_script(
             &nrpt_domains,
             &["corp.ray".to_owned(), "ray".to_owned()],
             &["corp.ray".to_owned(), "ray".to_owned()],
             "txn-match",
         );
-        assert!(match_domains.contains("$desired=@('corp.ray','ray','corp','other')"));
+        assert!(match_domains.contains("$desired=@('ray','corp.ray','corp','other')"));
         assert!(match_domains.contains("$suffixDesired=@('corp.ray','ray')"));
         assert!(match_domains.contains("$nextManaged=@('corp.ray','ray')"));
         assert!(match_domains.contains("$next=@($foreign + $suffixDesired"));
@@ -1358,8 +1424,10 @@ mod tests {
             "second reconcile entered while the first transaction was live"
         );
         drop(first);
+        // The waiter can queue behind other tests' daemons, which take this
+        // lock for every DNS update and hold it while PowerShell runs.
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
                 .await
                 .unwrap()
                 .unwrap()

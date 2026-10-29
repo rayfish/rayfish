@@ -40,6 +40,26 @@ pub(crate) struct MeshConnection {
     pre_registered: bool,
 }
 
+/// A missing handler can be a restore still in progress, so joining remains
+/// retryable. Grants need an explicit failure because their sender records success.
+async fn reply_network_unavailable(mut send: SendStream, net: EndpointId, msg: &ControlMsg) {
+    let reply = match msg {
+        ControlMsg::JoinRequest { .. } | ControlMsg::MeshHello { .. } => {
+            ControlMsg::JoinUnavailable {
+                reason: "network is not active on this peer".to_string(),
+            }
+        }
+        ControlMsg::AdminGrant { .. } => ControlMsg::AdminGrantResult {
+            network_pubkey: net,
+            error: Some("network is not active on this peer".to_string()),
+        },
+        _ => return,
+    };
+    if let Err(error) = control::send_msg(&mut send, Some(net), &reply).await {
+        tracing::debug!(%error, "could not reply for unavailable network");
+    }
+}
+
 /// Bounds [`ControlMsg::NotSupported`] nacks on one connection: each unknown
 /// kind is nacked once, at most [`NackGate::LIMIT`] distinct kinds, and never a
 /// `NotSupported` itself, so two mismatched builds cannot ping-pong.
@@ -215,9 +235,10 @@ impl MeshConnection {
     /// Drive the connection for its whole life: spawn the single data reader, then
     /// loop accepting control streams and routing each `ControlFrame` to the right
     /// per-network handler by `net`, or handling connection-level messages
-    /// (`NetworkHandles`, `Ping`/`Pong`, `Unpaired`, `CertRefresh`) inline. On any
-    /// exit that isn't daemon shutdown, stop the reader and, if this connection was
-    /// ever a registered member, report the drop to the supervisor.
+    /// (`NetworkHandles`, `Ping`/`Pong`, the unpair notices, `CertRefresh`)
+    /// inline. On any exit that isn't daemon shutdown, stop the reader and, if
+    /// this connection was ever a registered member, report the drop to the
+    /// supervisor.
     pub(crate) async fn run(mut self) {
         // Feed the warm-start cache from the authenticated connection.  A later
         // restart can try its selected relay or direct path immediately instead
@@ -278,6 +299,7 @@ impl MeshConnection {
                             net = %frame.net.fmt_short(),
                             "network gone before its queued control frame ran; dropping"
                         );
+                        reply_network_unavailable(frame.send, frame.net, &frame.msg).await;
                         return;
                     };
                     // The reachability wall for the control plane, mirroring
@@ -482,17 +504,29 @@ impl MeshConnection {
                     }
                     continue;
                 }
-                ControlMsg::Unpaired => {
-                    // Our primary is unpairing this device. Act only if the sender
-                    // actually signed our cert (a stranger is a no-op). Leaving
-                    // every network is heavy, so spawn it off the demux loop rather
-                    // than awaiting inline.
-                    if is_unpaired_by(self.peer_id) {
-                        let registry = Arc::clone(&self.ctx.registry);
-                        tokio::spawn(async move {
-                            let _ = registry.unpair_self().await;
-                        });
+                ControlMsg::Unpaired | ControlMsg::PairingRevoked { .. } => {
+                    // Our primary is unpairing this device, or repeating it until
+                    // we confirm. Acted on only if the sender signed our cert (a
+                    // stranger is a no-op), and judged against the cert stored
+                    // when it is acted on, not now: a notice read now may have
+                    // waited behind another stream while this device paired
+                    // again. Leaving every network is heavy, so spawn it off the
+                    // demux loop rather than awaiting inline.
+                    let revoked = match frame.msg {
+                        ControlMsg::PairingRevoked { generation } => Some(generation),
+                        _ => None,
+                    };
+                    // A primary on version 7 names the pairing; only an older
+                    // one sends the bare notice.
+                    if revoked.is_none() && !predates_pairing_generations(self.conn.alpn()) {
+                        tracing::debug!(peer = %self.peer_id.fmt_short(), "ignoring an unpair notice that names no pairing");
+                        continue;
                     }
+                    let registry = Arc::clone(&self.ctx.registry);
+                    let sender = self.peer_id;
+                    tokio::spawn(async move {
+                        registry.on_unpaired_notice(sender, revoked).await;
+                    });
                     continue;
                 }
                 ControlMsg::CertRefresh { cert } => {
@@ -502,17 +536,17 @@ impl MeshConnection {
                     continue;
                 }
                 ControlMsg::RequestUnpair => {
-                    // A paired secondary is unpairing itself and asks us (its
-                    // primary) to write the authoritative nullifier. Act only if we
-                    // are a primary (hold the network keys); `nullify_device`
-                    // rejects a requester that is not one of our paired devices, so
-                    // a stranger is a no-op. Off the demux loop: republish + prune
-                    // is heavy.
+                    // A paired secondary on an older build is unpairing itself and
+                    // asks us (its primary) to write the authoritative nullifier.
+                    // Act only if we are a primary (hold the network keys);
+                    // `nullify_device` rejects a requester that is not one of our
+                    // paired devices, so a stranger is a no-op. Off the demux loop:
+                    // republish + prune is heavy.
                     if self.ctx.registry.current_device_cert().is_none() {
                         let registry = Arc::clone(&self.ctx.registry);
                         let requester = self.peer_id;
                         tokio::spawn(async move {
-                            if let Err(reason) = registry.nullify_device(requester).await {
+                            if let Err(reason) = registry.nullify_device(requester, false).await {
                                 tracing::debug!(peer = %requester.fmt_short(), %reason, "ignoring unpair request");
                             }
                         });
@@ -540,10 +574,10 @@ impl MeshConnection {
                 // A peer talking to us about a network we have saved but never
                 // registered means our restore of it is still owed: the network
                 // is plainly reachable, since its traffic just arrived. Nudge the
-                // supervisor to retry now rather than at its next tick. This
-                // frame is still dropped (there is no handler to give it to), but
-                // the peer's own reconnect loop will be back.
+                // supervisor to retry now rather than at its next tick.
+                // Joining remains pending until the handler is restored.
                 self.ctx.registry.nudge_restore();
+                reply_network_unavailable(send, net_pubkey, &frame.msg).await;
                 continue;
             }
             drop(recv); // one message per stream; the reply rides `send`

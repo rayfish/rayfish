@@ -8,6 +8,14 @@
 
 use super::super::*;
 
+/// An explicit refusal is terminal, unlike a failed connection or pending approval.
+#[derive(Debug, thiserror::Error)]
+#[error("coordinator denied joining to {network}: {reason}")]
+pub(crate) struct JoinDenied {
+    pub(crate) network: String,
+    reason: String,
+}
+
 /// Result of the initial join handshake against the coordinator.
 pub(crate) enum JoinResult {
     /// Admitted (open network, valid invite, or pre-approved): live network state.
@@ -500,16 +508,47 @@ async fn build_member_state(
 pub(crate) async fn send_mesh_hello(
     conn: &Connection,
     network_key: EndpointId,
+    network_name: &str,
     hello: &ControlMsg,
 ) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let (mut send, mut recv) = conn.open_bi().await?;
         control::send_msg(&mut send, Some(network_key), hello).await?;
         // Same maximum body size as the framed control reader, plus its prefix.
-        recv.read_to_end(65_536 + 4)
+        let reply = recv
+            .read_to_end(65_536 + 4)
             .await
             .context("read mesh hello reply")?;
-        Ok::<(), anyhow::Error>(())
+        if reply.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(reply.len() >= 4, "incomplete mesh hello reply");
+        let length = u32::from_be_bytes(reply[..4].try_into().context("mesh hello reply length")?);
+        anyhow::ensure!(
+            usize::try_from(length)? == reply.len() - 4,
+            "invalid mesh hello reply length"
+        );
+        let frame: control::ControlFrame =
+            rmp_serde::from_slice(&reply[4..]).context("decode mesh hello reply")?;
+        anyhow::ensure!(
+            frame.net == Some(network_key),
+            "mesh hello reply names a different network"
+        );
+        match frame.msg {
+            ControlMsg::Welcome { .. } => Ok(()),
+            ControlMsg::JoinDenied { reason } => Err(JoinDenied {
+                network: network_name.to_string(),
+                reason,
+            }
+            .into()),
+            ControlMsg::JoinUnavailable { reason } => {
+                anyhow::bail!("cannot join network '{network_name}': {reason}")
+            }
+            ControlMsg::JoinPending => anyhow::bail!(
+                "network '{network_name}' is not ready to accept this connection; retrying"
+            ),
+            _ => anyhow::bail!("unexpected mesh hello reply"),
+        }
     })
     .await
     .context("timeout awaiting mesh hello completion")?
@@ -542,6 +581,7 @@ async fn connect_to_roster_peers(
                 if let Err(error) = send_mesh_hello(
                     &conn,
                     net_pubkey,
+                    network_name,
                     &ControlMsg::MeshHello {
                         identity: my_identity,
                         hostname: outgoing_hostname(network_name),
@@ -635,12 +675,19 @@ async fn perform_join_handshake(
                     record_ts: None,
                 })
             }
+            ControlMsg::JoinUnavailable { reason } => {
+                anyhow::bail!("cannot join network '{network_name}': {reason}")
+            }
             ControlMsg::JoinPending => {
                 tracing::info!(network = %network_name, "join pending operator approval");
                 Ok(HandshakeOutcome::Pending)
             }
-            ControlMsg::JoinDenied { reason } => anyhow::bail!("join denied: {reason}"),
-            other => anyhow::bail!("expected Welcome or JoinPending, got {other:?}"),
+            ControlMsg::JoinDenied { reason } => Err(JoinDenied {
+                network: network_name.to_string(),
+                reason,
+            }
+            .into()),
+            _ => anyhow::bail!("unexpected join response"),
         }
     } else {
         // Reconnect/restore: re-announce ourselves so the coordinator's demux
@@ -681,7 +728,20 @@ async fn perform_join_handshake(
                 )?;
                 (members, approved, direct)
             }
-            other => anyhow::bail!("expected Welcome after reconnect hello, got {other:?}"),
+            ControlMsg::JoinDenied { reason } => {
+                return Err(JoinDenied {
+                    network: network_name.to_string(),
+                    reason,
+                }
+                .into());
+            }
+            ControlMsg::JoinUnavailable { reason } => {
+                anyhow::bail!("cannot join network '{network_name}': {reason}")
+            }
+            ControlMsg::JoinPending => anyhow::bail!(
+                "network '{network_name}' is not ready to accept this connection; retrying"
+            ),
+            _ => anyhow::bail!("unexpected reconnect hello reply"),
         };
         if direct.is_some() {
             let mut blob = fallback_blob.clone();
@@ -873,7 +933,7 @@ mod mesh_hello_reply_tests {
             );
             registered.add(derive_ipv6(&client_id), incoming, client_id, "mesh");
         });
-        send_mesh_hello(&outgoing, network_key, &hello(client_id))
+        send_mesh_hello(&outgoing, network_key, "test-net", &hello(client_id))
             .await
             .unwrap();
         replying.await.unwrap();
@@ -893,12 +953,52 @@ mod mesh_hello_reply_tests {
             drop(send);
             incoming
         });
-        send_mesh_hello(&outgoing, network_key, &hello(client.id()))
+        send_mesh_hello(&outgoing, network_key, "test-net", &hello(client.id()))
             .await
             .unwrap();
         let _incoming = replying.await.unwrap();
         client.close().await;
         server.close().await;
+    }
+
+    #[tokio::test]
+    async fn hello_refusal_and_pending_are_not_successful_registration() {
+        for response in [
+            ControlMsg::JoinDenied {
+                reason: "device certificate has been revoked".to_string(),
+            },
+            ControlMsg::JoinPending,
+            ControlMsg::JoinUnavailable {
+                reason: "network is not active on this peer".to_string(),
+            },
+        ] {
+            let (server, client, incoming, outgoing) = connected_pair().await;
+            let network_key = SecretKey::generate().public();
+            let denied = matches!(response, ControlMsg::JoinDenied { .. });
+            let replying = tokio::spawn(async move {
+                let mut send = receive_hello(&incoming, network_key).await;
+                control::send_msg(&mut send, Some(network_key), &response)
+                    .await
+                    .unwrap();
+                send.stopped().await.unwrap();
+                incoming
+            });
+            let error = send_mesh_hello(&outgoing, network_key, "test-net", &hello(client.id()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.is::<JoinDenied>(), denied);
+            if denied {
+                assert_eq!(
+                    error.to_string(),
+                    "coordinator denied joining to test-net: device certificate has been revoked"
+                );
+            } else {
+                assert!(error.to_string().contains("network 'test-net'"));
+            }
+            let _incoming = replying.await.unwrap();
+            client.close().await;
+            server.close().await;
+        }
     }
 
     #[tokio::test]
@@ -911,7 +1011,7 @@ mod mesh_hello_reply_tests {
             incoming
         });
         assert!(
-            send_mesh_hello(&outgoing, network_key, &hello(client.id()))
+            send_mesh_hello(&outgoing, network_key, "test-net", &hello(client.id()))
                 .await
                 .is_err()
         );

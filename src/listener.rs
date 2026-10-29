@@ -32,7 +32,7 @@ pub(crate) fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     // exists. Nothing binds through here on Windows today (`v4bridge` has no
     // port enumeration there), so the first caller that does needs to set
     // SO_EXCLUSIVEADDRUSE by hand: socket2 0.6 does not expose it.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
     let addr: SocketAddr = (ip, port).into();

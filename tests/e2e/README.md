@@ -1,9 +1,9 @@
 # Rayfish end-to-end tests
 
-Each scenario provisions a fleet of hosts, deploys `ray` over SSH, drives a flow end
-to end, and prints a `PASS`/`FAIL` line per check (exit non-zero on any failure). The
+Host scenarios provision a fleet, deploy `ray` over SSH, drive a flow end
+to end, and print a `PASS`/`FAIL` line per check (exit non-zero on any failure). The
 shared SSH/deploy/reset/assert plumbing lives in [`../lib/`](../lib) and is sourced by
-every scenario.
+host scenarios.
 
 A host is anything that answers `ssh root@<ip>`, so there are two backends: real
 DigitalOcean droplets (the default) and local Docker containers
@@ -13,6 +13,7 @@ DigitalOcean droplets (the default) and local Docker containers
 
 | Dir | Hosts | What it proves |
 |-----|-------|----------------|
+| [`rootless/`](rootless) | 2 local processes | Ordinary-user IPC, private invites, authenticated HTTP/SOCKS5/CONNECT, streaming and half-close through explicitly exposed services, with both firewalls enabled. No Docker or TUN. |
 | [`device-cert/`](device-cert) | 3 | A third peer reaches a user identity backed by two paired devices (`ray pair` + DeviceCert), over a closed (invite-gated) network. |
 | [`connect/`](connect) | 2 | The `ray connect` direct 2-peer friend-request flow over the public pkarr DHT — request, approve, `[direct]` network, ping + `ray send`, per-network firewall, offline negative case. |
 | [`firewall/`](firewall) | 3 | The coordinator suggested-firewall pipeline (`suggest` → `pending`/`accept`, `auto-accept`, additive whitelist vs blacklist) and the per-packet rule matrix (UDP, port ranges, same-selector replace, `--network` scoping) over a real TUN. |
@@ -37,7 +38,7 @@ tests/e2e.sh <scenario> provision   # just spin up instances -> <dir>/.servers
 tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 ```
 
-where `<scenario>` is `device-cert`, `connect`, `firewall`, `closed-net`,
+where `<scenario>` is `rootless`, `device-cert`, `connect`, `firewall`, `closed-net`,
 `apply`, `invites`, `dns`, `ssh`, `operator`, `v4bridge`, `reliability`, `restore-offline`,
 `unpair`, `churn`, `exit-node`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
@@ -51,7 +52,16 @@ probe errors, bounded diagnostics, cleanup retries, and unknown-peer failures
 without Docker or cloud credentials. It includes the focused cleanup and connect
 regression scripts. These checks also run in CI.
 
-## Prerequisites (both backends)
+## Local rootless scenario
+
+Build with `cargo -q build`, then run `tests/e2e.sh rootless` as an ordinary Linux
+user. This needs only Python 3.10+ and the binary. `RAY_BIN` overrides the binary;
+otherwise it uses `${CARGO_TARGET_DIR:-target}/debug/ray`. It owns temporary state,
+cleans up both daemons, and does no provisioning. See [rootless/](rootless).
+Use `E2E_BACKEND=docker tests/e2e.sh rootless` to run both daemons inside an
+unprivileged container, with no capabilities or TUN device.
+
+## Prerequisites (host backends)
 
 - `jq` (the assertions parse `ray status --json` on the runner), plus `just` and
   `cross` with Docker running (the x86_64-linux build behind `just deploy`).

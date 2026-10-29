@@ -67,8 +67,9 @@ pub fn store_device_cert(cert: &DeviceCert) -> Result<()> {
     Ok(())
 }
 
-/// Delete this device's stored cert (`ray unpair` best-effort wipe on the
-/// unpaired device). Idempotent: succeeds if the file is already absent.
+/// Delete this device's stored cert, as part of unpairing it (see
+/// `daemon::mesh::unpair`). Idempotent: succeeds if the file is already absent.
+/// The caller makes the deletion durable (`config::sync_deletions`).
 pub fn delete_device_cert() -> Result<()> {
     let path = device_cert_path()?;
     match std::fs::remove_file(&path) {

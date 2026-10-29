@@ -275,6 +275,7 @@ impl NetworkRegistry {
         let requests = s
             .pending
             .iter()
+            .filter(|(_, pj)| !pj.denied)
             .map(|(id, pj)| ipc::PendingRequestInfo {
                 short_id: id.fmt_short().to_string(),
                 hostname: pj.hostname.clone(),
@@ -298,6 +299,7 @@ impl NetworkRegistry {
                 selector,
                 s.pending
                     .iter()
+                    .filter(|(_, request)| !request.denied)
                     .map(|(identity, request)| (*identity, request.hostname.clone())),
             );
             let found = match found {
@@ -357,11 +359,14 @@ impl NetworkRegistry {
             selector,
             s.pending
                 .iter()
+                .filter(|(_, request)| !request.denied)
                 .map(|(identity, request)| (*identity, request.hostname.clone())),
         );
         match found {
             Ok(Some(id)) => {
-                s.pending.remove(&id);
+                if let Some(request) = s.pending.get_mut(&id) {
+                    request.denied = true;
+                }
                 IpcMessage::Ok {
                     message: format!("denied {}", id.fmt_short()),
                 }
