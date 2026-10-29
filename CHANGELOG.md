@@ -6,7 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
+  and DNS through the packet tunnel, or restore a direct connection.
+
+- Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
+  with only an IPv4 internet connection.
+
 ### Changed
+
+- While an exit node is selected, the LAN, Docker networks and other VPNs stay
+  reachable directly, and SSH sessions to the client's own address keep
+  working. Only new connections to the internet outside the tunnel are
+  blocked.
 
 - Mesh SSH no longer limits the number of session channels on one connection.
 - New installs default Magic DNS to `partial`: only `.ray` names resolve, and
@@ -16,6 +29,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Relay and peer-discovery lookups keep HTTPS DNS fallback when plain DNS is blocked.
+- After network changes, peer discovery retries DNS records that were missing
+  before a peer started, instead of caching the earlier miss.
 - Cached peer addresses expire after seven days, with up to eight paths per
   peer and 64 peers in both saved hints and the running lookup. Connected paths
   refresh hourly. Old hints without timestamps are discarded on upgrade.
@@ -35,6 +51,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   paths rather than guessing. Local failures and unanswered probes are no longer
   described as packet loss. Probes use the current connection and bound the
   send/reply exchange to one second.
+
+### Security
+
+- An exit node no longer forwards unsolicited inbound connections from the
+  internet to the clients using it, and clients drop them too.
 
 ## [0.5.11] - 2026-10-27
 
@@ -502,6 +523,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Check for Updates" in the app menu to check at any time.
 
 ### Changed
+
+- Selecting an exit node captures both IP families and DNS. Unsupported families
+  and unavailable exits stay blocked until the exit is cleared. Transport traffic
+  remains outside the tunnel. Android exit routing is deferred.
 
 - `ray status` shows each network's admission mode. Member networks show
   `mode unknown` because the coordinator does not share this setting.

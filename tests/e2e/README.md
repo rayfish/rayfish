@@ -28,7 +28,7 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
 | [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
 | [`churn/`](churn) | 4 | Lifecycle events under churn: repeated hard flap, simultaneous flap, `ray down`/`up` cycles (including one on a host with no `ip` binary, since link state goes over netlink), and a `kick`/`nuke` delivered while a member is offline (which must still converge from the signed blob). Ends with a no-panic/no-crash-restart sweep. |
-| [`exit-node/`](exit-node) | 3 | The internet-gateway path: `allow`/`use` forwarding + NAT, full-tunnel egress, `SO_MARK` loop prevention, the IPv6-only tunnel gate, and the deny path. |
+| [`exit-node/`](exit-node) | 3 | The internet-gateway path for IPv4 and IPv6: `allow`/`use` forwarding + NAT, full-tunnel egress, `SO_MARK` loop prevention, inbound SSH and established flows surviving, the client guard (LAN, a Docker-style bridge and a co-resident VPN stay reachable, uplink-bound new flows and route loss do not leak), the deny path, and teardown. |
 
 Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
 
@@ -80,12 +80,12 @@ Real droplets, one fleet per scenario. Needs `doctl` authenticated (`doctl auth
 init`, then `doctl account get` should work) and at least one SSH key on the
 account.
 
-Droplets are created with `--enable-ipv6`, which matters more than it looks:
-the overlay is IPv6-only and `exit-node/run.sh` **skips** its egress assertions
-on a host with no v6 internet, so a fleet without IPv6 makes that suite pass
-without testing the tunnel. IPv6 is settable only at create time, so a fleet
-provisioned without it is easier to destroy and recreate than to fix. Provision
-warns when a droplet comes up without a v6 address.
+Droplets are created with `--enable-ipv6`. The exit test always checks IPv4;
+IPv6 is checked when the gateway has an uplink and must stay blocked otherwise.
+The harness keeps no SSH exemption of its own: staying connected under the full
+tunnel is one of the assertions. The LAN check uses the droplets' VPC address on
+`eth1` and is skipped without one. `tests/exit-ipv4-kernel.sh` tests kernel NAT
+and route-loss protection locally with no external network.
 
 Unlike some providers, DigitalOcean injects **no** SSH key unless `--ssh-keys`
 names one, so the provisioner passes every key on the account by default

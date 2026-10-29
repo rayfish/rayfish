@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -133,11 +133,26 @@ struct ActiveConnection {
     /// held open like an eager node so it never flaps.
     supports_idle_close: Arc<AtomicBool>,
     receive_mtu: Arc<AtomicU16>,
+    exit_ipv4: Arc<AtomicU8>,
     /// Held from snapshotting `out_handles` until the `NetworkHandles` stream
     /// is open. The peer replaces its whole decode table per announcement, in
     /// stream order, so an older snapshot must never open its stream after a
     /// newer one.
     announce: Arc<AsyncMutex<()>>,
+}
+
+/// `exit_ipv4` values: the peer's announcement has not arrived yet, or it said
+/// it cannot, or can, translate IPv4 exit traffic.
+const EXIT_IPV4_UNKNOWN: u8 = 0;
+const EXIT_IPV4_REFUSED: u8 = 1;
+const EXIT_IPV4_SUPPORTED: u8 = 2;
+
+fn decode_exit_ipv4(state: &AtomicU8) -> Option<bool> {
+    match state.load(Ordering::Relaxed) {
+        EXIT_IPV4_REFUSED => Some(false),
+        EXIT_IPV4_SUPPORTED => Some(true),
+        _ => None,
+    }
 }
 
 impl ActiveConnection {
@@ -150,6 +165,7 @@ impl ActiveConnection {
             last_active: Arc::new(AtomicU64::new(now_ms())),
             supports_idle_close: Arc::new(AtomicBool::new(false)),
             receive_mtu: Arc::new(AtomicU16::new(crate::tun::MIN_TUN_MTU)),
+            exit_ipv4: Arc::new(AtomicU8::new(EXIT_IPV4_UNKNOWN)),
             announce: Arc::new(AsyncMutex::new(())),
         }
     }
@@ -192,12 +208,21 @@ pub struct PeerRoute {
     /// The outbound datagram tag for `network` on this connection.
     pub handle: u16,
     receive_mtu: Arc<AtomicU16>,
+    exit_ipv4: Arc<AtomicU8>,
     /// Shared last-activity clock for this peer's connection; the sender bumps it
     /// after a successful send so the idle reaper sees the connection as active.
     last_active: Arc<AtomicU64>,
 }
 
 impl PeerRoute {
+    /// Whether the peer said it cannot carry IPv4 exit traffic. A peer whose
+    /// announcement has not arrived yet is not refusing: the first packets of a
+    /// lazy dial are flushed before it lands, and an older gateway drops IPv4 on
+    /// its own.
+    pub fn refuses_exit_ipv4(&self) -> bool {
+        decode_exit_ipv4(&self.exit_ipv4) == Some(false)
+    }
+
     /// The peer's advertised IP packet limit; conservative until it announces.
     pub fn receive_mtu(&self) -> u16 {
         self.receive_mtu.load(Ordering::Relaxed)
@@ -332,6 +357,7 @@ impl PeerEntry {
             network,
             handle,
             receive_mtu: Arc::clone(&self.active.receive_mtu),
+            exit_ipv4: Arc::clone(&self.active.exit_ipv4),
             last_active: Arc::clone(&self.active.last_active),
         }
     }
@@ -519,6 +545,23 @@ impl PeerTable {
     pub fn ipv6_for_id(&self, peer_id: &EndpointId) -> Option<Ipv6Addr> {
         let ip = membership::derive_ipv6(peer_id);
         self.peers.contains_key(&ip).then_some(ip)
+    }
+
+    pub fn note_exit_ipv4_support(&self, peer: &EndpointId, conn: &Connection, supported: bool) {
+        self.update_current(&membership::derive_ipv6(peer), conn, |entry| {
+            entry.active.exit_ipv4.store(
+                if supported {
+                    EXIT_IPV4_SUPPORTED
+                } else {
+                    EXIT_IPV4_REFUSED
+                },
+                Ordering::Relaxed,
+            );
+        });
+    }
+
+    pub fn exit_ipv4_support(&self, ip: &Ipv6Addr) -> Option<bool> {
+        decode_exit_ipv4(&self.peers.get(ip)?.active.exit_ipv4)
     }
 
     /// Record whether `peer_id` advertised idle-close support in its `MeshHello`

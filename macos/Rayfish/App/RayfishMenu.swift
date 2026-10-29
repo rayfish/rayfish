@@ -81,6 +81,35 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
                 entry.submenu = peers
                 items.append(entry)
             }
+            items.append(separator("exit-start"))
+            let exit = item("Exit Node", id: "exit-node")
+            exit.isEnabled = controller.isConnected && !controller.isLoading
+            let choices = NSMenu()
+            choices.autoenablesItems = false
+            let direct = item("Direct Connection", action: #selector(selectExitNode(_:)), id: "exit-direct")
+            direct.state = status.exitSelected ? .off : .on
+            direct.representedObject = ExitNodeChoice(network: status.exitNodes.first { $0.using != nil }?.network ?? "", peer: nil)
+            direct.isEnabled = status.exitSelected && !controller.isLoading
+            choices.addItem(direct)
+            for network in status.exitNodes where !network.available.isEmpty {
+                choices.addItem(separator("exit-network:\(network.network)"))
+                choices.addItem(item(network.network, id: "exit-label:\(network.network)"))
+                for peer in network.available where !network.refused.contains(peer) {
+                    let entry = item("  \(peer)", action: #selector(selectExitNode(_:)),
+                                     id: "exit:\(network.network):\(peer)")
+                    entry.representedObject = ExitNodeChoice(network: network.network, peer: peer)
+                    entry.isEnabled = !controller.isLoading
+                    if let selected = network.using,
+                       status.networks.first(where: { $0.name == network.network })?.peers.contains(where: {
+                           $0.hostname == peer && $0.identity == selected
+                       }) == true {
+                        entry.state = .on
+                    }
+                    choices.addItem(entry)
+                }
+            }
+            exit.submenu = choices
+            items.append(exit)
         }
         if let activity = controller.activity {
             items.append(separator("activity-start"))
@@ -123,6 +152,7 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
                 current.toolTip = next.toolTip
                 current.representedObject = next.representedObject
                 current.image = next.image
+                current.state = next.state
                 if let submenu = next.submenu {
                     if let existing = current.submenu { reconcile(existing, with: submenu.items) }
                     else { next.submenu = nil; current.submenu = submenu }
@@ -158,6 +188,16 @@ final class RayfishMenu: NSObject, NSMenuDelegate {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(address, forType: .string)
     }
+
+    @objc private func selectExitNode(_ sender: NSMenuItem) {
+        guard let choice = sender.representedObject as? ExitNodeChoice, !choice.network.isEmpty else { return }
+        Task { await controller.selectExitNode(network: choice.network, peer: choice.peer) }
+    }
+}
+
+private struct ExitNodeChoice {
+    let network: String
+    let peer: String?
 }
 
 private struct RayfishConnectionSwitch: View {
