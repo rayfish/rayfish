@@ -7,11 +7,11 @@ use eframe::egui::{
     self, Align, Color32, Context, FontData, FontDefinitions, FontFamily, FontId, Frame, Layout,
     Margin, RichText, ScrollArea, Stroke, TextureHandle, Ui, Vec2,
 };
-use ray_proto::Action as FirewallAction;
-use ray_proto::ipc::{NetworkRole, NetworkStatus, PeerStatus};
+use ray_proto::ipc::{IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
+use ray_proto::{Action as FirewallAction, FirewallKey, GlobalKey, NodeKey};
 
 use crate::forms::{FormKind, console_args};
-use crate::model::{PendingItem, PendingKind, Snapshot, words};
+use crate::model::{PendingItem, PendingKind, Snapshot};
 
 const BACKGROUND: Color32 = color(0x18181b);
 const PANEL: Color32 = color(0x1c1c20);
@@ -63,9 +63,16 @@ impl Page {
 pub(crate) enum Action {
     Refresh,
     Toggle,
-    Run(Vec<String>),
-    Join { args: Vec<String>, hostname: String },
-    ShowResult { kind: OutputKind, args: Vec<String> },
+    Run(IpcMessage),
+    Join {
+        request: IpcMessage,
+        hostname: String,
+    },
+    ShowResult {
+        kind: OutputKind,
+        request: IpcMessage,
+    },
+    Console(Vec<String>),
     Startup(bool),
 }
 
@@ -112,7 +119,7 @@ enum Dialog {
     Confirm {
         title: String,
         message: String,
-        args: Vec<String>,
+        request: Option<Box<IpcMessage>>,
     },
     Output,
 }
@@ -120,6 +127,8 @@ enum Dialog {
 pub(crate) struct Dashboard {
     pub snapshot: Option<Box<Snapshot>>,
     pub busy: bool,
+    pub refreshing: bool,
+    pub status_error: Option<String>,
     pub error: Option<String>,
     pub notice: Option<String>,
     pub output: String,
@@ -227,6 +236,8 @@ impl Dashboard {
         Ok(Self {
             snapshot: None,
             busy: false,
+            refreshing: false,
+            status_error: None,
             error: None,
             notice: None,
             output: String::new(),
@@ -349,14 +360,11 @@ impl Dashboard {
                                         ui.label(mono(format!("{peers} peers"), 12.0).color(MUTED));
                                     });
                                 }
-                                if self.busy && self.joining.is_none() {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.label(RichText::new("Working...").color(MUTED));
-                                    });
-                                }
                                 if let Some(error) = &self.error {
                                     banner(ui, error, AMBER);
+                                }
+                                if self.status_error.is_some() && self.snapshot.is_some() {
+                                    self.status_panel(ui, &mut actions);
                                 }
                                 if let Some(snapshot) = &self.snapshot {
                                     for warning in &snapshot.warnings {
@@ -367,11 +375,15 @@ impl Dashboard {
                                     }
                                 }
                                 ui.add_space(14.0);
-                                match self.page {
-                                    Page::Networks => self.networks(ui, &mut actions),
-                                    Page::Devices => self.devices(ui, &mut actions),
-                                    Page::Files => self.files(ui, &mut actions),
-                                    Page::Settings => self.settings(ui, &mut actions),
+                                if self.snapshot.is_none() {
+                                    self.status_panel(ui, &mut actions);
+                                } else {
+                                    match self.page {
+                                        Page::Networks => self.networks(ui, &mut actions),
+                                        Page::Devices => self.devices(ui, &mut actions),
+                                        Page::Files => self.files(ui, &mut actions),
+                                        Page::Settings => self.settings(ui, &mut actions),
+                                    }
                                 }
                                 if let Some(notice) = &self.notice {
                                     ui.add_space(14.0);
@@ -407,16 +419,44 @@ impl Dashboard {
             }
             ui.label(wordmark);
             ui.add_space(4.0);
-            dot(ui, if active { GREEN } else { FAINT });
-            let state = if active {
-                "connected"
-            } else if self.snapshot.is_some() {
-                "standby"
+            let (state, state_color) = if self.status_error.is_some() {
+                (
+                    if self.refreshing {
+                        "retrying status"
+                    } else {
+                        "status unavailable"
+                    },
+                    AMBER,
+                )
+            } else if self.snapshot.is_none() {
+                ("loading status", MUTED)
+            } else if active {
+                ("connected", GREEN)
             } else {
-                "service unreachable"
+                ("standby", FAINT)
             };
-            ui.label(mono(state, 11.0).color(if active { GREEN } else { FAINT }));
+            if self.busy || (self.refreshing && self.snapshot.is_none()) {
+                ui.spinner().on_hover_text("Updating Rayfish");
+            } else {
+                dot(ui, state_color);
+            }
+            ui.label(mono(state, 11.0).color(state_color));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.status_error.is_some() || self.snapshot.is_none() {
+                    if button(
+                        ui,
+                        if self.refreshing {
+                            "Loading..."
+                        } else {
+                            "Retry"
+                        },
+                        Kind::Secondary,
+                        !self.busy && !self.refreshing,
+                    ) {
+                        actions.push(Action::Refresh);
+                    }
+                    return;
+                }
                 if button(
                     ui,
                     if active { "Disconnect" } else { "Connect" },
@@ -466,8 +506,61 @@ impl Dashboard {
         ui.add_space((y - ui.cursor().min.y).max(0.0));
     }
 
+    fn status_panel(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if let Some(error) = &self.status_error {
+                ui.horizontal(|ui| {
+                    ui.label(heading("Network status unavailable", 16.0).color(AMBER));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if button(
+                            ui,
+                            if self.refreshing {
+                                "Retrying..."
+                            } else {
+                                "Retry"
+                            },
+                            Kind::Secondary,
+                            !self.busy && !self.refreshing,
+                        ) {
+                            actions.push(Action::Refresh);
+                        }
+                        if button(ui, "Copy error", Kind::Secondary, true) {
+                            ui.ctx().copy_text(error.clone());
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new(if self.snapshot.is_some() {
+                        "Showing the last received status. Rayfish will retry automatically."
+                    } else {
+                        "Rayfish could not read your network list. It will retry automatically."
+                    })
+                    .color(MUTED),
+                );
+                ScrollArea::vertical()
+                    .id_salt("status-error")
+                    .max_height(80.0)
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(mono(error, 11.0)).wrap().selectable(true));
+                    });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.vertical(|ui| {
+                        ui.label(heading("Loading your networks", 16.0));
+                        ui.label(
+                            RichText::new("Reading the Rayfish service status...").color(MUTED),
+                        );
+                    });
+                });
+            }
+        });
+    }
+
     fn networks(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let mut dialog = None;
+        let unavailable = self.busy || self.status_error.is_some();
         if let Some(snapshot) = &self.snapshot {
             let pending: Vec<_> = snapshot
                 .pending
@@ -483,7 +576,7 @@ impl Dashboard {
                 ui,
                 "Needs attention",
                 &pending,
-                self.busy,
+                unavailable,
                 actions,
                 &mut dialog,
             );
@@ -491,10 +584,10 @@ impl Dashboard {
         ui.horizontal(|ui| {
             ui.label(heading("Networks", 17.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if button(ui, "Create a network", Kind::Primary, !self.busy) {
+                if button(ui, "Create a network", Kind::Primary, !unavailable) {
                     dialog = Some(form(FormKind::Create, None, ""));
                 }
-                if button(ui, "Join with a code", Kind::Secondary, !self.busy) {
+                if button(ui, "Join with a code", Kind::Secondary, !unavailable) {
                     dialog = Some(form(FormKind::Join, None, ""));
                 }
             });
@@ -526,7 +619,15 @@ impl Dashboard {
                 });
             });
         }
-        if networks.is_empty() && inactive.is_empty() && self.joining.is_none() {
+        if networks.is_empty()
+            && inactive.is_empty()
+            && self.joining.is_none()
+            && self.status_error.is_none()
+            && self
+                .snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.status.pending_networks.is_empty())
+        {
             empty(
                 ui,
                 "No networks yet.",
@@ -588,12 +689,14 @@ impl Dashboard {
                                 }
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if button(ui, "Leave", Kind::Danger, !self.busy) {
+                                if button(ui, "Leave", Kind::Danger, !unavailable) {
                                     dialog = Some(Dialog::Confirm {
                                         title: format!("Leave {}?", network.name),
                                         message: "This PC will lose access until it joins again."
                                             .into(),
-                                        args: words(&["leave", &network.name]),
+                                        request: Some(Box::new(IpcMessage::Leave {
+                                            name: network.name.clone(),
+                                        })),
                                     });
                                 }
                                 if restoring.is_some() {
@@ -601,7 +704,7 @@ impl Dashboard {
                                     ui.spinner();
                                     return;
                                 }
-                                if button(ui, "Rename", Kind::Secondary, !self.busy) {
+                                if button(ui, "Rename", Kind::Secondary, !unavailable) {
                                     dialog = Some(form(
                                         FormKind::Rename,
                                         Some(network.name.clone()),
@@ -609,11 +712,16 @@ impl Dashboard {
                                     ));
                                 }
                                 if network.role == NetworkRole::Coordinator
-                                    && button(ui, "Invite", Kind::Secondary, !self.busy)
+                                    && button(ui, "Invite", Kind::Secondary, !unavailable)
                                 {
                                     actions.push(Action::ShowResult {
                                         kind: OutputKind::Invite,
-                                        args: words(&["invite", &network.name]),
+                                        request: IpcMessage::InviteCreate {
+                                            network: network.name.clone(),
+                                            expires_secs: 7 * 24 * 60 * 60,
+                                            hostname: None,
+                                            reusable: false,
+                                        },
                                     });
                                 }
                             });
@@ -633,7 +741,12 @@ impl Dashboard {
                     });
                     for peer in &network.peers {
                         ui.add(egui::Separator::default().spacing(1.0));
-                        peer_entry(ui, peer, network, restoring.is_some());
+                        peer_entry(
+                            ui,
+                            peer,
+                            network,
+                            restoring.is_some() || self.status_error.is_some(),
+                        );
                     }
                     if network.peers.is_empty() {
                         rule(ui);
@@ -665,6 +778,20 @@ impl Dashboard {
                     .color(MUTED),
                 );
             });
+        }
+        if let Some(snapshot) = &self.snapshot {
+            for network in &snapshot.status.pending_networks {
+                card().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(heading(network, 16.0).color(MUTED));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(mono("Joining", 12.0).color(MUTED));
+                            ui.spinner();
+                        });
+                    });
+                    ui.label(RichText::new("Waiting for membership confirmation.").color(FAINT));
+                });
+            }
         }
         if let Some(dialog) = dialog {
             self.dialog = Some(dialog);
@@ -813,7 +940,7 @@ impl Dashboard {
                 if button(ui, "Transfer history", Kind::Secondary, !self.busy) {
                     actions.push(Action::ShowResult {
                         kind: OutputKind::Files,
-                        args: words(&["files"]),
+                        request: IpcMessage::ListFiles,
                     });
                 }
             });
@@ -861,13 +988,14 @@ impl Dashboard {
                         .snapshot
                         .as_ref()
                         .is_some_and(|snapshot| snapshot.status.active);
-                    ui.label(
-                        mono(if active { "connected" } else { "standby" }, 12.0).color(if active {
-                            GREEN
-                        } else {
-                            MUTED
-                        }),
-                    );
+                    let (state, color) = if self.status_error.is_some() {
+                        ("status unavailable", AMBER)
+                    } else if active {
+                        ("connected", GREEN)
+                    } else {
+                        ("standby", MUTED)
+                    };
+                    ui.label(mono(state, 12.0).color(color));
                 });
             });
             ui.label(
@@ -894,25 +1022,25 @@ impl Dashboard {
                         0,
                         "Magic DNS",
                         "Resolve device names ending in .ray.",
-                        "dns",
+                        GlobalKey::Dns,
                     ),
                     (
                         1,
                         "mDNS discovery",
                         "Discover peers on your local network.",
-                        "mdns",
+                        GlobalKey::Mdns,
                     ),
                     (
                         2,
                         "Automatic updates",
                         "Keep Rayfish up to date.",
-                        "auto-update",
+                        GlobalKey::AutoUpdate,
                     ),
                 ] {
                     if index != 0 {
                         rule(ui);
                     }
-                    let mut value = snapshot.enabled(key);
+                    let mut value = snapshot.enabled(key.name());
                     if setting(
                         ui,
                         title,
@@ -920,14 +1048,20 @@ impl Dashboard {
                         &mut value,
                         !self.busy && snapshot.config.is_ok(),
                     ) {
-                        actions.push(Action::Run(words(&[
-                            key,
-                            if value {
-                                if key == "dns" { "partial" } else { "on" }
+                        actions.push(Action::Run(IpcMessage::ConfigSet {
+                            key: NodeKey::Global(key),
+                            value: if value {
+                                if key == GlobalKey::Dns {
+                                    "partial"
+                                } else {
+                                    "on"
+                                }
                             } else {
                                 "off"
-                            },
-                        ])));
+                            }
+                            .into(),
+                            replace: false,
+                        }));
                     }
                 }
                 if let Err(error) = &snapshot.config {
@@ -956,16 +1090,20 @@ impl Dashboard {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if button(ui, "Change", Kind::Secondary, !self.busy) {
                                 let next = if firewall.default_inbound == FirewallAction::Deny {
-                                    "allow"
+                                    FirewallAction::Allow
                                 } else {
-                                    "deny"
+                                    FirewallAction::Deny
                                 };
                                 self.dialog = Some(Dialog::Confirm {
                                     title: "Change inbound default?".into(),
                                     message: format!(
                                         "Set the default inbound firewall policy to {next}."
                                     ),
-                                    args: words(&["firewall", "default", next]),
+                                    request: Some(Box::new(IpcMessage::ConfigSet {
+                                        key: NodeKey::Firewall(FirewallKey::DefaultIn),
+                                        value: next.to_string(),
+                                        replace: false,
+                                    })),
                                 });
                             }
                         });
@@ -1002,11 +1140,7 @@ impl Dashboard {
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if button(ui, "Remove", Kind::Danger, !self.busy) {
-                                    actions.push(Action::Run(words(&[
-                                        "firewall",
-                                        "remove",
-                                        &index.to_string(),
-                                    ])));
+                                    actions.push(Action::Run(IpcMessage::FirewallRemove { index }));
                                 }
                             });
                         });
@@ -1037,7 +1171,7 @@ impl Dashboard {
                 });
                 if run {
                     match console_args(&self.console) {
-                        Ok(args) => actions.push(Action::Run(args)),
+                        Ok(args) => actions.push(Action::Console(args)),
                         Err(error) => self.error = Some(error.to_string()),
                     }
                 }
@@ -1112,15 +1246,15 @@ impl Dashboard {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if button(ui, kind.submit_label(), Kind::Primary, !self.busy) {
                                 match kind.command(values, network.as_deref()) {
-                                    Ok(args) => {
+                                    Ok(request) => {
                                         if *kind == FormKind::Join {
                                             actions.push(Action::Join {
-                                                args,
+                                                request,
                                                 hostname: values[1].trim().to_owned(),
                                             });
                                         } else {
                                             self.submitted_form = true;
-                                            actions.push(Action::Run(args));
+                                            actions.push(Action::Run(request));
                                         }
                                     }
                                     Err(error) => self.error = Some(error.to_string()),
@@ -1132,14 +1266,16 @@ impl Dashboard {
                     Dialog::Confirm {
                         title,
                         message,
-                        args,
+                        request,
                     } => {
                         ui.label(heading(title.as_str(), 18.0));
                         ui.label(RichText::new(message.as_str()).color(MUTED));
                         ui.add_space(14.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(ui, "Confirm", Kind::Danger, !self.busy) {
-                                actions.push(Action::Run(args.clone()));
+                            if button(ui, "Confirm", Kind::Danger, !self.busy)
+                                && let Some(request) = request.take()
+                            {
+                                actions.push(Action::Run(*request));
                                 close = true;
                             }
                             close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
@@ -1330,10 +1466,10 @@ fn pending_section(
                     if button(ui, "Decline", Kind::Danger, !busy) { actions.push(Action::Run(item.command(false))); }
                     if button(ui, "Accept", Kind::Primary, !busy) {
                         if matches!(item.kind, PendingKind::Firewall { .. }) {
-                            *dialog = Some(Dialog::Confirm { title: "Accept firewall rules?".into(), message: "Suggested rules can open ports to peers. Review them before accepting.".into(), args: item.command(true) });
+                            *dialog = Some(Dialog::Confirm { title: "Accept firewall rules?".into(), message: "Suggested rules can open ports to peers. Review them before accepting.".into(), request: Some(Box::new(item.command(true))) });
                         } else { actions.push(Action::Run(item.command(true))); }
                     }
-                    if let Some(args) = item.review_command() && button(ui, "Review", Kind::Secondary, !busy) { actions.push(Action::ShowResult { kind: OutputKind::Firewall, args }); }
+                    if let Some(request) = item.review_command() && button(ui, "Review", Kind::Secondary, !busy) { actions.push(Action::ShowResult { kind: OutputKind::Firewall, request }); }
                 });
             });
         }
@@ -1384,6 +1520,119 @@ fn setting(ui: &mut Ui, title: &str, detail: &str, value: &mut bool, enabled: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_loading_never_claims_the_network_list_is_empty() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.refreshing = true;
+        for page in Page::ALL {
+            app.page = page;
+            render(&mut app, &ctx);
+            let labels = render(&mut app, &ctx);
+            assert!(
+                labels
+                    .iter()
+                    .any(|(text, _)| text == "Loading your networks")
+            );
+            assert!(
+                !labels
+                    .iter()
+                    .any(|(text, _)| text == "No networks yet." || text == "service unreachable")
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_status_exposes_its_error_and_retry_without_an_empty_state() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.status_error = Some("Example service connection failed.".into());
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "Network status unavailable")
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "Example service connection failed.")
+        );
+        assert!(!labels.iter().any(|(text, _)| text == "No networks yet."));
+        let pos = labels.iter().find(|(text, _)| text == "Retry").unwrap().1 + Vec2::new(4.0, 8.0);
+        let mut actions = Vec::new();
+        for pressed in [true, false] {
+            let _paint = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| actions.extend(app.draw(ctx)),
+            );
+        }
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Refresh))
+        );
+    }
+
+    #[test]
+    fn last_known_network_stays_visible_during_a_failed_refresh_and_recovers() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        app.status_error = Some("Example service connection failed.".into());
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "example"));
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text.starts_with("Showing the last received status."))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|(text, _)| text == "connected" || text == "No networks yet.")
+        );
+        app.page = Page::Settings;
+        let labels = render(&mut app, &ctx);
+        assert!(!labels.iter().any(|(text, _)| text == "connected"));
+        app.status_error = None;
+        app.page = Page::Networks;
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "connected"));
+        assert!(
+            !labels
+                .iter()
+                .any(|(text, _)| text == "Network status unavailable")
+        );
+    }
+
+    #[test]
+    fn pending_membership_is_shown_as_joining_instead_of_no_networks() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        let mut snapshot = crate::preview::fixture(false);
+        snapshot.status.pending_networks.push("example".into());
+        app.snapshot = Some(Box::new(snapshot));
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "example"));
+        assert!(labels.iter().any(|(text, _)| text == "Joining"));
+        assert!(!labels.iter().any(|(text, _)| text == "No networks yet."));
+    }
 
     #[test]
     fn disconnect_stays_clickable_while_a_join_is_running() {

@@ -8,17 +8,24 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::de::DeserializeOwned;
+use ray_proto::ipc::{IpcMessage, PendingRequestInfo};
 
-use crate::model::{Files, PendingItem, PendingKind, Request, Snapshot, Status, words};
+use crate::model::{
+    Firewall, PendingItem, PendingKind, Snapshot, Status, config_from_response, words,
+};
+
+mod rpc;
+
+use rpc::Client;
 
 const MAX_OUTPUT: u64 = 512 * 1024;
 const STARTUP_TASK: &str = "Rayfish Desktop App";
 
-#[derive(Debug)]
 pub(crate) enum Work {
+    Initialize,
     Refresh,
-    Run(Vec<String>),
+    Request(Box<IpcMessage>),
+    Console(Vec<String>),
     Startup(bool),
     Disconnect,
     Quit,
@@ -63,22 +70,17 @@ pub(crate) struct Worker {
 
 impl Worker {
     pub fn start(ray: PathBuf, app: PathBuf, notify: impl Fn() + Send + 'static) -> Result<Self> {
+        let client = Client::new()?;
         Self::start_with(
             move |id, work, cancelled| {
                 let quit = matches!(work, Work::Quit);
+                let start_service = matches!(&work, Work::Initialize);
                 let output = match work {
-                    Work::Refresh => None,
-                    Work::Run(args) => Some(run_ray(&ray, &args, cancelled)),
+                    Work::Initialize | Work::Refresh => None,
+                    Work::Request(request) => Some(client.run(*request, cancelled)),
+                    Work::Console(args) => Some(run_ray(&ray, &args, cancelled)),
                     Work::Startup(enabled) => Some(set_startup(&app, enabled, cancelled)),
-                    Work::Disconnect | Work::Quit => Some(
-                        process_with_timeout(
-                            &ray,
-                            &words(&["down"]),
-                            cancelled,
-                            Duration::from_secs(10),
-                        )
-                        .and_then(ProcessOutput::into_result),
-                    ),
+                    Work::Disconnect | Work::Quit => Some(client.run(IpcMessage::Down, cancelled)),
                 }
                 .map(|result| result.map_err(|error| format!("{error:#}")));
                 let snapshot = if quit {
@@ -86,7 +88,7 @@ impl Worker {
                     // including when disconnect failed and the UI needs its error.
                     Err("Could not disconnect Rayfish.".into())
                 } else {
-                    snapshot(&ray, cancelled)
+                    snapshot(&client, cancelled, start_service)
                         .map(Box::new)
                         .map_err(|error| format!("{error:#}"))
                 };
@@ -247,28 +249,50 @@ impl Drop for Worker {
     }
 }
 
-fn snapshot(ray: &Path, cancelled: &AtomicBool) -> Result<Snapshot> {
-    let status: Status = json(ray, &["status", "--json"], cancelled)?;
-    let config = json(ray, &["config", "--json"], cancelled).map_err(|error| format!("{error:#}"));
-    let firewall =
-        json(ray, &["firewall", "show", "--json"], cancelled).map_err(|error| format!("{error:#}"));
+fn snapshot(client: &Client, cancelled: &AtomicBool, start_service: bool) -> Result<Snapshot> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("The operation was cancelled.");
+    }
+    #[cfg(windows)]
+    if start_service {
+        crate::service::ensure_running()?;
+    }
+    #[cfg(not(windows))]
+    let _ = start_service;
+    let mut status = Status::from_response(client.read(IpcMessage::Status, cancelled)?)?;
+    let config = client
+        .read(IpcMessage::ConfigGet { key: None }, cancelled)
+        .and_then(config_from_response)
+        .map_err(|error| format!("{error:#}"));
+    let firewall = client
+        .read(IpcMessage::FirewallShow, cancelled)
+        .and_then(Firewall::from_response)
+        .map_err(|error| format!("{error:#}"));
     let mut pending = Vec::new();
     let mut warnings = Vec::new();
     for network in &status.networks {
         if network.pending_requests > 0 {
-            match json::<Vec<Request>>(ray, &["requests", &network.name, "--json"], cancelled) {
+            let requests = client
+                .read(
+                    IpcMessage::Requests {
+                        network: network.name.clone(),
+                    },
+                    cancelled,
+                )
+                .and_then(pending_requests);
+            match requests {
                 Ok(requests) => {
                     for request in requests {
                         pending.push(PendingItem {
                             description: format!(
                                 "{} asks to join {} (waiting {}s)",
-                                request.hostname.as_deref().unwrap_or(&request.id),
+                                request.hostname.as_deref().unwrap_or(&request.short_id),
                                 network.name,
                                 request.waiting_secs
                             ),
                             kind: PendingKind::Join {
                                 network: network.name.clone(),
-                                id: request.id,
+                                id: request.short_id,
                             },
                         });
                     }
@@ -289,16 +313,21 @@ fn snapshot(ray: &Path, cancelled: &AtomicBool) -> Result<Snapshot> {
         }
     }
     if status.pending.connects > 0 {
-        match json::<Vec<Request>>(ray, &["connect", "--json"], cancelled) {
+        match client
+            .read(IpcMessage::Connections, cancelled)
+            .and_then(pending_requests)
+        {
             Ok(requests) => {
                 for request in requests {
                     pending.push(PendingItem {
                         description: format!(
                             "{} wants a direct connection (waiting {}s)",
-                            request.hostname.as_deref().unwrap_or(&request.id),
+                            request.hostname.as_deref().unwrap_or(&request.short_id),
                             request.waiting_secs
                         ),
-                        kind: PendingKind::Connect { id: request.id },
+                        kind: PendingKind::Connect {
+                            id: request.short_id,
+                        },
                     });
                 }
             }
@@ -306,9 +335,9 @@ fn snapshot(ray: &Path, cancelled: &AtomicBool) -> Result<Snapshot> {
         }
     }
     if status.pending.files > 0 {
-        match json::<Files>(ray, &["files", "--json"], cancelled) {
-            Ok(files) => {
-                for file in files.pending {
+        match client.read(IpcMessage::ListFiles, cancelled) {
+            Ok(IpcMessage::FileList { files, .. }) => {
+                for file in files {
                     pending.push(PendingItem {
                         description: format!(
                             "{} sends {} ({} bytes)",
@@ -318,8 +347,20 @@ fn snapshot(ray: &Path, cancelled: &AtomicBool) -> Result<Snapshot> {
                     });
                 }
             }
+            Ok(_) => warnings.push(
+                "Could not read file offers: the service returned an unexpected response.".into(),
+            ),
             Err(error) => warnings.push(format!("Could not read file offers: {error:#}")),
         }
+    }
+    match client.read(IpcMessage::ManagedMachines { probe: false }, cancelled) {
+        Ok(IpcMessage::ManagedMachinesResponse { machines }) => {
+            status.managed_machines = Some(machines)
+        }
+        Ok(_) => warnings.push(
+            "Could not read managed machines: the service returned an unexpected response.".into(),
+        ),
+        Err(error) => warnings.push(format!("Could not read managed machines: {error:#}")),
     }
     let launch_at_login = match process_with_timeout(
         Path::new("schtasks.exe"),
@@ -343,10 +384,12 @@ fn snapshot(ray: &Path, cancelled: &AtomicBool) -> Result<Snapshot> {
     })
 }
 
-fn json<T: DeserializeOwned>(ray: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<T> {
-    let output = process_with_timeout(ray, &words(args), cancelled, Duration::from_secs(8))?
-        .into_result()?;
-    serde_json::from_str(&output).context("reading the ray command's JSON response")
+fn pending_requests(response: IpcMessage) -> Result<Vec<PendingRequestInfo>> {
+    match response {
+        IpcMessage::PendingRequests { requests } => Ok(requests),
+        IpcMessage::Error { message } => bail!("{message}"),
+        _ => bail!("The Rayfish service returned an unexpected pending request response."),
+    }
 }
 
 fn run_ray(ray: &Path, args: &[String], cancelled: &AtomicBool) -> Result<String> {
@@ -540,9 +583,13 @@ mod tests {
     #[test]
     fn worker_delivers_failures_and_shuts_down_without_a_daemon() {
         let (sender, receiver) = sync_channel(1);
-        let mut worker = Worker::start(
-            PathBuf::from("nonexistent-ray-command"),
-            PathBuf::new(),
+        let mut worker = Worker::start_with(
+            |id, _, _| Update {
+                id,
+                snapshot: Err("Example service unavailable.".into()),
+                output: None,
+                quit: false,
+            },
             move || {
                 sender.send(()).unwrap();
             },
@@ -565,7 +612,7 @@ mod tests {
             let (done, completed) = sync_channel(1);
             let mut worker = Worker::start_with(
                 move |id, work, cancelled| match work {
-                    Work::Run(_) => {
+                    Work::Request(_) => {
                         started.send(()).unwrap();
                         while !cancelled.load(Ordering::Acquire) {
                             thread::park();
@@ -591,7 +638,10 @@ mod tests {
             )
             .unwrap();
             worker
-                .submit(Work::Run(words(&["join", "example-invite"])))
+                .submit(Work::Request(Box::new(IpcMessage::Connect {
+                    peer: "example-peer".into(),
+                    hostname: None,
+                })))
                 .unwrap();
             waiting.recv_timeout(Duration::from_secs(5)).unwrap();
             let quitting = matches!(priority, Work::Quit);

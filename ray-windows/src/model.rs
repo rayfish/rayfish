@@ -1,25 +1,54 @@
+use anyhow::{Result, bail};
 use ray_proto::Action;
 use ray_proto::ipc::{
-    ConnectionErrorInfo, FirewallRuleView, InactiveNetwork, ManagedMachineInfo, NetworkStatus,
-    PendingFileInfo,
+    ConnectionErrorInfo, FirewallRuleView, InactiveNetwork, IpcMessage, ManagedMachineInfo,
+    NetworkStatus,
 };
-use serde::Deserialize;
 use serde_json::{Map, Value};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub(crate) struct Status {
     pub active: bool,
     pub identity: Option<String>,
     pub networks: Vec<NetworkStatus>,
-    #[serde(default)]
     pub inactive_networks: Vec<InactiveNetwork>,
-    #[serde(default)]
     pub connection_errors: Vec<ConnectionErrorInfo>,
+    pub pending_networks: Vec<String>,
     pub managed_machines: Option<Vec<ManagedMachineInfo>>,
     pub pending: PendingCounts,
 }
 
 impl Status {
+    pub fn from_response(response: IpcMessage) -> Result<Self> {
+        match response {
+            IpcMessage::StatusResponse {
+                active,
+                identity,
+                networks,
+                inactive_networks,
+                connection_errors,
+                pending_networks,
+                pending_files,
+                pending_connects,
+                ..
+            } => Ok(Self {
+                active,
+                identity: identity.map(|identity| identity.to_string()),
+                networks,
+                inactive_networks,
+                connection_errors,
+                pending_networks,
+                managed_machines: None,
+                pending: PendingCounts {
+                    connects: pending_connects,
+                    files: pending_files,
+                },
+            }),
+            IpcMessage::Error { message } => bail!(message),
+            _ => bail!("The daemon returned an unexpected status response."),
+        }
+    }
+
     pub fn visible_networks(&self) -> impl Iterator<Item = &NetworkStatus> {
         self.networks.iter().chain(
             self.inactive_networks
@@ -29,29 +58,47 @@ impl Status {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub(crate) struct PendingCounts {
     pub connects: usize,
     pub files: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub(crate) struct Firewall {
     pub default_inbound: Action,
     pub default_outbound: Action,
     pub rules: Vec<FirewallRuleView>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct Request {
-    pub id: String,
-    pub hostname: Option<String>,
-    pub waiting_secs: u64,
+impl Firewall {
+    pub fn from_response(response: IpcMessage) -> Result<Self> {
+        match response {
+            IpcMessage::FirewallState {
+                default_inbound,
+                default_outbound,
+                rules,
+                ..
+            } => Ok(Self {
+                default_inbound,
+                default_outbound,
+                rules,
+            }),
+            IpcMessage::Error { message } => bail!(message),
+            _ => bail!("The daemon returned an unexpected firewall response."),
+        }
+    }
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct Files {
-    pub pending: Vec<PendingFileInfo>,
+pub(crate) fn config_from_response(response: IpcMessage) -> Result<Map<String, Value>> {
+    match response {
+        IpcMessage::ConfigValues { rows } => Ok(rows
+            .into_iter()
+            .map(|(key, value)| (key, Value::String(value)))
+            .collect()),
+        IpcMessage::Error { message } => bail!(message),
+        _ => bail!("The daemon returned an unexpected settings response."),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,25 +116,37 @@ pub(crate) struct PendingItem {
 }
 
 impl PendingItem {
-    pub fn command(&self, accept: bool) -> Vec<String> {
-        let resolution = if accept { "accept" } else { "deny" };
-        match &self.kind {
-            PendingKind::Join { network, id } => words(&["requests", network, resolution, id]),
-            PendingKind::Connect { id } => {
-                words(&["connect", if accept { "approve" } else { "deny" }, id])
-            }
-            PendingKind::File { id } => words(&[
-                "files",
-                if accept { "accept" } else { "reject" },
-                &id.to_string(),
-            ]),
-            PendingKind::Firewall { network } => words(&["firewall", resolution, network]),
+    pub fn command(&self, accept: bool) -> IpcMessage {
+        match (&self.kind, accept) {
+            (PendingKind::Join { network, id }, true) => IpcMessage::AcceptRequest {
+                network: network.clone(),
+                id: id.clone(),
+            },
+            (PendingKind::Join { network, id }, false) => IpcMessage::DenyRequest {
+                network: network.clone(),
+                id: id.clone(),
+            },
+            (PendingKind::Connect { id }, true) => IpcMessage::ApproveConnection { id: id.clone() },
+            (PendingKind::Connect { id }, false) => IpcMessage::ConnectDeny { id: id.clone() },
+            (PendingKind::File { id }, true) => IpcMessage::AcceptFile {
+                id: *id,
+                output: None,
+            },
+            (PendingKind::File { id }, false) => IpcMessage::RejectFile { id: *id },
+            (PendingKind::Firewall { network }, true) => IpcMessage::FirewallAccept {
+                network: network.clone(),
+            },
+            (PendingKind::Firewall { network }, false) => IpcMessage::FirewallDeny {
+                network: network.clone(),
+            },
         }
     }
 
-    pub fn review_command(&self) -> Option<Vec<String>> {
+    pub fn review_command(&self) -> Option<IpcMessage> {
         match &self.kind {
-            PendingKind::Firewall { network } => Some(words(&["firewall", "pending", network])),
+            PendingKind::Firewall { network } => Some(IpcMessage::FirewallPending {
+                network: network.clone(),
+            }),
             _ => None,
         }
     }
@@ -124,10 +183,104 @@ pub(crate) fn words(args: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use ray_proto::{Direction, Protocol};
+
     use super::*;
 
+    fn status_response() -> IpcMessage {
+        let fixture = crate::preview::fixture(true).status;
+        let mut saved = fixture.networks[0].clone();
+        saved.name = "saved-example".into();
+        IpcMessage::StatusResponse {
+            endpoint_id: "5866666666666666666666666666666666666666666666666666666666666666"
+                .parse()
+                .unwrap(),
+            mdns_enabled: true,
+            auto_update: true,
+            active: true,
+            identity: None,
+            daemon_version: "0.0.0".into(),
+            networks: fixture.networks,
+            packets_rx: 0,
+            packets_tx: 0,
+            bytes_rx: 0,
+            bytes_tx: 0,
+            pending_files: 2,
+            pending_connects: 3,
+            connection_errors: Vec::new(),
+            pending_networks: vec!["pending-example".into()],
+            inactive_networks: vec![InactiveNetwork {
+                name: saved.name.clone(),
+                reason: Some("Example coordinator is reconnecting.".into()),
+                saved: Some(saved),
+            }],
+            lan_peers: Vec::new(),
+        }
+    }
+
     #[test]
-    fn request_buttons_use_the_matching_cli_command() {
+    fn direct_status_keeps_live_saved_and_pending_networks() {
+        let status = Status::from_response(status_response()).unwrap();
+        assert!(status.active);
+        assert_eq!(status.networks[0].name, "example");
+        assert_eq!(status.inactive_networks[0].name, "saved-example");
+        assert_eq!(status.visible_networks().count(), 2);
+        assert_eq!(status.pending_networks, ["pending-example"]);
+        assert_eq!(status.pending.files, 2);
+        assert_eq!(status.pending.connects, 3);
+        assert!(status.managed_machines.is_none());
+    }
+
+    #[test]
+    fn service_errors_remain_service_errors_instead_of_json_failures() {
+        let error = Status::from_response(IpcMessage::Error {
+            message: "Example service refused the request.".into(),
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Example service refused the request.");
+        assert!(
+            Status::from_response(IpcMessage::Ok {
+                message: "example".into()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn direct_firewall_and_settings_keep_typed_daemon_values() {
+        let rule = FirewallRuleView {
+            direction: Direction::In,
+            action: Action::Allow,
+            protocol: Protocol::Any,
+            port: "*".into(),
+            peer: "any".into(),
+            network: "example".into(),
+            suggested_by: None,
+        };
+        let firewall = Firewall::from_response(IpcMessage::FirewallState {
+            default_inbound: Action::Deny,
+            default_outbound: Action::Allow,
+            reject: false,
+            disabled: false,
+            rules: vec![rule.clone()],
+        })
+        .unwrap();
+        assert_eq!(firewall.default_inbound, Action::Deny);
+        assert_eq!(firewall.default_outbound, Action::Allow);
+        assert_eq!(firewall.rules, [rule]);
+        let config = config_from_response(IpcMessage::ConfigValues {
+            rows: vec![
+                ("dns".into(), "partial".into()),
+                ("mdns".into(), "on".into()),
+            ],
+        })
+        .unwrap();
+        assert_eq!(config["dns"], "partial");
+        assert_eq!(config["mdns"], "on");
+    }
+
+    #[test]
+    fn request_buttons_send_the_matching_daemon_request() {
         let join = PendingItem {
             kind: PendingKind::Join {
                 network: "example".into(),
@@ -135,13 +288,11 @@ mod tests {
             },
             description: String::new(),
         };
-        assert_eq!(
-            join.command(true),
-            ["requests", "example", "accept", "request-id"]
+        assert!(
+            matches!(join.command(true), IpcMessage::AcceptRequest { network, id } if network == "example" && id == "request-id")
         );
-        assert_eq!(
-            join.command(false),
-            ["requests", "example", "deny", "request-id"]
+        assert!(
+            matches!(join.command(false), IpcMessage::DenyRequest { network, id } if network == "example" && id == "request-id")
         );
         let connection = PendingItem {
             kind: PendingKind::Connect {
@@ -149,14 +300,38 @@ mod tests {
             },
             description: String::new(),
         };
-        assert_eq!(
-            connection.command(true),
-            ["connect", "approve", "request-id"]
+        assert!(
+            matches!(connection.command(true), IpcMessage::ApproveConnection { id } if id == "request-id")
+        );
+        assert!(
+            matches!(connection.command(false), IpcMessage::ConnectDeny { id } if id == "request-id")
         );
         let file = PendingItem {
             kind: PendingKind::File { id: 3 },
             description: String::new(),
         };
-        assert_eq!(file.command(false), ["files", "reject", "3"]);
+        assert!(matches!(
+            file.command(true),
+            IpcMessage::AcceptFile { id: 3, .. }
+        ));
+        assert!(matches!(
+            file.command(false),
+            IpcMessage::RejectFile { id: 3 }
+        ));
+        let firewall = PendingItem {
+            kind: PendingKind::Firewall {
+                network: "example".into(),
+            },
+            description: String::new(),
+        };
+        assert!(
+            matches!(firewall.command(true), IpcMessage::FirewallAccept { network } if network == "example")
+        );
+        assert!(
+            matches!(firewall.command(false), IpcMessage::FirewallDeny { network } if network == "example")
+        );
+        assert!(
+            matches!(firewall.review_command(), Some(IpcMessage::FirewallPending { network }) if network == "example")
+        );
     }
 }

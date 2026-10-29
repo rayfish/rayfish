@@ -11,6 +11,8 @@ mod model;
 #[cfg(any(not(windows), test))]
 #[cfg_attr(windows, allow(dead_code))]
 mod preview;
+#[cfg(windows)]
+mod service;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ui;
 mod window;
@@ -34,7 +36,13 @@ fn main() {
             PathBuf::from(path),
             args.iter().any(|arg| arg == "--populated"),
             page,
-            if args.iter().any(|arg| arg == "--joining") {
+            if args.iter().any(|arg| arg == "--loading") {
+                preview::PreviewState::Loading
+            } else if args.iter().any(|arg| arg == "--unavailable") {
+                preview::PreviewState::Unavailable
+            } else if args.iter().any(|arg| arg == "--stale") {
+                preview::PreviewState::Stale
+            } else if args.iter().any(|arg| arg == "--joining") {
                 preview::PreviewState::Joining
             } else if args.iter().any(|arg| arg == "--reconnecting") {
                 preview::PreviewState::Reconnecting

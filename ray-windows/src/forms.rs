@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 
-use crate::model::words;
+use ray_proto::invite::decode_invite_code;
+use ray_proto::ipc::IpcMessage;
+use ray_proto::{Action, Direction, GroupMode, Protocol};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FormKind {
@@ -87,7 +89,7 @@ impl FormKind {
         }
     }
 
-    pub fn command(self, values: &[String], network: Option<&str>) -> Result<Vec<String>> {
+    pub fn command(self, values: &[String], network: Option<&str>) -> Result<IpcMessage> {
         let fields = self.fields();
         if values.len() != fields.len() {
             bail!("The form is incomplete.");
@@ -100,31 +102,58 @@ impl FormKind {
                 bail!("Select {}.", field.label.to_lowercase());
             }
         }
-        let mut args = match self {
-            Self::Create => words(&["create"]),
-            Self::Join => words(&["join", values[0].trim()]),
-            Self::Connect => words(&["connect", values[0].trim()]),
-            Self::Rename => words(&[
-                "hostname",
-                network.ok_or_else(|| anyhow::anyhow!("Select a network."))?,
-                values[0].trim(),
-            ]),
-            Self::Firewall => words(&[
-                "firewall", "add", &values[0], &values[1], "--proto", &values[2],
-            ]),
+        let value = |index: usize| {
+            let text = values[index].trim();
+            (!text.is_empty()).then(|| text.to_owned())
         };
-        let options: &[(usize, &str)] = match self {
-            Self::Create => &[(0, "--name"), (1, "--hostname")],
-            Self::Join | Self::Connect => &[(1, "--hostname")],
-            Self::Rename => &[],
-            Self::Firewall => &[(3, "--port"), (4, "--peer"), (5, "--network")],
-        };
-        for (index, flag) in options {
-            if !values[*index].trim().is_empty() {
-                args.extend(words(&[flag, values[*index].trim()]));
+        Ok(match self {
+            Self::Create => IpcMessage::Create {
+                mode: GroupMode::default(),
+                name: value(0),
+                hostname: value(1),
+                transport: None,
+            },
+            Self::Join => {
+                let code = values[0].trim();
+                // Bare network keys are shorter than encoded invites. Preserve
+                // them, but report damaged invite credentials before sending.
+                let decoded = match decode_invite_code(code) {
+                    Ok(invite) => Some(invite),
+                    Err(_) if code.len() <= 64 => None,
+                    Err(error) => return Err(error),
+                };
+                IpcMessage::Join {
+                    network_key: decoded
+                        .as_ref()
+                        .map_or_else(|| code.to_owned(), |invite| invite.network_key.to_string()),
+                    name: None,
+                    hostname: value(1),
+                    transport: None,
+                    coordinator: decoded.as_ref().map(|invite| invite.coordinator),
+                    invite: decoded.map(|invite| invite.secret),
+                    auto_accept_firewall: false,
+                    auto_accept_files: true,
+                }
             }
-        }
-        Ok(args)
+            Self::Connect => IpcMessage::Connect {
+                peer: values[0].trim().to_owned(),
+                hostname: value(1),
+            },
+            Self::Rename => IpcMessage::SetHostname {
+                network: network
+                    .ok_or_else(|| anyhow::anyhow!("Select a network."))?
+                    .to_owned(),
+                hostname: values[0].trim().to_owned(),
+            },
+            Self::Firewall => IpcMessage::FirewallAdd {
+                direction: values[0].parse::<Direction>().map_err(anyhow::Error::msg)?,
+                action: values[1].parse::<Action>().map_err(anyhow::Error::msg)?,
+                protocol: values[2].parse::<Protocol>().map_err(anyhow::Error::msg)?,
+                port: value(3),
+                peer: value(4),
+                network: value(5),
+            },
+        })
     }
 }
 
@@ -182,30 +211,64 @@ mod tests {
     }
 
     #[test]
-    fn forms_validate_required_fields_and_pass_arguments_without_a_shell() {
-        assert!(FormKind::Join.command(&words(&["", ""]), None).is_err());
-        assert_eq!(
-            FormKind::Create
-                .command(&words(&["example", "pc"]), None)
-                .unwrap(),
-            ["create", "--name", "example", "--hostname", "pc"]
-        );
-        assert_eq!(
+    fn join_preserves_the_invite_credentials_and_paired_device_file_policy() {
+        use crate::model::words;
+
+        let key = "5866666666666666666666666666666666666666666666666666666666666666"
+            .parse()
+            .unwrap();
+        let code = ray_proto::invite::encode_invite_code(&key, &key, &[1; 16]);
+        let request = FormKind::Join
+            .command(&words(&[&code, "workstation"]), None)
+            .unwrap();
+        match request {
+            IpcMessage::Join {
+                network_key,
+                coordinator,
+                invite,
+                hostname,
+                auto_accept_files,
+                ..
+            } => {
+                assert_eq!(network_key, key.to_string());
+                assert_eq!(coordinator, Some(key));
+                assert_eq!(invite, Some(vec![1; 16]));
+                assert_eq!(hostname.as_deref(), Some("workstation"));
+                assert!(auto_accept_files);
+            }
+            _ => panic!("join should produce the typed Join request"),
+        }
+        assert!(
             FormKind::Join
-                .command(&words(&["invite-code", ""]), None)
-                .unwrap(),
-            ["join", "invite-code"]
+                .command(&words(&[&code[..code.len() - 4], ""]), None)
+                .is_err()
         );
-        assert_eq!(
-            FormKind::Rename
-                .command(&words(&["new-name"]), Some("example"))
-                .unwrap(),
-            ["hostname", "example", "new-name"]
-        );
+    }
+
+    #[test]
+    fn forms_build_typed_daemon_requests() {
+        use crate::model::words;
+        assert!(FormKind::Join.command(&words(&["", ""]), None).is_err());
+        assert!(matches!(
+            FormKind::Create.command(&words(&["example", "pc"]), None).unwrap(),
+            IpcMessage::Create { name: Some(name), hostname: Some(hostname), .. } if name == "example" && hostname == "pc"
+        ));
+        assert!(matches!(
+            FormKind::Join.command(&words(&["network-key", ""]), None).unwrap(),
+            IpcMessage::Join { network_key, hostname: None, invite: None, .. } if network_key == "network-key"
+        ));
+        assert!(matches!(
+            FormKind::Rename.command(&words(&["new-name"]), Some("example")).unwrap(),
+            IpcMessage::SetHostname { network, hostname } if network == "example" && hostname == "new-name"
+        ));
         assert!(
             FormKind::Firewall
                 .command(&words(&["in", "oops", "tcp", "", "", ""]), None)
                 .is_err()
+        );
+        assert!(
+            matches!(FormKind::Firewall.command(&words(&["in", "allow", "tcp", "443", "", "example"]), None).unwrap(),
+            IpcMessage::FirewallAdd { direction: Direction::In, action: Action::Allow, protocol: Protocol::Tcp, network: Some(network), .. } if network == "example")
         );
     }
 }

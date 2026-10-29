@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use eframe::egui::{Context as UiContext, ViewportCommand};
+use ray_proto::ipc::IpcMessage;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
@@ -17,7 +18,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::backend::{Update, Work, WorkId, Worker};
-use crate::model::words;
 use crate::ui::{Action, Dashboard, OutputKind};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -81,9 +81,6 @@ pub(crate) fn run() -> Result<()> {
     };
     let executable = std::env::current_exe().context("finding the desktop executable")?;
     let ray = executable.with_file_name("ray.exe");
-    if !ray.is_file() {
-        anyhow::bail!("The bundled ray.exe was not found. Reinstall Rayfish.");
-    }
     let options = crate::window::options()?;
     eframe::run_native(
         "Rayfish",
@@ -154,7 +151,7 @@ pub(crate) fn run() -> Result<()> {
                 result_kind: None,
                 quitting: false,
             };
-            app.submit(Work::Refresh)?;
+            app.submit(Work::Initialize)?;
             Ok(Box::new(app))
         }),
     )
@@ -166,13 +163,14 @@ impl WindowsApp {
         if self.dashboard.busy {
             anyhow::bail!("Wait for the current operation to finish.");
         }
-        let refreshing = matches!(work, Work::Refresh);
+        let refreshing = matches!(work, Work::Refresh | Work::Initialize);
         self.active_work = Some(if self.active_work.is_some() {
             self.worker.interrupt(work)?
         } else {
             self.worker.submit(work)?
         });
         self.dashboard.busy = !refreshing;
+        self.dashboard.refreshing = refreshing;
         if !refreshing {
             self.dashboard.error = None;
             self.dashboard.notice = None;
@@ -185,8 +183,10 @@ impl WindowsApp {
             if snapshot.status.active {
                 self.interrupt(Work::Disconnect)?;
             } else {
-                self.submit(Work::Run(words(&["up"])))?;
+                self.submit(Work::Request(Box::new(IpcMessage::Up { hostname: None })))?;
             }
+        } else {
+            self.submit(Work::Request(Box::new(IpcMessage::Up { hostname: None })))?;
         }
         Ok(())
     }
@@ -195,6 +195,7 @@ impl WindowsApp {
         self.active_work = Some(self.worker.interrupt(work)?);
         self.dashboard.operation_interrupted();
         self.dashboard.busy = true;
+        self.dashboard.refreshing = false;
         self.result_kind = None;
         Ok(())
     }
@@ -205,6 +206,7 @@ impl WindowsApp {
         }
         self.active_work = None;
         self.dashboard.busy = false;
+        self.dashboard.refreshing = false;
         self.next_refresh = Instant::now() + REFRESH_INTERVAL;
         if update.quit {
             self.quitting = true;
@@ -212,10 +214,12 @@ impl WindowsApp {
             return;
         }
         match update.snapshot {
-            Ok(snapshot) => self.dashboard.snapshot = Some(snapshot),
+            Ok(snapshot) => {
+                self.dashboard.snapshot = Some(snapshot);
+                self.dashboard.status_error = None;
+            }
             Err(error) => {
-                self.dashboard.snapshot = None;
-                self.dashboard.error = Some(error);
+                self.dashboard.status_error = Some(error);
             }
         }
         if let Some(output) = update.output {
@@ -257,16 +261,21 @@ impl eframe::App for WindowsApp {
         }
         for action in self.dashboard.draw(ctx) {
             let result = match action {
-                Action::Refresh => self.submit(Work::Refresh),
+                Action::Refresh => self.submit(Work::Initialize),
                 Action::Toggle => self.toggle(),
-                Action::Run(args) => self.submit(Work::Run(args)),
-                Action::Join { args, hostname } => self.submit(Work::Run(args)).map(|()| {
-                    self.dashboard.begin_join(hostname);
-                    ctx.request_repaint();
-                }),
-                Action::ShowResult { kind, args } => self
-                    .submit(Work::Run(args))
+                Action::Run(request) => self.submit(Work::Request(Box::new(request))),
+                Action::Join { request, hostname } => {
+                    self.submit(Work::Request(Box::new(request))).map(|()| {
+                        self.dashboard.begin_join(hostname);
+                        ctx.request_repaint();
+                    })
+                }
+                Action::ShowResult { kind, request } => self
+                    .submit(Work::Request(Box::new(request)))
                     .map(|()| self.result_kind = Some(kind)),
+                Action::Console(args) => self
+                    .submit(Work::Console(args))
+                    .map(|()| self.result_kind = Some(OutputKind::Command)),
                 Action::Startup(enabled) => self.submit(Work::Startup(enabled)),
             };
             if let Err(error) = result {
@@ -279,20 +288,27 @@ impl eframe::App for WindowsApp {
                 self.dashboard.error = Some(format!("{error:#}"));
             }
         }
-        let state = self
-            .dashboard
-            .snapshot
-            .as_ref()
-            .map_or("Service unreachable", |snapshot| {
-                if snapshot.status.active {
-                    "Connected"
-                } else {
-                    "Standby"
-                }
-            });
+        let state = if self.dashboard.status_error.is_some() {
+            "Service unavailable"
+        } else if self.dashboard.snapshot.is_none() {
+            "Connecting to service..."
+        } else {
+            self.dashboard
+                .snapshot
+                .as_ref()
+                .map_or("Service unreachable", |snapshot| {
+                    if snapshot.status.active {
+                        "Connected"
+                    } else {
+                        "Standby"
+                    }
+                })
+        };
         self.state_item.set_text(format!("Rayfish: {state}"));
-        self.connection_item.set_text(
-            if self
+        self.connection_item
+            .set_text(if self.dashboard.snapshot.is_none() {
+                "Connect"
+            } else if self
                 .dashboard
                 .snapshot
                 .as_ref()
@@ -301,13 +317,14 @@ impl eframe::App for WindowsApp {
                 "Disconnect"
             } else {
                 "Connect"
-            },
-        );
+            });
         self.connection_item.set_enabled(
-            self.dashboard
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.status.active || !self.dashboard.busy),
+            !self.dashboard.busy
+                || self
+                    .dashboard
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.status.active),
         );
         ctx.request_repaint_after(REFRESH_INTERVAL);
     }

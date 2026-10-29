@@ -17,6 +17,9 @@ pub(crate) enum PreviewState {
     Normal,
     Joining,
     Reconnecting,
+    Loading,
+    Unavailable,
+    Stale,
 }
 
 pub(crate) fn run(path: PathBuf, populated: bool, page: Page, state: PreviewState) -> Result<()> {
@@ -26,7 +29,9 @@ pub(crate) fn run(path: PathBuf, populated: bool, page: Page, state: PreviewStat
         crate::window::options()?,
         Box::new(move |cc| {
             let mut dashboard = Dashboard::new(&cc.egui_ctx)?;
-            let mut snapshot = fixture(populated || matches!(state, PreviewState::Reconnecting));
+            let mut snapshot = fixture(
+                populated || matches!(state, PreviewState::Reconnecting | PreviewState::Stale),
+            );
             if matches!(state, PreviewState::Reconnecting) {
                 let mut network = snapshot.status.networks.remove(0);
                 for peer in &mut network.peers {
@@ -38,8 +43,18 @@ pub(crate) fn run(path: PathBuf, populated: bool, page: Page, state: PreviewStat
                     saved: Some(network),
                 });
             }
-            dashboard.snapshot = Some(Box::new(snapshot));
+            dashboard.snapshot =
+                if matches!(state, PreviewState::Loading | PreviewState::Unavailable) {
+                    None
+                } else {
+                    Some(Box::new(snapshot))
+                };
             dashboard.page = page;
+            dashboard.refreshing = matches!(state, PreviewState::Loading);
+            if matches!(state, PreviewState::Unavailable | PreviewState::Stale) {
+                dashboard.status_error =
+                    Some("Could not read the service status: example connection failure.".into());
+            }
             if matches!(state, PreviewState::Joining) {
                 dashboard.begin_join("workstation".into());
                 dashboard.busy = true;
@@ -142,6 +157,7 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
             identity: None,
             networks,
             inactive_networks: Vec::new(),
+            pending_networks: Vec::new(),
             connection_errors: Vec::new(),
             managed_machines: None,
             pending: PendingCounts::default(),

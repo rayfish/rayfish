@@ -32,6 +32,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: the app talks directly to the service over typed IPC, starts a stopped
+  service, and shows connection errors without replacing saved networks with an
+  empty list.
 - Windows: joining closes the dialog immediately and shows a joining network
   card. Peer rows are compact, and saved networks stay visible while reconnecting.
 - Windows: desktop and Start menu shortcuts launch the app directly without

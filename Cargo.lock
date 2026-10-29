@@ -6375,6 +6375,8 @@ name = "ray-proto"
 version = "0.1.21"
 dependencies = [
  "anyhow",
+ "blake3",
+ "bs58",
  "bytes",
  "derive_more 2.1.1",
  "futures",
@@ -6396,12 +6398,14 @@ name = "ray-windows"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "eframe",
  "image",
  "ray-proto",
- "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-util",
  "tray-icon",
  "wgpu",
  "windows-sys 0.61.2",

@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 // one early), acceptable for a TTL credential.
 use crate::membership::now_secs;
 
-/// Length of the random invite secret, in bytes (128 bits).
-pub const SECRET_LEN: usize = 16;
+use ray_proto::invite::MAX_CODE_LEN;
+pub use ray_proto::invite::{DecodedInvite, SECRET_LEN, decode_invite_code, encode_invite_code};
 
 /// Lifecycle state of a single invite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,49 +177,6 @@ pub(crate) fn ledger_path_in(dir: &Path, network: &str) -> PathBuf {
     dir.join("invites").join(format!("{network}.toml"))
 }
 
-/// Payload of an invite code, before the checksum: two keys and the secret.
-const PAYLOAD_LEN: usize = 32 + 32 + SECRET_LEN;
-/// Bytes of blake3 appended as an integrity check (see [`encode_invite_code`]).
-const CHECKSUM_LEN: usize = 4;
-
-/// The checksum appended to an invite code: the leading bytes of the payload's
-/// blake3 hash. Not a security control (the payload is public and anyone can
-/// recompute it), purely error detection so a truncated or mistyped code fails
-/// as "invalid invite code" instead of decoding into a plausible-looking
-/// invite for a network that doesn't exist.
-fn invite_checksum(payload: &[u8]) -> [u8; CHECKSUM_LEN] {
-    let hash = blake3::hash(payload);
-    let mut out = [0u8; CHECKSUM_LEN];
-    out.copy_from_slice(&hash.as_bytes()[..CHECKSUM_LEN]);
-    out
-}
-
-/// Encode an invite code:
-/// `bs58(network_pubkey(32) || coordinator(32) || secret(16) || checksum(4))`.
-///
-/// base58 carries no error detection of its own, so the trailing checksum is
-/// what makes a mangled code fail cleanly: without it, dropping a character
-/// divides the encoded number by 58 and can still land on a payload of the
-/// right length, which then decodes into a well-formed invite pointing
-/// nowhere.
-pub fn encode_invite_code(
-    network_pubkey: &EndpointId,
-    coordinator: &EndpointId,
-    secret: &[u8],
-) -> String {
-    let mut bytes = Vec::with_capacity(PAYLOAD_LEN + CHECKSUM_LEN);
-    bytes.extend_from_slice(network_pubkey.as_bytes());
-    bytes.extend_from_slice(coordinator.as_bytes());
-    bytes.extend_from_slice(secret);
-    bytes.extend_from_slice(&invite_checksum(&bytes));
-    bs58::encode(&bytes).into_string()
-}
-
-/// Longest code accepted from a peer or a file. A checksummed code is about
-/// 115 base58 characters; base58 decoding grows with the square of the
-/// length, so anything longer is refused before it is decoded.
-const MAX_CODE_LEN: usize = 120;
-
 /// An encoded invite code. A credential: `Debug` never prints it.
 /// Deserializing bounds its length and refuses whitespace, since it also
 /// arrives from peers.
@@ -234,23 +191,6 @@ impl<'de> Deserialize<'de> for InviteCode {
             return Err(serde::de::Error::custom("malformed invite code"));
         }
         Ok(Self(code))
-    }
-}
-
-/// [`decode_invite_code`]'s result, with names instead of positions.
-pub struct DecodedInvite {
-    pub network_key: EndpointId,
-    pub coordinator: EndpointId,
-    pub secret: Vec<u8>,
-}
-
-impl Debug for DecodedInvite {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DecodedInvite")
-            .field("network_key", &self.network_key)
-            .field("coordinator", &self.coordinator)
-            .field("secret", &"[redacted]")
-            .finish()
     }
 }
 
@@ -272,50 +212,6 @@ impl Debug for InviteCode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("InviteCode([redacted])")
     }
-}
-
-/// Decode an invite code into `(network_pubkey, coordinator, secret)`.
-///
-/// Accepts both the checksummed form and the older unchecksummed one, so codes
-/// minted before the checksum existed (and codes minted by a peer still on an
-/// older build) keep working. A code carrying a checksum must have a correct
-/// one.
-pub fn decode_invite_code(code: &str) -> Result<DecodedInvite> {
-    let code = code.trim();
-    // Base58 decoding grows with the square of the length, and codes also
-    // arrive from peers, so the length is checked before anything decodes.
-    anyhow::ensure!(code.len() <= MAX_CODE_LEN, "invalid invite code: too long");
-    let bytes = bs58::decode(code)
-        .into_vec()
-        .map_err(|e| anyhow::anyhow!("invalid invite code: {e}"))?;
-
-    let payload = match bytes.len() {
-        PAYLOAD_LEN => &bytes[..],
-        len if len == PAYLOAD_LEN + CHECKSUM_LEN => {
-            let (payload, checksum) = bytes.split_at(PAYLOAD_LEN);
-            if checksum != invite_checksum(payload) {
-                bail!("invalid invite code: checksum mismatch (was it copied in full?)");
-            }
-            payload
-        }
-        len => bail!(
-            "invalid invite code: expected {} bytes, got {len}",
-            PAYLOAD_LEN + CHECKSUM_LEN,
-        ),
-    };
-
-    let net: [u8; 32] = payload[0..32].try_into().unwrap();
-    let coord: [u8; 32] = payload[32..64].try_into().unwrap();
-    let secret = payload[64..].to_vec();
-    let network_pubkey = EndpointId::from_bytes(&net)
-        .map_err(|e| anyhow::anyhow!("invalid network key in invite: {e}"))?;
-    let coordinator = EndpointId::from_bytes(&coord)
-        .map_err(|e| anyhow::anyhow!("invalid coordinator key in invite: {e}"))?;
-    Ok(DecodedInvite {
-        network_key: network_pubkey,
-        coordinator,
-        secret,
-    })
 }
 
 impl InviteStore {
