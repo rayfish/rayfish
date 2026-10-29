@@ -34,6 +34,13 @@ fn main() {
             PathBuf::from(path),
             args.iter().any(|arg| arg == "--populated"),
             page,
+            if args.iter().any(|arg| arg == "--joining") {
+                preview::PreviewState::Joining
+            } else if args.iter().any(|arg| arg == "--reconnecting") {
+                preview::PreviewState::Reconnecting
+            } else {
+                preview::PreviewState::Normal
+            },
         ) {
             eprintln!("{error:#}");
             std::process::exit(1);

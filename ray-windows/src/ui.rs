@@ -64,6 +64,7 @@ pub(crate) enum Action {
     Refresh,
     Toggle,
     Run(Vec<String>),
+    Join { args: Vec<String>, hostname: String },
     ShowResult { kind: OutputKind, args: Vec<String> },
     Startup(bool),
 }
@@ -125,6 +126,7 @@ pub(crate) struct Dashboard {
     output_kind: OutputKind,
     pub page: Page,
     pub submitted_form: bool,
+    joining: Option<String>,
     dialog: Option<Dialog>,
     console: String,
     logo: TextureHandle,
@@ -231,6 +233,7 @@ impl Dashboard {
             output_kind: OutputKind::Command,
             page: Page::Networks,
             submitted_form: false,
+            joining: None,
             dialog: None,
             console: String::new(),
             logo,
@@ -247,6 +250,48 @@ impl Dashboard {
             self.dialog = None;
         }
         self.submitted_form = false;
+    }
+
+    pub fn begin_join(&mut self, hostname: String) {
+        self.dialog = None;
+        self.submitted_form = false;
+        self.joining = Some(hostname);
+        self.page = Page::Networks;
+    }
+
+    pub fn operation_interrupted(&mut self) {
+        self.dialog = None;
+        self.joining = None;
+        self.submitted_form = false;
+        self.error = None;
+        self.notice = None;
+    }
+
+    pub fn command_finished(&mut self, output: Result<String, String>, kind: Option<OutputKind>) {
+        self.joining = None;
+        match output {
+            Ok(text) => {
+                let text = match kind {
+                    Some(kind) => kind.prepare(text),
+                    None => text,
+                };
+                self.output = if text.is_empty() {
+                    "Done.".into()
+                } else {
+                    text
+                };
+                self.form_succeeded();
+                self.notice = Some("Done.".into());
+            }
+            Err(error) => {
+                self.output = error.clone();
+                self.error = Some(error);
+                self.submitted_form = false;
+            }
+        }
+        if let Some(kind) = kind {
+            self.show_output(kind);
+        }
     }
 
     pub fn draw(&mut self, ctx: &Context) -> Vec<Action> {
@@ -267,7 +312,9 @@ impl Dashboard {
                                 ui.add_space(18.0);
                                 if let Some(snapshot) = &self.snapshot {
                                     ui.horizontal(|ui| {
-                                        if let Some(network) = snapshot.status.networks.first() {
+                                        if let Some(network) =
+                                            snapshot.status.visible_networks().next()
+                                        {
                                             let ip = network.my_ipv6.to_string();
                                             if ui
                                                 .add(
@@ -283,15 +330,16 @@ impl Dashboard {
                                         }
                                         let peers: usize = snapshot
                                             .status
-                                            .networks
-                                            .iter()
+                                            .visible_networks()
                                             .map(|network| network.peers.len())
                                             .sum();
+                                        let count = snapshot.status.networks.len()
+                                            + snapshot.status.inactive_networks.len();
                                         ui.label(
                                             mono(
                                                 format!(
-                                                    "{} networks",
-                                                    snapshot.status.networks.len()
+                                                    "{count} {}",
+                                                    if count == 1 { "network" } else { "networks" }
                                                 ),
                                                 12.0,
                                             )
@@ -301,7 +349,7 @@ impl Dashboard {
                                         ui.label(mono(format!("{peers} peers"), 12.0).color(MUTED));
                                     });
                                 }
-                                if self.busy {
+                                if self.busy && self.joining.is_none() {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
                                         ui.label(RichText::new("Working...").color(MUTED));
@@ -313,20 +361,6 @@ impl Dashboard {
                                 if let Some(snapshot) = &self.snapshot {
                                     for warning in &snapshot.warnings {
                                         banner(ui, warning, AMBER);
-                                    }
-                                    for network in &snapshot.status.inactive_networks {
-                                        banner(
-                                            ui,
-                                            &format!(
-                                                "{}: {}",
-                                                network.name,
-                                                network
-                                                    .reason
-                                                    .as_deref()
-                                                    .unwrap_or("Restoring network...")
-                                            ),
-                                            AMBER,
-                                        );
                                     }
                                     for error in &snapshot.status.connection_errors {
                                         banner(ui, &error.message, AMBER);
@@ -391,7 +425,7 @@ impl Dashboard {
                     } else {
                         Kind::Primary
                     },
-                    !self.busy && self.snapshot.is_some(),
+                    self.snapshot.is_some() && (active || !self.busy),
                 ) {
                     actions.push(Action::Toggle);
                 }
@@ -471,21 +505,54 @@ impl Dashboard {
             .as_ref()
             .map(|snapshot| snapshot.status.networks.as_slice())
             .unwrap_or_default();
-        if networks.is_empty() {
+        let inactive = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.status.inactive_networks.as_slice())
+            .unwrap_or_default();
+        if let Some(hostname) = &self.joining {
+            card().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.vertical(|ui| {
+                        ui.label(heading("New network", 16.0).color(MUTED));
+                        if !hostname.is_empty() {
+                            ui.label(mono(hostname, 11.0).color(FAINT));
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(mono("Joining", 12.0).color(MUTED));
+                    });
+                });
+            });
+        }
+        if networks.is_empty() && inactive.is_empty() && self.joining.is_none() {
             empty(
                 ui,
                 "No networks yet.",
                 "Create a private network or join one with an invite code.",
             );
         }
-        for network in networks {
+        for (network, restoring) in
+            networks
+                .iter()
+                .map(|network| (network, None))
+                .chain(inactive.iter().filter_map(|inactive| {
+                    inactive.saved.as_ref().map(|saved| (saved, Some(inactive)))
+                }))
+        {
             ui.push_id(&network.name, |ui| {
                 card().inner_margin(0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     Frame::new().inner_margin(14).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(heading(&network.name, 16.0));
+                                    ui.label(
+                                        heading(&network.name, 16.0)
+                                            .color(if restoring.is_some() { MUTED } else { INK }),
+                                    );
                                     Frame::new()
                                         .stroke(Stroke::new(1.0_f32, BORDER))
                                         .corner_radius(20)
@@ -529,6 +596,11 @@ impl Dashboard {
                                         args: words(&["leave", &network.name]),
                                     });
                                 }
+                                if restoring.is_some() {
+                                    ui.label(mono("Reconnecting", 12.0).color(MUTED));
+                                    ui.spinner();
+                                    return;
+                                }
                                 if button(ui, "Rename", Kind::Secondary, !self.busy) {
                                     dialog = Some(form(
                                         FormKind::Rename,
@@ -546,14 +618,22 @@ impl Dashboard {
                                 }
                             });
                         });
+                        if let Some(inactive) = restoring {
+                            ui.label(
+                                RichText::new(
+                                    inactive
+                                        .reason
+                                        .as_deref()
+                                        .unwrap_or("Syncing membership automatically."),
+                                )
+                                .small()
+                                .color(MUTED),
+                            );
+                        }
                     });
                     for peer in &network.peers {
-                        rule(ui);
-                        Frame::new()
-                            .inner_margin(Margin::symmetric(14, 11))
-                            .show(ui, |ui| {
-                                peer_row(ui, peer, network);
-                            });
+                        ui.add(egui::Separator::default().spacing(1.0));
+                        peer_entry(ui, peer, network, restoring.is_some());
                     }
                     if network.peers.is_empty() {
                         rule(ui);
@@ -564,6 +644,27 @@ impl Dashboard {
                 });
             });
             ui.add_space(4.0);
+        }
+        for inactive in inactive.iter().filter(|inactive| inactive.saved.is_none()) {
+            card().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(heading(&inactive.name, 16.0).color(MUTED));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(mono("Reconnecting", 12.0).color(MUTED));
+                        ui.spinner();
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        inactive
+                            .reason
+                            .as_deref()
+                            .unwrap_or("Syncing membership automatically."),
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+            });
         }
         if let Some(dialog) = dialog {
             self.dialog = Some(dialog);
@@ -1012,13 +1113,20 @@ impl Dashboard {
                             if button(ui, kind.submit_label(), Kind::Primary, !self.busy) {
                                 match kind.command(values, network.as_deref()) {
                                     Ok(args) => {
-                                        self.submitted_form = true;
-                                        actions.push(Action::Run(args));
+                                        if *kind == FormKind::Join {
+                                            actions.push(Action::Join {
+                                                args,
+                                                hostname: values[1].trim().to_owned(),
+                                            });
+                                        } else {
+                                            self.submitted_form = true;
+                                            actions.push(Action::Run(args));
+                                        }
                                     }
                                     Err(error) => self.error = Some(error.to_string()),
                                 }
                             }
-                            close = button(ui, "Cancel", Kind::Secondary, !self.busy);
+                            close = button(ui, "Cancel", Kind::Secondary, true);
                         });
                     }
                     Dialog::Confirm {
@@ -1148,7 +1256,19 @@ fn empty(ui: &mut Ui, title: &str, detail: &str) {
         });
 }
 
+fn peer_entry(ui: &mut Ui, peer: &PeerStatus, network: &NetworkStatus, restoring: bool) {
+    Frame::new()
+        .inner_margin(Margin::symmetric(14, 8))
+        .show(ui, |ui| {
+            if restoring {
+                ui.multiply_opacity(0.5);
+            }
+            peer_row(ui, peer, network);
+        });
+}
+
 fn peer_row(ui: &mut Ui, peer: &PeerStatus, network: &NetworkStatus) {
+    ui.spacing_mut().interact_size.y = 18.0;
     let state = peer
         .connection
         .as_ref()
@@ -1165,7 +1285,7 @@ fn peer_row(ui: &mut Ui, peer: &PeerStatus, network: &NetworkStatus) {
         dot(ui, color);
         let hostname = peer.hostname.as_deref().unwrap_or("Unnamed peer");
         if ui
-            .add(egui::Button::new(mono(hostname, 12.0).color(INK)).frame(false))
+            .add(egui::Label::new(mono(hostname, 12.0).color(INK)).sense(egui::Sense::click()))
             .on_hover_text("Copy domain")
             .clicked()
         {
@@ -1264,6 +1384,160 @@ fn setting(ui: &mut Ui, title: &str, detail: &str, value: &mut bool, enabled: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_stays_clickable_while_a_join_is_running() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(false)));
+        app.begin_join("workstation".into());
+        app.busy = true;
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        let pos = labels
+            .iter()
+            .find(|(text, _)| text == "Disconnect")
+            .unwrap()
+            .1
+            + Vec2::new(4.0, 8.0);
+        let mut actions = Vec::new();
+        for pressed in [true, false] {
+            let _paint = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| actions.extend(app.draw(ctx)),
+            );
+        }
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Toggle))
+        );
+    }
+
+    #[test]
+    fn accepted_join_closes_the_form_and_shows_progress_until_completion() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(false)));
+        app.dialog = Some(form(FormKind::Join, None, "example-invite"));
+        app.busy = true;
+        app.begin_join("workstation".into());
+        assert!(app.dialog.is_none());
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "Joining"));
+        assert!(!labels.iter().any(|(text, _)| text == "No networks yet."));
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        app.command_finished(Ok("Joined example.".into()), None);
+        app.busy = false;
+        let labels = render(&mut app, &ctx);
+        assert!(!labels.iter().any(|(text, _)| text == "Joining"));
+        assert!(labels.iter().any(|(text, _)| text == "example"));
+    }
+
+    #[test]
+    fn failed_join_reports_the_error_without_a_stuck_progress_card() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(false)));
+        app.begin_join(String::new());
+        app.command_finished(Err("Example invite expired.".into()), None);
+        assert!(app.joining.is_none());
+        assert!(app.dialog.is_none());
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "Example invite expired.")
+        );
+    }
+
+    fn render(app: &mut Dashboard, ctx: &Context) -> Vec<(String, egui::Pos2)> {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1000.0, 680.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw(ctx);
+            },
+        );
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::epaint::Shape::Text(text) => Some((text.galley.job.text.clone(), text.pos)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn six_peers_fit_in_the_default_window_with_compact_rows() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        let peers: Vec<_> = labels
+            .iter()
+            .filter(|(text, _)| text.starts_with("workstation-"))
+            .collect();
+        assert_eq!(
+            peers.len(),
+            6,
+            "all six peers should be visible: {labels:?}"
+        );
+        for pair in peers.windows(2) {
+            assert!(
+                pair[1].1.y - pair[0].1.y <= 40.0,
+                "peer rows should be at most 40 points apart"
+            );
+        }
+    }
+
+    #[test]
+    fn restoring_network_keeps_its_card_and_saved_peers() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        let mut snapshot = crate::preview::fixture(true);
+        let network = snapshot.status.networks.remove(0);
+        snapshot
+            .status
+            .inactive_networks
+            .push(ray_proto::ipc::InactiveNetwork {
+                name: network.name.clone(),
+                reason: None,
+                saved: Some(network),
+            });
+        app.snapshot = Some(Box::new(snapshot));
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels.iter().any(|(text, _)| text == "example"),
+            "saved network card is missing"
+        );
+        assert!(
+            labels.iter().any(|(text, _)| text == "workstation-1"),
+            "saved peer is missing"
+        );
+        assert!(labels.iter().any(|(text, _)| text == "6 peers"));
+        assert!(!labels.iter().any(|(text, _)| text == "No networks yet."));
+    }
 
     #[test]
     fn invite_dialog_copies_only_the_invite_code() {

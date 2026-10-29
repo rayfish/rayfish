@@ -12,10 +12,11 @@ use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastE
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, MB_ICONERROR, MB_OK, MessageBoxW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    FindWindowW, MB_ICONERROR, MB_OK, MessageBoxW, PostMessageW, SW_RESTORE, SetForegroundWindow,
+    ShowWindow, WM_PAINT,
 };
 
-use crate::backend::{Update, Work, Worker};
+use crate::backend::{Update, Work, WorkId, Worker};
 use crate::model::words;
 use crate::ui::{Action, Dashboard, OutputKind};
 
@@ -63,7 +64,7 @@ enum MenuAction {
 struct WindowsApp {
     dashboard: Dashboard,
     worker: Worker,
-    updates: Receiver<Update>,
+    active_work: Option<WorkId>,
     events: Receiver<MenuAction>,
     state_item: MenuItem,
     connection_item: MenuItem,
@@ -136,19 +137,14 @@ pub(crate) fn run() -> Result<()> {
                 }
                 // Repeated tray clicks beyond the bounded queue are deliberately ignored.
                 let _ = event_sender.try_send(action);
-                ctx.request_repaint();
+                wake_ui(&ctx);
             }));
-            let (sender, updates) = sync_channel(1);
             let ctx = cc.egui_ctx.clone();
-            let worker = Worker::start(ray, executable, move |update| {
-                let sent = sender.try_send(update).is_ok();
-                ctx.request_repaint();
-                sent
-            })?;
+            let worker = Worker::start(ray, executable, move || wake_ui(&ctx))?;
             let mut app = WindowsApp {
                 dashboard,
                 worker,
-                updates,
+                active_work: None,
                 events,
                 state_item,
                 connection_item,
@@ -168,27 +164,46 @@ pub(crate) fn run() -> Result<()> {
 impl WindowsApp {
     fn submit(&mut self, work: Work) -> Result<()> {
         if self.dashboard.busy {
-            return Ok(());
+            anyhow::bail!("Wait for the current operation to finish.");
         }
-        self.worker.submit(work)?;
-        self.dashboard.busy = true;
-        self.dashboard.error = None;
-        self.dashboard.notice = None;
+        let refreshing = matches!(work, Work::Refresh);
+        self.active_work = Some(if self.active_work.is_some() {
+            self.worker.interrupt(work)?
+        } else {
+            self.worker.submit(work)?
+        });
+        self.dashboard.busy = !refreshing;
+        if !refreshing {
+            self.dashboard.error = None;
+            self.dashboard.notice = None;
+        }
         Ok(())
     }
 
     fn toggle(&mut self) -> Result<()> {
         if let Some(snapshot) = &self.dashboard.snapshot {
-            self.submit(Work::Run(words(&[if snapshot.status.active {
-                "down"
+            if snapshot.status.active {
+                self.interrupt(Work::Disconnect)?;
             } else {
-                "up"
-            }])))?;
+                self.submit(Work::Run(words(&["up"])))?;
+            }
         }
         Ok(())
     }
 
+    fn interrupt(&mut self, work: Work) -> Result<()> {
+        self.active_work = Some(self.worker.interrupt(work)?);
+        self.dashboard.operation_interrupted();
+        self.dashboard.busy = true;
+        self.result_kind = None;
+        Ok(())
+    }
+
     fn updated(&mut self, update: Update, ctx: &UiContext) {
+        if self.active_work != Some(update.id) {
+            return;
+        }
+        self.active_work = None;
         self.dashboard.busy = false;
         self.next_refresh = Instant::now() + REFRESH_INTERVAL;
         if update.quit {
@@ -204,31 +219,12 @@ impl WindowsApp {
             }
         }
         if let Some(output) = update.output {
+            if output.is_err() {
+                show_existing_window();
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            }
             let kind = self.result_kind.take();
-            match output {
-                Ok(text) => {
-                    let text = if let Some(kind) = kind {
-                        kind.prepare(text)
-                    } else {
-                        text
-                    };
-                    self.dashboard.output = if text.is_empty() {
-                        "Done.".into()
-                    } else {
-                        text
-                    };
-                    self.dashboard.form_succeeded();
-                    self.dashboard.notice = Some("Done.".into());
-                }
-                Err(error) => {
-                    self.dashboard.output = error.clone();
-                    self.dashboard.error = Some(error);
-                    self.dashboard.submitted_form = false;
-                }
-            }
-            if let Some(kind) = kind {
-                self.dashboard.show_output(kind);
-            }
+            self.dashboard.command_finished(output, kind);
         }
     }
 }
@@ -239,8 +235,10 @@ impl eframe::App for WindowsApp {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
-        while let Ok(update) = self.updates.try_recv() {
-            self.updated(update, ctx);
+        match self.worker.take_update() {
+            Ok(Some(update)) => self.updated(update, ctx),
+            Ok(None) => {}
+            Err(error) => self.dashboard.error = Some(format!("{error:#}")),
         }
         while let Ok(event) = self.events.try_recv() {
             let result = match event {
@@ -251,7 +249,7 @@ impl eframe::App for WindowsApp {
                     Ok(())
                 }
                 MenuAction::Toggle => self.toggle(),
-                MenuAction::Quit => self.submit(Work::Quit),
+                MenuAction::Quit => self.interrupt(Work::Quit),
             };
             if let Err(error) = result {
                 self.dashboard.error = Some(format!("{error:#}"));
@@ -262,17 +260,20 @@ impl eframe::App for WindowsApp {
                 Action::Refresh => self.submit(Work::Refresh),
                 Action::Toggle => self.toggle(),
                 Action::Run(args) => self.submit(Work::Run(args)),
-                Action::ShowResult { kind, args } => {
-                    self.result_kind = Some(kind);
-                    self.submit(Work::Run(args))
-                }
+                Action::Join { args, hostname } => self.submit(Work::Run(args)).map(|()| {
+                    self.dashboard.begin_join(hostname);
+                    ctx.request_repaint();
+                }),
+                Action::ShowResult { kind, args } => self
+                    .submit(Work::Run(args))
+                    .map(|()| self.result_kind = Some(kind)),
                 Action::Startup(enabled) => self.submit(Work::Startup(enabled)),
             };
             if let Err(error) = result {
                 self.dashboard.error = Some(format!("{error:#}"));
             }
         }
-        if Instant::now() >= self.next_refresh && !self.dashboard.busy {
+        if Instant::now() >= self.next_refresh && self.active_work.is_none() {
             self.next_refresh = Instant::now() + REFRESH_INTERVAL;
             if let Err(error) = self.submit(Work::Refresh) {
                 self.dashboard.error = Some(format!("{error:#}"));
@@ -302,9 +303,31 @@ impl eframe::App for WindowsApp {
                 "Connect"
             },
         );
-        self.connection_item
-            .set_enabled(!self.dashboard.busy && self.dashboard.snapshot.is_some());
+        self.connection_item.set_enabled(
+            self.dashboard
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status.active || !self.dashboard.busy),
+        );
         ctx.request_repaint_after(REFRESH_INTERVAL);
+    }
+}
+
+fn wake_ui(ctx: &UiContext) {
+    ctx.request_repaint();
+    let title = wide("Rayfish");
+    // SAFETY: The title is terminated, and PostMessage validates the handle.
+    // Hidden windows do not receive the normal repaint used by eframe to
+    // deliver updates. An explicit paint also processes tray commands and
+    // worker completions while the window is hidden.
+    unsafe {
+        let window = FindWindowW(null(), title.as_ptr());
+        if !window.is_null() && PostMessageW(window, WM_PAINT, 0, 0) == 0 {
+            eprintln!(
+                "Could not wake the desktop window: {}",
+                IoError::last_os_error()
+            );
+        }
     }
 }
 
@@ -354,5 +377,50 @@ pub(crate) fn show_error(message: &str) {
             title.as_ptr(),
             MB_OK | MB_ICONERROR,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::zeroed;
+
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW,
+    };
+
+    use super::*;
+
+    #[test]
+    fn tray_and_worker_updates_wake_a_hidden_window() {
+        let class = wide("STATIC");
+        let title = wide("Rayfish");
+        // SAFETY: STATIC is a system window class. The strings and message
+        // buffer outlive these calls, and the test destroys the window it owns.
+        unsafe {
+            let window = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                0,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            assert_eq!(IsWindowVisible(window), 0);
+            wake_ui(&UiContext::default());
+            let mut message: MSG = zeroed();
+            assert_ne!(
+                PeekMessageW(&mut message, window, WM_PAINT, WM_PAINT, PM_REMOVE),
+                0
+            );
+            assert_eq!(IsWindowVisible(window), 0);
+            assert_ne!(DestroyWindow(window), 0);
+        }
     }
 }

@@ -7,21 +7,43 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use anyhow::{Context, Result};
 use eframe::egui::{self, ViewportCommand};
 use ray_proto::Action;
-use ray_proto::ipc::{NetworkRole, NetworkStatus};
+use ray_proto::ipc::{InactiveNetwork, NetworkRole, NetworkStatus, PeerState, PeerStatus};
 use serde_json::{Map, json};
 
 use crate::model::{Firewall, PendingCounts, Snapshot, Status};
 use crate::ui::{Dashboard, Page};
 
-pub(crate) fn run(path: PathBuf, populated: bool, page: Page) -> Result<()> {
+pub(crate) enum PreviewState {
+    Normal,
+    Joining,
+    Reconnecting,
+}
+
+pub(crate) fn run(path: PathBuf, populated: bool, page: Page, state: PreviewState) -> Result<()> {
     let (sender, receiver) = sync_channel(1);
     eframe::run_native(
         "Rayfish preview",
         crate::window::options()?,
         Box::new(move |cc| {
             let mut dashboard = Dashboard::new(&cc.egui_ctx)?;
-            dashboard.snapshot = Some(Box::new(fixture(populated)));
+            let mut snapshot = fixture(populated || matches!(state, PreviewState::Reconnecting));
+            if matches!(state, PreviewState::Reconnecting) {
+                let mut network = snapshot.status.networks.remove(0);
+                for peer in &mut network.peers {
+                    peer.state = PeerState::Offline;
+                }
+                snapshot.status.inactive_networks.push(InactiveNetwork {
+                    name: network.name.clone(),
+                    reason: None,
+                    saved: Some(network),
+                });
+            }
+            dashboard.snapshot = Some(Box::new(snapshot));
             dashboard.page = page;
+            if matches!(state, PreviewState::Joining) {
+                dashboard.begin_join("workstation".into());
+                dashboard.busy = true;
+            }
             Ok(Box::new(Preview {
                 dashboard,
                 path,
@@ -98,7 +120,7 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
             my_hostname: Some("workstation".into()),
             network_key: None,
             member_count: 1,
-            peers: Vec::new(),
+            peers: (1..=6).map(peer).collect(),
             pending_suggestions: 0,
             pending_requests: 0,
             aliases: Default::default(),
@@ -134,4 +156,16 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
         warnings: Vec::new(),
         launch_at_login: false,
     }
+}
+
+fn peer(index: u8) -> PeerStatus {
+    serde_json::from_value(json!({
+        "endpoint_id": "5866666666666666666666666666666666666666666666666666666666666666",
+        "ipv6": Ipv6Addr::from(u128::from(index)).to_string(),
+        "hostname": format!("workstation-{index}"),
+        "user_identity": null,
+        "connection": null,
+        "state": "Idle"
+    }))
+    .expect("The fabricated peer uses a valid public key and status fields.")
 }

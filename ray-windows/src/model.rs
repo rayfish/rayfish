@@ -19,6 +19,16 @@ pub(crate) struct Status {
     pub pending: PendingCounts,
 }
 
+impl Status {
+    pub fn visible_networks(&self) -> impl Iterator<Item = &NetworkStatus> {
+        self.networks.iter().chain(
+            self.inactive_networks
+                .iter()
+                .filter_map(|network| network.saved.as_ref()),
+        )
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct PendingCounts {
     pub connects: usize,

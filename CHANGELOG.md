@@ -32,6 +32,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: joining closes the dialog immediately and shows a joining network
+  card. Peer rows are compact, and saved networks stay visible while reconnecting.
+- Windows: desktop and Start menu shortcuts launch the app directly without
+  running Windows Installer repair checks.
+- Windows: Disconnect and Quit interrupt a pending join or refresh instead of
+  ignoring the action while the app is busy. Tray actions also work when the
+  window is hidden.
 - Relay and peer-discovery lookups keep HTTPS DNS fallback when plain DNS is blocked.
 - After network changes, peer discovery retries DNS records that were missing
   before a peer started, instead of caching the earlier miss.

@@ -2,9 +2,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,90 +20,228 @@ pub(crate) enum Work {
     Refresh,
     Run(Vec<String>),
     Startup(bool),
+    Disconnect,
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkId(u64);
+
 #[derive(Debug)]
 pub(crate) struct Update {
+    pub id: WorkId,
     pub snapshot: Result<Box<Snapshot>, String>,
     pub output: Option<Result<String, String>>,
     pub quit: bool,
 }
 
+struct Job {
+    id: WorkId,
+    work: Work,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct Queue {
+    pending: Option<Job>,
+    running: Option<Arc<AtomicBool>>,
+    closing: bool,
+}
+
+#[derive(Default)]
+struct Shared {
+    queue: Mutex<Queue>,
+    ready: Condvar,
+    update: Mutex<Option<Update>>,
+}
+
 pub(crate) struct Worker {
-    sender: Option<SyncSender<Work>>,
-    stopping: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    shared: Arc<Shared>,
+    next_id: u64,
+    thread: Option<JoinHandle<Result<()>>>,
 }
 
 impl Worker {
-    pub fn start(
-        ray: PathBuf,
-        app: PathBuf,
-        notify: impl Fn(Update) -> bool + Send + 'static,
+    pub fn start(ray: PathBuf, app: PathBuf, notify: impl Fn() + Send + 'static) -> Result<Self> {
+        Self::start_with(
+            move |id, work, cancelled| {
+                let quit = matches!(work, Work::Quit);
+                let output = match work {
+                    Work::Refresh => None,
+                    Work::Run(args) => Some(run_ray(&ray, &args, cancelled)),
+                    Work::Startup(enabled) => Some(set_startup(&app, enabled, cancelled)),
+                    Work::Disconnect | Work::Quit => Some(
+                        process_with_timeout(
+                            &ray,
+                            &words(&["down"]),
+                            cancelled,
+                            Duration::from_secs(10),
+                        )
+                        .and_then(ProcessOutput::into_result),
+                    ),
+                }
+                .map(|result| result.map_err(|error| format!("{error:#}")));
+                let snapshot = if quit {
+                    // Quit must not wait on unrelated status and settings reads,
+                    // including when disconnect failed and the UI needs its error.
+                    Err("Could not disconnect Rayfish.".into())
+                } else {
+                    snapshot(&ray, cancelled)
+                        .map(Box::new)
+                        .map_err(|error| format!("{error:#}"))
+                };
+                let quit = quit && output.as_ref().is_some_and(Result::is_ok);
+                Update {
+                    id,
+                    snapshot,
+                    output,
+                    quit,
+                }
+            },
+            notify,
+        )
+    }
+
+    fn start_with(
+        execute: impl Fn(WorkId, Work, &AtomicBool) -> Update + Send + 'static,
+        notify: impl Fn() + Send + 'static,
     ) -> Result<Self> {
-        let (sender, receiver) = sync_channel(1);
-        let stopping = Arc::new(AtomicBool::new(false));
-        let cancelled = stopping.clone();
+        let shared = Arc::new(Shared::default());
+        let owner = shared.clone();
         let thread = thread::Builder::new()
             .name("rayfish-ui".into())
             .spawn(move || {
-                while let Ok(work) = receiver.recv() {
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let quit = matches!(work, Work::Quit);
-                    let output = match work {
-                        Work::Refresh => None,
-                        Work::Run(args) => Some(run_ray(&ray, &args, &cancelled)),
-                        Work::Startup(enabled) => Some(set_startup(&app, enabled, &cancelled)),
-                        Work::Quit => Some(run_ray(&ray, &words(&["down"]), &cancelled)),
-                    }
-                    .map(|result| result.map_err(|error| format!("{error:#}")));
-                    let quit = quit && output.as_ref().is_some_and(Result::is_ok);
-                    let snapshot = if quit {
-                        Err("Rayfish is closing.".into())
-                    } else {
-                        snapshot(&ray, &cancelled)
-                            .map(Box::new)
-                            .map_err(|error| format!("{error:#}"))
+                loop {
+                    let job = {
+                        let queue = owner
+                            .queue
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("The command queue was poisoned."))?;
+                        let mut queue = owner
+                            .ready
+                            .wait_while(queue, |queue| queue.pending.is_none() && !queue.closing)
+                            .map_err(|_| anyhow::anyhow!("The command queue was poisoned."))?;
+                        if queue.closing {
+                            return Ok(());
+                        }
+                        let job = queue
+                            .pending
+                            .take()
+                            .context("the ready command queue is empty")?;
+                        queue.running = Some(job.cancelled.clone());
+                        job
                     };
-                    if cancelled.load(Ordering::Acquire)
-                        || !notify(Update {
-                            snapshot,
-                            output,
-                            quit,
-                        })
-                    {
-                        break;
+                    let update = execute(job.id, job.work, &job.cancelled);
+                    let mut queue = owner
+                        .queue
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("The command queue was poisoned."))?;
+                    queue.running = None;
+                    if queue.closing {
+                        return Ok(());
+                    }
+                    if !job.cancelled.load(Ordering::Acquire) {
+                        // A single result slot keeps delivery bounded. A newer completion
+                        // supersedes a result the UI has not consumed yet.
+                        *owner
+                            .update
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("The command result was poisoned."))? =
+                            Some(update);
+                        drop(queue);
+                        notify();
                     }
                 }
             })
             .context("starting the desktop command worker")?;
         Ok(Self {
-            sender: Some(sender),
-            stopping,
+            shared,
+            next_id: 0,
             thread: Some(thread),
         })
     }
 
-    pub fn submit(&self, work: Work) -> Result<()> {
-        self.sender
-            .as_ref()
-            .context("the command worker has stopped")?
-            .try_send(work)
-            .context("the command worker is busy or has stopped")
+    pub fn submit(&mut self, work: Work) -> Result<WorkId> {
+        self.enqueue(work, false)
+    }
+
+    pub fn interrupt(&mut self, work: Work) -> Result<WorkId> {
+        self.enqueue(work, true)
+    }
+
+    fn enqueue(&mut self, work: Work, interrupt: bool) -> Result<WorkId> {
+        let id = WorkId(
+            self.next_id
+                .checked_add(1)
+                .context("the command identifier overflowed")?,
+        );
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The command queue was poisoned."))?;
+        if queue.closing
+            || self
+                .thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished())
+        {
+            bail!("The command worker has stopped.");
+        }
+        if interrupt {
+            if let Some(running) = &queue.running {
+                running.store(true, Ordering::Release);
+            }
+            if let Some(pending) = queue.pending.take() {
+                pending.cancelled.store(true, Ordering::Release);
+            }
+        } else if queue.pending.is_some() {
+            bail!("The command queue is full.");
+        }
+        queue.pending = Some(Job {
+            id,
+            work,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        self.next_id = id.0;
+        self.shared.ready.notify_one();
+        if let Some(thread) = &self.thread {
+            thread.thread().unpark();
+        }
+        Ok(id)
+    }
+
+    pub fn take_update(&self) -> Result<Option<Update>> {
+        Ok(self
+            .shared
+            .update
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The command result was poisoned."))?
+            .take())
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
-        self.sender.take();
+        // A poisoned queue still needs to cancel and reap its child on shutdown.
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        queue.closing = true;
+        if let Some(running) = &queue.running {
+            running.store(true, Ordering::Release);
+        }
+        queue.pending = None;
+        self.shared.ready.notify_one();
+        drop(queue);
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
-            if thread.join().is_err() {
-                eprintln!("the desktop command worker panicked");
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("The command worker failed: {error:#}"),
+                Err(_) => eprintln!("The command worker panicked."),
             }
         }
     }
@@ -184,10 +321,11 @@ fn snapshot(ray: &Path, cancelled: &AtomicBool) -> Result<Snapshot> {
             Err(error) => warnings.push(format!("Could not read file offers: {error:#}")),
         }
     }
-    let launch_at_login = match process(
+    let launch_at_login = match process_with_timeout(
         Path::new("schtasks.exe"),
         &words(&["/Query", "/TN", STARTUP_TASK]),
         cancelled,
+        Duration::from_secs(5),
     ) {
         Ok(output) => output.success,
         Err(error) => {
@@ -206,8 +344,9 @@ fn snapshot(ray: &Path, cancelled: &AtomicBool) -> Result<Snapshot> {
 }
 
 fn json<T: DeserializeOwned>(ray: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<T> {
-    serde_json::from_str(&run_ray(ray, &words(args), cancelled)?)
-        .context("reading the ray command's JSON response")
+    let output = process_with_timeout(ray, &words(args), cancelled, Duration::from_secs(8))?
+        .into_result()?;
+    serde_json::from_str(&output).context("reading the ray command's JSON response")
 }
 
 fn run_ray(ray: &Path, args: &[String], cancelled: &AtomicBool) -> Result<String> {
@@ -343,6 +482,7 @@ fn read_output(file: &mut File) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::mpsc::{TryRecvError, sync_channel};
 
     use super::*;
 
@@ -399,18 +539,94 @@ mod tests {
 
     #[test]
     fn worker_delivers_failures_and_shuts_down_without_a_daemon() {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let worker = Worker::start(
+        let (sender, receiver) = sync_channel(1);
+        let mut worker = Worker::start(
             PathBuf::from("nonexistent-ray-command"),
             PathBuf::new(),
-            move |update| sender.send(update).is_ok(),
+            move || {
+                sender.send(()).unwrap();
+            },
         )
         .unwrap();
-        worker.submit(Work::Refresh).unwrap();
-        let update = receiver.recv().unwrap();
+        let id = worker.submit(Work::Refresh).unwrap();
+        receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let update = worker.take_update().unwrap().unwrap();
+        assert_eq!(update.id, id);
         assert!(update.snapshot.is_err());
         assert!(update.output.is_none());
         assert!(!update.quit);
+        drop(worker);
+    }
+
+    #[test]
+    fn disconnect_and_quit_preempt_a_running_command_and_discard_its_result() {
+        for priority in [Work::Disconnect, Work::Quit] {
+            let (started, waiting) = sync_channel(1);
+            let (done, completed) = sync_channel(1);
+            let mut worker = Worker::start_with(
+                move |id, work, cancelled| match work {
+                    Work::Run(_) => {
+                        started.send(()).unwrap();
+                        while !cancelled.load(Ordering::Acquire) {
+                            thread::park();
+                        }
+                        Update {
+                            id,
+                            snapshot: Err("cancelled".into()),
+                            output: Some(Err("cancelled".into())),
+                            quit: false,
+                        }
+                    }
+                    Work::Disconnect | Work::Quit => Update {
+                        id,
+                        snapshot: Ok(Box::new(crate::preview::fixture(false))),
+                        output: Some(Ok("Disconnected.".into())),
+                        quit: matches!(work, Work::Quit),
+                    },
+                    _ => panic!("unexpected work"),
+                },
+                move || {
+                    done.send(()).unwrap();
+                },
+            )
+            .unwrap();
+            worker
+                .submit(Work::Run(words(&["join", "example-invite"])))
+                .unwrap();
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            let quitting = matches!(priority, Work::Quit);
+            let id = worker.interrupt(priority).unwrap();
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let update = worker.take_update().unwrap().unwrap();
+            assert_eq!(update.id, id);
+            assert_eq!(update.quit, quitting);
+            assert_eq!(update.output.unwrap().unwrap(), "Disconnected.");
+            assert_eq!(completed.try_recv(), Err(TryRecvError::Empty));
+        }
+    }
+
+    #[test]
+    fn dropping_a_busy_worker_cancels_and_joins_its_thread() {
+        let (started, waiting) = sync_channel(1);
+        let worker = Worker::start_with(
+            move |id, _, cancelled| {
+                started.send(()).unwrap();
+                while !cancelled.load(Ordering::Acquire) {
+                    thread::park();
+                }
+                Update {
+                    id,
+                    snapshot: Err("cancelled".into()),
+                    output: None,
+                    quit: false,
+                }
+            },
+            || panic!("a cancelled result must not reach the UI"),
+        )
+        .unwrap();
+        let mut worker = worker;
+        worker.submit(Work::Refresh).unwrap();
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(worker);
     }
 

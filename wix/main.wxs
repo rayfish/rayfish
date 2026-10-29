@@ -75,14 +75,17 @@
         <File Id="WintunDll" Source="$(var.CargoTargetBinDir)\wintun.dll" KeyPath="yes" />
       </Component>
       <Component Id="RayfishAppExecutable" Guid="*">
-        <File Id="RayfishAppExe" Source="$(var.CargoTargetBinDir)\rayfish-app.exe" KeyPath="yes">
-          <Shortcut Id="RayfishStartMenuShortcut" Directory="ProgramMenuFolder"
-                    Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
-                    Icon="Rayfish.exe" IconIndex="0" />
-          <Shortcut Id="RayfishDesktopShortcut" Directory="DesktopFolder"
-                    Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
-                    Icon="Rayfish.exe" IconIndex="0" />
-        </File>
+        <File Id="RayfishAppExe" Source="$(var.CargoTargetBinDir)\rayfish-app.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="RayfishAppShortcuts" Guid="*" Directory="ProgramMenuFolder">
+        <Shortcut Id="RayfishStartMenuShortcut" Directory="ProgramMenuFolder"
+                  Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="no"
+                  Target="[#RayfishAppExe]" Icon="Rayfish.exe" IconIndex="0" />
+        <Shortcut Id="RayfishDesktopShortcut" Directory="DesktopFolder"
+                  Name="Rayfish" WorkingDirectory="INSTALLFOLDER" Advertise="no"
+                  Target="[#RayfishAppExe]" Icon="Rayfish.exe" IconIndex="0" />
+        <RegistryValue Root="HKCU" Key="Software\Rayfish\Installer" Name="Shortcuts"
+                       Type="integer" Value="1" KeyPath="yes" />
       </Component>
       <Component Id="ReleaseIdentityRegistry" Guid="*" Win64="yes">
         <RegistryValue Root="HKLM" Key="Software\Rayfish" Name="ReleaseIdentity"
