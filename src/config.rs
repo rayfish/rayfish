@@ -101,94 +101,6 @@ fn ensure_not_in_network_update() -> Result<()> {
     })
 }
 
-/// Globals persisted to `settings.toml` (everything in [`AppConfig`] except the
-/// per-network entries, which live in their own files).
-///
-/// `Default` gives every field its type-default (so `mdns_enabled` is `false`);
-/// the fresh-install defaults are built at the `load_in` site with explicit
-/// overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Settings {
-    #[serde(default = "default_true")]
-    mdns_enabled: bool,
-    #[serde(default)]
-    operator_uid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    default_hostname: Option<String>,
-    #[serde(default)]
-    relay: ServerOverride,
-    #[serde(default)]
-    discovery_dns: ServerOverride,
-    #[serde(default)]
-    dns_upstreams: ServerOverride,
-    #[serde(
-        default,
-        alias = "dns_enabled",
-        deserialize_with = "deserialize_dns_mode"
-    )]
-    dns_mode: DnsMode,
-    #[serde(
-        default,
-        alias = "quic_congestion",
-        deserialize_with = "deserialize_quic_engine"
-    )]
-    quic_engine: QuicEngine,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "endpoint_hints::deserialize"
-    )]
-    endpoint_hints: Vec<EndpointHint>,
-    #[serde(default)]
-    ssh_enabled: bool,
-    #[serde(default = "default_ssh_port")]
-    ssh_port: u16,
-    #[serde(default = "default_true")]
-    v4_bridge: bool,
-    #[serde(default = "default_true")]
-    pf_passthrough: bool,
-    #[serde(default = "default_true")]
-    on_demand: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    idle_timeout_secs: Option<u64>,
-    #[serde(default)]
-    auto_update: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    auto_update_last_target: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    auto_update_last_attempt: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    download_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    file_auto_accept_peers: Vec<EndpointId>,
-    #[serde(default)]
-    inbound: InboundPolicy,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    blocked: Vec<EndpointId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    download_user: Option<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pending_joins: Vec<PendingJoinEntry>,
-    #[serde(default)]
-    cert_generation: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    device_generations: Vec<DeviceGeneration>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    revoked_devices: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pending_unpairs: Vec<PendingUnpair>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pending_unpair_notices: Vec<PendingUnpairNotice>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    controllers: Vec<ControllerGrant>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    managed_machines: Vec<ManagedMachine>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    forgotten_machines: Vec<EndpointId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    enrollment_credentials: Vec<EnrollmentCredential>,
-}
-
 mod paths;
 pub use paths::*;
 
@@ -366,7 +278,7 @@ pub fn load_inbound() -> Result<InboundSettings> {
         return Ok(InboundSettings::default());
     }
     let contents = std::fs::read_to_string(&path).context("reading settings.toml")?;
-    let settings: Settings = toml::from_str(&contents).context("parsing settings.toml")?;
+    let settings: AppConfig = toml::from_str(&contents).context("parsing settings.toml")?;
     Ok(InboundSettings {
         inbound: settings.inbound,
         blocked: settings.blocked,
@@ -386,22 +298,12 @@ pub fn load_for_read() -> Result<AppConfig> {
 
 fn load_in(dir: &Path) -> Result<AppConfig> {
     let settings_path = dir.join(SETTINGS_FILE);
-    let settings: Settings = if settings_path.exists() {
+    // `settings.toml` holds every global; a missing file is a fresh install.
+    let mut config: AppConfig = if settings_path.exists() {
         let s = std::fs::read_to_string(&settings_path).context("reading settings.toml")?;
         toml::from_str(&s).context("parsing settings.toml")?
     } else {
-        // Fresh install: discovery, `.ray`-only Magic DNS, on-demand and the pf
-        // passthrough are on, and mesh SSH uses port 22, matching the serde
-        // field defaults.
-        Settings {
-            mdns_enabled: true,
-            dns_mode: DnsMode::default(),
-            ssh_port: default_ssh_port(),
-            v4_bridge: true,
-            pf_passthrough: true,
-            on_demand: true,
-            ..Default::default()
-        }
+        AppConfig::default()
     };
 
     let mut networks = Vec::new();
@@ -428,42 +330,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         }
     }
 
-    Ok(AppConfig {
-        mdns_enabled: settings.mdns_enabled,
-        operator_uid: settings.operator_uid,
-        default_hostname: settings.default_hostname,
-        relay: settings.relay,
-        discovery_dns: settings.discovery_dns,
-        dns_upstreams: settings.dns_upstreams,
-        dns_mode: settings.dns_mode,
-        quic_engine: settings.quic_engine,
-        endpoint_hints: settings.endpoint_hints,
-        ssh_enabled: settings.ssh_enabled,
-        ssh_port: settings.ssh_port,
-        v4_bridge: settings.v4_bridge,
-        pf_passthrough: settings.pf_passthrough,
-        on_demand: settings.on_demand,
-        idle_timeout_secs: settings.idle_timeout_secs,
-        auto_update: settings.auto_update,
-        auto_update_last_target: settings.auto_update_last_target,
-        auto_update_last_attempt: settings.auto_update_last_attempt,
-        file_auto_accept_peers: settings.file_auto_accept_peers,
-        inbound: settings.inbound,
-        blocked: settings.blocked,
-        download_dir: settings.download_dir,
-        download_user: settings.download_user,
-        networks,
-        pending_joins: settings.pending_joins,
-        cert_generation: settings.cert_generation,
-        device_generations: settings.device_generations,
-        revoked_devices: settings.revoked_devices,
-        pending_unpairs: settings.pending_unpairs,
-        pending_unpair_notices: settings.pending_unpair_notices,
-        controllers: settings.controllers,
-        managed_machines: settings.managed_machines,
-        forgotten_machines: settings.forgotten_machines,
-        enrollment_credentials: settings.enrollment_credentials,
-    })
+    config.networks = networks;
+    Ok(config)
 }
 
 /// Atomically load, synchronously mutate, and save the globals. The read and the
@@ -509,41 +377,9 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
 /// The `settings.toml` projection of `config`, serialized. Also the change
 /// detector for [`update_settings`]: identical text means nothing to write.
 fn settings_toml(config: &AppConfig) -> Result<String> {
-    let settings = Settings {
-        mdns_enabled: config.mdns_enabled,
-        operator_uid: config.operator_uid,
-        default_hostname: config.default_hostname.clone(),
-        relay: config.relay.clone(),
-        discovery_dns: config.discovery_dns.clone(),
-        dns_upstreams: config.dns_upstreams.clone(),
-        dns_mode: config.dns_mode,
-        quic_engine: config.quic_engine,
-        endpoint_hints: config.endpoint_hints.clone(),
-        ssh_enabled: config.ssh_enabled,
-        ssh_port: config.ssh_port,
-        v4_bridge: config.v4_bridge,
-        pf_passthrough: config.pf_passthrough,
-        on_demand: config.on_demand,
-        idle_timeout_secs: config.idle_timeout_secs,
-        auto_update: config.auto_update,
-        auto_update_last_target: config.auto_update_last_target.clone(),
-        auto_update_last_attempt: config.auto_update_last_attempt,
-        file_auto_accept_peers: config.file_auto_accept_peers.clone(),
-        inbound: config.inbound,
-        blocked: config.blocked.clone(),
-        download_dir: config.download_dir.clone(),
-        download_user: config.download_user,
-        pending_joins: config.pending_joins.clone(),
-        cert_generation: config.cert_generation,
-        device_generations: config.device_generations.clone(),
-        revoked_devices: config.revoked_devices.clone(),
-        pending_unpairs: config.pending_unpairs.clone(),
-        pending_unpair_notices: config.pending_unpair_notices.clone(),
-        controllers: config.controllers.clone(),
-        managed_machines: config.managed_machines.clone(),
-        forgotten_machines: config.forgotten_machines.clone(),
-        enrollment_credentials: config.enrollment_credentials.clone(),
-    };
+    // Every global, minus the networks, which live in their own files.
+    let mut settings = toml::Table::try_from(config).context("serializing settings")?;
+    settings.remove("networks");
     toml::to_string_pretty(&settings).context("serializing settings")
 }
 

@@ -918,7 +918,7 @@ fn management_state_roundtrips_with_typed_values() {
 
 #[test]
 fn legacy_controller_grant_loads_without_a_receipt() {
-    let settings: Settings = toml::from_str(&format!(
+    let settings: AppConfig = toml::from_str(&format!(
         "[[controllers]]\nidentity = '{}'\nenrolled_at = 100\n",
         test_id(31)
     ))
@@ -1744,4 +1744,16 @@ fn concurrent_writes_to_one_path_never_mix() {
         .filter(|n| n.contains(".tmp."))
         .collect();
     assert!(left.is_empty(), "temp files left behind: {left:?}");
+}
+
+#[test]
+fn settings_file_leaves_the_networks_to_their_own_files() {
+    let config = AppConfig {
+        networks: vec![empty_network_config("lab")],
+        ..Default::default()
+    };
+    let text = settings_toml(&config).expect("serialize settings");
+    let parsed: AppConfig = toml::from_str(&text).expect("parse settings");
+    assert!(parsed.networks.is_empty());
+    assert_eq!(parsed.ssh_port, config.ssh_port);
 }
