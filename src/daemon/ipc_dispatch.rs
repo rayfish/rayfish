@@ -339,17 +339,22 @@ impl Daemon {
 
     /// Persist the setting and change discovery on the existing endpoint.
     pub async fn set_mdns_enabled(&self, enabled: bool) -> Result<()> {
-        self.mdns.set_enabled(enabled, &self.shutdown_token).await
+        self.mdns
+            .set_enabled(enabled, &self.registry.shutdown_token)
+            .await
     }
 
     /// Apply `ray dns on|off` immediately. Unlike the other settings, DNS owns
     /// host state that must be restored before the command reports success.
     async fn dns_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
         let mode = save_global(GlobalKey::Dns, value, false)?.dns_mode;
-        let tun_name = self.tun_name.load().as_str().to_owned();
-        self.dns.resolver.set_short_names(mode.short_names());
+        let tun_name = self.registry.tun_name.load().as_str().to_owned();
+        self.registry
+            .dns
+            .resolver
+            .set_short_names(mode.short_names());
         if !mode.enabled() {
-            self.dns.revert(&tun_name).await;
+            self.registry.dns.revert(&tun_name).await;
             return Ok(Done(
                 "DNS disabled and Rayfish's system DNS configuration removed.".to_string(),
             ));
@@ -366,7 +371,7 @@ impl Daemon {
             )));
         }
         let mut warnings = Vec::new();
-        self.dns.configure(&tun_name, &mut warnings).await;
+        self.registry.dns.configure(&tun_name, &mut warnings).await;
         let mut message = state.to_string();
         if !warnings.is_empty() {
             message.push(' ');
@@ -547,7 +552,7 @@ impl Daemon {
             IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
-                self.shutdown_token.cancel();
+                self.registry.shutdown_token.cancel();
                 IpcMessage::Ok {
                     message: "shutting down".to_string(),
                 }

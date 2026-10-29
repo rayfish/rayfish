@@ -82,7 +82,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         let (tun_reader, tun_writer, tun_name) = tun::create(my_ipv6)
             .await
             .context("failed to create TUN device")?;
-        daemon.tun_name.store(Arc::new(tun_name));
+        daemon.registry.tun_name.store(Arc::new(tun_name));
         daemon.fatal.arm();
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
@@ -110,7 +110,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // (the self-replacing updater is not built into the Android lib).
     #[cfg(feature = "desktop")]
     if daemon.auto_update {
-        spawn_auto_update(daemon.shutdown_token.clone());
+        spawn_auto_update(daemon.registry.shutdown_token.clone());
     }
 
     let result = serve_ipc(&daemon, token, ipc).await;
@@ -787,15 +787,10 @@ async fn build_daemon_inner(
         registry,
         connection_history: Mutex::new(Default::default()),
         paired_network_joins: Arc::new(DashSet::new()),
-        stats: Arc::clone(&stats),
         start: Instant::now(),
-        tun_tx,
-        shutdown_token: token.clone(),
         protocol_router: Arc::clone(&protocol_router),
-        dns,
         mdns,
         auto_update,
-        tun_name,
         tun_tasks: Mutex::new(None),
         fatal: Arc::default(),
         exit_reconcile: AsyncMutex::new(()),
@@ -899,7 +894,7 @@ pub async fn start_embedded_ipc(daemon: &Arc<Daemon>, owner_uid: u32) -> Result<
         if let Err(error) = accept_ipc(
             socket,
             &daemon,
-            daemon.shutdown_token.clone(),
+            daemon.registry.shutdown_token.clone(),
             IpcHost::PacketTunnel { owner_uid },
         )
         .await
@@ -1327,7 +1322,7 @@ mod embedded_ipc_tests {
             accept_ipc(
                 socket,
                 &server_daemon,
-                server_daemon.shutdown_token.clone(),
+                server_daemon.registry.shutdown_token.clone(),
                 IpcHost::PacketTunnel {
                     owner_uid: unsafe { libc::geteuid() },
                 },
@@ -1384,7 +1379,7 @@ mod embedded_ipc_tests {
             assert!(
                 matches!(response, IpcMessage::Error { message } if message.contains("Rayfish app"))
             );
-            assert!(!daemon.shutdown_token.is_cancelled());
+            assert!(!daemon.registry.shutdown_token.is_cancelled());
         }
         daemon.shutdown_and_close().await;
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -1494,7 +1489,7 @@ async fn handle_ipc_client(
                 &mut framed,
                 since,
                 follow,
-                &daemon.shutdown_token,
+                &daemon.registry.shutdown_token,
             )
             .await;
         }
@@ -1503,7 +1498,7 @@ async fn handle_ipc_client(
             &mut framed,
             since,
             follow,
-            &daemon.shutdown_token,
+            &daemon.registry.shutdown_token,
         )
         .await;
     }
@@ -1808,7 +1803,7 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
             &mut framed,
             since,
             follow,
-            &daemon.shutdown_token,
+            &daemon.registry.shutdown_token,
         )
         .await;
     }
@@ -1942,7 +1937,7 @@ fn boottime() -> Option<Duration> {
 #[cfg(target_os = "linux")]
 fn spawn_resume_watch(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
-        let token = daemon.shutdown_token.clone();
+        let token = daemon.registry.shutdown_token.clone();
         let Some(mut last_boot) = boottime() else {
             return;
         };

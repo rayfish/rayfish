@@ -270,7 +270,7 @@ impl Daemon {
         let nudge = Arc::clone(&self.registry.poll_nudge);
         loop {
             tokio::select! {
-                _ = self.shutdown_token.cancelled() => return,
+                _ = self.registry.shutdown_token.cancelled() => return,
                 _ = tick.tick() => {},
                 _ = nudge.notified() => tick.reset(),
             }

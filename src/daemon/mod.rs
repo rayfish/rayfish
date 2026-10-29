@@ -35,7 +35,6 @@
 //!   that network's background tasks. Because cancellation is one-shot, every
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
-use arc_swap::ArcSwap;
 use bytes::Bytes;
 use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -814,47 +813,26 @@ pub struct Daemon {
     connection_history: Mutex<mesh::diagnostics::ConnectionHistory>,
     /// The process-lifetime foundation (endpoint, identity, blob store, metrics),
     /// grouped so extracted services can depend on `Arc<Transport>`
-    /// instead of the whole daemon. During the service-decomposition transition
-    /// this holds clones of the same handles the loose fields below still use;
-    /// the loose fields go away when `Daemon` is dissolved.
+    /// instead of the whole daemon.
     transport: Arc<Transport>,
-    stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
     start: Instant,
-    /// Sender half of the current TUN write channel, in a swappable cell.
-    /// [`DaemonState::attach_tun`] creates a fresh channel on every attach and
-    /// stores the new sender here, so incoming send-sites (peer readers, DNS
-    /// injection) always resolve the live writer via `tun_tx.load()`. This is
-    /// what makes the VPN off/on toggle work: `detach_tun` stops the writer, and
-    /// the next `attach_tun` swaps in a new sender feeding a fresh writer. On
-    /// desktop the daemon attaches exactly once, so the cell holds one sender for
-    /// its whole life and is never swapped.
-    tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
     /// The network-owning service. Owns the `networks` map, `peers`, `firewall`,
-    /// `device_user_map`, and `pruned_peers`; Daemon reaches all of them
+    /// `device_user_map`, `pruned_peers`, the DNS service, the TUN name and
+    /// writer cell, and the shutdown token; Daemon reaches all of them
     /// through `self.registry` rather than keeping its own copies. The
     /// daemon delegates coordinator registration / promotion to it, and hands
     /// clones to services (FileService) and control readers (MemberAcceptState)
     /// so they call it directly instead of signalling the daemon over a channel.
     registry: Arc<NetworkRegistry>,
     paired_network_joins: Arc<DashSet<EndpointId>>,
-    shutdown_token: CancellationToken,
     protocol_router: Arc<ProtocolRouter>,
-    /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
-    /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
-    dns: Arc<DnsService>,
     mdns: Arc<MdnsDiscovery>,
     /// Whether this node opted into automatic stable updates
     /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
     /// back in `ray status`.
     auto_update: bool,
-    /// Name of the OS TUN device (desktop) or a placeholder until a packet
-    /// interface is attached. Interior-mutable because on embedders (mobile) the
-    /// interface is attached after construction via [`Daemon::attach_tun`],
-    /// while on desktop it is set once at boot. `Arc` so [`NetworkRegistry`] shares
-    /// it for the leave/teardown DNS search-domain refresh.
-    tun_name: Arc<ArcSwap<String>>,
     /// Handles for the packet-forwarding tasks spawned by
     /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
@@ -1006,7 +984,7 @@ impl Daemon {
         let started = Instant::now();
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
-        self.shutdown_token.cancel();
+        self.registry.shutdown_token.cancel();
         self.mdns.stop().await;
         self.management.stop_announcements().await;
         // The DNS background tasks run on bare `tokio::spawn`s that observe their
@@ -1014,7 +992,7 @@ impl Daemon {
         // reach them. They also hold an `Arc<DnsService>`, which on an embedder
         // that rebuilds a daemon in the same process keeps the whole dead service
         // alive; see `DnsService::shutdown_background`.
-        self.dns.shutdown_background();
+        self.registry.dns.shutdown_background();
         // Accept handlers hold the registry, which owns the manager they are
         // registered on; drop them so the registry can go with the daemon.
         self.registry.conn.unregister_all();
@@ -1094,23 +1072,23 @@ impl Daemon {
         // `detach_tun`, which dropped the old receiver; swapping in the new sender
         // reconnects every incoming send-site to this writer.
         let (new_tx, new_rx) = mpsc::channel::<Bytes>(256);
-        self.tun_tx.store(Arc::new(new_tx.clone()));
+        self.registry.tun_tx.store(Arc::new(new_tx.clone()));
 
         // A dedicated child token so the data plane can be stopped independently
         // of a full daemon shutdown; it still cancels when `shutdown_token` does.
-        let cancel = self.shutdown_token.child_token();
+        let cancel = self.registry.shutdown_token.child_token();
         let writer_handle = forward::spawn_tun_writer(
             writer,
             new_rx,
             Arc::clone(&self.active),
-            Arc::clone(&self.stats),
+            Arc::clone(&self.transport.stats),
         );
         let mesh_handle = {
             let peers = self.registry.peers.clone();
             let firewall = self.registry.firewall.clone();
             let cancel = cancel.clone();
-            let stats = Arc::clone(&self.stats);
-            let resolver = Arc::clone(&self.dns.resolver);
+            let stats = Arc::clone(&self.transport.stats);
+            let resolver = Arc::clone(&self.registry.dns.resolver);
             // The registry is the forwarding loop's on-demand dial mechanism: when a
             // packet has no live route, the loop asks it to dial the roster member.
             // Present on every node so any peer stays reachable-on-demand after a link
@@ -1118,7 +1096,7 @@ impl Daemon {
             let dialer = Some(Arc::clone(&self.registry));
             let local_ipv6 = self.transport.identity.local_ipv6();
             let fatal = Arc::clone(&self.fatal);
-            let shutdown = self.shutdown_token.clone();
+            let shutdown = self.registry.shutdown_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = (forward::MeshForwarder {
                     tun: reader,
@@ -1157,7 +1135,7 @@ impl Daemon {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             idle_transport: idle_transport::spawn(
                 Arc::clone(&self.registry),
-                self.shutdown_token.child_token(),
+                self.registry.shutdown_token.child_token(),
             ),
         };
         let old = self.tun_tasks.lock().unwrap().replace(new_tasks);
@@ -1169,7 +1147,7 @@ impl Daemon {
         let peers = self.registry.peers.clone();
         for (ip, conn) in peers.all_connections() {
             let peers = peers.clone();
-            let token = self.shutdown_token.clone();
+            let token = self.registry.shutdown_token.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = token.cancelled() => {},
@@ -1239,7 +1217,7 @@ impl Daemon {
     /// upstreams from the system resolver config; Android has none to capture, so
     /// the platform reads the underlying network's DNS servers and passes them in.
     pub fn set_dns_upstreams(&self, servers: Vec<Ipv4Addr>) {
-        self.dns.resolver.set_upstreams(servers);
+        self.registry.dns.resolver.set_upstreams(servers);
     }
 
     /// Point the Magic DNS resolver at explicit `ip:port` upstreams. Android uses
@@ -1247,7 +1225,7 @@ impl Daemon {
     /// lookups honor the system Private DNS (DoT/DoH) rather than being forwarded
     /// as cleartext UDP on port 53.
     pub fn set_dns_upstream_addrs(&self, servers: Vec<SocketAddr>) {
-        self.dns.resolver.set_upstream_addrs(servers);
+        self.registry.dns.resolver.set_upstream_addrs(servers);
     }
 
     // -----------------------------------------------------------------------
@@ -1314,15 +1292,15 @@ impl Daemon {
 
         // Update DNS table: remove old entry for our IP, insert new one.
         dns::remove_hostname_by_ip(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
+            &self.registry.dns.hostname_table,
+            &self.registry.dns.reverse_table,
             network,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
         dns::update_hostname(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
+            &self.registry.dns.hostname_table,
+            &self.registry.dns.reverse_table,
             network,
             &new_hostname,
             derive_ipv6(&self.transport.identity.local_identity()),
@@ -2307,7 +2285,7 @@ pub(crate) mod accept_handler_tests {
             PeerTable::new(),
             Arc::new(ConnectionManager::new()),
             dns,
-            Arc::new(ArcSwap::from_pointee(String::from("test"))),
+            Arc::new(arc_swap::ArcSwap::from_pointee(String::from("test"))),
             None,
             CancellationToken::new(),
             SharedFirewall::new(firewall::FirewallConfig::default()),
@@ -5574,6 +5552,7 @@ mod headless_tests {
         // and DNS-injection paths use, then wait for the given writer to see it.
         async fn send_pkt(daemon: &Arc<DaemonState>, pkt: &'static [u8]) {
             daemon
+                .registry
                 .tun_tx
                 .load_full()
                 .send(Bytes::from_static(pkt))

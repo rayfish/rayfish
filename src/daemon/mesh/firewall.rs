@@ -603,7 +603,7 @@ impl Daemon {
         #[cfg(feature = "desktop")]
         if enabled
             && let Some(warning) = {
-                let tun_name = self.tun_name.load().as_str().to_owned();
+                let tun_name = self.registry.tun_name.load().as_str().to_owned();
                 let port = crate::forward::SSH_LISTEN_PORT;
                 let probe =
                     move || crate::hostfw::ensure_inbound_tcp(&tun_name, port).warning(port);
@@ -666,7 +666,7 @@ impl Daemon {
         #[cfg(all(target_os = "macos", feature = "desktop"))]
         if self.active.load(Ordering::SeqCst) {
             if enabled {
-                let tun = self.tun_name.load().as_str().to_owned();
+                let tun = self.registry.tun_name.load().as_str().to_owned();
                 if let Err(e) = crate::hostfw::install_tun_passthrough(&tun) {
                     return op_err(format!("failed to load the pf passthrough anchor: {e:#}"));
                 }

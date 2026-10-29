@@ -168,10 +168,12 @@ pub(crate) struct NetworkRegistry {
     /// network's accept handler (coordinator promotion) or unregister it on
     /// teardown directly.
     pub(crate) conn: Arc<ConnectionManager>,
-    /// Magic-DNS service, to clear a torn-down network's `.ray` entries.
+    /// Magic DNS service: naming tables, resolver, and OS-DNS configurator.
     pub(crate) dns: Arc<DnsService>,
-    /// The TUN interface name, shared with the daemon (which sets it once the TUN
-    /// is up), for refreshing DNS search domains after a network is torn down.
+    /// Name of the OS TUN device (desktop) or a placeholder until a packet
+    /// interface is attached. Interior-mutable because on embedders (mobile) the
+    /// interface is attached after construction via [`Daemon::attach_tun`],
+    /// while on desktop it is set once at boot.
     pub(crate) tun_name: Arc<ArcSwap<String>>,
     /// This device's cert as last read from disk (seeded at boot), the
     /// in-memory fallback for the paired check when the on-disk cert read
@@ -183,7 +185,13 @@ pub(crate) struct NetworkRegistry {
     pub(crate) firewall: SharedFirewall,
     /// Transport-key -> user-identity map.
     pub(crate) device_user_map: peers::DeviceUserMap,
-    /// Sender to the single TUN writer, threaded into each peer reader.
+    /// Sender half of the current TUN write channel, in a swappable cell.
+    /// [`Daemon::attach_tun`] creates a fresh channel on every attach and stores
+    /// the new sender here, so send-sites (peer readers, DNS injection) always
+    /// resolve the live writer via `tun_tx.load()`. This is what makes the VPN
+    /// off/on toggle work: `detach_tun` stops the writer, and the next
+    /// `attach_tun` swaps in a new sender feeding a fresh writer. On desktop the
+    /// daemon attaches exactly once, so the cell is never swapped.
     pub(crate) tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     /// Peers removed from a network's roster (via `ray kick` or a stale-entry
     /// prune during reconverge), keyed by `(network, transport id)`. A member

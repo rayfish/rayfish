@@ -374,7 +374,7 @@ impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// snapshot the daemon's status (identity, networks, peers).
     pub fn status(&self) -> NodeStatus {
-        let hostname_snapshot = self.dns.hostname_table.try_read().ok();
+        let hostname_snapshot = self.registry.dns.hostname_table.try_read().ok();
         let my_id = self.transport.endpoint.id();
         let saved = config::load().ok();
         // Direct-connection networks are flagged in config; collect their names
@@ -497,10 +497,10 @@ impl Daemon {
             identity: Some(self.registry.own_identity()),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             networks: statuses,
-            packets_rx: self.stats.packets_rx.get(),
-            packets_tx: self.stats.packets_tx.get(),
-            bytes_rx: self.stats.bytes_rx.get(),
-            bytes_tx: self.stats.bytes_tx.get(),
+            packets_rx: self.transport.stats.packets_rx.get(),
+            packets_tx: self.transport.stats.packets_tx.get(),
+            bytes_rx: self.transport.stats.bytes_rx.get(),
+            bytes_tx: self.transport.stats.bytes_tx.get(),
             pending_files: self.files.pending_files.lock().unwrap().len(),
             pending_connects: self.connect.pending_connects.len(),
             connection_errors: {
@@ -735,7 +735,7 @@ impl Daemon {
         let _ = writeln!(sysinfo, "networks: {}", self.registry.networks.len());
 
         // --- metrics.txt ---
-        let snap = self.stats.snapshot(self.start);
+        let snap = self.transport.stats.snapshot(self.start);
         let total_drops: u64 = snap.drops.iter().map(|(_, c)| c).sum();
         let mut metrics = String::new();
         let _ = writeln!(metrics, "packets_rx: {}", snap.packets_rx);

@@ -1274,7 +1274,7 @@ impl Daemon {
         // so these desktop route calls don't apply.
         #[cfg(not(embedded_tun))]
         {
-            let tun_name = self.tun_name.load().as_str().to_owned();
+            let tun_name = self.registry.tun_name.load().as_str().to_owned();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::set_link_up(&tun_name).await {
                 // Not one warning among many. With the link down the kernel
@@ -1384,8 +1384,11 @@ impl Daemon {
         // Clone the TUN name out of the lock before awaiting: the embedder
         // (mobile) stores it behind a mutex, and a std guard can't be held across
         // an await point.
-        let dns_tun_name = self.tun_name.load().as_str().to_owned();
-        self.dns.configure(&dns_tun_name, &mut warnings).await;
+        let dns_tun_name = self.registry.tun_name.load().as_str().to_owned();
+        self.registry
+            .dns
+            .configure(&dns_tun_name, &mut warnings)
+            .await;
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
         // configured port, so it follows the data plane (mesh addresses must be up).
@@ -1472,7 +1475,7 @@ impl Daemon {
         started: tokio::time::Instant,
     ) -> Option<String> {
         let locked = started.elapsed();
-        let tun_name = self.tun_name.load().as_str().to_owned();
+        let tun_name = self.registry.tun_name.load().as_str().to_owned();
         let reload = self.registry.reload_exit_state();
         let reloaded = started.elapsed();
         // Both halves run even if the first one failed: they are independent roles,
@@ -1520,7 +1523,7 @@ impl Daemon {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = daemon.shutdown_token.cancelled() => break,
+                    _ = daemon.registry.shutdown_token.cancelled() => break,
                     _ = daemon.registry.exit_reapply.notified() => {}
                 }
                 if !daemon.active.load(Ordering::SeqCst) {
@@ -1552,7 +1555,7 @@ impl Daemon {
             tick.tick().await;
             loop {
                 tokio::select! {
-                    _ = daemon.shutdown_token.cancelled() => break,
+                    _ = daemon.registry.shutdown_token.cancelled() => break,
                     _ = tick.tick() => {}
                 }
                 if daemon.active.load(Ordering::SeqCst) {
@@ -1579,7 +1582,7 @@ impl Daemon {
         {
             return;
         }
-        let tun_name = self.tun_name.load().as_str().to_owned();
+        let tun_name = self.registry.tun_name.load().as_str().to_owned();
         let port = crate::forward::SSH_LISTEN_PORT;
         if let Ok(Some(warning)) = tokio::task::spawn_blocking(move || {
             crate::hostfw::ensure_inbound_tcp(&tun_name, port).warning(port)
@@ -1616,7 +1619,7 @@ impl Daemon {
             return;
         };
         if check.forward_firewall {
-            let tun_name = self.tun_name.load().as_str().to_owned();
+            let tun_name = self.registry.tun_name.load().as_str().to_owned();
             let _ = tokio::task::spawn_blocking(move || {
                 crate::exit_node::reassert_forward_firewall(&tun_name)
             })
@@ -1653,7 +1656,7 @@ impl Daemon {
         if !serving && using.is_none() {
             return None;
         }
-        let tun_name = self.tun_name.load().as_str().to_owned();
+        let tun_name = self.registry.tun_name.load().as_str().to_owned();
         tokio::task::spawn_blocking(move || {
             if serving {
                 server.refresh_host_interfaces();
@@ -1739,18 +1742,18 @@ impl Daemon {
         // way, and this is the host the mode is for, so it is worth saying.
         #[cfg(target_os = "linux")]
         if over.is_some()
-            && let Some(backend) = self.dns.backend_name()
-            && (backend != "direct-resolv.conf" || self.dns.resolver.defers_off_mesh())
+            && let Some(backend) = self.registry.dns.backend_name()
+            && (backend != "direct-resolv.conf" || self.registry.dns.resolver.defers_off_mesh())
         {
             tracing::warn!(
                 backend,
-                shared_resolv_conf = self.dns.resolver.defers_off_mesh(),
+                shared_resolv_conf = self.registry.dns.resolver.defers_off_mesh(),
                 "IPv6-only full tunnel is up, but non-`.ray` lookups do not reach \
                  rayfish's forwarder on this host, so they still leave over IPv4, \
                  outside the exit node"
             );
         }
-        self.dns.resolver.set_tunnel_upstreams(over);
+        self.registry.dns.resolver.set_tunnel_upstreams(over);
     }
 
     /// Install or remove the client full-tunnel routing to match the selection.
@@ -1856,7 +1859,7 @@ impl Daemon {
         // Re-apply system DNS to match the now-settled full-tunnel state: route
         // *all* DNS through Magic DNS while the tunnel is up (so resolution goes
         // out via the exit), split `.ray`-only otherwise.
-        self.dns.reassert_os_config(tun_name).await;
+        self.registry.dns.reassert_os_config(tun_name).await;
         result
     }
 
@@ -2052,8 +2055,8 @@ impl Daemon {
 
         // Clone the TUN name out of the lock before awaiting (see `activate`);
         // the DnsService reverts system DNS and clears the TUN search domains.
-        let tun_name = self.tun_name.load().as_str().to_owned();
-        self.dns.revert(&tun_name).await;
+        let tun_name = self.registry.tun_name.load().as_str().to_owned();
+        self.registry.dns.revert(&tun_name).await;
 
         #[cfg(target_os = "windows")]
         if let Err(e) = tun::unroute_peer_range(&tun_name).await {
