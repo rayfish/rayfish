@@ -18,15 +18,15 @@ impl Daemon {
             .await
     }
 
-    pub fn list_requests(&self, network: &str) -> IpcMessage {
+    pub fn list_requests(&self, network: &str) -> OpResult<Vec<ipc::PendingRequestInfo>> {
         self.registry.list_requests(network)
     }
 
-    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
+    pub async fn accept_request(&self, network: &str, selector: &str) -> OpResult<Done> {
         self.registry.accept_request(network, selector).await
     }
 
-    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
+    pub fn deny_request(&self, network: &str, selector: &str) -> OpResult<Done> {
         self.registry.deny_request(network, selector)
     }
 }
@@ -267,12 +267,12 @@ impl NetworkRegistry {
         }
     }
 
-    pub fn list_requests(&self, network: &str) -> IpcMessage {
+    pub fn list_requests(&self, network: &str) -> OpResult<Vec<ipc::PendingRequestInfo>> {
         let Some(handle) = self.networks.get(network) else {
-            return ipc_err(format!("network '{network}' not active"));
+            return op_err(format!("network '{network}' not active"));
         };
         if !handle.role.is_coordinator() {
-            return ipc_err(format!(
+            return op_err(format!(
                 "only the coordinator of '{network}' has join requests"
             ));
         }
@@ -287,17 +287,15 @@ impl NetworkRegistry {
                 waiting_secs: pj.requested_at.elapsed().as_secs(),
             })
             .collect();
-        IpcMessage::PendingRequests { requests }
+        Ok(requests)
     }
 
-    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
-        if let Err(e) = self.coordinator_handle(network) {
-            return e.into();
-        }
+    pub async fn accept_request(&self, network: &str, selector: &str) -> OpResult<Done> {
+        self.coordinator_handle(network)?;
         // Find and remove the pending request matching its hostname or id.
         let pending = {
             let Some(handle) = self.networks.get(network) else {
-                return ipc_err(format!("network '{network}' not active"));
+                return op_err(format!("network '{network}' not active"));
             };
             let mut s = handle.state.write().unwrap();
             let found = resolve_named_identity(
@@ -310,19 +308,19 @@ impl NetworkRegistry {
             let found = match found {
                 Ok(found) => found,
                 Err(()) => {
-                    return ipc_err(format!("pending request '{selector}' is ambiguous"));
+                    return op_err(format!("pending request '{selector}' is ambiguous"));
                 }
             };
             found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
         };
         let Some((identity, pj)) = pending else {
-            return ipc_err(format!("no pending request matching '{selector}'"));
+            return op_err(format!("no pending request matching '{selector}'"));
         };
 
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
         let net_pubkey = {
             let Some(handle) = self.networks.get(network) else {
-                return ipc_err(format!("network '{network}' not active"));
+                return op_err(format!("network '{network}' not active"));
             };
             let net_pubkey = handle.network_key;
             let mut s = handle.state.write().unwrap();
@@ -354,15 +352,13 @@ impl NetworkRegistry {
         if !saved {
             message = format!("{message}\n{}", unsaved_snapshot_warning(network));
         }
-        IpcMessage::Ok { message }
+        Ok(Done(message))
     }
 
-    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
-        if let Err(e) = self.coordinator_handle(network) {
-            return e.into();
-        }
+    pub fn deny_request(&self, network: &str, selector: &str) -> OpResult<Done> {
+        self.coordinator_handle(network)?;
         let Some(handle) = self.networks.get(network) else {
-            return ipc_err(format!("network '{network}' not active"));
+            return op_err(format!("network '{network}' not active"));
         };
         let mut s = handle.state.write().unwrap();
         let found = resolve_named_identity(
@@ -377,12 +373,10 @@ impl NetworkRegistry {
                 if let Some(request) = s.pending.get_mut(&id) {
                     request.denied = true;
                 }
-                IpcMessage::Ok {
-                    message: format!("denied {}", id.fmt_short()),
-                }
+                Ok(Done(format!("denied {}", id.fmt_short())))
             }
-            Ok(None) => ipc_err(format!("no pending request matching '{selector}'")),
-            Err(()) => ipc_err(format!("pending request '{selector}' is ambiguous")),
+            Ok(None) => op_err(format!("no pending request matching '{selector}'")),
+            Err(()) => op_err(format!("pending request '{selector}' is ambiguous")),
         }
     }
 }
@@ -445,7 +439,7 @@ mod unsaved_snapshot_tests {
         let revoked = registry.invite_revoke("home", &reusable_id).await;
         assert!(warned(&revoked), "{revoked:?}");
         assert!(state.read().unwrap().reusable_keys[&hash].revoked);
-        let accepted = registry.accept_request("home", &joiner.to_string()).await;
+        let accepted = reply(registry.accept_request("home", &joiner.to_string()).await);
         assert!(warned(&accepted), "{accepted:?}");
         assert!(state.read().unwrap().approved.is_approved(&joiner));
         let suggested = registry

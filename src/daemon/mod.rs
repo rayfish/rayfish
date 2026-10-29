@@ -2945,7 +2945,7 @@ pub(crate) mod accept_handler_tests {
             },
         );
         let reply = connect.reject_connection("tablet");
-        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        assert!(reply.is_ok(), "{reply:?}");
         assert!(connect.pending_connects.is_empty());
         assert!(config::load().unwrap().blocked.is_empty());
         endpoint.close().await;
@@ -3107,7 +3107,7 @@ pub(crate) mod accept_handler_tests {
             },
         );
         let reply = connect.deny_connection("laptop").await;
-        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        assert!(reply.is_ok(), "{reply:?}");
         assert!(connect.pending_connects.is_empty());
         assert_eq!(config::load().unwrap().blocked, vec![requester]);
         endpoint.close().await;
@@ -3252,8 +3252,8 @@ pub(crate) mod accept_handler_tests {
 
     async fn invitations_of(connect: &ConnectService) -> Vec<ipc::InvitationInfo> {
         match connect.list_invitations().await {
-            IpcMessage::InvitationsResponse { invitations } => invitations,
-            other => panic!("expected invitations, got {other:?}"),
+            Ok(invitations) => invitations,
+            Err(e) => panic!("expected invitations, got {e}"),
         }
     }
 
@@ -3330,17 +3330,11 @@ pub(crate) mod accept_handler_tests {
         );
         let invitations = invitations_of(&connect).await;
         let id = invitations[0].id.clone();
-        assert!(matches!(
-            connect.decline_invitation(&id).await,
-            IpcMessage::Ok { .. }
-        ));
+        assert!(connect.decline_invitation(&id).await.is_ok());
         assert_eq!(config::load().unwrap().blocked, vec![sender]);
         let invitations = invitations_of(&connect).await;
         assert_eq!(invitations[0].status, ipc::InvitationStatus::Declined);
-        assert!(matches!(
-            connect.accept_invitation(&id, None).await,
-            IpcMessage::Error { .. }
-        ));
+        assert!(connect.accept_invitation(&id, None).await.is_err());
         endpoint.close().await;
     }
 
@@ -3362,7 +3356,7 @@ pub(crate) mod accept_handler_tests {
         );
         let invitations = invitations_of(&connect).await;
         let reply = connect.accept_invitation(&invitations[0].id, None).await;
-        assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+        assert!(reply.is_err(), "{reply:?}");
         let invitations = invitations_of(&connect).await;
         assert_eq!(invitations[0].status, ipc::InvitationStatus::Pending);
         endpoint.close().await;
@@ -3424,7 +3418,7 @@ pub(crate) mod accept_handler_tests {
             ),
         ] {
             let reply = connect.settle_accept(&entry, Err(OpError::msg(kept))).await;
-            assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
+            assert!(reply.is_err(), "{reply:?}");
             assert_eq!(invitations_of(&connect).await.len(), 1);
         }
         let revoked = Err(OpError::msg(format!(
@@ -3433,7 +3427,7 @@ pub(crate) mod accept_handler_tests {
         )));
         let reply = connect.settle_accept(&entry, revoked).await;
         assert!(
-            matches!(&reply, IpcMessage::Error { message } if message.contains("revoked or has expired")),
+            matches!(&reply, Err(e) if e.message().contains("revoked or has expired")),
             "{reply:?}"
         );
         assert!(invitations_of(&connect).await.is_empty());
@@ -3576,10 +3570,10 @@ pub(crate) mod accept_handler_tests {
         (endpoint, connect)
     }
 
-    fn reply_text(reply: IpcMessage) -> String {
+    fn reply_text(reply: OpResult<Done>) -> String {
         match reply {
-            IpcMessage::Ok { message } => message,
-            other => panic!("expected Ok, got {other:?}"),
+            Ok(Done(message)) => message,
+            Err(e) => panic!("expected Ok, got {e}"),
         }
     }
 
@@ -3641,7 +3635,10 @@ pub(crate) mod accept_handler_tests {
                 .into_message(),
             "no pending delivery"
         );
-        connect.deliver_invite("sample-net", recipient).await;
+        connect
+            .deliver_invite("sample-net", recipient)
+            .await
+            .unwrap();
         // Revoked after the sweep picked it: still nothing new is minted.
         let id = crate::invite::InviteStore::load("sample-net")
             .unwrap()
@@ -4787,11 +4784,7 @@ pub(crate) mod accept_handler_tests {
             },
         );
         for expected in [2, 1, 0] {
-            let IpcMessage::PendingRequests { requests } =
-                daemon.registry.list_requests("test-net")
-            else {
-                panic!("expected pending requests");
-            };
+            let requests = daemon.registry.list_requests("test-net").unwrap();
             assert_eq!(requests.len(), expected);
             let IpcMessage::StatusResponse { networks, .. } = daemon.status() else {
                 panic!("expected status");
@@ -4799,12 +4792,12 @@ pub(crate) mod accept_handler_tests {
             let network = networks.iter().find(|net| net.name == "test-net").unwrap();
             assert_eq!(network.pending_requests, expected);
             if expected > 0 {
-                assert!(matches!(
+                assert!(
                     daemon
                         .registry
-                        .deny_request("test-net", &requests[0].short_id),
-                    IpcMessage::Ok { .. }
-                ));
+                        .deny_request("test-net", &requests[0].short_id)
+                        .is_ok()
+                );
             }
         }
         daemon.shutdown_and_close().await;
@@ -4875,15 +4868,8 @@ pub(crate) mod accept_handler_tests {
                 assert!(matches!(reply, ControlMsg::JoinDenied { .. }), "{reply:?}");
             } else {
                 assert!(matches!(reply, ControlMsg::JoinPending), "{reply:?}");
-                assert!(matches!(
-                    registry.deny_request("test-net", "joining-peer"),
-                    IpcMessage::Ok { .. }
-                ));
-                let IpcMessage::PendingRequests { requests } = registry.list_requests("test-net")
-                else {
-                    panic!("expected pending requests");
-                };
-                assert!(requests.is_empty());
+                assert!(registry.deny_request("test-net", "joining-peer").is_ok());
+                assert!(registry.list_requests("test-net").unwrap().is_empty());
             }
         }
         accepting.abort();

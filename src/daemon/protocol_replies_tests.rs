@@ -23,7 +23,7 @@ async fn protocol_reply_connect_rejection_is_terminal_on_next_poll() {
         } else {
             service.reject_connection("tablet")
         };
-        assert!(matches!(answer, IpcMessage::Ok { .. }), "{answer:?}");
+        assert!(answer.is_ok(), "{answer:?}");
         let server = tokio::spawn({
             let service = Arc::clone(&service);
             let receiver = receiver.clone();
@@ -119,17 +119,17 @@ async fn protocol_reply_declined_delivery_is_recorded_and_stops_polling() {
         }
     });
     let first = service.deliver_invite("sample-net", receiver.id()).await;
-    assert!(matches!(first, IpcMessage::Ok { .. }), "{first:?}");
+    assert!(first.is_ok(), "{first:?}");
     let invitations = invitations_of(&inbox).await;
     let declined = inbox.decline_invitation(&invitations[0].id).await;
-    assert!(matches!(declined, IpcMessage::Ok { .. }), "{declined:?}");
+    assert!(declined.is_ok(), "{declined:?}");
     service.sweep_deliveries(&CancellationToken::new()).await;
     server.await.unwrap();
     let store = crate::invite::InviteStore::load("sample-net").unwrap();
     assert!(store.deliveries_to_check().is_empty());
     assert!(store.list()[0].status.starts_with("refused:"));
     let retry = service.deliver_invite("sample-net", receiver.id()).await;
-    assert!(matches!(retry, IpcMessage::Error { message } if message.contains("refused")));
+    assert!(matches!(retry, Err(e) if e.message().contains("refused")));
     sender.close().await;
     receiver.close().await;
 }

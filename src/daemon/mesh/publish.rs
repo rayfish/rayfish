@@ -629,34 +629,34 @@ pub(crate) async fn update_snapshot_and_publish(
 
 impl Daemon {
     /// `ray connect <identity>`: request a direct connection to that identity.
-    pub async fn connect(&self, peer: &str, hostname: Option<String>) -> IpcMessage {
+    pub async fn connect(&self, peer: &str, hostname: Option<String>) -> OpResult<ConnectOutcome> {
         self.connect.connect(peer, hostname).await
     }
 
     /// `ray connect`: list pending incoming connect requests.
-    pub fn list_connections(&self) -> IpcMessage {
+    pub fn list_connections(&self) -> Vec<ipc::PendingRequestInfo> {
         self.connect.list_connections()
     }
 
     /// Decline a pending connect request: drop it without minting a network or
     /// blocking. The requester's retry loop eventually times out.
-    pub fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
+    pub fn reject_connect(&self, id_prefix: &str) -> OpResult<Done> {
         self.connect.reject_connection(id_prefix)
     }
 
     /// `ray connect approve <id>`: approve a pending connect request, minting
     /// a 2-peer network with the requester pre-approved.
-    pub async fn approve_connection(&self, id_prefix: &str) -> IpcMessage {
+    pub async fn approve_connection(&self, id_prefix: &str) -> OpResult<Done> {
         self.connect.approve_connection(id_prefix).await
     }
 
     /// `ray connect deny <id>`: drop a pending request and block the requester.
-    pub async fn deny_connection(&self, id_prefix: &str) -> IpcMessage {
+    pub async fn deny_connection(&self, id_prefix: &str) -> OpResult<Done> {
         self.connect.deny_connection(id_prefix).await
     }
 
     /// `ray invitations`: invitations received from coordinators.
-    pub async fn list_invitations(&self) -> IpcMessage {
+    pub async fn list_invitations(&self) -> OpResult<Vec<ipc::InvitationInfo>> {
         self.connect.list_invitations().await
     }
 
@@ -665,17 +665,17 @@ impl Daemon {
         &self,
         id: &str,
         hostname: Option<ipc::MachineHostname>,
-    ) -> IpcMessage {
+    ) -> OpResult<JoinOutcome> {
         self.connect.accept_invitation(id, hostname).await
     }
 
     /// `ray invitations decline <id>`.
-    pub async fn decline_invitation(&self, id: &str) -> IpcMessage {
+    pub async fn decline_invitation(&self, id: &str) -> OpResult<Done> {
         self.connect.decline_invitation(id).await
     }
 
     /// Deliver an invite for `network` straight to `recipient`'s identity.
-    pub async fn deliver_invite(&self, network: &str, recipient: EndpointId) -> IpcMessage {
+    pub async fn deliver_invite(&self, network: &str, recipient: EndpointId) -> OpResult<Done> {
         self.connect.deliver_invite(network, recipient).await
     }
 }

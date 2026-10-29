@@ -121,3 +121,45 @@ impl From<CreatedInvite> for IpcMessage {
         }
     }
 }
+
+/// The IPC reply for a result whose value the caller wraps itself, for the
+/// replies that are just a list.
+pub(crate) fn reply_with<T>(result: OpResult<T>, ok: impl FnOnce(T) -> IpcMessage) -> IpcMessage {
+    result.map_or_else(IpcMessage::from, ok)
+}
+
+/// `Err` with `message`, for an operation's early returns.
+pub(crate) fn op_err<T>(message: impl Into<String>) -> OpResult<T> {
+    Err(OpError::msg(message))
+}
+
+/// How `ray connect` ended.
+#[derive(Debug, Clone)]
+pub enum ConnectOutcome {
+    /// The peer approved at once and this node joined the network it minted.
+    Joined(JoinOutcome),
+    /// Waiting for approval, or already connected; the message says which.
+    Done(Done),
+}
+
+impl ConnectOutcome {
+    /// One line for an app to show.
+    pub fn summary(self) -> String {
+        match self {
+            ConnectOutcome::Joined(JoinOutcome::Joined(joined)) => {
+                format!("Connected on {}", joined.name)
+            }
+            ConnectOutcome::Joined(JoinOutcome::Queued(Done(message)))
+            | ConnectOutcome::Done(Done(message)) => message,
+        }
+    }
+}
+
+impl From<ConnectOutcome> for IpcMessage {
+    fn from(outcome: ConnectOutcome) -> Self {
+        match outcome {
+            ConnectOutcome::Joined(joined) => joined.into(),
+            ConnectOutcome::Done(done) => done.into(),
+        }
+    }
+}

@@ -796,29 +796,43 @@ impl Daemon {
             IpcMessage::InviteRevoke { network, id } => {
                 self.registry.invite_revoke(&network, &id).await
             }
-            IpcMessage::Requests { network } => self.registry.list_requests(&network),
-            IpcMessage::AcceptRequest { network, id } => {
-                self.registry.accept_request(&network, &id).await
+            IpcMessage::Requests { network } => {
+                reply_with(self.registry.list_requests(&network), |requests| {
+                    IpcMessage::PendingRequests { requests }
+                })
             }
-            IpcMessage::DenyRequest { network, id } => self.registry.deny_request(&network, &id),
+            IpcMessage::AcceptRequest { network, id } => {
+                reply(self.registry.accept_request(&network, &id).await)
+            }
+            IpcMessage::DenyRequest { network, id } => {
+                reply(self.registry.deny_request(&network, &id))
+            }
             IpcMessage::AdminAdd { network, identity } => {
                 self.registry.admin_add(&network, &identity).await
             }
             IpcMessage::AdminList { network } => self.registry.admin_list(&network),
-            IpcMessage::Connect { peer, hostname } => self.connect(&peer, hostname).await,
-            IpcMessage::Connections => self.list_connections(),
-            IpcMessage::ApproveConnection { id } => self.approve_connection(&id).await,
-            IpcMessage::ConnectDeny { id } => self.connect.deny_connection(&id).await,
-            IpcMessage::Invitations => self.connect.list_invitations().await,
-            IpcMessage::InviteDeliver { network, recipient } => {
+            IpcMessage::Connect { peer, hostname } => reply(self.connect(&peer, hostname).await),
+            IpcMessage::Connections => IpcMessage::PendingRequests {
+                requests: self.list_connections(),
+            },
+            IpcMessage::ApproveConnection { id } => reply(self.approve_connection(&id).await),
+            IpcMessage::ConnectDeny { id } => reply(self.connect.deny_connection(&id).await),
+            IpcMessage::Invitations => {
+                reply_with(self.connect.list_invitations().await, |invitations| {
+                    IpcMessage::InvitationsResponse { invitations }
+                })
+            }
+            IpcMessage::InviteDeliver { network, recipient } => reply(
                 self.connect
                     .deliver_invite(network.as_ref(), recipient)
-                    .await
-            }
+                    .await,
+            ),
             IpcMessage::InvitationAccept { id, hostname } => {
-                self.connect.accept_invitation(&id, hostname).await
+                reply(self.connect.accept_invitation(&id, hostname).await)
             }
-            IpcMessage::InvitationDecline { id } => self.connect.decline_invitation(&id).await,
+            IpcMessage::InvitationDecline { id } => {
+                reply(self.connect.decline_invitation(&id).await)
+            }
             IpcMessage::Ping {
                 peer,
                 count,

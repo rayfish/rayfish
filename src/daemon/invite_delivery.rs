@@ -68,13 +68,15 @@ impl Drop for DeliveryLock<'_> {
 impl ConnectService {
     /// `InviteDeliver`: deliver (or reuse and redeliver) an invite to
     /// `recipient` for `network`.
-    pub(super) async fn deliver_invite(&self, network: &str, recipient: EndpointId) -> IpcMessage {
-        match self.deliver_locked(network, recipient, Mint::Allow).await {
-            Ok(outcome) => IpcMessage::Ok {
-                message: outcome.into_message(),
-            },
-            Err(e) => ipc_err(e.to_string()),
-        }
+    pub(super) async fn deliver_invite(
+        &self,
+        network: &str,
+        recipient: EndpointId,
+    ) -> OpResult<Done> {
+        self.deliver_locked(network, recipient, Mint::Allow)
+            .await
+            .map(|outcome| Done(outcome.into_message()))
+            .map_err(|e| OpError::msg(e.to_string()))
     }
 
     /// One delivery per recipient at a time, so a slow dial to one recipient

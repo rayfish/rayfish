@@ -80,7 +80,7 @@ use rayfish::config::QuicEngine as CoreQuicEngine;
 use rayfish::config::settings::GlobalKey;
 use rayfish::control;
 use rayfish::daemon::transfers;
-use rayfish::daemon::{DaemonState, JoinOutcome, OpError, build_headless};
+use rayfish::daemon::{DaemonState, Done, JoinOutcome, OpError, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
@@ -1152,87 +1152,62 @@ impl Node {
     /// Incoming `ray connect` friend requests waiting for a decision.
     pub fn list_connect_requests(&self) -> Result<Vec<PendingRequest>, RayError> {
         let state = self.state()?;
-        match state.list_connections() {
-            IpcMessage::PendingRequests { requests } => {
-                Ok(requests.into_iter().map(PendingRequest::from).collect())
-            }
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected connections response: {other:?}"
-            ))),
-        }
+        Ok(state
+            .list_connections()
+            .into_iter()
+            .map(PendingRequest::from)
+            .collect())
     }
 
     /// Approve an incoming connect request (mints a direct 2-peer network).
     pub fn approve_connect_request(&self, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.approve_connection(&short_id)),
-            "connections",
-        )
+        self.runtime.block_on(state.approve_connection(&short_id))?;
+        Ok(())
     }
 
     /// Decline an incoming connect request.
     pub fn reject_connect_request(&self, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.reject_connect(&short_id), "connections")
+        state.reject_connect(&short_id)?;
+        Ok(())
     }
 
     /// Decline an incoming connect request and block the requester.
     pub fn block_connect_request(&self, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.deny_connection(&short_id)),
-            "connections",
-        )
+        self.runtime.block_on(state.deny_connection(&short_id))?;
+        Ok(())
     }
 
     /// Ask the user behind `peer` (an identity) for a direct connection. They
     /// must approve it before a private network is created.
     pub fn connect_peer(&self, peer: String, hostname: Option<String>) -> Result<String, RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.connect(peer.trim(), hostname)) {
-            IpcMessage::Ok { message } => Ok(message),
-            IpcMessage::Joined { name, .. } => Ok(format!("Connected on {name}")),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected connect response: {other:?}"
-            ))),
-        }
+        Ok(self
+            .runtime
+            .block_on(state.connect(peer.trim(), hostname))?
+            .summary())
     }
 
     /// Invitations coordinators delivered to this node, newest state included.
     pub fn list_invitations(&self) -> Result<Vec<Invitation>, RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.list_invitations()) {
-            IpcMessage::InvitationsResponse { invitations } => {
-                Ok(invitations.into_iter().map(Invitation::from).collect())
-            }
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected invitations response: {other:?}"
-            ))),
-        }
+        let invitations = self.runtime.block_on(state.list_invitations())?;
+        Ok(invitations.into_iter().map(Invitation::from).collect())
     }
 
     /// Join the network an invitation names.
     pub fn accept_invitation(&self, id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.accept_invitation(&id, None)) {
-            IpcMessage::Ok { .. } | IpcMessage::Joined { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected invitation response: {other:?}"
-            ))),
-        }
+        self.runtime.block_on(state.accept_invitation(&id, None))?;
+        Ok(())
     }
 
     pub fn decline_invitation(&self, id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.decline_invitation(&id)),
-            "invitations",
-        )
+        self.runtime.block_on(state.decline_invitation(&id))?;
+        Ok(())
     }
 
     /// Deliver an invite for `network` to `recipient`'s identity. An offline
@@ -1240,16 +1215,10 @@ impl Node {
     pub fn send_invite(&self, network: String, recipient: String) -> Result<String, RayError> {
         let recipient: EndpointId = recipient.trim().parse().map_err(RayError::network)?;
         let state = self.state()?;
-        match self
+        let Done(message) = self
             .runtime
-            .block_on(state.deliver_invite(&network, recipient))
-        {
-            IpcMessage::Ok { message } => Ok(message),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected invite response: {other:?}"
-            ))),
-        }
+            .block_on(state.deliver_invite(&network, recipient))?;
+        Ok(message)
     }
 
     /// Who may send connect requests and invitations, and who is blocked.
@@ -1278,31 +1247,23 @@ impl Node {
     /// Join requests awaiting approval on a network we coordinate.
     pub fn list_join_requests(&self, network: String) -> Result<Vec<PendingRequest>, RayError> {
         let state = self.state()?;
-        match state.list_requests(&network) {
-            IpcMessage::PendingRequests { requests } => {
-                Ok(requests.into_iter().map(PendingRequest::from).collect())
-            }
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected requests response: {other:?}"
-            ))),
-        }
+        let requests = state.list_requests(&network)?;
+        Ok(requests.into_iter().map(PendingRequest::from).collect())
     }
 
     /// Approve a pending join request on a network we coordinate.
     pub fn accept_join_request(&self, network: String, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.accept_request(&network, &short_id)),
-            "requests",
-        )
+        self.runtime
+            .block_on(state.accept_request(&network, &short_id))?;
+        Ok(())
     }
 
     /// Deny a pending join request on a network we coordinate.
     pub fn deny_join_request(&self, network: String, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.deny_request(&network, &short_id), "requests")
+        state.deny_request(&network, &short_id)?;
+        Ok(())
     }
 
     /// Whether this device already holds a device cert (it was paired to a
