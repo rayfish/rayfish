@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use ray_proto::ipc::{IpcMessage, PendingRequestInfo};
 
 use crate::model::{
-    Firewall, PendingItem, PendingKind, Snapshot, Status, config_from_response, words,
+    Firewall, PendingItem, PendingKind, Snapshot, SshState, Status, config_from_response, words,
 };
 
 mod rpc;
@@ -268,6 +268,10 @@ fn snapshot(client: &Client, cancelled: &AtomicBool, start_service: bool) -> Res
         .read(IpcMessage::FirewallShow, cancelled)
         .and_then(Firewall::from_response)
         .map_err(|error| format!("{error:#}"));
+    let ssh = client
+        .read(IpcMessage::FirewallSshShow, cancelled)
+        .and_then(SshState::from_response)
+        .map_err(|error| format!("{error:#}"));
     let mut pending = Vec::new();
     let mut warnings = Vec::new();
     for network in &status.networks {
@@ -378,6 +382,7 @@ fn snapshot(client: &Client, cancelled: &AtomicBool, start_service: bool) -> Res
         status,
         config,
         firewall,
+        ssh,
         pending,
         warnings,
         launch_at_login,

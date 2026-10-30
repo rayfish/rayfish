@@ -11,6 +11,7 @@ use tokio::time::timeout;
 use tun_rs::{AsyncDevice, DeviceBuilder};
 use windows_sys::Win32::UI::Shell::{CSIDL_PROGRAM_FILES, SHGFP_TYPE_CURRENT, SHGetFolderPathW};
 
+use super::super::windows_reconcile_route_script;
 use super::*;
 use crate::membership::derive_ipv6;
 
@@ -79,12 +80,27 @@ struct TestInterface {
 impl TestInterface {
     fn configure_script(&self) -> String {
         let local = quote(&self.local.to_string());
-        let remote = quote(&format!("{}/128", self.remote));
+        let route =
+            windows_reconcile_route_script(&self.alias, &format!("{}/128", self.remote), "::");
         format!(
             "$ErrorActionPreference='Stop'; \
              Set-NetIPInterface -InterfaceIndex {index} -AddressFamily IPv6 -DadTransmits 0 -RouterDiscovery Disabled; \
              New-NetIPAddress -InterfaceIndex {index} -AddressFamily IPv6 -IPAddress {local} -PrefixLength 128 | Out-Null; \
-             New-NetRoute -DestinationPrefix {remote} -InterfaceIndex {index} -NextHop '::' -PolicyStore ActiveStore | Out-Null",
+             {route}",
+            index = self.index,
+        )
+    }
+
+    fn verify_route_script(&self) -> String {
+        let prefix = format!("{}/128", self.remote);
+        let reconcile = windows_reconcile_route_script(&self.alias, &prefix, "::");
+        let prefix = quote(&prefix);
+        format!(
+            "$ErrorActionPreference='Stop'; \
+             Get-NetRoute -InterfaceIndex {index} -DestinationPrefix {prefix} -PolicyStore ActiveStore | Set-NetRoute -RouteMetric 37 | Out-Null; \
+             {reconcile}; {reconcile}; \
+             $routes=@(Get-NetRoute -InterfaceIndex {index} -DestinationPrefix {prefix} -PolicyStore ActiveStore); \
+             if ($routes.Count -ne 1 -or $routes[0].NextHop -ne '::' -or $routes[0].Protocol -ne 'NetMgmt' -or $routes[0].RouteMetric -ne 37) {{ throw 'Route reconciliation replaced a correct owned route or changed its metric.' }}",
             index = self.index,
         )
     }
@@ -255,6 +271,7 @@ async fn windows_kernel_echo_reply_uses_scoped_host_rule() -> Result<()> {
     let result = async {
         ensure!(interface.alias == alias, "the disposable adapter name changed unexpectedly");
         runner.powershell(&interface.configure_script(), "configuring the disposable ICMPv6 route").await?;
+        runner.powershell(&interface.verify_route_script(), "checking route reconciliation preserves its existing metric").await?;
         // An unrelated rule with the same name must survive unchanged.
         runner.powershell(&format!(
             "New-NetFirewallRule -Name {name} -DisplayName 'Rayfish test collision' -Group 'Rayfish test collision' -Direction Inbound -Action Block -Protocol ICMPv6 -IcmpType 128 -InterfaceAlias {alias} -LocalAddress {local} -RemoteAddress '200::/7' -PolicyStore PersistentStore -ErrorAction Stop | Out-Null",

@@ -1,5 +1,8 @@
 //! Rayfish's macOS design expressed as a desktop egui view.
 
+#[path = "ui/ssh.rs"]
+mod ssh;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -10,8 +13,8 @@ use eframe::egui::{
 use ray_proto::ipc::{FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
 use ray_proto::{Action as FirewallAction, FirewallKey, GlobalKey, NodeKey};
 
-use crate::forms::{FormKind, console_args};
-use crate::model::{PendingItem, PendingKind, Snapshot};
+use crate::forms::{FormKind, SshEditor, console_args};
+use crate::model::{PendingItem, PendingKind, Snapshot, SshRule};
 
 const BACKGROUND: Color32 = color(0x18181b);
 const PANEL: Color32 = color(0x1c1c20);
@@ -90,6 +93,7 @@ pub(crate) enum OutputKind {
     Invite,
     Files,
     Firewall,
+    SshAccess,
 }
 
 impl OutputKind {
@@ -99,6 +103,7 @@ impl OutputKind {
             Self::Invite => "Invite code",
             Self::Files => "File transfers",
             Self::Firewall => "Suggested firewall rules",
+            Self::SshAccess => "SSH access",
         }
     }
 
@@ -133,6 +138,8 @@ enum Dialog {
         index: usize,
         rule: Box<FirewallRuleView>,
     },
+    SshEditor(Box<SshEditor>),
+    SshRemove(Box<SshRule>),
     Output,
 }
 
@@ -150,6 +157,9 @@ pub(crate) struct Dashboard {
     joining: Option<String>,
     dialog: Option<Dialog>,
     console: String,
+    advanced_open: bool,
+    focus_ssh: bool,
+    notice_in_ssh: bool,
     logo: TextureHandle,
 }
 
@@ -259,6 +269,9 @@ impl Dashboard {
             joining: None,
             dialog: None,
             console: String::new(),
+            advanced_open: false,
+            focus_ssh: false,
+            notice_in_ssh: false,
             logo,
         })
     }
@@ -300,6 +313,7 @@ impl Dashboard {
 
     pub fn command_finished(&mut self, output: Result<String, String>, kind: Option<OutputKind>) {
         self.joining = None;
+        self.notice_in_ssh = matches!(kind, Some(OutputKind::SshAccess));
         match output {
             Ok(text) => {
                 let text = match kind {
@@ -312,15 +326,27 @@ impl Dashboard {
                     text
                 };
                 self.form_succeeded();
-                self.notice = Some("Done.".into());
+                if self.notice_in_ssh {
+                    self.focus_ssh_settings();
+                }
+                self.notice = Some(if matches!(kind, Some(OutputKind::SshAccess)) {
+                    self.output.clone()
+                } else {
+                    "Done.".into()
+                });
             }
             Err(error) => {
+                if self.notice_in_ssh {
+                    self.focus_ssh_settings();
+                }
                 self.output = error.clone();
                 self.error = Some(error);
                 self.submitted_form = false;
             }
         }
-        if let Some(kind) = kind {
+        if let Some(kind) = kind
+            && !matches!(kind, OutputKind::SshAccess)
+        {
             self.show_output(kind);
         }
     }
@@ -406,7 +432,9 @@ impl Dashboard {
                                         Page::Settings => self.settings(ui, &mut actions),
                                     }
                                 }
-                                if let Some(notice) = &self.notice {
+                                if let Some(notice) = &self.notice
+                                    && !self.notice_in_ssh
+                                {
                                     ui.add_space(14.0);
                                     ui.label(RichText::new(notice).small().color(GREEN));
                                 }
@@ -1162,6 +1190,22 @@ impl Dashboard {
         });
     }
 
+    pub(crate) fn focus_ssh_settings(&mut self) {
+        self.page = Page::Settings;
+        self.focus_ssh = true;
+    }
+
+    #[cfg(any(not(windows), test))]
+    pub(crate) fn preview_ssh_editor(&mut self) {
+        self.page = Page::Settings;
+        let network = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.status.visible_networks().next())
+            .map(|network| network.name.as_str());
+        self.dialog = Some(Dialog::SshEditor(Box::new(SshEditor::new(network))));
+    }
+
     fn settings(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.label(heading("Settings", 17.0));
         card().show(ui, |ui| {
@@ -1222,12 +1266,6 @@ impl Dashboard {
                         "Keep Rayfish up to date.",
                         GlobalKey::AutoUpdate,
                     ),
-                    (
-                        3,
-                        "Mesh SSH",
-                        "Let approved peers sign in using allowed local Windows accounts.",
-                        GlobalKey::Ssh,
-                    ),
                 ] {
                     if index != 0 {
                         rule(ui);
@@ -1262,49 +1300,76 @@ impl Dashboard {
             });
         }
         ui.add_space(10.0);
-        card().show(ui, |ui| {
-            egui::CollapsingHeader::new(heading("Advanced", 15.0)).show(ui, |ui| {
-                ui.label(
-                    RichText::new("Run a ray command. Select output text to copy it.").color(MUTED),
-                );
-                let mut run = false;
-                ui.horizontal(|ui| {
-                    let response = ui.add_sized(
-                        [ui.available_width() - 80.0, 32.0],
-                        egui::TextEdit::singleline(&mut self.console)
-                            .font(font("mono", 12.0))
-                            .hint_text("ray status"),
-                    );
-                    run = (response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                        || button(ui, "Run", Kind::Primary, !self.busy);
-                });
-                if run {
-                    match console_args(&self.console) {
-                        Ok(args) => actions.push(Action::Console(args)),
-                        Err(error) => self.error = Some(error.to_string()),
-                    }
+        self.ssh_settings(ui, actions);
+        ui.add_space(10.0);
+        card()
+            .inner_margin(Margin::symmetric(14, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new(heading(
+                            if self.advanced_open {
+                                "- Advanced"
+                            } else {
+                                "+ Advanced"
+                            },
+                            14.0,
+                        ))
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    self.advanced_open = !self.advanced_open;
                 }
-                if !self.output.is_empty() {
-                    Frame::new()
-                        .fill(DEEP)
-                        .corner_radius(8)
-                        .inner_margin(12)
-                        .show(ui, |ui| {
-                            ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                                ui.add(egui::Label::new(mono(&self.output, 12.0)).selectable(true));
+                if self.advanced_open {
+                    ui.label(
+                        RichText::new("Run a ray command. Select output text to copy it.")
+                            .color(MUTED),
+                    );
+                    let mut run = false;
+                    ui.horizontal(|ui| {
+                        let response = ui.add_sized(
+                            [ui.available_width() - 80.0, 32.0],
+                            egui::TextEdit::singleline(&mut self.console)
+                                .font(font("mono", 12.0))
+                                .hint_text("ray status"),
+                        );
+                        run = (response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                            || button(ui, "Run", Kind::Primary, !self.busy);
+                    });
+                    if run {
+                        match console_args(&self.console) {
+                            Ok(args) => actions.push(Action::Console(args)),
+                            Err(error) => self.error = Some(error.to_string()),
+                        }
+                    }
+                    if !self.output.is_empty() {
+                        Frame::new()
+                            .fill(DEEP)
+                            .corner_radius(8)
+                            .inner_margin(12)
+                            .show(ui, |ui| {
+                                ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(mono(&self.output, 12.0)).selectable(true),
+                                    );
+                                });
                             });
-                        });
-                    if button(ui, "Copy output", Kind::Secondary, true) {
-                        ui.ctx().copy_text(self.output.clone());
+                        if button(ui, "Copy output", Kind::Secondary, true) {
+                            ui.ctx().copy_text(self.output.clone());
+                        }
                     }
                 }
             });
-        });
     }
 
     fn dialog(&mut self, ctx: &Context, actions: &mut Vec<Action>) {
         let firewall_ready = self.firewall_ready();
+        let ssh_ready = self.ssh_ready();
+        let snapshot = self.snapshot.as_deref();
         let firewall_rules = self
             .snapshot
             .as_ref()
@@ -1453,6 +1518,52 @@ impl Dashboard {
                                 actions.push(Action::Run(IpcMessage::FirewallRemove {
                                     index: *index,
                                 }));
+                                close = true;
+                            }
+                            close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
+                        });
+                    }
+                    Dialog::SshEditor(editor) => {
+                        let result =
+                            ssh::editor(ui, editor, snapshot, ssh_ready, self.error.as_deref());
+                        if let Some(request) = result.request {
+                            self.submitted_form = true;
+                            actions.push(Action::ShowResult {
+                                kind: OutputKind::SshAccess,
+                                request,
+                            });
+                        }
+                        close = result.close;
+                    }
+                    Dialog::SshRemove(rule) => {
+                        ui.label(heading("Remove SSH access?", 18.0));
+                        ui.label(
+                            RichText::new(
+                                "Other matching rules can still grant access to this peer.",
+                            )
+                            .color(MUTED),
+                        );
+                        let unchanged = snapshot
+                            .and_then(|snapshot| snapshot.ssh.as_ref().ok())
+                            .is_some_and(|ssh| ssh.rules.contains(rule.as_ref()));
+                        if ssh_ready && !unchanged {
+                            ui.colored_label(
+                                AMBER,
+                                "SSH rules changed. Cancel and select the rule again.",
+                            );
+                        }
+                        ui.add_space(12.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if button(ui, "Remove access", Kind::Danger, ssh_ready && unchanged) {
+                                actions.push(Action::ShowResult {
+                                    kind: OutputKind::SshAccess,
+                                    request: IpcMessage::FirewallSshAllow {
+                                        network: rule.network.clone(),
+                                        peer: rule.peer.clone(),
+                                        users: Vec::new(),
+                                        allow: false,
+                                    },
+                                });
                                 close = true;
                             }
                             close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
@@ -1675,9 +1786,14 @@ fn pending_section(
 fn setting(ui: &mut Ui, title: &str, detail: &str, value: &mut bool, enabled: bool) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
+        let detail_width = (ui.available_width() - 56.0).max(80.0);
         ui.vertical(|ui| {
+            ui.set_max_width(detail_width);
             ui.label(title);
-            ui.label(RichText::new(detail).font(font("body", 14.0)).color(MUTED));
+            ui.add(
+                egui::Label::new(RichText::new(detail).font(font("body", 14.0)).color(MUTED))
+                    .wrap(),
+            );
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let response = ui.add_enabled_ui(enabled, |ui| {
@@ -2075,13 +2191,132 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|(text, _)| text.contains("allowed local Windows accounts"))
+                .any(|(text, _)| text.contains("local accounts below"))
         );
         assert!(
             !labels
                 .iter()
                 .any(|(text, _)| text == "Add rule" || text == "Change inbound")
         );
+    }
+
+    fn ssh_app(ctx: &Context) -> Dashboard {
+        let mut app = Dashboard::new(ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        app.focus_ssh_settings();
+        render(&mut app, ctx);
+        render(&mut app, ctx);
+        app
+    }
+
+    #[test]
+    fn ssh_picker_grants_access_and_reports_warnings_without_commands() {
+        let ctx = Context::default();
+        let mut app = ssh_app(&ctx);
+        assert!(click(&mut app, &ctx, "Add access rule").is_empty());
+        if let Some(Dialog::SshEditor(editor)) = &mut app.dialog {
+            editor.usernames = "local-user".into();
+        } else {
+            panic!("the access editor should open");
+        }
+        assert!(click(&mut app, &ctx, "Choose peer").is_empty());
+        assert!(click(&mut app, &ctx, "All peers on this network").is_empty());
+        let actions = click(&mut app, &ctx, "Save access");
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::ShowResult {
+            kind: OutputKind::SshAccess,
+            request: IpcMessage::FirewallSshAllow { network, peer, users, allow: true },
+        } if network == "example" && peer == "*" && users == &["local-user"]))
+        );
+        app.command_finished(
+            Ok("Saved. Other matching rules can still grant access.".into()),
+            Some(OutputKind::SshAccess),
+        );
+        assert!(app.dialog.is_none());
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text.contains("Other matching rules"))
+        );
+        assert!(!labels.iter().any(
+            |(text, _)| text.contains("Run a ray command") || text.contains("ray firewall ssh")
+        ));
+        assert!(!app.advanced_open);
+    }
+
+    #[test]
+    fn ssh_edit_and_revoke_emit_the_exact_selected_permission_request() {
+        let ctx = Context::default();
+        let mut app = ssh_app(&ctx);
+        assert!(click(&mut app, &ctx, "Edit").is_empty());
+        let Some(Dialog::SshEditor(editor)) = &mut app.dialog else {
+            panic!("edit should open the permission editor");
+        };
+        editor.usernames = "another-local-user".into();
+        let actions = click(&mut app, &ctx, "Save access");
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], Action::ShowResult {
+            request: IpcMessage::FirewallSshAllow { network, peer, users, allow: true }, ..
+        } if network == "example" && peer == "*" && users == &["another-local-user"]));
+        app.command_finished(Ok("Saved.".into()), Some(OutputKind::SshAccess));
+        assert!(click(&mut app, &ctx, "Remove").is_empty());
+        assert!(click(&mut app, &ctx, "Remove access").iter().any(|action| matches!(action,
+            Action::ShowResult { request: IpcMessage::FirewallSshAllow { network, peer, allow: false, .. }, .. }
+                if network == "example" && peer == "*"
+        )));
+    }
+
+    #[test]
+    fn ssh_read_failures_are_not_empty_access_and_block_open_editors() {
+        let ctx = Context::default();
+        let mut app = ssh_app(&ctx);
+        assert!(click(&mut app, &ctx, "Edit").is_empty());
+        app.status_error = Some("Example status read failed.".into());
+        assert!(click(&mut app, &ctx, "Save access").is_empty());
+        app.status_error = None;
+        app.snapshot.as_mut().unwrap().ssh = Err("Example SSH read failed.".into());
+        assert!(click(&mut app, &ctx, "Save access").is_empty());
+        app.dialog = None;
+        app.focus_ssh_settings();
+        render(&mut app, &ctx);
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "SSH access unavailable")
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|(text, _)| text.contains("No peers have SSH access"))
+        );
+        assert!(
+            click(&mut app, &ctx, "Retry SSH access")
+                .iter()
+                .any(|action| matches!(action, Action::Refresh))
+        );
+    }
+
+    #[test]
+    fn ssh_editor_keeps_actions_visible_at_the_minimum_window_size() {
+        let ctx = Context::default();
+        let mut app = ssh_app(&ctx);
+        app.preview_ssh_editor();
+        app.error = Some("Example permission error. ".repeat(30));
+        let size = Vec2::new(820.0, 560.0);
+        render_at(&mut app, &ctx, size);
+        let labels = render_at(&mut app, &ctx, size);
+        for title in ["Save access", "Cancel"] {
+            let pos = labels.iter().find(|(text, _)| text == title).unwrap().1;
+            assert!(
+                pos.y >= 0.0 && pos.y < 530.0 && pos.x < 790.0,
+                "{title} must stay in view: {pos:?}"
+            );
+        }
     }
 
     #[test]

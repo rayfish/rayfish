@@ -4,6 +4,8 @@ use ray_proto::invite::decode_invite_code;
 use ray_proto::ipc::IpcMessage;
 use ray_proto::{Action, Direction, GroupMode, Protocol};
 
+use crate::model::SshRule;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FormKind {
     Create,
@@ -189,6 +191,130 @@ impl FormKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SshAccounts {
+    Specific,
+    NonAdministrator,
+    All,
+}
+
+impl SshAccounts {
+    pub const ALL: [Self; 3] = [Self::Specific, Self::NonAdministrator, Self::All];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Specific => "Specific accounts",
+            Self::NonAdministrator => "Any account except administrators",
+            Self::All => "Any account, including administrators",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SshPeerScope {
+    Specific,
+    All,
+}
+
+pub(crate) struct SshEditor {
+    pub network: String,
+    pub peer: String,
+    pub scope: SshPeerScope,
+    pub accounts: SshAccounts,
+    pub usernames: String,
+    pub original: Option<SshRule>,
+}
+
+impl SshEditor {
+    pub fn new(network: Option<&str>) -> Self {
+        Self {
+            network: network.unwrap_or_default().into(),
+            peer: String::new(),
+            scope: SshPeerScope::Specific,
+            accounts: SshAccounts::Specific,
+            usernames: String::new(),
+            original: None,
+        }
+    }
+
+    pub fn edit(rule: SshRule) -> Self {
+        Self {
+            network: rule.network.clone(),
+            peer: rule.peer.clone(),
+            scope: if rule.peer == "*" {
+                SshPeerScope::All
+            } else {
+                SshPeerScope::Specific
+            },
+            accounts: if rule.users.contains(&"*".to_owned()) {
+                SshAccounts::All
+            } else if rule.users.is_empty() {
+                SshAccounts::NonAdministrator
+            } else {
+                SshAccounts::Specific
+            },
+            usernames: rule
+                .users
+                .iter()
+                .filter(|user| user.as_str() != "*")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            original: Some(rule),
+        }
+    }
+
+    pub fn command(&self) -> Result<IpcMessage> {
+        let network = self.network.trim();
+        if network.is_empty() || network.contains('\0') {
+            bail!("Choose a network.");
+        }
+        let peer = match self.scope {
+            SshPeerScope::All => "*",
+            SshPeerScope::Specific => {
+                let peer = self.peer.trim();
+                if peer.is_empty() || peer.contains('\0') {
+                    bail!("Choose or enter a peer.");
+                }
+                if peer == "*" {
+                    bail!("Choose All peers on this network explicitly to allow every peer.");
+                }
+                peer
+            }
+        };
+        let users = match self.accounts {
+            SshAccounts::All => vec!["*".into()],
+            SshAccounts::NonAdministrator => Vec::new(),
+            SshAccounts::Specific => {
+                let mut users = Vec::new();
+                for name in self
+                    .usernames
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    if name.contains(['*', '\0']) {
+                        bail!("Enter specific local usernames, without wildcards.");
+                    }
+                    if !users.iter().any(|user| user == name) {
+                        users.push(name.to_owned());
+                    }
+                }
+                if users.is_empty() {
+                    bail!("Enter at least one local Windows username.");
+                }
+                users
+            }
+        };
+        Ok(IpcMessage::FirewallSshAllow {
+            network: network.to_owned(),
+            peer: peer.to_owned(),
+            users,
+            allow: true,
+        })
+    }
+}
+
 pub(crate) fn console_args(input: &str) -> Result<Vec<String>> {
     // Parse quotes without consuming Windows path separators. No shell is involved.
     let mut args = Vec::new();
@@ -274,6 +400,46 @@ mod tests {
             FormKind::Join
                 .command(&words(&[&code[..code.len() - 4], ""]), None)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn ssh_grants_require_explicit_peer_and_account_scopes() {
+        let mut editor = SshEditor::new(Some("example"));
+        assert!(editor.command().is_err());
+        editor.peer = "*".into();
+        editor.usernames = "local-user".into();
+        assert!(editor.command().is_err());
+        editor.scope = SshPeerScope::All;
+        assert!(
+            matches!(editor.command().unwrap(), IpcMessage::FirewallSshAllow {
+            peer, users, allow: true, ..
+        } if peer == "*" && users == ["local-user"])
+        );
+        editor.usernames = "*".into();
+        assert!(editor.command().is_err());
+        editor.accounts = SshAccounts::NonAdministrator;
+        assert!(
+            matches!(editor.command().unwrap(), IpcMessage::FirewallSshAllow { users, .. } if users.is_empty())
+        );
+        editor.accounts = SshAccounts::All;
+        assert!(
+            matches!(editor.command().unwrap(), IpcMessage::FirewallSshAllow { users, .. } if users == ["*"])
+        );
+    }
+
+    #[test]
+    fn editing_ssh_access_updates_the_same_scope_and_preserves_local_names() {
+        let mut editor = SshEditor::edit(SshRule {
+            network: "example".into(),
+            peer: "example-peer".into(),
+            users: vec!["local-user".into()],
+        });
+        editor.usernames = " Local User, local-user, Local User ".into();
+        assert!(
+            matches!(editor.command().unwrap(), IpcMessage::FirewallSshAllow {
+            network, peer, users, allow: true,
+        } if network == "example" && peer == "example-peer" && users == ["Local User", "local-user"])
         );
     }
 

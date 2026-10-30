@@ -12,11 +12,13 @@ use ray_proto::ipc::{
 use ray_proto::{Action, Direction, Protocol};
 use serde_json::{Map, json};
 
-use crate::model::{Firewall, PendingCounts, Snapshot, Status};
+use crate::model::{Firewall, PendingCounts, Snapshot, SshRule, SshState, Status};
 use crate::ui::{Dashboard, Page};
 
 pub(crate) enum PreviewState {
     Normal,
+    SshSettings,
+    SshEditor,
     Joining,
     Reconnecting,
     Loading,
@@ -24,13 +26,24 @@ pub(crate) enum PreviewState {
     Stale,
 }
 
-pub(crate) fn run(path: PathBuf, populated: bool, page: Page, state: PreviewState) -> Result<()> {
+pub(crate) fn run(
+    path: PathBuf,
+    populated: bool,
+    page: Page,
+    state: PreviewState,
+    minimum: bool,
+) -> Result<()> {
     let (sender, receiver) = sync_channel(1);
+    let mut options = crate::window::options()?;
+    if minimum {
+        options.viewport = options.viewport.with_inner_size([820.0, 560.0]);
+    }
     eframe::run_native(
         "Rayfish preview",
-        crate::window::options()?,
+        options,
         Box::new(move |cc| {
             let mut dashboard = Dashboard::new(&cc.egui_ctx)?;
+            cc.egui_ctx.style_mut(|style| style.animation_time = 0.0);
             let mut snapshot = fixture(
                 populated || matches!(state, PreviewState::Reconnecting | PreviewState::Stale),
             );
@@ -60,6 +73,12 @@ pub(crate) fn run(path: PathBuf, populated: bool, page: Page, state: PreviewStat
             if matches!(state, PreviewState::Joining) {
                 dashboard.begin_join("workstation".into());
                 dashboard.busy = true;
+            }
+            if matches!(state, PreviewState::SshEditor) {
+                dashboard.preview_ssh_editor();
+            }
+            if matches!(state, PreviewState::SshSettings) {
+                dashboard.focus_ssh_settings();
             }
             Ok(Box::new(Preview {
                 dashboard,
@@ -190,6 +209,19 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
                         suggested_by: None,
                     },
                 ]
+            } else {
+                Vec::new()
+            },
+        }),
+        ssh: Ok(SshState {
+            enabled: true,
+            port: 22,
+            rules: if populated {
+                vec![SshRule {
+                    network: "example".into(),
+                    peer: "*".into(),
+                    users: vec!["local-user".into()],
+                }]
             } else {
                 Vec::new()
             },

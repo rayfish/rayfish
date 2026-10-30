@@ -25,7 +25,12 @@ fn main() {
     if let Some(index) = args.iter().position(|arg| arg == "--preview-screenshot")
         && let Some(path) = args.get(index + 1)
     {
-        let page = if args.iter().any(|arg| arg == "--settings") {
+        let page = if args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--settings" | "--ssh-settings" | "--ssh-editor"
+            )
+        }) {
             ui::Page::Settings
         } else if args.iter().any(|arg| arg == "--firewall") {
             ui::Page::Firewall
@@ -48,9 +53,14 @@ fn main() {
                 preview::PreviewState::Joining
             } else if args.iter().any(|arg| arg == "--reconnecting") {
                 preview::PreviewState::Reconnecting
+            } else if args.iter().any(|arg| arg == "--ssh-editor") {
+                preview::PreviewState::SshEditor
+            } else if args.iter().any(|arg| arg == "--ssh-settings") {
+                preview::PreviewState::SshSettings
             } else {
                 preview::PreviewState::Normal
             },
+            args.iter().any(|arg| arg == "--minimum"),
         ) {
             eprintln!("{error:#}");
             std::process::exit(1);

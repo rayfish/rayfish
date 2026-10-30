@@ -228,10 +228,10 @@ fn render(response: IpcMessage) -> Result<String> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use ray_proto::ipc::InactiveNetwork;
+    use ray_proto::ipc::{InactiveNetwork, SshAllowView};
     use tokio::io::duplex;
 
-    use crate::model::Status;
+    use crate::model::{SshRule, SshState, Status};
 
     use super::*;
 
@@ -510,6 +510,49 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "Example disconnect refused."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ssh_settings_read_uses_typed_ipc_and_preserves_rule_scope() {
+        let (client, server) = duplex(4096);
+        let daemon = async move {
+            let mut connection = ipc::framed(server);
+            assert!(matches!(
+                ipc::recv(&mut connection).await.unwrap(),
+                IpcMessage::FirewallSshShow
+            ));
+            ipc::send(
+                &mut connection,
+                IpcMessage::FirewallSshState {
+                    enabled: true,
+                    port: u16::MAX,
+                    networks: vec![(
+                        "example".into(),
+                        vec![SshAllowView {
+                            peer: "example-peer".into(),
+                            users: vec!["example-user".into()],
+                        }],
+                    )],
+                },
+            )
+            .await
+            .unwrap();
+        };
+        let request =
+            async move { exchange(&mut ipc::framed(client), IpcMessage::FirewallSshShow).await };
+        let (response, ()) = tokio::join!(request, daemon);
+        assert_eq!(
+            SshState::from_response(response.unwrap()).unwrap(),
+            SshState {
+                enabled: true,
+                port: u16::MAX,
+                rules: vec![SshRule {
+                    network: "example".into(),
+                    peer: "example-peer".into(),
+                    users: vec!["example-user".into()],
+                }],
+            }
         );
     }
 

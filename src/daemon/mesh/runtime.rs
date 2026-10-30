@@ -1403,14 +1403,21 @@ impl Daemon {
             // default route.
             // `200::/7` also delivers `dns::MAGIC_DNS_V6`, so the resolver needs
             // no host route of its own.
-            if let Err(e) = tun::route_peer_range(&tun_name).await {
+            #[cfg(not(target_os = "windows"))]
+            let route = tun::route_peer_range(&tun_name).await;
+            #[cfg(target_os = "windows")]
+            let (route, echo_access) = tokio::join!(
+                tun::route_peer_range(&tun_name),
+                tun::ensure_echo_request_access(&tun_name, my_v6),
+            );
+            if let Err(e) = route {
                 let err = format!("{e:#}");
                 tracing::warn!(error = %err, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {err}"));
             }
 
             #[cfg(target_os = "windows")]
-            if let Err(error) = tun::ensure_echo_request_access(&tun_name, my_v6).await {
+            if let Err(error) = echo_access {
                 let error = format!("{error:#}");
                 tracing::warn!(%error, "failed to allow mesh ICMPv6 echo requests");
                 warnings.push(format!(

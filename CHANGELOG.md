@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Windows: manage SSH access below Mesh SSH, with network, peer, and local
+  account choices, plus editing and removal of saved access rules.
 - Windows: a dedicated Firewall page manages mesh rules and inbound/outbound
   defaults. Settings includes a mesh SSH toggle.
 - Windows: embedded mesh SSH supports local-account PowerShell terminals,
@@ -22,6 +24,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Windows: Advanced settings use a compact disclosure row.
 - Windows: the desktop app follows the macOS app's layout, dark theme, fonts,
   and network cards, without requiring WebView2.
 - While an exit node is selected, the LAN, Docker networks and other VPNs stay
@@ -37,6 +40,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- SSH settings report unreadable configuration and controller-managed access
+  instead of showing empty rules or claiming a managed grant was removed.
 - Windows: configure a host firewall rule for mesh ICMPv6 echo requests.
 - Windows: mesh SSH can be enabled through the app and CLI.
 - Coordinators synchronize newer membership before renewing published network
@@ -88,6 +93,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - An exit node no longer forwards unsolicited inbound connections from the
   internet to the clients using it, and clients drop them too.
+
+### Performance
+
+- Windows: Connect combines adapter and route setup, preserves correct routes,
+  and configures the ping firewall rule alongside route setup.
 
 ## [0.5.11] - 2026-10-27
 

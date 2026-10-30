@@ -569,13 +569,19 @@ fn windows_remove_route_script(prefix: &str, index: u32) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> String {
+fn windows_reconcile_route_script(tun_name: &str, prefix: &str, next_hop: &str) -> String {
+    let interface = windows_interface_query_script(tun_name);
+    let prefix = prefix.replace('\'', "''");
+    let next_hop = next_hop.replace('\'', "''");
     format!(
-        "{}; New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -PolicyStore ActiveStore -ErrorAction Stop",
-        windows_remove_route_script(prefix, index),
-        prefix,
-        index,
-        next_hop
+        "$rayfishIndices={interface}; \
+         if ($rayfishIndices.Count -ne 1) {{ throw 'The Windows TUN adapter was not uniquely found.' }}; \
+         $rayfishIndex=[uint32]$rayfishIndices[0]; \
+         $rayfishRoutes=@(Get-NetRoute -AddressFamily IPv6 -InterfaceIndex $rayfishIndex -PolicyStore ActiveStore | Where-Object {{ $_.DestinationPrefix -eq '{prefix}' }}); \
+         if ($rayfishRoutes.Count -ne 1 -or $rayfishRoutes[0].NextHop -ne '{next_hop}' -or $rayfishRoutes[0].Protocol -ne 'NetMgmt') {{ \
+             $rayfishRoutes | Remove-NetRoute -Confirm:$false; \
+             New-NetRoute -DestinationPrefix '{prefix}' -InterfaceIndex $rayfishIndex -NextHop '{next_hop}' -Protocol NetMgmt -PolicyStore ActiveStore -ErrorAction Stop | Out-Null \
+         }}"
     )
 }
 
@@ -819,19 +825,8 @@ pub async fn unroute_peer_range(_tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name).await?;
-    let mut installed = Vec::new();
-    for &(prefix, next_hop) in &WINDOWS_PEER_ROUTES {
-        let result =
-            windows_powershell(&windows_replace_route_script(prefix, index, next_hop)).await;
-        if let Err(error) = result {
-            for previous in installed {
-                let _ = windows_powershell(&windows_remove_route_script(previous, index)).await;
-            }
-            return Err(error);
-        }
-        installed.push(prefix);
-    }
+    let [(prefix, next_hop)] = WINDOWS_PEER_ROUTES;
+    windows_powershell(&windows_reconcile_route_script(tun_name, prefix, next_hop)).await?;
     Ok(())
 }
 
@@ -1339,14 +1334,15 @@ mod tests {
         assert!(remove.contains("-InterfaceIndex 17"));
         assert!(remove.contains("-ErrorAction SilentlyContinue"));
 
-        // Replace is remove-then-add, so re-running it is a no-op rather than a
-        // duplicate route.
-        let replace = super::windows_replace_route_script("200::/7", 17, "::");
-        assert!(replace.starts_with(&remove));
-        assert!(replace.contains("New-NetRoute"));
-        assert!(replace.contains("-DestinationPrefix '200::/7'"));
-        assert!(replace.contains("-NextHop '::'"));
-        assert!(replace.contains("-PolicyStore ActiveStore"));
+        let reconcile = super::windows_reconcile_route_script("O'Brien", "200::/7", "::");
+        assert!(reconcile.contains("Name -eq 'O''Brien'"));
+        assert!(reconcile.contains("$rayfishIndices.Count -ne 1"));
+        assert!(reconcile.contains("$rayfishRoutes.Count -ne 1"));
+        assert!(reconcile.contains(".NextHop -ne '::'"));
+        assert!(reconcile.contains(".Protocol -ne 'NetMgmt'"));
+        assert!(reconcile.contains("-InterfaceIndex $rayfishIndex"));
+        assert!(reconcile.contains("-DestinationPrefix '200::/7'"));
+        assert!(reconcile.contains("-PolicyStore ActiveStore"));
     }
 
     /// `tun-rs` loads Wintun by path, so the wrong name here is a runtime

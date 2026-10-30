@@ -90,6 +90,47 @@ impl Firewall {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshRule {
+    pub network: String,
+    pub peer: String,
+    pub users: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshState {
+    pub enabled: bool,
+    pub port: u16,
+    pub rules: Vec<SshRule>,
+}
+
+impl SshState {
+    pub fn from_response(response: IpcMessage) -> Result<Self> {
+        match response {
+            IpcMessage::FirewallSshState {
+                enabled,
+                port,
+                networks,
+            } => Ok(Self {
+                enabled,
+                port,
+                rules: networks
+                    .into_iter()
+                    .flat_map(|(network, rules)| {
+                        rules.into_iter().map(move |rule| SshRule {
+                            network: network.clone(),
+                            peer: rule.peer,
+                            users: rule.users,
+                        })
+                    })
+                    .collect(),
+            }),
+            IpcMessage::Error { message } => bail!(message),
+            _ => bail!("The daemon returned an unexpected SSH settings response."),
+        }
+    }
+}
+
 pub(crate) fn config_from_response(response: IpcMessage) -> Result<Map<String, Value>> {
     match response {
         IpcMessage::ConfigValues { rows } => Ok(rows
@@ -157,6 +198,7 @@ pub(crate) struct Snapshot {
     pub status: Status,
     pub config: Result<Map<String, Value>, String>,
     pub firewall: Result<Firewall, String>,
+    pub ssh: Result<SshState, String>,
     pub pending: Vec<PendingItem>,
     pub warnings: Vec<String>,
     pub launch_at_login: bool,
@@ -183,6 +225,7 @@ pub(crate) fn words(args: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use ray_proto::ipc::SshAllowView;
     use ray_proto::{Direction, Protocol};
 
     use super::*;
@@ -277,6 +320,82 @@ mod tests {
         .unwrap();
         assert_eq!(config["dns"], "partial");
         assert_eq!(config["mdns"], "on");
+    }
+
+    #[test]
+    fn ssh_settings_keep_networks_accounts_and_configured_port() {
+        let state = SshState::from_response(IpcMessage::FirewallSshState {
+            enabled: true,
+            port: u16::MAX,
+            networks: vec![
+                (
+                    "example".into(),
+                    vec![
+                        SshAllowView {
+                            peer: "*".into(),
+                            users: Vec::new(),
+                        },
+                        SshAllowView {
+                            peer: "example-peer".into(),
+                            users: vec![r".\example-user".into()],
+                        },
+                    ],
+                ),
+                (
+                    "second-example".into(),
+                    vec![SshAllowView {
+                        peer: "example-peer".into(),
+                        users: vec!["*".into()],
+                    }],
+                ),
+            ],
+        })
+        .unwrap();
+        assert!(state.enabled);
+        assert_eq!(state.port, u16::MAX);
+        assert_eq!(
+            state.rules,
+            [
+                SshRule {
+                    network: "example".into(),
+                    peer: "*".into(),
+                    users: Vec::new()
+                },
+                SshRule {
+                    network: "example".into(),
+                    peer: "example-peer".into(),
+                    users: vec![r".\example-user".into()]
+                },
+                SshRule {
+                    network: "second-example".into(),
+                    peer: "example-peer".into(),
+                    users: vec!["*".into()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_ssh_grants_and_failed_reads_remain_distinct() {
+        let state = SshState::from_response(IpcMessage::FirewallSshState {
+            enabled: false,
+            port: u16::MAX,
+            networks: Vec::new(),
+        })
+        .unwrap();
+        assert!(!state.enabled);
+        assert!(state.rules.is_empty());
+        let error = SshState::from_response(IpcMessage::Error {
+            message: "Example SSH settings read failed.".into(),
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Example SSH settings read failed.");
+        let unexpected = SshState::from_response(IpcMessage::PairingTicket {
+            ticket: "example-secret".into(),
+        })
+        .unwrap_err();
+        assert!(unexpected.to_string().contains("unexpected SSH settings"));
+        assert!(!unexpected.to_string().contains("example-secret"));
     }
 
     #[test]
