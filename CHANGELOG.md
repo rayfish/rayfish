@@ -40,6 +40,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: confirmation dialogs stay compact after closing a larger editor.
 - SSH settings report unreadable configuration and controller-managed access
   instead of showing empty rules or claiming a managed grant was removed.
 - Windows: configure a host firewall rule for mesh ICMPv6 echo requests.

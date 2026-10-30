@@ -1441,30 +1441,34 @@ impl Dashboard {
                                 }
                             });
                         ui.add_space(10.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(
-                                ui,
-                                kind.submit_label(),
-                                Kind::Primary,
-                                !self.busy && (*kind != FormKind::Firewall || firewall_ready),
-                            ) {
-                                match kind.command(values, network.as_deref()) {
-                                    Ok(request) => {
-                                        if *kind == FormKind::Join {
-                                            actions.push(Action::Join {
-                                                request,
-                                                hostname: values[1].trim().to_owned(),
-                                            });
-                                        } else {
-                                            self.submitted_form = true;
-                                            actions.push(Action::Run(request));
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), 34.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                if button(
+                                    ui,
+                                    kind.submit_label(),
+                                    Kind::Primary,
+                                    !self.busy && (*kind != FormKind::Firewall || firewall_ready),
+                                ) {
+                                    match kind.command(values, network.as_deref()) {
+                                        Ok(request) => {
+                                            if *kind == FormKind::Join {
+                                                actions.push(Action::Join {
+                                                    request,
+                                                    hostname: values[1].trim().to_owned(),
+                                                });
+                                            } else {
+                                                self.submitted_form = true;
+                                                actions.push(Action::Run(request));
+                                            }
                                         }
+                                        Err(error) => self.error = Some(error.to_string()),
                                     }
-                                    Err(error) => self.error = Some(error.to_string()),
                                 }
-                            }
-                            close = button(ui, "Cancel", Kind::Secondary, true);
-                        });
+                                close = button(ui, "Cancel", Kind::Secondary, true);
+                            },
+                        );
                     }
                     Dialog::Confirm {
                         title,
@@ -1474,20 +1478,24 @@ impl Dashboard {
                         ui.label(heading(title.as_str(), 18.0));
                         ui.label(RichText::new(message.as_str()).color(MUTED));
                         ui.add_space(14.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let enabled = !self.busy
-                                && (firewall_ready
-                                    || request
-                                        .as_deref()
-                                        .is_none_or(|request| !firewall_mutation(request)));
-                            if button(ui, "Confirm", Kind::Danger, enabled)
-                                && let Some(request) = request.take()
-                            {
-                                actions.push(Action::Run(*request));
-                                close = true;
-                            }
-                            close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
-                        });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), 34.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                let enabled = !self.busy
+                                    && (firewall_ready
+                                        || request
+                                            .as_deref()
+                                            .is_none_or(|request| !firewall_mutation(request)));
+                                if button(ui, "Confirm", Kind::Danger, enabled)
+                                    && let Some(request) = request.take()
+                                {
+                                    actions.push(Action::Run(*request));
+                                    close = true;
+                                }
+                                close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
+                            },
+                        );
                     }
                     Dialog::FirewallRemove { index, rule } => {
                         ui.label(heading("Remove firewall rule?", 18.0));
@@ -1513,15 +1521,20 @@ impl Dashboard {
                             );
                         }
                         ui.add_space(14.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(ui, "Confirm", Kind::Danger, firewall_ready && unchanged) {
-                                actions.push(Action::Run(IpcMessage::FirewallRemove {
-                                    index: *index,
-                                }));
-                                close = true;
-                            }
-                            close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
-                        });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), 34.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                if button(ui, "Confirm", Kind::Danger, firewall_ready && unchanged)
+                                {
+                                    actions.push(Action::Run(IpcMessage::FirewallRemove {
+                                        index: *index,
+                                    }));
+                                    close = true;
+                                }
+                                close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
+                            },
+                        );
                     }
                     Dialog::SshEditor(editor) => {
                         let result =
@@ -1553,21 +1566,26 @@ impl Dashboard {
                             );
                         }
                         ui.add_space(12.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(ui, "Remove access", Kind::Danger, ssh_ready && unchanged) {
-                                actions.push(Action::ShowResult {
-                                    kind: OutputKind::SshAccess,
-                                    request: IpcMessage::FirewallSshAllow {
-                                        network: rule.network.clone(),
-                                        peer: rule.peer.clone(),
-                                        users: Vec::new(),
-                                        allow: false,
-                                    },
-                                });
-                                close = true;
-                            }
-                            close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
-                        });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), 34.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                if button(ui, "Remove access", Kind::Danger, ssh_ready && unchanged)
+                                {
+                                    actions.push(Action::ShowResult {
+                                        kind: OutputKind::SshAccess,
+                                        request: IpcMessage::FirewallSshAllow {
+                                            network: rule.network.clone(),
+                                            peer: rule.peer.clone(),
+                                            users: Vec::new(),
+                                            allow: false,
+                                        },
+                                    });
+                                    close = true;
+                                }
+                                close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
+                            },
+                        );
                     }
                     Dialog::Output => {
                         ui.label(heading(self.output_kind.title(), 18.0));
@@ -1575,12 +1593,16 @@ impl Dashboard {
                             ui.add(egui::Label::new(mono(&self.output, 12.0)).selectable(true));
                         });
                         ui.add_space(12.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            close = button(ui, "Done", Kind::Secondary, true);
-                            if button(ui, "Copy", Kind::Primary, true) {
-                                ctx.copy_text(self.output.clone());
-                            }
-                        });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), 34.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                close = button(ui, "Done", Kind::Secondary, true);
+                                if button(ui, "Copy", Kind::Primary, true) {
+                                    ctx.copy_text(self.output.clone());
+                                }
+                            },
+                        );
                     }
                 }
             });
@@ -2268,6 +2290,42 @@ mod tests {
             Action::ShowResult { request: IpcMessage::FirewallSshAllow { network, peer, allow: false, .. }, .. }
                 if network == "example" && peer == "*"
         )));
+    }
+
+    #[test]
+    fn ssh_remove_confirmation_keeps_buttons_next_to_its_message() {
+        for size in [Vec2::new(820.0, 560.0), Vec2::new(1200.0, 1000.0)] {
+            let ctx = Context::default();
+            let mut app = ssh_app(&ctx);
+            let rule = app.snapshot.as_ref().unwrap().ssh.as_ref().unwrap().rules[0].clone();
+            app.preview_ssh_editor();
+            render_at(&mut app, &ctx, size);
+            render_at(&mut app, &ctx, size);
+            app.dialog = Some(Dialog::SshRemove(Box::new(rule)));
+            render_at(&mut app, &ctx, size);
+            let labels = render_at(&mut app, &ctx, size);
+            let title = labels
+                .iter()
+                .find(|(text, _)| text == "Remove SSH access?")
+                .unwrap()
+                .1;
+            let remove = labels
+                .iter()
+                .find(|(text, _)| text == "Remove access")
+                .unwrap()
+                .1;
+            assert!(
+                remove.y - title.y < 120.0,
+                "confirmation has excessive empty space: {title:?}, {remove:?}"
+            );
+            let modal = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("rayfish-dialog")))
+                .unwrap();
+            assert!(
+                modal.height() < 220.0,
+                "confirmation is too tall: {modal:?}"
+            );
+        }
     }
 
     #[test]
