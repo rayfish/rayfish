@@ -12,6 +12,8 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows_firewall;
 #[cfg(target_os = "windows")]
+mod windows_routes;
+#[cfg(target_os = "windows")]
 pub(crate) use windows_firewall::ensure_echo_request_access;
 
 #[cfg(target_os = "linux")]
@@ -34,9 +36,8 @@ use std::net::Ipv6Addr;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
-// Windows drives the interface through PowerShell (`windows_process`), not a
-// synchronous `Command`, so nothing here needs the blocking spawn. Linux does
-// every one of these through netlink and spawns nothing at all.
+// Windows uses bounded subprocesses for interface administration and native
+// IP Helper calls for routes. Linux configures its interface through netlink.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
@@ -527,12 +528,11 @@ fn wintun_library_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("wintun.dll"))
 }
 
-/// The overlay range, routed into the Wintun adapter. IPv6 only: the mesh
-/// carries no IPv4, and `100.64.0.0/10` belongs to whatever else shares the
-/// host. `::` is the on-link next hop, matching the interface-scoped routes the
-/// other platforms install.
+/// The IPv6 overlay routed into the Wintun adapter.
 #[cfg(target_os = "windows")]
-const WINDOWS_PEER_ROUTES: [(&str, &str); 1] = [("200::/7", "::")];
+const WINDOWS_PEER_PREFIX: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0);
+#[cfg(target_os = "windows")]
+const WINDOWS_PEER_PREFIX_LEN: u8 = 7;
 
 #[cfg(target_os = "windows")]
 fn windows_link_args(tun_name: &str, up: bool) -> Option<[String; 5]> {
@@ -549,40 +549,6 @@ fn windows_link_args(tun_name: &str, up: bool) -> Option<[String; 5]> {
         format!("name={tun_name}"),
         "admin=enabled".to_owned(),
     ])
-}
-
-#[cfg(target_os = "windows")]
-fn windows_interface_query_script(tun_name: &str) -> String {
-    let quoted = tun_name.replace('\'', "''");
-    format!(
-        "@(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty ifIndex)",
-        quoted
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn windows_remove_route_script(prefix: &str, index: u32) -> String {
-    format!(
-        "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
-        prefix, index
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn windows_reconcile_route_script(tun_name: &str, prefix: &str, next_hop: &str) -> String {
-    let interface = windows_interface_query_script(tun_name);
-    let prefix = prefix.replace('\'', "''");
-    let next_hop = next_hop.replace('\'', "''");
-    format!(
-        "$rayfishIndices={interface}; \
-         if ($rayfishIndices.Count -ne 1) {{ throw 'The Windows TUN adapter was not uniquely found.' }}; \
-         $rayfishIndex=[uint32]$rayfishIndices[0]; \
-         $rayfishRoutes=@(Get-NetRoute -AddressFamily IPv6 -InterfaceIndex $rayfishIndex -PolicyStore ActiveStore | Where-Object {{ $_.DestinationPrefix -eq '{prefix}' }}); \
-         if ($rayfishRoutes.Count -ne 1 -or $rayfishRoutes[0].NextHop -ne '{next_hop}' -or $rayfishRoutes[0].Protocol -ne 'NetMgmt') {{ \
-             $rayfishRoutes | Remove-NetRoute -Confirm:$false; \
-             New-NetRoute -DestinationPrefix '{prefix}' -InterfaceIndex $rayfishIndex -NextHop '{next_hop}' -Protocol NetMgmt -PolicyStore ActiveStore -ErrorAction Stop | Out-Null \
-         }}"
-    )
 }
 
 /// The overlay range, `200::/7`, as the netlink route the TUN carries.
@@ -811,11 +777,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name).await?;
-    for &(prefix, _) in &WINDOWS_PEER_ROUTES {
-        windows_powershell(&windows_remove_route_script(prefix, index)).await?;
-    }
-    Ok(())
+    windows_routes::remove(tun_name, WINDOWS_PEER_PREFIX, WINDOWS_PEER_PREFIX_LEN).await
 }
 
 #[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
@@ -825,9 +787,7 @@ pub async fn unroute_peer_range(_tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
-    let [(prefix, next_hop)] = WINDOWS_PEER_ROUTES;
-    windows_powershell(&windows_reconcile_route_script(tun_name, prefix, next_hop)).await?;
-    Ok(())
+    windows_routes::ensure(tun_name, WINDOWS_PEER_PREFIX, WINDOWS_PEER_PREFIX_LEN).await
 }
 
 /// The full-tunnel default as two half-space routes per family: `0.0.0.0/1` +
@@ -1011,28 +971,6 @@ async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-async fn windows_powershell(script: &str) -> Result<String> {
-    crate::windows_process::WindowsProcessRunner::default()
-        .powershell(
-            &format!("$ErrorActionPreference='Stop'; {script}"),
-            "run Windows network PowerShell",
-        )
-        .await
-}
-
-#[cfg(target_os = "windows")]
-async fn windows_interface_index(tun_name: &str) -> Result<u32> {
-    let output = windows_powershell(&windows_interface_query_script(tun_name)).await?;
-    anyhow::ensure!(
-        !output.is_empty() && !output.contains('\n'),
-        "Windows TUN adapter {tun_name:?} was not uniquely found"
-    );
-    output
-        .parse()
-        .with_context(|| format!("resolve Windows interface index for {tun_name:?}"))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1309,40 +1247,14 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_interface_query_quotes_powershell_boundaries() {
-        let script = super::windows_interface_query_script("O'Brien");
-        assert!(script.contains("Name -eq 'O''Brien'"));
-        assert!(script.contains("ExpandProperty ifIndex"));
-    }
-
     /// The overlay is IPv6-only. A `100.64.0.0/10` entry here would put a route
     /// for another VPN's range into our adapter.
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_peer_routes_are_the_overlay_range_only() {
-        assert_eq!(super::WINDOWS_PEER_ROUTES, [("200::/7", "::")]);
+        assert_eq!(super::WINDOWS_PEER_PREFIX.to_string(), "200::");
+        assert_eq!(super::WINDOWS_PEER_PREFIX_LEN, 7);
         assert_eq!(super::WINDOWS_TUN_NAME, "rayfish");
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_route_scripts_are_scoped_and_idempotent() {
-        let remove = super::windows_remove_route_script("200::/7", 17);
-        assert!(remove.contains("Remove-NetRoute"));
-        assert!(remove.contains("-InterfaceIndex 17"));
-        assert!(remove.contains("-ErrorAction SilentlyContinue"));
-
-        let reconcile = super::windows_reconcile_route_script("O'Brien", "200::/7", "::");
-        assert!(reconcile.contains("Name -eq 'O''Brien'"));
-        assert!(reconcile.contains("$rayfishIndices.Count -ne 1"));
-        assert!(reconcile.contains("$rayfishRoutes.Count -ne 1"));
-        assert!(reconcile.contains(".NextHop -ne '::'"));
-        assert!(reconcile.contains(".Protocol -ne 'NetMgmt'"));
-        assert!(reconcile.contains("-InterfaceIndex $rayfishIndex"));
-        assert!(reconcile.contains("-DestinationPrefix '200::/7'"));
-        assert!(reconcile.contains("-PolicyStore ActiveStore"));
     }
 
     /// `tun-rs` loads Wintun by path, so the wrong name here is a runtime

@@ -522,7 +522,9 @@ pub struct ForwardCtx {
 /// ([`dns::MAGIC_DNS_V6`]), the only address the resolver answers on and the one
 /// handed to the OS.
 pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
-    info.dst_port == 53 && info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6)
+    matches!(info.protocol, 6 | 17)
+        && info.dst_port == 53
+        && info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6)
 }
 
 /// The inputs and shared handles for one TUN forwarding loop.
@@ -741,6 +743,24 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                 });
                 continue; // do not fall through to peer routing
             }
+            if info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6) {
+                if let Some(reply) = dns::packet::build_echo_reply(&pkt, &info) {
+                    tokio::select! {
+                        _ = token.cancelled() => return Ok(()),
+                        result = tun_tx.send(reply) => {
+                            result.map_err(|_| anyhow::anyhow!("TUN writer stopped"))?;
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        protocol = info.protocol,
+                        dst_port = info.dst_port,
+                        icmp_type = info.icmp_type,
+                        "unsupported or invalid packet addressed to local DNS resolver"
+                    );
+                }
+                continue;
+            }
             let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
                 // No live connection to this destination (direct or via the exit peer).
                 // Dial the destination member itself for overlay traffic, or the
@@ -751,7 +771,13 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     reg.resolve_route(dst)
                 });
                 let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
-                    tracing::debug!(dst = %info.dst_ip, "no peer for dst");
+                    tracing::debug!(
+                        dst = %info.dst_ip,
+                        protocol = info.protocol,
+                        dst_port = info.dst_port,
+                        icmp_type = info.icmp_type,
+                        "no peer for dst"
+                    );
                     stats.record_drop(DropReason::NoPeer);
                     continue;
                 };

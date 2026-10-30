@@ -984,6 +984,9 @@ pub struct Daemon {
     /// Whether the VPN is currently active (TUN up, networks connected) or on
     /// standby. Toggled by the `Up`/`Down` IPC commands.
     active: Arc<AtomicBool>,
+    /// Windows Up/Down must not race route setup against standby cleanup.
+    #[cfg(windows)]
+    data_plane_lifecycle: AsyncMutex<()>,
     /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
     /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
     /// changes without restart. See [`crate::ssh`]. Desktop-only: the embedded

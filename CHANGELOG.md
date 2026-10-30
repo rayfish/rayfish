@@ -40,6 +40,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: failed mesh route setup leaves the VPN on standby and reports an
+  error instead of claiming it connected. Disconnect waits for DNS cleanup.
+- Magic DNS answers valid IPv6 ping probes locally instead of trying to find
+  a network peer for its resolver address.
 - Windows: confirmation dialogs stay compact after closing a larger editor.
 - SSH settings report unreadable configuration and controller-managed access
   instead of showing empty rules or claiming a managed grant was removed.
@@ -97,6 +101,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Performance
 
+- Windows: mesh route setup uses the native routing API instead of PowerShell.
 - Windows: Connect combines adapter and route setup, preserves correct routes,
   and configures the ping firewall rule alongside route setup.
 

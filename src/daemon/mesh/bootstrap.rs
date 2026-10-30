@@ -812,6 +812,8 @@ async fn build_daemon_inner(
         management,
         device_cert,
         active: Arc::clone(&active),
+        #[cfg(windows)]
+        data_plane_lifecycle: AsyncMutex::new(()),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
         #[cfg(feature = "desktop")]

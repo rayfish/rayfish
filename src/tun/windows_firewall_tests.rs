@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tun_rs::{AsyncDevice, DeviceBuilder};
 use windows_sys::Win32::UI::Shell::{CSIDL_PROGRAM_FILES, SHGFP_TYPE_CURRENT, SHGetFolderPathW};
 
-use super::super::windows_reconcile_route_script;
+use super::super::windows_routes;
 use super::*;
 use crate::membership::derive_ipv6;
 
@@ -80,28 +80,47 @@ struct TestInterface {
 impl TestInterface {
     fn configure_script(&self) -> String {
         let local = quote(&self.local.to_string());
-        let route =
-            windows_reconcile_route_script(&self.alias, &format!("{}/128", self.remote), "::");
         format!(
             "$ErrorActionPreference='Stop'; \
              Set-NetIPInterface -InterfaceIndex {index} -AddressFamily IPv6 -DadTransmits 0 -RouterDiscovery Disabled; \
-             New-NetIPAddress -InterfaceIndex {index} -AddressFamily IPv6 -IPAddress {local} -PrefixLength 128 | Out-Null; \
-             {route}",
+             New-NetIPAddress -InterfaceIndex {index} -AddressFamily IPv6 -IPAddress {local} -PrefixLength 128 | Out-Null",
             index = self.index,
         )
     }
 
-    fn verify_route_script(&self) -> String {
-        let prefix = format!("{}/128", self.remote);
-        let reconcile = windows_reconcile_route_script(&self.alias, &prefix, "::");
-        let prefix = quote(&prefix);
+    fn prepare_route_repair_script(&self, unrelated: Ipv6Addr) -> String {
+        let segments = self.remote.segments();
+        let gateway = Ipv6Addr::new(
+            0xfe80,
+            0,
+            0,
+            0,
+            segments[4],
+            segments[5],
+            segments[6],
+            segments[7],
+        );
         format!(
             "$ErrorActionPreference='Stop'; \
              Get-NetRoute -InterfaceIndex {index} -DestinationPrefix {prefix} -PolicyStore ActiveStore | Set-NetRoute -RouteMetric 37 | Out-Null; \
-             {reconcile}; {reconcile}; \
-             $routes=@(Get-NetRoute -InterfaceIndex {index} -DestinationPrefix {prefix} -PolicyStore ActiveStore); \
-             if ($routes.Count -ne 1 -or $routes[0].NextHop -ne '::' -or $routes[0].Protocol -ne 'NetMgmt' -or $routes[0].RouteMetric -ne 37) {{ throw 'Route reconciliation replaced a correct owned route or changed its metric.' }}",
+             New-NetRoute -InterfaceIndex {index} -DestinationPrefix {prefix} -NextHop {gateway} -RouteMetric 81 -PolicyStore ActiveStore | Out-Null; \
+             New-NetRoute -InterfaceIndex {index} -DestinationPrefix {unrelated} -NextHop '::' -RouteMetric 41 -PolicyStore ActiveStore | Out-Null",
             index = self.index,
+            prefix = quote(&format!("{}/128", self.remote)),
+            gateway = quote(&gateway.to_string()),
+            unrelated = quote(&format!("{unrelated}/128")),
+        )
+    }
+
+    fn verify_route_script(&self, unrelated: Ipv6Addr) -> String {
+        format!(
+            "$ErrorActionPreference='Stop'; $routes=@(Get-NetRoute -InterfaceIndex {index} -DestinationPrefix {prefix} -PolicyStore ActiveStore); \
+             if ($routes.Count -ne 1 -or $routes[0].NextHop -ne '::' -or $routes[0].Protocol -ne 'NetMgmt' -or $routes[0].RouteMetric -ne 37) {{ throw 'Native route reconciliation changed the route or its metric.' }}; \
+             $other=@(Get-NetRoute -InterfaceIndex {index} -DestinationPrefix {unrelated} -PolicyStore ActiveStore); \
+             if ($other.Count -ne 1 -or $other[0].RouteMetric -ne 41) {{ throw 'Native route reconciliation modified another prefix.' }}",
+            index = self.index,
+            prefix = quote(&format!("{}/128", self.remote)),
+            unrelated = quote(&format!("{unrelated}/128")),
         )
     }
 
@@ -271,7 +290,13 @@ async fn windows_kernel_echo_reply_uses_scoped_host_rule() -> Result<()> {
     let result = async {
         ensure!(interface.alias == alias, "the disposable adapter name changed unexpectedly");
         runner.powershell(&interface.configure_script(), "configuring the disposable ICMPv6 route").await?;
-        runner.powershell(&interface.verify_route_script(), "checking route reconciliation preserves its existing metric").await?;
+        windows_routes::ensure(&interface.alias, interface.remote, 128).await?;
+        let unrelated = derive_ipv6(&SecretKey::generate().public());
+        ensure!(unrelated != interface.remote && unrelated != interface.local, "the generated route fixtures collided");
+        runner.powershell(&interface.prepare_route_repair_script(unrelated), "preparing disposable native route repair fixtures").await?;
+        windows_routes::ensure(&interface.alias, interface.remote, 128).await?;
+        windows_routes::ensure(&interface.alias, interface.remote, 128).await?;
+        runner.powershell(&interface.verify_route_script(unrelated), "checking native route scope and existing metric").await?;
         // An unrelated rule with the same name must survive unchanged.
         runner.powershell(&format!(
             "New-NetFirewallRule -Name {name} -DisplayName 'Rayfish test collision' -Group 'Rayfish test collision' -Direction Inbound -Action Block -Protocol ICMPv6 -IcmpType 128 -InterfaceAlias {alias} -LocalAddress {local} -RemoteAddress '200::/7' -PolicyStore PersistentStore -ErrorAction Stop | Out-Null",

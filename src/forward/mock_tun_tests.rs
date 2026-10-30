@@ -11,6 +11,7 @@ use crate::tun::{TUN_MTU, TunRead, TunWrite, UnreadablePacket};
 use futures::FutureExt;
 use iroh::Endpoint;
 use iroh::endpoint::{QuicTransportConfig, presets};
+use simple_dns::{CLASS, Name, Packet, QTYPE, Question, RCODE, TYPE};
 use smol_str::SmolStr;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -381,17 +382,88 @@ fn packet(
         packet[44..46].copy_from_slice(&((len - 40) as u16).to_be_bytes());
         46
     };
-    let mut sum = (len - 40) as u32 + u32::from(proto);
+    let checksum = raw_ipv6_checksum(&packet);
+    let checksum = if checksum == 0 { 0xffff } else { checksum };
+    packet[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
+    Bytes::from(packet)
+}
+
+fn raw_ipv6_checksum(packet: &[u8]) -> u16 {
+    let mut sum = (packet.len() - 40) as u32 + u32::from(packet[6]);
     for bytes in packet[8..40].chunks(2).chain(packet[40..].chunks(2)) {
         sum += u32::from(u16::from_be_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)]));
     }
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    let checksum = !(sum as u16);
-    let checksum = if checksum == 0 { 0xffff } else { checksum };
-    packet[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
-    Bytes::from(packet)
+    !(sum as u16)
+}
+
+#[tokio::test]
+async fn resolver_echo_and_dns_are_answered_locally_without_a_peer() {
+    for engine in ENGINES {
+        let mut h = Harness::new(engine, 0, policy(Action::Deny, vec![])).await;
+        let magic = dns::MAGIC_DNS_V6;
+        let payload = b"\x12\x34\x00\x01resolver-probe";
+        let mut echo = vec![0; 44 + payload.len()];
+        echo[0] = 0x60;
+        let payload_len = u16::try_from(echo.len() - 40).unwrap();
+        echo[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        echo[6] = 58;
+        echo[7] = 64;
+        echo[8..24].copy_from_slice(&h.local_ipv6.octets());
+        echo[24..40].copy_from_slice(&magic.octets());
+        echo[40] = 128;
+        echo[44..].copy_from_slice(payload);
+        let checksum = raw_ipv6_checksum(&echo);
+        echo[42..44].copy_from_slice(&checksum.to_be_bytes());
+        h.inject(Bytes::from(echo)).await;
+        let reply = h.receive_tun().await;
+        let info = firewall::parse_packet_info(&reply).unwrap();
+        assert_eq!(info.src_ip, IpAddr::V6(magic));
+        assert_eq!(info.dst_ip, IpAddr::V6(h.local_ipv6));
+        assert_eq!(info.icmp_type, 129);
+        assert_eq!(&reply[44..], payload);
+        assert_eq!(raw_ipv6_checksum(&reply), 0);
+
+        let mut query = Packet::new_query(123);
+        query.questions.push(Question::new(
+            Name::new("missing.test-network.ray").unwrap(),
+            QTYPE::TYPE(TYPE::AAAA),
+            CLASS::IN.into(),
+            false,
+        ));
+        let body = query.build_bytes_vec().unwrap();
+        let mut udp = packet(17, h.local_ipv6, magic, 50000, 53, 0, 48 + body.len()).to_vec();
+        udp[48..].copy_from_slice(&body);
+        udp[46..48].fill(0);
+        let checksum = raw_ipv6_checksum(&udp);
+        udp[46..48].copy_from_slice(&checksum.to_be_bytes());
+        h.inject(Bytes::from(udp)).await;
+        let reply = h.receive_tun().await;
+        let info = firewall::parse_packet_info(&reply).unwrap();
+        assert_eq!(info.src_port, 53);
+        assert_eq!(info.dst_port, 50000);
+        assert_eq!(raw_ipv6_checksum(&reply), 0);
+        let response = Packet::parse(&reply[48..]).unwrap();
+        assert_eq!(response.id(), query.id());
+        assert_eq!(response.rcode(), RCODE::NameError);
+
+        h.inject(packet(6, h.local_ipv6, magic, 50001, 53, 2, 60))
+            .await;
+        let reply = h.receive_tun().await;
+        let info = firewall::parse_packet_info(&reply).unwrap();
+        assert_eq!(info.src_port, 53);
+        assert_eq!(info.dst_port, 50001);
+        assert_ne!(info.tcp_flags & 0x04, 0, "TCP DNS is explicitly refused");
+        assert_eq!(raw_ipv6_checksum(&reply), 0);
+
+        h.inject(packet(17, h.local_ipv6, magic, 50002, 54, 0, 48))
+            .await;
+        assert_eq!(h.stats.drop_count(DropReason::NoPeer), 0);
+        assert_eq!(h.stats.packets_tx.get(), 0);
+        h.shutdown().await;
+    }
 }
 
 #[tokio::test]

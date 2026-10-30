@@ -1316,15 +1316,16 @@ impl Daemon {
     /// Idempotent: a no-op if already active. Runs entirely inside the
     /// (root) daemon, so the IPC client needs no privileges.
     ///
-    /// Returns `Error` only when the link itself could not be brought up, which
-    /// nothing after it can work around; that path puts the node back on standby
-    /// rather than leaving it half configured. Every other problem comes back as
-    /// an `Ok` carrying warnings.
+    /// Required link or peer-route failures return `Error` after standby cleanup.
+    /// Optional services return `Ok` with warnings. Windows publishes its active
+    /// state only after setup finishes and serializes setup with disconnect.
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// bring the data plane up (mark active, configure Magic DNS). On Android the
     /// packet interface + routes are the `VpnService`'s job, so those desktop
     /// route calls are skipped.
     pub async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
+        #[cfg(windows)]
+        let _lifecycle = self.data_plane_lifecycle.lock().await;
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future
@@ -1343,12 +1344,25 @@ impl Daemon {
             }
         }
 
-        if self.active.swap(true, Ordering::SeqCst) {
+        #[cfg(windows)]
+        let already_active = self.active.load(Ordering::SeqCst);
+        #[cfg(not(windows))]
+        let already_active = self.active.swap(true, Ordering::SeqCst);
+        if already_active {
             return IpcMessage::Ok {
                 message: "already up".to_string(),
             };
         }
 
+        #[cfg(windows)]
+        {
+            publish_activation(&self.active, self.activate_data_plane()).await
+        }
+        #[cfg(not(windows))]
+        self.activate_data_plane().await
+    }
+
+    async fn activate_data_plane(self: &Arc<Self>) -> IpcMessage {
         // Re-resolve every network's signed record now. A battery-powered node
         // polls on a long interval, so a device coming up after a spell on
         // standby would otherwise route from whatever the roster looked like
@@ -1373,18 +1387,15 @@ impl Daemon {
         {
             let tun_name = self.tun_name.load().as_str().to_owned();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
-            if let Err(e) = tun::set_link_up(&tun_name).await {
-                // Not one warning among many. With the link down the kernel
-                // flushes the address assigned below and refuses the connected
-                // route, so every step after this one would report success onto
-                // an interface that cannot carry a packet, and the node would
-                // sit there advertising a data plane it does not have. Undo the
-                // half-built state and stay on standby, which is both true and
-                // what `ray status` will then say.
-                let err = format!("{e:#}");
-                tracing::error!(error = %err, "failed to bring TUN interface up");
-                self.deactivate().await;
-                return ipc_err(format!("failed to bring the TUN interface up: {err}"));
+            if let Err(response) = require_tun_setup(
+                &self.active,
+                tun::set_link_up(&tun_name).await,
+                "failed to bring the TUN interface up",
+                self.deactivate_data_plane(),
+            )
+            .await
+            {
+                return ipc_err(response);
             }
 
             // Linux drops the TUN's global IPv6 address whenever the link goes
@@ -1410,10 +1421,15 @@ impl Daemon {
                 tun::route_peer_range(&tun_name),
                 tun::ensure_echo_request_access(&tun_name, my_v6),
             );
-            if let Err(e) = route {
-                let err = format!("{e:#}");
-                tracing::warn!(error = %err, "failed to route 200::/7 into TUN");
-                warnings.push(format!("failed to route IPv6 peer range into TUN: {err}"));
+            if let Err(response) = require_tun_setup(
+                &self.active,
+                route,
+                "failed to route IPv6 peer range into TUN",
+                self.deactivate_data_plane(),
+            )
+            .await
+            {
+                return ipc_err(response);
             }
 
             #[cfg(target_os = "windows")]
@@ -2155,12 +2171,20 @@ impl Daemon {
     /// live so the node remains online to peers and keeps receiving roster/blob
     /// updates. Connections are dropped only on leave/nuke/shutdown. Idempotent.
     pub(crate) async fn deactivate(&self) -> IpcMessage {
+        #[cfg(windows)]
+        let _lifecycle = self.data_plane_lifecycle.lock().await;
         if !self.active.swap(false, Ordering::SeqCst) {
             return IpcMessage::Ok {
                 message: "already on standby".into(),
             };
         }
 
+        self.deactivate_data_plane().await
+    }
+
+    // Also called while activation is still inactive. Rollback must always
+    // undo partial setup, without reacquiring the Windows lifecycle lock.
+    async fn deactivate_data_plane(&self) -> IpcMessage {
         if crate::instance::is_rootless() {
             return IpcMessage::Ok {
                 message: "rootless userspace networking on standby".into(),
@@ -2251,6 +2275,39 @@ impl Daemon {
     pub async fn leave_network(&self, name: &str) -> IpcMessage {
         self.registry.leave_network(name).await
     }
+}
+
+/// Required setup failures close the forwarding gate before rollback begins.
+#[cfg(any(not(embedded_tun), test))]
+async fn require_tun_setup(
+    active: &AtomicBool,
+    outcome: Result<()>,
+    operation: &'static str,
+    cleanup: impl Future<Output = IpcMessage>,
+) -> Result<(), String> {
+    if let Err(error) = outcome {
+        active.store(false, Ordering::SeqCst);
+        let mut message = format!("{operation}: {error:#}");
+        tracing::error!(%error, operation, "required TUN setup failed");
+        if let IpcMessage::Error {
+            message: cleanup_error,
+        } = cleanup.await
+        {
+            message.push_str(&format!("; standby cleanup also failed: {cleanup_error}"));
+        }
+        return Err(message);
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+async fn publish_activation(
+    active: &AtomicBool,
+    setup: impl Future<Output = IpcMessage>,
+) -> IpcMessage {
+    let outcome = setup.await;
+    active.store(matches!(outcome, IpcMessage::Ok { .. }), Ordering::SeqCst);
+    outcome
 }
 
 /// Run [`ExitServer::apply_os`](crate::exit_node::ExitServer::apply_os) on the
@@ -2664,3 +2721,7 @@ mod pending_join_resume_tests {
         assert!(reply.is_closed());
     }
 }
+
+#[cfg(test)]
+#[path = "activation_tests.rs"]
+mod activation_tests;

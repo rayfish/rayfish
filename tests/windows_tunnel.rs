@@ -2,7 +2,10 @@
 #![cfg(all(windows, feature = "desktop"))]
 
 use std::ffi::OsStr;
+use std::io::Error as IoError;
+use std::mem::size_of_val;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
+use std::ptr::{null, null_mut};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -14,6 +17,11 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::time::timeout;
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    ICMPV6_ECHO_REPLY_LH, Icmp6CreateFile, Icmp6SendEcho2, IcmpCloseHandle,
+};
+use windows_sys::Win32::Networking::WinSock::{AF_INET6, IN6_ADDR, IN6_ADDR_0, SOCKADDR_IN6};
 
 const IPC_DEADLINE: Duration = Duration::from_secs(90);
 const DNS_DEADLINE: Duration = Duration::from_secs(10);
@@ -130,6 +138,69 @@ fn query_through_windows_tunnel(address: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
+fn ping_magic_dns(address: Ipv6Addr) -> Result<()> {
+    let socket_address = |ip: Ipv6Addr| SOCKADDR_IN6 {
+        sin6_family: AF_INET6,
+        sin6_addr: IN6_ADDR {
+            u: IN6_ADDR_0 { Byte: ip.octets() },
+        },
+        ..Default::default()
+    };
+    let source = socket_address(address);
+    let destination = socket_address(MAGIC_DNS_V6);
+    let payload = b"resolver-probe";
+    // Aligned storage for one reply header, payload, and the API's error quote.
+    let mut buffer = [0u64; 128];
+    let buffer_size = u32::try_from(size_of_val(&buffer))?;
+    let payload_size = u16::try_from(payload.len())?;
+    // SAFETY: This call has no pointer parameters and creates an owned ICMP handle.
+    let handle = unsafe { Icmp6CreateFile() };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(IoError::last_os_error()).context("opening the Windows ICMPv6 probe");
+    }
+    // SAFETY: All buffers and socket addresses are valid until this synchronous
+    // call returns. Null event/callback select the bounded five-second wait.
+    let replies = unsafe {
+        Icmp6SendEcho2(
+            handle,
+            null_mut(),
+            None,
+            null(),
+            &source,
+            &destination,
+            payload.as_ptr().cast(),
+            payload_size,
+            null(),
+            buffer.as_mut_ptr().cast(),
+            buffer_size,
+            5000,
+        )
+    };
+    let query_error = (replies == 0).then(IoError::last_os_error);
+    // SAFETY: The probe completed and this code exclusively owns the ICMP handle.
+    let closed = unsafe { IcmpCloseHandle(handle) };
+    if closed == 0 {
+        return Err(IoError::last_os_error()).context("closing the Windows ICMPv6 probe");
+    }
+    if let Some(error) = query_error {
+        return Err(error).context("Magic DNS did not answer Windows ICMPv6 echo");
+    }
+    // SAFETY: A successful synchronous call populated a reply header in aligned
+    // storage whose capacity exceeds ICMPV6_ECHO_REPLY_LH plus the sent payload.
+    let reply = unsafe { buffer.as_ptr().cast::<ICMPV6_ECHO_REPLY_LH>().read() };
+    ensure!(
+        reply.Status == 0,
+        "Windows received an ICMPv6 error instead of a resolver echo reply (status {})",
+        reply.Status
+    );
+    let responder = reply.Address.sin6_addr;
+    ensure!(
+        Ipv6Addr::from(responder.map(u16::from_be)) == MAGIC_DNS_V6,
+        "the resolver echo reply came from another address"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires the installed MSI service on a disposable Windows runner"]
 fn installed_service_routes_magic_dns_packets_through_windows() -> Result<()> {
@@ -166,6 +237,7 @@ fn installed_service_routes_magic_dns_packets_through_windows() -> Result<()> {
             _ => bail!("the installed service did not create the private test network"),
         };
         query_through_windows_tunnel(address)?;
+        ping_magic_dns(address)?;
         ensure!(
             service_pid()? == original_pid,
             "the installed service restarted while processing tunnel packets"

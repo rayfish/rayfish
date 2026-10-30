@@ -14,7 +14,9 @@ use tokio_util::codec::Framed;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// DNS cleanup can outlast one Windows subprocess deadline. Keep waiting for
+// the result instead of reporting a failure while the service is still stopping.
+const DISCONNECT_TIMEOUT: Duration = COMMAND_TIMEOUT;
 const STARTUP_GRACE: Duration = Duration::from_secs(3);
 
 pub(super) struct Client {
@@ -226,6 +228,7 @@ fn render(response: IpcMessage) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
     use std::sync::atomic::AtomicUsize;
 
     use ray_proto::ipc::{InactiveNetwork, SshAllowView};
@@ -510,6 +513,33 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "Example disconnect refused."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn disconnect_waits_for_windows_cleanup_but_remains_bounded() {
+        let cancelled = AtomicBool::new(false);
+        let cleanup = async {
+            sleep(Duration::from_secs(18)).await;
+            Ok::<_, anyhow::Error>(IpcMessage::Ok {
+                message: "VPN on standby".into(),
+            })
+        };
+        let response = checked_request(cleanup, &cancelled, DISCONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(matches!(response, IpcMessage::Ok { .. }));
+        let stalled = checked_request(
+            pending::<Result<IpcMessage>>(),
+            &cancelled,
+            DISCONNECT_TIMEOUT,
+        )
+        .await;
+        assert!(
+            stalled
+                .unwrap_err()
+                .to_string()
+                .contains("did not respond in time")
         );
     }
 
