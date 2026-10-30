@@ -1297,8 +1297,8 @@ pub(crate) enum SshAction {
         /// Peer (hostname / mesh IP / short id) or `*`
         #[arg(add = complete::peers_or_any())]
         peer: String,
-        /// Local unix users this peer may log in as (comma-separated). Omit for
-        /// any non-root user; pass `*` for any user including root.
+        /// Local accounts this peer may log in as (comma-separated). Omit for
+        /// any unprivileged account; pass `*` for any account including administrators.
         #[arg(long = "user", short = 'u', value_delimiter = ',')]
         user: Vec<String>,
     },

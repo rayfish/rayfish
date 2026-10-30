@@ -29,8 +29,8 @@
 //! So joining a public/open network never exposes a local service port to peers.
 //! `ray firewall default allow` flips inbound TCP/UDP back to permissive (the old
 //! behaviour); `ray firewall default deny` restores the secure inbound default.
-//! The outbound default is always `allow` and is not affected by
-//! `ray firewall default`.
+//! The outbound default starts at `allow` and is not affected by
+//! `ray firewall default`. Change it with `ray config set firewall.default-out`.
 //!
 //! Inbound ICMP-allow is **not** a hard-coded special case: a fresh config ships
 //! a seeded, ordinary `allow in icmp` rule (`default_icmp_rule`) that the rule

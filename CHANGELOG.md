@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Windows: a dedicated Firewall page manages mesh rules and inbound/outbound
+  defaults. Settings includes a mesh SSH toggle.
 - Windows: embedded mesh SSH supports local-account PowerShell terminals,
   command execution, and TCP forwarding. SFTP uses the Windows OpenSSH helper
   when installed.
@@ -35,6 +37,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Windows: configure a host firewall rule for mesh ICMPv6 echo requests.
+- Windows: mesh SSH can be enabled through the app and CLI.
 - Coordinators synchronize newer membership before renewing published network
   records, instead of republishing an unchanged stale roster.
 - Saved networks survive older signed roster updates, and fresh joins retain

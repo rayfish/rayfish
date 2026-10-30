@@ -17,6 +17,7 @@ pub(crate) struct Field {
     pub label: &'static str,
     pub choices: &'static [&'static str],
     pub required: bool,
+    pub hint: &'static str,
 }
 
 impl Field {
@@ -25,7 +26,13 @@ impl Field {
             label,
             choices: &[],
             required,
+            hint: "",
         }
+    }
+
+    const fn with_hint(mut self, hint: &'static str) -> Self {
+        self.hint = hint;
+        self
     }
 
     const fn choice(label: &'static str, choices: &'static [&'static str]) -> Self {
@@ -33,6 +40,7 @@ impl Field {
             label,
             choices,
             required: true,
+            hint: "",
         }
     }
 }
@@ -73,12 +81,16 @@ impl FormKind {
         ];
         const RENAME: &[Field] = &[Field::text("This PC's name", true)];
         const FIREWALL: &[Field] = &[
-            Field::choice("Direction", &["in", "out"]),
+            Field::choice("Direction", &["in", "out"])
+                .with_hint("in: traffic to this PC; out: traffic from this PC"),
             Field::choice("Action", &["allow", "deny"]),
             Field::choice("Protocol", &["tcp", "udp", "icmp", "any"]),
-            Field::text("Ports (optional)", false),
-            Field::text("Peer (optional)", false),
-            Field::text("Network (optional)", false),
+            Field::text("Ports (blank means Any)", false)
+                .with_hint("443 or 8000-9000; leave blank for all ports"),
+            Field::text("Peer (blank means Any)", false)
+                .with_hint("Peer name, IP address or identity"),
+            Field::text("Network (blank means Any)", false)
+                .with_hint("Network name; leave blank for every network"),
         ];
         match self {
             Self::Create => CREATE,
@@ -87,6 +99,19 @@ impl FormKind {
             Self::Rename => RENAME,
             Self::Firewall => FIREWALL,
         }
+    }
+
+    pub fn initial_values(self) -> Vec<String> {
+        let mut values = self
+            .fields()
+            .iter()
+            .map(|field| field.choices.first().copied().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        if self == Self::Firewall {
+            // Start with one TCP port instead of an unrestricted allow rule.
+            values[3] = "443".into();
+        }
+        values
     }
 
     pub fn command(self, values: &[String], network: Option<&str>) -> Result<IpcMessage> {
@@ -145,14 +170,21 @@ impl FormKind {
                     .to_owned(),
                 hostname: values[0].trim().to_owned(),
             },
-            Self::Firewall => IpcMessage::FirewallAdd {
-                direction: values[0].parse::<Direction>().map_err(anyhow::Error::msg)?,
-                action: values[1].parse::<Action>().map_err(anyhow::Error::msg)?,
-                protocol: values[2].parse::<Protocol>().map_err(anyhow::Error::msg)?,
-                port: value(3),
-                peer: value(4),
-                network: value(5),
-            },
+            Self::Firewall => {
+                let protocol = values[2].parse::<Protocol>().map_err(anyhow::Error::msg)?;
+                IpcMessage::FirewallAdd {
+                    direction: values[0].parse::<Direction>().map_err(anyhow::Error::msg)?,
+                    action: values[1].parse::<Action>().map_err(anyhow::Error::msg)?,
+                    protocol,
+                    port: if protocol == Protocol::Icmp {
+                        None
+                    } else {
+                        value(3)
+                    },
+                    peer: value(4),
+                    network: value(5),
+                }
+            }
         })
     }
 }
@@ -241,6 +273,65 @@ mod tests {
         assert!(
             FormKind::Join
                 .command(&words(&[&code[..code.len() - 4], ""]), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn firewall_form_starts_with_one_tcp_port_and_blank_any_scopes() {
+        let values = FormKind::Firewall.initial_values();
+        assert_eq!(values, ["in", "allow", "tcp", "443", "", ""]);
+        assert!(matches!(
+            FormKind::Firewall.command(&values, None).unwrap(),
+            IpcMessage::FirewallAdd {
+                direction: Direction::In,
+                action: Action::Allow,
+                protocol: Protocol::Tcp,
+                port: Some(port), peer: None, network: None,
+            } if port == "443"
+        ));
+        assert!(FormKind::Firewall.fields()[4].label.contains("Any"));
+        assert!(FormKind::Firewall.fields()[5].label.contains("Any"));
+    }
+
+    #[test]
+    fn selecting_icmp_does_not_keep_the_tcp_port_filter() {
+        let mut values = FormKind::Firewall.initial_values();
+        values[2] = "icmp".into();
+        assert!(matches!(
+            FormKind::Firewall.command(&values, None).unwrap(),
+            IpcMessage::FirewallAdd {
+                protocol: Protocol::Icmp,
+                port: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn firewall_form_trims_scopes_and_preserves_explicit_ranges() {
+        use crate::model::words;
+        assert!(matches!(
+            FormKind::Firewall.command(&words(&["out", "deny", "udp", " 8000-9000 ", " example-peer ", " example "]), None).unwrap(),
+            IpcMessage::FirewallAdd {
+                direction: Direction::Out, action: Action::Deny, protocol: Protocol::Udp,
+                port: Some(port), peer: Some(peer), network: Some(network),
+            } if port == "8000-9000" && peer == "example-peer" && network == "example"
+        ));
+        assert!(matches!(
+            FormKind::Firewall
+                .command(&words(&["in", "allow", "any", "  ", " ", " "]), None)
+                .unwrap(),
+            IpcMessage::FirewallAdd {
+                port: None,
+                peer: None,
+                network: None,
+                ..
+            }
+        ));
+        assert!(
+            FormKind::Firewall
+                .command(&words(&["in", "allow", "unknown", "", "", ""]), None)
                 .is_err()
         );
     }

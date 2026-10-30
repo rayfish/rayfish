@@ -6,8 +6,10 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 
 use anyhow::{Context, Result};
 use eframe::egui::{self, ViewportCommand};
-use ray_proto::Action;
-use ray_proto::ipc::{InactiveNetwork, NetworkRole, NetworkStatus, PeerState, PeerStatus};
+use ray_proto::ipc::{
+    FirewallRuleView, InactiveNetwork, NetworkRole, NetworkStatus, PeerState, PeerStatus,
+};
+use ray_proto::{Action, Direction, Protocol};
 use serde_json::{Map, json};
 
 use crate::model::{Firewall, PendingCounts, Snapshot, Status};
@@ -151,6 +153,7 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
     config.insert("dns".into(), json!("partial"));
     config.insert("mdns".into(), json!(true));
     config.insert("auto-update".into(), json!(true));
+    config.insert("ssh".into(), json!(true));
     Snapshot {
         status: Status {
             active: true,
@@ -166,7 +169,30 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
         firewall: Ok(Firewall {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
-            rules: Vec::new(),
+            rules: if populated {
+                vec![
+                    FirewallRuleView {
+                        direction: Direction::In,
+                        action: Action::Allow,
+                        protocol: Protocol::Tcp,
+                        port: "443".into(),
+                        peer: "any".into(),
+                        network: "example".into(),
+                        suggested_by: None,
+                    },
+                    FirewallRuleView {
+                        direction: Direction::Out,
+                        action: Action::Deny,
+                        protocol: Protocol::Udp,
+                        port: "8000-9000".into(),
+                        peer: "workstation".into(),
+                        network: "any".into(),
+                        suggested_by: None,
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
         }),
         pending: Vec::new(),
         warnings: Vec::new(),

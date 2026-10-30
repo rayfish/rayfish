@@ -27,6 +27,8 @@ fn main() {
     {
         let page = if args.iter().any(|arg| arg == "--settings") {
             ui::Page::Settings
+        } else if args.iter().any(|arg| arg == "--firewall") {
+            ui::Page::Firewall
         } else if args.iter().any(|arg| arg == "--devices") {
             ui::Page::Devices
         } else {

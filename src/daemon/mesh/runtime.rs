@@ -1409,6 +1409,15 @@ impl Daemon {
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {err}"));
             }
 
+            #[cfg(target_os = "windows")]
+            if let Err(error) = tun::ensure_echo_request_access(&tun_name, my_v6).await {
+                let error = format!("{error:#}");
+                tracing::warn!(%error, "failed to allow mesh ICMPv6 echo requests");
+                warnings.push(format!(
+                    "failed to allow mesh ICMPv6 echo requests: {error}"
+                ));
+            }
+
             // Another interface routing part of `200::/7` wins over ours for
             // that part, and the mesh just looks dead. Say which one. The
             // metric is left alone: lowering it would break the other overlay

@@ -192,6 +192,13 @@ jobs:
           . (Join-Path $env:RUNNER_TEMP 'safe-diagnostics.ps1')
           cargo test -q -p rayfish --test windows_tunnel --locked -- --ignored --nocapture --test-threads=1 2>&1 | ConvertTo-SafeDiagnostic
           if ($LASTEXITCODE -ne 0) { throw 'The installed service did not pass the Windows tunnel packet test.' }
+          $echoLog = Join-Path $env:RUNNER_TEMP 'windows-kernel-echo-test.log'
+          cargo test -q -p rayfish --lib --locked windows_kernel_echo_reply_uses_scoped_host_rule -- --ignored --nocapture --test-threads=1 2>&1 |
+            ConvertTo-SafeDiagnostic | Tee-Object -FilePath $echoLog
+          if ($LASTEXITCODE -ne 0) { throw 'The Windows kernel ICMPv6 echo test failed.' }
+          if (-not (Select-String -LiteralPath $echoLog -Pattern 'test result: ok\. 1 passed; 0 failed;' -Quiet)) {
+            throw 'The Windows kernel ICMPv6 echo test did not execute exactly one test.'
+          }
 
       - name: Collect service failure diagnostics
         if: failure()

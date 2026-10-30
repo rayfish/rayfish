@@ -533,18 +533,6 @@ impl Daemon {
     /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
     /// on its own leaves the node advertising SSH with nothing listening.
     pub fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        // There is no Windows SSH server to start, so turning it on would write
-        // `ssh_enabled = true` and open its port for a listener that never
-        // arrives. Rejected before anything is persisted, so the config and the
-        // firewall stay consistent with what the daemon can actually do.
-        // `off` still goes through, so a config carried over from another
-        // platform can be turned back off here.
-        #[cfg(windows)]
-        if settings::parse_bool(value, false).unwrap_or(false) {
-            return ipc_err(
-                "the embedded SSH server is not available on Windows; nothing was changed",
-            );
-        }
         // The registry parses and writes the field; everything below is the side
         // effects it deliberately does not do.
         let mut parse_err = None;
@@ -898,6 +886,7 @@ fn firewall_set_message(config: &firewall::FirewallConfig, key: FirewallKey) -> 
             if config.reject { "on" } else { "off" }
         ),
         FirewallKey::DefaultIn => format!("inbound default set to {}", config.default_inbound),
+        FirewallKey::DefaultOut => format!("outbound default set to {}", config.default_outbound),
     }
 }
 
@@ -1025,5 +1014,84 @@ mod ssh_user_tests {
     fn only_a_bare_asterisk_is_the_wildcard() {
         let got = normalize_ssh_users(v(&["ro*t", "alice"]));
         assert_eq!(got, v(&["alice", "ro*t"]));
+    }
+}
+
+#[cfg(all(test, windows, feature = "desktop"))]
+mod windows_ssh_config_tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use tokio::time::timeout;
+
+    use super::*;
+
+    struct ConfigEnvironment {
+        previous: Option<OsString>,
+    }
+
+    impl ConfigEnvironment {
+        fn set(directory: &Path) -> Self {
+            let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
+            // SAFETY: Windows environment updates are thread-safe. The shared
+            // test lock serializes config fixtures, and no daemon is running yet.
+            unsafe {
+                std::env::set_var("RAYFISH_CONFIG_DIR", directory);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ConfigEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: The daemon has shut down before this guard is released,
+            // and the shared fixture lock is still held.
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var("RAYFISH_CONFIG_DIR", previous),
+                    None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn windows_ssh_config_dispatch_enables_and_disables() -> Result<()> {
+        // The lock coordinates the temporary process-wide config override; it
+        // protects no daemon I/O and is never acquired by its background tasks.
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let directory = tempfile::tempdir()?;
+        let _environment = ConfigEnvironment::set(directory.path());
+        anyhow::ensure!(
+            config::config_dir_for_read()? == directory.path(),
+            "The daemon fixture must use its temporary config."
+        );
+        let daemon = timeout(Duration::from_secs(30), build_headless(false)).await??;
+        let result = async {
+            // Stay on standby: this tests real request dispatch and persistence
+            // without starting a host listener or changing Windows networking.
+            anyhow::ensure!(!daemon.active.load(Ordering::SeqCst), "The daemon fixture must start on standby.");
+            for (value, enabled) in [("on", true), ("on", true), ("off", false)] {
+                let response = daemon.handle_authorized_request(
+                    IpcMessage::ConfigSet { key: NodeKey::Global(GlobalKey::Ssh), value: value.into(), replace: false },
+                    None,
+                    Vec::new(),
+                ).await;
+                anyhow::ensure!(matches!(response, IpcMessage::Ok { .. }), "The Windows daemon rejected SSH {value}: {response:?}");
+                anyhow::ensure!(config::load()?.ssh_enabled == enabled, "SSH {value} did not persist its setting.");
+                let state = daemon.handle_authorized_request(IpcMessage::FirewallSshShow, None, Vec::new()).await;
+                anyhow::ensure!(matches!(state, IpcMessage::FirewallSshState { enabled: actual, .. } if actual == enabled), "SSH status does not reflect the settings request.");
+                let managed = |rules: &[firewall::FirewallRule]| rules.iter().filter(|rule| rule.origin == firewall::RuleOrigin::Ssh).count();
+                anyhow::ensure!(managed(&daemon.registry.firewall.get_config().rules) == usize::from(enabled), "SSH {value} did not update its live passthrough rule.");
+                anyhow::ensure!(managed(&firewall::load_firewall()?.rules) == usize::from(enabled), "SSH {value} did not persist its passthrough rule.");
+                anyhow::ensure!(daemon.ssh_token.lock().unwrap_or_else(|error| error.into_inner()).is_none(), "Standby SSH settings must not start a listener.");
+            }
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        daemon.shutdown_and_close().await;
+        result
     }
 }

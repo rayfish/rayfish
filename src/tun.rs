@@ -9,6 +9,10 @@
 mod apple;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows_firewall;
+#[cfg(target_os = "windows")]
+pub(crate) use windows_firewall::ensure_echo_request_access;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{overlay_route_warnings, spawn_repair_watcher};
@@ -259,6 +263,9 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
         Ok(())
     })?;
 
+    #[cfg(target_os = "windows")]
+    let tun_name = device.name().context("read Windows TUN adapter name")?;
+    #[cfg(not(target_os = "windows"))]
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
     #[cfg(target_os = "linux")]
     tracing::info!(

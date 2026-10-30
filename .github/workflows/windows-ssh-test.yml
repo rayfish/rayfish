@@ -73,6 +73,13 @@ jobs:
           $code = $LASTEXITCODE
           Get-Content -LiteralPath $log | ForEach-Object { ConvertTo-SafeSshDiagnostic $_ }
           if ($code -ne 0) { throw 'The native listener reservation test failed.' }
+          & cargo test -q -p rayfish --lib --locked 'windows_ssh_config_dispatch_enables_and_disables' -- --test-threads=1 1> $log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log | ForEach-Object { ConvertTo-SafeSshDiagnostic $_ }
+          if ($code -ne 0) { throw 'The Windows daemon SSH settings dispatch test failed.' }
+          if (-not (Select-String -LiteralPath $log -Pattern 'test result: ok\. 1 passed; 0 failed;' -Quiet)) {
+            throw 'The Windows daemon SSH settings dispatch regression did not execute.'
+          }
 
       - name: Build native library test executable
         shell: pwsh

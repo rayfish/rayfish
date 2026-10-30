@@ -7,7 +7,7 @@ use eframe::egui::{
     self, Align, Color32, Context, FontData, FontDefinitions, FontFamily, FontId, Frame, Layout,
     Margin, RichText, ScrollArea, Stroke, TextureHandle, Ui, Vec2,
 };
-use ray_proto::ipc::{IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
+use ray_proto::ipc::{FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
 use ray_proto::{Action as FirewallAction, FirewallKey, GlobalKey, NodeKey};
 
 use crate::forms::{FormKind, console_args};
@@ -45,16 +45,24 @@ pub(crate) enum Page {
     Networks,
     Devices,
     Files,
+    Firewall,
     Settings,
 }
 
 impl Page {
-    pub const ALL: [Self; 4] = [Self::Networks, Self::Devices, Self::Files, Self::Settings];
+    pub const ALL: [Self; 5] = [
+        Self::Networks,
+        Self::Devices,
+        Self::Files,
+        Self::Firewall,
+        Self::Settings,
+    ];
     fn title(self) -> &'static str {
         match self {
             Self::Networks => "Networks",
             Self::Devices => "Devices",
             Self::Files => "Files",
+            Self::Firewall => "Firewall",
             Self::Settings => "Settings",
         }
     }
@@ -120,6 +128,10 @@ enum Dialog {
         title: String,
         message: String,
         request: Option<Box<IpcMessage>>,
+    },
+    FirewallRemove {
+        index: usize,
+        rule: Box<FirewallRuleView>,
     },
     Output,
 }
@@ -390,6 +402,7 @@ impl Dashboard {
                                         Page::Networks => self.networks(ui, &mut actions),
                                         Page::Devices => self.devices(ui, &mut actions),
                                         Page::Files => self.files(ui, &mut actions),
+                                        Page::Firewall => self.firewall(ui, &mut actions),
                                         Page::Settings => self.settings(ui, &mut actions),
                                     }
                                 }
@@ -993,6 +1006,162 @@ impl Dashboard {
         }
     }
 
+    fn firewall_ready(&self) -> bool {
+        !self.busy
+            && self.status_error.is_none()
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.firewall.is_ok())
+    }
+
+    fn firewall(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let enabled = self.firewall_ready();
+        ui.horizontal(|ui| {
+            ui.label(heading("Firewall", 17.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if button(ui, "Add rule", Kind::Primary, enabled) {
+                    self.dialog = Some(form(FormKind::Firewall, None, ""));
+                    self.error = None;
+                }
+            });
+        });
+        ui.label(RichText::new("Rules apply to Rayfish mesh traffic. Windows Firewall can also block these connections.").color(MUTED));
+        ui.add_space(8.0);
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let pending = snapshot
+            .pending
+            .iter()
+            .filter(|item| matches!(item.kind, PendingKind::Firewall { .. }))
+            .collect::<Vec<_>>();
+        let mut dialog = None;
+        pending_section(
+            ui,
+            "Suggested rules",
+            &pending,
+            !enabled,
+            actions,
+            &mut dialog,
+        );
+        if let Some(dialog) = dialog {
+            self.dialog = Some(dialog);
+        }
+        let firewall = match &snapshot.firewall {
+            Ok(firewall) => firewall,
+            Err(error) => {
+                card().show(ui, |ui| {
+                    ui.label(heading("Firewall unavailable", 15.0));
+                    ui.colored_label(AMBER, error);
+                    if button(
+                        ui,
+                        "Retry firewall",
+                        Kind::Secondary,
+                        !self.busy && !self.refreshing,
+                    ) {
+                        actions.push(Action::Refresh);
+                    }
+                });
+                return;
+            }
+        };
+        card().show(ui, |ui| {
+            ui.label(heading("Default policies", 15.0));
+            for (title, current, key) in [
+                ("Inbound", firewall.default_inbound, FirewallKey::DefaultIn),
+                ("Outbound", firewall.default_outbound, FirewallKey::DefaultOut),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(title);
+                    ui.label(mono(current.to_string().to_uppercase(), 11.0).color(if current == FirewallAction::Deny { ROSE } else { GREEN }));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if button(ui, &format!("Change {}", title.to_lowercase()), Kind::Secondary, enabled) {
+                            let next = if current == FirewallAction::Deny { FirewallAction::Allow } else { FirewallAction::Deny };
+                            self.dialog = Some(Dialog::Confirm {
+                                title: format!("Change {} default?", title.to_lowercase()),
+                                message: format!("Set the default {} mesh policy to {next}. This applies when no rule matches.", title.to_lowercase()),
+                                request: Some(Box::new(IpcMessage::ConfigSet {
+                                    key: NodeKey::Firewall(key), value: next.to_string(), replace: false,
+                                })),
+                            });
+                        }
+                    });
+                });
+            }
+        });
+        ui.add_space(10.0);
+        ui.label(heading("Rules", 15.0));
+        if firewall.rules.is_empty() {
+            empty(
+                ui,
+                "No firewall rules.",
+                "Traffic follows the default policies above.",
+            );
+            return;
+        }
+        card().inner_margin(12).show(ui, |ui| {
+            ScrollArea::horizontal()
+                .id_salt("firewall-columns")
+                .show(ui, |ui| {
+                    egui::Grid::new("firewall-rules")
+                        .num_columns(7)
+                        .spacing(Vec2::new(16.0, 4.0))
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for title in [
+                                "Direction",
+                                "Action",
+                                "Protocol",
+                                "Ports",
+                                "Peer",
+                                "Network",
+                                "",
+                            ] {
+                                ui.label(mono(title, 10.0).color(FAINT));
+                            }
+                            ui.end_row();
+                            for (index, item) in firewall.rules.iter().enumerate() {
+                                ui.label(mono(item.direction.to_string().to_uppercase(), 11.0));
+                                ui.label(mono(item.action.to_string().to_uppercase(), 11.0).color(
+                                    if item.action == FirewallAction::Deny {
+                                        ROSE
+                                    } else {
+                                        GREEN
+                                    },
+                                ));
+                                ui.label(
+                                    mono(item.protocol.to_string().to_uppercase(), 11.0)
+                                        .color(MUTED),
+                                );
+                                ui.label(mono(scope_label(&item.port), 11.0));
+                                ui.add_sized(
+                                    [150.0, 22.0],
+                                    egui::Label::new(mono(scope_label(&item.peer), 11.0))
+                                        .truncate()
+                                        .halign(Align::LEFT),
+                                )
+                                .on_hover_text(&item.peer);
+                                ui.add_sized(
+                                    [115.0, 22.0],
+                                    egui::Label::new(mono(scope_label(&item.network), 11.0))
+                                        .truncate()
+                                        .halign(Align::LEFT),
+                                )
+                                .on_hover_text(&item.network);
+                                if button(ui, "Remove", Kind::Danger, enabled) {
+                                    self.dialog = Some(Dialog::FirewallRemove {
+                                        index,
+                                        rule: Box::new(item.clone()),
+                                    });
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    }
+
     fn settings(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.label(heading("Settings", 17.0));
         card().show(ui, |ui| {
@@ -1053,6 +1222,12 @@ impl Dashboard {
                         "Keep Rayfish up to date.",
                         GlobalKey::AutoUpdate,
                     ),
+                    (
+                        3,
+                        "Mesh SSH",
+                        "Let approved peers sign in using allowed local Windows accounts.",
+                        GlobalKey::Ssh,
+                    ),
                 ] {
                     if index != 0 {
                         rule(ui);
@@ -1063,7 +1238,7 @@ impl Dashboard {
                         title,
                         detail,
                         &mut value,
-                        !self.busy && snapshot.config.is_ok(),
+                        !self.busy && self.status_error.is_none() && snapshot.config.is_ok(),
                     ) {
                         actions.push(Action::Run(IpcMessage::ConfigSet {
                             key: NodeKey::Global(key),
@@ -1082,88 +1257,6 @@ impl Dashboard {
                     }
                 }
                 if let Err(error) = &snapshot.config {
-                    ui.colored_label(AMBER, error);
-                }
-            });
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(heading("Firewall", 17.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if button(
-                        ui,
-                        "Add rule",
-                        Kind::Primary,
-                        !self.busy && snapshot.firewall.is_ok(),
-                    ) {
-                        self.dialog = Some(form(FormKind::Firewall, None, ""));
-                    }
-                });
-            });
-            card().show(ui, |ui| match &snapshot.firewall {
-                Ok(firewall) => {
-                    ui.horizontal(|ui| {
-                        ui.label("Inbound default");
-                        ui.label(mono(firewall.default_inbound.to_string(), 12.0).color(MUTED));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(ui, "Change", Kind::Secondary, !self.busy) {
-                                let next = if firewall.default_inbound == FirewallAction::Deny {
-                                    FirewallAction::Allow
-                                } else {
-                                    FirewallAction::Deny
-                                };
-                                self.dialog = Some(Dialog::Confirm {
-                                    title: "Change inbound default?".into(),
-                                    message: format!(
-                                        "Set the default inbound firewall policy to {next}."
-                                    ),
-                                    request: Some(Box::new(IpcMessage::ConfigSet {
-                                        key: NodeKey::Firewall(FirewallKey::DefaultIn),
-                                        value: next.to_string(),
-                                        replace: false,
-                                    })),
-                                });
-                            }
-                        });
-                    });
-                    ui.label(
-                        mono(
-                            format!("Outbound default: {}", firewall.default_outbound),
-                            12.0,
-                        )
-                        .color(MUTED),
-                    );
-                    if firewall.rules.is_empty() {
-                        rule(ui);
-                        ui.label(RichText::new("No firewall rules.").color(FAINT));
-                    }
-                    for (index, item) in firewall.rules.iter().enumerate() {
-                        rule(ui);
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(heading(
-                                    format!(
-                                        "{} {} {} {}",
-                                        item.direction, item.action, item.protocol, item.port
-                                    ),
-                                    14.0,
-                                ));
-                                ui.label(
-                                    mono(
-                                        format!("peer {} / network {}", item.peer, item.network),
-                                        11.0,
-                                    )
-                                    .color(MUTED),
-                                );
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if button(ui, "Remove", Kind::Danger, !self.busy) {
-                                    actions.push(Action::Run(IpcMessage::FirewallRemove { index }));
-                                }
-                            });
-                        });
-                    }
-                }
-                Err(error) => {
                     ui.colored_label(AMBER, error);
                 }
             });
@@ -1211,6 +1304,12 @@ impl Dashboard {
     }
 
     fn dialog(&mut self, ctx: &Context, actions: &mut Vec<Action>) {
+        let firewall_ready = self.firewall_ready();
+        let firewall_rules = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.firewall.as_ref().ok())
+            .map(|firewall| firewall.rules.as_slice());
         let Some(dialog) = &mut self.dialog else {
             return;
         };
@@ -1228,40 +1327,62 @@ impl Dashboard {
                     } => {
                         ui.label(heading(kind.title(), 18.0));
                         ui.add_space(6.0);
-                        for (index, field) in kind.fields().iter().enumerate() {
-                            ui.label(RichText::new(field.label).size(13.0).color(MUTED));
-                            if field.choices.is_empty() {
-                                let response = ui.add_sized(
-                                    [ui.available_width(), 34.0],
-                                    egui::TextEdit::singleline(&mut values[index])
-                                        .margin(Vec2::new(11.0, 8.0)),
-                                );
-                                if *focus && index == 0 {
-                                    response.request_focus();
-                                }
-                            } else {
-                                egui::ComboBox::from_id_salt(index)
-                                    .width(ui.available_width())
-                                    .selected_text(&values[index])
-                                    .show_ui(ui, |ui| {
-                                        for choice in field.choices {
-                                            ui.selectable_value(
-                                                &mut values[index],
-                                                (*choice).into(),
-                                                *choice,
-                                            );
+                        ScrollArea::vertical()
+                            .id_salt("form-fields")
+                            .max_height((ctx.content_rect().height() - 160.0).max(80.0))
+                            .show(ui, |ui| {
+                                for (index, field) in kind.fields().iter().enumerate() {
+                                    ui.label(RichText::new(field.label).size(13.0).color(MUTED));
+                                    if *kind == FormKind::Firewall
+                                        && index == 3
+                                        && values[2] == "icmp"
+                                    {
+                                        ui.label(RichText::new("Not used for ICMP.").color(FAINT));
+                                        ui.add_space(4.0);
+                                        continue;
+                                    }
+                                    if field.choices.is_empty() {
+                                        let response = ui.add_sized(
+                                            [ui.available_width(), 34.0],
+                                            egui::TextEdit::singleline(&mut values[index])
+                                                .hint_text(field.hint)
+                                                .margin(Vec2::new(11.0, 8.0)),
+                                        );
+                                        if *focus && index == 0 {
+                                            response.request_focus();
                                         }
-                                    });
-                            }
-                            ui.add_space(4.0);
-                        }
-                        *focus = false;
-                        if let Some(error) = &self.error {
-                            ui.colored_label(AMBER, error);
-                        }
+                                    } else {
+                                        egui::ComboBox::from_id_salt(index)
+                                            .width(ui.available_width())
+                                            .selected_text(&values[index])
+                                            .show_ui(ui, |ui| {
+                                                for choice in field.choices {
+                                                    ui.selectable_value(
+                                                        &mut values[index],
+                                                        (*choice).into(),
+                                                        *choice,
+                                                    );
+                                                }
+                                            });
+                                    }
+                                    if !field.hint.is_empty() && !field.choices.is_empty() {
+                                        ui.label(RichText::new(field.hint).small().color(FAINT));
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                                *focus = false;
+                                if let Some(error) = &self.error {
+                                    ui.colored_label(AMBER, error);
+                                }
+                            });
                         ui.add_space(10.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(ui, kind.submit_label(), Kind::Primary, !self.busy) {
+                            if button(
+                                ui,
+                                kind.submit_label(),
+                                Kind::Primary,
+                                !self.busy && (*kind != FormKind::Firewall || firewall_ready),
+                            ) {
                                 match kind.command(values, network.as_deref()) {
                                     Ok(request) => {
                                         if *kind == FormKind::Join {
@@ -1289,10 +1410,49 @@ impl Dashboard {
                         ui.label(RichText::new(message.as_str()).color(MUTED));
                         ui.add_space(14.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(ui, "Confirm", Kind::Danger, !self.busy)
+                            let enabled = !self.busy
+                                && (firewall_ready
+                                    || request
+                                        .as_deref()
+                                        .is_none_or(|request| !firewall_mutation(request)));
+                            if button(ui, "Confirm", Kind::Danger, enabled)
                                 && let Some(request) = request.take()
                             {
                                 actions.push(Action::Run(*request));
+                                close = true;
+                            }
+                            close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
+                        });
+                    }
+                    Dialog::FirewallRemove { index, rule } => {
+                        ui.label(heading("Remove firewall rule?", 18.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "Remove {} {} {} {} for peer {} on network {}?",
+                                rule.direction,
+                                rule.action,
+                                rule.protocol,
+                                scope_label(&rule.port),
+                                scope_label(&rule.peer),
+                                scope_label(&rule.network)
+                            ))
+                            .color(MUTED),
+                        );
+                        let unchanged = firewall_rules
+                            .and_then(|rules| rules.get(*index))
+                            .is_some_and(|current| current == rule.as_ref());
+                        if firewall_ready && !unchanged {
+                            ui.colored_label(
+                                AMBER,
+                                "Rules changed. Cancel and select the rule again.",
+                            );
+                        }
+                        ui.add_space(14.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if button(ui, "Confirm", Kind::Danger, firewall_ready && unchanged) {
+                                actions.push(Action::Run(IpcMessage::FirewallRemove {
+                                    index: *index,
+                                }));
                                 close = true;
                             }
                             close |= button(ui, "Cancel", Kind::Secondary, !self.busy);
@@ -1319,12 +1479,30 @@ impl Dashboard {
     }
 }
 
+fn firewall_mutation(request: &IpcMessage) -> bool {
+    matches!(
+        request,
+        IpcMessage::FirewallAdd { .. }
+            | IpcMessage::FirewallRemove { .. }
+            | IpcMessage::FirewallAccept { .. }
+            | IpcMessage::FirewallDeny { .. }
+            | IpcMessage::ConfigSet {
+                key: NodeKey::Firewall(_),
+                ..
+            }
+    )
+}
+
+fn scope_label(value: &str) -> &str {
+    if value.is_empty() || matches!(value, "*" | "any") {
+        "Any"
+    } else {
+        value
+    }
+}
+
 fn form(kind: FormKind, network: Option<String>, initial: &str) -> Dialog {
-    let mut values = kind
-        .fields()
-        .iter()
-        .map(|field| field.choices.first().copied().unwrap_or("").to_owned())
-        .collect::<Vec<_>>();
+    let mut values = kind.initial_values();
     if kind.fields()[0].choices.is_empty() {
         values[0] = initial.into();
     }
@@ -1739,13 +1917,266 @@ mod tests {
         );
     }
 
+    #[test]
+    fn firewall_tab_runs_typed_rules_and_both_default_policy_confirmations() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        assert!(click(&mut app, &ctx, "Firewall").is_empty());
+        assert_eq!(app.page, Page::Firewall);
+        let labels = render(&mut app, &ctx);
+        for title in [
+            "Direction",
+            "Action",
+            "Protocol",
+            "Ports",
+            "Peer",
+            "Network",
+            "Any",
+        ] {
+            assert!(
+                labels.iter().any(|(text, _)| text == title),
+                "missing firewall column or scope: {title}"
+            );
+        }
+        for (button, key, value) in [
+            ("Change inbound", FirewallKey::DefaultIn, "allow"),
+            ("Change outbound", FirewallKey::DefaultOut, "deny"),
+        ] {
+            assert!(click(&mut app, &ctx, button).is_empty());
+            let actions = click(&mut app, &ctx, "Confirm");
+            assert!(actions.iter().any(|action| matches!(action,
+                Action::Run(IpcMessage::ConfigSet { key: NodeKey::Firewall(actual), value: actual_value, replace: false })
+                    if *actual == key && actual_value == value
+            )));
+        }
+        assert!(click(&mut app, &ctx, "Remove").is_empty());
+        assert!(
+            click(&mut app, &ctx, "Confirm")
+                .iter()
+                .any(|action| matches!(
+                    action,
+                    Action::Run(IpcMessage::FirewallRemove { index: 1 })
+                ))
+        );
+        assert!(click(&mut app, &ctx, "Add rule").is_empty());
+        assert!(click(&mut app, &ctx, "Add rule").iter().any(|action| matches!(action,
+            Action::Run(IpcMessage::FirewallAdd { port: Some(port), peer: None, network: None, .. }) if port == "443"
+        )));
+    }
+
+    #[test]
+    fn stale_firewall_cannot_mutate_even_from_an_already_open_dialog() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        app.page = Page::Firewall;
+        assert!(click(&mut app, &ctx, "Remove").is_empty());
+        app.status_error = Some("Example status connection failed.".into());
+        assert!(click(&mut app, &ctx, "Confirm").is_empty());
+        app.dialog = None;
+        for button in ["Add rule", "Change inbound", "Change outbound", "Remove"] {
+            assert!(click(&mut app, &ctx, button).is_empty());
+            assert!(app.dialog.is_none());
+        }
+        app.dialog = Some(form(FormKind::Firewall, None, ""));
+        assert!(click(&mut app, &ctx, "Add rule").is_empty());
+        app.dialog = None;
+        app.status_error = None;
+        app.snapshot.as_mut().unwrap().firewall = Err("Example firewall read failed.".into());
+        assert!(click(&mut app, &ctx, "Add rule").is_empty());
+        assert!(app.dialog.is_none());
+        assert!(
+            click(&mut app, &ctx, "Retry firewall")
+                .iter()
+                .any(|action| matches!(action, Action::Refresh))
+        );
+    }
+
+    #[test]
+    fn changed_rules_cannot_delete_a_different_rule_from_an_open_confirmation() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        app.page = Page::Firewall;
+        assert!(click(&mut app, &ctx, "Remove").is_empty());
+        app.snapshot
+            .as_mut()
+            .unwrap()
+            .firewall
+            .as_mut()
+            .unwrap()
+            .rules
+            .swap(0, 1);
+        assert!(click(&mut app, &ctx, "Confirm").is_empty());
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "Rules changed. Cancel and select the rule again.")
+        );
+    }
+
+    #[test]
+    fn an_open_suggestion_confirmation_requires_current_firewall_status() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        let mut snapshot = crate::preview::fixture(true);
+        snapshot.pending.push(PendingItem {
+            description: "Example suggested rule.".into(),
+            kind: PendingKind::Firewall {
+                network: "example".into(),
+            },
+        });
+        app.snapshot = Some(Box::new(snapshot));
+        app.page = Page::Firewall;
+        assert!(click(&mut app, &ctx, "Accept").is_empty());
+        app.status_error = Some("Example service read failed.".into());
+        assert!(click(&mut app, &ctx, "Confirm").is_empty());
+        app.status_error = None;
+        app.snapshot.as_mut().unwrap().firewall = Err("Example firewall read failed.".into());
+        assert!(click(&mut app, &ctx, "Confirm").is_empty());
+        app.snapshot.as_mut().unwrap().firewall = crate::preview::fixture(true).firewall;
+        assert!(
+            click(&mut app, &ctx, "Confirm")
+                .iter()
+                .any(|action| matches!(
+                    action,
+                    Action::Run(IpcMessage::FirewallAccept { network }) if network == "example"
+                ))
+        );
+    }
+
+    #[test]
+    fn settings_exposes_mesh_ssh_and_keeps_firewall_rules_on_their_own_page() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        app.page = Page::Settings;
+        render(&mut app, &ctx);
+        let _paint = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(500.0, 500.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -350.0),
+                        modifiers: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw(ctx);
+            },
+        );
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "Mesh SSH"));
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text.contains("allowed local Windows accounts"))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|(text, _)| text == "Add rule" || text == "Change inbound")
+        );
+    }
+
+    #[test]
+    fn firewall_columns_keep_long_scopes_compact_at_the_minimum_window_width() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        let mut snapshot = crate::preview::fixture(true);
+        for rule in &mut snapshot.firewall.as_mut().unwrap().rules {
+            rule.peer = "example-peer-".repeat(8);
+            rule.network = "example-network-".repeat(4);
+        }
+        app.snapshot = Some(Box::new(snapshot));
+        app.page = Page::Firewall;
+        render_at(&mut app, &ctx, Vec2::new(820.0, 680.0));
+        let labels = render_at(&mut app, &ctx, Vec2::new(820.0, 680.0));
+        let remove = labels
+            .iter()
+            .filter(|(text, _)| text == "Remove")
+            .collect::<Vec<_>>();
+        assert_eq!(remove.len(), 2);
+        assert!(remove.iter().all(|(_, pos)| pos.x < 790.0));
+        let row_spacing = remove[1].1.y - remove[0].1.y;
+        assert!(
+            row_spacing <= 40.0,
+            "firewall rows are {row_spacing} points apart"
+        );
+    }
+
+    #[test]
+    fn firewall_form_actions_fit_the_minimum_window_height() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        app.page = Page::Firewall;
+        for error in [
+            None,
+            Some("Example invalid rule. Select a valid port and try again.".into()),
+        ] {
+            app.dialog = Some(form(FormKind::Firewall, None, ""));
+            app.error = error;
+            render_at(&mut app, &ctx, Vec2::new(820.0, 560.0));
+            let labels = render_at(&mut app, &ctx, Vec2::new(820.0, 560.0));
+            for title in ["Add rule", "Cancel"] {
+                let (_, position) = labels
+                    .iter()
+                    .rev()
+                    .find(|(label, _)| label == title)
+                    .unwrap_or_else(|| panic!("missing form action {title}"));
+                assert!(
+                    position.y >= 0.0 && position.y + 24.0 <= 560.0,
+                    "form action {title} is outside the minimum window: {position:?}"
+                );
+            }
+        }
+    }
+
+    fn click(app: &mut Dashboard, ctx: &Context, label: &str) -> Vec<Action> {
+        render(app, ctx);
+        let labels = render(app, ctx);
+        let pos = labels
+            .iter()
+            .rev()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("missing button {label}"))
+            .1
+            + Vec2::new(4.0, 8.0);
+        let mut actions = Vec::new();
+        for pressed in [true, false] {
+            let _paint = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| actions.extend(app.draw(ctx)),
+            );
+        }
+        actions
+    }
+
     fn render(app: &mut Dashboard, ctx: &Context) -> Vec<(String, egui::Pos2)> {
+        render_at(app, ctx, Vec2::new(1000.0, 680.0))
+    }
+
+    fn render_at(app: &mut Dashboard, ctx: &Context, size: Vec2) -> Vec<(String, egui::Pos2)> {
         let output = ctx.run(
             egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    Vec2::new(1000.0, 680.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                 ..Default::default()
             },
             |ctx| {
