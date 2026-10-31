@@ -1276,7 +1276,6 @@ impl NetworkRegistry {
                     key,
                     initially_published,
                 }),
-                poll_record: true,
                 reconverge_worker,
                 my_hostname: Some(my_hostname),
                 dial,

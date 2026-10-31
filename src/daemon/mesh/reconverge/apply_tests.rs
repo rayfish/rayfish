@@ -1,11 +1,15 @@
 //! The shared apply routine, run on a real headless daemon that holds a network
-//! as a plain member. The blob fetch needs a serving peer, so most tests hand a
-//! verified blob straight to `commit_group_blob`, the half of the routine every
-//! source of records goes through after the fetch.
+//! as a plain member or as one of its coordinators. The blob fetch needs a
+//! serving peer, so most member tests hand a verified blob straight to
+//! `commit_group_blob`, the half of the routine every source of records goes
+//! through after the fetch. The coordinator tests run a second coordinator that
+//! serves its blob.
 
 use std::sync::MutexGuard;
 
 use iroh::SecretKey;
+use iroh::protocol::Router;
+use iroh_dns::pkarr::SignedPacket;
 
 use super::*;
 use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
@@ -243,5 +247,190 @@ async fn a_blob_without_us_departs_instead_of_adopting() {
 
     assert_eq!(outcome, ReconvergeOutcome::Departed);
     assert_ne!(fx.state.read().unwrap().converged_hash, Some(hash));
+    fx.finish().await;
+}
+
+/// A daemon that created `NETWORK` and so coordinates it, next to a second
+/// coordinator of the same network that only serves blobs. Holds the config lock
+/// and the config directory for as long as it lives.
+struct CoordinatorFixture {
+    daemon: Arc<Daemon>,
+    state: SharedNetworkState,
+    key: SecretKey,
+    second: Router,
+    second_store: FsStore,
+    _second_dir: tempfile::TempDir,
+    _relay: Relay,
+    _env: ConfigDir,
+    _dir: tempfile::TempDir,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl CoordinatorFixture {
+    #[allow(clippy::await_holding_lock)]
+    async fn start() -> Self {
+        let lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("temporary config directory");
+        let env = ConfigDir::set(dir.path());
+        let relay = Relay::start().await;
+        relay.configure();
+        let daemon = build_headless(false).await.expect("headless daemon");
+        let net = create(&daemon, NETWORK).await;
+        let key = net
+            .network_secret_key
+            .expect("a created network holds its key");
+        let state = Arc::clone(&daemon.registry.networks.get(NETWORK).expect("live").state);
+
+        let second_dir = tempfile::tempdir().expect("temporary blob directory");
+        let second_store = FsStore::load(second_dir.path())
+            .await
+            .expect("second coordinator blob store");
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("loopback address")
+            .bind()
+            .await
+            .expect("second coordinator endpoint");
+        daemon
+            .transport
+            .warm_lookup
+            .add_endpoint_info(endpoint.addr());
+        let second = Router::builder(endpoint)
+            .accept(
+                iroh_blobs::protocol::ALPN,
+                BlobsProtocol::new(&second_store, None),
+            )
+            .spawn();
+        Self {
+            daemon,
+            state,
+            key,
+            second,
+            second_store,
+            _second_dir: second_dir,
+            _relay: relay,
+            _env: env,
+            _dir: dir,
+            _lock: lock,
+        }
+    }
+
+    /// The edit the second coordinator authors: the live roster plus itself as
+    /// a coordinator, stored where only the second coordinator can serve it.
+    async fn second_coordinators_edit(&self) -> blake3::Hash {
+        let bytes = {
+            let s = self.state.read().unwrap();
+            let mut group = s.group.clone();
+            group.members.add(Member {
+                is_coordinator: true,
+                ..laptop(self.second.endpoint().id())
+            });
+            crate::membership::canonical_group_bytes(&group)
+        };
+        self.second_store
+            .blobs()
+            .add_slice(&bytes)
+            .await
+            .expect("store the edit");
+        blake3::hash(&bytes)
+    }
+
+    fn signed_by_second(&self, hash: blake3::Hash) -> SignedPacket {
+        dht::encode_network_record(&self.key, &hash, &[self.second.endpoint().id()])
+            .expect("sign the second coordinator's record")
+    }
+
+    async fn finish(self) {
+        self.second
+            .shutdown()
+            .await
+            .expect("stop the second coordinator");
+        self.daemon.shutdown_and_close().await;
+    }
+}
+
+/// A coordinator learns an edit another coordinator published from its own
+/// group poller, with no `MemberSync` or `BlobUpdated` to prompt it. Created
+/// and restored coordinators ran no poller, so they missed such an edit until
+/// a trigger happened to reach them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_coordinator_polls_an_edit_another_coordinator_published() {
+    let fx = CoordinatorFixture::start().await;
+    let edit = fx.second_coordinators_edit().await;
+    let record = fx.signed_by_second(edit);
+    dht::publish_record(&fx.daemon.registry.transport.pkarr, &record)
+        .await
+        .expect("the second coordinator publishes");
+
+    let converged = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if fx.state.read().unwrap().converged_hash == Some(edit) {
+                break;
+            }
+            // Cut the poll interval short; the poller does the resolve.
+            fx.daemon.registry.poll_nudge.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "the poller never applied the edit");
+    assert!(
+        fx.state
+            .read()
+            .unwrap()
+            .group
+            .members
+            .is_member(&fx.second.endpoint().id())
+    );
+    fx.finish().await;
+}
+
+/// A record signed before this coordinator's own latest publish is stale, even
+/// though it names a blob this node does not hold and can fetch. A coordinator
+/// kept no floor, so once it polled its own record, a relay serving an older
+/// copy would roll back its edit and the publisher would sign the rollback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_coordinator_refuses_a_record_older_than_its_own_publish() {
+    let fx = CoordinatorFixture::start().await;
+    let registry = Arc::clone(&fx.daemon.registry);
+    let edit = fx.second_coordinators_edit().await;
+    let stale = fx.signed_by_second(edit);
+    let own = fx
+        .state
+        .read()
+        .unwrap()
+        .converged_hash
+        .expect("a created network has a converged hash");
+    assert!(
+        registry
+            .publish_group_hash(NETWORK, &fx.key, own, &fx.state)
+            .await
+            .is_some(),
+        "the coordinator republishes after the stale record was signed"
+    );
+
+    let record = SignedGroupRecord {
+        hash: edit,
+        seeds: vec![fx.second.endpoint().id()],
+        timestamp: stale.timestamp().as_micros(),
+    };
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &registry,
+        NETWORK,
+        &fx.state,
+        &None,
+        &record,
+    )
+    .await;
+
+    assert_eq!(outcome, ReconvergeOutcome::Stale);
+    assert_eq!(fx.state.read().unwrap().converged_hash, Some(own));
     fx.finish().await;
 }
