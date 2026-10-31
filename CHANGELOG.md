@@ -30,6 +30,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- On a network with several coordinators, a coordinator that created the
+  network or restarted now picks up changes another coordinator makes, instead
+  of missing them until something else prompted a refresh.
 - A member whose coordinator handshake failed partway through a restart now
   picks up roster and firewall changes as they happen, instead of waiting for
   the next poll.

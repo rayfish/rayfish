@@ -1257,12 +1257,7 @@ impl CoordinatorAcceptState {
         let published = match &signed {
             Some((hash, packet)) => {
                 self.registry
-                    .publish_signed_group_record(
-                        &self.network_name,
-                        *hash,
-                        packet,
-                        &snapshot_commit,
-                    )
+                    .publish_signed_group_record(&self.network_name, *hash, packet, &self.state)
                     .await
             }
             None => false,

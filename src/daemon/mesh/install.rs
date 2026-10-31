@@ -27,10 +27,6 @@ pub(crate) struct NetworkInstall<'a> {
     /// `Some` makes this node a coordinator: it gets the publisher, the
     /// stale-member pruner and the coordinator accept handler.
     pub(crate) authority: Option<RecordAuthority>,
-    /// Watch the signed record for changes made elsewhere. Every joined
-    /// network does; a network this node created or restored as its
-    /// coordinator does not.
-    pub(crate) poll_record: bool,
     /// The reconverge worker a member handshake already started. The
     /// handshake registers the member accept handler before it drives the
     /// coordinator's connection, so the worker exists before the network
@@ -66,7 +62,6 @@ impl NetworkRegistry {
             invite_lock,
             incompatible,
             authority,
-            poll_record,
             reconverge_worker,
             my_hostname,
             dial,
@@ -85,16 +80,19 @@ impl NetworkRegistry {
             ));
             notify
         });
-        if poll_record {
-            tasks.push(spawn_group_poller(
-                network_key,
-                Arc::clone(&state),
-                self.transport.endpoint.clone(),
-                Arc::clone(self),
-                name.to_string(),
-                cancel.clone(),
-            ));
-        }
+        // Every node watches the signed record, coordinators included: with
+        // more than one coordinator, another one can publish an edit that no
+        // trigger delivers here. A coordinator's own records do not undo
+        // themselves: publishing raises its replay floor, and an unconfirmed
+        // authored snapshot is kept until its record lands.
+        tasks.push(spawn_group_poller(
+            network_key,
+            Arc::clone(&state),
+            self.transport.endpoint.clone(),
+            Arc::clone(self),
+            name.to_string(),
+            cancel.clone(),
+        ));
         // A member registered without a handshake (warm resume, or a restore
         // whose coordinator did not answer) has no worker or accept handler yet.
         let fresh_member_notify = match reconverge_worker {

@@ -288,7 +288,7 @@ pub(crate) fn spawn_network_publisher(
                 if let Some((hash, packet, seed_count)) = prepared {
                     match publish_signed_record(
                         &registry.transport.pkarr,
-                        &commit,
+                        &state,
                         &network_name,
                         hash,
                         &packet,
@@ -452,21 +452,38 @@ pub(crate) async fn persist_group_hash_locked(
     write_group_hash_pointer(state, network, hash, published)
 }
 
-/// Publish a record signed under `commit`, then mark its generation published
-/// if it is still the recovery pointer. No lock is held across the relay call.
-/// The mark takes `commit` again because it compares against the pointer, and
-/// a commit may have moved it while the publish was in flight. `Ok(false)`
-/// means it did, and a newer record is owed.
+/// Publish a record signed under `state`'s commit lock, then mark its
+/// generation published if it is still the recovery pointer. No lock is held
+/// across the relay call. The mark takes the lock again because it compares
+/// against the pointer, and a commit may have moved it while the publish was in
+/// flight. `Ok(false)` means it did, and a newer record is owed.
+///
+/// The record's timestamp also becomes this node's replay floor, under the same
+/// lock as the mark. The group poller reads this coordinator's own network
+/// record, and without the floor a stale copy served after this publish names
+/// an older blob, reads as newer than nothing, and is applied and then
+/// republished over our own edit.
 pub(crate) async fn publish_signed_record(
     client: &PkarrRelayClient,
-    commit: &AsyncMutex<()>,
+    state: &SharedNetworkState,
     network: &str,
     hash: blake3::Hash,
     packet: &SignedPacket,
 ) -> Result<bool> {
     dht::publish_record(client, packet).await?;
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let _commit = commit.lock().await;
+    raise_record_floor(state, packet.timestamp().as_micros());
     Ok(mark_group_hash_published(network, hash))
+}
+
+/// Refuse any record authored before `published`, a record the relay took.
+fn raise_record_floor(state: &SharedNetworkState, published: u64) {
+    let mut state = state.write().unwrap();
+    let floor = state
+        .last_record_timestamp
+        .map_or(published, |floor| floor.max(published));
+    state.last_record_timestamp = Some(floor);
 }
 
 pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash) -> bool {

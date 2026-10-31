@@ -662,7 +662,6 @@ fn member_install(name: &str, key: EndpointId, state: SharedNetworkState) -> Net
         invite_lock: Arc::new(AsyncMutex::new(())),
         incompatible: None,
         authority: None,
-        poll_record: false,
         reconverge_worker: None,
         my_hostname: None,
         dial: None,

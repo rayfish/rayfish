@@ -264,8 +264,7 @@ impl NetworkRegistry {
             mode,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
-            // A key holder authors records rather than applying them, so it keeps
-            // no replay floor.
+            // Raised by each record this node publishes.
             last_record_timestamp: None,
         };
 
@@ -295,13 +294,9 @@ impl NetworkRegistry {
             Ok(())
         })?;
         anyhow::ensure!(updated.is_some(), "network is no longer saved");
+        let state = Arc::new(RwLock::new(net_state));
         let restored_record = self
-            .publish_group_hash(
-                name,
-                &net_secret_key,
-                last_group_hash,
-                &net_state.snapshot_commit,
-            )
+            .publish_group_hash(name, &net_secret_key, last_group_hash, &state)
             .await;
 
         // Never replace a handle another path registered meanwhile: the old
@@ -312,7 +307,7 @@ impl NetworkRegistry {
             .install_network(NetworkInstall {
                 name,
                 network_key: net_public_key,
-                state: Arc::new(RwLock::new(net_state)),
+                state,
                 cancel: self.shutdown_token.child_token(),
                 invite_lock: Arc::new(AsyncMutex::new(())),
                 // A coordinator holds the network key and publishes a version
@@ -323,7 +318,6 @@ impl NetworkRegistry {
                     key: net_secret_key,
                     initially_published: restored_record.map(|_| last_group_hash),
                 }),
-                poll_record: false,
                 reconverge_worker: None,
                 my_hostname: None,
                 // Full mesh: a restarting coordinator reconnects to peers that

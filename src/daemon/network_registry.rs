@@ -1414,13 +1414,9 @@ impl NetworkRegistry {
             exit_node_use: None,
         })?;
         drop(revoking);
+        let state = Arc::new(std::sync::RwLock::new(net_state));
         let initial_record = self
-            .publish_group_hash(
-                &name,
-                &net_secret_key,
-                last_group_hash,
-                &net_state.snapshot_commit,
-            )
+            .publish_group_hash(&name, &net_secret_key, last_group_hash, &state)
             .await;
 
         // The registration claim keeps every other path from installing it.
@@ -1428,7 +1424,7 @@ impl NetworkRegistry {
             .install_network(NetworkInstall {
                 name: &name,
                 network_key: net_public_key,
-                state: Arc::new(std::sync::RwLock::new(net_state)),
+                state,
                 cancel: self.shutdown_token.child_token(),
                 invite_lock: Arc::new(AsyncMutex::new(())),
                 // A coordinator holds the network key and publishes the record,
@@ -1438,7 +1434,6 @@ impl NetworkRegistry {
                     key: net_secret_key,
                     initially_published: initial_record.map(|_| last_group_hash),
                 }),
-                poll_record: false,
                 reconverge_worker: None,
                 my_hostname: None,
                 dial: None,
@@ -1510,7 +1505,7 @@ impl NetworkRegistry {
             mode,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
-            // We author this network's records; there is nothing to replay to us.
+            // Raised by each record this node publishes.
             last_record_timestamp: None,
         })
     }
@@ -1551,7 +1546,7 @@ impl NetworkRegistry {
         network: &str,
         net_secret_key: &SecretKey,
         blob_hash: blake3::Hash,
-        commit: &AsyncMutex<()>,
+        state: &SharedNetworkState,
     ) -> Option<Vec<u8>> {
         let packet = match dht::encode_network_record(
             net_secret_key,
@@ -1564,21 +1559,21 @@ impl NetworkRegistry {
                 return None;
             }
         };
-        self.publish_signed_group_record(network, blob_hash, &packet, commit)
+        self.publish_signed_group_record(network, blob_hash, &packet, state)
             .await
             .then(|| packet.as_bytes().to_vec())
     }
 
-    /// Publish a record already signed under `commit` and mark it published.
-    /// Returns whether both happened; failures are logged here.
+    /// Publish a record already signed under `state`'s commit lock and mark it
+    /// published. Returns whether both happened; failures are logged here.
     pub(crate) async fn publish_signed_group_record(
         &self,
         network: &str,
         hash: blake3::Hash,
         packet: &SignedPacket,
-        commit: &AsyncMutex<()>,
+        state: &SharedNetworkState,
     ) -> bool {
-        match publish_signed_record(&self.transport.pkarr, commit, network, hash, packet).await {
+        match publish_signed_record(&self.transport.pkarr, state, network, hash, packet).await {
             Ok(marked) => {
                 if marked {
                     self.records_published.send_replace(());
