@@ -553,17 +553,16 @@ impl Daemon {
     /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
     /// on its own leaves the node advertising SSH with nothing listening.
     pub fn ssh_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
-        // There is no Windows SSH server to start, so turning it on would write
+        // Where there is no SSH server to start, turning it on would write
         // `ssh_enabled = true` and open its port for a listener that never
         // arrives. Rejected before anything is persisted, so the config and the
         // firewall stay consistent with what the daemon can actually do.
         // `off` still goes through, so a config carried over from another
         // platform can be turned back off here.
-        #[cfg(windows)]
-        if settings::parse_bool(value, false).unwrap_or(false) {
-            return op_err(
-                "the embedded SSH server is not available on Windows; nothing was changed",
-            );
+        if let Some(reason) = mesh_ssh_unavailable(crate::instance::is_rootless())
+            && settings::parse_bool(value, false).unwrap_or(false)
+        {
+            return op_err(format!("{reason}; nothing was changed"));
         }
         // The registry parses and writes the field; everything below is the side
         // effects it deliberately does not do.
@@ -872,6 +871,21 @@ fn firewall_set_message(config: &firewall::FirewallConfig, key: FirewallKey) -> 
 /// Normalize an SSH allow rule's user list: a `*` (any user incl. root) collapses
 /// the whole list to just `*`; otherwise sort + dedupe. An empty list is left
 /// empty, meaning "any non-root user" (the secure default).
+/// Why this node cannot run mesh SSH, or `None` when it can. Windows has no
+/// embedded server, a build without `desktop` (Android, iOS) has none either,
+/// and a rootless instance cannot bind the mesh address.
+fn mesh_ssh_unavailable(rootless: bool) -> Option<&'static str> {
+    if cfg!(windows) {
+        Some("the embedded SSH server is not available on Windows")
+    } else if !cfg!(feature = "desktop") {
+        Some("mesh SSH is not available on this device")
+    } else if rootless {
+        Some("mesh SSH is unavailable in rootless mode")
+    } else {
+        None
+    }
+}
+
 fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
     if users.iter().any(|u| u == "*") {
         return vec!["*".to_string()];
@@ -986,6 +1000,16 @@ mod ssh_user_tests {
             normalize_ssh_users(v(&["carol", "alice", "bob", "alice"])),
             v(&["alice", "bob", "carol"]),
         );
+    }
+
+    /// `ssh on` must fail where there is no listener to start, so it never
+    /// seeds a passthrough for nothing. A rootless instance is one such node:
+    /// `start_ssh` returns early there.
+    #[test]
+    fn mesh_ssh_is_unavailable_where_no_listener_can_start() {
+        assert!(mesh_ssh_unavailable(true).is_some());
+        let expected = cfg!(windows) || !cfg!(feature = "desktop");
+        assert_eq!(mesh_ssh_unavailable(false).is_some(), expected);
     }
 
     /// A name that merely contains an asterisk is not the wildcard.

@@ -865,6 +865,8 @@ pub(super) fn save_global(key: GlobalKey, value: &str, replace: bool) -> OpResul
 }
 
 /// Host listeners, exit routing and service updates belong to the system instance.
+/// `ssh` is not listed: its setter refuses `on` in rootless mode and lets `off`
+/// through, the same as on any node without mesh SSH.
 fn rootless_request_supported(req: &IpcMessage) -> bool {
     match req {
         IpcMessage::SetOperator { .. }
@@ -874,8 +876,7 @@ fn rootless_request_supported(req: &IpcMessage) -> bool {
         IpcMessage::ConfigSet { key, .. } | IpcMessage::ConfigUnset { key } => !matches!(
             key,
             NodeKey::Global(
-                GlobalKey::Ssh
-                    | GlobalKey::SshPort
+                GlobalKey::SshPort
                     | GlobalKey::V4Bridge
                     | GlobalKey::AutoUpdate
                     | GlobalKey::PfPassthrough
@@ -894,7 +895,6 @@ mod tests {
     #[test]
     fn rootless_rejects_host_network_mutations() {
         for key in [
-            GlobalKey::Ssh,
             GlobalKey::V4Bridge,
             GlobalKey::AutoUpdate,
             GlobalKey::Dns,
@@ -912,6 +912,23 @@ mod tests {
         }));
         assert!(rootless_request_supported(&IpcMessage::Status));
         assert!(rootless_request_supported(&IpcMessage::Down));
+    }
+
+    /// `ssh off` and `config unset ssh` reach `ssh_config_set` in rootless mode,
+    /// which accepts them as a no-op and refuses `on` itself. The blanket
+    /// rootless rejection used to fail `off` too.
+    #[test]
+    fn rootless_passes_ssh_to_its_setter() {
+        for value in ["on", "off"] {
+            assert!(rootless_request_supported(&IpcMessage::ConfigSet {
+                key: NodeKey::Global(GlobalKey::Ssh),
+                value: value.into(),
+                replace: false
+            }));
+        }
+        assert!(rootless_request_supported(&IpcMessage::ConfigUnset {
+            key: NodeKey::Global(GlobalKey::Ssh)
+        }));
     }
 
     #[test]
