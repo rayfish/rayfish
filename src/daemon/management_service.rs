@@ -717,6 +717,12 @@ impl ManagementService {
             Ok(target) => target,
             Err(error) => return ipc_err(error),
         };
+        // As for a join: the machine knows the network by the exact name it
+        // joined under, not by however the operator typed it here.
+        let network = &match self.registry.active_network_name(network.as_ref()) {
+            Some(name) => NetworkName::new(name),
+            None => return ipc_err(format!("network '{network}' not active")),
+        };
         let remote_result = self
             .send_request(
                 target.identity,
