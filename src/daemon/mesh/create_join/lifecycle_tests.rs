@@ -698,6 +698,42 @@ async fn a_member_registered_from_the_blob_replaces_a_failed_handshakes_handler(
     daemon.shutdown_and_close().await;
 }
 
+/// An install that loses to a live network starts nothing on its state and
+/// stops the reconverge worker its handshake started. Its tasks used to be
+/// spawned before the name was checked, so the poller's immediate first apply
+/// could write the loser's roster into the winner's saved network.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_losing_install_runs_nothing_on_its_state() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    hold_live(registry, "home", key);
+
+    let state = empty_state(key, "home");
+    let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::spawn(async move {
+        let _alive = alive;
+        std::future::pending::<()>().await;
+    });
+    let mut install = member_install("home", key, Arc::clone(&state));
+    install.reconverge_worker = Some(worker);
+    assert!(!registry.install_network(install).await);
+
+    assert_eq!(
+        Arc::strong_count(&state),
+        1,
+        "no task holds the losing install's state"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), stopped)
+        .await
+        .expect("the handshake's worker is stopped");
+    assert!(ended.is_err(), "the worker was aborted, not finished");
+    daemon.shutdown_and_close().await;
+}
+
 /// Installing over a live network stops what it spawned and leaves the live
 /// handle and its handler alone.
 #[tokio::test]

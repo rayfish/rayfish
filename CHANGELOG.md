@@ -98,6 +98,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ray files accept -o <dir>` resolves a relative directory against the
   current directory.
 - A peer renamed to an invalid name no longer keeps answering PTR lookups.
+- A join or restore that loses the race to an already running copy of the
+  network no longer applies its own roster, which could overwrite the running
+  network's saved state or make it leave.
 
 ### Security
 
