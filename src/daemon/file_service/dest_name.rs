@@ -6,6 +6,10 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path};
 
+use iroh::EndpointId;
+
+use crate::control;
+
 /// How many `name (n).ext` alternatives to try before giving up on a name.
 pub(super) const MAX_NAME_ATTEMPTS: u32 = 1000;
 
@@ -51,11 +55,28 @@ pub(super) fn numbered_name(file_name: &str, attempt: u32) -> String {
     }
 }
 
-/// A name for a file being received, until it is complete. Random, so two
-/// receives into one directory never share one, and short, so it fits however
-/// long the real name is. A leading dot keeps it out of most file listings.
-pub(super) fn temp_name() -> String {
-    format!(".rayfish-{:016x}.part", rand::random::<u64>())
+/// The name a file being received has until it is complete, one per offer.
+///
+/// Derived from the sender and the offer, which together name one receive, so
+/// a receive that starts again after a crash finds what it left and writes
+/// over it, instead of picking a fresh name and leaving the leftover for good.
+/// Two receives into one directory never share one. Short, so it fits however
+/// long the real name is; a leading dot keeps it out of most file listings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TempName(String);
+
+impl TempName {
+    pub(super) fn for_offer(sender: &EndpointId, offer: control::FileOfferId) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key("rayfish received file temporary name");
+        hasher.update(sender.as_bytes());
+        hasher.update(&offer.0);
+        let hex = hasher.finalize().to_hex();
+        Self(format!(".rayfish-{}.part", &hex.as_str()[..32]))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// How many leading components of `path` are its prefix and root, which the
@@ -159,6 +180,23 @@ mod tests {
         // Exactly at the limit, nothing changes.
         let edge = "y".repeat(MAX_SAVED_NAME);
         assert_eq!(fitted_name(&edge), edge);
+    }
+
+    #[test]
+    fn a_temporary_name_belongs_to_one_offer() {
+        let sender = iroh::SecretKey::generate().public();
+        let offer = control::FileOfferId::new();
+        let name = TempName::for_offer(&sender, offer);
+        assert_eq!(name, TempName::for_offer(&sender, offer));
+        assert_ne!(
+            name,
+            TempName::for_offer(&sender, control::FileOfferId::new())
+        );
+        let other = iroh::SecretKey::generate().public();
+        assert_ne!(name, TempName::for_offer(&other, offer));
+        assert!(name.as_str().starts_with(".rayfish-"), "{name:?}");
+        assert!(name.as_str().ends_with(".part"), "{name:?}");
+        assert_eq!(name.as_str().len(), 46);
     }
 
     #[test]

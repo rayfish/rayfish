@@ -60,7 +60,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::dest_name::{
-    MAX_NAME_ATTEMPTS, fitted_name, missing_names, numbered_name, root_len, temp_name,
+    MAX_NAME_ATTEMPTS, TempName, fitted_name, missing_names, numbered_name, root_len,
     windows_file_name,
 };
 use super::{Recipient, WindowsCaller};
@@ -169,18 +169,19 @@ fn dir_check(recipient: &Recipient) -> io::Result<DirCheck<'_>> {
     }
 }
 
-/// Open (creating as needed) `dir` for `recipient` and create a temporary
-/// file in it for `file_name`. Returns the empty file, ready to be written
-/// and then committed.
+/// Open (creating as needed) `dir` for `recipient` and create the temporary
+/// file `temp` in it for `file_name`. Returns the empty file, ready to be
+/// written and then committed.
 pub(super) fn create(
     dir: &Path,
     file_name: &str,
+    temp: &TempName,
     recipient: Recipient,
 ) -> io::Result<(Staged, File)> {
     let check = dir_check(&recipient)?;
     let wanted = usable_name(file_name)?;
     let dir = open_dir(dir, &check)?;
-    let (temp, file) = create_temp(&dir, check.caller_sid())?;
+    let (temp, file) = create_temp(&dir, temp, check.caller_sid())?;
     let keep = match file.try_clone() {
         Ok(keep) => keep,
         Err(e) => {
@@ -484,14 +485,15 @@ fn make_dir(path: &Path, sid: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-/// Create a fresh temporary file in `dir`, exclusively and without following
-/// a reparse point.
-fn create_temp(dir: &OpenDir, sid: Option<&str>) -> io::Result<(OsString, File)> {
+/// Create the temporary file `name` in `dir`, exclusively and without
+/// following a reparse point. A leftover from an earlier receive of the same
+/// offer is removed first ([`remove_leftover`]).
+fn create_temp(dir: &OpenDir, name: &TempName, sid: Option<&str>) -> io::Result<(OsString, File)> {
     let mut descriptor = caller_descriptor(sid, false)?;
     let attributes = descriptor.as_mut().map(OwnedSecurityDescriptor::attributes);
-    for _ in 0..MAX_NAME_ATTEMPTS {
-        let name = temp_name();
-        let wide = wide(dir.final_path.join(&name).as_os_str());
+    let path = dir.final_path.join(name.as_str());
+    let wide = wide(path.as_os_str());
+    let open = || {
         // SAFETY: `wide` is a NUL-terminated path, the security attributes
         // (when present) point at a descriptor `descriptor` keeps alive, and
         // the template handle may be null.
@@ -507,20 +509,56 @@ fn create_temp(dir: &OpenDir, sid: Option<&str>) -> io::Result<(OsString, File)>
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                continue;
-            }
-            return Err(e);
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: `CreateFileW` just returned this handle and nothing else owns it.
-        let file = unsafe { File::from_raw_handle(handle) };
-        return Ok((OsString::from(name), file));
+        Ok(unsafe { File::from_raw_handle(handle) })
+    };
+    let file = match open() {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            remove_leftover(&wide, name)?;
+            open()?
+        }
+        result => result?,
+    };
+    Ok((OsString::from(name.as_str()), file))
+}
+
+/// Remove what an interrupted receive of the same offer left at `wide`: a
+/// plain file. A directory or a reparse point there the daemon did not make,
+/// and it is left alone. Opened without following a reparse point and
+/// deleted through that handle, so it is the entry itself that goes.
+fn remove_leftover(wide: &[u16], name: &TempName) -> io::Result<()> {
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call; the
+    // null security attributes and template handle are allowed.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not pick a free temporary file name",
-    ))
+    // SAFETY: `CreateFileW` just returned this handle and nothing else owns it.
+    let file = unsafe { File::from_raw_handle(handle) };
+    let attributes = file.metadata()?.file_attributes();
+    if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "'{}' is in the way; remove it to receive this file",
+                name.as_str()
+            ),
+        ));
+    }
+    tracing::debug!("removing {name:?} left by an interrupted receive");
+    mark_deleted(&file)
 }
 
 /// Rename the file `file` is open on to `to`, a full path in the same
@@ -572,11 +610,18 @@ fn rename_by_handle(file: &File, to: &Path) -> io::Result<()> {
 
 /// Mark the file `file` is open on for deletion. Through the handle, so it is
 /// the file this module created, whatever has happened to its name since.
+/// Best effort: whatever stopped the receive is the error worth reporting.
 fn delete_on_close(file: &File, name: &OsStr) {
+    if let Err(e) = mark_deleted(file) {
+        tracing::debug!("remove partial {name:?}: {e}");
+    }
+}
+
+/// Have the file `file` is open on deleted once its last handle closes.
+fn mark_deleted(file: &File) -> io::Result<()> {
     let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-    let Ok(size) = u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()) else {
-        return;
-    };
+    let size =
+        u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()).map_err(io::Error::other)?;
     // SAFETY: the handle is open with DELETE access for the call, and `info`
     // is a live FILE_DISPOSITION_INFO of the size passed.
     let ok = unsafe {
@@ -588,8 +633,9 @@ fn delete_on_close(file: &File, name: &OsStr) {
         )
     };
     if ok == 0 {
-        tracing::debug!("remove partial {name:?}: {}", io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
 }
 
 fn wide(value: &OsStr) -> Vec<u16> {
@@ -611,6 +657,13 @@ fn with_path(e: io::Error, path: &Path) -> io::Error {
 mod tests {
     use super::*;
 
+    fn temp() -> TempName {
+        TempName::for_offer(
+            &iroh::SecretKey::generate().public(),
+            crate::control::FileOfferId::new(),
+        )
+    }
+
     fn configured() -> Recipient {
         Recipient {
             owner: None,
@@ -628,7 +681,7 @@ mod tests {
             caller_chose_dir: true,
             caller: WindowsCaller::Unknown,
         };
-        let Err(e) = create(&nested, "f.bin", unknown) else {
+        let Err(e) = create(&nested, "f.bin", &temp(), unknown) else {
             panic!("a caller with no token must not choose the directory");
         };
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -656,16 +709,16 @@ mod tests {
         // SAFETY: `path` is NUL-terminated and `attributes` points at a
         // descriptor that outlives the call.
         assert_ne!(unsafe { CreateDirectoryW(path.as_ptr(), &attributes) }, 0);
-        let Err(e) = create(&locked, "f.bin", me()) else {
+        let Err(e) = create(&locked, "f.bin", &temp(), me()) else {
             panic!("a directory only SYSTEM may write must be refused");
         };
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-        let Err(e) = create(&locked.join("sub"), "f.bin", me()) else {
+        let Err(e) = create(&locked.join("sub"), "f.bin", &temp(), me()) else {
             panic!("nothing may be created under it either");
         };
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         // The same directory is fine when the caller could write it.
-        let (staged, file) = create(tmp.path(), "f.bin", me()).unwrap();
+        let (staged, file) = create(tmp.path(), "f.bin", &temp(), me()).unwrap();
         drop(file);
         assert_eq!(staged.commit().unwrap(), "f.bin");
     }
@@ -674,7 +727,7 @@ mod tests {
     fn a_taken_name_gets_a_number_and_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
-        let (staged, file) = create(tmp.path(), "f.bin", configured()).unwrap();
+        let (staged, file) = create(tmp.path(), "f.bin", &temp(), configured()).unwrap();
         drop(file);
         assert_eq!(staged.commit().unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
@@ -685,7 +738,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let long = format!("{}.txt", "é".repeat(300));
         for expected_suffix in [".txt", " (1).txt"] {
-            let (staged, file) = create(tmp.path(), &long, configured()).unwrap();
+            let (staged, file) = create(tmp.path(), &long, &temp(), configured()).unwrap();
             drop(file);
             let name = staged.commit().unwrap().into_string().unwrap();
             assert!(name.encode_utf16().count() <= 255, "{name}");
@@ -697,7 +750,7 @@ mod tests {
     fn a_stream_name_becomes_a_plain_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.txt"), b"keep").unwrap();
-        let (staged, file) = create(tmp.path(), "notes.txt:hidden", configured()).unwrap();
+        let (staged, file) = create(tmp.path(), "notes.txt:hidden", &temp(), configured()).unwrap();
         drop(file);
         assert_eq!(staged.commit().unwrap(), "notes.txt_hidden");
     }
@@ -706,7 +759,7 @@ mod tests {
     fn missing_directories_are_created_and_a_dropped_file_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a").join("b");
-        let (staged, file) = create(&nested, "f.bin", configured()).unwrap();
+        let (staged, file) = create(&nested, "f.bin", &temp(), configured()).unwrap();
         drop(file);
         drop(staged);
         assert!(nested.is_dir());
@@ -717,7 +770,7 @@ mod tests {
     fn commit_never_replaces_a_file_that_appeared_meanwhile() {
         use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
-        let (staged, mut file) = create(tmp.path(), "f.bin", configured()).unwrap();
+        let (staged, mut file) = create(tmp.path(), "f.bin", &temp(), configured()).unwrap();
         file.write_all(b"new").unwrap();
         drop(file);
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
@@ -744,7 +797,7 @@ mod tests {
             .unwrap();
         assert!(made.status.success(), "{made:?}");
         for dir in [junction.clone(), junction.join("sub")] {
-            let Err(e) = create(&dir, "f.bin", configured()) else {
+            let Err(e) = create(&dir, "f.bin", &temp(), configured()) else {
                 panic!("{dir:?} goes through a junction");
             };
             assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");

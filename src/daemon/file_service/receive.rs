@@ -585,7 +585,8 @@ impl FileService {
         to: AcceptedReceive,
     ) -> Result<Written, String> {
         let dir = receive_dir(to.output.as_deref());
-        self.write_received(file.blob_hash, dir, &file.filename, to.recipient)
+        let temp = dest_name::TempName::for_offer(&file.from, file.offer_id);
+        self.write_received(file.blob_hash, dir, &file.filename, temp, to.recipient)
             .await
             .map_err(|e| format!("write failed: {e}"))
     }

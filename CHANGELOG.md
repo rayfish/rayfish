@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   soon as the download starts, instead of filling the disk with a larger file.
 - A receive that gives up after a few minutes without progress says so,
   instead of "gave up after 0 hours".
+- A receive cut short by a crash or power loss no longer leaves a hidden
+  `.rayfish-*.part` file in the download folder for good: receiving the same
+  offer again replaces it.
 - On a network with several coordinators, a coordinator that created the
   network or restarted now picks up changes another coordinator makes, instead
   of missing them until something else prompted a refresh.

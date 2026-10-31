@@ -1009,13 +1009,14 @@ impl FileService {
         hash: iroh_blobs::Hash,
         dir: PathBuf,
         file_name: &str,
+        temp: dest_name::TempName,
         recipient: Recipient,
     ) -> std::io::Result<Written> {
         use tokio::io::AsyncWriteExt;
 
         let name = file_name.to_string();
         let (dir, (staged, file)) = tokio::task::spawn_blocking(move || {
-            receive_dest::create(&dir, &name, recipient).map(|created| (dir, created))
+            receive_dest::create(&dir, &name, &temp, recipient).map(|created| (dir, created))
         })
         .await
         .map_err(std::io::Error::other)??;
