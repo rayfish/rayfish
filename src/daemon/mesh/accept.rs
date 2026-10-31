@@ -1552,6 +1552,19 @@ impl MemberAcceptState {
             seeds: seed_peers,
             timestamp: packet.timestamp().as_micros(),
         };
+        // Anyone who knows the network id can replay the current record here as
+        // often as it likes. A copy of the blob we hold that is no newer than the
+        // floor tells us nothing, so it costs no commit lock, config write or
+        // sends. The first sight of the current record is newer than the floor
+        // and still goes through, which is what raises the floor.
+        {
+            let s = self.state.read().unwrap();
+            if !s.needs_reconverge(record.hash)
+                && !record_is_newer(record.timestamp, s.last_record_timestamp)
+            {
+                return;
+            }
+        }
         // Freshness is checked inside, against the last record applied, and the
         // floor only moves once the blob is in hand: a record whose blob we could
         // not fetch must stay acceptable to the next trigger.
@@ -2877,6 +2890,50 @@ mod signed_record_fast_path_tests {
         )
         .await;
         assert_eq!(retry, ReconvergeOutcome::Unfetched);
+        fx.finish().await;
+    }
+
+    /// A replay of the current record that is no newer than the floor returns
+    /// before the commit lock. Each one used to take it and then write config
+    /// and send, for anyone who knows the network id. The first sight of the
+    /// record still raises the floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_replayed_current_record_does_no_work() {
+        let fx = MemberFixture::start().await;
+        let handler = MemberAcceptState {
+            network_name: NETWORK.to_string(),
+            state: Arc::clone(&fx.state),
+            net_pubkey: fx.key.public(),
+            my_identity: fx.daemon.transport.endpoint.id(),
+            endpoint: fx.daemon.transport.endpoint.clone(),
+            registry: Arc::clone(&fx.daemon.registry),
+            invite_lock: Arc::new(AsyncMutex::new(())),
+            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        let current = fx
+            .state
+            .read()
+            .unwrap()
+            .converged_hash
+            .expect("a resumed member has a converged hash");
+        let packet = dht::encode_network_record(&fx.key, &current, &[]).unwrap();
+
+        handler.apply_signed_record(packet.as_bytes()).await;
+        assert_eq!(
+            fx.state.read().unwrap().last_record_timestamp,
+            Some(packet.timestamp().as_micros())
+        );
+
+        let commit = Arc::clone(&fx.state.read().unwrap().snapshot_commit);
+        let held = commit.lock().await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.apply_signed_record(packet.as_bytes()),
+        )
+        .await
+        .expect("the replay returns without waiting on the commit lock");
+        drop(held);
         fx.finish().await;
     }
 }

@@ -129,6 +129,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can write to, instead of anywhere the service account can. It never follows
   a link at the file name and never overwrites an existing file. Characters
   Windows reserves in a received file name, such as `:`, become `_`.
+- Anyone who knows a network's id can no longer make its members repeat
+  config writes and roster messages by resending the network's current signed
+  record. A copy no newer than the one already applied is ignored.
 
 ## [0.5.13] - 2026-10-31
 
