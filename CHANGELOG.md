@@ -43,8 +43,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
   minute later. It shows as done once the recipient finishes it.
-- Windows: a file receive started by an administrator command resumes after a
-  daemon restart instead of downloading again and then being refused.
+- Windows: a file accepted by a process running as SYSTEM into a folder it
+  named resumes after a daemon restart instead of downloading again and then
+  being refused.
 - Accepting a file into a folder it cannot be saved in now fails right away,
   before anything downloads. On macOS, where accepting returns as soon as the
   download starts, a bad folder used to cost the whole download and then put
