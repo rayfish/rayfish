@@ -12,8 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   laptop sleeps) now resumes by itself where it stopped, with no second
   `ray files accept`. It shows as transferring with the reason in `ray files`,
   keeps retrying for up to a day without progress, and stops at once if the
-  sender no longer has the file. `ray files cancel-transfer` stops it and puts
-  the offer back in the queue.
+  sender no longer has the file. A daemon restart picks it up again into the
+  same folder. `ray files cancel-transfer` stops it and puts the offer back in
+  the queue.
 
 ### Changed
 

@@ -25,7 +25,7 @@ mod receive_dest;
 
 /// Who an accepted file is for, and how far the directory it lands in is
 /// trusted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Recipient {
     /// The user the file (and any directory created for it) is handed to.
     /// `None` leaves it owned by the daemon.
@@ -144,8 +144,12 @@ fn reclaim_blob(store: FsStore, tag: String) {
 }
 
 /// Return an unsuccessful receive to the queue, including when its task is canceled.
+///
+/// A receive stopped by daemon shutdown keeps its accepted destination, so the
+/// next start resumes it; any other failure makes it a plain pending offer.
 struct ReceiveOfferGuard {
     file: Option<PendingFile>,
+    shutdown: CancellationToken,
     pending: Arc<Mutex<Vec<PendingFile>>>,
     active: Arc<Mutex<Vec<PendingFile>>>,
     offer_id: control::FileOfferId,
@@ -155,7 +159,10 @@ struct ReceiveOfferGuard {
 
 impl Drop for ReceiveOfferGuard {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
+        if let Some(mut file) = self.file.take() {
+            if !self.shutdown.is_cancelled() {
+                file.accepted = None;
+            }
             let mut queue = self.pending.lock().unwrap();
             let mut active = self.active.lock().unwrap();
             active.retain(|entry| entry.offer_id != self.offer_id);
@@ -256,16 +263,30 @@ pub(crate) struct OutboxEntry {
     pub(crate) blob_hash: blake3::Hash,
 }
 
-/// A received file offer awaiting `ray files accept`.
+/// A received file offer awaiting `ray files accept`, or one being received.
+///
+/// Saved in `pending-files.json` together with the receives in progress, so
+/// both survive a restart. `accepted` marks a receive in progress; files saved
+/// before it existed load as plain offers.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct PendingFile {
     offer_id: control::FileOfferId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<AcceptedReceive>,
     pub(crate) id: u64,
     pub(crate) from: EndpointId,
     pub(crate) filename: String,
     pub(crate) size: u64,
     pub(crate) mime_type: String,
     pub(crate) blob_hash: iroh_blobs::Hash,
+}
+
+/// Where an accepted receive is going, kept so it can restart after the daemon
+/// does. The directory ownership check runs again when the file is written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct AcceptedReceive {
+    output: Option<String>,
+    recipient: Recipient,
 }
 
 fn pending_files_path() -> Option<PathBuf> {
@@ -589,6 +610,7 @@ impl FileService {
                     PendingFile {
                         id: self.file_id_counter.fetch_add(1, Ordering::Relaxed),
                         offer_id,
+                        accepted: None,
                         from,
                         filename,
                         size,
@@ -2121,6 +2143,7 @@ mod tests {
         let file = take_pending(&mut service.pending_files.lock().unwrap(), 1).unwrap();
         service.active_files.lock().unwrap().push(file.clone());
         let guard = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(file),
             offer_id,
             pending: Arc::clone(&service.pending_files),
@@ -2344,6 +2367,7 @@ mod tests {
     fn pending(id: u64) -> PendingFile {
         PendingFile {
             offer_id: control::FileOfferId([id as u8; 32]),
+            accepted: None,
             id,
             from: SecretKey::from([id as u8; 32]).public(),
             filename: format!("file{id}.bin"),
@@ -2464,6 +2488,7 @@ mod tests {
         let transfers = Arc::new(transfers::TransferRegistry::new());
         let mut changes = transfers.subscribe();
         let offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: take_pending(&mut queue.lock().unwrap(), 1),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2495,6 +2520,7 @@ mod tests {
         let store = FsStore::load(tmp.path()).await.unwrap();
         let queue = Arc::new(Mutex::new(vec![pending(2)]));
         let mut offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(pending(1)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2527,6 +2553,7 @@ mod tests {
         files[0].blob_hash = hash;
         let queue = Arc::new(Mutex::new(files));
         let offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(pending(999)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2539,6 +2566,25 @@ mod tests {
         assert!(take_pending(&mut queue.lock().unwrap(), 1).is_none());
         assert!(take_pending(&mut queue.lock().unwrap(), 999).is_some());
         collected(&store, hash, "the evicted receive").await;
+    }
+
+    #[test]
+    fn pending_files_saved_without_an_accepted_destination_still_load() {
+        let old = serde_json::to_string(&[pending(1)]).unwrap();
+        assert!(!old.contains("accepted"), "{old}");
+        let loaded: Vec<PendingFile> = serde_json::from_str(&old).unwrap();
+        assert_eq!(loaded[0].accepted, None);
+        let mut file = pending(2);
+        file.accepted = Some(AcceptedReceive {
+            output: Some("/path/to/work".into()),
+            recipient: Recipient {
+                owner: Some((1000, 1000)),
+                caller_chose_dir: true,
+            },
+        });
+        let saved = serde_json::to_vec(&[file.clone()]).unwrap();
+        let loaded: Vec<PendingFile> = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(loaded[0].accepted, file.accepted);
     }
 
     /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`

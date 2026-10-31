@@ -814,6 +814,14 @@ async fn build_daemon_inner(
     // File auto-accept is evaluated inline by `FileService::accept_file_offer`
     // (no worker channel), so nothing to spawn here.
 
+    // Receives that were running when the daemon stopped pick up where they
+    // were. Not on Android: the app saves into a staging directory and moves
+    // the file to Downloads after its own accept call returns, so a receive
+    // finished without it would never reach Downloads. There the offer comes
+    // back to the queue, as before.
+    #[cfg(not(target_os = "android"))]
+    daemon.files.resume_accepted_receives();
+
     // Device-cert revocation is now carried per-network in the signed blob's
     // nullifier set (`ray unpair`); no separate pkarr record or background
     // publisher/poller is needed. Coordinated networks seed their nullifiers from
