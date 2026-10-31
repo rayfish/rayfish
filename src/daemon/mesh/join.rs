@@ -270,7 +270,6 @@ pub(crate) async fn join_mesh_shared(
         registry.clone(),
         ep.clone(),
         net_pubkey,
-        device_cert.clone(),
     );
 
     // Register this network's member accept handler so the per-connection demux
@@ -763,7 +762,6 @@ async fn perform_join_handshake(
 /// handler's notify: [`join_mesh_shared`] starts it for a handshake, and
 /// `finalize_join` for a network registered without one (warm resume, a
 /// restore whose coordinator was unreachable). It ends with `token`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_reconverge_worker(
     notify: Arc<tokio::sync::Notify>,
     token: CancellationToken,
@@ -772,7 +770,6 @@ pub(crate) fn spawn_reconverge_worker(
     registry_w: Arc<NetworkRegistry>,
     endpoint_w: Endpoint,
     net_pubkey_w: EndpointId,
-    device_cert_w: Option<control::DeviceCert>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Backstop tick so a queued rename is retried even on a quiet
@@ -808,13 +805,16 @@ pub(crate) fn spawn_reconverge_worker(
                 _ = token.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
             }
+            // Read per run, as the poller does: the device may have been
+            // paired or unpaired since this worker started.
+            let device_cert = registry_w.current_device_cert();
             reconverge_and_apply(
                 &endpoint_w,
                 &registry_w,
                 net_pubkey_w,
                 &network_name,
                 &live_state,
-                &device_cert_w,
+                &device_cert,
             )
             .await;
         }

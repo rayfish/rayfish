@@ -389,6 +389,76 @@ async fn the_first_current_record_sets_the_floor_of_a_resumed_member() {
     fx.finish().await;
 }
 
+/// The member reconverge worker judges the record with the certificate the
+/// device holds when it runs. It kept the one it started with, so a device
+/// paired after that never noticed its primary nullifying it on this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_reconverge_worker_follows_a_later_pairing() {
+    let fx = MemberFixture::start().await;
+    let registry = fx.registry();
+    let device = registry.transport.endpoint.id();
+    let primary = SecretKey::generate();
+    // A network of its own, so the fixture's poller never sees its record.
+    let key = SecretKey::generate();
+    let mut group = fx.state.read().unwrap().group.clone();
+    group.members.add(Member {
+        is_coordinator: true,
+        ..laptop(primary.public())
+    });
+    group.nullifiers.insert(device);
+    let mut held = NetworkState {
+        group,
+        snapshot: None,
+        snapshot_commit: Arc::new(AsyncMutex::new(())),
+        destroyed: false,
+        converged_hash: None,
+        unconfirmed_durable_hash: None,
+        network_secret_key: None,
+        network_public_key: key.public(),
+        network_name: Some(NETWORK.to_string()),
+        mode: GroupMode::Restricted,
+        pending_suggestions: Vec::new(),
+        pending: HashMap::new(),
+        last_record_timestamp: None,
+    };
+    held.refresh_snapshot();
+    let hash = held.converged_hash.expect("a refreshed state has a hash");
+    let record = dht::encode_network_record(&key, &hash, &[]).expect("sign the record");
+    dht::publish_record(&registry.transport.pkarr, &record)
+        .await
+        .expect("publish the record");
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let cancel = CancellationToken::new();
+    let worker = spawn_reconverge_worker(
+        Arc::clone(&notify),
+        cancel.clone(),
+        Arc::new(RwLock::new(held)),
+        NETWORK.to_string(),
+        Arc::clone(&registry),
+        registry.transport.endpoint.clone(),
+        key.public(),
+    );
+
+    let cert = control::DeviceCert::create(&primary, &device, 1);
+    crate::identity::store_device_cert(&cert).expect("pair the device");
+    notify.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while crate::identity::load_device_cert()
+            .expect("read the device cert")
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the nullified device unpairs itself");
+    cancel.cancel();
+    worker.await.expect("the worker ends with its token");
+    fx.finish().await;
+}
+
 /// An older signed record that drops this node changes nothing: membership and
 /// the saved network survive, whether it is refused before the fetch or after.
 /// A newer one is our removal and forgets the saved network.

@@ -66,8 +66,6 @@ impl NetworkRegistry {
             my_hostname,
             dial,
         } = install;
-        // Read before the slot is held: it is a file read.
-        let device_cert = self.current_device_cert();
         // Claim the name before spawning anything. A task started for an
         // install that then loses runs on a state no network owns: the poller's
         // first tick is an immediate apply, and an apply can persist its hash
@@ -132,7 +130,6 @@ impl NetworkRegistry {
                             Arc::clone(self),
                             self.transport.endpoint.clone(),
                             network_key,
-                            device_cert,
                         ));
                         Some(notify)
                     }

@@ -101,6 +101,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A join or restore that loses the race to an already running copy of the
   network no longer applies its own roster, which could overwrite the running
   network's saved state or make it leave.
+- A device paired or unpaired while the daemon runs now handles pushed roster
+  updates under its current pairing, so it unpairs itself as soon as its
+  primary revokes it instead of only at the next poll.
 
 ### Security
 
