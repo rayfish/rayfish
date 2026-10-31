@@ -12,8 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   laptop sleeps) now resumes by itself where it stopped, with no second
   `ray files accept`. It shows as transferring with the reason in `ray files`,
   keeps retrying for up to a day without progress, and stops at once if the
-  sender no longer has the file. `ray files cancel-transfer` stops it and puts
-  the offer back in the queue.
+  sender no longer has the file. A daemon restart picks it up again into the
+  same folder. `ray files cancel-transfer` stops it and puts the offer back in
+  the queue.
 
 ### Changed
 
@@ -36,6 +37,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ray firewall ssh off` now succeeds in rootless mode instead of being
   refused. `ssh on` still fails there, with a message saying mesh SSH is
   unavailable in rootless mode.
+- macOS: saving a file returns as soon as the download starts, with progress in
+  the file list, instead of reporting a timeout after five minutes while the
+  download kept going.
+- A send whose download was interrupted now shows in `ray files` on the
+  sender as still in progress, with a note, instead of failed and then gone a
+  minute later. It shows as done once the recipient finishes it.
 - A member whose coordinator handshake failed partway through a restart now
   picks up roster and firewall changes as they happen, instead of waiting for
   the next poll.

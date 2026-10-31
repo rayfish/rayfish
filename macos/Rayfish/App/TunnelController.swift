@@ -438,7 +438,7 @@ final class TunnelController: ObservableObject {
         defer { receivingFileIDs.remove(file.transferId) }
         error = nil
         do {
-            // A receive waits for the entire download. Keep status polling active.
+            // Returns once the receive starts; status polling shows its progress.
             let response = try await TunnelIPC.request(ProviderRequest(action: .acceptFile, fileId: file.transferId,
                                                                       directory: directory.path, uid: getuid(), gid: getgid()))
             guard isConnected, !isQuitting else { return }

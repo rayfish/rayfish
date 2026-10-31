@@ -1,9 +1,9 @@
 //! Running an accepted receive, and resuming it when the connection drops.
 //!
 //! An accepted file is fetched by a task the service owns, not by the request
-//! that accepted it. The accepting caller (`ray files accept`, the apps) waits
-//! for the outcome, but the receive does not depend on it: a CLI that is
-//! killed, or a laptop that sleeps through a download, leaves the task running.
+//! that accepted it. `ray files accept` waits for the outcome and the macOS app
+//! does not, but the receive depends on neither: a CLI that is killed, or a
+//! laptop that sleeps through a download, leaves the task running.
 //!
 //! When a fetch is interrupted (the sender is unreachable, the connection
 //! drops, or the stream stops moving), the task waits with capped exponential
@@ -22,6 +22,11 @@
 //! Errors that another attempt cannot fix end the receive at once: the sender
 //! no longer having the file, data that does not match the offered hash, and
 //! local store or disk failures.
+//!
+//! An accepted receive is saved with its destination in `pending-files.json`,
+//! so a daemon restart picks it up again ([`FileService::resume_accepted_receives`])
+//! instead of returning it to the queue. Only a failure or a cancel turns it
+//! back into a plain offer.
 
 use super::*;
 
@@ -97,10 +102,19 @@ impl FileService {
     ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
         let file = {
             let mut pending = self.pending_files.lock().unwrap();
-            let Some(file) = take_pending(&mut pending, id) else {
+            let Some(mut file) = take_pending(&mut pending, id) else {
                 return op_err(format!("no pending file with id {id}"));
             };
-            self.active_files.lock().unwrap().push(file.clone());
+            file.accepted = recipient.survives_restart().then(|| AcceptedReceive {
+                output: output.clone(),
+                recipient: recipient.clone(),
+            });
+            let mut active = self.active_files.lock().unwrap();
+            active.push(file.clone());
+            let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
+            if let Err(error) = save_pending_files(&durable) {
+                tracing::warn!(%error, "could not save accepted file; it will not resume after a restart");
+            }
             file
         };
         let transfer_id = self.transfers.register_receive(
@@ -112,6 +126,7 @@ impl FileService {
         // while it connects, fetches and retries.
         let finish = transfers::FinishGuard::new(Arc::clone(&self.transfers), transfer_id);
         let offer = ReceiveOfferGuard {
+            shutdown: self.registry.shutdown_token.clone(),
             offer_id: file.offer_id,
             file: Some(file.clone()),
             pending: Arc::clone(&self.pending_files),
@@ -145,6 +160,27 @@ impl FileService {
             let _ = outcome_tx.send(outcome);
         });
         Ok(outcome_rx)
+    }
+
+    /// Restart the receives that were accepted and still running when the
+    /// daemon last stopped, into the destination they were accepted to. Not
+    /// on Android, see the call site.
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn resume_accepted_receives(self: &Arc<Self>) {
+        let accepted: Vec<_> = self
+            .pending_files
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|file| file.accepted.clone().map(|to| (file.id, to)))
+            .collect();
+        for (id, to) in accepted {
+            // Not awaited, as for auto-accept: the task logs its own outcome.
+            match self.start_receive(id, to.output, to.recipient) {
+                Ok(_) => tracing::info!(id, "resuming accepted file receive"),
+                Err(error) => tracing::warn!(id, %error, "could not resume file receive"),
+            }
+        }
     }
 
     /// Settle a finished receive: on success record the delivery and drop the
@@ -549,6 +585,7 @@ mod tests {
         service.pending_files.lock().unwrap().push(PendingFile {
             id: 1,
             offer_id: control::FileOfferId::new(),
+            accepted: None,
             from,
             filename: "big.bin".into(),
             size: u64::try_from(data.len()).unwrap(),
@@ -657,6 +694,115 @@ mod tests {
         assert!(receiver.active_files.lock().unwrap().is_empty());
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn an_accepted_receive_resumes_after_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let data = payload();
+        let lookup = MemoryLookup::new();
+        let key = SecretKey::generate();
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        let first = sender(
+            &key,
+            &lookup,
+            &tmp.path().join("sender-1"),
+            Some(&data),
+            Some((CHUNKS_BEFORE_STALL, stalled_tx)),
+        )
+        .await;
+        let mut receiver =
+            file_service(file_endpoint(lookup.clone()).await, &tmp.path().join("r")).await;
+        Arc::get_mut(&mut receiver).unwrap().resume = quick_retries();
+        offer(&receiver, key.public(), &data);
+        let mut changes = receiver.transfers.subscribe();
+        let downloads = tmp.path().join("downloads");
+        let output = Some(downloads.to_string_lossy().into_owned());
+        let recipient = Recipient {
+            owner: None,
+            caller_chose_dir: true,
+        };
+        let _outcome = receiver
+            .start_receive(1, output.clone(), recipient.clone())
+            .unwrap();
+        stalled_rx.await.unwrap();
+        wait_for(&receiver, &mut changes, |t| t.transferred > 0).await;
+
+        // The daemon stops partway through.
+        receiver.registry.shutdown_token.cancel();
+        wait_for(&receiver, &mut changes, |t| {
+            t.state == transfers::TransferState::Failed
+        })
+        .await;
+        first.router.endpoint().close().await;
+        let saved = load_pending_files();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].accepted,
+            Some(AcceptedReceive { output, recipient })
+        );
+
+        // It starts again with the sender back, and nobody accepts it twice.
+        let _second = sender(
+            &key,
+            &lookup,
+            &tmp.path().join("sender-2"),
+            Some(&data),
+            None,
+        )
+        .await;
+        let mut restarted =
+            file_service(file_endpoint(lookup.clone()).await, &tmp.path().join("r2")).await;
+        Arc::get_mut(&mut restarted).unwrap().resume = quick_retries();
+        let mut changes = restarted.transfers.subscribe();
+        restarted.resume_accepted_receives();
+        assert!(restarted.pending_files.lock().unwrap().is_empty());
+        let done = wait_for(&restarted, &mut changes, |t| {
+            t.state != transfers::TransferState::Transferring
+        })
+        .await;
+        assert_eq!(done.state, transfers::TransferState::Done, "{done:?}");
+        assert_eq!(std::fs::read(downloads.join("big.bin")).unwrap(), data);
+        assert!(load_pending_files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn starting_an_accept_returns_before_the_download_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let data = payload();
+        let lookup = MemoryLookup::new();
+        let key = SecretKey::generate();
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        // Holds every chunk, so the download cannot finish while we look.
+        let _sender = sender(
+            &key,
+            &lookup,
+            &tmp.path().join("sender"),
+            Some(&data),
+            Some((0, stalled_tx)),
+        )
+        .await;
+        let mut receiver =
+            file_service(file_endpoint(lookup.clone()).await, &tmp.path().join("r")).await;
+        Arc::get_mut(&mut receiver).unwrap().resume = quick_retries();
+        offer(&receiver, key.public(), &data);
+        let output = Some(tmp.path().join("downloads").to_string_lossy().into_owned());
+
+        let started = receiver.start_accepting_file(1, output, None).unwrap();
+        assert!(started.0.contains("receiving"), "{started:?}");
+        assert!(receiver.pending_files.lock().unwrap().is_empty());
+        let running = receive(&receiver);
+        assert_eq!(running.state, transfers::TransferState::Transferring);
+        stalled_rx.await.unwrap();
+        assert_eq!(
+            receive(&receiver).state,
+            transfers::TransferState::Transferring
+        );
+
+        receiver.cancel_transfer(running.id).unwrap();
+    }
+
     #[tokio::test]
     async fn a_sender_without_the_blob_ends_the_receive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -678,6 +824,7 @@ mod tests {
         assert_eq!(failed.error.as_deref(), Some(SENDER_GONE));
         // Back in the queue, so it can be rejected.
         assert_eq!(receiver.pending_files.lock().unwrap().len(), 1);
+        assert!(load_pending_files()[0].accepted.is_none());
         assert!(receiver.active_files.lock().unwrap().is_empty());
     }
 
@@ -724,5 +871,7 @@ mod tests {
         assert_eq!(receive(&receiver).state, transfers::TransferState::Failed);
         assert!(receiver.receives.lock().unwrap().is_empty());
         assert_eq!(receiver.pending_files.lock().unwrap().len(), 1);
+        // Canceled by the user, it is a plain offer again, also after a restart.
+        assert!(load_pending_files()[0].accepted.is_none());
     }
 }

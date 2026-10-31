@@ -29,7 +29,8 @@ mod receive_dest;
 
 /// Who an accepted file is for, and how far the directory it lands in is
 /// trusted.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(not(windows), derive(PartialEq, Eq))]
 pub(crate) struct Recipient {
     /// The user the file (and any directory created for it) is handed to.
     /// `None` leaves it owned by the daemon. Unix only in effect: Windows
@@ -41,24 +42,40 @@ pub(crate) struct Recipient {
     pub(crate) caller_chose_dir: bool,
     /// Who asked, on Windows, where there is no uid to compare: the daemon
     /// asks Windows whether this caller could write the directory themselves.
+    /// Not saved: a token cannot outlive the daemon, so a saved receive loads
+    /// as `Unknown` (see [`Recipient::survives_restart`]).
     #[cfg(windows)]
+    #[serde(skip)]
     pub(crate) caller: WindowsCaller,
 }
 
 /// The Windows caller behind an accept, as far as the destination check
 /// needs to know.
 #[cfg(windows)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) enum WindowsCaller {
     /// LocalSystem, the daemon's own account: it could write there anyway.
     System,
     /// A user whose token decides, through the directory's ACL.
     User(Arc<crate::windows_identity::ClientToken>),
     /// Nothing identified the caller. A directory they chose is refused.
+    #[default]
     Unknown,
 }
 
 impl Recipient {
+    /// Whether a receive for this recipient can restart after the daemon does.
+    /// On Windows a directory the caller chose is checked against their token,
+    /// which is gone after a restart, so such a receive is not saved and its
+    /// offer comes back to the queue instead.
+    pub(crate) fn survives_restart(&self) -> bool {
+        #[cfg(windows)]
+        if self.caller_chose_dir && !matches!(self.caller, WindowsCaller::System) {
+            return false;
+        }
+        true
+    }
+
     /// A local caller accepting a file into a directory they named (or the
     /// CLI defaulted to their Downloads).
     pub(crate) fn caller(peer: Option<&PeerIdentity>) -> Self {
@@ -187,8 +204,12 @@ fn reclaim_blob(store: FsStore, tag: String) {
 }
 
 /// Return an unsuccessful receive to the queue, including when its task is canceled.
+///
+/// A receive stopped by daemon shutdown keeps its accepted destination, so the
+/// next start resumes it; any other failure makes it a plain pending offer.
 struct ReceiveOfferGuard {
     file: Option<PendingFile>,
+    shutdown: CancellationToken,
     pending: Arc<Mutex<Vec<PendingFile>>>,
     active: Arc<Mutex<Vec<PendingFile>>>,
     offer_id: control::FileOfferId,
@@ -198,7 +219,10 @@ struct ReceiveOfferGuard {
 
 impl Drop for ReceiveOfferGuard {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
+        if let Some(mut file) = self.file.take() {
+            if !self.shutdown.is_cancelled() {
+                file.accepted = None;
+            }
             let mut queue = self.pending.lock().unwrap();
             let mut active = self.active.lock().unwrap();
             active.retain(|entry| entry.offer_id != self.offer_id);
@@ -299,16 +323,31 @@ pub(crate) struct OutboxEntry {
     pub(crate) blob_hash: blake3::Hash,
 }
 
-/// A received file offer awaiting `ray files accept`.
+/// A received file offer awaiting `ray files accept`, or one being received.
+///
+/// Saved in `pending-files.json` together with the receives in progress, so
+/// both survive a restart. `accepted` marks a receive in progress; files saved
+/// before it existed load as plain offers.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct PendingFile {
     offer_id: control::FileOfferId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<AcceptedReceive>,
     pub(crate) id: u64,
     pub(crate) from: EndpointId,
     pub(crate) filename: String,
     pub(crate) size: u64,
     pub(crate) mime_type: String,
     pub(crate) blob_hash: iroh_blobs::Hash,
+}
+
+/// Where an accepted receive is going, kept so it can restart after the daemon
+/// does. The directory ownership check runs again when the file is written.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(not(windows), derive(PartialEq, Eq))]
+struct AcceptedReceive {
+    output: Option<String>,
+    recipient: Recipient,
 }
 
 fn pending_files_path() -> Option<PathBuf> {
@@ -632,6 +671,7 @@ impl FileService {
                     PendingFile {
                         id: self.file_id_counter.fetch_add(1, Ordering::Relaxed),
                         offer_id,
+                        accepted: None,
                         from,
                         filename,
                         size,
@@ -848,6 +888,28 @@ impl FileService {
             caller: WindowsCaller::Unknown,
         };
         self.accept_file_for(id, output, recipient).await
+    }
+
+    /// Like [`Self::accept_file`], but returns once the receive has started.
+    /// For the apps, whose provider calls time out long before a large
+    /// download ends; they follow it in the transfer list.
+    pub(crate) fn start_accepting_file(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        peer_cred: Option<(u32, u32)>,
+    ) -> OpResult<Done> {
+        let recipient = Recipient {
+            owner: peer_cred,
+            caller_chose_dir: true,
+            #[cfg(windows)]
+            caller: WindowsCaller::Unknown,
+        };
+        // Dropping the outcome leaves the receive running; it logs the result.
+        drop(self.start_receive(id, output, recipient)?);
+        Ok(Done(format!(
+            "receiving file {id}; see `ray files` for progress"
+        )))
     }
 
     /// Start the receive and wait for its outcome. The receive itself runs
@@ -2171,6 +2233,7 @@ mod tests {
         let file = take_pending(&mut service.pending_files.lock().unwrap(), 1).unwrap();
         service.active_files.lock().unwrap().push(file.clone());
         let guard = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(file),
             offer_id,
             pending: Arc::clone(&service.pending_files),
@@ -2394,6 +2457,7 @@ mod tests {
     fn pending(id: u64) -> PendingFile {
         PendingFile {
             offer_id: control::FileOfferId([id as u8; 32]),
+            accepted: None,
             id,
             from: SecretKey::from([id as u8; 32]).public(),
             filename: format!("file{id}.bin"),
@@ -2514,6 +2578,7 @@ mod tests {
         let transfers = Arc::new(transfers::TransferRegistry::new());
         let mut changes = transfers.subscribe();
         let offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: take_pending(&mut queue.lock().unwrap(), 1),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2545,6 +2610,7 @@ mod tests {
         let store = FsStore::load(tmp.path()).await.unwrap();
         let queue = Arc::new(Mutex::new(vec![pending(2)]));
         let mut offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(pending(1)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2577,6 +2643,7 @@ mod tests {
         files[0].blob_hash = hash;
         let queue = Arc::new(Mutex::new(files));
         let offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(pending(999)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2589,6 +2656,26 @@ mod tests {
         assert!(take_pending(&mut queue.lock().unwrap(), 1).is_none());
         assert!(take_pending(&mut queue.lock().unwrap(), 999).is_some());
         collected(&store, hash, "the evicted receive").await;
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pending_files_saved_without_an_accepted_destination_still_load() {
+        let old = serde_json::to_string(&[pending(1)]).unwrap();
+        assert!(!old.contains("accepted"), "{old}");
+        let loaded: Vec<PendingFile> = serde_json::from_str(&old).unwrap();
+        assert_eq!(loaded[0].accepted, None);
+        let mut file = pending(2);
+        file.accepted = Some(AcceptedReceive {
+            output: Some("/path/to/work".into()),
+            recipient: Recipient {
+                owner: Some((1000, 1000)),
+                caller_chose_dir: true,
+            },
+        });
+        let saved = serde_json::to_vec(&[file.clone()]).unwrap();
+        let loaded: Vec<PendingFile> = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(loaded[0].accepted, file.accepted);
     }
 
     /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`
