@@ -31,6 +31,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- macOS: saving a file returns as soon as the download starts, with progress in
+  the file list, instead of reporting a timeout after five minutes while the
+  download kept going.
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
   minute later. It shows as done once the recipient finishes it.

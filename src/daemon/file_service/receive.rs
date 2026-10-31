@@ -1,9 +1,9 @@
 //! Running an accepted receive, and resuming it when the connection drops.
 //!
 //! An accepted file is fetched by a task the service owns, not by the request
-//! that accepted it. The accepting caller (`ray files accept`, the apps) waits
-//! for the outcome, but the receive does not depend on it: a CLI that is
-//! killed, or a laptop that sleeps through a download, leaves the task running.
+//! that accepted it. `ray files accept` waits for the outcome and the macOS app
+//! does not, but the receive depends on neither: a CLI that is killed, or a
+//! laptop that sleeps through a download, leaves the task running.
 //!
 //! When a fetch is interrupted (the sender is unreachable, the connection
 //! drops, or the stream stops moving), the task waits with capped exponential
@@ -783,6 +783,43 @@ mod tests {
         assert_eq!(done.state, transfers::TransferState::Done, "{done:?}");
         assert_eq!(std::fs::read(downloads.join("big.bin")).unwrap(), data);
         assert!(load_pending_files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn starting_an_accept_returns_before_the_download_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let data = payload();
+        let lookup = MemoryLookup::new();
+        let key = SecretKey::generate();
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        // Holds every chunk, so the download cannot finish while we look.
+        let _sender = sender(
+            &key,
+            &lookup,
+            &tmp.path().join("sender"),
+            Some(&data),
+            Some((0, stalled_tx)),
+        )
+        .await;
+        let mut receiver =
+            file_service(file_endpoint(lookup.clone()).await, &tmp.path().join("r")).await;
+        Arc::get_mut(&mut receiver).unwrap().resume = quick_retries();
+        offer(&receiver, key.public(), &data);
+        let output = Some(tmp.path().join("downloads").to_string_lossy().into_owned());
+
+        let started = receiver.start_accepting_file(1, output, None).unwrap();
+        assert!(started.0.contains("receiving"), "{started:?}");
+        assert!(receiver.pending_files.lock().unwrap().is_empty());
+        let running = receive(&receiver);
+        assert_eq!(running.state, transfers::TransferState::Transferring);
+        stalled_rx.await.unwrap();
+        assert_eq!(
+            receive(&receiver).state,
+            transfers::TransferState::Transferring
+        );
+
+        receiver.cancel_transfer(running.id).unwrap();
     }
 
     #[tokio::test]

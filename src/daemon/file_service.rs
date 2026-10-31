@@ -821,6 +821,26 @@ impl FileService {
         self.accept_file_for(id, output, recipient).await
     }
 
+    /// Like [`Self::accept_file`], but returns once the receive has started.
+    /// For the apps, whose provider calls time out long before a large
+    /// download ends; they follow it in the transfer list.
+    pub(crate) fn start_accepting_file(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        peer_cred: Option<(u32, u32)>,
+    ) -> OpResult<Done> {
+        let recipient = Recipient {
+            owner: peer_cred,
+            caller_chose_dir: true,
+        };
+        // Dropping the outcome leaves the receive running; it logs the result.
+        drop(self.start_receive(id, output, recipient)?);
+        Ok(Done(format!(
+            "receiving file {id}; see `ray files` for progress"
+        )))
+    }
+
     /// Start the receive and wait for its outcome. The receive itself runs
     /// in a task of its own (see [`receive`]), so it continues, and keeps
     /// retrying, if this caller goes away.
