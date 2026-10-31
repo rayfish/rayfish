@@ -163,7 +163,9 @@ impl FileService {
     }
 
     /// Restart the receives that were accepted and still running when the
-    /// daemon last stopped, into the destination they were accepted to.
+    /// daemon last stopped, into the destination they were accepted to. Not
+    /// on Android, see the call site.
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn resume_accepted_receives(self: &Arc<Self>) {
         let accepted: Vec<_> = self
             .pending_files
