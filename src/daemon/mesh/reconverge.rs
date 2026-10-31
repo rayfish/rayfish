@@ -327,6 +327,9 @@ pub(crate) enum ReconvergeOutcome {
     Current,
     /// The record is no newer than the last one applied, so it was refused.
     Stale,
+    /// A record handed over the mesh would remove this node, but no floor is
+    /// set to tell whether it is current. Left to a relay-resolved record.
+    Unconfirmed,
     /// The blob could not be fetched from any peer or seed; nothing changed.
     Unfetched,
     /// State changed while the blob was in flight, so its result was discarded.
@@ -334,6 +337,16 @@ pub(crate) enum ReconvergeOutcome {
     /// This node is no longer part of the network (kicked, or its own primary
     /// nullified this device). The caller should stop polling this network.
     Departed,
+}
+
+/// Where a verified signed record came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordSource {
+    /// Resolved from a pkarr relay, which keeps the newest record it took.
+    Relay,
+    /// Handed over the mesh by a peer, which can be anyone holding the network
+    /// id and can pick any record the network ever published.
+    Mesh,
 }
 
 /// Converge on a verified signed record. The one apply routine behind every
@@ -352,6 +365,28 @@ pub(crate) async fn apply_group_record(
     state: &SharedNetworkState,
     device_cert: &Option<control::DeviceCert>,
     record: &SignedGroupRecord,
+) -> ReconvergeOutcome {
+    apply_group_record_from(
+        endpoint,
+        registry,
+        network_name,
+        state,
+        device_cert,
+        record,
+        RecordSource::Relay,
+    )
+    .await
+}
+
+/// [`apply_group_record`] for a record from `source`.
+pub(crate) async fn apply_group_record_from(
+    endpoint: &Endpoint,
+    registry: &Arc<NetworkRegistry>,
+    network_name: &str,
+    state: &SharedNetworkState,
+    device_cert: &Option<control::DeviceCert>,
+    record: &SignedGroupRecord,
+    source: RecordSource,
 ) -> ReconvergeOutcome {
     let blob_store = &registry.transport.blob_store;
     let my_identity = registry.transport.identity.local_identity();
@@ -373,6 +408,9 @@ pub(crate) async fn apply_group_record(
     // timestamp still raises the replay floor, so an older record for a
     // different roster cannot roll the network back afterwards.
     if observe_current_record(state, record.hash, record.timestamp) {
+        if record_is_newer(record.timestamp, floor) {
+            persist_record_floor(network_name, record.timestamp);
+        }
         // A prior apply may have reached live state while its config write failed.
         // Retry the durable pointer even though no blob reconvergence is needed;
         // the stored verified bytes make this safe and stale pointers stay
@@ -433,6 +471,17 @@ pub(crate) async fn apply_group_record(
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
         return ReconvergeOutcome::Unfetched;
     };
+    // A peer can hand over any record the network ever published, including one
+    // from before this node joined, which does not list it. Without a floor
+    // nothing says that record is not current, so leaving on it is for a record
+    // the relay served.
+    if source == RecordSource::Mesh
+        && state.read().unwrap().last_record_timestamp.is_none()
+        && blob_removes_us(&data, my_identity, device_cert)
+    {
+        tracing::warn!(network = %network_name, "not leaving on a record handed over the mesh before any record set the floor");
+        return ReconvergeOutcome::Unconfirmed;
+    }
     commit_group_blob(
         registry,
         network_name,
@@ -443,6 +492,21 @@ pub(crate) async fn apply_group_record(
         data,
     )
     .await
+}
+
+/// Whether applying `data` would take this node out of the network: it no
+/// longer lists us, or our own primary nullified this device.
+fn blob_removes_us(
+    data: &crate::membership::GroupBlob,
+    my_identity: EndpointId,
+    device_cert: &Option<control::DeviceCert>,
+) -> bool {
+    let listed = data.members.iter().any(|m| m.identity == my_identity)
+        || data.approved.iter().any(|a| a.identity == my_identity);
+    !listed
+        || device_cert
+            .as_ref()
+            .is_some_and(|cert| self_is_nullified(cert, &data.members, &data.nullifiers))
 }
 
 /// Apply a fetched, verified blob for `record`: the half of

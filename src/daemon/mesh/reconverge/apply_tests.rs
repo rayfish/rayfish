@@ -159,6 +159,39 @@ impl MemberFixture {
         current_group_hash(&self.state.read().unwrap())
     }
 
+    /// Stop the network and bring it back from its saved config, as a daemon
+    /// restart, a standby activation or a mobile re-enable rebuilds it.
+    async fn restart(&mut self) {
+        let registry = self.registry();
+        assert!(registry.teardown_network_runtime(NETWORK).await);
+        let net = config::load_network(NETWORK)
+            .unwrap()
+            .expect("stopping keeps the network saved");
+        let saved = SavedMemberNetwork {
+            name: NETWORK.to_string(),
+            net_pubkey: self.key.public().to_string(),
+            persisted_hostname: net.my_hostname,
+            auto_accept_firewall: net.auto_accept_firewall,
+            auto_accept_files: net.auto_accept_files,
+            cached_hash: net.last_group_hash,
+            cached_is_published: net.last_group_hash_published,
+        };
+        assert!(
+            registry
+                .warm_resume_member_network(&saved, self.key.public())
+                .await
+                .expect("warm-resume the member network"),
+            "the member network resumes from its saved config"
+        );
+        self.state = Arc::clone(
+            &registry
+                .networks
+                .get(NETWORK)
+                .expect("network is live")
+                .state,
+        );
+    }
+
     pub(in crate::daemon::mesh) async fn finish(self) {
         self.daemon.shutdown_and_close().await;
     }
@@ -526,6 +559,131 @@ async fn an_older_removal_keeps_membership_and_the_saved_network() {
     })
     .await
     .expect("the confirmed removal deletes the saved network");
+    fx.finish().await;
+}
+
+/// A restart rebuilds the network from its saved config, replay floor
+/// included. The floor was kept in memory only, so after a restart any old
+/// record read as newer, and one from before this node joined, which anyone
+/// holding the network id can hand over the mesh, deleted the saved network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_restart_keeps_refusing_an_old_record_that_drops_us() {
+    let mut fx = MemberFixture::start().await;
+    let me = fx.daemon.transport.endpoint.id();
+    let (without_us, old_hash) = fx
+        .blob_with(|m| {
+            m.remove(&me);
+        })
+        .await;
+    let old = SignedGroupRecord {
+        hash: old_hash,
+        seeds: Vec::new(),
+        timestamp: 10,
+    };
+    let (current_blob, current_hash) = fx
+        .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
+        .await;
+    let current = SignedGroupRecord {
+        hash: current_hash,
+        seeds: Vec::new(),
+        timestamp: 20,
+    };
+    let outcome = commit_group_blob(
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &current,
+        fx.generation(),
+        current_blob,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Applied);
+
+    fx.restart().await;
+
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(20));
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &old,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Stale);
+    let outcome = commit_group_blob(
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &old,
+        fx.generation(),
+        without_us,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Superseded);
+    assert!(fx.state.read().unwrap().group.members.is_member(&me));
+    assert!(config::load_network(NETWORK).unwrap().is_some());
+    fx.finish().await;
+}
+
+/// With no floor yet, as on the first start of a config from an older build,
+/// a record handed over the mesh cannot remove this node. The same record
+/// resolved from the relay still can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_mesh_record_cannot_remove_us_before_any_floor() {
+    let fx = MemberFixture::start().await;
+    let registry = fx.registry();
+    let server = BlobServer::start(&fx.daemon).await;
+    let me = registry.transport.endpoint.id();
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, None);
+    let without_us = {
+        let mut group = fx.state.read().unwrap().group.clone();
+        group.members.remove(&me);
+        group
+    };
+    let record = SignedGroupRecord {
+        hash: server.serve(&without_us).await,
+        seeds: vec![server.id()],
+        timestamp: 10,
+    };
+
+    let outcome = apply_group_record_from(
+        &fx.daemon.transport.endpoint,
+        &registry,
+        NETWORK,
+        &fx.state,
+        &None,
+        &record,
+        RecordSource::Mesh,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Unconfirmed);
+    assert!(fx.state.read().unwrap().group.members.is_member(&me));
+    assert!(config::load_network(NETWORK).unwrap().is_some());
+
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &registry,
+        NETWORK,
+        &fx.state,
+        &None,
+        &record,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Departed);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while config::load_network(NETWORK).unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the relay-resolved removal deletes the saved network");
+    server.finish().await;
     fx.finish().await;
 }
 

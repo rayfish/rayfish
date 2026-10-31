@@ -402,6 +402,10 @@ fn persist_join_config(
             // same transaction as the exact complete recovery hash it governs.
             net.network_secret_key = None;
         }
+        // A floor saved for another network under this name orders nothing here.
+        if net.network_public_key != Some(net_pubkey) {
+            net.last_record_timestamp = None;
+        }
         net.network_public_key = Some(net_pubkey);
         if initial {
             net.auto_accept_firewall = auto_accept_firewall;
@@ -451,7 +455,9 @@ async fn build_member_state(
         mode: GroupMode::Restricted,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
-        last_record_timestamp: record_ts,
+        // A reconnect whose roster came from config has no record of its own,
+        // and even one that does may be older than the floor saved last run.
+        last_record_timestamp: record_ts.max(saved_record_floor(network_name, net_pubkey)),
     };
     ns.refresh_snapshot();
     if let Some(hash) = exact_group_hash {
@@ -1338,6 +1344,7 @@ mod persist_config_tests {
             independent_paired_devices: vec![],
             last_group_hash: Some(cached_hash),
             last_group_hash_published: true,
+            last_record_timestamp: None,
             transport: None,
             auto_accept_firewall: true,
             auto_accept_files: true,

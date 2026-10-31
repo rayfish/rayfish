@@ -1396,6 +1396,7 @@ impl NetworkRegistry {
             independent_paired_devices: vec![],
             last_group_hash: Some(last_group_hash),
             last_group_hash_published: false,
+            last_record_timestamp: None,
             transport: None,
             auto_accept_firewall: false,
             // Own-device file offers are auto-accepted by default (identity-checked).

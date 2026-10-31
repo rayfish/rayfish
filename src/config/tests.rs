@@ -196,6 +196,7 @@ fn test_serialize_roundtrip() {
                 independent_paired_devices: vec![],
                 last_group_hash: None,
                 last_group_hash_published: true,
+                last_record_timestamp: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -222,6 +223,7 @@ fn test_serialize_roundtrip() {
                 independent_paired_devices: vec![],
                 last_group_hash: None,
                 last_group_hash_published: true,
+                last_record_timestamp: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -269,6 +271,7 @@ fn test_upsert_new() {
         independent_paired_devices: vec![],
         last_group_hash: None,
         last_group_hash_published: true,
+        last_record_timestamp: None,
         my_hostname: None,
         pending_hostname: None,
         transport: None,
@@ -304,6 +307,7 @@ fn test_upsert_replaces_existing() {
             independent_paired_devices: vec![],
             last_group_hash: None,
             last_group_hash_published: true,
+            last_record_timestamp: None,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -332,6 +336,7 @@ fn test_upsert_replaces_existing() {
         independent_paired_devices: vec![],
         last_group_hash: None,
         last_group_hash_published: true,
+        last_record_timestamp: None,
         my_hostname: None,
         pending_hostname: None,
         transport: None,
@@ -367,6 +372,7 @@ fn test_remove_network() {
                 independent_paired_devices: vec![],
                 last_group_hash: None,
                 last_group_hash_published: true,
+                last_record_timestamp: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -393,6 +399,7 @@ fn test_remove_network() {
                 independent_paired_devices: vec![],
                 last_group_hash: None,
                 last_group_hash_published: true,
+                last_record_timestamp: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -445,6 +452,7 @@ fn test_serialize_with_approved() {
             independent_paired_devices: vec![],
             last_group_hash: None,
             last_group_hash_published: true,
+            last_record_timestamp: None,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -484,6 +492,7 @@ fn test_serialize_with_network_key() {
             independent_paired_devices: vec![],
             last_group_hash: None,
             last_group_hash_published: true,
+            last_record_timestamp: None,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -561,6 +570,23 @@ fn last_group_hash_roundtrips_and_defaults_none() {
     assert!(minimal.last_group_hash_published);
 }
 
+#[test]
+fn last_record_timestamp_roundtrips_and_defaults_none() {
+    let mut n = net("floored");
+    n.last_record_timestamp = Some(1_700_000_000_000_000);
+    let text = toml::to_string(&n).unwrap();
+    let back: NetworkConfig = toml::from_str(&text).unwrap();
+    assert_eq!(back.last_record_timestamp, Some(1_700_000_000_000_000));
+
+    let minimal: NetworkConfig = toml::from_str("name = \"x\"").unwrap();
+    assert_eq!(minimal.last_record_timestamp, None);
+    assert!(
+        !toml::to_string(&minimal)
+            .unwrap()
+            .contains("last_record_timestamp")
+    );
+}
+
 fn net(name: &str) -> NetworkConfig {
     NetworkConfig {
         name: name.to_string(),
@@ -575,6 +601,7 @@ fn net(name: &str) -> NetworkConfig {
         independent_paired_devices: vec![],
         last_group_hash: None,
         last_group_hash_published: true,
+        last_record_timestamp: None,
         transport: None,
         auto_accept_firewall: false,
         auto_accept_files: false,
