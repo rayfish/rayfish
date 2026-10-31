@@ -223,3 +223,61 @@ async fn controller_cannot_join_a_machine_with_a_foreign_invite() {
     daemon.shutdown_and_close().await;
     remote.close().await;
 }
+
+fn roster(members: &[(EndpointId, bool)]) -> MemberList {
+    let mut list = MemberList::new();
+    for &(identity, is_coordinator) in members {
+        list.add(Member {
+            identity,
+            is_coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        });
+    }
+    list
+}
+
+/// A delegated join goes through the controller alone. A controller holding
+/// another network's invite secret (a reusable key, or an unredeemed invite)
+/// can write itself into the invite's coordinator field and pass the check in
+/// the handler. If the dial then fell through to the network's real
+/// coordinators once the controller refused, they would admit the machine on
+/// that secret. Reaching the dial from the handler needs the network's signed
+/// record from discovery, so the dial is covered in `create_join`'s lifecycle
+/// tests and this checks the order it dials.
+#[test]
+fn a_delegated_join_dials_only_a_controller_the_roster_names_a_coordinator() {
+    let controller = SecretKey::generate().public();
+    let real = SecretKey::generate().public();
+    let me = SecretKey::generate().public();
+    let required = Some(JoinCoordinator::Required(controller));
+
+    for foreign in [
+        roster(&[(real, true), (controller, false)]),
+        roster(&[(real, true)]),
+    ] {
+        let error = fresh_join_dial_order(required, &foreign, me)
+            .expect_err("a controller that does not coordinate the network");
+        assert!(
+            error.to_string().contains("is not a coordinator"),
+            "{error}"
+        );
+        // An ordinary invite join still tries the named coordinator, then
+        // the roster's.
+        assert_eq!(
+            fresh_join_dial_order(Some(JoinCoordinator::Preferred(controller)), &foreign, me)
+                .unwrap(),
+            vec![controller, real]
+        );
+    }
+
+    let managed = roster(&[(real, true), (controller, true)]);
+    assert_eq!(
+        fresh_join_dial_order(required, &managed, me).unwrap(),
+        vec![controller]
+    );
+}

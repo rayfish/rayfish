@@ -143,8 +143,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Security
 
 - A managed machine only lets its controller remove it from networks that
-  controller coordinates, and only joins networks through invites that
-  controller issued. Before, a controller could make it leave any network.
+  controller coordinates, and only joins a network when that controller is one
+  of its coordinators and admits the machine itself. Before, a controller could
+  make it leave any network, or join one it did not run with an invite meant
+  for someone else.
 - Received files whose names would leave the download directory are refused.
 - Only root can ask the daemon to send a file by path, so operators cannot
   read files they have no access to.

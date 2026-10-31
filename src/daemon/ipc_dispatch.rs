@@ -522,7 +522,7 @@ impl Daemon {
                             name.as_deref(),
                             hostname,
                             invite,
-                            coordinator,
+                            coordinator.map(JoinCoordinator::Preferred),
                             auto_accept_firewall,
                             auto_accept_files,
                             transport,

@@ -27,8 +27,9 @@ struct JoinContext<'a> {
     /// (`--auto-accept-files`); persisted, config wins on reconnect/restore.
     auto_accept_files: bool,
     invite_lock: Arc<AsyncMutex<()>>,
-    /// Pinned coordinator to dial first (the invite minter), if known.
-    coordinator: Option<EndpointId>,
+    /// Coordinator named by the invite or pairing, and whether the join may
+    /// fall through to the roster's other coordinators.
+    coordinator: Option<JoinCoordinator>,
     /// Set on a restore whose network record advertises a mesh protocol version
     /// this build does not speak. Only [`VersionGate::Record`] can produce it,
     /// so it is always `None` on a fresh join.
@@ -235,7 +236,7 @@ struct PendingJoinRetry {
     name: Option<String>,
     hostname: Option<String>,
     invite: Option<Vec<u8>>,
-    coordinator: Option<EndpointId>,
+    coordinator: Option<JoinCoordinator>,
     auto_accept_firewall: bool,
     auto_accept_files: bool,
     transport: Option<config::TransportMode>,
@@ -302,7 +303,7 @@ impl Daemon {
                 name,
                 hostname,
                 invite,
-                coordinator,
+                coordinator.map(JoinCoordinator::Preferred),
                 auto_accept_firewall,
                 auto_accept_files,
                 None,
@@ -351,7 +352,7 @@ impl NetworkRegistry {
         name: Option<&str>,
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
+        coordinator: Option<JoinCoordinator>,
         auto_accept_firewall: bool,
         auto_accept_files: bool,
         // `--tor`: saved on the network once admitted, now or after approval.
@@ -546,7 +547,7 @@ impl NetworkRegistry {
         alias: Option<&str>,
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
+        coordinator: Option<JoinCoordinator>,
         // Auto-install coordinator-suggested firewall rules on this network
         // (`--auto-accept-firewall`); persisted so it survives restarts.
         auto_accept_firewall: bool,
@@ -803,24 +804,7 @@ impl NetworkRegistry {
         data: &crate::membership::GroupBlob,
     ) -> Result<Option<EstablishedMesh>> {
         let my_id = self.transport.identity.local_identity();
-        // With no invite, use our own id as the nominal minter;
-        // coordinator_dial_order filters it out (minter != me), so we just get
-        // all blob coordinators in order.
-        let minter = ctx.coordinator.unwrap_or(my_id);
-        let mut order = coordinator_dial_order(minter, &data.members, my_id);
-        // An explicitly-provided coordinator (from an invite, or the primary we
-        // just paired with) is a trusted dial target even if the fetched blob's
-        // roster does not flag it `is_coordinator`: a stale roster must not
-        // strand the join. Try it first.
-        if let Some(coord) = ctx.coordinator
-            && coord != my_id
-            && !order.contains(&coord)
-        {
-            order.insert(0, coord);
-        }
-        if order.is_empty() {
-            anyhow::bail!("no coordinator found in network record");
-        }
+        let order = fresh_join_dial_order(ctx.coordinator, &data.members, my_id)?;
 
         let mut last_err = anyhow::anyhow!("no coordinators tried");
         let mut pending = false;
@@ -921,8 +905,12 @@ impl NetworkRegistry {
         data: &crate::membership::GroupBlob,
     ) -> Result<Option<EstablishedMesh>> {
         let my_identity = self.transport.identity.local_identity();
-        let coordinator_id = reconnect_coordinator(ctx.coordinator, &data.members, my_identity)
-            .context("no coordinator found in network record")?;
+        let coordinator_id = reconnect_coordinator(
+            ctx.coordinator.map(JoinCoordinator::id),
+            &data.members,
+            my_identity,
+        )
+        .context("no coordinator found in network record")?;
 
         // The reconnect loop is spawned unconditionally and up front. A member
         // already holds the verified blob, so being *in* the network does not

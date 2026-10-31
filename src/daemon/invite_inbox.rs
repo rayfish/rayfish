@@ -293,7 +293,7 @@ impl ConnectService {
                 None,
                 hostname.map(|h| h.to_string()),
                 Some(decoded.secret),
-                Some(invitation.coordinator),
+                Some(JoinCoordinator::Preferred(invitation.coordinator)),
                 false,
                 false,
                 None,

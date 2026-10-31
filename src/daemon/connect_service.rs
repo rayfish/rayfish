@@ -310,7 +310,7 @@ impl ConnectService {
                 None,
                 hostname,
                 None,
-                Some(coordinator),
+                Some(JoinCoordinator::Preferred(coordinator)),
                 false,
                 false,
                 None,

@@ -1226,7 +1226,10 @@ impl ManagementService {
                 // `delegated_join` always mints the invite itself, so its
                 // coordinator field is the controller's own endpoint. Anything
                 // else would let a controller enroll this machine in a network
-                // it does not run.
+                // it does not run. The field alone proves nothing, since the
+                // controller wrote it: `Required` makes the join dial only the
+                // controller, and only if the signed roster names it a
+                // coordinator.
                 if coordinator != controller {
                     return ManagementResult::Error {
                         message: "invite was not issued by this controller; a controller can only join networks it coordinates".to_string(),
@@ -1239,7 +1242,7 @@ impl ManagementService {
                         Some(network_name.as_ref()),
                         Some(hostname.into()),
                         Some(secret),
-                        Some(coordinator),
+                        Some(JoinCoordinator::Required(coordinator)),
                         auto_accept_firewall,
                         auto_accept_files,
                         None,

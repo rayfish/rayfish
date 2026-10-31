@@ -769,3 +769,98 @@ async fn an_install_gives_way_to_a_live_network() {
     assert!(Arc::ptr_eq(&handler.state, &live_handler_state));
     daemon.shutdown_and_close().await;
 }
+
+/// A controller's delegated join is admitted by the controller or not at all.
+/// The controller here holds the network's invite secret but does not
+/// coordinate it, and refuses the dial. The join used to fall through to the
+/// real coordinator, which would admit the machine on that secret.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_delegated_join_never_falls_through_to_another_coordinator() {
+    use iroh::RelayMode;
+    use iroh::endpoint::presets;
+
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let bind = |alpn: Vec<u8>| {
+        Endpoint::builder(presets::N0)
+            .alpns(vec![alpn])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+    };
+    // Speaks no mesh ALPN, so a dial to it fails at once.
+    let controller = bind(b"not-mesh".to_vec()).await.unwrap();
+    let coordinator = bind(transport::mesh_alpn()).await.unwrap();
+    for endpoint in [&controller, &coordinator] {
+        daemon
+            .transport
+            .warm_lookup
+            .add_endpoint_info(endpoint.addr());
+    }
+    let server = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            let Some(incoming) = coordinator.accept().await else {
+                return false;
+            };
+            let connection = incoming.await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            assert!(matches!(
+                control::recv_msg(&mut recv).await.unwrap(),
+                ControlMsg::JoinRequest { .. }
+            ));
+            control::send_msg(&mut send, None, &ControlMsg::JoinPending)
+                .await
+                .unwrap();
+            let _ = send.finish();
+            connection.closed().await;
+            true
+        }
+    });
+    let data = GroupBlob {
+        members: MemberList::from(vec![
+            roster_row(coordinator.id(), true, None),
+            roster_row(controller.id(), false, None),
+        ]),
+        approved: ApprovedList::new(),
+        suggested_firewall: SuggestedFirewall::default(),
+        name: Some("box".into()),
+        reusable_keys: BTreeMap::new(),
+        nullifiers: BTreeSet::new(),
+    };
+    let context = JoinContext {
+        display_name: "box",
+        my_hostname: "studio",
+        net_pubkey: SecretKey::generate().public(),
+        group_hash: blake3::hash(b"test roster"),
+        invite: Some(vec![7; 16]),
+        auto_accept_firewall: false,
+        auto_accept_files: false,
+        invite_lock: Arc::new(AsyncMutex::new(())),
+        coordinator: Some(JoinCoordinator::Required(controller.id())),
+        mismatch: None,
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        daemon.registry.dial_fresh_join(&context, &data),
+    )
+    .await
+    .expect("the join ends");
+    let error = match outcome {
+        Err(error) => error,
+        Ok(established) => panic!(
+            "a delegated join reached another coordinator (queued: {})",
+            established.is_none()
+        ),
+    };
+    assert!(
+        error.to_string().contains("is not a coordinator"),
+        "{error:#}"
+    );
+    daemon.shutdown_and_close().await;
+    coordinator.close().await;
+    assert!(!server.await.unwrap(), "the real coordinator was dialed");
+    controller.close().await;
+}
