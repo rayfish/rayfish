@@ -1197,13 +1197,12 @@ impl Daemon {
         )
         .await;
 
-        // Fast-path the rename to connected peers via `MeshHello`, regardless of
-        // role. A peer *coordinator* only learns a self-rename this way: it acts
-        // on another node's `MeshHello` (routed to `handle_member_hello`, which
-        // applies the rename and republishes) but not on a `MemberSync`/
-        // `BlobUpdated` trigger, and coordinators don't run the group poller. So
-        // without this, a co-coordinator's rename never reached its peer
-        // coordinators (roster + `.ray` DNS both stayed stale on them).
+        // Deliver the rename to connected peers via `MeshHello`, regardless of
+        // role. Coordinators act on it (`handle_member_hello` applies the rename
+        // and republishes the signed record); plain members ignore the claim and
+        // pick the name up from that record. A peer coordinator only learns a
+        // self-rename this way: it does not act on a `MemberSync`/`BlobUpdated`
+        // trigger, and coordinators don't run the group poller.
         self.announce_rename_to_peers(network, my_identity, &new_hostname)
             .await;
         if is_coord {
