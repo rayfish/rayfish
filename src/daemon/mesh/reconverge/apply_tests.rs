@@ -341,6 +341,54 @@ async fn renewing_the_current_record_raises_the_floor() {
     fx.finish().await;
 }
 
+/// A resumed member starts with no floor, and the first record naming the blob
+/// it holds sets one. Without that, a kicked member could replay an older record
+/// for another roster over the mesh and roll the network back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_first_current_record_sets_the_floor_of_a_resumed_member() {
+    let fx = MemberFixture::start().await;
+    let current = fx.generation();
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, None);
+    let renewal = SignedGroupRecord {
+        hash: current,
+        seeds: Vec::new(),
+        timestamp: 5,
+    };
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &renewal,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Current);
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(5));
+
+    let (_, other) = fx
+        .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
+        .await;
+    let older = SignedGroupRecord {
+        hash: other,
+        seeds: Vec::new(),
+        timestamp: 1,
+    };
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &older,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Stale);
+    assert_eq!(fx.generation(), current);
+    fx.finish().await;
+}
+
 /// An older signed record that drops this node changes nothing: membership and
 /// the saved network survive, whether it is refused before the fetch or after.
 /// A newer one is our removal and forgets the saved network.
