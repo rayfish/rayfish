@@ -43,10 +43,11 @@ pub(crate) struct Recipient {
     pub(crate) caller_chose_dir: bool,
     /// Who asked, on Windows, where there is no uid to compare: the daemon
     /// asks Windows whether this caller could write the directory themselves.
-    /// Not saved: a token cannot outlive the daemon, so a saved receive loads
-    /// as `Unknown` (see [`Recipient::survives_restart`]).
+    /// Saved only as whether it was LocalSystem: a user's token cannot
+    /// outlive the daemon, so that receive is not saved at all (see
+    /// [`Recipient::survives_restart`]) and anything else loads as `Unknown`.
     #[cfg(windows)]
-    #[serde(skip)]
+    #[serde(default, rename = "caller_is_system", with = "saved_caller")]
     pub(crate) caller: WindowsCaller,
 }
 
@@ -62,6 +63,30 @@ pub(crate) enum WindowsCaller {
     /// Nothing identified the caller. A directory they chose is refused.
     #[default]
     Unknown,
+}
+
+/// [`WindowsCaller`] in `pending-files.json`: whether it was LocalSystem.
+#[cfg(windows)]
+mod saved_caller {
+    use super::WindowsCaller;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        caller: &WindowsCaller,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bool(matches!(caller, WindowsCaller::System))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<WindowsCaller, D::Error> {
+        Ok(if bool::deserialize(deserializer)? {
+            WindowsCaller::System
+        } else {
+            WindowsCaller::Unknown
+        })
+    }
 }
 
 impl Recipient {
@@ -2961,6 +2986,34 @@ mod tests {
         assert_eq!(service.pending_files.lock().unwrap().len(), 1);
         assert!(service.transfers.list().is_empty());
         assert!(!tmp.path().join("downloads").exists());
+    }
+
+    /// LocalSystem's receive is saved to resume after a restart, so it has
+    /// to come back as LocalSystem's, or the resumed receive downloads the
+    /// whole file and is then refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_saved_system_caller_loads_as_system() {
+        let saved = |caller| {
+            let recipient = Recipient {
+                owner: None,
+                caller_chose_dir: true,
+                caller,
+            };
+            let json = serde_json::to_string(&recipient).unwrap();
+            serde_json::from_str::<Recipient>(&json).unwrap().caller
+        };
+        assert!(matches!(
+            saved(WindowsCaller::System),
+            WindowsCaller::System
+        ));
+        assert!(matches!(
+            saved(WindowsCaller::Unknown),
+            WindowsCaller::Unknown
+        ));
+        let older: Recipient =
+            serde_json::from_str(r#"{"owner":null,"caller_chose_dir":true}"#).unwrap();
+        assert!(matches!(older.caller, WindowsCaller::Unknown));
     }
 
     /// A link planted at the file name must not redirect the daemon's write.
