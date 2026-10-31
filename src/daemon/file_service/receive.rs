@@ -424,8 +424,8 @@ impl FileService {
             };
             if stalled.exhausted(backoff, policy.give_up_after) {
                 return Err(format!(
-                    "{reason}; gave up after {} hours without progress",
-                    policy.give_up_after.as_secs() / 3600
+                    "{reason}; gave up after {} without progress",
+                    span(policy.give_up_after)
                 ));
             }
             tracing::info!(
@@ -589,6 +589,20 @@ impl FileService {
             .await
             .map_err(|e| format!("write failed: {e}"))
     }
+}
+
+/// `24 hours`, `2 minutes` or `1 second`: the largest unit that measures
+/// `duration` whole.
+fn span(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let (count, unit) = match secs {
+        0 => (0, "second"),
+        _ if secs % 3600 == 0 => (secs / 3600, "hour"),
+        _ if secs % 60 == 0 => (secs / 60, "minute"),
+        _ => (secs, "second"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural}")
 }
 
 /// What a fetch attempt waits on next.
@@ -760,6 +774,16 @@ mod tests {
             quick.for_blocking_call().give_up_after,
             BLOCKING_GIVE_UP_AFTER
         );
+    }
+
+    #[test]
+    fn the_give_up_window_reads_in_its_own_unit() {
+        assert_eq!(span(ResumePolicy::default().give_up_after), "24 hours");
+        assert_eq!(span(BLOCKING_GIVE_UP_AFTER), "2 minutes");
+        assert_eq!(span(Duration::from_secs(3600)), "1 hour");
+        assert_eq!(span(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(span(Duration::from_secs(1)), "1 second");
+        assert_eq!(span(Duration::ZERO), "0 seconds");
     }
 
     fn payload() -> Vec<u8> {

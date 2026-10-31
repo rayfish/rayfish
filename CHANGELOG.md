@@ -32,6 +32,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   saved under a shortened name instead of failing after the whole download.
 - A file offer whose real size differs from the size it claims now fails as
   soon as the download starts, instead of filling the disk with a larger file.
+- A receive that gives up after a few minutes without progress says so,
+  instead of "gave up after 0 hours".
 - On a network with several coordinators, a coordinator that created the
   network or restarted now picks up changes another coordinator makes, instead
   of missing them until something else prompted a refresh.
