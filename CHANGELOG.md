@@ -120,6 +120,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ray files accept -o <dir>` resolves a relative directory against the
   current directory.
 - A peer renamed to an invalid name no longer keeps answering PTR lookups.
+- A join or restore that loses the race to an already running copy of the
+  network no longer applies its own roster, which could overwrite the running
+  network's saved state or make it leave.
+- A device paired or unpaired while the daemon runs now handles pushed roster
+  updates under its current pairing, so it unpairs itself as soon as its
+  primary revokes it instead of only at the next poll.
+- A kick message no longer makes a member leave on the strength of an old
+  roster served from discovery, such as one from before it joined. The member
+  leaves only when a roster newer than its own drops it.
 
 ### Security
 
@@ -147,6 +156,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can write to, instead of anywhere the service account can. It never follows
   a link at the file name and never overwrites an existing file. Characters
   Windows reserves in a received file name, such as `:`, become `_`.
+- Anyone who knows a network's id can no longer make its members repeat
+  config writes and roster messages by resending the network's current signed
+  record. A copy no newer than the one already applied is ignored.
 
 ## [0.5.13] - 2026-10-31
 

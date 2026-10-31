@@ -16,14 +16,12 @@ use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
 
 pub(in crate::daemon::mesh) const NETWORK: &str = "home";
 
-/// A record timestamp (microseconds) later than any record the fixture's own
-/// coordinator publishes. Its group poller raises the floor to each renewal of
-/// the current record it sees, so a hand-set floor must sit above wall-clock
-/// time to stay put while a test runs.
-const FUTURE: u64 = 1 << 62;
-
-/// A daemon that joined `NETWORK` as a member. Holds the config lock and the
-/// config directory for as long as it lives.
+/// A daemon that holds `NETWORK` as a plain member, warm-resumed from a saved
+/// config and a stored verified blob the way a restart brings a member back. It
+/// has no network key, so it runs no publisher, pruner or coordinator handler,
+/// and nothing serves a record for the network, so its group poller changes
+/// nothing a test sets. Holds the config lock and the config directory for as
+/// long as it lives.
 pub(in crate::daemon::mesh) struct MemberFixture {
     pub(in crate::daemon::mesh) daemon: Arc<Daemon>,
     pub(in crate::daemon::mesh) state: SharedNetworkState,
@@ -46,24 +44,60 @@ impl MemberFixture {
         let relay = Relay::start().await;
         relay.configure();
         let daemon = build_headless(false).await.expect("headless daemon");
-        let net = create(&daemon, NETWORK).await;
-        let key = net
-            .network_secret_key
-            .expect("a created network holds its key");
-        // Demote to a member, so nothing here counts as locally authored.
-        config::update_network(NETWORK, |net| {
-            net.network_secret_key = None;
-            Ok(())
+        let key = SecretKey::generate();
+        let me = daemon.registry.transport.identity.local_identity();
+        let bytes = crate::membership::canonical_group_bytes(&GroupBlob {
+            members: MemberList::from(vec![Member {
+                identity: me,
+                hostname: Some("test-node".to_string()),
+                ..laptop(me)
+            }]),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some(NETWORK.to_string()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
+        let hash = blake3::hash(&bytes);
+        daemon
+            .transport
+            .blob_store
+            .blobs()
+            .add_slice(&bytes)
+            .await
+            .expect("store the member's blob");
+        config::save_network(&config::NetworkConfig {
+            network_public_key: Some(key.public()),
+            last_group_hash: Some(hash),
+            last_group_hash_published: true,
+            my_hostname: Some("test-node".to_string()),
+            ..config::empty_network_config(NETWORK)
         })
-        .expect("demote the network config");
+        .expect("save the member network");
+        let saved = SavedMemberNetwork {
+            name: NETWORK.to_string(),
+            net_pubkey: key.public().to_string(),
+            persisted_hostname: Some("test-node".to_string()),
+            auto_accept_firewall: false,
+            auto_accept_files: false,
+            cached_hash: Some(hash),
+            cached_is_published: true,
+        };
+        assert!(
+            daemon
+                .registry
+                .warm_resume_member_network(&saved, key.public())
+                .await
+                .expect("warm-resume the member network"),
+            "the member network resumes from its stored blob"
+        );
         let state = {
-            let mut handle = daemon
+            let handle = daemon
                 .registry
                 .networks
-                .get_mut(NETWORK)
+                .get(NETWORK)
                 .expect("network is live");
-            handle.role = NetworkRole::Member;
-            handle.state.write().unwrap().network_secret_key = None;
+            assert_eq!(handle.role, NetworkRole::Member);
             Arc::clone(&handle.state)
         };
         Self {
@@ -194,7 +228,7 @@ async fn applying_a_record_publishes_dns_and_routes() {
 #[allow(clippy::await_holding_lock)]
 async fn an_older_record_is_refused_on_every_path() {
     let fx = MemberFixture::start().await;
-    fx.state.write().unwrap().last_record_timestamp = Some(FUTURE + 1_000);
+    fx.state.write().unwrap().last_record_timestamp = Some(1_000);
     let before = fx.generation();
     let (_, hash) = fx
         .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
@@ -202,7 +236,7 @@ async fn an_older_record_is_refused_on_every_path() {
     let record = SignedGroupRecord {
         hash,
         seeds: Vec::new(),
-        timestamp: FUTURE + 500,
+        timestamp: 500,
     };
 
     let outcome = apply_group_record(
@@ -217,10 +251,7 @@ async fn an_older_record_is_refused_on_every_path() {
 
     assert_eq!(outcome, ReconvergeOutcome::Stale);
     assert_eq!(fx.generation(), before);
-    assert_eq!(
-        fx.state.read().unwrap().last_record_timestamp,
-        Some(FUTURE + 1_000)
-    );
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(1_000));
     fx.finish().await;
 }
 
@@ -269,12 +300,12 @@ async fn renewing_the_current_record_raises_the_floor() {
     {
         let mut s = fx.state.write().unwrap();
         s.converged_hash = Some(current);
-        s.last_record_timestamp = Some(FUTURE + 10);
+        s.last_record_timestamp = Some(10);
     }
     let renewal = SignedGroupRecord {
         hash: current,
         seeds: Vec::new(),
-        timestamp: FUTURE + 50,
+        timestamp: 50,
     };
     let outcome = apply_group_record(
         &fx.daemon.transport.endpoint,
@@ -286,10 +317,7 @@ async fn renewing_the_current_record_raises_the_floor() {
     )
     .await;
     assert_eq!(outcome, ReconvergeOutcome::Current);
-    assert_eq!(
-        fx.state.read().unwrap().last_record_timestamp,
-        Some(FUTURE + 50)
-    );
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(50));
 
     let (_, other) = fx
         .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
@@ -297,7 +325,7 @@ async fn renewing_the_current_record_raises_the_floor() {
     let older = SignedGroupRecord {
         hash: other,
         seeds: Vec::new(),
-        timestamp: FUTURE + 30,
+        timestamp: 30,
     };
     let outcome = apply_group_record(
         &fx.daemon.transport.endpoint,
@@ -313,6 +341,124 @@ async fn renewing_the_current_record_raises_the_floor() {
     fx.finish().await;
 }
 
+/// A resumed member starts with no floor, and the first record naming the blob
+/// it holds sets one. Without that, a kicked member could replay an older record
+/// for another roster over the mesh and roll the network back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_first_current_record_sets_the_floor_of_a_resumed_member() {
+    let fx = MemberFixture::start().await;
+    let current = fx.generation();
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, None);
+    let renewal = SignedGroupRecord {
+        hash: current,
+        seeds: Vec::new(),
+        timestamp: 5,
+    };
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &renewal,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Current);
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(5));
+
+    let (_, other) = fx
+        .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
+        .await;
+    let older = SignedGroupRecord {
+        hash: other,
+        seeds: Vec::new(),
+        timestamp: 1,
+    };
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &older,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Stale);
+    assert_eq!(fx.generation(), current);
+    fx.finish().await;
+}
+
+/// The member reconverge worker judges the record with the certificate the
+/// device holds when it runs. It kept the one it started with, so a device
+/// paired after that never noticed its primary nullifying it on this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_reconverge_worker_follows_a_later_pairing() {
+    let fx = MemberFixture::start().await;
+    let registry = fx.registry();
+    let device = registry.transport.endpoint.id();
+    let primary = SecretKey::generate();
+    // A network of its own, so the fixture's poller never sees its record.
+    let key = SecretKey::generate();
+    let mut group = fx.state.read().unwrap().group.clone();
+    group.members.add(Member {
+        is_coordinator: true,
+        ..laptop(primary.public())
+    });
+    group.nullifiers.insert(device);
+    let mut held = NetworkState {
+        group,
+        snapshot: None,
+        snapshot_commit: Arc::new(AsyncMutex::new(())),
+        destroyed: false,
+        converged_hash: None,
+        unconfirmed_durable_hash: None,
+        network_secret_key: None,
+        network_public_key: key.public(),
+        network_name: Some(NETWORK.to_string()),
+        mode: GroupMode::Restricted,
+        pending_suggestions: Vec::new(),
+        pending: HashMap::new(),
+        last_record_timestamp: None,
+    };
+    held.refresh_snapshot();
+    let hash = held.converged_hash.expect("a refreshed state has a hash");
+    let record = dht::encode_network_record(&key, &hash, &[]).expect("sign the record");
+    dht::publish_record(&registry.transport.pkarr, &record)
+        .await
+        .expect("publish the record");
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let cancel = CancellationToken::new();
+    let worker = spawn_reconverge_worker(
+        Arc::clone(&notify),
+        cancel.clone(),
+        Arc::new(RwLock::new(held)),
+        NETWORK.to_string(),
+        Arc::clone(&registry),
+        registry.transport.endpoint.clone(),
+        key.public(),
+    );
+
+    let cert = control::DeviceCert::create(&primary, &device, 1);
+    crate::identity::store_device_cert(&cert).expect("pair the device");
+    notify.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while crate::identity::load_device_cert()
+            .expect("read the device cert")
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the nullified device unpairs itself");
+    cancel.cancel();
+    worker.await.expect("the worker ends with its token");
+    fx.finish().await;
+}
+
 /// An older signed record that drops this node changes nothing: membership and
 /// the saved network survive, whether it is refused before the fetch or after.
 /// A newer one is our removal and forgets the saved network.
@@ -321,7 +467,7 @@ async fn renewing_the_current_record_raises_the_floor() {
 async fn an_older_removal_keeps_membership_and_the_saved_network() {
     let fx = MemberFixture::start().await;
     let me = fx.daemon.transport.endpoint.id();
-    fx.state.write().unwrap().last_record_timestamp = Some(FUTURE + 20);
+    fx.state.write().unwrap().last_record_timestamp = Some(20);
     let (blob, hash) = fx
         .blob_with(|m| {
             m.remove(&me);
@@ -330,7 +476,7 @@ async fn an_older_removal_keeps_membership_and_the_saved_network() {
     let older = SignedGroupRecord {
         hash,
         seeds: Vec::new(),
-        timestamp: FUTURE + 19,
+        timestamp: 19,
     };
 
     let outcome = apply_group_record(
@@ -356,13 +502,10 @@ async fn an_older_removal_keeps_membership_and_the_saved_network() {
     assert_eq!(outcome, ReconvergeOutcome::Superseded);
     assert!(fx.state.read().unwrap().group.members.is_member(&me));
     assert!(config::load_network(NETWORK).unwrap().is_some());
-    assert_eq!(
-        fx.state.read().unwrap().last_record_timestamp,
-        Some(FUTURE + 20)
-    );
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(20));
 
     let newer = SignedGroupRecord {
-        timestamp: FUTURE + 21,
+        timestamp: 21,
         ..older
     };
     let outcome = commit_group_blob(
@@ -386,6 +529,98 @@ async fn an_older_removal_keeps_membership_and_the_saved_network() {
     fx.finish().await;
 }
 
+/// A coordinator's kick is confirmed only by a record newer than the last one
+/// applied. A stale copy from before this node joined does not list it either,
+/// and taking that as the removal let the kick message alone delete the saved
+/// network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_kick_is_confirmed_only_by_a_newer_record() {
+    let fx = MemberFixture::start().await;
+    let registry = fx.registry();
+    let server = BlobServer::start(&fx.daemon).await;
+    let me = registry.transport.endpoint.id();
+    let without_us = {
+        let mut group = fx.state.read().unwrap().group.clone();
+        group.members.remove(&me);
+        group
+    };
+    let hash = server.serve(&without_us).await;
+    let packet =
+        dht::encode_network_record(&fx.key, &hash, &[server.id()]).expect("sign the record");
+    let ts = packet.timestamp().as_micros();
+    // Set before the record is published, so the fixture's poller cannot
+    // apply it either.
+    fx.state.write().unwrap().last_record_timestamp = Some(ts + 1);
+    dht::publish_record(&registry.transport.pkarr, &packet)
+        .await
+        .expect("publish the record");
+
+    registry.confirm_kick_and_leave(NETWORK).await;
+    assert!(registry.networks.contains_key(NETWORK));
+    assert!(config::load_network(NETWORK).unwrap().is_some());
+
+    fx.state.write().unwrap().last_record_timestamp = Some(ts - 1);
+    registry.confirm_kick_and_leave(NETWORK).await;
+    assert!(!registry.networks.contains_key(NETWORK));
+    assert!(config::load_network(NETWORK).unwrap().is_none());
+    server.finish().await;
+    fx.finish().await;
+}
+
+/// A peer that only serves blobs, reachable from the fixture's daemon.
+struct BlobServer {
+    router: Router,
+    store: FsStore,
+    _dir: tempfile::TempDir,
+}
+
+impl BlobServer {
+    async fn start(daemon: &Daemon) -> Self {
+        let dir = tempfile::tempdir().expect("temporary blob directory");
+        let store = FsStore::load(dir.path()).await.expect("blob server store");
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("loopback address")
+            .bind()
+            .await
+            .expect("blob server endpoint");
+        daemon
+            .transport
+            .warm_lookup
+            .add_endpoint_info(endpoint.addr());
+        let router = Router::builder(endpoint)
+            .accept(iroh_blobs::protocol::ALPN, BlobsProtocol::new(&store, None))
+            .spawn();
+        Self {
+            router,
+            store,
+            _dir: dir,
+        }
+    }
+
+    fn id(&self) -> EndpointId {
+        self.router.endpoint().id()
+    }
+
+    /// Store `group` where only this peer can serve it.
+    async fn serve(&self, group: &GroupBlob) -> blake3::Hash {
+        let bytes = crate::membership::canonical_group_bytes(group);
+        self.store
+            .blobs()
+            .add_slice(&bytes)
+            .await
+            .expect("store the blob");
+        blake3::hash(&bytes)
+    }
+
+    async fn finish(self) {
+        self.router.shutdown().await.expect("stop the blob server");
+    }
+}
+
 /// A daemon that created `NETWORK` and so coordinates it, next to a second
 /// coordinator of the same network that only serves blobs. Holds the config lock
 /// and the config directory for as long as it lives.
@@ -393,9 +628,7 @@ struct CoordinatorFixture {
     daemon: Arc<Daemon>,
     state: SharedNetworkState,
     key: SecretKey,
-    second: Router,
-    second_store: FsStore,
-    _second_dir: tempfile::TempDir,
+    second: BlobServer,
     _relay: Relay,
     _env: ConfigDir,
     _dir: tempfile::TempDir,
@@ -418,36 +651,12 @@ impl CoordinatorFixture {
             .network_secret_key
             .expect("a created network holds its key");
         let state = Arc::clone(&daemon.registry.networks.get(NETWORK).expect("live").state);
-
-        let second_dir = tempfile::tempdir().expect("temporary blob directory");
-        let second_store = FsStore::load(second_dir.path())
-            .await
-            .expect("second coordinator blob store");
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .relay_mode(iroh::RelayMode::Disabled)
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .expect("loopback address")
-            .bind()
-            .await
-            .expect("second coordinator endpoint");
-        daemon
-            .transport
-            .warm_lookup
-            .add_endpoint_info(endpoint.addr());
-        let second = Router::builder(endpoint)
-            .accept(
-                iroh_blobs::protocol::ALPN,
-                BlobsProtocol::new(&second_store, None),
-            )
-            .spawn();
+        let second = BlobServer::start(&daemon).await;
         Self {
             daemon,
             state,
             key,
             second,
-            second_store,
-            _second_dir: second_dir,
             _relay: relay,
             _env: env,
             _dir: dir,
@@ -458,33 +667,24 @@ impl CoordinatorFixture {
     /// The edit the second coordinator authors: the live roster plus itself as
     /// a coordinator, stored where only the second coordinator can serve it.
     async fn second_coordinators_edit(&self) -> blake3::Hash {
-        let bytes = {
-            let s = self.state.read().unwrap();
-            let mut group = s.group.clone();
+        let group = {
+            let mut group = self.state.read().unwrap().group.clone();
             group.members.add(Member {
                 is_coordinator: true,
-                ..laptop(self.second.endpoint().id())
+                ..laptop(self.second.id())
             });
-            crate::membership::canonical_group_bytes(&group)
+            group
         };
-        self.second_store
-            .blobs()
-            .add_slice(&bytes)
-            .await
-            .expect("store the edit");
-        blake3::hash(&bytes)
+        self.second.serve(&group).await
     }
 
     fn signed_by_second(&self, hash: blake3::Hash) -> SignedPacket {
-        dht::encode_network_record(&self.key, &hash, &[self.second.endpoint().id()])
+        dht::encode_network_record(&self.key, &hash, &[self.second.id()])
             .expect("sign the second coordinator's record")
     }
 
     async fn finish(self) {
-        self.second
-            .shutdown()
-            .await
-            .expect("stop the second coordinator");
+        self.second.finish().await;
         self.daemon.shutdown_and_close().await;
     }
 }
@@ -521,7 +721,7 @@ async fn a_coordinator_polls_an_edit_another_coordinator_published() {
             .unwrap()
             .group
             .members
-            .is_member(&fx.second.endpoint().id())
+            .is_member(&fx.second.id())
     );
     fx.finish().await;
 }
@@ -553,7 +753,7 @@ async fn a_coordinator_refuses_a_record_older_than_its_own_publish() {
 
     let record = SignedGroupRecord {
         hash: edit,
-        seeds: vec![fx.second.endpoint().id()],
+        seeds: vec![fx.second.id()],
         timestamp: stale.timestamp().as_micros(),
     };
     let outcome = apply_group_record(
