@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.13] - 2026-10-31
+
 ### Added
 
 - Windows: manage SSH access below Mesh SSH, with network, peer, and local
@@ -32,7 +34,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   working. Only new connections to the internet outside the tunnel are
   blocked.
 
-- Mesh SSH no longer limits the number of session channels on one connection.
 - New installs default Magic DNS to `partial`: only `.ray` names resolve, and
   the host's search domains are left alone. Existing installs keep their mode.
   Run `ray config set dns on` for short names.
@@ -78,9 +79,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peer and 64 peers in both saved hints and the running lookup. Connected paths
   refresh hourly. Old hints without timestamps are discarded on upgrade.
   Cache write failures do not prevent startup or restore rejected addresses.
-- Completed SSH commands release their session state and forwarded agent sockets
-  on reused connections.
-- Status no longer counts denied join requests as waiting for approval.
 - Windows: `.ray` names resolve in `partial` DNS mode.
 - With `dns off`, joining or leaving a network no longer routes `.ray` to
   Rayfish on Linux and Windows.
@@ -104,6 +102,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Windows: mesh route setup uses the native routing API instead of PowerShell.
 - Windows: Connect combines adapter and route setup, preserves correct routes,
   and configures the ping firewall rule alongside route setup.
+
+## [0.5.12] - 2026-10-28
+
+### Changed
+
+- Mesh SSH no longer limits the number of session channels on one connection.
+
+### Fixed
+
+- Completed SSH commands release their session state and forwarded agent sockets
+  on reused connections.
+- Status no longer counts denied join requests as waiting for approval.
 
 ## [0.5.11] - 2026-10-27
 
@@ -3095,7 +3105,9 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.11...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.13...HEAD
+[0.5.13]: https://github.com/rayfish/rayfish/compare/v0.5.12...v0.5.13
+[0.5.12]: https://github.com/rayfish/rayfish/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/rayfish/rayfish/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/rayfish/rayfish/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/rayfish/rayfish/compare/v0.5.8...v0.5.9
