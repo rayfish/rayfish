@@ -145,10 +145,14 @@ struct Written {
 
 impl Written {
     /// Move the file to its name, or a numbered variant when that is taken,
-    /// and return the path it was saved under.
-    async fn commit(self) -> std::io::Result<PathBuf> {
+    /// and return the path it was saved under. `before_rename` is told each
+    /// name just before the file is moved to it.
+    async fn commit(
+        self,
+        before_rename: impl FnMut(&str) + Send + 'static,
+    ) -> std::io::Result<PathBuf> {
         let Written { staged, dir } = self;
-        let name = tokio::task::spawn_blocking(move || staged.commit())
+        let name = tokio::task::spawn_blocking(move || staged.commit(before_rename))
             .await
             .map_err(std::io::Error::other)??;
         Ok(dir.join(name))
@@ -268,11 +272,17 @@ struct ReceiveOfferGuard {
 impl Drop for ReceiveOfferGuard {
     fn drop(&mut self) {
         if let Some(mut file) = self.file.take() {
-            if !self.shutdown.is_cancelled() {
-                file.accepted = None;
-            }
             let mut queue = self.pending.lock().unwrap();
             let mut active = self.active.lock().unwrap();
+            if self.shutdown.is_cancelled() {
+                // The active entry is the latest word on where it is going,
+                // including any name it was being saved under.
+                if let Some(current) = active.iter().find(|entry| entry.offer_id == self.offer_id) {
+                    file.accepted.clone_from(&current.accepted);
+                }
+            } else {
+                file.accepted = None;
+            }
             active.retain(|entry| entry.offer_id != self.offer_id);
             make_room(&mut queue, &self.store);
             queue.push(file);
@@ -396,6 +406,11 @@ pub(crate) struct PendingFile {
 struct AcceptedReceive {
     output: Option<String>,
     recipient: Recipient,
+    /// The name the complete file was being renamed to, saved just before
+    /// the rename. A restart between the rename and recording the delivery
+    /// finds the file under it rather than saving it a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved_as: Option<String>,
 }
 
 fn pending_files_path() -> Option<PathBuf> {
@@ -423,6 +438,32 @@ fn load_pending_files() -> Vec<PendingFile> {
             tracing::warn!(%error, "could not load pending files");
             Vec::new()
         }
+    }
+}
+
+/// Save that accepted receive `offer_id` is about to be renamed to `name`,
+/// for [`AcceptedReceive::saved_as`]. Runs on the blocking pool with the
+/// rename. A failure is logged and the rename goes ahead: failing the receive
+/// would put the offer back to be downloaded and saved again anyway.
+fn note_saving_as(
+    pending: &Mutex<Vec<PendingFile>>,
+    active: &Mutex<Vec<PendingFile>>,
+    offer_id: control::FileOfferId,
+    name: &str,
+) {
+    let pending = pending.lock().unwrap();
+    let mut active = active.lock().unwrap();
+    let Some(accepted) = active
+        .iter_mut()
+        .find(|entry| entry.offer_id == offer_id)
+        .and_then(|entry| entry.accepted.as_mut())
+    else {
+        return;
+    };
+    accepted.saved_as = Some(name.to_string());
+    let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
+    if let Err(error) = save_pending_files(&durable) {
+        tracing::warn!(%error, "could not note the name a received file is saved under");
     }
 }
 
@@ -1009,13 +1050,14 @@ impl FileService {
         hash: iroh_blobs::Hash,
         dir: PathBuf,
         file_name: &str,
+        temp: dest_name::TempName,
         recipient: Recipient,
     ) -> std::io::Result<Written> {
         use tokio::io::AsyncWriteExt;
 
         let name = file_name.to_string();
         let (dir, (staged, file)) = tokio::task::spawn_blocking(move || {
-            receive_dest::create(&dir, &name, recipient).map(|created| (dir, created))
+            receive_dest::create(&dir, &name, &temp, recipient).map(|created| (dir, created))
         })
         .await
         .map_err(std::io::Error::other)??;
@@ -1026,6 +1068,10 @@ impl FileService {
         let mut out = tokio::fs::File::from_std(file);
         tokio::io::copy_buf(&mut reader, &mut out).await?;
         out.flush().await?;
+        // On disk before it gets its real name: once it has it, the delivery
+        // is confirmed and the sender drops its copy, so a power loss must
+        // not leave an empty file there instead.
+        out.sync_all().await?;
         drop(out);
         Ok(Written { staged, dir })
     }
@@ -2742,7 +2788,13 @@ mod tests {
                 owner: Some((1000, 1000)),
                 caller_chose_dir: true,
             },
+            saved_as: None,
         });
+        let saved = serde_json::to_string(&[file.clone()]).unwrap();
+        assert!(!saved.contains("saved_as"), "{saved}");
+        if let Some(accepted) = file.accepted.as_mut() {
+            accepted.saved_as = Some("report.pdf".into());
+        }
         let saved = serde_json::to_vec(&[file.clone()]).unwrap();
         let loaded: Vec<PendingFile> = serde_json::from_slice(&saved).unwrap();
         assert_eq!(loaded[0].accepted, file.accepted);

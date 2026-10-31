@@ -34,6 +34,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On a network with several coordinators, a member reconnecting to one that
   has not yet caught up no longer rolls back to its older roster and then
   ignores the newer one.
+- A received file is flushed to disk before it is reported as saved, so a
+  power loss right after cannot leave an empty file in its place.
+- A received file whose name is too long for the disk (as macOS allows) is
+  saved under a shortened name instead of failing after the whole download.
+- A file offer whose real size differs from the size it claims now fails as
+  soon as the download starts, instead of filling the disk with a larger file.
+- A receive that gives up after a few minutes without progress says so,
+  instead of "gave up after 0 hours".
+- A receive cut short by a crash or power loss no longer leaves a hidden
+  `.rayfish-*.part` file in the download folder for good: receiving the same
+  offer again replaces it.
+- A daemon that stops just after saving a received file no longer saves it a
+  second time, as `name (1)`, when it starts again.
 - On a network with several coordinators, a coordinator that created the
   network or restarted now picks up changes another coordinator makes, instead
   of missing them until something else prompted a refresh.

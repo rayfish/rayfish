@@ -13,8 +13,9 @@
 //! file itself is created with `O_CREAT | O_EXCL | O_NOFOLLOW`, so nothing that
 //! already exists at the name is ever opened, let alone followed.
 //!
-//! The file is written under a temporary name and moved to its real name only
-//! once every byte is on disk, without replacing anything already there. A
+//! The file is written under a temporary name, synced, and moved to its real
+//! name only once every byte is on disk, without replacing anything already
+//! there; the directory is synced after the rename so the name lasts too. A
 //! receive that is canceled or interrupted partway removes the temporary file,
 //! so it never leaves a truncated file under the name a retry would then have
 //! to number around.
@@ -27,7 +28,9 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf, absolute};
 
 use super::Recipient;
-use super::dest_name::{MAX_NAME_ATTEMPTS, missing_names, numbered_name, root_len, temp_name};
+use super::dest_name::{
+    MAX_NAME_ATTEMPTS, TempName, fitted_name, missing_names, numbered_name, root_len,
+};
 
 /// A received file being written under a temporary name in its directory.
 /// Dropping it before [`Staged::commit`] removes the temporary file.
@@ -42,14 +45,22 @@ pub(super) struct Staged {
 impl Staged {
     /// Move the written file to its name, or the first free `name (n).ext`,
     /// never replacing an existing entry. Returns the name it got.
-    pub(super) fn commit(mut self) -> io::Result<OsString> {
+    /// `before_rename` is told each name just before the file is moved to it.
+    pub(super) fn commit(mut self, mut before_rename: impl FnMut(&str)) -> io::Result<OsString> {
         let temp = c_name(&self.temp)?;
         for attempt in 0..MAX_NAME_ATTEMPTS {
             let name = numbered_name(&self.wanted, attempt);
             let to = c_name(OsStr::new(&name))?;
+            // Known to be taken: not worth telling `before_rename` about. The
+            // rename still refuses a name taken since.
+            if exists_at(&self.dir, &to)? {
+                continue;
+            }
+            before_rename(&name);
             match rename_no_replace(&self.dir, &temp, &to) {
                 Ok(()) => {
                     self.committed = true;
+                    sync_dir(&self.dir);
                     return Ok(OsString::from(name));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -79,20 +90,21 @@ impl Drop for Staged {
     }
 }
 
-/// Open (creating as needed) `dir` for `recipient` and create a temporary
-/// file in it for `file_name`. Returns the empty file, owned by the
+/// Open (creating as needed) `dir` for `recipient` and create the temporary
+/// file `temp` in it for `file_name`. Returns the empty file, owned by the
 /// recipient, ready to be written and then committed.
 pub(super) fn create(
     dir: &Path,
     file_name: &str,
+    temp: &TempName,
     recipient: Recipient,
 ) -> io::Result<(Staged, File)> {
     let dir = open_dir(dir, &recipient)?;
-    let (temp, file) = create_temp(&dir, recipient.owner)?;
+    let (temp, file) = create_temp(&dir, temp, recipient.owner)?;
     let staged = Staged {
         dir,
         temp,
-        wanted: file_name.to_string(),
+        wanted: fitted_name(file_name),
         committed: false,
     };
     Ok((staged, file))
@@ -119,7 +131,8 @@ pub(super) enum DirTrust {
 /// Check, without creating anything, that a file for `recipient` could be
 /// saved in `dir`: the part of it that exists passes the same check a write
 /// does, and the rest is plain names. Lets an accept be refused before the
-/// download rather than after it. Any plain file name is usable here.
+/// download rather than after it. Any plain file name is usable here: one
+/// too long for the filesystem is cut to fit ([`fitted_name`]).
 pub(super) fn check(dir: &Path, _file_name: &str, recipient: &Recipient) -> io::Result<()> {
     let path = &absolute(dir)?;
     let trust = recipient.dir_trust();
@@ -331,39 +344,74 @@ fn check_dir(dir: &OwnedFd, trust: DirTrust, link_free: bool, path: &Path) -> io
     Ok(())
 }
 
-/// Create a fresh temporary file in `dir`, exclusively and without
-/// following a link, then hand it to `owner`.
-fn create_temp(dir: &OwnedFd, owner: Option<(u32, u32)>) -> io::Result<(OsString, File)> {
-    for _ in 0..MAX_NAME_ATTEMPTS {
-        let name = temp_name();
-        let c = c_name(OsStr::new(&name))?;
-        let flags =
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+/// Create the temporary file `name` in `dir`, exclusively and without
+/// following a link, then hand it to `owner`. A leftover from an earlier
+/// receive of the same offer is removed first ([`remove_leftover`]).
+fn create_temp(
+    dir: &OwnedFd,
+    name: &TempName,
+    owner: Option<(u32, u32)>,
+) -> io::Result<(OsString, File)> {
+    let c = c_name(OsStr::new(name.as_str()))?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let open = || {
         // SAFETY: `dir` is an open directory descriptor, `c` a valid
         // NUL-terminated string, and the mode argument is supplied because
         // `O_CREAT` is set.
         let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o644 as libc::c_uint) };
         if fd < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                continue;
-            }
-            return Err(e);
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: `openat` just returned this descriptor and nothing else owns it.
-        let file = unsafe { File::from_raw_fd(fd) };
-        if let Some((uid, gid)) = owner {
-            // SAFETY: `file` holds an open descriptor for the call.
-            if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
-                tracing::debug!("chown {name}: {}", io::Error::last_os_error());
-            }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    };
+    let file = match open() {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            remove_leftover(dir, &c, owner)?;
+            open()?
         }
-        return Ok((OsString::from(name), file));
+        result => result?,
+    };
+    if let Some((uid, gid)) = owner {
+        // SAFETY: `file` holds an open descriptor for the call.
+        if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+            tracing::debug!("chown {name:?}: {}", io::Error::last_os_error());
+        }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not pick a free temporary file name",
-    ))
+    Ok((OsString::from(name.as_str()), file))
+}
+
+/// Remove what an interrupted receive of the same offer left at `name`: a
+/// regular file owned by the recipient, or by the daemon when handing it over
+/// failed. Anything else there the daemon did not make, and it is left alone.
+/// The unlink removes the entry itself, never what a link points at.
+fn remove_leftover(dir: &OwnedFd, name: &CStr, owner: Option<(u32, u32)>) -> io::Result<()> {
+    // SAFETY: an all-zero `stat` is a valid value for the out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open directory descriptor, `name` a valid
+    // NUL-terminated string and `st` a writable `stat` for the call.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: geteuid cannot fail and touches no memory.
+    let daemon = unsafe { libc::geteuid() };
+    let ours = st.st_uid == daemon || owner.is_some_and(|(uid, _)| st.st_uid == uid);
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG || !ours {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{name:?} is in the way; remove it to receive this file"),
+        ));
+    }
+    tracing::debug!("removing {name:?} left by an interrupted receive");
+    unlink_at(dir, name)
 }
 
 /// Rename `from` to `to` inside `dir`, failing with `AlreadyExists` rather
@@ -505,6 +553,17 @@ fn exists_at(dir: &OwnedFd, name: &CStr) -> io::Result<bool> {
     Err(e)
 }
 
+/// Make a rename in `dir` durable. The file's bytes were synced before the
+/// rename; this is the directory entry that names them. Logged rather than
+/// returned: the file already has its name, and some filesystems (FUSE,
+/// Android's shared storage) refuse `fsync` on a directory outright.
+fn sync_dir(dir: &OwnedFd) {
+    // SAFETY: `dir` is an open directory descriptor for the call.
+    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+        tracing::debug!("sync directory: {}", io::Error::last_os_error());
+    }
+}
+
 fn unlink_at(dir: &OwnedFd, name: &CStr) -> io::Result<()> {
     // SAFETY: `dir` is an open directory descriptor for the call and `name`
     // is a valid NUL-terminated string.
@@ -529,6 +588,13 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
 
+    fn temp() -> TempName {
+        TempName::for_offer(
+            &iroh::SecretKey::generate().public(),
+            crate::control::FileOfferId::new(),
+        )
+    }
+
     fn me() -> (u32, u32) {
         // SAFETY: getuid and getgid cannot fail and touch no memory.
         unsafe { (libc::getuid(), libc::getgid()) }
@@ -547,7 +613,7 @@ mod tests {
         let (uid, gid) = me();
         let other = (uid.wrapping_add(1).max(1), gid);
         let nested = tmp.path().join("new/sub");
-        let Err(e) = create(&nested, "f.bin", caller(other)) else {
+        let Err(e) = create(&nested, "f.bin", &temp(), caller(other)) else {
             panic!("a directory owned by another uid must be refused");
         };
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -555,7 +621,7 @@ mod tests {
             !tmp.path().join("new").exists(),
             "nothing is created under a refused directory"
         );
-        let Err(e) = create(tmp.path(), "f.bin", caller(other)) else {
+        let Err(e) = create(tmp.path(), "f.bin", &temp(), caller(other)) else {
             panic!("a directory owned by another uid must be refused");
         };
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -588,10 +654,11 @@ mod tests {
     fn a_configured_directory_without_links_is_trusted_whoever_owns_it() {
         let tmp = tempfile::tempdir().unwrap();
         let other = me().0.wrapping_add(1).max(1);
-        assert!(create(tmp.path(), "a.bin", configured(None)).is_ok());
+        assert!(create(tmp.path(), "a.bin", &temp(), configured(None)).is_ok());
         let nested = tmp.path().join("new/sub");
-        let (staged, _file) = create(&nested, "a.bin", configured(Some((other, other)))).unwrap();
-        staged.commit().unwrap();
+        let (staged, _file) =
+            create(&nested, "a.bin", &temp(), configured(Some((other, other)))).unwrap();
+        staged.commit(|_| {}).unwrap();
         assert!(nested.join("a.bin").exists());
     }
 
@@ -607,7 +674,7 @@ mod tests {
         let other = me().0.wrapping_add(1).max(1);
         for recipient in [configured(Some((other, other))), configured(None)] {
             for dir in [link.clone(), link.join("sub")] {
-                let Err(e) = create(&dir, "f.bin", recipient.clone()) else {
+                let Err(e) = create(&dir, "f.bin", &temp(), recipient.clone()) else {
                     panic!("{dir:?} leads to a directory that is not theirs");
                 };
                 assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
@@ -616,8 +683,8 @@ mod tests {
         assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
         // Through a link to their own directory, as a Downloads folder on
         // another disk would be, it still works.
-        let (staged, _file) = create(&link, "f.bin", configured(Some(me()))).unwrap();
-        staged.commit().unwrap();
+        let (staged, _file) = create(&link, "f.bin", &temp(), configured(Some(me()))).unwrap();
+        staged.commit(|_| {}).unwrap();
         assert!(real.join("f.bin").exists());
     }
 
@@ -629,8 +696,8 @@ mod tests {
         let dir = tmp.path().join("in");
         std::fs::create_dir(&dir).unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("f.bin")).unwrap();
-        let (staged, _file) = create(&dir, "f.bin", caller(me())).unwrap();
-        assert_eq!(staged.commit().unwrap(), "f (1).bin");
+        let (staged, _file) = create(&dir, "f.bin", &temp(), caller(me())).unwrap();
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert!(dir.join("f.bin").symlink_metadata().unwrap().is_symlink());
     }
@@ -639,7 +706,7 @@ mod tests {
     fn an_escaping_path_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let escape = tmp.path().join("missing/../../x");
-        assert!(create(&escape, "f.bin", caller(me())).is_err());
+        assert!(create(&escape, "f.bin", &temp(), caller(me())).is_err());
         assert!(!tmp.path().join("missing").exists());
     }
 
@@ -647,8 +714,8 @@ mod tests {
     fn created_directories_and_files_belong_to_the_recipient() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a/b");
-        let (staged, _file) = create(&nested, "f.bin", caller(me())).unwrap();
-        staged.commit().unwrap();
+        let (staged, _file) = create(&nested, "f.bin", &temp(), caller(me())).unwrap();
+        staged.commit(|_| {}).unwrap();
         let (uid, _) = me();
         assert_eq!(std::fs::metadata(tmp.path().join("a")).unwrap().uid(), uid);
         assert_eq!(std::fs::metadata(&nested).unwrap().uid(), uid);
@@ -667,33 +734,121 @@ mod tests {
     #[test]
     fn the_file_is_written_under_a_temporary_name_until_committed() {
         let tmp = tempfile::tempdir().unwrap();
-        let (staged, mut file) = create(tmp.path(), "f.bin", caller(me())).unwrap();
+        let (staged, mut file) = create(tmp.path(), "f.bin", &temp(), caller(me())).unwrap();
         file.write_all(b"data").unwrap();
         let during = names(tmp.path());
         assert_eq!(during.len(), 1);
         assert!(during[0].starts_with(".rayfish-"), "{during:?}");
         drop(file);
-        assert_eq!(staged.commit().unwrap(), "f.bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f.bin");
         assert_eq!(names(tmp.path()), ["f.bin"]);
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"data");
+    }
+
+    /// A name longer than one directory entry holds, as APFS allows, is
+    /// saved cut to fit, numbered too when it is taken.
+    #[test]
+    fn a_name_too_long_for_the_filesystem_is_cut_to_fit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "é".repeat(148));
+        assert_eq!(long.len(), 300);
+        let mut saved = Vec::new();
+        for _ in 0..2 {
+            let (staged, mut file) = create(tmp.path(), &long, &temp(), caller(me())).unwrap();
+            file.write_all(b"data").unwrap();
+            drop(file);
+            let name = staged.commit(|_| {}).unwrap().into_string().unwrap();
+            assert!(name.len() <= 255, "{}", name.len());
+            assert!(name.ends_with(".txt"), "{name}");
+            assert_eq!(std::fs::read(tmp.path().join(&name)).unwrap(), b"data");
+            saved.push(name);
+        }
+        assert!(saved[1].ends_with(" (1).txt"), "{saved:?}");
+    }
+
+    /// A receive cut short by a crash leaves its temporary file. The same
+    /// offer received again writes over it, so nothing is left behind.
+    #[test]
+    fn a_leftover_from_an_interrupted_receive_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let temp = temp();
+        let (staged, mut file) = create(tmp.path(), "f.bin", &temp, caller(me())).unwrap();
+        file.write_all(b"partial").unwrap();
+        drop(file);
+        // A crash: nothing gets to remove it.
+        std::mem::forget(staged);
+        assert_eq!(names(tmp.path()).len(), 1);
+        let (staged, mut file) = create(tmp.path(), "f.bin", &temp, caller(me())).unwrap();
+        file.write_all(b"full").unwrap();
+        drop(file);
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f.bin");
+        assert_eq!(names(tmp.path()), ["f.bin"]);
+        assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"full");
+    }
+
+    /// Only a plain file can be a leftover. A link or a directory at the
+    /// temporary name is not the daemon's, and stays.
+    #[test]
+    fn something_else_at_the_temporary_name_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let dir = tmp.path().join("in");
+        std::fs::create_dir(&dir).unwrap();
+        let link = temp();
+        std::os::unix::fs::symlink(&victim, dir.join(link.as_str())).unwrap();
+        let Err(e) = create(&dir, "f.bin", &link, caller(me())) else {
+            panic!("a link at the temporary name must not be replaced");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert!(
+            dir.join(link.as_str())
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let directory = temp();
+        std::fs::create_dir(dir.join(directory.as_str())).unwrap();
+        assert!(create(&dir, "f.bin", &directory, caller(me())).is_err());
+        assert!(dir.join(directory.as_str()).is_dir());
     }
 
     #[test]
     fn dropping_before_commit_leaves_nothing_behind() {
         let tmp = tempfile::tempdir().unwrap();
-        let (staged, mut file) = create(tmp.path(), "f.bin", caller(me())).unwrap();
+        let (staged, mut file) = create(tmp.path(), "f.bin", &temp(), caller(me())).unwrap();
         file.write_all(b"partial").unwrap();
         drop(staged);
         assert!(names(tmp.path()).is_empty());
     }
 
+    /// The name is announced before the file has it, so a crash between the
+    /// two leaves a note of where to look.
+    #[test]
+    fn commit_announces_the_name_before_the_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
+        let (staged, _file) = create(tmp.path(), "f.bin", &temp(), caller(me())).unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut announced = Vec::new();
+        let name = staged
+            .commit(|name| {
+                assert!(!dir.join(name).exists(), "{name} already renamed");
+                announced.push(name.to_string());
+            })
+            .unwrap();
+        assert_eq!(name, "f (1).bin");
+        assert_eq!(announced, ["f (1).bin"]);
+    }
+
     #[test]
     fn commit_never_replaces_a_file_that_appeared_meanwhile() {
         let tmp = tempfile::tempdir().unwrap();
-        let (staged, mut file) = create(tmp.path(), "f.bin", caller(me())).unwrap();
+        let (staged, mut file) = create(tmp.path(), "f.bin", &temp(), caller(me())).unwrap();
         file.write_all(b"new").unwrap();
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
-        assert_eq!(staged.commit().unwrap(), "f (1).bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
         assert_eq!(std::fs::read(tmp.path().join("f (1).bin")).unwrap(), b"new");
         assert_eq!(names(tmp.path()), ["f (1).bin", "f.bin"]);

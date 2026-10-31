@@ -20,8 +20,15 @@
 //! later `ray files accept` still resumes it.
 //!
 //! Errors that another attempt cannot fix end the receive at once: the sender
-//! no longer having the file, data that does not match the offered hash, and
-//! local store or disk failures.
+//! no longer having the file, data that does not match the offered hash or
+//! size, and local store or disk failures.
+//!
+//! The offer's size is only the sender's word, and the hash alone does not
+//! bound what it names: "1 KB" with the hash of a 100 GB blob would fill the
+//! disk as root. So the size the sender's stream declares is held against the
+//! offered one as soon as the store records it, after the first chunk, and a
+//! mismatch ends the receive. A declared size that matches but is a lie fails
+//! verification instead, since the decoder never reads past it.
 //!
 //! An accepted receive is saved with its destination in `pending-files.json`,
 //! so a daemon restart picks it up again ([`FileService::resume_accepted_receives`])
@@ -30,7 +37,9 @@
 
 use super::*;
 
+use futures::Stream;
 use iroh::endpoint::{ReadError, WriteError};
+use iroh_blobs::api::proto::Bitfield;
 use iroh_blobs::get::GetError;
 use iroh_blobs::get::fsm::{AtBlobHeaderNextError, ConnectedNextError, DecodeError};
 use tokio::sync::{Semaphore, oneshot};
@@ -190,14 +199,22 @@ impl FileService {
         recipient: Recipient,
         policy: ResumePolicy,
     ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
-        let file = {
+        let (file, saved_as) = {
             let mut pending = self.pending_files.lock().unwrap();
             let Some(mut file) = take_pending(&mut pending, id) else {
                 return op_err(format!("no pending file with id {id}"));
             };
+            // A receive resumed into the same place keeps the name it was
+            // being saved under, which is how it finds a file already saved.
+            let saved_as = file
+                .accepted
+                .take()
+                .filter(|before| before.output == output)
+                .and_then(|before| before.saved_as);
             file.accepted = recipient.survives_restart().then(|| AcceptedReceive {
                 output: output.clone(),
                 recipient: recipient.clone(),
+                saved_as: saved_as.clone(),
             });
 
             let mut active = self.active_files.lock().unwrap();
@@ -206,7 +223,7 @@ impl FileService {
             if let Err(error) = save_pending_files(&durable) {
                 tracing::warn!(%error, "could not save accepted file; it will not resume after a restart");
             }
-            file
+            (file, saved_as)
         };
         let transfer_id = self.transfers.register_receive(
             file.from.fmt_short().to_string(),
@@ -232,7 +249,17 @@ impl FileService {
             .insert(transfer_id, cancel.clone());
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let service = Arc::clone(self);
-        let to = AcceptedReceive { output, recipient };
+        let to = AcceptedReceive {
+            output,
+            recipient,
+            saved_as,
+        };
+        let before_rename = {
+            let pending = Arc::clone(&self.pending_files);
+            let active = Arc::clone(&self.active_files);
+            let offer_id = file.offer_id;
+            move |name: &str| note_saving_as(&pending, &active, offer_id, name)
+        };
         tokio::spawn(async move {
             // Biased so a receive that finished in the same poll as a cancel
             // counts as finished.
@@ -245,10 +272,11 @@ impl FileService {
             // Naming the complete file is not canceled: once the rename has
             // happened, the outcome has to say so.
             let received = match written {
-                Ok(written) => written
-                    .commit()
+                Ok(Received::Written(written)) => written
+                    .commit(before_rename)
                     .await
                     .map_err(|e| format!("write failed: {e}")),
+                Ok(Received::Saved(path)) => Ok(path),
                 Err(error) => Err(error),
             };
             let outcome = service.finish_receive(offer, finish, received);
@@ -355,11 +383,15 @@ impl FileService {
         transfer_id: u64,
         to: AcceptedReceive,
         policy: ResumePolicy,
-    ) -> Result<Written, String> {
+    ) -> Result<Received, String> {
         // Checked again here, not only when the offer was queued: offers saved
         // by an older daemon were never validated.
         if !is_safe_file_name(&file.filename) {
             return Err(format!("invalid file name '{}'", file.filename));
+        }
+        if let Some(path) = already_saved(file, &to).await {
+            tracing::info!(file = %file.filename, "found the file saved before a restart");
+            return Ok(Received::Saved(path));
         }
         // Claim the blob before fetching it. `fetch` leaves what it downloads
         // untagged, so a GC triggered by some other transfer finishing mid-fetch
@@ -375,7 +407,7 @@ impl FileService {
             .await
             .map_err(|e| format!("blob store error: {e}"))?;
         self.fetch_resuming(file, transfer_id, policy).await?;
-        self.save_received(file, to).await
+        self.save_received(file, to).await.map(Received::Written)
     }
 
     /// Fetch until the blob is complete, waiting out interruptions.
@@ -415,8 +447,8 @@ impl FileService {
             };
             if stalled.exhausted(backoff, policy.give_up_after) {
                 return Err(format!(
-                    "{reason}; gave up after {} hours without progress",
-                    policy.give_up_after.as_secs() / 3600
+                    "{reason}; gave up after {} without progress",
+                    span(policy.give_up_after)
                 ));
             }
             tracing::info!(
@@ -443,15 +475,31 @@ impl FileService {
     ) -> Result<(), FetchError> {
         let hash = file.blob_hash;
         let store = &self.transport.blob_store;
+        let store_error =
+            |e: &dyn std::fmt::Display| FetchError::Fatal(format!("blob store error: {e}"));
+        // Watched from before the fetch, so the size the sender declares is
+        // seen the moment the store has it.
+        let mut sizes = Box::pin(
+            store
+                .blobs()
+                .observe(hash)
+                .stream()
+                .await
+                .map_err(|e| store_error(&e))?,
+        );
+        let mut size_known = match sizes.next().await {
+            Some(bitfield) => check_size(&bitfield, file.size)?,
+            None => false,
+        };
         let local = store
             .remote()
             .local(hash)
             .await
-            .map_err(|e| FetchError::Fatal(format!("blob store error: {e}")))?;
+            .map_err(|e| store_error(&e))?;
         let downloaded = local.local_bytes();
         self.transfers.note_progress(transfer_id, downloaded);
         if local.is_complete() {
-            return Ok(());
+            return self.check_stored_size(file).await;
         }
         let connect = transport::connect_to_peer_with_alpn(
             &self.transport.endpoint,
@@ -488,12 +536,36 @@ impl FileService {
         );
         let mut progressed = false;
         loop {
-            let Ok(item) = tokio::time::timeout(policy.idle_timeout, stream.next()).await else {
-                probe.close(VarInt::from_u32(0), b"stalled");
-                return Err(FetchError::Interrupted {
-                    reason: "the transfer stalled".to_string(),
-                    progressed,
-                });
+            let next = tokio::select! {
+                biased;
+                bitfield = next_size(&mut sizes), if !size_known => Next::Size(bitfield),
+                item = tokio::time::timeout(policy.idle_timeout, stream.next()) => Next::Fetch(item),
+            };
+            let item = match next {
+                Next::Size(Some(bitfield)) => {
+                    match check_size(&bitfield, file.size) {
+                        Ok(known) => size_known = known,
+                        Err(e) => {
+                            probe.close(VarInt::from_u32(0), b"wrong size");
+                            return Err(e);
+                        }
+                    }
+                    continue;
+                }
+                // The store stopped reporting; the size is checked once the
+                // fetch is done instead.
+                Next::Size(None) => {
+                    size_known = true;
+                    continue;
+                }
+                Next::Fetch(Ok(item)) => item,
+                Next::Fetch(Err(_)) => {
+                    probe.close(VarInt::from_u32(0), b"stalled");
+                    return Err(FetchError::Interrupted {
+                        reason: "the transfer stalled".to_string(),
+                        progressed,
+                    });
+                }
             };
             match item {
                 Some(GetProgressItem::Progress(n)) => {
@@ -501,7 +573,7 @@ impl FileService {
                     self.transfers
                         .note_progress(transfer_id, downloaded.saturating_add(n));
                 }
-                Some(GetProgressItem::Done(_)) => return Ok(()),
+                Some(GetProgressItem::Done(_)) => return self.check_stored_size(file).await,
                 Some(GetProgressItem::Error(e)) => {
                     return Err(classify(&e, probe.close_reason().is_some(), progressed));
                 }
@@ -515,6 +587,20 @@ impl FileService {
         }
     }
 
+    /// Hold the size of the blob in the store against the offered one. For a
+    /// complete blob, which a single fetch can deliver before the watch above
+    /// sees it.
+    async fn check_stored_size(&self, file: &PendingFile) -> Result<(), FetchError> {
+        let bitfield = self
+            .transport
+            .blob_store
+            .blobs()
+            .observe(file.blob_hash)
+            .await
+            .map_err(|e| FetchError::Fatal(format!("blob store error: {e}")))?;
+        check_size(&bitfield, file.size).map(|_| ())
+    }
+
     /// Write the fetched blob to the destination directory.
     async fn save_received(
         &self,
@@ -522,10 +608,89 @@ impl FileService {
         to: AcceptedReceive,
     ) -> Result<Written, String> {
         let dir = receive_dir(to.output.as_deref());
-        self.write_received(file.blob_hash, dir, &file.filename, to.recipient)
+        let temp = dest_name::TempName::for_offer(&file.from, file.offer_id);
+        self.write_received(file.blob_hash, dir, &file.filename, temp, to.recipient)
             .await
             .map_err(|e| format!("write failed: {e}"))
     }
+}
+
+/// `24 hours`, `2 minutes` or `1 second`: the largest unit that measures
+/// `duration` whole.
+fn span(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let (count, unit) = match secs {
+        0 => (0, "second"),
+        _ if secs.is_multiple_of(3600) => (secs / 3600, "hour"),
+        _ if secs.is_multiple_of(60) => (secs / 60, "minute"),
+        _ => (secs, "second"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural}")
+}
+
+/// How far a receive got.
+enum Received {
+    /// Written under its temporary name, still to be given its own.
+    Written(Written),
+    /// Already saved here by an earlier run that stopped before recording it.
+    Saved(PathBuf),
+}
+
+/// The file an earlier run of this receive saved, if it got as far as the
+/// rename but not as recording the delivery: the name it was being renamed to
+/// holds a plain file of the offered size, and its temporary file is gone.
+/// With the temporary file still there, the rename never happened and the
+/// receive writes it again. Anything unreadable counts as not saved, which
+/// at worst saves a second copy, as before.
+async fn already_saved(file: &PendingFile, to: &AcceptedReceive) -> Option<PathBuf> {
+    let name = to.saved_as.clone()?;
+    if !is_safe_file_name(&name) {
+        return None;
+    }
+    let dir = receive_dir(to.output.as_deref());
+    let temp = dest_name::TempName::for_offer(&file.from, file.offer_id);
+    let size = file.size;
+    tokio::task::spawn_blocking(move || {
+        match dir.join(temp.as_str()).symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        let path = dir.join(name);
+        let meta = path.symlink_metadata().ok()?;
+        (meta.is_file() && meta.len() == size).then_some(path)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// What a fetch attempt waits on next.
+enum Next {
+    /// An update to what the store holds of the blob.
+    Size(Option<Bitfield>),
+    /// The fetch's next item, or the idle timeout.
+    Fetch(Result<Option<GetProgressItem>, tokio::time::error::Elapsed>),
+}
+
+async fn next_size(sizes: &mut (impl Stream<Item = Bitfield> + Unpin)) -> Option<Bitfield> {
+    sizes.next().await
+}
+
+/// Whether the store knows the blob's size yet, failing when it is not the
+/// `offered` one. Until the sender's first chunk arrives the store has none:
+/// a size of zero counts only once validated, as an empty blob's is.
+fn check_size(bitfield: &Bitfield, offered: u64) -> Result<bool, FetchError> {
+    let size = bitfield.size();
+    if size == 0 && !bitfield.is_validated() {
+        return Ok(false);
+    }
+    if size != offered {
+        return Err(FetchError::Fatal(format!(
+            "the sender's file is {size} bytes, not the {offered} it offered"
+        )));
+    }
+    Ok(true)
 }
 
 /// The directory a receive saves into: the one asked for, or the daemon
@@ -671,6 +836,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_give_up_window_reads_in_its_own_unit() {
+        assert_eq!(span(ResumePolicy::default().give_up_after), "24 hours");
+        assert_eq!(span(BLOCKING_GIVE_UP_AFTER), "2 minutes");
+        assert_eq!(span(Duration::from_secs(3600)), "1 hour");
+        assert_eq!(span(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(span(Duration::from_secs(1)), "1 second");
+        assert_eq!(span(Duration::ZERO), "0 seconds");
+    }
+
     fn payload() -> Vec<u8> {
         (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect()
     }
@@ -749,13 +924,18 @@ mod tests {
 
     /// Queue an offer of `data` from `from` as pending file 1.
     fn offer(service: &FileService, from: EndpointId, data: &[u8]) {
+        offer_sized(service, from, data, u64::try_from(data.len()).unwrap());
+    }
+
+    /// Queue an offer of `data` that claims to be `size` bytes.
+    fn offer_sized(service: &FileService, from: EndpointId, data: &[u8], size: u64) {
         service.pending_files.lock().unwrap().push(PendingFile {
             id: 1,
             offer_id: control::FileOfferId::new(),
             accepted: None,
             from,
             filename: "big.bin".into(),
-            size: u64::try_from(data.len()).unwrap(),
+            size,
             mime_type: "application/octet-stream".into(),
             blob_hash: blake3::hash(data).into(),
         });
@@ -907,7 +1087,11 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(
             saved[0].accepted,
-            Some(AcceptedReceive { output, recipient })
+            Some(AcceptedReceive {
+                output,
+                recipient,
+                saved_as: None,
+            })
         );
 
         // It starts again with the sender back, and nobody accepts it twice.
@@ -932,6 +1116,70 @@ mod tests {
         assert_eq!(done.state, transfers::TransferState::Done, "{done:?}");
         assert_eq!(std::fs::read(downloads.join("big.bin")).unwrap(), data);
         assert!(load_pending_files().is_empty());
+    }
+
+    /// A daemon that stops between saving a file and recording the delivery
+    /// finds the file on restart instead of saving it a second time.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_receive_saved_before_a_restart_is_not_saved_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let data = payload();
+        let sender = SecretKey::generate().public();
+        let receiver = file_service(
+            file_endpoint(MemoryLookup::new()).await,
+            &tmp.path().join("r"),
+        )
+        .await;
+        // As the first run left it: the blob complete and tagged, the file
+        // renamed into place, the delivery not yet recorded.
+        let store = &receiver.transport.blob_store;
+        let blob = store.blobs().add_slice(&data).temp_tag().await.unwrap();
+        let hash = blob.hash_and_format();
+        store
+            .tags()
+            .set(blob_tags::recv(&hash.hash, 1), hash)
+            .await
+            .unwrap();
+        offer(&receiver, sender, &data);
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        std::fs::write(downloads.join("big.bin"), &data).unwrap();
+        let offer_id = {
+            let mut pending = receiver.pending_files.lock().unwrap();
+            pending[0].accepted = Some(AcceptedReceive {
+                output: Some(downloads.to_string_lossy().into_owned()),
+                recipient: Recipient {
+                    owner: None,
+                    caller_chose_dir: true,
+                },
+                saved_as: Some("big.bin".into()),
+            });
+            pending[0].offer_id
+        };
+
+        let mut changes = receiver.transfers.subscribe();
+        receiver.resume_accepted_receives();
+        let done = wait_for(&receiver, &mut changes, |t| {
+            t.state != transfers::TransferState::Transferring
+        })
+        .await;
+        assert_eq!(done.state, transfers::TransferState::Done, "{done:?}");
+        let names: Vec<_> = std::fs::read_dir(&downloads)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["big.bin"]);
+        assert!(load_pending_files().is_empty());
+        assert!(
+            receiver
+                .declines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.accepted && entry.offer_id == offer_id)
+        );
     }
 
     #[tokio::test]
@@ -997,6 +1245,40 @@ mod tests {
         assert_eq!(receiver.pending_files.lock().unwrap().len(), 1);
         assert!(load_pending_files()[0].accepted.is_none());
         assert!(receiver.active_files.lock().unwrap().is_empty());
+    }
+
+    /// An offer that understates its size must not get to write the rest:
+    /// it fails at once, with nothing saved and no retry.
+    #[tokio::test]
+    async fn a_blob_larger_than_offered_ends_the_receive() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let data = payload();
+        let lookup = MemoryLookup::new();
+        let key = SecretKey::generate();
+        let _sender = sender(&key, &lookup, &tmp.path().join("sender"), Some(&data), None).await;
+        let mut receiver =
+            file_service(file_endpoint(lookup.clone()).await, &tmp.path().join("r")).await;
+        Arc::get_mut(&mut receiver).unwrap().resume = quick_retries();
+        offer_sized(&receiver, key.public(), &data, 1024);
+        let downloads = tmp.path().join("downloads");
+        let output = Some(downloads.to_string_lossy().into_owned());
+
+        let error = receiver.accept_file(1, output, None).await.unwrap_err();
+        let expected = format!("is {} bytes, not the 1024 it offered", data.len());
+        assert!(error.message().contains(&expected), "{error}");
+        let failed = receive(&receiver);
+        assert_eq!(failed.state, transfers::TransferState::Failed);
+        assert!(!downloads.join("big.bin").exists());
+        let stored = receiver
+            .transport
+            .blob_store
+            .remote()
+            .local(iroh_blobs::Hash::from(blake3::hash(&data)))
+            .await
+            .unwrap();
+        assert!(!stored.is_complete(), "the whole blob was fetched");
+        assert_eq!(receiver.pending_files.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
