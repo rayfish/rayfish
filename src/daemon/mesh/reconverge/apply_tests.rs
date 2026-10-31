@@ -16,14 +16,12 @@ use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
 
 pub(in crate::daemon::mesh) const NETWORK: &str = "home";
 
-/// A record timestamp (microseconds) later than any record the fixture's own
-/// coordinator publishes. Its group poller raises the floor to each renewal of
-/// the current record it sees, so a hand-set floor must sit above wall-clock
-/// time to stay put while a test runs.
-const FUTURE: u64 = 1 << 62;
-
-/// A daemon that joined `NETWORK` as a member. Holds the config lock and the
-/// config directory for as long as it lives.
+/// A daemon that holds `NETWORK` as a plain member, warm-resumed from a saved
+/// config and a stored verified blob the way a restart brings a member back. It
+/// has no network key, so it runs no publisher, pruner or coordinator handler,
+/// and nothing serves a record for the network, so its group poller changes
+/// nothing a test sets. Holds the config lock and the config directory for as
+/// long as it lives.
 pub(in crate::daemon::mesh) struct MemberFixture {
     pub(in crate::daemon::mesh) daemon: Arc<Daemon>,
     pub(in crate::daemon::mesh) state: SharedNetworkState,
@@ -46,24 +44,60 @@ impl MemberFixture {
         let relay = Relay::start().await;
         relay.configure();
         let daemon = build_headless(false).await.expect("headless daemon");
-        let net = create(&daemon, NETWORK).await;
-        let key = net
-            .network_secret_key
-            .expect("a created network holds its key");
-        // Demote to a member, so nothing here counts as locally authored.
-        config::update_network(NETWORK, |net| {
-            net.network_secret_key = None;
-            Ok(())
+        let key = SecretKey::generate();
+        let me = daemon.registry.transport.identity.local_identity();
+        let bytes = crate::membership::canonical_group_bytes(&GroupBlob {
+            members: MemberList::from(vec![Member {
+                identity: me,
+                hostname: Some("test-node".to_string()),
+                ..laptop(me)
+            }]),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some(NETWORK.to_string()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
+        let hash = blake3::hash(&bytes);
+        daemon
+            .transport
+            .blob_store
+            .blobs()
+            .add_slice(&bytes)
+            .await
+            .expect("store the member's blob");
+        config::save_network(&config::NetworkConfig {
+            network_public_key: Some(key.public()),
+            last_group_hash: Some(hash),
+            last_group_hash_published: true,
+            my_hostname: Some("test-node".to_string()),
+            ..config::empty_network_config(NETWORK)
         })
-        .expect("demote the network config");
+        .expect("save the member network");
+        let saved = SavedMemberNetwork {
+            name: NETWORK.to_string(),
+            net_pubkey: key.public().to_string(),
+            persisted_hostname: Some("test-node".to_string()),
+            auto_accept_firewall: false,
+            auto_accept_files: false,
+            cached_hash: Some(hash),
+            cached_is_published: true,
+        };
+        assert!(
+            daemon
+                .registry
+                .warm_resume_member_network(&saved, key.public())
+                .await
+                .expect("warm-resume the member network"),
+            "the member network resumes from its stored blob"
+        );
         let state = {
-            let mut handle = daemon
+            let handle = daemon
                 .registry
                 .networks
-                .get_mut(NETWORK)
+                .get(NETWORK)
                 .expect("network is live");
-            handle.role = NetworkRole::Member;
-            handle.state.write().unwrap().network_secret_key = None;
+            assert_eq!(handle.role, NetworkRole::Member);
             Arc::clone(&handle.state)
         };
         Self {
@@ -194,7 +228,7 @@ async fn applying_a_record_publishes_dns_and_routes() {
 #[allow(clippy::await_holding_lock)]
 async fn an_older_record_is_refused_on_every_path() {
     let fx = MemberFixture::start().await;
-    fx.state.write().unwrap().last_record_timestamp = Some(FUTURE + 1_000);
+    fx.state.write().unwrap().last_record_timestamp = Some(1_000);
     let before = fx.generation();
     let (_, hash) = fx
         .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
@@ -202,7 +236,7 @@ async fn an_older_record_is_refused_on_every_path() {
     let record = SignedGroupRecord {
         hash,
         seeds: Vec::new(),
-        timestamp: FUTURE + 500,
+        timestamp: 500,
     };
 
     let outcome = apply_group_record(
@@ -217,10 +251,7 @@ async fn an_older_record_is_refused_on_every_path() {
 
     assert_eq!(outcome, ReconvergeOutcome::Stale);
     assert_eq!(fx.generation(), before);
-    assert_eq!(
-        fx.state.read().unwrap().last_record_timestamp,
-        Some(FUTURE + 1_000)
-    );
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(1_000));
     fx.finish().await;
 }
 
@@ -269,12 +300,12 @@ async fn renewing_the_current_record_raises_the_floor() {
     {
         let mut s = fx.state.write().unwrap();
         s.converged_hash = Some(current);
-        s.last_record_timestamp = Some(FUTURE + 10);
+        s.last_record_timestamp = Some(10);
     }
     let renewal = SignedGroupRecord {
         hash: current,
         seeds: Vec::new(),
-        timestamp: FUTURE + 50,
+        timestamp: 50,
     };
     let outcome = apply_group_record(
         &fx.daemon.transport.endpoint,
@@ -286,10 +317,7 @@ async fn renewing_the_current_record_raises_the_floor() {
     )
     .await;
     assert_eq!(outcome, ReconvergeOutcome::Current);
-    assert_eq!(
-        fx.state.read().unwrap().last_record_timestamp,
-        Some(FUTURE + 50)
-    );
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(50));
 
     let (_, other) = fx
         .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
@@ -297,7 +325,7 @@ async fn renewing_the_current_record_raises_the_floor() {
     let older = SignedGroupRecord {
         hash: other,
         seeds: Vec::new(),
-        timestamp: FUTURE + 30,
+        timestamp: 30,
     };
     let outcome = apply_group_record(
         &fx.daemon.transport.endpoint,
@@ -321,7 +349,7 @@ async fn renewing_the_current_record_raises_the_floor() {
 async fn an_older_removal_keeps_membership_and_the_saved_network() {
     let fx = MemberFixture::start().await;
     let me = fx.daemon.transport.endpoint.id();
-    fx.state.write().unwrap().last_record_timestamp = Some(FUTURE + 20);
+    fx.state.write().unwrap().last_record_timestamp = Some(20);
     let (blob, hash) = fx
         .blob_with(|m| {
             m.remove(&me);
@@ -330,7 +358,7 @@ async fn an_older_removal_keeps_membership_and_the_saved_network() {
     let older = SignedGroupRecord {
         hash,
         seeds: Vec::new(),
-        timestamp: FUTURE + 19,
+        timestamp: 19,
     };
 
     let outcome = apply_group_record(
@@ -356,13 +384,10 @@ async fn an_older_removal_keeps_membership_and_the_saved_network() {
     assert_eq!(outcome, ReconvergeOutcome::Superseded);
     assert!(fx.state.read().unwrap().group.members.is_member(&me));
     assert!(config::load_network(NETWORK).unwrap().is_some());
-    assert_eq!(
-        fx.state.read().unwrap().last_record_timestamp,
-        Some(FUTURE + 20)
-    );
+    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(20));
 
     let newer = SignedGroupRecord {
-        timestamp: FUTURE + 21,
+        timestamp: 21,
         ..older
     };
     let outcome = commit_group_blob(
