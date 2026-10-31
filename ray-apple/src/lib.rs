@@ -1123,6 +1123,33 @@ mod tests {
     }
 
     #[test]
+    fn command_results_preserve_daemon_errors_and_reject_other_responses() {
+        assert!(
+            expect_ok(
+                IpcMessage::Ok {
+                    message: "done".into()
+                },
+                "exit-node selection"
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            expect_ok(
+                IpcMessage::Error {
+                    message: "denied".into()
+                },
+                "exit-node selection"
+            ),
+            Err(AppleError::Network(message)) if message == "denied"
+        ));
+        assert!(matches!(
+            expect_ok(IpcMessage::Status, "exit-node selection"),
+            Err(AppleError::Network(message))
+                if message == "node returned an invalid exit-node selection response"
+        ));
+    }
+
+    #[test]
     fn command_errors_keep_the_daemon_message() {
         assert!(matches!(
             AppleError::from(OpError::msg("denied")),
