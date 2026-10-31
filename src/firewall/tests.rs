@@ -1926,6 +1926,35 @@ fn concurrent_edits_are_not_lost() {
     assert_eq!(fw.get_config().rules.len(), usize::from(THREADS * EDITS));
 }
 
+/// An edit's blocking save does not hold up the async worker it was called
+/// on. With one worker, a task queued behind the edit can only run if the
+/// edit hands that worker off; the save waits for it, so a stalled worker
+/// never sees the message.
+#[test]
+fn edit_hands_off_the_async_worker_while_it_saves() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .expect("a one-worker runtime builds");
+    let fw = SharedFirewall::new(FirewallConfig::default());
+    let saw_queued_task = runtime.block_on(async move {
+        tokio::spawn(async move {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tokio::spawn(async move { tx.send(()).expect("the save is waiting") });
+            let mut received = false;
+            fw.edit(
+                |_| {},
+                // A bound so a regression fails instead of hanging the suite.
+                |_| received = rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            );
+            received
+        })
+        .await
+        .expect("the edit task does not panic")
+    });
+    assert!(saw_queued_task);
+}
+
 #[test]
 fn ssh_passthrough_toggles_a_single_managed_rule() {
     let fw = SharedFirewall::new(FirewallConfig::default());
