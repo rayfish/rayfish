@@ -62,6 +62,7 @@ fn empty_state(net_pubkey: EndpointId, name: &str) -> SharedNetworkState {
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
         last_record_timestamp: None,
+        last_published_record: None,
     };
     state.refresh_snapshot();
     Arc::new(std::sync::RwLock::new(state))

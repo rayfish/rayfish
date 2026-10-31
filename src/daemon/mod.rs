@@ -57,6 +57,7 @@ use iroh::endpoint::{Connection, Endpoint, VarInt};
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
+use iroh_dns::pkarr::SignedPacket;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -490,6 +491,12 @@ pub(crate) struct NetworkState {
     /// (a config from an older build, a legacy join); there a mesh record cannot
     /// remove us, only a relay-resolved one can.
     last_record_timestamp: Option<u64>,
+    /// The record this node last had a relay take, as signed. A coordinator
+    /// hands it to a reconnecting member rather than signing a fresh one: a
+    /// fresh timestamp would outrank a newer edit another coordinator published
+    /// that this one has not applied yet, and the member would then refuse that
+    /// edit as stale.
+    last_published_record: Option<SignedPacket>,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.

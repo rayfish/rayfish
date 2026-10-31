@@ -313,6 +313,7 @@ impl NetworkRegistry {
             pending: HashMap::new(),
             // Raised by each record this node publishes, from where it was.
             last_record_timestamp: net_config.last_record_timestamp,
+            last_published_record: None,
         };
 
         let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;

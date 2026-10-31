@@ -907,6 +907,7 @@ impl NetworkRegistry {
             // Cold restore and warm resume: the floor saved when it last rose,
             // so a record from before then is still refused.
             last_record_timestamp: saved_record_floor(ctx.display_name, ctx.net_pubkey),
+            last_published_record: None,
         };
         state.refresh_snapshot();
         Arc::new(std::sync::RwLock::new(state))

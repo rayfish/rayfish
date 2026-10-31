@@ -195,6 +195,7 @@ fn network_state(key: &SecretKey, members: Vec<Member>) -> SharedNetworkState {
         network_name: Some("test".into()),
         mode: GroupMode::Restricted,
         last_record_timestamp: None,
+        last_published_record: None,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
     };

@@ -454,6 +454,7 @@ async fn the_reconverge_worker_follows_a_later_pairing() {
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
         last_record_timestamp: None,
+        last_published_record: None,
     };
     held.refresh_snapshot();
     let hash = held.converged_hash.expect("a refreshed state has a hash");
@@ -926,5 +927,41 @@ async fn a_coordinator_refuses_a_record_older_than_its_own_publish() {
 
     assert_eq!(outcome, ReconvergeOutcome::Stale);
     assert_eq!(fx.state.read().unwrap().converged_hash, Some(own));
+    fx.finish().await;
+}
+
+/// The record a coordinator hands a reconnecting member is the one it last
+/// published, timestamp included. It used to sign a fresh one, which outranks
+/// a newer edit another coordinator published that this one has not applied
+/// yet: the member took the older roster and then refused the edit as stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_coordinator_hands_out_the_record_it_published() {
+    let fx = CoordinatorFixture::start().await;
+    let registry = Arc::clone(&fx.daemon.registry);
+    let own = fx
+        .state
+        .read()
+        .unwrap()
+        .converged_hash
+        .expect("a created network has a converged hash");
+    let published = registry
+        .publish_group_hash(NETWORK, &fx.key, own, &fx.state)
+        .await
+        .expect("the coordinator publishes its roster");
+    let edit = fx.signed_by_second(fx.second_coordinators_edit().await);
+
+    let handed = registry
+        .current_signed_record(NETWORK)
+        .await
+        .expect("a coordinator holds a published record");
+
+    let packet = dht::verify_network_record(&handed.packet, fx.key.public())
+        .expect("the handed record verifies");
+    assert!(
+        packet.timestamp() < edit.timestamp(),
+        "the handed record outranks the other coordinator's newer edit"
+    );
+    assert!(handed.packet == published);
     fx.finish().await;
 }

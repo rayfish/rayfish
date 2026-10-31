@@ -1002,6 +1002,7 @@ mod reconverge_tests {
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             last_record_timestamp: None,
+            last_published_record: None,
         }))
     }
 

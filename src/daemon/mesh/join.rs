@@ -458,6 +458,7 @@ async fn build_member_state(
         // A reconnect whose roster came from config has no record of its own,
         // and even one that does may be older than the floor saved last run.
         last_record_timestamp: record_ts.max(saved_record_floor(network_name, net_pubkey)),
+        last_published_record: None,
     };
     ns.refresh_snapshot();
     if let Some(hash) = exact_group_hash {

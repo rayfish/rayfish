@@ -584,8 +584,8 @@ pub(crate) async fn persist_group_hash_locked(
 /// against the pointer, and a commit may have moved it while the publish was in
 /// flight. `Ok(false)` means it did, and a newer record is owed.
 ///
-/// The record's timestamp also becomes this node's replay floor, under the same
-/// lock as the mark. The group poller reads this coordinator's own network
+/// The record's timestamp also becomes this node's replay floor, and the record
+/// the one it hands reconnecting members, under the same lock as the mark. The group poller reads this coordinator's own network
 /// record, and without the floor a stale copy served after this publish names
 /// an older blob, reads as newer than nothing, and is applied and then
 /// republished over our own edit.
@@ -600,17 +600,26 @@ pub(crate) async fn publish_signed_record(
     let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let _commit = commit.lock().await;
     let published = packet.timestamp().as_micros();
-    raise_record_floor(state, published);
+    raise_record_floor(state, packet);
     Ok(mark_group_hash_published(network, hash, published))
 }
 
-/// Refuse any record authored before `published`, a record the relay took.
-fn raise_record_floor(state: &SharedNetworkState, published: u64) {
+/// Refuse any record authored before `packet`, a record the relay took, and
+/// keep it as the last published unless a later one is already held.
+fn raise_record_floor(state: &SharedNetworkState, packet: &SignedPacket) {
+    let published = packet.timestamp().as_micros();
     let mut state = state.write().unwrap();
     let floor = state
         .last_record_timestamp
         .map_or(published, |floor| floor.max(published));
     state.last_record_timestamp = Some(floor);
+    if state
+        .last_published_record
+        .as_ref()
+        .is_none_or(|held| held.timestamp() < packet.timestamp())
+    {
+        state.last_published_record = Some(packet.clone());
+    }
 }
 
 /// Raise the saved replay floor, never lower it: a write carrying an older
@@ -899,6 +908,7 @@ mod tests {
             network_name: Some("test".to_string()),
             mode: GroupMode::Restricted,
             last_record_timestamp: None,
+            last_published_record: None,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         }))
