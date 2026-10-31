@@ -17,6 +17,7 @@ use futures::future::BoxFuture;
 use iroh::TransportAddr;
 use iroh::endpoint::PathEvent;
 use iroh_dns::pkarr::SignedPacket;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::{OnceLock, Weak};
 use std::time::Duration;
@@ -260,6 +261,11 @@ pub(crate) struct NetworkRegistry {
     /// run a second coordinator state for the same network. See
     /// [`NetworkRegistry::claim_registration`].
     pub(crate) restoring: Arc<DashSet<String>>,
+    /// Network keys that a join, restore or warm resume is bringing up right
+    /// now, under whatever local name. The name claim alone lets one network go
+    /// live under two names, and a join registers its accept handler by key
+    /// before its handle exists. See [`NetworkRegistry::claim_network_key`].
+    joining_keys: Arc<DashSet<EndpointId>>,
     /// Network keys with a pending-join retry loop running, so a join queued
     /// twice (startup resume, a repeated `ray join`, a paired primary) retries
     /// once. See [`NetworkRegistry::spawn_pending_join_retry`].
@@ -342,16 +348,23 @@ fn peer_selector_for_network<'a>(network: &str, selector: &'a str) -> Option<&'a
 /// testable without a running daemon, which is the part worth pinning down: the
 /// sweep runs on a timer and on peer traffic, so starting a duplicate restore
 /// (or skipping a genuinely dead network) is the failure mode that matters.
-/// A network name held in [`NetworkRegistry::restoring`] while one path brings
-/// that network up. Dropping it releases the name, however that path ends.
-pub(crate) struct RegistrationClaim {
-    claims: Arc<DashSet<String>>,
-    name: String,
+/// A network name held in [`NetworkRegistry::restoring`], or a network key in
+/// `joining_keys`, while one path brings that network up. Dropping it releases
+/// the claim, however that path ends.
+pub(crate) struct RegistrationClaim<K: Eq + Hash = String> {
+    claims: Arc<DashSet<K>>,
+    held: K,
 }
 
-impl Drop for RegistrationClaim {
+impl<K: Eq + Hash> RegistrationClaim<K> {
+    pub(crate) fn held(&self) -> &K {
+        &self.held
+    }
+}
+
+impl<K: Eq + Hash> Drop for RegistrationClaim<K> {
     fn drop(&mut self) {
-        self.claims.remove(&self.name);
+        self.claims.remove(&self.held);
     }
 }
 
@@ -444,6 +457,7 @@ impl NetworkRegistry {
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
             restoring: Arc::new(DashSet::new()),
+            joining_keys: Arc::new(DashSet::new()),
             pending_join_retries: Arc::new(DashSet::new()),
             restore_errors: Arc::new(DashMap::new()),
             restore_nudge: Arc::new(Notify::new()),
@@ -463,14 +477,34 @@ impl NetworkRegistry {
             .insert(name.to_string())
             .then(|| RegistrationClaim {
                 claims: Arc::clone(&self.restoring),
-                name: name.to_string(),
+                held: name.to_string(),
             })
+    }
+
+    /// Claim `key` for the one join, restore or warm resume that may bring it
+    /// up, or `None` while another holds it.
+    pub(crate) fn claim_network_key(
+        &self,
+        key: EndpointId,
+    ) -> Option<RegistrationClaim<EndpointId>> {
+        self.joining_keys.insert(key).then(|| RegistrationClaim {
+            claims: Arc::clone(&self.joining_keys),
+            held: key,
+        })
     }
 
     /// Whether a network with this key is live, under whatever local name.
     /// `networks` is keyed by name, so a key lookup has to scan.
     pub(crate) fn is_live_network_key(&self, key: EndpointId) -> bool {
         self.networks.iter().any(|handle| handle.network_key == key)
+    }
+
+    /// The local name a network with this key is live under, if any.
+    pub(crate) fn live_name_of_key(&self, key: EndpointId) -> Option<String> {
+        self.networks
+            .iter()
+            .find(|handle| handle.network_key == key)
+            .map(|handle| handle.name.clone())
     }
 
     /// A live mesh connection to `peer`, registered or freshly dialed, sharing
@@ -865,9 +899,7 @@ impl NetworkRegistry {
             return false;
         };
         handle.cancel.cancel();
-        for task in handle.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        }
+        stop_network_tasks(name, handle.tasks, NETWORK_TASK_STOP_WAIT).await;
 
         // Drop this network from every peer's routing. A peer left sharing no
         // network at all is fully disconnected, so close its now-unused link with
@@ -1349,6 +1381,9 @@ impl NetworkRegistry {
 
         let net_secret_key = SecretKey::generate();
         let net_public_key = net_secret_key.public();
+        let key_claim = self
+            .claim_network_key(net_public_key)
+            .context("a freshly generated network key is already claimed")?;
 
         let my_ip = self.transport.identity.local_ipv6();
 
@@ -1437,6 +1472,7 @@ impl NetworkRegistry {
                 reconverge_worker: None,
                 my_hostname: None,
                 dial: None,
+                key_claim: &key_claim,
             })
             .await;
         anyhow::ensure!(installed, "network '{name}' is already active");
@@ -2042,9 +2078,55 @@ pub(super) fn coordinator_tasks(
     ]
 }
 
+/// How long teardown waits for each cancelled network task before aborting it.
+const NETWORK_TASK_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait up to `wait` for each of a cancelled network's tasks, then abort the
+/// ones still running. Dropping a `JoinHandle` detaches its task: a poller
+/// still inside a sequential blob fetch only sees the cancel between ticks,
+/// and once it returns it could persist a hash or tear down by name a network
+/// rejoined under the same name meanwhile.
+async fn stop_network_tasks(network: &str, tasks: Vec<JoinHandle<()>>, wait: Duration) {
+    for (index, mut task) in tasks.into_iter().enumerate() {
+        if tokio::time::timeout(wait, &mut task).await.is_err() {
+            tracing::debug!(
+                network,
+                task = index,
+                "network task ignored cancellation; aborting it"
+            );
+            task.abort();
+            // Settled before teardown goes on, so nothing it does lands after.
+            let _ = task.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task that ignores the network's cancel is aborted once the wait runs
+    /// out, not left running detached; one that stops in time is left to end.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_aborts_a_task_that_ignores_cancellation() {
+        let (stuck_alive, stuck_gone) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _alive = stuck_alive;
+            std::future::pending::<()>().await;
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let prompt = tokio::spawn(async move {
+            let _ = done_tx.send(());
+        });
+
+        stop_network_tasks("home", vec![stuck, prompt], Duration::from_secs(5)).await;
+
+        let gone = tokio::time::timeout(Duration::from_secs(1), stuck_gone)
+            .await
+            .expect("the stuck task is no longer running");
+        assert!(gone.is_err(), "it was aborted, dropping its sender unsent");
+        assert_eq!(done_rx.await, Ok(()), "the prompt task finished on its own");
+    }
 
     #[test]
     fn network_selector_accepts_public_key_and_invite_code() {

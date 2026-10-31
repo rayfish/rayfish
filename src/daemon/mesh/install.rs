@@ -3,7 +3,7 @@
 //! handle, expose its accept handler, then publish its names and dial its
 //! members. [`NetworkRegistry::install_network`] is that one step.
 
-use super::super::network_registry::coordinator_tasks;
+use super::super::network_registry::{RegistrationClaim, coordinator_tasks};
 use super::super::*;
 use dashmap::mapref::entry::Entry;
 
@@ -38,6 +38,9 @@ pub(crate) struct NetworkInstall<'a> {
     /// Seed routes to every roster member and dial them in the background,
     /// announcing this hostname.
     pub(crate) dial: Option<MemberDial>,
+    /// This path's hold on `network_key`, so no other path installs the key
+    /// under another name meanwhile.
+    pub(crate) key_claim: &'a RegistrationClaim<EndpointId>,
 }
 
 pub(crate) struct MemberDial {
@@ -45,9 +48,10 @@ pub(crate) struct MemberDial {
 }
 
 impl NetworkRegistry {
-    /// Make a network live. `false` when another path registered `name` first:
-    /// that handle owns the network, so nothing is spawned, `cancel` is
-    /// cancelled, a handshake's worker is aborted, and nothing else is touched.
+    /// Make a network live. `false` when another path registered `name` or
+    /// `network_key` first: that handle owns the network, so nothing is
+    /// spawned, `cancel` is cancelled, a handshake's worker is aborted, and
+    /// nothing else is touched.
     ///
     /// The handle is inserted before any peer is dialed, so `ray status` sees
     /// the network the moment it exists, and the coordinator handler is only
@@ -65,6 +69,7 @@ impl NetworkRegistry {
             reconverge_worker,
             my_hostname,
             dial,
+            key_claim,
         } = install;
         // Claim the name before spawning anything. A task started for an
         // install that then loses runs on a state no network owns: the poller's
@@ -72,15 +77,21 @@ impl NetworkRegistry {
         // into the saved network, or tear the network down by name, which is
         // the winner's by then. The spawns are synchronous, so holding the
         // slot across them is brief.
+        //
+        // A key live under another name loses too: two handles would run their
+        // tasks on one network, and leaving either unregisters the key's accept
+        // handler under the other. Every install holds the key's claim, so no
+        // other install of it lands between this scan and the insert. The scan
+        // cannot run inside the entry: iterating the map waits on the shard the
+        // entry holds.
+        debug_assert_eq!(*key_claim.held(), network_key, "install holds its own key");
+        if self.is_live_network_key(network_key) {
+            lose_install(&cancel, reconverge_worker);
+            return false;
+        }
         let (dht_notify, fresh_member_notify) = match self.networks.entry(name.to_string()) {
             Entry::Occupied(_) => {
-                cancel.cancel();
-                // The handshake started this one before the network existed.
-                // Cancelling is not enough: an apply already in flight would
-                // finish on the losing state.
-                if let Some(task) = reconverge_worker {
-                    task.abort();
-                }
+                lose_install(&cancel, reconverge_worker);
                 return false;
             }
             Entry::Vacant(slot) => {
@@ -220,5 +231,15 @@ impl NetworkRegistry {
             }
         }
         true
+    }
+}
+
+/// Stop what a losing install was handed. The handshake started its worker
+/// before the network existed, and cancelling is not enough: an apply already
+/// in flight would finish on the losing state.
+fn lose_install(cancel: &CancellationToken, reconverge_worker: Option<JoinHandle<()>>) {
+    cancel.cancel();
+    if let Some(task) = reconverge_worker {
+        task.abort();
     }
 }
