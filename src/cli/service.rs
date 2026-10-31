@@ -499,7 +499,7 @@ pub(crate) async fn cmd_stop() -> Result<()> {
     run_cmd(
         "launchctl",
         &["unload", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
-    )?;
+    );
 
     #[cfg(windows)]
     rayfish::windows_service::stop()?;
