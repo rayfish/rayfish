@@ -35,6 +35,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - macOS: saving a file returns as soon as the download starts, with progress in
   the file list, instead of reporting a timeout after five minutes while the
   download kept going.
+- With an exit node selected, a `dns-upstreams` replacement naming only
+  Rayfish's own resolver address no longer sends lookups to the system
+  resolvers outside the tunnel. They go to public resolvers through the exit.
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
   minute later. It shows as done once the recipient finishes it.

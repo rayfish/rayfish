@@ -28,7 +28,7 @@ use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
 /// legitimate upstream, and under a full tunnel it is the *best* one, being
 /// reachable only through the tunnel by construction. `MAGIC_DNS_V4` is here
 /// only because an older build may have left it in a file we then captured.
-fn is_own_resolver(ip: IpAddr) -> bool {
+pub(crate) fn is_own_resolver(ip: IpAddr) -> bool {
     ip == IpAddr::V6(MAGIC_DNS_V6) || ip == IpAddr::V4(MAGIC_DNS_V4)
 }
 
@@ -118,8 +118,9 @@ impl Resolver {
     /// resolver addresses to avoid recursion. Clearing this restores normal DNS.
     pub fn set_tunnel_upstreams(&self, addrs: Option<Vec<SocketAddr>>) {
         // An override that filters down to nothing becomes no override: `forward`
-        // reads an empty list as "no upstream configured" and refuses, where
-        // falling back to the captured ones at least resolves something.
+        // reads an empty list as "no upstream configured" and refuses.
+        // `exit_node::tunnel_upstreams` drops our own addresses itself, so an
+        // exit tunnel never reaches this and never falls back to the captured set.
         let addrs = addrs
             .map(|v| {
                 v.into_iter()
@@ -161,7 +162,8 @@ impl Resolver {
     }
 
     /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
-    /// avoid a forwarding loop. The desktop capture path uses this.
+    /// avoid a forwarding loop. The desktop capture holds IPv6 servers too and
+    /// goes through [`Self::set_upstream_addrs`] instead.
     pub fn set_upstreams(&self, servers: Vec<Ipv4Addr>) {
         self.set_upstream_addrs(servers.into_iter().map(|ip| SocketAddr::from((ip, 53u16))));
     }
@@ -1302,7 +1304,7 @@ mod tests {
         assert_eq!(r.upstreams(), vec![peer]);
 
         // And the tunnel override, where dropping it is worst: an empty result
-        // becomes `None`, and the forwarder falls back to the captured IPv4
+        // becomes `None`, and the forwarder falls back to the captured
         // servers, which leave around the exit.
         r.set_tunnel_upstreams(Some(vec![peer]));
         assert_eq!(r.tunnel_upstreams(), Some(vec![peer]));

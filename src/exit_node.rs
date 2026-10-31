@@ -1751,16 +1751,15 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert!(!s.is_active());
     }
 
-    /// Only a tunnel carrying IPv6 and not IPv4 needs its own DNS upstreams: any
-    /// tunnel that carries IPv4 already carries the family the captured upstreams
-    /// live in. That is IPv6-only mode, and now also a dual-stack node routing
-    /// through a gateway that can only return IPv6.
+    /// Every exit tunnel gets its own DNS upstreams, limited to the families it
+    /// carries. The captured ones are never used under a tunnel: they can be
+    /// LAN resolvers, or IPv6 servers a tunnel carrying only IPv4 cannot reach.
     #[test]
     fn every_exit_tunnel_overrides_dns_upstreams() {
         use crate::config::ServerOverride;
         use ExitFamilies::{Dual, V4, V6};
 
-        // Both families, or IPv4 alone: the captured upstreams already ride it.
+        // Both families, or IPv4 alone: the public IPv4 fallback.
         assert!(
             tunnel_upstreams(Dual, &ServerOverride::default())
                 .iter()
@@ -1852,5 +1851,32 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             tunnel_upstreams(V6, &junk).len(),
             PUBLIC_FALLBACK_DNS_V6.len()
         );
+    }
+
+    /// Our own resolver address is no upstream at all. Kept as the replacement,
+    /// the resolver filters it out, the override comes up empty, and lookups go
+    /// to the captured system resolvers around the exit.
+    #[test]
+    fn own_resolver_in_dns_upstreams_does_not_empty_the_tunnel_override() {
+        use crate::config::ServerOverride;
+        use ExitFamilies::{Dual, V4, V6};
+
+        let own = ServerOverride {
+            servers: strs(&["200::53"]),
+            replace: true,
+        };
+        for carries in [V4, V6, Dual] {
+            let got = tunnel_upstreams(carries, &own);
+            assert!(!got.is_empty(), "{carries:?}: an empty override");
+            assert!(
+                got.iter()
+                    .all(|a| a.ip() != IpAddr::V6(crate::dns::MAGIC_DNS_V6)),
+                "{carries:?}: {got:?}"
+            );
+            assert!(
+                got.iter().all(|a| carries.carries(a.ip())),
+                "{carries:?}: {got:?}"
+            );
+        }
     }
 }
