@@ -171,6 +171,17 @@ internal fun queryDisplayName(context: Context, uri: Uri): String {
 }
 
 /**
+ * A fresh app-private directory to receive one offer into, for [moveToDownloads]
+ * to take the file from. The core saves under `name (1).ext` when the name is
+ * taken, so each receive gets a directory of its own and the file is always
+ * at `File(dir, filename)`. The core creates the directory.
+ */
+internal fun receiveStagingDir(context: Context): File {
+    val base = context.getExternalFilesDir(null) ?: context.filesDir
+    return File(base, "incoming/${UUID.randomUUID()}")
+}
+
+/**
  * Copy the bytes behind a content [uri] into a fresh per-item subdirectory of the
  * app cache, preserving the original file name so the recipient sees it. Returns
  * the staged file, or null on failure. The caller deletes the file (and its parent
@@ -247,8 +258,6 @@ object FileAutoAccept {
         if (!NodeHolder.isAutoAcceptOwnDevices(context)) return
         val node = NodeHolder.get(context)
         val offers = node.listFileOffers()
-        // App-private staging dir; moveToDownloads then relocates to public Downloads.
-        val saveDir = context.getExternalFilesDir(null)?.absolutePath ?: context.filesDir.absolutePath
         for (f in offers) {
             if (!f.ownDevice) continue
             if (!handled.add(f.id)) continue
@@ -263,8 +272,10 @@ object FileAutoAccept {
             // how many can run at once regardless of how many offers are pending.
             // The core registers the transfer, so TransferNotifier picks it up.
             executor.execute {
+                // App-private staging dir; moveToDownloads then relocates to public Downloads.
+                val stage = receiveStagingDir(context)
                 try {
-                    node.acceptFileOffer(f.id, saveDir)
+                    node.acceptFileOffer(f.id, stage.absolutePath)
                     // Re-stamp pending now that the download is done and the copy
                     // is about to start: the first markPending call above only
                     // needed to cover the wait for DONE to appear, and acceptFileOffer
@@ -272,7 +283,9 @@ object FileAutoAccept {
                     // which would otherwise expire the entry before the copy even
                     // begins.
                     DownloadsOutcome.markPending(key)
-                    val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    val reached = moveToDownloads(context, File(stage, f.filename), f.filename, f.mimeType)
+                    // Empty once the file moved; otherwise the file stays in it.
+                    if (reached) stage.delete()
                     DownloadsOutcome.record(key, reached)
                     attempts.remove(f.id)
                     Log.i("RayfishFiles", "auto-accepted own-device file ${f.filename}")
@@ -281,6 +294,7 @@ object FileAutoAccept {
                     // for this key, so stop treating it as pending immediately
                     // rather than making the result notification wait out the
                     // timeout for a failure that has already happened.
+                    stage.delete()
                     OfferNotifier.markFailed(context, f.id)
                     DownloadsOutcome.clearPending(key)
                     val tries = attempts.merge(f.id, 1) { old, inc -> old + inc } ?: 1

@@ -60,13 +60,13 @@ impl Daemon {
 
     /// Accept a queued file offer and return once its receive has started.
     /// Progress and the result show in the transfer list.
-    pub fn start_accepting_file(
+    pub async fn start_accepting_file(
         &self,
         id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
     ) -> OpResult<Done> {
-        self.files.start_accepting_file(id, output, peer_cred)
+        self.files.start_accepting_file(id, output, peer_cred).await
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):

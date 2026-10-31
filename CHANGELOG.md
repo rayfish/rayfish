@@ -37,7 +37,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   download kept going.
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
-  minute later. It shows as done once the recipient finishes it.
+  minute later. It shows as done once the recipient finishes it, and as
+  offered again if the recipient does not resume it within a day.
+- Android: a received file is moved to Downloads from a folder of its own, so
+  one whose name was already taken in the app's storage no longer moves the
+  older file instead. Accepting a file stops after two minutes without
+  progress rather than waiting up to a day; accepting it again carries on
+  from where it stopped.
+- Windows: a file accepted by a process running as SYSTEM into a folder it
+  named resumes after a daemon restart instead of downloading again and then
+  being refused.
+- Accepting a file into a folder it cannot be saved in now fails right away,
+  before anything downloads. On macOS, where accepting returns as soon as the
+  download starts, a bad folder used to cost the whole download and then put
+  the file back in the list without saying why.
+- A file receive that is canceled, or stopped by a daemon restart, while the
+  file is being written no longer leaves a truncated file under the file's
+  name. The file is written under a hidden temporary name and appears under
+  its own name only once complete, without replacing a file that is already
+  there.
+- A received file whose delivery could not be recorded is no longer put back
+  in the queue while showing as done, where accepting it again downloaded a
+  second copy. The receive fails with a message naming where the file was
+  saved.
 - A member whose coordinator handshake failed partway through a restart now
   picks up roster and firewall changes as they happen, instead of waiting for
   the next poll.
@@ -112,6 +134,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Received files only go into a directory the accepting user owns, never
   through a link, and never over an existing file (the new one is saved as
   `name (1).ext`). Only root can set `download-dir` and `download-user`.
+- File auto-accept no longer follows a link in the configured download
+  directory to a directory its user does not own. A user who replaced their
+  `~/Downloads` with a link to `/etc` (or a junction to `System32` on Windows)
+  could have the daemon create a file there and hand it to them. A configured
+  directory reached without links works as before, whoever owns it.
 - A member no longer takes another member's name from that member's own
   claim. Names in the roster and Magic DNS come only from what the coordinator
   signed, so a peer cannot make others resolve it under a name it chose.

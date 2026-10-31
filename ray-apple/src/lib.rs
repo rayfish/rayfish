@@ -828,8 +828,9 @@ impl Node {
         self.edit_blocked(&peer, true)
     }
 
-    /// Start receiving a file offer. Returns once the receive has started, not
-    /// when the download ends; the app follows it in the status file list.
+    /// Start receiving a file offer. Returns once the destination is checked
+    /// and the receive has started, not when the download ends; the app
+    /// follows it in the status file list.
     pub fn accept_file(
         &self,
         id: u64,
@@ -838,9 +839,10 @@ impl Node {
         gid: u32,
     ) -> Result<(), AppleError> {
         let state = self.state()?;
-        // Inside the runtime: the receive runs in a task spawned on it.
-        let _runtime = self.runtime.enter();
-        state.start_accepting_file(id, Some(directory), Some((uid, gid)))?;
+        // The destination is checked before this returns, so a folder the
+        // file cannot be saved in fails here rather than after the download.
+        self.runtime
+            .block_on(state.start_accepting_file(id, Some(directory), Some((uid, gid))))?;
         Ok(())
     }
 

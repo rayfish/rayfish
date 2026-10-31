@@ -38,14 +38,16 @@ pub(crate) struct Recipient {
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) owner: Option<(u32, u32)>,
     /// `owner` named the directory, so it must be one they own. Off for the
-    /// root-configured auto-accept target.
+    /// root-configured auto-accept target, which is trusted as long as no
+    /// link redirects it.
     pub(crate) caller_chose_dir: bool,
     /// Who asked, on Windows, where there is no uid to compare: the daemon
     /// asks Windows whether this caller could write the directory themselves.
-    /// Not saved: a token cannot outlive the daemon, so a saved receive loads
-    /// as `Unknown` (see [`Recipient::survives_restart`]).
+    /// Saved only as whether it was LocalSystem: a user's token cannot
+    /// outlive the daemon, so that receive is not saved at all (see
+    /// [`Recipient::survives_restart`]) and anything else loads as `Unknown`.
     #[cfg(windows)]
-    #[serde(skip)]
+    #[serde(default, rename = "caller_is_system", with = "saved_caller")]
     pub(crate) caller: WindowsCaller,
 }
 
@@ -61,6 +63,30 @@ pub(crate) enum WindowsCaller {
     /// Nothing identified the caller. A directory they chose is refused.
     #[default]
     Unknown,
+}
+
+/// [`WindowsCaller`] in `pending-files.json`: whether it was LocalSystem.
+#[cfg(windows)]
+mod saved_caller {
+    use super::WindowsCaller;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        caller: &WindowsCaller,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bool(matches!(caller, WindowsCaller::System))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<WindowsCaller, D::Error> {
+        Ok(if bool::deserialize(deserializer)? {
+            WindowsCaller::System
+        } else {
+            WindowsCaller::Unknown
+        })
+    }
 }
 
 impl Recipient {
@@ -96,14 +122,36 @@ impl Recipient {
         }
     }
 
-    /// The uid the destination directory must belong to, if any. Root may
-    /// name any directory: it could write there anyway.
+    /// How far the destination directory is trusted. Root may name any
+    /// directory: it could write there anyway. A directory root configured
+    /// is trusted as long as nobody redirected it with a link.
     #[cfg(unix)]
-    fn required_dir_owner(&self) -> Option<u32> {
-        match self.owner {
-            Some((uid, _)) if self.caller_chose_dir && uid != 0 => Some(uid),
-            _ => None,
+    fn dir_trust(&self) -> receive_dest::DirTrust {
+        use receive_dest::DirTrust;
+        let uid = self.owner.map(|(uid, _)| uid).filter(|&uid| uid != 0);
+        match (self.caller_chose_dir, uid) {
+            (true, Some(uid)) => DirTrust::Owner(uid),
+            (true, None) => DirTrust::Any,
+            (false, uid) => DirTrust::Configured(uid),
         }
+    }
+}
+
+/// A received file with every byte written, still under its temporary name.
+struct Written {
+    staged: receive_dest::Staged,
+    dir: PathBuf,
+}
+
+impl Written {
+    /// Move the file to its name, or a numbered variant when that is taken,
+    /// and return the path it was saved under.
+    async fn commit(self) -> std::io::Result<PathBuf> {
+        let Written { staged, dir } = self;
+        let name = tokio::task::spawn_blocking(move || staged.commit())
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(dir.join(name))
     }
 }
 
@@ -848,7 +896,8 @@ impl FileService {
         };
         let output = Some(dir.to_string_lossy().into_owned());
         // Root set both the directory and its user (`check_authorized`), so the
-        // directory is trusted; only the file name still comes from the peer.
+        // directory is trusted as configured. Its user may still own part of
+        // the path, so a link in it is not (see `receive_dest`).
         let recipient = Recipient {
             owner: cred,
             caller_chose_dir: false,
@@ -856,9 +905,9 @@ impl FileService {
             caller: WindowsCaller::System,
         };
 
-        // Not awaited: an interrupted receive keeps retrying for hours, and
-        // the receive task logs its own outcome.
-        match self.start_receive(id, output, recipient) {
+        // Only the start is awaited: an interrupted receive keeps retrying for
+        // hours, and the receive task logs its own outcome.
+        match self.begin_receive(id, output, recipient, self.resume).await {
             Ok(_) => tracing::info!(from = %from.fmt_short(), "file auto-accepted"),
             Err(error) => {
                 tracing::warn!(from = %from.fmt_short(), %error, "file auto-accept failed");
@@ -875,6 +924,11 @@ impl FileService {
     /// The embedder entry point, which knows the caller only by uid. On
     /// Windows that identifies nobody, so a named directory is refused there;
     /// IPC goes through [`Self::accept_file_for`] with the pipe's caller.
+    ///
+    /// Its caller (the Android app) blocks until the receive ends, so it stops
+    /// retrying much sooner than a receive nobody waits on
+    /// ([`receive::ResumePolicy::for_blocking_call`]). An accept that gives up keeps
+    /// what arrived, and accepting again continues from there.
     pub(crate) async fn accept_file(
         self: &Arc<Self>,
         id: u64,
@@ -887,13 +941,14 @@ impl FileService {
             #[cfg(windows)]
             caller: WindowsCaller::Unknown,
         };
-        self.accept_file_for(id, output, recipient).await
+        let policy = self.resume.for_blocking_call();
+        self.wait_for_receive(id, output, recipient, policy).await
     }
 
     /// Like [`Self::accept_file`], but returns once the receive has started.
     /// For the apps, whose provider calls time out long before a large
     /// download ends; they follow it in the transfer list.
-    pub(crate) fn start_accepting_file(
+    pub(crate) async fn start_accepting_file(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
@@ -906,7 +961,10 @@ impl FileService {
             caller: WindowsCaller::Unknown,
         };
         // Dropping the outcome leaves the receive running; it logs the result.
-        drop(self.start_receive(id, output, recipient)?);
+        drop(
+            self.begin_receive(id, output, recipient, self.resume)
+                .await?,
+        );
         Ok(Done(format!(
             "receiving file {id}; see `ray files` for progress"
         )))
@@ -921,30 +979,42 @@ impl FileService {
         output: Option<String>,
         recipient: Recipient,
     ) -> OpResult<Done> {
-        let outcome = self.start_receive(id, output, recipient)?;
+        self.wait_for_receive(id, output, recipient, self.resume)
+            .await
+    }
+
+    async fn wait_for_receive(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        recipient: Recipient,
+        policy: receive::ResumePolicy,
+    ) -> OpResult<Done> {
+        let outcome = self.begin_receive(id, output, recipient, policy).await?;
         outcome
             .await
             .unwrap_or_else(|_| op_err("the receive stopped before reporting a result"))
     }
 
-    /// Write a fetched blob to `file_name` in `dir` for `recipient`, returning
-    /// the path it was saved under (a numbered variant when the name exists).
+    /// Write a fetched blob for `file_name` into `dir` for `recipient`,
+    /// under a temporary name until [`Written::commit`] gives it its own.
     ///
     /// Streamed from the blob store rather than read whole: `get_bytes` holds
     /// the entire file in memory, which on a phone sharing a video is a kill.
     /// Not `export` either, which writes through the path and so follows
-    /// whatever link sits there; see [`receive_dest`].
+    /// whatever link sits there; see [`receive_dest`]. Dropped partway, by a
+    /// cancel or a failed write, the temporary file is removed.
     async fn write_received(
         &self,
         hash: iroh_blobs::Hash,
         dir: PathBuf,
         file_name: &str,
         recipient: Recipient,
-    ) -> std::io::Result<PathBuf> {
+    ) -> std::io::Result<Written> {
         use tokio::io::AsyncWriteExt;
 
         let name = file_name.to_string();
-        let (dir, (dest, file)) = tokio::task::spawn_blocking(move || {
+        let (dir, (staged, file)) = tokio::task::spawn_blocking(move || {
             receive_dest::create(&dir, &name, recipient).map(|created| (dir, created))
         })
         .await
@@ -954,16 +1024,10 @@ impl FileService {
             self.transport.blob_store.blobs().reader(hash),
         );
         let mut out = tokio::fs::File::from_std(file);
-        let written = async {
-            tokio::io::copy_buf(&mut reader, &mut out).await?;
-            out.flush().await
-        }
-        .await;
-        if let Err(e) = written {
-            dest.discard();
-            return Err(e);
-        }
-        Ok(dir.join(&dest.name))
+        tokio::io::copy_buf(&mut reader, &mut out).await?;
+        out.flush().await?;
+        drop(out);
+        Ok(Written { staged, dir })
     }
 
     /// This device's pairing cert, as the registry currently holds it.
@@ -2315,7 +2379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_completion_persistence_keeps_the_saved_offer_retryable() {
+    async fn failed_completion_persistence_keeps_the_file_and_does_not_requeue() {
         let tmp = tempfile::tempdir().unwrap();
         config::set_thread_config_dir(tmp.path().join("config"));
         let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
@@ -2346,15 +2410,21 @@ mod tests {
             panic!("confirmation failure must be reported")
         };
         let message = error.to_string();
-        assert!(message.contains("file saved but could not record delivery confirmation"));
+        assert!(
+            message.contains("but could not record delivery confirmation"),
+            "{message}"
+        );
         assert_eq!(
             std::fs::read(tmp.path().join("downloads/file.bin")).unwrap(),
             b"payload"
         );
-        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+        // Not queued again: a second accept would save a second copy.
+        assert!(service.pending_files.lock().unwrap().is_empty());
         assert!(service.active_files.lock().unwrap().is_empty());
         assert!(service.declines.lock().unwrap().is_empty());
-        assert_eq!(load_pending_files().len(), 1);
+        assert!(load_pending_files().is_empty());
+        let receive = service.transfers.list().pop().unwrap();
+        assert_eq!(receive.state, transfers::TransferState::Failed);
     }
 
     #[tokio::test]
@@ -2912,6 +2982,58 @@ mod tests {
         assert!(message.contains("not owned by uid"), "{message}");
         assert!(!downloads.join("sub").exists());
         assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+    }
+
+    /// The apps' accept returns as soon as the receive starts, so a folder
+    /// the file cannot go to has to be refused then, not after the whole
+    /// download. The sender here is unreachable: nothing could be fetched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn starting_an_accept_into_a_refused_directory_fails_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let file = pending(1);
+        service.queue_incoming_offer(file.from, file);
+        let (uid, gid) = current_cred();
+        let other = (uid.wrapping_add(1).max(1), gid);
+        let output = Some(tmp.path().join("downloads").to_string_lossy().into_owned());
+        let Err(error) = service.start_accepting_file(1, output, Some(other)).await else {
+            panic!("a directory owned by someone else must be refused before the download");
+        };
+        assert!(error.message().contains("not owned by uid"), "{error}");
+        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+        assert!(service.transfers.list().is_empty());
+        assert!(!tmp.path().join("downloads").exists());
+    }
+
+    /// LocalSystem's receive is saved to resume after a restart, so it has
+    /// to come back as LocalSystem's, or the resumed receive downloads the
+    /// whole file and is then refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_saved_system_caller_loads_as_system() {
+        let saved = |caller| {
+            let recipient = Recipient {
+                owner: None,
+                caller_chose_dir: true,
+                caller,
+            };
+            let json = serde_json::to_string(&recipient).unwrap();
+            serde_json::from_str::<Recipient>(&json).unwrap().caller
+        };
+        assert!(matches!(
+            saved(WindowsCaller::System),
+            WindowsCaller::System
+        ));
+        assert!(matches!(
+            saved(WindowsCaller::Unknown),
+            WindowsCaller::Unknown
+        ));
+        let older: Recipient =
+            serde_json::from_str(r#"{"owner":null,"caller_chose_dir":true}"#).unwrap();
+        assert!(matches!(older.caller, WindowsCaller::Unknown));
     }
 
     /// A link planted at the file name must not redirect the daemon's write.

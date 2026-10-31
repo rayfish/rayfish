@@ -55,10 +55,25 @@ pub(super) struct ResumePolicy {
     /// moved no bytes.
     pub(super) first_backoff: Duration,
     pub(super) max_backoff: Duration,
-    /// How long to keep trying without receiving a single byte. Measured on
-    /// the monotonic clock, which stops while the machine sleeps, so a night
-    /// with the lid closed does not count against it.
+    /// How long to keep trying without receiving a single byte. Counted as
+    /// the time spent trying (see [`NoProgress`]), not as time elapsed, so a
+    /// night with the lid closed does not count against it on any platform.
     pub(super) give_up_after: Duration,
+}
+
+/// How long a receive whose caller waits for it, the phone apps' accept, keeps
+/// trying without progress. Short, since the caller is blocked for all of it;
+/// what arrived is kept, so accepting again carries on from there.
+const BLOCKING_GIVE_UP_AFTER: Duration = Duration::from_secs(2 * 60);
+
+impl ResumePolicy {
+    /// This policy for a caller that blocks until the receive ends.
+    pub(super) fn for_blocking_call(self) -> Self {
+        Self {
+            give_up_after: self.give_up_after.min(BLOCKING_GIVE_UP_AFTER),
+            ..self
+        }
+    }
 }
 
 impl Default for ResumePolicy {
@@ -70,6 +85,51 @@ impl Default for ResumePolicy {
             max_backoff: Duration::from_secs(60),
             give_up_after: Duration::from_secs(24 * 60 * 60),
         }
+    }
+}
+
+/// Time spent trying since a receive last moved a byte, for
+/// [`ResumePolicy::give_up_after`].
+///
+/// Not the time elapsed: whether a clock counts a suspend differs between
+/// platforms (Windows' can), and a laptop that sleeps through a night with one
+/// attempt pending must not come back to a receive it gave up on. So it adds
+/// up the backoff waits it asked for and each failed attempt's own duration,
+/// with an attempt capped at the longest one could take awake (a connect
+/// timeout, then an idle one). However long a suspend inside either lasts,
+/// it counts as at most that.
+#[derive(Debug)]
+struct NoProgress {
+    spent: Duration,
+    longest_attempt: Duration,
+}
+
+impl NoProgress {
+    fn new(policy: &ResumePolicy) -> Self {
+        Self {
+            spent: Duration::ZERO,
+            longest_attempt: policy.connect_timeout.saturating_add(policy.idle_timeout),
+        }
+    }
+
+    /// Bytes moved: start counting again.
+    fn reset(&mut self) {
+        self.spent = Duration::ZERO;
+    }
+
+    /// An attempt that moved nothing, as long as it took by the clock.
+    fn failed_attempt(&mut self, took: Duration) {
+        self.spent = self.spent.saturating_add(took.min(self.longest_attempt));
+    }
+
+    /// A backoff wait that was asked for.
+    fn waited(&mut self, wait: Duration) {
+        self.spent = self.spent.saturating_add(wait);
+    }
+
+    /// Whether waiting `next` more would go past `limit`.
+    fn exhausted(&self, next: Duration, limit: Duration) -> bool {
+        self.spent.saturating_add(next) > limit
     }
 }
 
@@ -91,14 +151,44 @@ pub(super) fn receive_slots() -> Semaphore {
 }
 
 impl FileService {
+    /// Check that offer `id` could be saved where it is going, then start
+    /// receiving it. A directory the file could never be saved in is refused
+    /// here, before anything is downloaded, with the offer left queued.
+    pub(super) async fn begin_receive(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        recipient: Recipient,
+        policy: ResumePolicy,
+    ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
+        let filename = {
+            let pending = self.pending_files.lock().unwrap();
+            let Some(file) = pending.iter().find(|file| file.id == id) else {
+                return op_err(format!("no pending file with id {id}"));
+            };
+            file.filename.clone()
+        };
+        let dir = receive_dir(output.as_deref());
+        let checked = recipient.clone();
+        let usable =
+            tokio::task::spawn_blocking(move || receive_dest::check(&dir, &filename, &checked))
+                .await
+                .map_err(|e| OpError::msg(format!("destination check failed: {e}")))?;
+        if let Err(e) = usable {
+            return op_err(format!("cannot save the file: {e}"));
+        }
+        self.start_receive(id, output, recipient, policy)
+    }
+
     /// Take pending offer `id` and start receiving it in a task the service
-    /// owns. The returned channel carries the outcome; dropping it leaves the
-    /// receive running.
+    /// owns, retrying as `policy` says. The returned channel carries the
+    /// outcome; dropping it leaves the receive running.
     pub(super) fn start_receive(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
         recipient: Recipient,
+        policy: ResumePolicy,
     ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
         let file = {
             let mut pending = self.pending_files.lock().unwrap();
@@ -109,6 +199,7 @@ impl FileService {
                 output: output.clone(),
                 recipient: recipient.clone(),
             });
+
             let mut active = self.active_files.lock().unwrap();
             active.push(file.clone());
             let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
@@ -141,12 +232,25 @@ impl FileService {
             .insert(transfer_id, cancel.clone());
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let service = Arc::clone(self);
+        let to = AcceptedReceive { output, recipient };
         tokio::spawn(async move {
-            let received = tokio::select! {
+            // Biased so a receive that finished in the same poll as a cancel
+            // counts as finished.
+            let written = tokio::select! {
+                biased;
+                written = service.run_receive(&file, transfer_id, to, policy) => written,
                 () = cancel.cancelled() => Err("receive canceled".to_string()),
-                received = service.run_receive(&file, transfer_id, output, recipient) => received,
             };
             service.receives.lock().unwrap().remove(&transfer_id);
+            // Naming the complete file is not canceled: once the rename has
+            // happened, the outcome has to say so.
+            let received = match written {
+                Ok(written) => written
+                    .commit()
+                    .await
+                    .map_err(|e| format!("write failed: {e}")),
+                Err(error) => Err(error),
+            };
             let outcome = service.finish_receive(offer, finish, received);
             match &outcome {
                 Ok(Done(message)) => {
@@ -176,7 +280,7 @@ impl FileService {
             .collect();
         for (id, to) in accepted {
             // Not awaited, as for auto-accept: the task logs its own outcome.
-            match self.start_receive(id, to.output, to.recipient) {
+            match self.start_receive(id, to.output, to.recipient, self.resume) {
                 Ok(_) => tracing::info!(id, "resuming accepted file receive"),
                 Err(error) => tracing::warn!(id, %error, "could not resume file receive"),
             }
@@ -186,57 +290,72 @@ impl FileService {
     /// Settle a finished receive: on success record the delivery and drop the
     /// offer for good; on failure leave it to `offer`, which returns it to the
     /// queue with its downloaded data.
+    ///
+    /// The delivery is recorded before the transfer is marked done and the
+    /// blob released. If recording fails the file is still saved, so the offer
+    /// is not queued again: accepting it a second time would only download it
+    /// once more and save it beside the first copy.
     fn finish_receive(
         self: &Arc<Self>,
         mut offer: ReceiveOfferGuard,
         finish: transfers::FinishGuard,
         received: Result<PathBuf, String>,
     ) -> OpResult<Done> {
-        let Some(file) = offer.file.clone() else {
+        let Some(file) = offer.file.take() else {
             return op_err("receive lost its offer");
         };
         let id = file.id;
         let dest = match received {
             Ok(dest) => dest,
             Err(error) => {
+                offer.file = Some(file);
                 finish.fail(error.clone());
                 return op_err(format!("{error}; retry with `ray files accept {id}`"));
             }
         };
+        let recorded = self.record_completed_offer(&file);
+        self.forget_active(offer.offer_id);
+        // The file is where the user wanted it, so the store's copy is now pure
+        // duplication: every accepted file used to be kept twice, forever.
+        self.reclaim_blob(blob_tags::recv(&file.blob_hash, file.id));
+        if let Err(error) = recorded {
+            let reason = format!(
+                "saved to {} but could not record delivery confirmation: {error}",
+                dest.display()
+            );
+            finish.fail(reason.clone());
+            return op_err(reason);
+        }
         // The file is fully on disk (chown failures are ignored, by design,
         // and never fail the transfer): only now is the transfer really done.
         let destination = std::fs::canonicalize(&dest).unwrap_or_else(|_| dest.clone());
         finish.success(&destination);
-        if let Err(error) = self.record_completed_offer(&file) {
-            return op_err(format!(
-                "file saved but could not record delivery confirmation: {error}; retry with `ray files accept {id}`"
-            ));
-        }
-        offer.file.take();
-        {
-            let pending = self.pending_files.lock().unwrap();
-            let mut active = self.active_files.lock().unwrap();
-            active.retain(|entry| entry.offer_id != offer.offer_id);
-            let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
-            if let Err(error) = save_pending_files(&durable) {
-                tracing::warn!(%error, "could not persist completed incoming file");
-            }
-        }
         let service = Arc::clone(self);
         let peer = file.from;
         tokio::spawn(async move { service.flush_outbox_for(peer).await });
         Ok(Done(format!("saved to {}", dest.display())))
     }
 
+    /// Drop a finished receive from the active list and the saved queue.
+    fn forget_active(&self, offer_id: control::FileOfferId) {
+        let pending = self.pending_files.lock().unwrap();
+        let mut active = self.active_files.lock().unwrap();
+        active.retain(|entry| entry.offer_id != offer_id);
+        let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
+        if let Err(error) = save_pending_files(&durable) {
+            tracing::warn!(%error, "could not persist completed incoming file");
+        }
+    }
+
     /// Fetch the offer's blob, retrying interruptions, and write it to its
-    /// destination. Returns where the file was saved.
+    /// destination under a temporary name.
     async fn run_receive(
         &self,
         file: &PendingFile,
         transfer_id: u64,
-        output: Option<String>,
-        recipient: Recipient,
-    ) -> Result<PathBuf, String> {
+        to: AcceptedReceive,
+        policy: ResumePolicy,
+    ) -> Result<Written, String> {
         // Checked again here, not only when the offer was queued: offers saved
         // by an older daemon were never validated.
         if !is_safe_file_name(&file.filename) {
@@ -247,6 +366,7 @@ impl FileService {
         // would sweep the bytes out from under us. The tag is dropped again as
         // soon as the file reaches its destination or the offer is rejected.
         // Failed receives keep the tag so a retry can reuse the downloaded ranges.
+        // A finished one releases it in `finish_receive`.
         let recv_tag = blob_tags::recv(&file.blob_hash, file.id);
         self.transport
             .blob_store
@@ -254,27 +374,31 @@ impl FileService {
             .set(&recv_tag, iroh_blobs::HashAndFormat::raw(file.blob_hash))
             .await
             .map_err(|e| format!("blob store error: {e}"))?;
-        self.fetch_resuming(file, transfer_id).await?;
-        let dest = self.save_received(file, output, recipient).await?;
-        // The file is where the user wanted it, so the store's copy is now pure
-        // duplication: every accepted file used to be kept twice, forever.
-        self.reclaim_blob(recv_tag);
-        Ok(dest)
+        self.fetch_resuming(file, transfer_id, policy).await?;
+        self.save_received(file, to).await
     }
 
     /// Fetch until the blob is complete, waiting out interruptions.
-    async fn fetch_resuming(&self, file: &PendingFile, transfer_id: u64) -> Result<(), String> {
-        let policy = self.resume;
+    async fn fetch_resuming(
+        &self,
+        file: &PendingFile,
+        transfer_id: u64,
+        policy: ResumePolicy,
+    ) -> Result<(), String> {
         let mut backoff = policy.first_backoff;
-        let mut last_progress = Instant::now();
+        let mut stalled = NoProgress::new(&policy);
         loop {
-            let attempt = {
+            let (attempt, took) = {
                 let _slot = self
                     .receive_slots
                     .acquire()
                     .await
                     .map_err(|_| "file receives are shutting down".to_string())?;
-                self.fetch_once(file, transfer_id, &policy).await
+                // Timed once the slot is held: waiting for other receives to
+                // finish is not trying.
+                let started = Instant::now();
+                let attempt = self.fetch_once(file, transfer_id, &policy).await;
+                (attempt, started.elapsed())
             };
             let reason = match attempt {
                 Ok(()) => return Ok(()),
@@ -282,12 +406,14 @@ impl FileService {
                 Err(FetchError::Interrupted { reason, progressed }) => {
                     if progressed {
                         backoff = policy.first_backoff;
-                        last_progress = Instant::now();
+                        stalled.reset();
+                    } else {
+                        stalled.failed_attempt(took);
                     }
                     reason
                 }
             };
-            if last_progress.elapsed() + backoff > policy.give_up_after {
+            if stalled.exhausted(backoff, policy.give_up_after) {
                 return Err(format!(
                     "{reason}; gave up after {} hours without progress",
                     policy.give_up_after.as_secs() / 3600
@@ -302,6 +428,7 @@ impl FileService {
             );
             self.transfers.note_retrying(transfer_id, &reason);
             tokio::time::sleep(backoff).await;
+            stalled.waited(backoff);
             backoff = backoff.saturating_mul(2).min(policy.max_backoff);
         }
     }
@@ -392,20 +519,25 @@ impl FileService {
     async fn save_received(
         &self,
         file: &PendingFile,
-        output: Option<String>,
-        recipient: Recipient,
-    ) -> Result<PathBuf, String> {
-        let dir = match output {
-            Some(ref p) => PathBuf::from(p),
-            None => dirs::download_dir().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Downloads")
-            }),
-        };
-        self.write_received(file.blob_hash, dir, &file.filename, recipient)
+        to: AcceptedReceive,
+    ) -> Result<Written, String> {
+        let dir = receive_dir(to.output.as_deref());
+        self.write_received(file.blob_hash, dir, &file.filename, to.recipient)
             .await
             .map_err(|e| format!("write failed: {e}"))
+    }
+}
+
+/// The directory a receive saves into: the one asked for, or the daemon
+/// user's Downloads.
+fn receive_dir(output: Option<&str>) -> PathBuf {
+    match output {
+        Some(p) => PathBuf::from(p),
+        None => dirs::download_dir().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Downloads")
+        }),
     }
 }
 
@@ -502,6 +634,41 @@ mod tests {
             max_backoff: Duration::from_millis(200),
             give_up_after: Duration::from_secs(3600),
         }
+    }
+
+    /// A suspend in the middle of an attempt or a wait, however long, must
+    /// not use up the give-up window by itself.
+    #[test]
+    fn a_long_sleep_alone_does_not_give_up() {
+        let policy = ResumePolicy::default();
+        let day = policy.give_up_after;
+        let mut stalled = NoProgress::new(&policy);
+        // One attempt that the clock says took two days: the machine slept
+        // through it.
+        stalled.failed_attempt(2 * day);
+        assert!(!stalled.exhausted(policy.max_backoff, day));
+        // A day's worth of waiting that really happened does give up.
+        while !stalled.exhausted(policy.max_backoff, day) {
+            stalled.waited(policy.max_backoff);
+            stalled.failed_attempt(Duration::from_secs(1));
+        }
+        assert!(stalled.spent >= day - policy.max_backoff);
+        stalled.reset();
+        assert!(!stalled.exhausted(policy.max_backoff, day));
+    }
+
+    /// The Android accept blocks its caller, so it must not wait out a day.
+    #[test]
+    fn a_blocking_accept_gives_up_within_minutes() {
+        let policy = ResumePolicy::default();
+        let blocking = policy.for_blocking_call();
+        assert_eq!(blocking.give_up_after, BLOCKING_GIVE_UP_AFTER);
+        assert_eq!(blocking.max_backoff, policy.max_backoff);
+        let quick = quick_retries();
+        assert_eq!(
+            quick.for_blocking_call().give_up_after,
+            BLOCKING_GIVE_UP_AFTER
+        );
     }
 
     fn payload() -> Vec<u8> {
@@ -723,17 +890,18 @@ mod tests {
             caller_chose_dir: true,
         };
         let _outcome = receiver
-            .start_receive(1, output.clone(), recipient.clone())
+            .start_receive(1, output.clone(), recipient.clone(), quick_retries())
             .unwrap();
         stalled_rx.await.unwrap();
         wait_for(&receiver, &mut changes, |t| t.transferred > 0).await;
 
-        // The daemon stops partway through.
+        // The daemon stops partway through. The offer guard puts the entry
+        // back in the queue and rewrites the file under the queue lock, so
+        // once it is back in memory the saved copy is the guard's.
         receiver.registry.shutdown_token.cancel();
-        wait_for(&receiver, &mut changes, |t| {
-            t.state == transfers::TransferState::Failed
-        })
-        .await;
+        while receiver.pending_files.lock().unwrap().is_empty() {
+            changes.changed().await.unwrap();
+        }
         first.router.endpoint().close().await;
         let saved = load_pending_files();
         assert_eq!(saved.len(), 1);
@@ -789,7 +957,10 @@ mod tests {
         offer(&receiver, key.public(), &data);
         let output = Some(tmp.path().join("downloads").to_string_lossy().into_owned());
 
-        let started = receiver.start_accepting_file(1, output, None).unwrap();
+        let started = receiver
+            .start_accepting_file(1, output, None)
+            .await
+            .unwrap();
         assert!(started.0.contains("receiving"), "{started:?}");
         assert!(receiver.pending_files.lock().unwrap().is_empty());
         let running = receive(&receiver);

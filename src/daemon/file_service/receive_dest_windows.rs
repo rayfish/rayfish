@@ -25,6 +25,11 @@
 //!
 //! In place of the Unix `chown`, what is created for a caller carries an ACE
 //! granting that caller full control, on top of what it inherits.
+//!
+//! As on Unix, the file is written under a temporary name and renamed through
+//! its own handle once complete, without replacing an existing file. One
+//! dropped before that is deleted, so a canceled receive leaves nothing under
+//! the real name.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -48,37 +53,69 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-    GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle,
-    VOLUME_NAME_DOS,
+    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+    FileRenameInfo, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
+    SetFileInformationByHandle, VOLUME_NAME_DOS,
 };
 
 use super::dest_name::{
-    MAX_NAME_ATTEMPTS, missing_names, numbered_name, root_len, windows_file_name,
+    MAX_NAME_ATTEMPTS, missing_names, numbered_name, root_len, temp_name, windows_file_name,
 };
 use super::{Recipient, WindowsCaller};
 use crate::windows_identity::ClientToken;
 use crate::windows_security::OwnedSecurityDescriptor;
 
-/// A newly created destination file: a second handle to it, kept to delete
-/// it again, and the name it was created under, after any collision suffix.
-pub(super) struct Destination {
+/// A received file being written under a temporary name: a second handle to
+/// it, kept to rename or delete it, and the directory it is in. Dropping it
+/// before [`Staged::commit`] deletes the file.
+pub(super) struct Staged {
     file: File,
-    pub(super) name: OsString,
+    dir: PathBuf,
+    temp: OsString,
+    /// The name the file should end up under, before any collision suffix.
+    wanted: String,
+    committed: bool,
 }
 
-impl Destination {
-    /// Remove the file again, after a failed write. Best effort: the error
-    /// that caused the cleanup is the one worth reporting.
-    pub(super) fn discard(&self) {
-        delete_on_close(&self.file, &self.name);
+impl Staged {
+    /// Rename the written file to its name, or the first free `name (n).ext`,
+    /// never replacing an existing file. Returns the name it got.
+    pub(super) fn commit(mut self) -> io::Result<OsString> {
+        for attempt in 0..MAX_NAME_ATTEMPTS {
+            let name = numbered_name(&self.wanted, attempt);
+            match rename_by_handle(&self.file, &self.dir.join(&name)) {
+                Ok(()) => {
+                    self.committed = true;
+                    return Ok(OsString::from(name));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("'{}' and its numbered alternatives all exist", self.wanted),
+        ))
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.committed {
+            delete_on_close(&self.file, &self.temp);
+        }
     }
 }
 
 /// How far the destination directory has to be checked.
 enum DirCheck<'a> {
-    /// LocalSystem or the Administrator-configured auto-accept target.
+    /// LocalSystem chose it, and could write there anyway.
     Trusted,
+    /// An Administrator configured it as the auto-accept target. Trusted as
+    /// configured, so no component may be a junction or link: a user who can
+    /// replace part of the path (their own Downloads) could otherwise point
+    /// it at `C:\Windows\System32`.
+    Configured,
     /// The caller chose it: they must be able to write there themselves.
     Caller(&'a ClientToken),
 }
@@ -86,7 +123,7 @@ enum DirCheck<'a> {
 impl DirCheck<'_> {
     fn caller_sid(&self) -> Option<&str> {
         match self {
-            Self::Trusted => None,
+            Self::Trusted | Self::Configured => None,
             Self::Caller(token) => Some(token.sid()),
         }
     }
@@ -111,7 +148,7 @@ impl DirCheck<'_> {
 
 fn dir_check(recipient: &Recipient) -> io::Result<DirCheck<'_>> {
     if !recipient.caller_chose_dir {
-        return Ok(DirCheck::Trusted);
+        return Ok(DirCheck::Configured);
     }
     match &recipient.caller {
         WindowsCaller::System => Ok(DirCheck::Trusted),
@@ -124,31 +161,60 @@ fn dir_check(recipient: &Recipient) -> io::Result<DirCheck<'_>> {
     }
 }
 
-/// Open (creating as needed) `dir` for `recipient` and create `file_name` in
-/// it, or a free `name (n).ext` variant when the name is taken. Returns the
-/// empty file, ready to be written.
+/// Open (creating as needed) `dir` for `recipient` and create a temporary
+/// file in it for `file_name`. Returns the empty file, ready to be written
+/// and then committed.
 pub(super) fn create(
     dir: &Path,
     file_name: &str,
     recipient: Recipient,
-) -> io::Result<(Destination, File)> {
+) -> io::Result<(Staged, File)> {
     let check = dir_check(&recipient)?;
-    let name = windows_file_name(file_name).ok_or_else(|| {
+    let wanted = usable_name(file_name)?;
+    let dir = open_dir(dir, &check)?;
+    let (temp, file) = create_temp(&dir, check.caller_sid())?;
+    let keep = match file.try_clone() {
+        Ok(keep) => keep,
+        Err(e) => {
+            delete_on_close(&file, &temp);
+            return Err(e);
+        }
+    };
+    let staged = Staged {
+        file: keep,
+        dir: dir.final_path,
+        temp,
+        wanted,
+        committed: false,
+    };
+    Ok((staged, file))
+}
+
+/// Check, without creating anything, that a file for `recipient` could be
+/// saved in `dir`: the caller is known, the name is usable, and the deepest
+/// existing directory passes the same check a write does. Lets an accept be
+/// refused before the download rather than after it.
+pub(super) fn check(dir: &Path, file_name: &str, recipient: &Recipient) -> io::Result<()> {
+    let check = dir_check(recipient)?;
+    usable_name(file_name)?;
+    let path = &absolute(dir)?;
+    let (dir, existing) = find_existing(path, &check)?;
+    let access = if missing_names(path, existing)?.is_empty() {
+        FILE_ADD_FILE
+    } else {
+        FILE_ADD_SUBDIRECTORY
+    };
+    check.require(&dir, access, path)
+}
+
+/// A peer's file name as it will be saved on Windows.
+fn usable_name(file_name: &str) -> io::Result<String> {
+    windows_file_name(file_name).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("'{file_name}' is not a usable file name on Windows"),
         )
-    })?;
-    let dir = open_dir(dir, &check)?;
-    let (name, file) = create_file(&dir, &name, check.caller_sid())?;
-    let keep = match file.try_clone() {
-        Ok(keep) => keep,
-        Err(e) => {
-            delete_on_close(&file, &name);
-            return Err(e);
-        }
-    };
-    Ok((Destination { file: keep, name }, file))
+    })
 }
 
 /// A directory held open, and the path it really has.
@@ -162,23 +228,12 @@ fn open_dir(path: &Path, check: &DirCheck<'_>) -> io::Result<OpenDir> {
     // A relative path means the daemon's working directory, as it always has;
     // the walk below needs the absolute form to find an existing ancestor.
     let path = &absolute(path)?;
-    let components: Vec<Component<'_>> = path.components().collect();
     // Find the deepest prefix that already exists. Nothing is created until
     // that directory has passed the check, so a refused request leaves no
     // trace on disk. The caller's path may go through a link (a Downloads
     // folder redirected to another disk): what is checked is the directory
     // the handle ends up on.
-    let mut existing = components.len();
-    let mut dir = loop {
-        let prefix: PathBuf = components[..existing].iter().collect();
-        match open_dir_handle(&prefix, false) {
-            Ok(dir) => break dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound && existing > root_len(path) => {
-                existing -= 1
-            }
-            Err(e) => return Err(with_path(e, path)),
-        }
-    };
+    let (mut dir, existing) = find_existing(path, check)?;
     for name in missing_names(path, existing)? {
         check.require(&dir, FILE_ADD_SUBDIRECTORY, path)?;
         let child = dir.final_path.join(name);
@@ -187,6 +242,52 @@ fn open_dir(path: &Path, check: &DirCheck<'_>) -> io::Result<OpenDir> {
     }
     check.require(&dir, FILE_ADD_FILE, path)?;
     Ok(dir)
+}
+
+/// The deepest existing prefix of `path` and how many components it has,
+/// walked without links where `check` requires it.
+fn find_existing(path: &Path, check: &DirCheck<'_>) -> io::Result<(OpenDir, usize)> {
+    match check {
+        DirCheck::Configured => walk_without_links(path),
+        DirCheck::Trusted | DirCheck::Caller(_) => deepest_existing(path),
+    }
+}
+
+/// The deepest existing prefix of `path`, opened through any links in it,
+/// and how many components it has.
+fn deepest_existing(path: &Path) -> io::Result<(OpenDir, usize)> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut existing = components.len();
+    loop {
+        let prefix: PathBuf = components[..existing].iter().collect();
+        match open_dir_handle(&prefix, false) {
+            Ok(dir) => return Ok((dir, existing)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && existing > root_len(path) => {
+                existing -= 1
+            }
+            Err(e) => return Err(with_path(e, path)),
+        }
+    }
+}
+
+/// Like [`deepest_existing`], but one component at a time from the root,
+/// refusing any that is a reparse point. Each directory stays open while the
+/// next is opened, and an open directory cannot be renamed, so the next
+/// component is looked up in the directory that was just checked.
+fn walk_without_links(path: &Path) -> io::Result<(OpenDir, usize)> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let root = root_len(path);
+    let mut prefix: PathBuf = components[..root].iter().collect();
+    let mut dir = open_dir_handle(&prefix, true).map_err(|e| with_path(e, path))?;
+    for (index, component) in components.iter().enumerate().skip(root) {
+        prefix.push(component);
+        match open_dir_handle(&prefix, true) {
+            Ok(next) => dir = next,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((dir, index)),
+            Err(e) => return Err(with_path(e, path)),
+        }
+    }
+    Ok((dir, components.len()))
 }
 
 /// Open a directory for reading its security and attributes. `no_follow`
@@ -227,7 +328,7 @@ fn open_dir_handle(path: &Path, no_follow: bool) -> io::Result<OpenDir> {
     if no_follow && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "a directory created for the file was replaced by a link",
+            "a link or junction where a plain directory was expected",
         ));
     }
     let final_path = final_path(&handle)?;
@@ -374,13 +475,13 @@ fn make_dir(path: &Path, sid: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-/// Create `file_name` (or the first free `name (n).ext`) in `dir`,
-/// exclusively and without following a reparse point.
-fn create_file(dir: &OpenDir, file_name: &str, sid: Option<&str>) -> io::Result<(OsString, File)> {
+/// Create a fresh temporary file in `dir`, exclusively and without following
+/// a reparse point.
+fn create_temp(dir: &OpenDir, sid: Option<&str>) -> io::Result<(OsString, File)> {
     let mut descriptor = caller_descriptor(sid, false)?;
     let attributes = descriptor.as_mut().map(OwnedSecurityDescriptor::attributes);
-    for attempt in 0..MAX_NAME_ATTEMPTS {
-        let name = numbered_name(file_name, attempt);
+    for _ in 0..MAX_NAME_ATTEMPTS {
+        let name = temp_name();
         let wide = wide(dir.final_path.join(&name).as_os_str());
         // SAFETY: `wide` is a NUL-terminated path, the security attributes
         // (when present) point at a descriptor `descriptor` keeps alive, and
@@ -409,8 +510,55 @@ fn create_file(dir: &OpenDir, file_name: &str, sid: Option<&str>) -> io::Result<
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        format!("'{file_name}' and its numbered alternatives all exist"),
+        "could not pick a free temporary file name",
     ))
+}
+
+/// Rename the file `file` is open on to `to`, a full path in the same
+/// directory, failing with `AlreadyExists` instead of replacing a file there.
+/// Through the handle, so it is the file this module created that moves,
+/// whatever has happened to its temporary name.
+fn rename_by_handle(file: &File, to: &Path) -> io::Result<()> {
+    let name: Vec<u16> = to.as_os_str().encode_wide().collect();
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| io::Error::other("file name too long"))?;
+    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    // Room for the header, the name and a terminator, rounded up to whole
+    // `u64`s so the buffer is aligned for the struct.
+    let size = header
+        .checked_add(name_bytes)
+        .and_then(|n| n.checked_add(std::mem::size_of::<u16>()))
+        .ok_or_else(|| io::Error::other("file name too long"))?
+        .max(std::mem::size_of::<FILE_RENAME_INFO>());
+    let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let length = u32::try_from(name_bytes).map_err(io::Error::other)?;
+    let size = u32::try_from(size).map_err(io::Error::other)?;
+    // SAFETY: `buffer` is zeroed, aligned for `FILE_RENAME_INFO` and large
+    // enough for its header followed by `name` and a terminator, so the field
+    // writes and the copy into the trailing `FileName` array stay inside it.
+    // A zeroed header already means "do not replace" and no root directory.
+    unsafe {
+        (*info).FileNameLength = length;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    // SAFETY: the handle is open with DELETE access for the call, and `info`
+    // points at `size` initialized bytes laid out as a FILE_RENAME_INFO.
+    let ok = unsafe {
+        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfo, info.cast(), size)
+    };
+    if ok == 0 {
+        // A taken name is `ERROR_ALREADY_EXISTS` or `ERROR_FILE_EXISTS`,
+        // both `AlreadyExists`.
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Mark the file `file` is open on for deletion. Through the handle, so it is
@@ -454,7 +602,7 @@ fn with_path(e: io::Error, path: &Path) -> io::Error {
 mod tests {
     use super::*;
 
-    fn trusted() -> Recipient {
+    fn configured() -> Recipient {
         Recipient {
             owner: None,
             caller_chose_dir: false,
@@ -508,16 +656,18 @@ mod tests {
         };
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         // The same directory is fine when the caller could write it.
-        let (dest, _file) = create(tmp.path(), "f.bin", me()).unwrap();
-        assert_eq!(dest.name, "f.bin");
+        let (staged, file) = create(tmp.path(), "f.bin", me()).unwrap();
+        drop(file);
+        assert_eq!(staged.commit().unwrap(), "f.bin");
     }
 
     #[test]
     fn a_taken_name_gets_a_number_and_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
-        let (dest, _file) = create(tmp.path(), "f.bin", trusted()).unwrap();
-        assert_eq!(dest.name, "f (1).bin");
+        let (staged, file) = create(tmp.path(), "f.bin", configured()).unwrap();
+        drop(file);
+        assert_eq!(staged.commit().unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
     }
 
@@ -525,19 +675,58 @@ mod tests {
     fn a_stream_name_becomes_a_plain_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.txt"), b"keep").unwrap();
-        let (dest, _file) = create(tmp.path(), "notes.txt:hidden", trusted()).unwrap();
-        assert_eq!(dest.name, "notes.txt_hidden");
+        let (staged, file) = create(tmp.path(), "notes.txt:hidden", configured()).unwrap();
+        drop(file);
+        assert_eq!(staged.commit().unwrap(), "notes.txt_hidden");
     }
 
     #[test]
-    fn missing_directories_are_created_and_discard_removes_the_file() {
+    fn missing_directories_are_created_and_a_dropped_file_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a").join("b");
-        let (dest, file) = create(&nested, "f.bin", trusted()).unwrap();
-        dest.discard();
+        let (staged, file) = create(&nested, "f.bin", configured()).unwrap();
         drop(file);
-        drop(dest);
+        drop(staged);
         assert!(nested.is_dir());
-        assert!(!nested.join("f.bin").exists());
+        assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn commit_never_replaces_a_file_that_appeared_meanwhile() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let (staged, mut file) = create(tmp.path(), "f.bin", configured()).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+        std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
+        assert_eq!(staged.commit().unwrap(), "f (1).bin");
+        assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(tmp.path().join("f (1).bin")).unwrap(), b"new");
+    }
+
+    /// A user who turns their configured Downloads into a junction must not
+    /// steer SYSTEM's write somewhere else.
+    #[test]
+    fn a_junction_in_a_configured_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let junction = tmp.path().join("Downloads");
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        for dir in [junction.clone(), junction.join("sub")] {
+            let Err(e) = create(&dir, "f.bin", configured()) else {
+                panic!("{dir:?} goes through a junction");
+            };
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        }
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
     }
 }
