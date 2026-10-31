@@ -280,6 +280,13 @@ pub(crate) fn named_pipe_client_identity(pipe: HANDLE) -> Result<WindowsPeerIden
 
 #[cfg(test)]
 mod tests {
+    use std::os::windows::io::AsRawHandle;
+    use std::process;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+    use windows_sys::Win32::Foundation::ERROR_NO_TOKEN;
+
     use super::*;
 
     #[test]
@@ -307,6 +314,38 @@ mod tests {
     #[test]
     fn invalid_named_pipe_handle_fails_closed() {
         assert!(named_pipe_client_identity(std::ptr::null_mut()).is_err());
+    }
+
+    #[tokio::test]
+    async fn read_client_identity_matches_the_process_and_reverts_the_thread_token() {
+        let name = format!(r"\\.\pipe\rayfish-test-client-identity-{}", process::id());
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        let mut client = ClientOptions::new().open(&name).unwrap();
+        server.connect().await.unwrap();
+        let expected_sid = current_user_sid().unwrap();
+        let expected_admin = is_current_process_elevated_admin();
+        client.write_all(b"request").await.unwrap();
+        let mut request = [0; 7];
+        server.read_exact(&mut request).await.unwrap();
+        let identity = named_pipe_client_identity(server.as_raw_handle() as HANDLE).unwrap();
+        assert!(
+            identity.sid == expected_sid,
+            "The pipe returned another client's SID."
+        );
+        assert_eq!(identity.is_local_system, expected_sid == "S-1-5-18");
+        assert_eq!(identity.is_elevated_admin, expected_admin);
+        let mut thread_token = std::ptr::null_mut();
+        // SAFETY: The token output pointer is valid; a reverted test thread
+        // has no impersonation token, so no handle is returned to be closed.
+        assert_eq!(
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut thread_token) },
+            0
+        );
+        // SAFETY: Read immediately after the failed OpenThreadToken call.
+        assert_eq!(unsafe { GetLastError() }, ERROR_NO_TOKEN);
     }
 
     #[test]

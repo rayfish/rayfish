@@ -6,34 +6,32 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::time::Duration;
 
 use anyhow::Result;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{
+    SO_EXCLUSIVEADDRUSE, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, setsockopt,
+};
 
-/// Bind a TCP listener on one specific address with SO_REUSEADDR (and
-/// SO_REUSEPORT on Unix) so it can coexist with a host daemon bound on the
-/// wildcard address: the SSH server's port alongside a host sshd on
-/// `0.0.0.0:22`, and every port `v4bridge` claims on the mesh address alongside
-/// the `0.0.0.0` listener it bridges to. Returns a tokio listener ready to
-/// accept.
+/// Bind a TCP listener on one specific address. Unix reuse options allow
+/// coexistence with a wildcard host daemon. Windows reserves the endpoint
+/// exclusively so another local process cannot take delivery of its traffic.
 pub(crate) fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
-    use socket2::{Domain, Protocol, Socket, Type};
     let domain = if ip.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
     };
     let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(unix)]
     sock.set_reuse_address(true)?;
-    // Unix only, and deliberately not "because Windows has no SO_REUSEPORT".
-    // Windows spells SO_REUSEADDR differently enough to matter: it lets *any*
-    // process, including one running as another unprivileged user, bind the
-    // same address and take delivery. The Unix pair is a coexistence primitive;
-    // the Windows option is a hijack primitive, which is why SO_EXCLUSIVEADDRUSE
-    // exists. Nothing binds through here on Windows today (`v4bridge` has no
-    // port enumeration there), so the first caller that does needs to set
-    // SO_EXCLUSIVEADDRUSE by hand: socket2 0.6 does not expose it.
+    #[cfg(windows)]
+    reserve_windows_endpoint(&sock)?;
     #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
@@ -78,11 +76,38 @@ impl AcceptBackoff {
     }
 }
 
+#[cfg(windows)]
+fn reserve_windows_endpoint(socket: &Socket) -> Result<()> {
+    use std::io::Error as IoError;
+    use std::mem::size_of_val;
+
+    let enabled = 1_i32;
+    // SAFETY: This owns the unbound socket. The option value is an initialized
+    // integer whose buffer and declared length remain valid for the call.
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket().try_into()?,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&enabled as *const i32).cast(),
+            size_of_val(&enabled).try_into()?,
+        )
+    };
+    if result == SOCKET_ERROR {
+        // SAFETY: Read the error immediately after this thread's Winsock call.
+        return Err(IoError::from_raw_os_error(unsafe { WSAGetLastError() }).into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(windows)]
+    use std::net::Ipv4Addr;
 
     use tokio::time::Instant;
+
+    use super::*;
 
     #[tokio::test(start_paused = true)]
     async fn accept_backoff_doubles_to_a_cap_and_resets() {
@@ -103,5 +128,22 @@ mod tests {
         let started = Instant::now();
         backoff.wait(&error, "test").await;
         assert_eq!(started.elapsed(), AcceptBackoff::MIN);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_listener_rejects_a_competing_reuse_address_bind() {
+        let listener = bind_listener(Ipv4Addr::LOCALHOST.into(), 0)
+            .expect("the first loopback listener must bind");
+        let address = listener.local_addr().expect("the listener has an address");
+        let competing = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .expect("the competing socket must open");
+        competing
+            .set_reuse_address(true)
+            .expect("the competing socket must enable address reuse");
+        assert!(
+            competing.bind(&address.into()).is_err(),
+            "a second process must not bind the reserved listener endpoint"
+        );
     }
 }

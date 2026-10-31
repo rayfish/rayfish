@@ -17,6 +17,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Source {
     Peer(EndpointId),
+    #[cfg(any(unix, test))]
     LocalUid(u32),
 }
 

@@ -1,4 +1,4 @@
-//! Synthesis of UDP reply packets injected back into the TUN, so the in-daemon
+//! Synthesis of DNS and echo replies injected back into the TUN, so the in-daemon
 //! Magic DNS resolver can answer queries addressed to the magic IP without a
 //! host socket. IPv6 only: the resolver is reached at [`crate::dns::MAGIC_DNS_V6`]
 //! and nowhere else, so there is one family to synthesise for.
@@ -67,21 +67,64 @@ fn build_v6_reply(
 
 /// UDP checksum over the IPv6 pseudo-header + UDP header + payload.
 fn udp_checksum(src: Ipv6Addr, dst: Ipv6Addr, udp_segment: &[u8]) -> u16 {
+    transport_checksum(src, dst, 17, udp_segment)
+}
+
+/// Answer reachability probes to the resolver without looking for a mesh peer.
+/// Only valid, unicast ICMPv6 echo requests receive a reply.
+pub(crate) fn build_echo_reply(packet: &[u8], query: &PacketInfo) -> Option<Bytes> {
+    let IpAddr::V6(app) = query.src_ip else {
+        return None;
+    };
+    if query.dst_ip != IpAddr::V6(super::MAGIC_DNS_V6)
+        || query.protocol != 58
+        || app.is_unspecified()
+        || app.is_multicast()
+    {
+        return None;
+    }
+    let payload_len = usize::from(u16::from_be_bytes(packet.get(4..6)?.try_into().ok()?));
+    let end = IPV6_HEADER_LEN.checked_add(payload_len)?;
+    let echo = packet.get(query.transport_offset..end)?;
+    if echo.len() < 8
+        || echo[0] != 128
+        || echo[1] != 0
+        || IPV6_HEADER_LEN.checked_add(echo.len())? > MTU
+        || transport_checksum(app, super::MAGIC_DNS_V6, 58, echo) != 0
+    {
+        return None;
+    }
+    let mut reply = vec![0; IPV6_HEADER_LEN + echo.len()];
+    reply[0] = 0x60;
+    reply[4..6].copy_from_slice(&u16::try_from(echo.len()).ok()?.to_be_bytes());
+    reply[6] = 58;
+    reply[7] = 64;
+    reply[8..24].copy_from_slice(&super::MAGIC_DNS_V6.octets());
+    reply[24..40].copy_from_slice(&app.octets());
+    reply[40..].copy_from_slice(echo);
+    reply[40] = 129;
+    reply[42..44].fill(0);
+    let checksum = transport_checksum(super::MAGIC_DNS_V6, app, 58, &reply[40..]);
+    reply[42..44].copy_from_slice(&checksum.to_be_bytes());
+    Some(Bytes::from(reply))
+}
+
+fn transport_checksum(src: Ipv6Addr, dst: Ipv6Addr, protocol: u8, payload: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for ip in [src, dst] {
         for segment in ip.segments() {
             sum += segment as u32;
         }
     }
-    sum += 17u32; // protocol
-    sum += udp_segment.len() as u32; // UDP length
+    sum += u32::from(protocol);
+    sum += payload.len() as u32;
     let mut i = 0;
-    while i + 1 < udp_segment.len() {
-        sum += u16::from_be_bytes([udp_segment[i], udp_segment[i + 1]]) as u32;
+    while i + 1 < payload.len() {
+        sum += u16::from_be_bytes([payload[i], payload[i + 1]]) as u32;
         i += 2;
     }
-    if i < udp_segment.len() {
-        sum += (udp_segment[i] as u32) << 8;
+    if i < payload.len() {
+        sum += (payload[i] as u32) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -95,6 +138,84 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::dns::MAGIC_DNS_V6;
+
+    fn echo_request(extension: bool) -> Vec<u8> {
+        let source = Ipv6Addr::new(0x200, 0, 0, 0, 0, 0, 0, 5);
+        let offset = if extension { 48 } else { 40 };
+        let mut packet = vec![0; offset + 13];
+        packet[0] = 0x60;
+        let payload_len = u16::try_from(packet.len() - 40).unwrap();
+        packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        packet[6] = if extension { 60 } else { 58 };
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source.octets());
+        packet[24..40].copy_from_slice(&MAGIC_DNS_V6.octets());
+        if extension {
+            packet[40] = 58;
+        }
+        packet[offset] = 128;
+        packet[offset + 4..].copy_from_slice(b"\x12\x34\x00\x01probe");
+        let checksum = transport_checksum(source, MAGIC_DNS_V6, 58, &packet[offset..]);
+        packet[offset + 2..offset + 4].copy_from_slice(&checksum.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn resolver_echo_reply_preserves_payload_and_validates_checksum() {
+        for extension in [false, true] {
+            let request = echo_request(extension);
+            let info = crate::firewall::parse_packet_info(&request).unwrap();
+            let reply = build_echo_reply(&request, &info).expect("valid resolver echo reply");
+            let response = crate::firewall::parse_packet_info(&reply).unwrap();
+            assert_eq!(response.src_ip, info.dst_ip);
+            assert_eq!(response.dst_ip, info.src_ip);
+            assert_eq!(response.icmp_type, 129);
+            assert_eq!(reply[41], 0);
+            assert_eq!(&reply[44..], &request[info.transport_offset + 4..]);
+            let IpAddr::V6(app) = info.src_ip else {
+                panic!("IPv6 fixture");
+            };
+            assert_eq!(transport_checksum(MAGIC_DNS_V6, app, 58, &reply[40..]), 0);
+        }
+    }
+
+    #[test]
+    fn resolver_echo_does_not_answer_corrupt_or_non_request_packets() {
+        let request = echo_request(false);
+        let info = crate::firewall::parse_packet_info(&request).unwrap();
+        for index in [40, 41, 42, 52] {
+            let mut corrupt = request.clone();
+            corrupt[index] ^= 1;
+            assert!(build_echo_reply(&corrupt, &info).is_none());
+        }
+        let IpAddr::V6(app) = info.src_ip else {
+            panic!("IPv6 fixture");
+        };
+        for (kind, code) in [(129, 0), (1, 0), (128, 1)] {
+            let mut other = request.clone();
+            other[40] = kind;
+            other[41] = code;
+            other[42..44].fill(0);
+            let checksum = transport_checksum(app, MAGIC_DNS_V6, 58, &other[40..]);
+            other[42..44].copy_from_slice(&checksum.to_be_bytes());
+            let other_info = crate::firewall::parse_packet_info(&other).unwrap();
+            assert!(build_echo_reply(&other, &other_info).is_none());
+        }
+        assert!(build_echo_reply(&request[..48], &info).is_none());
+        for source in [
+            Ipv6Addr::UNSPECIFIED,
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+        ] {
+            let invalid = PacketInfo {
+                src_ip: IpAddr::V6(source),
+                ..info
+            };
+            assert!(build_echo_reply(&request, &invalid).is_none());
+        }
+        let reply = build_echo_reply(&request, &info).unwrap();
+        let reply_info = crate::firewall::parse_packet_info(&reply).unwrap();
+        assert!(build_echo_reply(&reply, &reply_info).is_none());
+    }
 
     /// The swap, and a UDP checksum that actually verifies: IPv6 has no header
     /// checksum to fall back on and makes the UDP one mandatory, so a wrong one is

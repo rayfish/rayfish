@@ -706,6 +706,7 @@ mod tests {
         });
         let forwarder = MeshForwarder {
             tun: node.network.reader,
+            active: Arc::new(AtomicBool::new(true)),
             local_ipv6: ip,
             peers,
             firewall,

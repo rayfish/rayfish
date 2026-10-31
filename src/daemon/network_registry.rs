@@ -1759,7 +1759,7 @@ impl NetworkRegistry {
     }
 
     /// Verified memberships for authorization, independent of transport handles.
-    #[cfg(any(test, all(feature = "desktop", unix)))]
+    #[cfg(any(test, feature = "desktop"))]
     pub(crate) fn authorization_networks(&self, peer: EndpointId) -> Vec<SmolStr> {
         let user = self.device_user_map.resolve(&peer);
         self.networks

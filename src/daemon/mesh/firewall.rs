@@ -747,10 +747,14 @@ impl Daemon {
             }
         };
         let ssh_enabled = app_config.ssh_enabled;
-        let existing_rule = app_config
-            .networks
-            .iter()
-            .any(|net| net.name == network && net.ssh_allow.iter().any(|rule| rule.peer == peer));
+        let existing_rule = app_config.networks.iter().any(|net| {
+            net.name == network
+                && net
+                    .ssh_allow
+                    .iter()
+                    .chain(&net.managed_ssh_allow)
+                    .any(|rule| rule.peer == peer)
+        });
         // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
         // resolve to the peer's **user identity** hex. The roster lookup may
         // return a transport endpoint id (for a connected peer) which differs
@@ -758,8 +762,8 @@ impl Daemon {
         // authorizes by user identity (`device_user_map.resolve`), so normalize
         // through the same map here. For an unmapped id this is a no-op.
         let entry = if peer == "*" || existing_rule {
-            // Stored identities must remain editable after a peer leaves, or
-            // while its network is inactive. New grants still require resolution.
+            // Stored selectors stay recognizable while a peer is offline,
+            // including controller-owned grants that must report their owner.
             peer.to_string()
         } else {
             match self.registry.resolve_peer_in_network(network, peer) {
@@ -770,24 +774,11 @@ impl Daemon {
             }
         };
         let net = match config::update_network(network, |net| {
-            if allow {
-                // Normalize: a `*` collapses the list to just `*` (any incl. root);
-                // otherwise dedupe. Empty = the non-root default.
-                let users = normalize_ssh_users(users);
-                match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
-                    Some(r) => r.users = users,
-                    None => net.ssh_allow.push(config::SshRule {
-                        peer: entry.clone(),
-                        users,
-                    }),
-                }
-            } else {
-                net.ssh_allow.retain(|r| r.peer != entry);
-            }
-            Ok(())
+            apply_ssh_rule(net, &entry, users, allow)
         }) {
             Ok(Some(net)) => net,
             Ok(None) => return op_err(format!("no such network: {network}")),
+            Err(error) if error.is::<ManagedSshRule>() => return op_err(error.to_string()),
             Err(e) => return op_err(format!("failed to persist network config: {e}")),
         };
         // Push the change to any live listener.
@@ -804,6 +795,9 @@ impl Daemon {
         } else {
             format!("ssh deny {peer} on {network}")
         };
+        if net.managed_ssh_allow.iter().any(|rule| rule.peer == entry) {
+            detail.push_str("\n\nController policy still grants access to this peer. Local changes do not modify that policy.");
+        }
         // Mirror of the `ssh on` nudge: a rule with the server off looks like it
         // took effect, but the port still falls through to the host service (which
         // asks for a password), so the failure doesn't point back here.
@@ -839,7 +833,7 @@ impl Daemon {
                     })
                     .collect(),
             ),
-            Err(_) => (false, crate::forward::SSH_PORT, Vec::new()),
+            Err(error) => return ipc_err(format!("failed to load SSH settings: {error}")),
         };
         IpcMessage::FirewallSshState {
             enabled,
@@ -865,16 +859,15 @@ fn firewall_set_message(config: &firewall::FirewallConfig, key: FirewallKey) -> 
             if config.reject { "on" } else { "off" }
         ),
         FirewallKey::DefaultIn => format!("inbound default set to {}", config.default_inbound),
+        FirewallKey::DefaultOut => format!("outbound default set to {}", config.default_outbound),
     }
 }
 
-/// Why this node cannot run mesh SSH, or `None` when it can. Windows has no
-/// embedded server, a build without `desktop` (Android, iOS) has none either,
-/// and a rootless instance cannot bind the mesh address.
+/// Why this node cannot run mesh SSH, or `None` when it can. A build without
+/// `desktop` (Android, iOS) has no embedded server, and a rootless instance
+/// cannot bind the mesh address.
 fn mesh_ssh_unavailable(rootless: bool) -> Option<&'static str> {
-    if cfg!(windows) {
-        Some("the embedded SSH server is not available on Windows")
-    } else if !cfg!(feature = "desktop") {
+    if !cfg!(feature = "desktop") {
         Some("mesh SSH is not available on this device")
     } else if rootless {
         Some("mesh SSH is unavailable in rootless mode")
@@ -893,6 +886,35 @@ fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
     users.sort();
     users.dedup();
     users
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("This SSH access rule is managed by a controller. Change it in the controller's policy.")]
+struct ManagedSshRule;
+
+fn apply_ssh_rule(
+    net: &mut config::NetworkConfig,
+    peer: &str,
+    users: Vec<String>,
+    allow: bool,
+) -> Result<()> {
+    let local = net.ssh_allow.iter().any(|rule| rule.peer == peer);
+    if !local && net.managed_ssh_allow.iter().any(|rule| rule.peer == peer) {
+        return Err(ManagedSshRule.into());
+    }
+    if allow {
+        let users = normalize_ssh_users(users);
+        match net.ssh_allow.iter_mut().find(|rule| rule.peer == peer) {
+            Some(rule) => rule.users = users,
+            None => net.ssh_allow.push(config::SshRule {
+                peer: peer.into(),
+                users,
+            }),
+        }
+    } else {
+        net.ssh_allow.retain(|rule| rule.peer != peer);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -969,6 +991,8 @@ mod firewall_message_tests {
 
 #[cfg(test)]
 mod ssh_user_tests {
+    use std::slice;
+
     use super::*;
 
     fn v(users: &[&str]) -> Vec<String> {
@@ -1008,7 +1032,7 @@ mod ssh_user_tests {
     #[test]
     fn mesh_ssh_is_unavailable_where_no_listener_can_start() {
         assert!(mesh_ssh_unavailable(true).is_some());
-        let expected = cfg!(windows) || !cfg!(feature = "desktop");
+        let expected = !cfg!(feature = "desktop");
         assert_eq!(mesh_ssh_unavailable(false).is_some(), expected);
     }
 
@@ -1017,6 +1041,152 @@ mod ssh_user_tests {
     fn only_a_bare_asterisk_is_the_wildcard() {
         let got = normalize_ssh_users(v(&["ro*t", "alice"]));
         assert_eq!(got, v(&["alice", "ro*t"]));
+    }
+
+    #[test]
+    fn managed_only_ssh_grants_cannot_be_edited_or_revoked_locally() {
+        let mut network = config::empty_network_config("example");
+        let managed = config::SshRule {
+            peer: "example-peer".into(),
+            users: v(&["example-user"]),
+        };
+        network.managed_ssh_allow.push(managed.clone());
+        for allow in [true, false] {
+            let error = apply_ssh_rule(&mut network, "example-peer", v(&["another-user"]), allow)
+                .unwrap_err();
+            assert!(error.is::<ManagedSshRule>());
+            assert!(network.ssh_allow.is_empty());
+            assert_eq!(
+                network.managed_ssh_allow.as_slice(),
+                slice::from_ref(&managed)
+            );
+        }
+    }
+
+    #[test]
+    fn editing_or_removing_local_ssh_grants_preserves_controller_policy() {
+        let mut network = config::empty_network_config("example");
+        let managed = config::SshRule {
+            peer: "example-peer".into(),
+            users: v(&["managed-user"]),
+        };
+        network.managed_ssh_allow.push(managed.clone());
+        network.ssh_allow.push(config::SshRule {
+            peer: "example-peer".into(),
+            users: v(&["local-user"]),
+        });
+        apply_ssh_rule(&mut network, "example-peer", v(&["another-user"]), true).unwrap();
+        assert_eq!(network.ssh_allow[0].users, v(&["another-user"]));
+        apply_ssh_rule(&mut network, "example-peer", Vec::new(), false).unwrap();
+        assert!(network.ssh_allow.is_empty());
+        assert_eq!(network.managed_ssh_allow, [managed]);
+    }
+}
+
+#[cfg(all(test, windows, feature = "desktop"))]
+mod windows_ssh_config_tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::Path;
+    use std::slice;
+
+    use tokio::time::timeout;
+
+    use super::*;
+
+    struct ConfigEnvironment {
+        previous: Option<OsString>,
+    }
+
+    impl ConfigEnvironment {
+        fn set(directory: &Path) -> Self {
+            let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
+            // SAFETY: Windows environment updates are thread-safe. The shared
+            // test lock serializes config fixtures, and no daemon is running yet.
+            unsafe {
+                std::env::set_var("RAYFISH_CONFIG_DIR", directory);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ConfigEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: The daemon has shut down before this guard is released,
+            // and the shared fixture lock is still held.
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var("RAYFISH_CONFIG_DIR", previous),
+                    None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn windows_ssh_config_dispatch_enables_and_disables() -> Result<()> {
+        // The lock coordinates the temporary process-wide config override; it
+        // protects no daemon I/O and is never acquired by its background tasks.
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let directory = tempfile::tempdir()?;
+        let _environment = ConfigEnvironment::set(directory.path());
+        anyhow::ensure!(
+            config::config_dir_for_read()? == directory.path(),
+            "The daemon fixture must use its temporary config."
+        );
+        let daemon = timeout(Duration::from_secs(30), build_headless(false)).await??;
+        let result = async {
+            // Stay on standby: this tests real request dispatch and persistence
+            // without starting a host listener or changing Windows networking.
+            anyhow::ensure!(!daemon.active.load(Ordering::SeqCst), "The daemon fixture must start on standby.");
+            for (value, enabled) in [("on", true), ("on", true), ("off", false)] {
+                let response = daemon.handle_authorized_request(
+                    IpcMessage::ConfigSet { key: NodeKey::Global(GlobalKey::Ssh), value: value.into(), replace: false },
+                    None,
+                    Vec::new(),
+                ).await;
+                anyhow::ensure!(matches!(response, IpcMessage::Ok { .. }), "The Windows daemon rejected SSH {value}: {response:?}");
+                anyhow::ensure!(config::load()?.ssh_enabled == enabled, "SSH {value} did not persist its setting.");
+                let state = daemon.handle_authorized_request(IpcMessage::FirewallSshShow, None, Vec::new()).await;
+                anyhow::ensure!(matches!(state, IpcMessage::FirewallSshState { enabled: actual, .. } if actual == enabled), "SSH status does not reflect the settings request.");
+                let managed = |rules: &[firewall::FirewallRule]| rules.iter().filter(|rule| rule.origin == firewall::RuleOrigin::Ssh).count();
+                anyhow::ensure!(managed(&daemon.registry.firewall.get_config().rules) == usize::from(enabled), "SSH {value} did not update its live passthrough rule.");
+                anyhow::ensure!(managed(&firewall::load_firewall()?.rules) == usize::from(enabled), "SSH {value} did not persist its passthrough rule.");
+                anyhow::ensure!(daemon.ssh_token.lock().unwrap_or_else(|error| error.into_inner()).is_none(), "Standby SSH settings must not start a listener.");
+            }
+            let mut network = config::empty_network_config("example");
+            let managed = config::SshRule { peer: "example-peer".into(), users: vec!["example-user".into()] };
+            network.managed_ssh_allow.push(managed.clone());
+            config::save_network(&network)?;
+            for allow in [true, false] {
+                let response = daemon.handle_authorized_request(IpcMessage::FirewallSshAllow {
+                    network: network.name.clone(), peer: managed.peer.clone(), users: vec!["another-user".into()], allow,
+                }, None, Vec::new()).await;
+                anyhow::ensure!(matches!(response, IpcMessage::Error { message } if message.contains("managed by a controller")), "Managed-only SSH edits must report their owner even when the peer is offline.");
+                let saved = config::load_network(&network.name)?.context("The fixture network must remain saved.")?;
+                anyhow::ensure!(saved.ssh_allow.is_empty() && saved.managed_ssh_allow.as_slice() == slice::from_ref(&managed), "Rejected SSH edits must preserve controller policy without adding local grants.");
+            }
+            network.ssh_allow.push(config::SshRule { peer: managed.peer.clone(), users: vec!["local-user".into()] });
+            config::save_network(&network)?;
+            let response = daemon.handle_authorized_request(IpcMessage::FirewallSshAllow {
+                network: network.name.clone(), peer: managed.peer.clone(), users: Vec::new(), allow: false,
+            }, None, Vec::new()).await;
+            anyhow::ensure!(matches!(response, IpcMessage::Ok { message } if message.contains("Controller policy still grants access")), "Removing a local SSH grant must warn when controller policy still grants access.");
+            let saved = config::load_network(&network.name)?.context("The fixture network must remain saved.")?;
+            anyhow::ensure!(saved.ssh_allow.is_empty() && saved.managed_ssh_allow == [managed], "Local SSH removal must preserve controller policy.");
+            let path = directory.path().join("settings.toml");
+            let settings = fs::read(&path)?;
+            fs::write(&path, "ssh_enabled = [")?;
+            let state = daemon.handle_authorized_request(IpcMessage::FirewallSshShow, None, Vec::new()).await;
+            fs::write(&path, settings)?;
+            anyhow::ensure!(matches!(state, IpcMessage::Error { message } if message.contains("failed to load SSH settings")), "An unreadable SSH configuration must not look like disabled SSH with no grants.");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        daemon.shutdown_and_close().await;
+        result
     }
 }
 

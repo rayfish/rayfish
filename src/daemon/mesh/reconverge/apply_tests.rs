@@ -16,6 +16,12 @@ use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
 
 pub(in crate::daemon::mesh) const NETWORK: &str = "home";
 
+/// A record timestamp (microseconds) later than any record the fixture's own
+/// coordinator publishes. Its group poller raises the floor to each renewal of
+/// the current record it sees, so a hand-set floor must sit above wall-clock
+/// time to stay put while a test runs.
+const FUTURE: u64 = 1 << 62;
+
 /// A daemon that joined `NETWORK` as a member. Holds the config lock and the
 /// config directory for as long as it lives.
 pub(in crate::daemon::mesh) struct MemberFixture {
@@ -188,7 +194,7 @@ async fn applying_a_record_publishes_dns_and_routes() {
 #[allow(clippy::await_holding_lock)]
 async fn an_older_record_is_refused_on_every_path() {
     let fx = MemberFixture::start().await;
-    fx.state.write().unwrap().last_record_timestamp = Some(1_000);
+    fx.state.write().unwrap().last_record_timestamp = Some(FUTURE + 1_000);
     let before = fx.generation();
     let (_, hash) = fx
         .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
@@ -196,7 +202,7 @@ async fn an_older_record_is_refused_on_every_path() {
     let record = SignedGroupRecord {
         hash,
         seeds: Vec::new(),
-        timestamp: 500,
+        timestamp: FUTURE + 500,
     };
 
     let outcome = apply_group_record(
@@ -211,7 +217,10 @@ async fn an_older_record_is_refused_on_every_path() {
 
     assert_eq!(outcome, ReconvergeOutcome::Stale);
     assert_eq!(fx.generation(), before);
-    assert_eq!(fx.state.read().unwrap().last_record_timestamp, Some(1_000));
+    assert_eq!(
+        fx.state.read().unwrap().last_record_timestamp,
+        Some(FUTURE + 1_000)
+    );
     fx.finish().await;
 }
 
@@ -247,6 +256,133 @@ async fn a_blob_without_us_departs_instead_of_adopting() {
 
     assert_eq!(outcome, ReconvergeOutcome::Departed);
     assert_ne!(fx.state.read().unwrap().converged_hash, Some(hash));
+    fx.finish().await;
+}
+
+/// A renewal of the record we already hold fetches nothing but raises the replay
+/// floor, so an older record for a different roster is refused afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn renewing_the_current_record_raises_the_floor() {
+    let fx = MemberFixture::start().await;
+    let current = fx.generation();
+    {
+        let mut s = fx.state.write().unwrap();
+        s.converged_hash = Some(current);
+        s.last_record_timestamp = Some(FUTURE + 10);
+    }
+    let renewal = SignedGroupRecord {
+        hash: current,
+        seeds: Vec::new(),
+        timestamp: FUTURE + 50,
+    };
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &renewal,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Current);
+    assert_eq!(
+        fx.state.read().unwrap().last_record_timestamp,
+        Some(FUTURE + 50)
+    );
+
+    let (_, other) = fx
+        .blob_with(|m| m.add(laptop(SecretKey::generate().public())))
+        .await;
+    let older = SignedGroupRecord {
+        hash: other,
+        seeds: Vec::new(),
+        timestamp: FUTURE + 30,
+    };
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &older,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Stale);
+    assert_eq!(fx.generation(), current);
+    fx.finish().await;
+}
+
+/// An older signed record that drops this node changes nothing: membership and
+/// the saved network survive, whether it is refused before the fetch or after.
+/// A newer one is our removal and forgets the saved network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_older_removal_keeps_membership_and_the_saved_network() {
+    let fx = MemberFixture::start().await;
+    let me = fx.daemon.transport.endpoint.id();
+    fx.state.write().unwrap().last_record_timestamp = Some(FUTURE + 20);
+    let (blob, hash) = fx
+        .blob_with(|m| {
+            m.remove(&me);
+        })
+        .await;
+    let older = SignedGroupRecord {
+        hash,
+        seeds: Vec::new(),
+        timestamp: FUTURE + 19,
+    };
+
+    let outcome = apply_group_record(
+        &fx.daemon.transport.endpoint,
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &older,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Stale);
+    let outcome = commit_group_blob(
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &older,
+        fx.generation(),
+        blob.clone(),
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Superseded);
+    assert!(fx.state.read().unwrap().group.members.is_member(&me));
+    assert!(config::load_network(NETWORK).unwrap().is_some());
+    assert_eq!(
+        fx.state.read().unwrap().last_record_timestamp,
+        Some(FUTURE + 20)
+    );
+
+    let newer = SignedGroupRecord {
+        timestamp: FUTURE + 21,
+        ..older
+    };
+    let outcome = commit_group_blob(
+        &fx.registry(),
+        NETWORK,
+        &fx.state,
+        &None,
+        &newer,
+        fx.generation(),
+        blob,
+    )
+    .await;
+    assert_eq!(outcome, ReconvergeOutcome::Departed);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while config::load_network(NETWORK).unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the confirmed removal deletes the saved network");
     fx.finish().await;
 }
 

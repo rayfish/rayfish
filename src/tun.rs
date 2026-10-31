@@ -9,6 +9,12 @@
 mod apple;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows_firewall;
+#[cfg(target_os = "windows")]
+mod windows_routes;
+#[cfg(target_os = "windows")]
+pub(crate) use windows_firewall::ensure_echo_request_access;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{overlay_route_warnings, spawn_repair_watcher};
@@ -16,8 +22,6 @@ pub(crate) use linux::{overlay_route_warnings, spawn_repair_watcher};
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-use crate::membership::ExitFamilies;
 use std::future::Future;
 #[cfg(not(target_os = "android"))]
 use std::io::Error as IoError;
@@ -32,9 +36,8 @@ use std::net::Ipv6Addr;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
-// Windows drives the interface through PowerShell (`windows_process`), not a
-// synchronous `Command`, so nothing here needs the blocking spawn. Linux does
-// every one of these through netlink and spawns nothing at all.
+// Windows uses bounded subprocesses for interface administration and native
+// IP Helper calls for routes. Linux configures its interface through netlink.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
@@ -261,6 +264,9 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
         Ok(())
     })?;
 
+    #[cfg(target_os = "windows")]
+    let tun_name = device.name().context("read Windows TUN adapter name")?;
+    #[cfg(not(target_os = "windows"))]
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
     #[cfg(target_os = "linux")]
     tracing::info!(
@@ -522,51 +528,27 @@ fn wintun_library_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("wintun.dll"))
 }
 
-/// The overlay range, routed into the Wintun adapter. IPv6 only: the mesh
-/// carries no IPv4, and `100.64.0.0/10` belongs to whatever else shares the
-/// host. `::` is the on-link next hop, matching the interface-scoped routes the
-/// other platforms install.
+/// The IPv6 overlay routed into the Wintun adapter.
 #[cfg(target_os = "windows")]
-const WINDOWS_PEER_ROUTES: [(&str, &str); 1] = [("200::/7", "::")];
+const WINDOWS_PEER_PREFIX: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0);
+#[cfg(target_os = "windows")]
+const WINDOWS_PEER_PREFIX_LEN: u8 = 7;
 
 #[cfg(target_os = "windows")]
-fn windows_link_args(tun_name: &str, up: bool) -> [String; 5] {
-    let state = if up { "enabled" } else { "disabled" };
-    [
+fn windows_link_args(tun_name: &str, up: bool) -> Option<[String; 5]> {
+    // Disabling a live Wintun adapter terminates its session and reader. Standby
+    // keeps that session open, pins overlay traffic to the adapter, withdraws
+    // DNS, and gates forwarding instead of allowing a physical-route fallback.
+    if !up {
+        return None;
+    }
+    Some([
         "interface".to_owned(),
         "set".to_owned(),
         "interface".to_owned(),
         format!("name={tun_name}"),
-        format!("admin={state}"),
-    ]
-}
-
-#[cfg(target_os = "windows")]
-fn windows_interface_query_script(tun_name: &str) -> String {
-    let quoted = tun_name.replace('\'', "''");
-    format!(
-        "@(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty ifIndex)",
-        quoted
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn windows_remove_route_script(prefix: &str, index: u32) -> String {
-    format!(
-        "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
-        prefix, index
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> String {
-    format!(
-        "{}; New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -PolicyStore ActiveStore -ErrorAction Stop",
-        windows_remove_route_script(prefix, index),
-        prefix,
-        index,
-        next_hop
-    )
+        "admin=enabled".to_owned(),
+    ])
 }
 
 /// The overlay range, `200::/7`, as the netlink route the TUN carries.
@@ -795,11 +777,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name).await?;
-    for &(prefix, _) in &WINDOWS_PEER_ROUTES {
-        windows_powershell(&windows_remove_route_script(prefix, index)).await?;
-    }
-    Ok(())
+    windows_routes::remove(tun_name, WINDOWS_PEER_PREFIX, WINDOWS_PEER_PREFIX_LEN).await
 }
 
 #[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
@@ -809,20 +787,7 @@ pub async fn unroute_peer_range(_tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name).await?;
-    let mut installed = Vec::new();
-    for &(prefix, next_hop) in &WINDOWS_PEER_ROUTES {
-        let result =
-            windows_powershell(&windows_replace_route_script(prefix, index, next_hop)).await;
-        if let Err(error) = result {
-            for previous in installed {
-                let _ = windows_powershell(&windows_remove_route_script(previous, index)).await;
-            }
-            return Err(error);
-        }
-        installed.push(prefix);
-    }
-    Ok(())
+    windows_routes::ensure(tun_name, WINDOWS_PEER_PREFIX, WINDOWS_PEER_PREFIX_LEN).await
 }
 
 /// The full-tunnel default as two half-space routes per family: `0.0.0.0/1` +
@@ -839,24 +804,16 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
     ("-inet6", "8000::/1"),
 ];
 
-/// Routes all traffic into the TUN via the [`SPLIT_DEFAULT`] half-space routes
-/// (the exit-node client full tunnel). Delete-then-add, so it is idempotent
-/// across re-applies. The caller is responsible for loop prevention *before*
-/// this goes in: from here on, everything the routing table decides, including
-/// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
-///
-/// Only the halves of the families the tunnel actually carries go in
-/// (`ExitFamilies::tunnelled`: what this node's data plane routes, intersected
-/// with what the gateway says it can return). That is `::/1` + `8000::/1`, or
-/// nothing at all: the overlay carries no IPv4, so IPv4 egress stays with
-/// whoever owns `100.64.0.0/10` here. Unlike Linux, no hole has to be
-/// punched for that VPN's own prefixes: the split default lives in the one routing
-/// table, where its more specific routes already win.
+/// Capture both families, including any family the selected exit cannot carry.
+/// The caller installs loop prevention and direct-egress protection first.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_default_via_tun(tun_name: &str, carries: ExitFamilies) -> Result<()> {
-    for step in split_default_plan(carries, tun_name) {
-        let _ = Command::new("route").args(&step.delete).status();
-        let Some(add) = &step.add else { continue };
+pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
+    crate::exit_node::add_client_ipv4(tun_name)?;
+    for (family, net) in SPLIT_DEFAULT {
+        let _ = Command::new("route")
+            .args(split_args("delete", family, net, tun_name))
+            .status();
+        let add = split_args("add", family, net, tun_name);
         let status = Command::new("route")
             .args(add)
             .status()
@@ -870,44 +827,10 @@ pub async fn route_default_via_tun(tun_name: &str, carries: ExitFamilies) -> Res
     Ok(())
 }
 
-/// What one [`SPLIT_DEFAULT`] entry costs: always a delete, and an add only if
-/// this tunnel carries that family.
+/// The `route` arguments for one [`SPLIT_DEFAULT`] entry.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-struct SplitDefaultStep {
-    delete: Vec<String>,
-    add: Option<Vec<String>>,
-}
-
-/// The `route` invocations an install makes, as data, so the shape is pinned by a
-/// test instead of by reading the loop.
-///
-/// Every entry is deleted whatever the answer, and only the carried ones are added
-/// back. That asymmetry is the point: this is an install, and an install has to be
-/// as family-symmetric as a teardown. `carries` follows the gateway's claim, so a
-/// live tunnel can narrow (the gateway loses its IPv6 uplink and republishes a
-/// narrower claim) and the re-apply arrives with one family fewer. Skipping the
-/// dropped family entirely would leave its half-space routes pointing at a utun
-/// that is still up, so that family keeps entering a tunnel whose far end cannot
-/// return it while the daemon tells the user it is leaving directly.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn split_default_plan(carries: ExitFamilies, tun_name: &str) -> [SplitDefaultStep; 4] {
-    SPLIT_DEFAULT.map(|(family, net)| {
-        let args = |verb: &str| {
-            ["-n", verb, family, "-net", net, "-interface", tun_name]
-                .map(str::to_string)
-                .to_vec()
-        };
-        // `Unknown` is not a `tunnelled()` output; read as both families, which is
-        // what an absent claim meant before the field existed.
-        let wanted = match family {
-            "-inet" => carries.carries_v4() || carries.is_unknown(),
-            _ => carries.carries_v6() || carries.is_unknown(),
-        };
-        SplitDefaultStep {
-            delete: args("delete"),
-            add: wanted.then(|| args("add")),
-        }
-    })
+fn split_args<'a>(verb: &'a str, family: &'a str, net: &'a str, tun: &'a str) -> [&'a str; 7] {
+    ["-n", verb, family, "-net", net, "-interface", tun]
 }
 
 /// Removes the full-tunnel half-space routes. Best-effort and idempotent: routes
@@ -917,9 +840,10 @@ fn split_default_plan(carries: ExitFamilies, tun_name: &str) -> [SplitDefaultSte
 /// the other one still clears what the last left behind.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn unroute_default_via_tun(tun_name: &str) {
+    crate::exit_node::remove_client_ipv4(tun_name);
     for (family, net) in SPLIT_DEFAULT {
         let _ = Command::new("route")
-            .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
+            .args(split_args("delete", family, net, tun_name))
             .status();
     }
 }
@@ -974,9 +898,9 @@ pub async fn set_link_up(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, true).await
 }
 
-/// Bring the TUN interface administratively down (standby). The underlying file
-/// descriptor stays open, so the device can be brought back up without
-/// recreating it.
+/// Put the owned TUN on standby without closing its session. Windows keeps its
+/// adapter up and gates forwarding, because disabling Wintun ends the reader;
+/// the other desktop platforms can lower the link without losing the device.
 #[cfg(not(embedded_tun))]
 pub async fn set_link_down(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, false).await
@@ -1032,7 +956,9 @@ async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let args = windows_link_args(tun_name, up);
+        let Some(args) = windows_link_args(tun_name, up) else {
+            return Ok(());
+        };
         let output = crate::windows_process::WindowsProcessRunner::default()
             .output("netsh.exe", args)
             .await
@@ -1045,28 +971,6 @@ async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-async fn windows_powershell(script: &str) -> Result<String> {
-    crate::windows_process::WindowsProcessRunner::default()
-        .powershell(
-            &format!("$ErrorActionPreference='Stop'; {script}"),
-            "run Windows network PowerShell",
-        )
-        .await
-}
-
-#[cfg(target_os = "windows")]
-async fn windows_interface_index(tun_name: &str) -> Result<u32> {
-    let output = windows_powershell(&windows_interface_query_script(tun_name)).await?;
-    anyhow::ensure!(
-        !output.is_empty() && !output.contains('\n'),
-        "Windows TUN adapter {tun_name:?} was not uniquely found"
-    );
-    output
-        .parse()
-        .with_context(|| format!("resolve Windows interface index for {tun_name:?}"))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1291,69 +1195,23 @@ mod tests {
         assert_eq!(super::mss_for_mtu(0), 0);
     }
 
-    /// A narrowing tunnel must delete the family it stopped carrying.
-    ///
-    /// `carries` follows the gateway's claim, so it changes under a live tunnel:
-    /// the gateway republishes a claim with no IPv6 in it, and the re-apply
-    /// arrives with one family fewer. The utun is still up, so nothing reaps the
-    /// dropped family's half-space routes on their own, and that family keeps
-    /// entering a tunnel whose far end cannot return it while
-    /// `ray exit-node status` says it is leaving directly.
-    ///
-    /// `tunnelled` narrows to `V6` or `Neither`, but the plan is written against
-    /// the whole enum because the claim rides the signed roster and is decoded
-    /// as well as written.
+    /// Pin the split-default `route` arguments, which no CI host runs.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
-    fn the_split_default_plan_visits_every_family_and_adds_only_what_it_carries() {
-        use crate::membership::ExitFamilies::{Dual, Neither, Unknown, V4, V6};
-
-        let deletes = |carries| -> Vec<String> {
-            super::split_default_plan(carries, "utun9")
-                .into_iter()
-                .map(|s| s.delete.join(" "))
-                .collect()
-        };
-        let adds = |carries| -> Vec<String> {
-            super::split_default_plan(carries, "utun9")
-                .into_iter()
-                .filter_map(|s| s.add.map(|a| a.join(" ")))
-                .collect()
-        };
-
-        // Every family is deleted whatever the tunnel carries. This is the half
-        // that a narrowing tunnel depends on, and the half that reads as dead code
-        // if you only look at the family it is installing.
-        let all_four = [
-            "-n delete -inet -net 0.0.0.0/1 -interface utun9",
-            "-n delete -inet -net 128.0.0.0/1 -interface utun9",
-            "-n delete -inet6 -net ::/1 -interface utun9",
-            "-n delete -inet6 -net 8000::/1 -interface utun9",
-        ];
-        for carries in [Dual, V6, V4, Neither, Unknown] {
-            assert_eq!(deletes(carries), all_four, "{carries:?}");
-        }
-
-        // And only the carried family is added back. `V6` and `Neither` are the
-        // two a real selection produces.
+    fn split_args_name_the_half_space_on_the_tunnel() {
+        let argv: Vec<String> = super::SPLIT_DEFAULT
+            .iter()
+            .map(|(family, net)| super::split_args("add", family, net, "utun9").join(" "))
+            .collect();
         assert_eq!(
-            adds(V6),
+            argv,
             [
+                "-n add -inet -net 0.0.0.0/1 -interface utun9",
+                "-n add -inet -net 128.0.0.0/1 -interface utun9",
                 "-n add -inet6 -net ::/1 -interface utun9",
                 "-n add -inet6 -net 8000::/1 -interface utun9",
             ]
         );
-        assert!(adds(Neither).is_empty(), "nothing to carry, nothing to add");
-        assert_eq!(
-            adds(V4),
-            [
-                "-n add -inet -net 0.0.0.0/1 -interface utun9",
-                "-n add -inet -net 128.0.0.0/1 -interface utun9",
-            ]
-        );
-        assert_eq!(adds(Dual).len(), 4);
-        // An absent claim predates the field, so it is read as both families.
-        assert_eq!(adds(Unknown).len(), 4);
     }
 
     /// The Wintun adapter is configured by generated PowerShell, so the
@@ -1363,8 +1221,8 @@ mod tests {
     /// touching the machine's routing table at large.
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_link_args_cover_up_down_and_name_boundary() {
-        let up = super::windows_link_args("Rayfish Tunnel", true);
+    fn windows_link_args_enable_the_adapter_but_preserve_its_session_on_standby() {
+        let up = super::windows_link_args("Rayfish Tunnel", true).unwrap();
         assert_eq!(
             up,
             [
@@ -1376,17 +1234,17 @@ mod tests {
             ]
         );
 
-        let down = super::windows_link_args("O'Brien", false);
-        assert_eq!(down[3], "name=O'Brien");
-        assert_eq!(down[4], "admin=disabled");
+        let quoted = super::windows_link_args("O'Brien", true).unwrap();
+        assert_eq!(quoted[3], "name=O'Brien");
+        assert!(super::windows_link_args("Rayfish Tunnel", false).is_none());
     }
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_interface_query_quotes_powershell_boundaries() {
-        let script = super::windows_interface_query_script("O'Brien");
-        assert!(script.contains("Name -eq 'O''Brien'"));
-        assert!(script.contains("ExpandProperty ifIndex"));
+    #[tokio::test]
+    async fn windows_standby_does_not_require_disabling_an_adapter() {
+        super::set_link_down("nonexistent-test-adapter")
+            .await
+            .unwrap();
     }
 
     /// The overlay is IPv6-only. A `100.64.0.0/10` entry here would put a route
@@ -1394,26 +1252,9 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_peer_routes_are_the_overlay_range_only() {
-        assert_eq!(super::WINDOWS_PEER_ROUTES, [("200::/7", "::")]);
+        assert_eq!(super::WINDOWS_PEER_PREFIX.to_string(), "200::");
+        assert_eq!(super::WINDOWS_PEER_PREFIX_LEN, 7);
         assert_eq!(super::WINDOWS_TUN_NAME, "rayfish");
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_route_scripts_are_scoped_and_idempotent() {
-        let remove = super::windows_remove_route_script("200::/7", 17);
-        assert!(remove.contains("Remove-NetRoute"));
-        assert!(remove.contains("-InterfaceIndex 17"));
-        assert!(remove.contains("-ErrorAction SilentlyContinue"));
-
-        // Replace is remove-then-add, so re-running it is a no-op rather than a
-        // duplicate route.
-        let replace = super::windows_replace_route_script("200::/7", 17, "::");
-        assert!(replace.starts_with(&remove));
-        assert!(replace.contains("New-NetRoute"));
-        assert!(replace.contains("-DestinationPrefix '200::/7'"));
-        assert!(replace.contains("-NextHop '::'"));
-        assert!(replace.contains("-PolicyStore ActiveStore"));
     }
 
     /// `tun-rs` loads Wintun by path, so the wrong name here is a runtime

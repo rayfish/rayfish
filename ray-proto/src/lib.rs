@@ -5,6 +5,7 @@
 //! of truth for that protocol so frontends never hand-mirror it.
 
 pub mod firewall;
+pub mod invite;
 pub mod ipc;
 pub mod policy;
 pub mod settings;

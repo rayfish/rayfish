@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::NetworkRegistry;
 use crate::dns;
-use crate::exit_node::{ExitClient, ExitContext, is_transitable};
+use crate::exit_node::{ExitClient, ExitContext, ipv4, is_transitable};
 use crate::firewall::{self, Direction, SharedFirewall};
 use crate::membership::{derive_ipv6, is_overlay_ip};
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
@@ -156,7 +156,7 @@ impl SshNat {
 /// RFC 1624 incremental checksum update for a single changed 16-bit word:
 /// `HC' = ~(~HC + ~m + m')`. Used so a port rewrite doesn't require recomputing
 /// the whole TCP checksum.
-fn csum_replace2(check: u16, old: u16, new: u16) -> u16 {
+pub(crate) fn csum_replace2(check: u16, old: u16, new: u16) -> u16 {
     let mut sum = (!check as u32) + (!old as u32 & 0xffff) + new as u32;
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -290,10 +290,11 @@ fn evaluate_inbound(
     // IP) is dropped before the firewall or any in-daemon listener sees it, so
     // identity-from-source-IP (used by mesh SSH) stays trustworthy.
     //
-    // The mesh address is the peer's derived IPv6, so an IPv4 source is never a
-    // legitimate mesh source. It still reaches the exit-node exemption below,
-    // which is where a routable public IPv4 return packet belongs.
-    let src_ok = matches!(info.src_ip, IpAddr::V6(v6) if v6 == peer_ipv6);
+    // IPv4 clients use a local source address only for exit transit. Gateway
+    // translation assigns a lease to the authenticated peer and network.
+    let src_ok = matches!(info.src_ip, IpAddr::V6(v6) if v6 == peer_ipv6)
+        || (info.src_ip == IpAddr::V4(ipv4::CLIENT_ADDR) && is_transitable(info.dst_ip));
+    let mut returning = false;
     if !src_ok {
         // Exit-node client return traffic: replies to our internet-bound flows come
         // back from our chosen exit peer sourced from the *host we reached*, not
@@ -305,15 +306,22 @@ fn evaluate_inbound(
         // let them face the firewall like any other inbound packet.
         //
         // They are not waved through: the conntrack entry our own outbound packet
-        // created is what admits the reply. So the exit peer can deliver traffic for
-        // flows we opened, but cannot inject unsolicited packets at our local ports.
+        // created is what admits the reply, and no inbound rule can stand in for
+        // it. So the exit peer can deliver traffic for flows we opened, but cannot
+        // inject unsolicited packets at our local ports.
         // (It is on-path for our real flows and can forge within them, as any
         // gateway or ISP can; that is what TLS is for. Reaching a service we never
         // dialed is a different matter, and it can't.)
-        let dst_is_me = matches!(info.dst_ip, IpAddr::V6(v6) if v6 == exit.my_v6);
+        let dst_is_me = matches!(info.dst_ip, IpAddr::V6(v6) if v6 == exit.my_v6)
+            || (info.dst_ip == IpAddr::V4(ipv4::CLIENT_ADDR)
+                && exit
+                    .client
+                    .selection()
+                    .is_some_and(|s| s.carries.carries_v4()));
         let exit_return = exit.client.is_return_from(peer_id, peer_ipv6)
             && is_transitable(info.src_ip)
             && dst_is_me;
+        returning = exit_return;
         if !exit_return {
             // A non-overlay source is a would-be exit-node reply: log why the
             // exemption did not fire so a broken return path is diagnosable.
@@ -346,7 +354,7 @@ fn evaluate_inbound(
     // gateway host itself. `peer_id` is already the sender's user
     // identity, matching the allow-list. The normal inbound firewall is bypassed:
     // this is transit, not traffic addressed to us.
-    if !is_overlay_ip(info.dst_ip) {
+    if !returning && !is_overlay_ip(info.dst_ip) {
         let permitted = exit.server.allows(network, peer_id)
             && is_transitable(info.dst_ip)
             && !exit.server.is_on_link(info.dst_ip)
@@ -368,10 +376,14 @@ fn evaluate_inbound(
         }
         Some(f) if is_ssh_fragment(&f.info, ssh_port()) => InboundDecision::DropFragment,
         whole_or_first => {
-            if firewall
-                .evaluate_packet(Direction::In, &info, peer_id, shares_network)
-                .is_deny()
-            {
+            let admitted = if returning {
+                firewall.admits_reply(&info)
+            } else {
+                !firewall
+                    .evaluate_packet(Direction::In, &info, peer_id, shares_network)
+                    .is_deny()
+            };
+            if !admitted {
                 return InboundDecision::DropFirewall(info);
             }
             if let Some(f) = whole_or_first {
@@ -510,7 +522,9 @@ pub struct ForwardCtx {
 /// ([`dns::MAGIC_DNS_V6`]), the only address the resolver answers on and the one
 /// handed to the OS.
 pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
-    info.dst_port == 53 && info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6)
+    matches!(info.protocol, 6 | 17)
+        && info.dst_port == 53
+        && info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6)
 }
 
 /// The inputs and shared handles for one TUN forwarding loop.
@@ -520,10 +534,30 @@ pub(crate) struct MeshForwarder<R> {
     pub peers: PeerTable,
     pub firewall: SharedFirewall,
     pub token: CancellationToken,
+    pub active: Arc<AtomicBool>,
     pub stats: Arc<ForwardMetrics>,
     pub resolver: Arc<dns::resolver::Resolver>,
     pub tun_tx: mpsc::Sender<Bytes>,
     pub dialer: Option<Arc<NetworkRegistry>>,
+}
+
+struct PendingDials {
+    buffered: LazyDialBuffers,
+    in_flight: HashSet<EndpointId>,
+    completed: mpsc::Receiver<(EndpointId, bool)>,
+    notify: mpsc::Sender<(EndpointId, bool)>,
+}
+
+impl PendingDials {
+    fn new() -> Self {
+        let (notify, completed) = mpsc::channel(64);
+        Self {
+            buffered: LazyDialBuffers::default(),
+            in_flight: HashSet::new(),
+            completed,
+            notify,
+        }
+    }
 }
 
 /// Main TUN read loop. Reads outgoing packets from the TUN device and sends each
@@ -540,12 +574,17 @@ pub(crate) struct MeshForwarder<R> {
 /// dial itself runs off-loop, so a slow handshake never blocks forwarding.
 impl<R: crate::tun::TunRead> MeshForwarder<R> {
     pub(crate) async fn run(self) -> Result<()> {
+        self.run_with_pending(PendingDials::new()).await
+    }
+
+    async fn run_with_pending(self, pending: PendingDials) -> Result<()> {
         let Self {
             mut tun,
             local_ipv6,
             peers,
             firewall,
             token,
+            active,
             stats,
             resolver,
             tun_tx,
@@ -555,9 +594,12 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
         // `LazyDialBuffers` bounds retained bytes and packets both per peer and for
         // the whole daemon, so an offline route cannot make the forwarding task grow
         // without limit during a dial timeout.
-        let mut buffered = LazyDialBuffers::default();
-        let mut in_flight: HashSet<EndpointId> = HashSet::new();
-        let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
+        let PendingDials {
+            mut buffered,
+            mut in_flight,
+            completed: mut done_rx,
+            notify: done_tx,
+        } = pending;
         let dns_queries = Arc::new(Semaphore::new(DNS_QUERIES_MAX_IN_FLIGHT));
         // Client-side exit-node selection (cheap Arc-backed clone), consulted for
         // internet-bound packets. Default (no selection) when there is no registry.
@@ -566,6 +608,7 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
             .map(|r| r.exit_client.clone())
             .unwrap_or_default();
         let ctx = SendCtx {
+            active: &active,
             firewall: &firewall,
             peers: &peers,
             stats: &stats,
@@ -594,6 +637,11 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     continue;
                 }
             };
+            // Standby drains the owned TUN instead of closing its reader. A
+            // pinned or stale OS route must not bypass the data-plane gate.
+            if !active.load(Ordering::Acquire) {
+                continue;
+            }
             let n = pkt.len();
             if n == 0 {
                 continue;
@@ -642,6 +690,45 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     reg.wake_transport().await;
                 }
             }
+            // Kernel NAT returns IPv4 to a gateway-owned lease. Resolve the
+            // authenticated peer before restoring its local client address.
+            if let IpAddr::V4(dst) = info.dst_ip
+                && ipv4::is_server_addr(dst)
+            {
+                let route = dialer.as_ref().and_then(|reg| {
+                    let lease = reg.exit_server.ipv4.return_lease(dst)?;
+                    let route = peers.route_on_network(&lease.peer, &lease.network)?;
+                    let user = reg.device_user_map.resolve(&route.endpoint_id);
+                    reg.exit_server
+                        .allows(&lease.network, &user)
+                        .then_some(route)
+                });
+                let Some(route) = route else {
+                    stats.record_drop(DropReason::ExitDenied);
+                    continue;
+                };
+                if !is_transitable(info.src_ip) {
+                    stats.record_drop(DropReason::Spoof);
+                    continue;
+                }
+                let Ok(pkt) = ipv4::rewrite(pkt, dst, ipv4::CLIENT_ADDR) else {
+                    stats.record_drop(DropReason::Malformed);
+                    continue;
+                };
+                let info = firewall::PacketInfo {
+                    dst_ip: IpAddr::V4(ipv4::CLIENT_ADDR),
+                    ..info
+                };
+                let ctx = SendCtx {
+                    active: &active,
+                    firewall: &firewall,
+                    peers: &peers,
+                    stats: &stats,
+                    tun_tx: &tun_tx,
+                };
+                send_over_route(&ctx, &route, &info, pkt).await;
+                continue;
+            }
             if is_magic_dns(&info) {
                 let Ok(permit) = Arc::clone(&dns_queries).try_acquire_owned() else {
                     stats.record_drop(DropReason::DnsConcurrency);
@@ -656,6 +743,24 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                 });
                 continue; // do not fall through to peer routing
             }
+            if info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6) {
+                if let Some(reply) = dns::packet::build_echo_reply(&pkt, &info) {
+                    tokio::select! {
+                        _ = token.cancelled() => return Ok(()),
+                        result = tun_tx.send(reply) => {
+                            result.map_err(|_| anyhow::anyhow!("TUN writer stopped"))?;
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        protocol = info.protocol,
+                        dst_port = info.dst_port,
+                        icmp_type = info.icmp_type,
+                        "unsupported or invalid packet addressed to local DNS resolver"
+                    );
+                }
+                continue;
+            }
             let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
                 // No live connection to this destination (direct or via the exit peer).
                 // Dial the destination member itself for overlay traffic, or the
@@ -666,7 +771,13 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     reg.resolve_route(dst)
                 });
                 let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
-                    tracing::debug!(dst = %info.dst_ip, "no peer for dst");
+                    tracing::debug!(
+                        dst = %info.dst_ip,
+                        protocol = info.protocol,
+                        dst_port = info.dst_port,
+                        icmp_type = info.icmp_type,
+                        "no peer for dst"
+                    );
                     stats.record_drop(DropReason::NoPeer);
                     continue;
                 };
@@ -710,7 +821,11 @@ fn dial_dst(exit: &ExitClient, dst: IpAddr) -> Option<IpAddr> {
     if is_overlay_ip(dst) {
         return Some(dst);
     }
-    Some(IpAddr::V6(exit.selection()?.ipv6))
+    let selection = exit.selection()?;
+    if !selection.carries.carries(dst) {
+        return None;
+    }
+    Some(IpAddr::V6(selection.ipv6))
 }
 
 /// Resolve the live route to send an outbound packet over: the destination's own
@@ -730,6 +845,9 @@ fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Opti
     // Internet-bound: route it through the selected exit peer, pinned to the exit
     // network's handle (the network whose allow-list permits us).
     let sel = exit.selection()?;
+    if !sel.carries.carries(dst) {
+        return None;
+    }
     peers.route_on_network(&sel.ipv6, &sel.network)
 }
 
@@ -743,6 +861,11 @@ async fn flush_or_drop(
     connected: bool,
     pkts: VecDeque<Bytes>,
 ) {
+    // A completed dial may arrive after Down. Its retained packets must not
+    // bypass the standby gate merely because the control-plane dial succeeded.
+    if !ctx.active.load(Ordering::Acquire) {
+        return;
+    }
     if !connected {
         for _ in &pkts {
             ctx.stats.record_drop(DropReason::NoPeer);
@@ -804,6 +927,7 @@ enum Admission {
 /// Forwarding state for outbound admission, membership checks, counters, and
 /// injecting reject or PMTU replies into the TUN.
 pub(crate) struct SendCtx<'a> {
+    pub active: &'a Arc<AtomicBool>,
     pub firewall: &'a SharedFirewall,
     pub peers: &'a PeerTable,
     pub stats: &'a Arc<ForwardMetrics>,
@@ -821,7 +945,14 @@ async fn prepare_datagrams(
     pkt: Bytes,
     admission: Admission,
 ) -> Option<fragment::Encoded> {
+    if !ctx.active.load(Ordering::Acquire) {
+        return None;
+    }
     let n = pkt.len();
+    if info.dst_ip.is_ipv4() && route.refuses_exit_ipv4() {
+        ctx.stats.record_drop(DropReason::NoPeer);
+        return None;
+    }
     // Reachability is "we share a network", enforced by connection existence. The
     // per-host firewall is the fine-grained gate.
     if admission == Admission::Firewall
@@ -929,7 +1060,9 @@ async fn send_routed(
         return false;
     };
     if let Some(slot) = &route.scheduler {
-        let sender = slot.get_or_init(|| fq_codel::Sender::spawn(route, Arc::clone(ctx.stats)));
+        let sender = slot.get_or_init(|| {
+            fq_codel::Sender::spawn(route, Arc::clone(ctx.active), Arc::clone(ctx.stats))
+        });
         sender.enqueue(info, route.handle, encoded, n);
     } else {
         let datagrams = encoded.datagrams();
@@ -944,7 +1077,7 @@ async fn send_routed(
 /// is full; QUIC datagrams are intentionally unreliable and the forwarding path
 /// never waits for capacity.
 fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes], packets: &[(usize, usize)]) {
-    if batch.is_empty() {
+    if batch.is_empty() || !ctx.active.load(Ordering::Acquire) {
         return;
     }
     match route.conn.send_many_datagrams(batch) {
@@ -1104,6 +1237,27 @@ pub fn spawn_peer_reader(
                             }
                             continue;
                         }
+                        let datagram = if info.dst_ip.is_ipv4() && is_transitable(info.dst_ip) {
+                            if !exit.server.offers_v4() {
+                                stats.record_drop(DropReason::ExitDenied);
+                                continue;
+                            }
+                            match exit
+                                .server
+                                .ipv4
+                                .outbound(datagram, peer_ipv6, network.clone())
+                                .await
+                            {
+                                Ok(packet) => packet,
+                                Err(error) => {
+                                    tracing::debug!(%error, "IPv4 exit translation failed");
+                                    stats.record_drop(DropReason::ExitDenied);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            datagram
+                        };
                         stats.record_rx(datagram.len());
                         // SSH NAT: a packet to our configured mesh SSH port is rewritten to the
                         // SSH server's internal listen port before injection. The

@@ -106,14 +106,11 @@ impl GlobalKey {
 
 setting_keys! {
     /// Keys backed by `firewall.toml`.
-    ///
-    /// `firewall.default-out` (`default_outbound`) is deliberately absent:
-    /// no command has ever set it, so a key for it would be new user-facing
-    /// surface rather than a migration of an existing one.
     FirewallKey {
         Enabled = "firewall.enabled", "enforce the firewall at all (on|off)";
         Reject = "firewall.reject", "reply RST/unreachable instead of dropping (on|off)";
         DefaultIn = "firewall.default-in", "default action for inbound traffic (allow|deny)";
+        DefaultOut = "firewall.default-out", "default action for outbound traffic (allow|deny)";
     }
 }
 

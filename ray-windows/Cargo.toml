@@ -9,19 +9,34 @@ publish = false
 name = "rayfish-app"
 path = "src/main.rs"
 
-[target.'cfg(windows)'.dependencies]
+[dependencies]
 anyhow = "1"
+dirs = "6"
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+ray-proto = { path = "../ray-proto" }
 serde_json = "1"
-tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "time", "macros", "sync", "net", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+wgpu = { version = "27", default-features = false, features = ["dx12", "vulkan", "metal", "wgsl"] }
+
+[target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.25.1", default-features = false, features = ["muda-common-controls-v6"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_System_Services",
     "Win32_UI_WindowsAndMessaging",
 ] }
-wry = { version = "0.57", default-features = false }
 
 [build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+winit = { version = "0.30.13", default-features = false }

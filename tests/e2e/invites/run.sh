@@ -79,6 +79,20 @@ apply_invite(){
   on "$A" "ray apply /tmp/spec-$3.yaml --invite-missing" 2>&1 | strip
 }
 
+# IPC can be ready before a restarted node publishes its discovery record.
+# Re-applying reuses the queued invitation while waiting for the legacy reply.
+check_older_recipient(){
+  local alias="$1" recipient="$2" network="$3" out
+  if retry_until 60 'out="$(apply_invite "$alias" "$recipient" "$network")" && grep -q "older Rayfish that cannot receive invites; send them this code" <<<"$out"'; then
+    echo "$out" | sed 's/^/   a| /'
+    pass "coordinator told to send the code by hand"
+  else
+    echo "$out" | sed 's/^/   a| /'
+    fail "older recipient not detected"
+    return 1
+  fi
+}
+
 restart_daemon(){
   on "$1" 'systemctl restart rayfish' >/dev/null 2>&1
   retry_until 60 "daemon_ready '$1'" || fail "daemon not responding on $1 after restart"
@@ -249,10 +263,7 @@ echo "$OLD_SEEN" | grep -q "${OLD_VERSION#v}" && pass "srv-b runs $OLD_VERSION" 
 # Older releases name the device's own id `endpoint` in status JSON.
 B_OLD_ID="$(status_json "$B" | jq -r '.identity // .endpoint // empty')"
 [[ -n "$B_OLD_ID" ]] && pass "read the older node's identity" || { fail "no identity from the older node"; summary; }
-OUT="$(apply_invite dave "$B_OLD_ID" lab3)"
-echo "$OUT" | sed 's/^/   a| /'
-echo "$OUT" | grep -q 'older Rayfish that cannot receive invites; send them this code' \
-  && pass "coordinator told to send the code by hand" || fail "older recipient not detected"
+check_older_recipient dave "$B_OLD_ID" lab3 || true
 OUT="$(apply_invite dave "$B_OLD_ID" lab3)"
 echo "$OUT" | sed 's/^/   a| /'
 echo "$OUT" | grep -q 'send them this code' && ! echo "$OUT" | grep -q 'unreachable; invite .* queued' \

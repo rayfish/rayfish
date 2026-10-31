@@ -29,8 +29,8 @@
 //! So joining a public/open network never exposes a local service port to peers.
 //! `ray firewall default allow` flips inbound TCP/UDP back to permissive (the old
 //! behaviour); `ray firewall default deny` restores the secure inbound default.
-//! The outbound default is always `allow` and is not affected by
-//! `ray firewall default`.
+//! The outbound default starts at `allow` and is not affected by
+//! `ray firewall default`. Change it with `ray config set firewall.default-out`.
 //!
 //! Inbound ICMP-allow is **not** a hard-coded special case: a fresh config ships
 //! a seeded, ordinary `allow in icmp` rule (`default_icmp_rule`) that the rule
@@ -375,6 +375,24 @@ struct Flow {
     icmp_id: u16,
 }
 
+impl Flow {
+    /// The flow `info` belongs to, seen from this host in `direction`.
+    fn of(direction: Direction, info: &PacketInfo) -> Self {
+        let (local_ip, local_port, peer_ip, peer_port) = match direction {
+            Direction::Out => (info.src_ip, info.src_port, info.dst_ip, info.dst_port),
+            Direction::In => (info.dst_ip, info.dst_port, info.src_ip, info.src_port),
+        };
+        Self {
+            proto: info.protocol,
+            local_ip,
+            local_port,
+            peer_ip,
+            peer_port,
+            icmp_id: info.icmp_id,
+        }
+    }
+}
+
 /// One-sided TCP close still permits data from the other side. Once both FINs
 /// arrive, a fixed grace period admits the final ACK and retransmissions.
 #[derive(Clone, Copy)]
@@ -613,18 +631,7 @@ impl SharedFirewall {
             return Action::Allow;
         }
         let proto = info.protocol;
-        let (local_ip, local_port, peer_ip, peer_port) = match direction {
-            Direction::Out => (info.src_ip, info.src_port, info.dst_ip, info.dst_port),
-            Direction::In => (info.dst_ip, info.dst_port, info.src_ip, info.src_port),
-        };
-        let flow = Flow {
-            proto,
-            local_ip,
-            local_port,
-            peer_ip,
-            peer_port,
-            icmp_id: info.icmp_id,
-        };
+        let flow = Flow::of(direction, info);
 
         // 1. Explicit rules always win.
         if let Some((_, rule)) = Self::match_rule(
@@ -669,6 +676,15 @@ impl SharedFirewall {
                 }
             }
         }
+    }
+
+    /// Whether an inbound packet answers a flow this host opened. Exit-node
+    /// replies come from internet hosts no rule names, so they are admitted on
+    /// conntrack alone: an allow rule for the gateway peer must not let a flow
+    /// started on the gateway's side reach a local port.
+    pub fn admits_reply(&self, info: &PacketInfo) -> bool {
+        self.inner.load().disabled
+            || self.track_packet(Direction::In, &Flow::of(Direction::In, info), info)
     }
 
     /// How [`Self::evaluate_packet`] would decide `info` as a new packet, and

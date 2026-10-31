@@ -272,6 +272,7 @@ struct StatusJson<'a> {
     daemon_version: &'a str,
     networks: &'a [ipc::NetworkStatus],
     inactive_networks: &'a [ipc::InactiveNetwork],
+    pending_networks: &'a [String],
     connection_errors: &'a [ipc::ConnectionErrorInfo],
     controllers: &'a [ipc::ControllerInfo],
     traffic: StatusTraffic,
@@ -371,6 +372,14 @@ impl DisplayOut for StatusOutput<'_> {
         for net in inactive_networks {
             println!();
             print!("{}", inactive_network_block(net, with_ips));
+        }
+
+        for network in self.json.pending_networks {
+            println!(
+                "\n  {}  {}",
+                style::rose(network),
+                style::faint("awaiting approval")
+            );
         }
 
         for error in self.json.connection_errors {
@@ -504,6 +513,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
             pending_files,
             pending_connects,
             inactive_networks,
+            pending_networks,
             connection_errors,
             lan_peers,
             ..
@@ -529,6 +539,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
                     daemon_version: &daemon_version,
                     networks: &networks,
                     inactive_networks: &inactive_networks,
+                    pending_networks: &pending_networks,
                     connection_errors: &connection_errors,
                     controllers: &controllers,
                     traffic: StatusTraffic {
@@ -1336,6 +1347,43 @@ mod grouping_tests {
             serde_json::to_value(&output).unwrap(),
             serde_json::json!({ "message": "done" })
         );
+    }
+
+    #[test]
+    fn json_status_keeps_pending_joins_when_no_network_is_active() {
+        let pending = vec!["test-network".to_string()];
+        let output = StatusJson {
+            rootless: false,
+            endpoint: String::new(),
+            mdns: false,
+            lan_peers: vec![],
+            auto_update: false,
+            active: true,
+            identity: None,
+            daemon_version: "test",
+            networks: &[],
+            inactive_networks: &[],
+            pending_networks: &pending,
+            connection_errors: &[],
+            controllers: &[],
+            traffic: StatusTraffic {
+                packets_rx: 0,
+                packets_tx: 0,
+                bytes_rx: 0,
+                bytes_tx: 0,
+            },
+            pending: StatusPending {
+                files: 0,
+                connects: 0,
+            },
+            managed_machines: None,
+        };
+        let json = serde_json::to_value(output).unwrap();
+        assert_eq!(
+            json["pending_networks"],
+            serde_json::json!(["test-network"])
+        );
+        assert!(json["networks"].as_array().unwrap().is_empty());
     }
 
     fn conn() -> ipc::ConnectionInfo {

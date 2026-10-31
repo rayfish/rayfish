@@ -661,11 +661,8 @@ impl CoordinatorAcceptState {
         let direct_key = grant_direct
             .then(|| record.as_ref().map(|signed| signed.key.to_bytes()))
             .flatten();
-        let direct_record = grant_direct
-            .then(|| record.as_ref().map(|signed| signed.packet.clone()))
-            .flatten();
-        let direct_record_published =
-            grant_direct && record.as_ref().is_some_and(|signed| signed.published);
+        let direct_record = record.as_ref().map(|signed| signed.packet.clone());
+        let direct_record_published = record.as_ref().is_some_and(|signed| signed.published);
         if let Err(e) = send_welcome(
             &mut send,
             self.net_pubkey(),
@@ -1249,7 +1246,7 @@ impl CoordinatorAcceptState {
         };
         let own_id = self.registry.transport.endpoint.id();
         let signed = target.and_then(|(key, hash)| {
-            dht::encode_network_record(&key, &hash, &[own_id])
+            sign_current_network_record(&self.state, &key, hash, &[own_id])
                 .ok()
                 .map(|packet| (hash, packet))
         });
@@ -1274,10 +1271,8 @@ impl CoordinatorAcceptState {
                 "admission publication was not confirmed; retaining its durable pending generation"
             );
         }
-        let direct_record_published = grant_direct && published;
-        let direct_record = grant_direct
-            .then(|| signed.map(|(_, packet)| packet.as_bytes().to_vec()))
-            .flatten();
+        let direct_record_published = published;
+        let direct_record = signed.map(|(_, packet)| packet.as_bytes().to_vec());
         AdmissionCommit::Committed {
             direct_record,
             direct_record_published,
@@ -1537,7 +1532,7 @@ impl MemberAcceptState {
     /// here: a signature says who wrote a record, not when, so without it anyone
     /// holding the room id could hand us a record the DHT served publicly last
     /// week and roll the roster back to it.
-    async fn apply_signed_record(&self, packet_bytes: &[u8]) {
+    pub(super) async fn apply_signed_record(&self, packet_bytes: &[u8]) {
         let packet = match dht::verify_network_record(packet_bytes, self.net_pubkey) {
             Ok(p) => p,
             Err(e) => {

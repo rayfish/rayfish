@@ -58,13 +58,14 @@ pub mod app_helper;
 mod as_user;
 mod authz;
 mod host_keys;
+mod key_store;
 mod local;
 mod login;
+mod protocol;
 mod session;
 mod session_env;
 mod slots;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::os::fd::AsFd;
@@ -78,11 +79,10 @@ use iroh::EndpointId;
 use pty_process::Size;
 #[cfg(test)]
 use russh::keys::Algorithm;
+#[cfg(test)]
 use russh::keys::PrivateKey;
 use russh::server::{Auth, ChannelOpenHandle, Config, Handle, Handler, Msg, Session};
-use russh::{
-    Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Preferred, Sig, compression,
-};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Sig};
 #[cfg(test)]
 use smol_str::SmolStr;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -105,6 +105,7 @@ use authz::{UserPolicy, auth_banner, resolve_user_policy_with_hostnames};
 use host_keys::{host_key_paths, parse_hostkey_paths, parse_sftp_subsystem};
 use host_keys::{load_host_key, sftp_subsystem_command};
 use login::{LoginInfo, resolve_login};
+use protocol::server_config;
 use session::{Exit, SessionSpec, run_pipe_session, run_pty_session, signal_number};
 use session_env::env_accepted;
 #[cfg(test)]
@@ -149,35 +150,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// without this deadline a peer could answer them forever without authenticating.
 /// Generous next to a handshake that is a few round trips over a mesh link.
 const LOGIN_GRACE: Duration = Duration::from_secs(60);
-
-fn server_config(key: PrivateKey) -> Config {
-    Config {
-        keys: vec![key],
-        // Mesh identity or the local socket owner authorizes `auth_none`.
-        methods: MethodSet::from(&[MethodKind::None][..]),
-        // Quiet sessions stay open while the client answers SSH keepalives.
-        // This also refreshes the mesh firewall's idle TCP flow tracking.
-        inactivity_timeout: None,
-        keepalive_interval: Some(Duration::from_secs(15)),
-        // Russh sends three probes, then closes on the fourth tick: roughly
-        // 60 seconds since the last received SSH packet, even with output flowing.
-        keepalive_max: 3,
-        auth_rejection_time: Duration::from_secs(1),
-        // Offer "none" only. Russh's zlib is broken on the receive side: with
-        // `zlib@openssh.com` negotiated, the second SSH_MSG_CHANNEL_DATA the
-        // client sends fails to decompress and the connection dies with
-        // `SshEncoding: length invalid`. A stock OpenSSH client picks zlib
-        // whenever `Compression yes` is set in its config, so anyone with that
-        // setting gets a session that drops the moment they type a second
-        // command. Traffic on the mesh link is already small and latency-bound;
-        // compressing it buys nothing worth that.
-        preferred: Preferred {
-            compression: Cow::Borrowed(&[compression::NONE]),
-            ..Preferred::DEFAULT
-        },
-        ..Default::default()
-    }
-}
 
 /// Handle to a running SSH server so the daemon can stop it on `ray down` /
 /// `ssh off`. Dropping or cancelling the token tears down every listener.

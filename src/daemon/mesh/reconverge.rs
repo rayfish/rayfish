@@ -240,6 +240,19 @@ fn adopt_blob(state: &mut NetworkState, data: crate::membership::GroupBlob, sign
     state.converged_hash = Some(signed);
 }
 
+/// Retain the timestamp of a verified renewal only while its hash still names
+/// the live roster. Different hashes advance the floor after successful apply.
+fn observe_current_record(state: &SharedNetworkState, hash: blake3::Hash, record_ts: u64) -> bool {
+    let mut live = state.write().unwrap();
+    if live.needs_reconverge(hash) {
+        return false;
+    }
+    if record_is_newer(record_ts, live.last_record_timestamp) {
+        live.last_record_timestamp = Some(record_ts);
+    }
+    true
+}
+
 /// Our own primary nullified this device's `cert` in a verified blob: tear
 /// ourselves out on a separate task, so teardown does not wait on the caller,
 /// unless the device has paired again by the time that task runs.
@@ -352,15 +365,14 @@ pub(crate) async fn apply_group_record(
         tracing::debug!(network = %network_name, "reconverge: keeping a durably authored snapshot until its publication is confirmed");
         return ReconvergeOutcome::Superseded;
     }
-    let (needs_reconverge, floor, generation) = {
+    let (floor, generation) = {
         let s = state.read().unwrap();
-        (
-            s.needs_reconverge(record.hash),
-            s.last_record_timestamp,
-            current_group_hash(&s),
-        )
+        (s.last_record_timestamp, current_group_hash(&s))
     };
-    if !needs_reconverge {
+    // A renewal names the blob we already hold: no fetch, but its newer
+    // timestamp still raises the replay floor, so an older record for a
+    // different roster cannot roll the network back afterwards.
+    if observe_current_record(state, record.hash, record.timestamp) {
         // A prior apply may have reached live state while its config write failed.
         // Retry the durable pointer even though no blob reconvergence is needed;
         // the stored verified bytes make this safe and stale pointers stay

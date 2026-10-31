@@ -18,11 +18,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Mesh SSH no longer limits the number of session channels on one connection.
-- New installs default Magic DNS to `partial`: only `.ray` names resolve, and
-  the host's search domains are left alone. Existing installs keep their mode.
-  Run `ray config set dns on` for short names.
-- macOS: turning DNS on in the app selects `partial` rather than `on`.
 - Under `--json`, commands that print a daemon confirmation now print
   `{"message": ...}`, and `ray invite`, `ray pair` and the `ray files`
   settings commands print JSON. `ray status --json` exits non-zero with the
@@ -46,19 +41,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A member whose coordinator handshake failed partway through a restart now
   picks up roster and firewall changes as they happen, instead of waiting for
   the next poll.
-- Cached peer addresses expire after seven days, with up to eight paths per
-  peer and 64 peers in both saved hints and the running lookup. Connected paths
-  refresh hourly. Old hints without timestamps are discarded on upgrade.
-  Cache write failures do not prevent startup or restore rejected addresses.
-- Completed SSH commands release their session state and forwarded agent sockets
-  on reused connections.
-- Status no longer counts denied join requests as waiting for approval.
-- Windows: `.ray` names resolve in `partial` DNS mode.
-- With `dns off`, joining or leaving a network no longer routes `.ray` to
-  Rayfish on Linux and Windows.
-- Windows: joining or leaving a network while Rayfish is down no longer routes
-  `.ray` to a resolver that is not running.
-- Packets dropped for exceeding the TUN MTU are now counted and logged as warnings.
 - `ray create --tor` and `ray join --tor` now use Tor (after a daemon restart)
   instead of silently ignoring the flag, and fail on builds without Tor. A
   `--tor` join still waiting for approval keeps Tor across a restart, and a
@@ -138,6 +120,115 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can write to, instead of anywhere the service account can. It never follows
   a link at the file name and never overwrites an existing file. Characters
   Windows reserves in a received file name, such as `:`, become `_`.
+
+## [0.5.13] - 2026-10-31
+
+### Added
+
+- Windows: manage SSH access below Mesh SSH, with network, peer, and local
+  account choices, plus editing and removal of saved access rules.
+- Windows: a dedicated Firewall page manages mesh rules and inbound/outbound
+  defaults. Settings includes a mesh SSH toggle.
+- Windows: embedded mesh SSH supports local-account PowerShell terminals,
+  command execution, and TCP forwarding. SFTP uses the Windows OpenSSH helper
+  when installed.
+- Windows: the installer creates a desktop shortcut with the Rayfish icon.
+- The macOS menu bar can select an advertised exit node and route IPv4, IPv6,
+  and DNS through the packet tunnel, or restore a direct connection.
+
+- Desktop daemon exit nodes support IPv4 alongside IPv6, including gateways
+  with only an IPv4 internet connection.
+
+### Changed
+
+- Windows: Advanced settings use a compact disclosure row.
+- Windows: the desktop app follows the macOS app's layout, dark theme, fonts,
+  and network cards, without requiring WebView2.
+- While an exit node is selected, the LAN, Docker networks and other VPNs stay
+  reachable directly, and SSH sessions to the client's own address keep
+  working. Only new connections to the internet outside the tunnel are
+  blocked.
+
+- New installs default Magic DNS to `partial`: only `.ray` names resolve, and
+  the host's search domains are left alone. Existing installs keep their mode.
+  Run `ray config set dns on` for short names.
+- macOS: turning DNS on in the app selects `partial` rather than `on`.
+
+### Fixed
+
+- Windows: failed mesh route setup leaves the VPN on standby and reports an
+  error instead of claiming it connected. Disconnect waits for DNS cleanup.
+- Magic DNS answers valid IPv6 ping probes locally instead of trying to find
+  a network peer for its resolver address.
+- Windows: confirmation dialogs stay compact after closing a larger editor.
+- SSH settings report unreadable configuration and controller-managed access
+  instead of showing empty rules or claiming a managed grant was removed.
+- Windows: configure a host firewall rule for mesh ICMPv6 echo requests.
+- Windows: mesh SSH can be enabled through the app and CLI.
+- Coordinators synchronize newer membership before renewing published network
+  records, instead of republishing an unchanged stale roster.
+- Saved networks survive older signed roster updates, and fresh joins retain
+  their signed admission across reconnects. Pending joins retry after restart
+  and appear in CLI status while awaiting approval.
+- Windows: pending network joins show that coordinator approval is required instead
+  of claiming the PC is connected before admission.
+- Windows: Quit closes a hidden app window after the service finishes disconnecting.
+- Windows: the service reads a pipe request before checking its caller, avoiding
+  connection failures while preserving authorization checks.
+- Windows: Disconnect keeps the service and saved memberships alive instead of
+  terminating the Wintun session. Standby blocks VPN traffic in both directions.
+- Windows: the app talks directly to the service over typed IPC, starts a stopped
+  service, and shows connection errors without replacing saved networks with an
+  empty list.
+- Windows: joining closes the dialog immediately and shows a joining network
+  card. Peer rows are compact, and saved networks stay visible while reconnecting.
+- Windows: desktop and Start menu shortcuts launch the app directly without
+  running Windows Installer repair checks.
+- Windows: Disconnect and Quit interrupt a pending join or refresh instead of
+  ignoring the action while the app is busy. Tray actions also work when the
+  window is hidden.
+- Relay and peer-discovery lookups keep HTTPS DNS fallback when plain DNS is blocked.
+- After network changes, peer discovery retries DNS records that were missing
+  before a peer started, instead of caching the earlier miss.
+- Cached peer addresses expire after seven days, with up to eight paths per
+  peer and 64 peers in both saved hints and the running lookup. Connected paths
+  refresh hourly. Old hints without timestamps are discarded on upgrade.
+  Cache write failures do not prevent startup or restore rejected addresses.
+- Windows: `.ray` names resolve in `partial` DNS mode.
+- With `dns off`, joining or leaving a network no longer routes `.ray` to
+  Rayfish on Linux and Windows.
+- Windows: joining or leaving a network while Rayfish is down no longer routes
+  `.ray` to a resolver that is not running.
+- Packets dropped for exceeding the TUN MTU are now counted and logged as warnings.
+- `ray ping` records selected-path observations for each probe, reports path
+  changes and reconnects, and stops labeling all replies with the final path.
+  The display distinguishes observations from packet routes and reports unknown
+  paths rather than guessing. Local failures and unanswered probes are no longer
+  described as packet loss. Probes use the current connection and bound the
+  send/reply exchange to one second.
+
+### Security
+
+- An exit node no longer forwards unsolicited inbound connections from the
+  internet to the clients using it, and clients drop them too.
+
+### Performance
+
+- Windows: mesh route setup uses the native routing API instead of PowerShell.
+- Windows: Connect combines adapter and route setup, preserves correct routes,
+  and configures the ping firewall rule alongside route setup.
+
+## [0.5.12] - 2026-10-28
+
+### Changed
+
+- Mesh SSH no longer limits the number of session channels on one connection.
+
+### Fixed
+
+- Completed SSH commands release their session state and forwarded agent sockets
+  on reused connections.
+- Status no longer counts denied join requests as waiting for approval.
 
 ## [0.5.11] - 2026-10-27
 
@@ -605,6 +696,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Check for Updates" in the app menu to check at any time.
 
 ### Changed
+
+- Selecting an exit node captures both IP families and DNS. Unsupported families
+  and unavailable exits stay blocked until the exit is cleared. Transport traffic
+  remains outside the tunnel. Android exit routing is deferred.
 
 - `ray status` shows each network's admission mode. Member networks show
   `mode unknown` because the coordinator does not share this setting.
@@ -3125,7 +3220,9 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.11...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.13...HEAD
+[0.5.13]: https://github.com/rayfish/rayfish/compare/v0.5.12...v0.5.13
+[0.5.12]: https://github.com/rayfish/rayfish/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/rayfish/rayfish/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/rayfish/rayfish/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/rayfish/rayfish/compare/v0.5.8...v0.5.9

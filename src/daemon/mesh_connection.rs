@@ -666,6 +666,11 @@ impl MeshConnection {
             &self.conn,
             announcement.features & crate::transport::FEATURE_IDLE_CLOSE != 0,
         );
+        self.registry.peers.note_exit_ipv4_support(
+            &self.peer_id,
+            &self.conn,
+            announcement.features & crate::transport::FEATURE_EXIT_IPV4 != 0,
+        );
     }
 
     /// Whether this peer is the selected exit node.

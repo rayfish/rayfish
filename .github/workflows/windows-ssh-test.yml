@@ -1,0 +1,212 @@
+name: Windows SSH protocol tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-ssh:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-x86_64-pc-windows-msvc
+          save-if: 'false'
+
+      - name: Prepare diagnostic sanitizer
+        shell: pwsh
+        run: |
+          @'
+          function ConvertTo-SafeSshDiagnostic {
+            param([string]$Text, [string]$TestUser = '')
+            $text = [regex]::Replace($Text, '\x1B\[[0-?]*[ -/]*[@-~]', '')
+            $roots = @(
+              @{Value=$env:GITHUB_WORKSPACE; Label='<workspace>'},
+              @{Value=$env:RUNNER_TEMP; Label='<temp>'},
+              @{Value=$env:RUNNER_WORKSPACE; Label='<runner-workspace>'},
+              @{Value=$env:USERPROFILE; Label='<user-profile>'},
+              @{Value=$env:WINDIR; Label='<windows>'}
+            )
+            if ($TestUser) {
+              $roots += @{Value=(Join-Path (Split-Path $env:USERPROFILE) $TestUser); Label='<test-profile>'}
+            }
+            foreach ($root in ($roots | Sort-Object { $_.Value.Length } -Descending)) {
+              if (-not $root.Value) { continue }
+              foreach ($value in @($root.Value.Replace('\', '\\'), $root.Value, $root.Value.Replace('\', '/'))) {
+                $text = [regex]::Replace($text, [regex]::Escape($value), $root.Label, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+              }
+            }
+            foreach ($identity in @(@{Value=$env:COMPUTERNAME; Label='<host>'}, @{Value=$env:USERNAME; Label='<user>'}, @{Value=$TestUser; Label='<test-user>'})) {
+              if ($identity.Value) {
+                $text = [regex]::Replace($text, [regex]::Escape($identity.Value), $identity.Label, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+              }
+            }
+            $text = [regex]::Replace($text, '(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?', '<address>')
+            [regex]::Replace($text, '(?<!\w)(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*(?:%[\w.-]+)?(?!\w)', [Text.RegularExpressions.MatchEvaluator]{
+              param($candidate)
+              $address = $null
+              if ([Net.IPAddress]::TryParse($candidate.Value.Split('%')[0], [ref]$address)) { return '<address>' }
+              return $candidate.Value
+            }, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'safe-ssh-diagnostics.ps1')
+
+      - name: Run ordinary native SSH module tests
+        shell: pwsh
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'safe-ssh-diagnostics.ps1')
+          $log = Join-Path $env:RUNNER_TEMP 'ssh-unit-tests.txt'
+          & cargo test -q -p rayfish --lib --locked 'ssh::' 1> $log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log | ForEach-Object { ConvertTo-SafeSshDiagnostic $_ }
+          if ($code -ne 0) { throw 'The ordinary native SSH module tests failed.' }
+          & cargo test -q -p rayfish --lib --locked 'listener::' 1> $log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log | ForEach-Object { ConvertTo-SafeSshDiagnostic $_ }
+          if ($code -ne 0) { throw 'The native listener reservation test failed.' }
+          & cargo test -q -p rayfish --lib --locked 'windows_ssh_config_dispatch_enables_and_disables' -- --test-threads=1 1> $log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log | ForEach-Object { ConvertTo-SafeSshDiagnostic $_ }
+          if ($code -ne 0) { throw 'The Windows daemon SSH settings dispatch test failed.' }
+          if (-not (Select-String -LiteralPath $log -Pattern 'test result: ok\. 1 passed; 0 failed;' -Quiet)) {
+            throw 'The Windows daemon SSH settings dispatch regression did not execute.'
+          }
+
+      - name: Build native library test executable
+        shell: pwsh
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'safe-ssh-diagnostics.ps1')
+          $messages = Join-Path $env:RUNNER_TEMP 'ssh-build-messages.jsonl'
+          $diagnostics = Join-Path $env:RUNNER_TEMP 'ssh-build-diagnostics.txt'
+          & cargo test -q -p rayfish --lib --locked --no-run --message-format=json 1> $messages 2> $diagnostics
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Get-Content -LiteralPath $diagnostics | ForEach-Object { ConvertTo-SafeSshDiagnostic $_ }
+            Get-Content -LiteralPath $messages | ForEach-Object {
+              $message = $_ | ConvertFrom-Json
+              if ($message.reason -eq 'compiler-message') { ConvertTo-SafeSshDiagnostic $message.message.rendered }
+            }
+            throw 'The native SSH tests did not compile.'
+          }
+          $artifacts = @(Get-Content -LiteralPath $messages | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'rayfish' -and $_.executable })
+          if ($artifacts.Count -ne 1) { throw 'Expected one library test executable.' }
+          $artifacts[0].executable | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'ssh-test-executable.txt')
+
+      - name: Run SSH login, exec, PTY, policy, and cleanup tests as LocalSystem
+        shell: pwsh
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'safe-ssh-diagnostics.ps1')
+          $root = Join-Path $env:RUNNER_TEMP ('ssh-test-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $acl = Get-Acl -LiteralPath $root
+          $acl.SetAccessRuleProtection($true, $false)
+          foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+            $principal = [Security.Principal.SecurityIdentifier]::new($sid)
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new($principal, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            $acl.AddAccessRule($rule)
+          }
+          Set-Acl -LiteralPath $root -AclObject $acl
+          $user = 'ssh-test-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+          $task = 'rayfish-ssh-test-' + [Guid]::NewGuid().ToString('N')
+          $watcher = $null
+          $created = $false
+          try {
+            $bytes = [byte[]]::new(48)
+            [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+            $secure = ConvertTo-SecureString ([Convert]::ToBase64String($bytes) + '!aA1') -AsPlainText -Force
+            [Array]::Clear($bytes, 0, $bytes.Length)
+            try {
+              New-LocalUser -Name $user -Password $secure -PasswordNeverExpires -AccountNeverExpires -UserMayNotChangePassword | Out-Null
+              $created = $true
+            } finally { $secure.Dispose() }
+            $users = Get-LocalGroup -SID 'S-1-5-32-545'
+            Add-LocalGroupMember -Group $users -Member $user
+            $configuration = Join-Path $root 'configuration.json'
+            $result = Join-Path $root 'result.json'
+            $stdout = Join-Path $root 'stdout.txt'
+            $stderr = Join-Path $root 'stderr.txt'
+            @{
+              executable=(Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'ssh-test-executable.txt') -Raw).Trim()
+              user=$user; result=$result; stdout=$stdout; stderr=$stderr
+            } | ConvertTo-Json | Set-Content -LiteralPath $configuration
+            $runner = Join-Path $root 'run-tests.ps1'
+            @'
+          param([Parameter(Mandatory=$true)][string]$ConfigurationPath)
+          $ErrorActionPreference = 'Stop'
+          $settings = Get-Content -LiteralPath $ConfigurationPath -Raw | ConvertFrom-Json
+          $env:RAYFISH_SSH_TEST_USER = $settings.user
+          $env:RUST_BACKTRACE = '0'
+          $executable = [string]$settings.executable
+          try {
+            $catalog = @(& $executable 'ssh::' --ignored --list)
+            if ($LASTEXITCODE -ne 0) { throw 'The native SSH test catalog could not be listed.' }
+            foreach ($required in @('windows_ssh_exec_and_interactive_powershell_use_the_login_account', 'windows_ssh_interactive_powershell_uses_the_login_account', 'windows_ssh_denies_unlisted_users_and_unapproved_peers', 'windows_ssh_channel_close_kills_the_command_and_its_descendant', 'windows_ssh_direct_and_reverse_forwarding_carry_real_tcp_bytes')) {
+              if (-not ($catalog -match [regex]::Escape($required))) { throw 'An expected native SSH protocol test is missing.' }
+            }
+            $process = Start-Process -FilePath $executable -ArgumentList @('ssh::', '--ignored', '--nocapture', '--test-threads=1') -Wait -PassThru -NoNewWindow -RedirectStandardOutput $settings.stdout -RedirectStandardError $settings.stderr
+            $code = $process.ExitCode
+          } catch {
+            $_ | Out-String | Add-Content -LiteralPath $settings.stderr
+            $code = 1
+          }
+          @{code=$code} | ConvertTo-Json | Set-Content -LiteralPath ($settings.result + '.pending')
+          Move-Item -LiteralPath ($settings.result + '.pending') -Destination $settings.result -Force
+          exit $code
+          '@ | Set-Content -LiteralPath $runner
+            $action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ConfigurationPath "{1}"' -f $runner, $configuration)
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 8)
+            Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings | Out-Null
+            $watcher = [IO.FileSystemWatcher]::new($root, 'result.json')
+            $watcher.EnableRaisingEvents = $true
+            $deadline = [DateTime]::UtcNow.AddMinutes(6)
+            Start-ScheduledTask -TaskName $task
+            while (-not (Test-Path -LiteralPath $result)) {
+              if ([DateTime]::UtcNow -ge $deadline) { throw 'The SYSTEM SSH test task exceeded its deadline.' }
+              $null = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, 1000)
+            }
+            foreach ($file in @($stdout, $stderr)) {
+              if (Test-Path -LiteralPath $file) {
+                Get-Content -LiteralPath $file | ForEach-Object { ConvertTo-SafeSshDiagnostic -Text $_ -TestUser $user }
+              }
+            }
+            $completion = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+            if ($completion.code -ne 0) { throw 'The native Windows SSH protocol tests failed.' }
+          } catch {
+            Write-Host (ConvertTo-SafeSshDiagnostic -Text ($_ | Out-String) -TestUser $user)
+            throw 'Windows SSH integration verification failed.'
+          } finally {
+            if ($watcher) { $watcher.Dispose() }
+            $cleanupFailed = $false
+            try {
+              if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) {
+                Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName $task -Confirm:$false
+              }
+            } catch {
+              Write-Host (ConvertTo-SafeSshDiagnostic -Text ($_ | Out-String) -TestUser $user)
+              $cleanupFailed = $true
+            }
+            try {
+              if ($created) { Remove-LocalUser -Name $user }
+            } catch {
+              Write-Host (ConvertTo-SafeSshDiagnostic -Text ($_ | Out-String) -TestUser $user)
+              $cleanupFailed = $true
+            }
+            try {
+              Remove-Item -LiteralPath $root -Recurse -Force
+            } catch {
+              Write-Host (ConvertTo-SafeSshDiagnostic -Text ($_ | Out-String) -TestUser $user)
+              $cleanupFailed = $true
+            }
+            if ($cleanupFailed) { throw 'Windows SSH fixture cleanup failed.' }
+          }

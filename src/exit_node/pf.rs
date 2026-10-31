@@ -49,22 +49,44 @@ pub(super) const ANCHOR_REF: &str = if cfg!(target_os = "macos") {
 ///
 /// As on Linux, this does not open the forward path: a host whose pf ruleset blocks
 /// forwarding has to be told to permit it on its own terms.
+///
+/// IPv4 transit needs an IPv4 uplink (`v4_uplink`) and the lease pool routed to
+/// the TUN; a route that overlaps the pool leaves it off and IPv6 working. Without
+/// both, IPv4 forwarding keeps its original value, as on Linux. Returns whether
+/// IPv4 transit is on.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(super) fn enable(_tun_name: &str) -> Result<()> {
+pub(super) fn enable(tun_name: &str, v4_uplink: bool) -> Result<bool> {
     let path = snapshot_path().context("no config dir to snapshot the forwarding sysctls into")?;
     let mut snap = if path.exists() {
         Snapshot::load(&path)
     } else {
         let snap = Snapshot {
-            v4: read_sysctl(V4_FORWARD),
+            v4: String::new(),
             v6: read_sysctl(V6_FORWARD),
             pf_token: None,
+            tun_name: Some(tun_name.to_owned()),
             extra: Vec::new(),
         };
         snap.save(&path)?;
         snap
     };
-    // IPv6 alone; see the Linux twin for why `ip_forward` is left where it was.
+    let v4_pool = v4_uplink
+        && match ensure_ipv4_space(tun_name) {
+            Ok(()) => {
+                bsd_route_pool(tun_name, true)?;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%error, "IPv4 exit transit disabled");
+                false
+            }
+        };
+    if !v4_pool {
+        let _ = bsd_route_pool(tun_name, false);
+    }
+    // A re-apply after the pool lost its route or the uplink went away puts
+    // back whatever this host had before we first turned it on.
+    snap.set_v4_forwarding(&path, v4_pool)?;
     write_sysctl(V6_FORWARD, "1")?;
 
     // Enable pf before loading the anchor (an unloaded ruleset has no anchors to
@@ -90,31 +112,22 @@ pub(super) fn enable(_tun_name: &str) -> Result<()> {
     ensure_anchor_referenced()?;
 
     let v6 = default_interface("-inet6");
-    pf_load_anchor(ANCHOR, &nat_rules(v6.as_deref()))?;
-    tracing::info!(v6 = ?v6, "exit node forwarding + NAT enabled");
-    Ok(())
+    pf_load_anchor(
+        ANCHOR,
+        &gateway_rules(
+            tun_name,
+            default_interface("-inet").as_deref(),
+            v6.as_deref(),
+        ),
+    )?;
+    tracing::info!(v6 = ?v6, v4_pool, "exit node forwarding + NAT enabled");
+    Ok(v4_pool)
 }
 
-/// The pf ruleset masquerading overlay traffic out the given IPv6 uplink, or an
-/// empty ruleset when there is none.
-///
-/// NAT is scoped to the interface the IPv6 default route leaves by, and rewrites to
-/// that interface's *current* address: the parentheses tell pf to re-resolve it, so
-/// a DHCP renewal doesn't strand the rule on a stale IP.
-///
-/// There is no IPv4 half. `nat on <uplink> inet` matches on the *uplink*, not our
-/// TUN, so with no mesh IPv4 left the only traffic such a rule could still catch is
-/// a co-resident VPN's: it would be us claiming `100.64.0.0/10`, which is the one
-/// thing the overlay promises not to do.
-///
-/// Empty rather than `None` on a host with no IPv6 uplink: that host has nothing to
-/// masquerade, but it is not an error, and refusing here would clear the offer and
-/// leave clients reading "does not advertise an exit node" instead of the reason
-/// [`ExitFamilies::Neither`] gives them. Loading an empty anchor flushes it.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(super) fn nat_rules(v6: Option<&str>) -> String {
-    match v6 {
-        Some(iface) => format!("nat on {iface} inet6 from {V6_OVERLAY} to any -> ({iface})\n"),
+/// NAT for one family, using the current address of its physical uplink.
+fn nat_rules(uplink: Option<&str>, af: &str, prefix: &str) -> String {
+    match uplink {
+        Some(iface) => format!("nat on {iface} {af} from {prefix} to any -> ({iface})\n"),
         None => String::new(),
     }
 }
@@ -132,6 +145,9 @@ pub fn disable() {
         return;
     }
     let snap = Snapshot::load(&path);
+    if let Some(tun) = &snap.tun_name {
+        let _ = bsd_route_pool(tun, false);
+    }
     let _ = pfctl(&["-a", ANCHOR, "-F", "all"]);
     if let Some(token) = &snap.pf_token {
         pf_release(token);
@@ -264,18 +280,46 @@ pub(super) const PF_CONF: &str = "/etc/pf.conf";
 /// or `None` if there is no default route for it.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(super) fn default_interface(family: &str) -> Option<String> {
-    let out = Command::new("route")
-        .args(["-n", "get", family, "default"])
+    physical_default_route(family).map(|route| route.interface)
+}
+
+pub(super) struct PhysicalDefaultRoute {
+    pub gateway: String,
+    pub interface: String,
+}
+
+/// Read the default entry itself. `route get default` can select our 0/1 route
+/// once the tunnel is active and would mistake the TUN for the physical uplink.
+pub(super) fn physical_default_route(family: &str) -> Option<PhysicalDefaultRoute> {
+    let family = if family == "-inet6" { "inet6" } else { "inet" };
+    let output = Command::new("netstat")
+        .args(["-rn", "-f", family])
         .output()
         .ok()?;
-    if !out.status.success() {
+    if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("interface:"))
-        .map(|i| i.trim().to_string())
-        .filter(|i| !i.is_empty())
+    let table = String::from_utf8_lossy(&output.stdout);
+    let index = table.lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        (fields.first() == Some(&"Destination"))
+            .then(|| fields.iter().position(|f| *f == "Netif"))
+            .flatten()
+    })?;
+    table.lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.first() != Some(&"default") {
+            return None;
+        }
+        let interface = *fields.get(index)?;
+        if is_tunnel_iface(interface) {
+            return None;
+        }
+        Some(PhysicalDefaultRoute {
+            gateway: fields.get(1)?.to_string(),
+            interface: interface.to_owned(),
+        })
+    })
 }
 
 /// Run `pfctl` and return its combined output (it reports most of what we ask for on
@@ -324,4 +368,102 @@ pub(super) fn write_sysctl(name: &str, value: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The gateway's NAT, and a filter that admits traffic to the lease pool and
+/// the overlay only as replies. The pool route makes every lease reachable from
+/// the uplink's segment; pf passes packets that match a NAT state before reading the block,
+/// so only a flow someone else starts towards a client is refused.
+pub(super) fn gateway_rules(tun: &str, v4: Option<&str>, v6: Option<&str>) -> String {
+    let mut rules = nat_rules(v4, "inet", ipv4::SERVER_PREFIX);
+    rules.push_str(&nat_rules(v6, "inet6", V6_OVERLAY));
+    for (af, prefix) in [("inet", ipv4::SERVER_PREFIX), ("inet6", V6_OVERLAY)] {
+        rules.push_str(&format!(
+            "block drop in quick on ! {tun} {af} to {prefix}\n"
+        ));
+    }
+    rules
+}
+
+fn bsd_route_pool(tun: &str, add: bool) -> Result<()> {
+    let _ = Command::new("route")
+        .args([
+            "-n",
+            "delete",
+            "-inet",
+            "-net",
+            ipv4::SERVER_PREFIX,
+            "-interface",
+            tun,
+        ])
+        .output();
+    if add {
+        bsd_command(
+            "route",
+            &[
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                ipv4::SERVER_PREFIX,
+                "-interface",
+                tun,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn bsd_command(program: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(program).args(args).output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{program} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+fn ensure_ipv4_space(tun: &str) -> Result<()> {
+    let output = Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()?;
+    anyhow::ensure!(output.status.success(), "cannot read IPv4 routes");
+    let routes = String::from_utf8_lossy(&output.stdout);
+    if let Some(line) = ipv4::conflicting_route(&routes, 1, |fields| fields.contains(&tun)) {
+        anyhow::bail!("IPv4 exit address space overlaps an existing route: {line}");
+    }
+    Ok(())
+}
+
+/// Give the TUN the client IPv4 address. Idempotent.
+pub fn add_client_ipv4(tun: &str) -> Result<()> {
+    let addr = ipv4::CLIENT_ADDR.to_string();
+    let existing = Command::new("ifconfig").args([tun, "inet"]).output()?;
+    if existing.status.success()
+        && String::from_utf8_lossy(&existing.stdout)
+            .split_whitespace()
+            .any(|word| word == addr)
+    {
+        return Ok(());
+    }
+    bsd_command(
+        "ifconfig",
+        &[
+            tun,
+            "inet",
+            &addr,
+            &addr,
+            "netmask",
+            "255.255.255.255",
+            "alias",
+        ],
+    )
+}
+
+/// Remove the client IPv4 address. Best-effort: it may already be gone.
+pub fn remove_client_ipv4(tun: &str) {
+    let _ = Command::new("ifconfig")
+        .args([tun, "inet", &ipv4::CLIENT_ADDR.to_string(), "-alias"])
+        .output();
 }

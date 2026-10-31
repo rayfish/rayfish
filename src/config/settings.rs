@@ -264,11 +264,6 @@ fn on_off(v: bool) -> String {
 /// FirewallConfig`: the caller is responsible for hot-swapping the live
 /// `ArcSwap` the data path reads from and persisting to disk (see
 /// `Daemon::edit_firewall`), neither of which happens here.
-///
-/// `firewall.default-out` (`default_outbound`) is deliberately not a key: there
-/// is no existing setter for it anywhere (`ray firewall default` only ever
-/// touches the inbound default), so adding one would be new user-facing surface
-/// rather than a migration of an existing one.
 pub fn apply_firewall(cfg: &mut FirewallConfig, key: FirewallKey, value: &str) -> Result<()> {
     match key {
         // The field is stored inverted: `disabled: true` means the firewall is
@@ -276,6 +271,7 @@ pub fn apply_firewall(cfg: &mut FirewallConfig, key: FirewallKey, value: &str) -
         FirewallKey::Enabled => cfg.disabled = !parse_bool(value, true)?,
         FirewallKey::Reject => cfg.reject = parse_bool(value, false)?,
         FirewallKey::DefaultIn => cfg.default_inbound = parse_action(value, Action::Deny)?,
+        FirewallKey::DefaultOut => cfg.default_outbound = parse_action(value, Action::Allow)?,
     }
     Ok(())
 }
@@ -285,6 +281,7 @@ pub fn render_firewall(cfg: &FirewallConfig, key: FirewallKey) -> String {
         FirewallKey::Enabled => on_off(!cfg.disabled),
         FirewallKey::Reject => on_off(cfg.reject),
         FirewallKey::DefaultIn => cfg.default_inbound.to_string(),
+        FirewallKey::DefaultOut => cfg.default_outbound.to_string(),
     }
 }
 
@@ -508,12 +505,23 @@ mod tests {
         assert_eq!(cfg.ssh_port, 22);
     }
 
-    /// No existing setter touches the outbound default; a key for it would be
-    /// new user-facing surface, not a migration of an existing one (same rule as
-    /// `hostname-default`).
     #[test]
-    fn firewall_default_out_is_deliberately_not_a_key() {
-        assert!("firewall.default-out".parse::<NodeKey>().is_err());
+    fn firewall_outbound_default_changes_independently_and_resets_to_allow() {
+        assert_eq!(
+            "firewall.default-out".parse::<NodeKey>().unwrap(),
+            NodeKey::Firewall(FirewallKey::DefaultOut)
+        );
+        let mut cfg = FirewallConfig::default();
+        apply_firewall(&mut cfg, FirewallKey::DefaultOut, "deny").unwrap();
+        assert_eq!(render_firewall(&cfg, FirewallKey::DefaultOut), "deny");
+        assert_eq!(cfg.default_inbound, Action::Deny);
+        assert!(apply_firewall(&mut cfg, FirewallKey::DefaultOut, "invalid").is_err());
+        assert_eq!(cfg.default_outbound, Action::Deny);
+        apply_firewall(&mut cfg, FirewallKey::DefaultIn, "allow").unwrap();
+        assert_eq!(cfg.default_outbound, Action::Deny);
+        apply_firewall(&mut cfg, FirewallKey::DefaultOut, "").unwrap();
+        assert_eq!(cfg.default_outbound, Action::Allow);
+        assert_eq!(cfg.default_inbound, Action::Allow);
     }
 
     #[test]

@@ -158,7 +158,16 @@ fn apply_finalized_join_config(
         net.last_group_hash = Some(current_hash);
         net.last_group_hash_published = published;
     } else {
-        apply_join_record_pointer(net, net_pubkey, initial_group_hash);
+        let admitted_hash = if direct_exact_hash.is_some() {
+            converged_hash.context("member join has no exact signed admission hash")?
+        } else {
+            initial_group_hash
+        };
+        apply_join_record_pointer(net, net_pubkey, admitted_hash);
+        if direct_exact_hash.is_some() {
+            net.last_group_hash_published = direct_hash_published
+                .context("member join has no signed admission publication provenance")?;
+        }
     }
     Ok(())
 }
@@ -1878,6 +1887,28 @@ mod tests {
         assert_eq!(net.last_group_hash, Some(signed_hash));
         assert!(net.last_group_hash_published);
         assert_ne!(net.last_group_hash, Some(local_partial_hash));
+    }
+
+    #[test]
+    fn ordinary_join_persists_its_exact_admission_without_coordinator_authority() {
+        let network_key = id(1);
+        let before_admission = blake3::hash(b"discovery roster");
+        let admitted = blake3::hash(b"signed admitted roster");
+        let mut net = config::empty_network_config("joined");
+        apply_finalized_join_config(
+            &mut net,
+            network_key,
+            before_admission,
+            None,
+            Some(admitted),
+            Some(admitted),
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(net.last_group_hash, Some(admitted));
+        assert_eq!(net.network_public_key, Some(network_key));
+        assert!(net.network_secret_key.is_none());
+        assert!(net.last_group_hash_published);
     }
 
     #[test]

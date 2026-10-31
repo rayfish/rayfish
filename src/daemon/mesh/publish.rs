@@ -3,6 +3,7 @@
 //! Also holds the thin `Daemon` direct-connection (`ray connect`) handlers that
 //! delegate to `ConnectService`.
 
+use iroh::address_lookup::pkarr::PkarrError;
 use iroh_dns::pkarr::SignedPacket;
 
 use super::super::*;
@@ -10,6 +11,103 @@ use super::super::*;
 /// Renew records with enough margin for scheduler/network delay that a healthy
 /// coordinator never lets its five-minute pkarr lease expire.
 const RECORD_REPUBLISH_INTERVAL: Duration = Duration::from_secs((dht::RECORD_TTL / 2) as u64);
+
+/// Sign a record for the current snapshot while the caller holds
+/// `snapshot_commit`, refusing a snapshot a reconverge has since replaced.
+///
+/// The replay floor is not raised here but by [`publish_signed_record`], once
+/// the relay has taken the record and under the same lock that clears the
+/// authored marker. Raising it at signing would, when the publish then fails,
+/// refuse another coordinator's newer record the relay still holds, and the
+/// retry would publish over that edit.
+pub(crate) fn sign_current_network_record(
+    state: &SharedNetworkState,
+    key: &SecretKey,
+    hash: blake3::Hash,
+    seeds: &[EndpointId],
+) -> Result<SignedPacket> {
+    anyhow::ensure!(
+        !state.read().unwrap().needs_reconverge(hash),
+        "cannot sign a group snapshot that is no longer current"
+    );
+    dht::encode_network_record(key, &hash, seeds)
+}
+
+fn has_authored_snapshot(state: &SharedNetworkState, network: &str) -> bool {
+    let durability_pending = state.read().unwrap().unconfirmed_durable_hash.is_some();
+    durability_pending || pending_authored_group_hash(state, network).is_some()
+}
+
+/// A clean publisher learns the canonical roster before renewing its lease, so
+/// a renewal cannot republish over an edit another coordinator made since this
+/// node's group poller last looked. Unpublished local mutations keep their
+/// publication priority. `Ok(false)` defers the renewal.
+///
+/// The record goes through [`apply_group_record`], the same routine as the
+/// poller, so the floor, the authored-snapshot guard and our own removal are
+/// handled once.
+async fn synchronize_before_renewal(
+    state: &SharedNetworkState,
+    registry: &Arc<NetworkRegistry>,
+    network: &str,
+    network_key: EndpointId,
+) -> Result<bool> {
+    if has_authored_snapshot(state, network) {
+        return Ok(true);
+    }
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(15),
+        registry.transport.pkarr.resolve(network_key),
+    )
+    .await
+    .context("timed out checking the canonical network record")
+    .and_then(|result| result.map_err(anyhow::Error::new));
+    let packet = match resolved {
+        Ok(packet) => packet,
+        Err(_) if has_authored_snapshot(state, network) => return Ok(true),
+        Err(error) => {
+            if error.chain().any(|cause| {
+                matches!(cause.downcast_ref::<PkarrError>(),
+                    Some(PkarrError::HttpRequest { status, .. }) if status.as_u16() == 404)
+            }) {
+                // A genesis record or expired lease has no canonical successor.
+                return Ok(true);
+            }
+            return Err(error.context("could not check the canonical network record"));
+        }
+    };
+    if dht::destruction::is_destroyed(&packet) {
+        registry.schedule_destruction(network, packet);
+        return Ok(false);
+    }
+    let (hash, seeds) = dht::decode_network_record(&packet)?;
+    if has_authored_snapshot(state, network) {
+        return Ok(true);
+    }
+    let record = SignedGroupRecord {
+        hash,
+        seeds,
+        timestamp: packet.timestamp().as_micros(),
+    };
+    let device_cert = crate::identity::load_device_cert().ok().flatten();
+    let outcome = apply_group_record(
+        &registry.transport.endpoint,
+        registry,
+        network,
+        state,
+        &device_cert,
+        &record,
+    )
+    .await;
+    Ok(match outcome {
+        // Adopted the canonical roster, already held it, or it is older than
+        // what this node last published: renew.
+        ReconvergeOutcome::Applied | ReconvergeOutcome::Current | ReconvergeOutcome::Stale => true,
+        // A local edit landed meanwhile and now has priority.
+        ReconvergeOutcome::Superseded => has_authored_snapshot(state, network),
+        ReconvergeOutcome::Unfetched | ReconvergeOutcome::Departed => false,
+    })
+}
 
 /// Re-import verified bytes to mint the permanent tag that protects membership
 /// snapshots from blob GC. Remote fetches populate the store without a tag.
@@ -237,6 +335,24 @@ pub(crate) fn spawn_network_publisher(
                     registry.schedule_destruction(&network_name, packet);
                     break;
                 }
+                match synchronize_before_renewal(
+                    &state,
+                    &registry,
+                    &network_name,
+                    net_secret_key.public(),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    outcome => {
+                        if let Err(error) = outcome {
+                            tracing::warn!(%error, "deferring network record renewal");
+                        }
+                        retry = target
+                            .map(|hash| (hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        continue;
+                    }
+                }
                 // Decide and sign under the commit lock, publish after releasing
                 // it. The relay round trip can take seconds, and admissions and
                 // reconverges on this network queue on the same lock. Signing
@@ -271,7 +387,12 @@ pub(crate) fn spawn_network_publisher(
                         seed_peers.push(endpoint_id);
                         seed_peers.sort();
                         seed_peers.dedup();
-                        match dht::encode_network_record(&net_secret_key, &hash, &seed_peers) {
+                        match sign_current_network_record(
+                            &state,
+                            &net_secret_key,
+                            hash,
+                            &seed_peers,
+                        ) {
                             Ok(packet) => prepared = Some((hash, packet, seed_peers.len())),
                             Err(e) => {
                                 tracing::warn!(error = %e, "failed to build network record");
@@ -703,6 +824,10 @@ impl Daemon {
         self.connect.deliver_invite(network, recipient).await
     }
 }
+
+#[cfg(test)]
+#[path = "publish_renewal_tests.rs"]
+mod renewal_tests;
 
 #[cfg(test)]
 mod tests {

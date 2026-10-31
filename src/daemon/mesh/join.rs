@@ -21,7 +21,7 @@ pub(crate) enum JoinResult {
     /// Admitted (open network, valid invite, or pre-approved): live network state.
     Joined {
         state: SharedNetworkState,
-        /// Exact signed hash bound to a direct admission's coordinator key.
+        /// Exact signed admission hash, including ordinary member admissions.
         direct_exact_hash: Option<blake3::Hash>,
         /// Publication provenance for that exact signed hash.
         direct_hash_published: Option<bool>,
@@ -38,44 +38,46 @@ pub(crate) enum TryJoin {
     Pending,
 }
 
-struct DirectAdmissionRecord {
+struct AdmissionRecord {
     hash: blake3::Hash,
     seeds: Vec<EndpointId>,
     timestamp: u64,
     published: bool,
 }
 
-/// A verified direct-network (`ray connect`) co-coordinator grant: the network
-/// secret key together with the exact signed admission record it is bound to.
-/// A Welcome carries both or neither, so they travel as one value.
-struct DirectAdmission {
-    key: [u8; 32],
-    record: DirectAdmissionRecord,
+/// An exact signed admission, optionally granting the network key to a direct
+/// co-coordinator. A signed record alone never grants coordinator authority.
+struct Admission {
+    key: Option<[u8; 32]>,
+    record: AdmissionRecord,
 }
 
-fn verify_direct_admission(
+fn verify_admission(
     direct_key: Option<[u8; 32]>,
     direct_record: Option<Vec<u8>>,
     direct_record_published: bool,
     net_pubkey: EndpointId,
-) -> Result<Option<DirectAdmission>> {
-    let Some(key) = direct_key else {
+) -> Result<Option<Admission>> {
+    if let Some(key) = direct_key {
+        anyhow::ensure!(
+            admin_grant_key_valid(key, net_pubkey),
+            "direct-network key in Welcome does not match network public key"
+        );
+    }
+    let Some(bytes) = direct_record else {
+        anyhow::ensure!(
+            direct_key.is_none(),
+            "direct-network Welcome omitted its signed admission record"
+        );
         return Ok(None);
     };
-    anyhow::ensure!(
-        admin_grant_key_valid(key, net_pubkey),
-        "direct-network key in Welcome does not match network public key"
-    );
-    let Some(bytes) = direct_record else {
-        anyhow::bail!("direct-network Welcome omitted its signed admission record")
-    };
     let packet = dht::verify_network_record(&bytes, net_pubkey)
-        .context("verify direct-network admission record")?;
+        .context("verify network admission record")?;
     let (hash, seeds) =
-        dht::decode_network_record(&packet).context("decode direct-network admission record")?;
-    Ok(Some(DirectAdmission {
-        key,
-        record: DirectAdmissionRecord {
+        dht::decode_network_record(&packet).context("decode network admission record")?;
+    Ok(Some(Admission {
+        key: direct_key,
+        record: AdmissionRecord {
             hash,
             seeds,
             timestamp: packet.timestamp().as_micros(),
@@ -92,12 +94,9 @@ enum HandshakeOutcome {
         /// but every signed field travels together so a later promotion cannot
         /// publish a lossy projection.
         blob: Box<crate::membership::GroupBlob>,
-        /// The per-network secret key and its exact signed admission record,
-        /// present only when we were admitted onto a `direct` (`ray connect`)
-        /// network as a co-coordinator. The key is already verified against the
-        /// network pubkey (`admin_grant_key_valid`); adopting it makes this node
-        /// a key-holder so `finalize_join` registers it as a coordinator.
-        direct: Option<DirectAdmission>,
+        /// The signed admission record, optionally including the verified
+        /// network key when this admission grants coordinator authority.
+        direct: Option<Admission>,
         /// Author timestamp of the signed record this roster came from, when it
         /// came from one. Seeds `NetworkState::last_record_timestamp` so the
         /// replay floor is set from the first roster the node adopts rather than
@@ -202,37 +201,36 @@ pub(crate) async fn join_mesh_shared(
         HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
     };
 
-    // A direct join adopts coordinator authority. Welcome binds the key to the
-    // exact network-key-signed admission record, so fetch that generation rather
-    // than racing a second DHT resolve that could return either its predecessor
-    // or a later publication.
+    // Fetch the exact signed admission rather than racing a fresh DHT resolve
+    // that could return its pre-admission predecessor. Only a validated key
+    // grant makes this node a coordinator.
     let direct_key = direct
         .as_ref()
-        .map(|admission| SecretKey::from(admission.key));
-    let (exact_group_hash, exact_hash_published) =
-        if let Some(DirectAdmission { record, .. }) = direct {
-            let data = fetch_verified_blob(
-                ep,
-                &registry.transport.blob_store,
-                &registry.peers,
-                record.hash,
-                network_name,
-                &record.seeds,
-            )
-            .await
-            .context("fetch admitted direct-network roster")?;
-            anyhow::ensure!(
-                data.members
-                    .iter()
-                    .any(|member| member.identity == my_identity && member.is_coordinator),
-                "signed direct-network roster does not contain this node's coordinator admission"
-            );
-            admitted_blob = data;
-            record_ts = Some(record.timestamp);
-            (Some(record.hash), Some(record.published))
-        } else {
-            (None, None)
-        };
+        .and_then(|admission| admission.key.map(SecretKey::from));
+    let (exact_group_hash, exact_hash_published) = if let Some(Admission { record, .. }) = direct {
+        let data = fetch_verified_blob(
+            ep,
+            &registry.transport.blob_store,
+            &registry.peers,
+            record.hash,
+            network_name,
+            &record.seeds,
+        )
+        .await
+        .context("fetch signed admission roster")?;
+        anyhow::ensure!(
+            data.members
+                .iter()
+                .any(|member| member.identity == my_identity
+                    && (direct_key.is_none() || member.is_coordinator)),
+            "signed network roster does not contain this node's admission"
+        );
+        admitted_blob = data;
+        record_ts = Some(record.timestamp);
+        (Some(record.hash), Some(record.published))
+    } else {
+        (None, None)
+    };
     persist_join_config(
         network_name,
         &admitted_blob.members,
@@ -624,7 +622,7 @@ async fn perform_join_handshake(
                 direct_record_published,
             } => {
                 tracing::info!(network = %network_name, "welcomed to network");
-                let direct = verify_direct_admission(
+                let direct = verify_admission(
                     direct_key,
                     direct_record,
                     direct_record_published,
@@ -636,8 +634,8 @@ async fn perform_join_handshake(
                 Ok(HandshakeOutcome::Admitted {
                     blob: Box::new(blob),
                     direct,
-                    // A fresh join takes its roster from the coordinator's
-                    // Welcome, not from a record, so there is no floor to set.
+                    // The signed admission seeds its floor after blob fetch.
+                    // Legacy Welcome messages have no signed replay boundary.
                     record_ts: None,
                 })
             }
@@ -686,7 +684,7 @@ async fn perform_join_handshake(
                 direct_record,
                 direct_record_published,
             } => {
-                let direct = verify_direct_admission(
+                let direct = verify_admission(
                     direct_key,
                     direct_record,
                     direct_record_published,
@@ -709,6 +707,16 @@ async fn perform_join_handshake(
             ),
             _ => anyhow::bail!("unexpected reconnect hello reply"),
         };
+        anyhow::ensure!(
+            direct
+                .as_ref()
+                .is_some_and(|admission| admission.key.is_some())
+                || !fallback_blob
+                    .members
+                    .iter()
+                    .any(|member| member.identity == my_identity && member.is_coordinator),
+            "coordinator authority is temporarily unavailable; retrying exact key grant"
+        );
         if direct.is_some() {
             let mut blob = fallback_blob.clone();
             blob.members = welcome_members;
@@ -719,13 +727,6 @@ async fn perform_join_handshake(
                 record_ts: None,
             });
         }
-        anyhow::ensure!(
-            !fallback_blob
-                .members
-                .iter()
-                .any(|member| member.identity == my_identity && member.is_coordinator),
-            "coordinator authority is temporarily unavailable; retrying exact key grant"
-        );
         tracing::info!(network = %network_name, "reconnected; reconverging roster from signed record");
         // Seed the replay floor from the record this roster came out of. If a
         // second resolve/fetch fails, retain the complete blob already verified
@@ -825,6 +826,240 @@ mod mesh_hello_reply_tests {
     use super::*;
     use iroh::RelayMode;
     use iroh::endpoint::{SendStream, presets};
+    use iroh_dns::pkarr::SignedPacket;
+
+    use crate::daemon::mesh::destruction::tests::ConfigDir;
+
+    fn record_at(packet: &SignedPacket, key: &SecretKey, timestamp: u64) -> SignedPacket {
+        let dns = &packet.as_bytes()[104..];
+        let mut signable = format!("3:seqi{timestamp}e1:v{}:", dns.len()).into_bytes();
+        signable.extend_from_slice(dns);
+        let mut bytes = key.public().as_bytes().to_vec();
+        bytes.extend_from_slice(&key.sign(&signable).to_bytes());
+        bytes.extend_from_slice(&timestamp.to_be_bytes());
+        bytes.extend_from_slice(dns);
+        SignedPacket::from_bytes(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn signed_member_welcome_protects_the_first_roster_poll() {
+        signed_member_welcome_preserves_membership(true).await;
+    }
+
+    #[tokio::test]
+    async fn signed_reconnect_welcome_protects_the_restored_roster() {
+        signed_member_welcome_preserves_membership(false).await;
+    }
+
+    #[allow(clippy::await_holding_lock)] // serializes the process-wide config override
+    async fn signed_member_welcome_preserves_membership(initial: bool) {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let _env = ConfigDir::set(directory.path());
+        let daemon = build_headless(false).await.unwrap();
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![transport::mesh_alpn()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let provider = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        daemon
+            .transport
+            .warm_lookup
+            .add_endpoint_info(provider.addr());
+        let provider_id = provider.id();
+        let router = iroh::protocol::Router::builder(provider)
+            .accept(
+                iroh_blobs::protocol::ALPN,
+                BlobsProtocol::new(&daemon.transport.blob_store, None),
+            )
+            .spawn();
+        let key = SecretKey::generate();
+        let me = daemon.transport.endpoint.id();
+        let coordinator = Member {
+            identity: server.id(),
+            is_coordinator: true,
+            hostname: Some("coordinator".into()),
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        };
+        let fallback = crate::membership::GroupBlob {
+            members: MemberList::from(vec![coordinator.clone()]),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some("test-network".into()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        };
+        let mut admitted = fallback.clone();
+        admitted.members.add(Member {
+            identity: me,
+            is_coordinator: false,
+            hostname: Some("workstation".into()),
+            ..coordinator
+        });
+        let bytes = crate::membership::canonical_group_bytes(&admitted);
+        daemon
+            .transport
+            .blob_store
+            .blobs()
+            .add_slice(&bytes)
+            .await
+            .unwrap();
+        let admitted_hash = blake3::hash(&bytes);
+        let packet = record_at(
+            &dht::encode_network_record(&key, &admitted_hash, &[provider_id]).unwrap(),
+            &key,
+            100,
+        );
+        let admitted_timestamp = packet.timestamp().as_micros();
+        let network_key = key.public();
+        if !initial {
+            config::save_network(&config::NetworkConfig {
+                network_public_key: Some(network_key),
+                ..config::empty_network_config("test-network")
+            })
+            .unwrap();
+        }
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let request = control::recv_msg(&mut recv).await.unwrap();
+                assert!(if initial {
+                    matches!(request, ControlMsg::JoinRequest { .. })
+                } else {
+                    matches!(request, ControlMsg::MeshHello { .. })
+                });
+                control::send_msg(
+                    &mut send,
+                    Some(network_key),
+                    &ControlMsg::Welcome {
+                        members: admitted.members,
+                        approved: ApprovedList::new(),
+                        direct_key: None,
+                        direct_record: Some(packet.as_bytes().to_vec()),
+                        direct_record_published: true,
+                    },
+                )
+                .await
+                .unwrap();
+                conn
+            }
+        });
+        let outgoing = daemon
+            .transport
+            .endpoint
+            .connect(server.addr(), &transport::mesh_alpn())
+            .await
+            .unwrap();
+        let token = daemon.registry.shutdown_token.child_token();
+        let result = join_mesh_shared(
+            outgoing,
+            &daemon.transport.endpoint,
+            "test-network",
+            Arc::clone(&daemon.registry),
+            JoinParams {
+                my_hostname: Some("workstation".into()),
+                net_pubkey: network_key,
+                device_cert: None,
+                invite_secret: None,
+                group_blob: fallback.clone(),
+                auto_accept_firewall: false,
+                auto_accept_files: false,
+                initial,
+                dial_claim: None,
+            },
+            token.clone(),
+            Arc::new(AsyncMutex::new(())),
+            Arc::clone(&daemon.protocol_router),
+        )
+        .await
+        .unwrap();
+        let _coordinator_connection = accepting.await.unwrap();
+        let JoinResult::Joined {
+            state,
+            direct_exact_hash,
+            ..
+        } = result
+        else {
+            panic!("expected admitted membership")
+        };
+        assert_eq!(direct_exact_hash, Some(admitted_hash));
+        assert_eq!(
+            state.read().unwrap().last_record_timestamp,
+            Some(admitted_timestamp)
+        );
+        assert!(state.read().unwrap().network_secret_key.is_none());
+        assert!(state.read().unwrap().group.members.is_member(&me));
+        let old_bytes = crate::membership::canonical_group_bytes(&fallback);
+        daemon
+            .transport
+            .blob_store
+            .blobs()
+            .add_slice(&old_bytes)
+            .await
+            .unwrap();
+        assert_eq!(
+            apply_group_record(
+                &daemon.transport.endpoint,
+                &daemon.registry,
+                "test-network",
+                &state,
+                &None,
+                &SignedGroupRecord {
+                    hash: blake3::hash(&old_bytes),
+                    seeds: vec![provider_id],
+                    timestamp: admitted_timestamp.checked_sub(1).unwrap(),
+                },
+            )
+            .await,
+            ReconvergeOutcome::Stale
+        );
+        assert!(state.read().unwrap().group.members.is_member(&me));
+        assert!(config::load_network("test-network").unwrap().is_some());
+
+        let handler = MemberAcceptState {
+            network_name: "test-network".into(),
+            state: Arc::clone(&state),
+            net_pubkey: network_key,
+            my_identity: me,
+            endpoint: daemon.transport.endpoint.clone(),
+            registry: Arc::clone(&daemon.registry),
+            invite_lock: Arc::new(AsyncMutex::new(())),
+            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        let renewed = record_at(
+            &dht::encode_network_record(&key, &admitted_hash, &[provider_id]).unwrap(),
+            &key,
+            300,
+        );
+        handler.apply_signed_record(renewed.as_bytes()).await;
+        let replay = record_at(
+            &dht::encode_network_record(&key, &blake3::hash(&old_bytes), &[provider_id]).unwrap(),
+            &key,
+            200,
+        );
+        handler.apply_signed_record(replay.as_bytes()).await;
+        assert_eq!(state.read().unwrap().last_record_timestamp, Some(300));
+        assert!(state.read().unwrap().group.members.is_member(&me));
+        assert!(config::load_network("test-network").unwrap().is_some());
+        token.cancel();
+        router.shutdown().await.unwrap();
+        server.close().await;
+        daemon.shutdown_and_close().await;
+    }
 
     async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
         let alpn = transport::mesh_alpn();
@@ -1026,14 +1261,14 @@ mod persist_config_tests {
             .as_bytes()
             .to_vec();
 
-        let DirectAdmission {
+        let Admission {
             key: granted,
             record,
-        } = verify_direct_admission(Some(key.to_bytes()), Some(packet), true, key.public())
+        } = verify_admission(Some(key.to_bytes()), Some(packet), true, key.public())
             .unwrap()
             .expect("a key with its record is a direct admission");
 
-        assert_eq!(granted, key.to_bytes());
+        assert_eq!(granted, Some(key.to_bytes()));
         assert_eq!(record.hash, hash);
         assert_eq!(record.seeds, vec![id(3)]);
         assert!(record.published);
@@ -1042,7 +1277,28 @@ mod persist_config_tests {
     #[test]
     fn direct_grant_without_a_signed_record_is_rejected() {
         let key = SecretKey::generate();
-        assert!(verify_direct_admission(Some(key.to_bytes()), None, false, key.public()).is_err());
+        assert!(verify_admission(Some(key.to_bytes()), None, false, key.public()).is_err());
+    }
+
+    #[test]
+    fn legacy_welcome_without_a_record_still_has_no_coordinator_grant() {
+        let key = SecretKey::generate();
+        assert!(
+            verify_admission(None, None, false, key.public())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_admission_rejects_a_record_signed_by_another_network() {
+        let key = SecretKey::generate();
+        let foreign_key = SecretKey::generate();
+        let record =
+            dht::encode_network_record(&foreign_key, &blake3::hash(b"roster"), &[]).unwrap();
+        assert!(
+            verify_admission(None, Some(record.as_bytes().to_vec()), true, key.public()).is_err()
+        );
     }
 
     /// Regression: a member daemon reconnecting must not erase the node-local

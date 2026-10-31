@@ -1,6 +1,8 @@
 use std::env;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/rayfish.ico");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -31,6 +33,7 @@ fn main() {
 "#;
 
     let mut resource = winresource::WindowsResource::new();
+    resource.set_icon("assets/rayfish.ico");
     resource.set_manifest(manifest);
     if let Err(error) = resource.compile() {
         panic!("failed to compile Windows app resources: {error}");

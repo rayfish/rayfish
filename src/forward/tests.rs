@@ -2,6 +2,7 @@ use super::*;
 use crate::AsyncMutex;
 use crate::config::QuicEngine;
 use crate::firewall::Action;
+use crate::membership::ExitFamilies;
 use iroh::SecretKey;
 use smol_str::SmolStr;
 use std::sync::Mutex;
@@ -29,6 +30,7 @@ async fn self_packets_return_to_tun_without_ssh_translation_or_a_peer() {
     let token = CancellationToken::new();
     let forwarder = MeshForwarder {
         tun: Reader(reader),
+        active: Arc::new(AtomicBool::new(true)),
         local_ipv6,
         peers: PeerTable::default(),
         firewall: SharedFirewall::new(firewall::FirewallConfig::default()),
@@ -178,6 +180,7 @@ async fn v5_connection_sends_only_whole_packets() {
     let fw = inbound_fw(Action::Allow, vec![]);
     let stats = Arc::new(ForwardMetrics::default());
     let ctx = SendCtx {
+        active: &Arc::new(AtomicBool::new(true)),
         firewall: &fw,
         peers: &peers,
         stats: &stats,
@@ -293,6 +296,7 @@ async fn check_fragmented_tcp(packet_len: usize, cc: QuicEngine) {
         ..Default::default()
     });
     let ctx = SendCtx {
+        active: &Arc::new(AtomicBool::new(true)),
         firewall: &sender_fw,
         peers: &sender_peers,
         stats: &send_stats,
@@ -1014,15 +1018,75 @@ fn csum_replace2_round_trips() {
     assert_eq!(csum_replace2(csum_replace2(c, 22, 41384), 41384, 22), c);
 }
 
-/// The overlay routes no IPv4, and there is no longer a rule that names it:
-/// `DropIpv4Disabled` went with the setting, having been unreachable twice
-/// over. What must not go with it is the outcome. An IPv4 destination makes
-/// the whole packet IPv4, so its source is IPv4 too, and a mesh source is
-/// always the peer's derived IPv6: anti-spoofing takes it and neither the
-/// exit-return exemption nor the transit branch below can hand it back, the
-/// first because `dst_is_me` compares an IPv6, the second because it is never
-/// reached. Accepting one would half-work, which is the failure the deleted
-/// rule existed to prevent.
+/// IPv4 transit still requires a canonical source and an exit grant.
+#[test]
+fn ipv4_transit_requires_canonical_source_and_network_permission() {
+    let peer = iroh::SecretKey::generate().public();
+    let fw = inbound_fw(Action::Deny, vec![]);
+    let exit = no_exit();
+    let packet = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
+    assert!(matches!(
+        evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
+        InboundDecision::DropExit
+    ));
+    exit.server.reload([("example", &[peer.to_string()][..])]);
+    assert!(matches!(
+        evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
+        InboundDecision::Accept(_)
+    ));
+    assert!(matches!(
+        evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "other"),
+        InboundDecision::DropExit
+    ));
+    for destination in [
+        [127, 0, 0, 1],
+        [10, 0, 0, 1],
+        [169, 254, 169, 254],
+        [192, 0, 0, 2],
+        [198, 19, 0, 1],
+    ] {
+        let packet = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), destination, 443);
+        assert!(!matches!(
+            evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
+            InboundDecision::Accept(_)
+        ));
+    }
+    let spoof = make_tcp_packet_v4([192, 0, 0, 3], [8, 8, 8, 8], 443);
+    assert!(matches!(
+        evaluate_inbound(&spoof, &fw, &exit, &peer, TEST_V6, "example"),
+        InboundDecision::DropSpoof
+    ));
+}
+
+#[test]
+fn ipv4_return_traffic_requires_selected_gateway_and_open_flow() {
+    let peer = iroh::SecretKey::generate().public();
+    let other = iroh::SecretKey::generate().public();
+    let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+    let exit = exit_via(peer);
+    let mut reply = make_tcp_packet_v4([8, 8, 8, 8], ipv4::CLIENT_ADDR.octets(), 50000);
+    reply[20..22].copy_from_slice(&443u16.to_be_bytes());
+    assert!(matches!(
+        evaluate_inbound(&reply, &fw, &exit, &peer, TEST_V6, "test-net"),
+        InboundDecision::DropFirewall(_)
+    ));
+    let mut request = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
+    request[20..22].copy_from_slice(&50000u16.to_be_bytes());
+    let info = firewall::parse_packet_info(&request).unwrap();
+    assert!(
+        fw.evaluate_packet(Direction::Out, &info, &peer, |name| name == "test-net")
+            .is_allow()
+    );
+    assert!(matches!(
+        evaluate_inbound(&reply, &fw, &exit, &peer, TEST_V6, "test-net"),
+        InboundDecision::Accept(_)
+    ));
+    assert!(matches!(
+        evaluate_inbound(&reply, &fw, &exit, &other, OTHER_V6, "test-net"),
+        InboundDecision::DropSpoof
+    ));
+}
+
 #[test]
 fn inbound_mesh_ipv4_is_never_accepted() {
     let peer = iroh::SecretKey::generate().public();
@@ -1279,7 +1343,7 @@ fn make_return_packet(dst: Ipv6Addr) -> Vec<u8> {
 fn exit_via(peer: EndpointId) -> ExitContext {
     let exit = no_exit();
     exit.client.set(Some(crate::exit_node::ExitSelection {
-        carries: crate::membership::ExitFamilies::Dual,
+        carries: ExitFamilies::Dual,
         peer_user: peer,
         ipv6: TEST_V6,
         network: SmolStr::new("test-net"),
@@ -1354,6 +1418,42 @@ fn exit_peer_cannot_inject_unsolicited_traffic() {
 }
 
 #[test]
+fn an_inbound_allow_does_not_admit_unsolicited_exit_traffic() {
+    // An allow-inbound default (or a rule such as mesh SSH's) speaks for mesh
+    // peers. A flow started from the gateway's side of the exit must still
+    // answer one of ours, or anyone routing to the gateway reaches our ports.
+    let peer = iroh::SecretKey::generate().public();
+    let fw = SharedFirewall::new(firewall::FirewallConfig {
+        default_inbound: firewall::Action::Allow,
+        ..Default::default()
+    });
+    let exit = exit_via(peer);
+    assert!(matches!(
+        evaluate_inbound(
+            &make_return_packet(MY_V6),
+            &fw,
+            &exit,
+            &peer,
+            TEST_V6,
+            "test-net"
+        ),
+        InboundDecision::DropFirewall(_)
+    ));
+    open_flow_to_internet(&fw, &peer);
+    assert!(matches!(
+        evaluate_inbound(
+            &make_return_packet(MY_V6),
+            &fw,
+            &exit,
+            &peer,
+            TEST_V6,
+            "test-net"
+        ),
+        InboundDecision::Accept(_)
+    ));
+}
+
+#[test]
 fn exit_return_traffic_not_addressed_to_us_is_spoof() {
     // The relaxation only applies to packets addressed to our own mesh IP; a
     // public-sourced packet to some other overlay IP still fails anti-spoof.
@@ -1410,7 +1510,7 @@ fn exit_return_traffic_accepted_by_ip_when_identity_differs() {
     let fw = SharedFirewall::new(firewall::FirewallConfig::default());
     let exit = no_exit();
     exit.client.set(Some(crate::exit_node::ExitSelection {
-        carries: crate::membership::ExitFamilies::Dual,
+        carries: ExitFamilies::Dual,
         peer_user: selected_user,
         ipv6: TEST_V6, // the exit peer's mesh IPv6
         network: SmolStr::new("test-net"),
