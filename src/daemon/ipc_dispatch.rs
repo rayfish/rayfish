@@ -7,6 +7,10 @@ use super::*;
 pub(crate) const ROOT_ONLY_DOWNLOAD_SETTING: &str = "permission denied: download-dir and download-user decide where the daemon \
      writes received files, so only root may set them (re-run with sudo)";
 
+/// A path send makes the daemon open the path with its own privileges.
+pub(crate) const ROOT_ONLY_PATH_SEND: &str = "permission denied: sending a file by path requires root; \
+     update the ray CLI, which sends an open file instead";
+
 impl Daemon {
     pub(crate) fn is_open_read(req: &IpcMessage) -> bool {
         matches!(
@@ -69,11 +73,7 @@ impl Daemon {
         // root, who could read it anyway, may use it; everyone else passes an
         // open descriptor (`SendFileFd`) or the bytes (`SendFileBegin`).
         if matches!(req, IpcMessage::SendFile { .. }) {
-            return Some(ipc_err(
-                "permission denied: sending a file by path requires root; \
-                 update the ray CLI, which sends an open file instead"
-                    .to_string(),
-            ));
+            return Some(ipc_err(ROOT_ONLY_PATH_SEND));
         }
 
         // Granting operator access is reserved for root.

@@ -921,6 +921,12 @@ enum IpcHost {
 #[cfg(unix)]
 impl IpcHost {
     fn check_authorized(self, req: &IpcMessage, peer: Option<&PeerIdentity>) -> Option<IpcMessage> {
+        // Only the Windows pipe handler builds these, after staging the bytes
+        // itself. From a client, `SendFileStaged` is a path send that skips the
+        // root-only rule below.
+        if is_internal_file_frame(req) {
+            return Some(ipc_err(INTERNAL_FILE_FRAME));
+        }
         #[cfg(all(target_os = "linux", feature = "desktop"))]
         if let Self::Rootless { owner_uid } = self {
             return authorize_rootless(owner_uid, peer);
@@ -941,6 +947,10 @@ impl IpcHost {
         });
         if uid == Some(0) {
             return None;
+        }
+        // The extension reads as root, so a path send stays root's here too.
+        if matches!(req, IpcMessage::SendFile { .. }) {
+            return Some(ipc_err(crate::daemon::ipc_dispatch::ROOT_ONLY_PATH_SEND));
         }
         // The extension writes as root, so the same settings stay root's here.
         if Daemon::is_root_only_setting(req) {
@@ -1243,6 +1253,34 @@ mod embedded_ipc_tests {
             host.check_authorized(&IpcMessage::SetOperator { uid: 502 }, Some(&root))
                 .is_some()
         );
+    }
+
+    /// `SendFileStaged` names a path just like `SendFile`, so a client must not
+    /// reach it on any host, and a path send stays root's on every host.
+    #[test]
+    fn path_sends_are_root_only_on_every_unix_host() {
+        let staged = IpcMessage::SendFileStaged {
+            path: "/etc/shadow".into(),
+            filename: "x".into(),
+            peer: "peer".into(),
+        };
+        let by_path = IpcMessage::SendFile {
+            path: "/etc/shadow".into(),
+            peer: "peer".into(),
+        };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        let owner = PeerIdentity::Unix { uid: 501, gid: 20 };
+        let mut hosts = vec![IpcHost::Daemon, IpcHost::PacketTunnel { owner_uid: 501 }];
+        #[cfg(all(target_os = "linux", feature = "desktop"))]
+        hosts.push(IpcHost::Rootless { owner_uid: 501 });
+        for host in hosts {
+            for caller in [&root, &owner] {
+                assert!(host.check_authorized(&staged, Some(caller)).is_some());
+            }
+        }
+        let tunnel = IpcHost::PacketTunnel { owner_uid: 501 };
+        assert!(tunnel.check_authorized(&by_path, Some(&owner)).is_some());
+        assert!(tunnel.check_authorized(&by_path, Some(&root)).is_none());
     }
 
     #[tokio::test]
@@ -1640,7 +1678,9 @@ fn is_ipc_upload_temp_name(name: &str) -> bool {
     name.starts_with(IPC_UPLOAD_PREFIX) && name.ends_with(IPC_UPLOAD_SUFFIX)
 }
 
-#[cfg(windows)]
+const INTERNAL_FILE_FRAME: &str =
+    "internal file-transfer frame is not accepted at the IPC boundary";
+
 fn is_internal_file_frame(message: &IpcMessage) -> bool {
     matches!(
         message,
@@ -1783,8 +1823,7 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
         ipc::send(
             &mut framed,
             IpcMessage::Error {
-                message: "internal file-transfer frame is not accepted at the IPC boundary"
-                    .to_owned(),
+                message: INTERNAL_FILE_FRAME.to_owned(),
             },
         )
         .await?;
