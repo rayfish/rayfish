@@ -2113,6 +2113,87 @@ async fn reconnect_registration_survives_a_stopped_welcome_reply() {
     }
 }
 
+/// A plain member takes a seated peer's name only from the signed record. A
+/// `MeshHello` claiming another name must leave the roster and Magic DNS on
+/// the signed one, or any member could pick the name others resolve it by.
+#[tokio::test]
+async fn member_ignores_hostname_claim_in_mesh_hello() {
+    let alpn = transport::mesh_alpn();
+    let server = Endpoint::builder(iroh::endpoint::presets::N0)
+        .alpns(vec![alpn.clone()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let client = Endpoint::builder(iroh::endpoint::presets::N0)
+        .alpns(vec![alpn.clone()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let (outgoing, incoming) = tokio::join!(client.connect(server.addr(), &alpn), async {
+        server.accept().await.unwrap().await.unwrap()
+    });
+    let outgoing = outgoing.unwrap();
+    let handler = sample_member_handler().await;
+    let (state, registry) = handler_parts(&handler);
+    let ip = derive_ipv6(&client.id());
+    let mut member = seated(client.id());
+    member.hostname = Some("signed-name".to_string());
+    state.write().unwrap().group.members.add(member);
+    dns::update_hostname(
+        &registry.dns.hostname_table,
+        &registry.dns.reverse_table,
+        "test-net",
+        "signed-name",
+        ip,
+    )
+    .await;
+
+    let net_key = SecretKey::from_bytes(&[1u8; 32]).public();
+    let (mut send, _recv) = outgoing.open_bi().await.unwrap();
+    control::send_msg(
+        &mut send,
+        Some(net_key),
+        &ControlMsg::MeshHello {
+            identity: client.id(),
+            hostname: Some("claimed-name".to_string()),
+            device_cert: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (reply, mut request) = incoming.accept_bi().await.unwrap();
+    let control::FrameRead::Frame(frame) = control::recv_frame(&mut request).await.unwrap() else {
+        panic!("expected MeshHello");
+    };
+    let registered = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.handle_frame(&incoming, reply, client.id(), frame.msg),
+    )
+    .await
+    .expect("the hello is handled");
+
+    assert_eq!(registered, Some(ip), "a seated member is still registered");
+    assert_eq!(
+        state
+            .read()
+            .unwrap()
+            .group
+            .members
+            .get(&client.id())
+            .and_then(|m| m.hostname.clone())
+            .as_deref(),
+        Some("signed-name"),
+    );
+    let table = registry.dns.hostname_table.read().await;
+    assert_eq!(table["test-net"].get("signed-name"), Some(&ip));
+    assert_eq!(table["test-net"].get("claimed-name"), None);
+    drop(table);
+    client.close().await;
+    server.close().await;
+}
+
 #[tokio::test]
 async fn register_replaces_member_handler_with_coordinator() {
     // AcceptHandler exposes whether it is the coordinator variant.

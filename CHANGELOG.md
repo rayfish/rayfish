@@ -114,6 +114,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Received files only go into a directory the accepting user owns, never
   through a link, and never over an existing file (the new one is saved as
   `name (1).ext`). Only root can set `download-dir` and `download-user`.
+- A member no longer takes another member's name from that member's own
+  claim. Names in the roster and Magic DNS come only from what the coordinator
+  signed, so a peer cannot make others resolve it under a name it chose.
+  Renames still show up once the coordinator accepts them.
 
 ## [0.5.11] - 2026-10-27
 

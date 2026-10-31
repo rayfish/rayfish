@@ -1584,8 +1584,9 @@ impl MemberAcceptState {
     }
 
     /// Another member (or an approved-but-not-yet-member peer) announced itself
-    /// over a connection to us. Verify identity, refresh DNS, and either promote an
-    /// approved peer to a member (replying `Welcome`) or register a known member.
+    /// over a connection to us. Verify identity, then either promote an approved
+    /// peer to a member (replying `Welcome`) or register a known member's
+    /// connection.
     #[allow(clippy::too_many_arguments)]
     async fn handle_mesh_hello(
         &self,
@@ -1645,40 +1646,23 @@ impl MemberAcceptState {
                 s.group.approved.is_approved(&peer_identity),
             )
         };
-        let final_hostname = if let Some(desired) = valid_claim(peer_identity, hostname) {
-            let taken = self.state.read().unwrap().taken_hostnames(peer_identity);
-            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-            Some(crate::hostname::resolve_collision(&desired, &taken_refs))
-        } else {
-            None
-        };
-
         if is_approved {
+            let final_hostname = valid_claim(peer_identity, hostname).map(|desired| {
+                let taken = self.state.read().unwrap().taken_hostnames(peer_identity);
+                let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+                crate::hostname::resolve_collision(&desired, &taken_refs)
+            });
             return self
                 .admit_approved_member(conn, send, peer_identity, final_hostname, device_cert)
                 .await;
         }
+        // A seated member's hostname claim is ignored here. Its name in our
+        // roster and Magic DNS comes only from the network-key-signed record; a
+        // rename reaches us when a coordinator signs it and we reconverge.
         if is_member {
-            let member_ip = derive_ipv6(&peer_identity);
-            if let Some(h) = &final_hostname {
-                {
-                    let mut s = self.state.write().unwrap();
-                    if let Some(m) = s.group.members.get_mut(&peer_identity) {
-                        m.hostname = Some(h.clone());
-                    }
-                }
-                dns::update_hostname(
-                    &self.registry.dns.hostname_table,
-                    &self.registry.dns.reverse_table,
-                    &self.network_name,
-                    h,
-                    derive_ipv6(&peer_identity),
-                )
-                .await;
-            }
             self.registry
                 .register_peer_conn(conn, peer_identity, &self.network_name);
-            return Some(member_ip);
+            return Some(derive_ipv6(&peer_identity));
         }
         let mut send = send;
         if let Err(error) = send_welcome(
