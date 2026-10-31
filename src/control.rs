@@ -12,7 +12,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::invite::InviteCode;
-use crate::membership::{ApprovedEntry, ExitFamilies, Member};
+use crate::membership::{ApprovedList, ExitFamilies, MemberList};
 use ray_proto::ipc::NetworkName;
 
 /// Certificate proving a device belongs to a user identity.
@@ -221,7 +221,7 @@ pub enum ControlMsg {
         reason: String,
     },
     JoinApproved {
-        members: Vec<Member>,
+        members: MemberList,
     },
     JoinDenied {
         reason: String,
@@ -256,8 +256,8 @@ pub enum ControlMsg {
         device_cert: Option<DeviceCert>,
     },
     Welcome {
-        members: Vec<Member>,
-        approved: Vec<ApprovedEntry>,
+        members: MemberList,
+        approved: ApprovedList,
         /// The per-network secret key, present only when the coordinator admits a
         /// pre-approved peer onto a `direct` (`ray connect`) 2-peer network. A
         /// direct link is symmetric, so the requester is made a co-coordinator on
@@ -696,6 +696,7 @@ pub fn decode_pairing_ticket(s: &str) -> Result<(EndpointId, [u8; 32])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::membership::Member;
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -715,7 +716,8 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-            }],
+            }]
+            .into(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -1039,13 +1041,15 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-            }],
+            }]
+            .into(),
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-            }],
+            }]
+            .into(),
             direct_key: Some([7u8; 32]),
             direct_record: Some(vec![1, 2, 3]),
             direct_record_published: true,

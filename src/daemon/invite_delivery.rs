@@ -215,7 +215,7 @@ impl ConnectService {
             handle.state.read().is_ok_and(|state| {
                 state
                     .members
-                    .all()
+                    .iter()
                     .any(|member| member.matches_identity(recipient))
             })
         })

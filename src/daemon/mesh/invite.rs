@@ -62,14 +62,7 @@ impl NetworkRegistry {
         let secret_hash = crate::invite::hash_secret(&secret);
         let expires = now_secs().saturating_add(expires_secs);
         if let Some(handle) = self.networks.get(network) {
-            let members: Vec<crate::membership::Member> = handle
-                .state
-                .read()
-                .unwrap()
-                .members
-                .all()
-                .cloned()
-                .collect();
+            let members = handle.state.read().unwrap().roster();
             let me = self.transport.endpoint.id();
             let net_pubkey = handle.network_key;
             drop(handle);

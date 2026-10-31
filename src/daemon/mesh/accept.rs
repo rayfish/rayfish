@@ -223,7 +223,7 @@ pub(crate) fn grants_direct_key(
         Some(peer) => peer == joiner,
         None => {
             let state = state.read().unwrap();
-            state.members.all().len() <= 1
+            state.members.iter().len() <= 1
                 || state
                     .members
                     .get(&joiner)
@@ -2262,8 +2262,8 @@ mod welcome_delivery_tests {
                 &mut send,
                 network_key,
                 &ControlMsg::Welcome {
-                    members: Vec::new(),
-                    approved: Vec::new(),
+                    members: Default::default(),
+                    approved: Default::default(),
                     direct_key: None,
                     direct_record: None,
                     direct_record_published: false,

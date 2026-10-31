@@ -51,7 +51,7 @@ fn kick_targets(
     candidate_user: EndpointId,
 ) -> Option<(Vec<EndpointId>, bool, String)> {
     let rows: Vec<&Member> = members
-        .all()
+        .iter()
         .filter(|m| {
             m.identity == candidate
                 || m.identity == candidate_user
@@ -135,7 +135,7 @@ fn materialize_coordinator_roster(
         hash: source_hash,
         published: source_published,
     } = restored;
-    let mut members = MemberList::from_members(data.members);
+    let mut members = data.members;
     match members.get_mut(&local_identity) {
         Some(local) => {
             local.is_coordinator = true;
@@ -154,7 +154,7 @@ fn materialize_coordinator_roster(
     }
     RestoredRoster {
         members,
-        approved: ApprovedList::from_entries(data.approved),
+        approved: data.approved,
         group_name: data.name,
         suggested_firewall: data.suggested_firewall,
         reusable_keys: data.reusable_keys,
@@ -175,8 +175,8 @@ fn apply_coordinator_restore_to_config(
 ) {
     config.group_mode = mode;
     config.pending_hostname = None;
-    config.members = to_member_entries(members.all());
-    config.approved = to_approved_entries(approved.all());
+    config.members = to_member_entries(members.iter());
+    config.approved = to_approved_entries(approved.iter());
     config.network_secret_key = Some(net_secret_key.clone());
     config.network_public_key = Some(net_secret_key.public());
     if let Some(hash) = last_group_hash {
@@ -213,7 +213,7 @@ impl NetworkRegistry {
         );
         tracing::info!(
             network = %name,
-            members = restored.members.all().len(),
+            members = restored.members.iter().len(),
             "restored roster from complete group blob"
         );
         Ok(restored)
@@ -381,12 +381,12 @@ impl NetworkRegistry {
                 .get(&my_id)
                 .map(|m| m.is_coordinator)
                 .unwrap_or(false);
-            let others = state.members.all().len() > 1;
+            let others = state.members.iter().len() > 1;
             // An offline coordinator still owns the network. Connectivity must
             // not turn a local departure into destruction for everyone else.
             let other_coordinators = state
                 .members
-                .all()
+                .iter()
                 .any(|member| member.identity != my_id && member.is_coordinator);
             (is_coord, others, other_coordinators)
         };
@@ -462,7 +462,7 @@ impl NetworkRegistry {
                 "local member is not a coordinator"
             );
             let mut seeds: Vec<EndpointId> = members
-                .all()
+                .iter()
                 .filter(|member| member.is_coordinator)
                 .map(|member| member.identity)
                 .collect();
@@ -2205,8 +2205,8 @@ mod coordinator_restore_tests {
 
     fn blob(members: Vec<Member>) -> crate::membership::GroupBlob {
         crate::membership::GroupBlob {
-            members,
-            approved: Vec::new(),
+            members: members.into(),
+            approved: Default::default(),
             suggested_firewall: SuggestedFirewall::default(),
             name: Some("signed-name".to_string()),
             reusable_keys: BTreeMap::new(),
@@ -2251,7 +2251,7 @@ mod coordinator_restore_tests {
             Some("local-host".to_string()),
         );
 
-        assert_eq!(restored.members.all().len(), 2);
+        assert_eq!(restored.members.iter().len(), 2);
         assert!(restored.members.get(&peer).is_some());
         let mine = restored.members.get(&me).unwrap();
         assert!(mine.is_coordinator);
@@ -2271,13 +2271,16 @@ mod coordinator_restore_tests {
             device_cert: None,
         };
         let mut source = blob(vec![member(me, true)]);
-        source.approved.push(approved.clone());
+        source.approved.approve(approved.clone());
         source.reusable_keys.insert(key_hash.clone(), key.clone());
         source.nullifiers.insert(nullified);
 
         let restored = materialize_coordinator_roster(restored(source), me, None);
 
-        assert_eq!(restored.approved.all().collect::<Vec<_>>(), vec![&approved]);
+        assert_eq!(
+            restored.approved.iter().collect::<Vec<_>>(),
+            vec![&approved]
+        );
         assert_eq!(restored.reusable_keys.get(&key_hash), Some(&key));
         assert_eq!(restored.nullifiers, BTreeSet::from([nullified]));
     }

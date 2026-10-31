@@ -198,7 +198,7 @@ fn gate_mesh_version(
 
 /// This machine's default hostname, steered clear of names other members of the
 /// roster already hold.
-fn default_join_hostname(members: &[crate::membership::Member], me: EndpointId) -> String {
+fn default_join_hostname(members: &MemberList, me: EndpointId) -> String {
     let taken: Vec<&str> = members
         .iter()
         .filter(|m| m.identity != me)
@@ -209,7 +209,7 @@ fn default_join_hostname(members: &[crate::membership::Member], me: EndpointId) 
 
 fn reconnect_coordinator(
     explicit: Option<EndpointId>,
-    members: &[crate::membership::Member],
+    members: &MemberList,
     my_identity: EndpointId,
 ) -> Option<EndpointId> {
     explicit.filter(|id| *id != my_identity).or_else(|| {
@@ -883,8 +883,8 @@ impl NetworkRegistry {
         data: &crate::membership::GroupBlob,
     ) -> SharedNetworkState {
         let mut state = NetworkState {
-            members: MemberList::from_members(data.members.clone()),
-            approved: ApprovedList::from_entries(data.approved.clone()),
+            members: data.members.clone(),
+            approved: data.approved.clone(),
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -1018,7 +1018,7 @@ impl NetworkRegistry {
     /// `NetworkHandle` is inserted by `finalize_join` after this returns, so the
     /// dial's per-network target lookup must tolerate a brief absence — the
     /// supervisor re-checks `self.networks` at dial time, by when it's present.
-    fn seed_absent_members(self: &Arc<Self>, network: &str, members: &[crate::membership::Member]) {
+    fn seed_absent_members(self: &Arc<Self>, network: &str, members: &MemberList) {
         let me = self.transport.identity.local_identity();
         let net = SmolStr::new(network);
         for m in members {
@@ -1460,7 +1460,7 @@ impl NetworkRegistry {
     /// skipped (the reconnect loop + group poller are the backstop).
     pub(crate) async fn dial_all_members(
         self: &Arc<Self>,
-        members: &[Member],
+        members: &MemberList,
         net_pubkey: EndpointId,
         network_name: &str,
         my_identity: EndpointId,
@@ -1717,13 +1717,22 @@ mod tests {
         let alpn = transport::mesh_alpn();
         let mut members = Vec::new();
         let mut servers = Vec::new();
-        for index in 0..2 {
-            let endpoint = Endpoint::builder(presets::N0)
-                .alpns(vec![alpn.clone()])
-                .relay_mode(RelayMode::Disabled)
-                .bind()
-                .await
-                .unwrap();
+        let mut endpoints = Vec::new();
+        for _ in 0..2 {
+            endpoints.push(
+                Endpoint::builder(presets::N0)
+                    .alpns(vec![alpn.clone()])
+                    .relay_mode(RelayMode::Disabled)
+                    .bind()
+                    .await
+                    .unwrap(),
+            );
+        }
+        // The join dials coordinators in roster order, which is identity order.
+        // Coordinator 0 (already connected, queues the join) must come first so
+        // it sees a request before coordinator 1's denial ends the join.
+        endpoints.sort_by_key(|endpoint| endpoint.id());
+        for (index, endpoint) in endpoints.into_iter().enumerate() {
             daemon
                 .transport
                 .warm_lookup
@@ -1778,8 +1787,8 @@ mod tests {
             }
         }
         let data = crate::membership::GroupBlob {
-            members,
-            approved: Vec::new(),
+            members: members.into(),
+            approved: Default::default(),
             suggested_firewall: SuggestedFirewall::default(),
             name: Some("box".into()),
             reusable_keys: BTreeMap::new(),
@@ -1855,7 +1864,7 @@ mod tests {
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
         };
-        let roster = vec![member(me), member(other)];
+        let roster = MemberList::from(vec![member(me), member(other)]);
 
         assert_eq!(reconnect_coordinator(None, &roster, me), Some(other));
         assert_eq!(reconnect_coordinator(Some(me), &roster, me), Some(other));

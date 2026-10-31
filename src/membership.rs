@@ -197,7 +197,7 @@ pub use ray_proto::GroupMode;
 
 /// Active members of a network, keyed by [`EndpointId`]. Ordered by identity,
 /// which is the canonical order the group blob encodes them in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberList {
     members: BTreeMap<EndpointId, Member>,
 }
@@ -235,7 +235,7 @@ impl MemberList {
         self.members.contains_key(identity)
     }
 
-    pub fn all(&self) -> impl ExactSizeIterator<Item = &Member> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Member> {
         self.members.values()
     }
 
@@ -303,12 +303,65 @@ impl MemberList {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
     pub fn from_members(members: Vec<Member>) -> Self {
+        members.into_iter().collect()
+    }
+}
+
+impl From<Vec<Member>> for MemberList {
+    fn from(members: Vec<Member>) -> Self {
+        members.into_iter().collect()
+    }
+}
+
+impl FromIterator<Member> for MemberList {
+    fn from_iter<I: IntoIterator<Item = Member>>(members: I) -> Self {
         let mut list = Self::new();
         for m in members {
             list.add(m);
         }
         list
+    }
+}
+
+impl<'a> IntoIterator for &'a MemberList {
+    type Item = &'a Member;
+    type IntoIter = std::collections::btree_map::Values<'a, EndpointId, Member>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.values()
+    }
+}
+
+impl IntoIterator for MemberList {
+    type Item = Member;
+    type IntoIter = std::collections::btree_map::IntoValues<EndpointId, Member>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.into_values()
+    }
+}
+
+/// Encoded as the plain sequence of members, in identity order: exactly the
+/// `Vec<Member>` the group blob always carried.
+impl Serialize for MemberList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.members.values())
+    }
+}
+
+/// A repeated identity keeps its last entry, as [`MemberList::add`] does.
+impl<'de> Deserialize<'de> for MemberList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::deserialize(deserializer).map(Self::from_members)
     }
 }
 
@@ -326,7 +379,7 @@ pub struct ApprovedEntry {
 
 /// Pre-approved peers that the coordinator has broadcast but that haven't
 /// connected yet. Any peer holding this list can welcome them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedList {
     entries: BTreeMap<EndpointId, ApprovedEntry>,
 }
@@ -356,8 +409,16 @@ impl ApprovedList {
         self.entries.remove(identity)
     }
 
-    pub fn all(&self) -> impl ExactSizeIterator<Item = &ApprovedEntry> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &ApprovedEntry> {
         self.entries.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn from_entries(entries: Vec<ApprovedEntry>) -> Self {
@@ -366,6 +427,25 @@ impl ApprovedList {
             list.entries.insert(e.identity, e);
         }
         list
+    }
+}
+
+impl From<Vec<ApprovedEntry>> for ApprovedList {
+    fn from(entries: Vec<ApprovedEntry>) -> Self {
+        Self::from_entries(entries)
+    }
+}
+
+/// Encoded as the plain sequence of entries, like [`MemberList`].
+impl Serialize for ApprovedList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.entries.values())
+    }
+}
+
+impl<'de> Deserialize<'de> for ApprovedList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::deserialize(deserializer).map(Self::from_entries)
     }
 }
 
@@ -438,8 +518,8 @@ pub struct ReusableKey {
 /// coordinator-suggested firewall rules, and any reusable join keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupBlob {
-    pub members: Vec<Member>,
-    pub approved: Vec<ApprovedEntry>,
+    pub members: MemberList,
+    pub approved: ApprovedList,
     /// Coordinator-suggested firewall rules, keyed by subject hostname (the `*`
     /// subject targets every node). Advisory: each node queues them for
     /// `ray firewall accept`, or auto-installs them if it opted into
@@ -542,8 +622,8 @@ pub fn canonical_group_bytes(
     nullifiers: &BTreeSet<EndpointId>,
 ) -> Vec<u8> {
     let data = GroupBlob {
-        members: members.all().cloned().collect(),
-        approved: approved.all().cloned().collect(),
+        members: members.clone(),
+        approved: approved.clone(),
         suggested_firewall: suggested_firewall.clone(),
         name: name.map(|s| s.to_string()),
         reusable_keys: reusable_keys.clone(),
@@ -786,7 +866,7 @@ mod tests {
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
         });
-        assert_eq!(list.all().len(), 2);
+        assert_eq!(list.iter().len(), 2);
     }
 
     #[test]
@@ -820,7 +900,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
         });
-        assert_eq!(approved.all().len(), 1);
+        assert_eq!(approved.iter().len(), 1);
     }
 
     #[test]
@@ -857,7 +937,7 @@ mod tests {
         let list = ApprovedList::from_entries(entries);
         assert!(list.is_approved(&test_id(1)));
         assert!(list.is_approved(&test_id(2)));
-        assert_eq!(list.all().len(), 2);
+        assert_eq!(list.iter().len(), 2);
     }
 
     // -- Canonical serialization + hashing ------------------------------------
@@ -896,11 +976,21 @@ mod tests {
                 device_cert: None,
             });
         }
-        let mut sorted_members: Vec<Member> = members.all().cloned().collect();
+        let mut sorted_members: Vec<Member> = members.iter().cloned().collect();
         sorted_members.sort_by_key(|m| m.identity.to_string());
-        let mut sorted_approved: Vec<ApprovedEntry> = approved.all().cloned().collect();
+        let mut sorted_approved: Vec<ApprovedEntry> = approved.iter().cloned().collect();
         sorted_approved.sort_by_key(|a| a.identity.to_string());
-        let string_sorted = rmp_serde::to_vec(&GroupBlob {
+        /// `GroupBlob` as it was, holding plain sorted vectors.
+        #[derive(Serialize)]
+        struct OldBlob {
+            members: Vec<Member>,
+            approved: Vec<ApprovedEntry>,
+            suggested_firewall: SuggestedFirewall,
+            name: Option<String>,
+            reusable_keys: BTreeMap<String, ReusableKey>,
+            nullifiers: BTreeSet<EndpointId>,
+        }
+        let string_sorted = rmp_serde::to_vec(&OldBlob {
             members: sorted_members,
             approved: sorted_approved,
             suggested_firewall: SuggestedFirewall::default(),
@@ -1172,7 +1262,7 @@ mod tests {
             &BTreeSet::new(),
         );
         let data = verify_group_blob(&bytes, &hash).unwrap();
-        assert_eq!(data.members[0].last_seen, Some(12345));
+        assert_eq!(data.members.iter().next().unwrap().last_seen, Some(12345));
     }
 
     #[test]
@@ -1212,7 +1302,7 @@ mod tests {
             &BTreeSet::new(),
         );
         let data = verify_group_blob(&bytes, &hash).unwrap();
-        assert_eq!(data.members[0].last_seen, None);
+        assert_eq!(data.members.iter().next().unwrap().last_seen, None);
     }
 
     #[test]
@@ -1311,7 +1401,7 @@ mod tests {
         }
         let members = make_member_list(&[1, 2]);
         let old = ShortBlob {
-            members: members.all().cloned().collect(),
+            members: members.iter().cloned().collect(),
             approved: vec![],
         };
         let bytes = rmp_serde::to_vec(&old).unwrap();
@@ -1504,8 +1594,11 @@ mod tests {
 
         let blob = decode_group_blob(&bytes).expect("a named map still decodes");
         assert_eq!(blob.members.len(), 1);
-        assert!(blob.members[0].exit_node);
-        assert_eq!(blob.members[0].exit_families, ExitFamilies::Unknown);
+        assert!(blob.members.iter().next().unwrap().exit_node);
+        assert_eq!(
+            blob.members.iter().next().unwrap().exit_families,
+            ExitFamilies::Unknown
+        );
         // And re-encoding it compactly gives different bytes, which is what makes
         // the local snapshot hash disagree with the signed one.
         assert_ne!(rmp_serde::to_vec(&blob).unwrap(), bytes);
@@ -1814,8 +1907,8 @@ mod tests {
             let mut keys = BTreeMap::new();
             keys.insert(hash, key);
             GroupBlob {
-                members: vec![],
-                approved: vec![],
+                members: MemberList::new(),
+                approved: ApprovedList::new(),
                 suggested_firewall: SuggestedFirewall::default(),
                 name: None,
                 reusable_keys: keys,

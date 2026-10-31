@@ -21,7 +21,7 @@ fn dial_order_puts_minter_first_then_other_coordinators() {
         exit_node: false,
         exit_families: ExitFamilies::Unknown,
     };
-    let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
+    let members = MemberList::from(vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)]);
     // minter = b: b first, then the other coordinator a, never c (not coord), never me.
     assert_eq!(super::coordinator_dial_order(b, &members, me), vec![b, a]);
 }
@@ -41,22 +41,22 @@ fn dial_order_edge_cases() {
     };
 
     // No coordinators in the roster ⇒ empty order (caller bails).
-    let none_coord = vec![mk(a, false), mk(b, false)];
+    let none_coord = MemberList::from(vec![mk(a, false), mk(b, false)]);
     assert!(super::coordinator_dial_order(a, &none_coord, me).is_empty());
 
     // Minter == me (the no-invite case where we pass our own id): we are
     // filtered out, leaving just the other coordinators.
-    let members = vec![mk(a, true), mk(me, true)];
+    let members = MemberList::from(vec![mk(a, true), mk(me, true)]);
     assert_eq!(super::coordinator_dial_order(me, &members, me), vec![a]);
 
     // Minter isn't a coordinator in the blob: it is not promoted to the
     // front, but real coordinators still get dialed.
-    let members = vec![mk(a, true), mk(b, false)];
+    let members = MemberList::from(vec![mk(a, true), mk(b, false)]);
     assert_eq!(super::coordinator_dial_order(b, &members, me), vec![a]);
 
     // Minter is a coordinator AND also appears in the member scan: listed
     // once (front), no duplicate.
-    let members = vec![mk(a, true), mk(b, true)];
+    let members = MemberList::from(vec![mk(a, true), mk(b, true)]);
     assert_eq!(super::coordinator_dial_order(a, &members, me), vec![a, b]);
 }
 
@@ -99,7 +99,7 @@ fn gossip_targets_are_coordinator_peers_only() {
         exit_node: false,
         exit_families: ExitFamilies::Unknown,
     };
-    let members = vec![mk(a, true), mk(b, false), mk(c, true)];
+    let members = MemberList::from(vec![mk(a, true), mk(b, false), mk(c, true)]);
     let me = a;
     // gossip to other coordinators only: c (not b, not me).
     assert_eq!(super::gossip_targets(&members, me), vec![c]);
@@ -119,6 +119,6 @@ fn gossip_targets_empty_when_sole_coordinator() {
         exit_families: ExitFamilies::Unknown,
     };
     // Only members are us (coordinator) and a plain member: nobody to gossip to.
-    let members = vec![mk(me, true), mk(test_id(2), false)];
+    let members = MemberList::from(vec![mk(me, true), mk(test_id(2), false)]);
     assert!(super::gossip_targets(&members, me).is_empty());
 }

@@ -113,7 +113,7 @@ impl NetworkRegistry {
                     .read()
                     .map_err(|_| anyhow::anyhow!("network state lock poisoned"))?
                     .members
-                    .all()
+                    .iter()
                 {
                     if member.identity != self.transport.endpoint.id()
                         && !targets.iter().any(|(id, _)| *id == member.identity)

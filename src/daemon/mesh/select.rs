@@ -10,7 +10,7 @@ use super::super::*;
 /// Consumed by the join dial-fallback loop.
 pub(crate) fn coordinator_dial_order(
     minter: EndpointId,
-    members: &[Member],
+    members: &MemberList,
     me: EndpointId,
 ) -> Vec<EndpointId> {
     let mut order = Vec::new();
@@ -30,7 +30,7 @@ pub(crate) fn coordinator_dial_order(
 /// `is_coordinator` member, excluding ourselves. Only coordinators (network-key
 /// holders) can admit, so only they need the shared invite ledger; a
 /// non-coordinator is never a target.
-pub(crate) fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<EndpointId> {
+pub(crate) fn gossip_targets(members: &MemberList, me: EndpointId) -> Vec<EndpointId> {
     members
         .iter()
         .filter(|m| m.is_coordinator && m.identity != me)

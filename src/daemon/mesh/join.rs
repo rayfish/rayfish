@@ -370,8 +370,8 @@ pub(crate) async fn register_dialed_peer(
 #[allow(clippy::too_many_arguments)]
 fn persist_join_config(
     network_name: &str,
-    members: &[crate::membership::Member],
-    approved: &[ApprovedEntry],
+    members: &MemberList,
+    approved: &ApprovedList,
     my_identity: EndpointId,
     net_pubkey: EndpointId,
     my_hostname: &Option<String>,
@@ -441,8 +441,8 @@ fn persist_join_config(
 /// blob store with those bytes.
 #[allow(clippy::too_many_arguments)]
 async fn build_member_state(
-    members: &[crate::membership::Member],
-    approved: Vec<ApprovedEntry>,
+    members: &MemberList,
+    approved: ApprovedList,
     net_pubkey: EndpointId,
     network_name: &str,
     group_name: Option<String>,
@@ -461,8 +461,8 @@ async fn build_member_state(
     exact_group_hash: Option<blake3::Hash>,
 ) -> SharedNetworkState {
     let mut ns = NetworkState {
-        members: MemberList::from_members(members.to_vec()),
-        approved: ApprovedList::from_entries(approved),
+        members: members.clone(),
+        approved,
         snapshot: None,
         snapshot_commit: Arc::new(AsyncMutex::new(())),
         destroyed: false,
@@ -551,7 +551,7 @@ pub(crate) async fn send_mesh_hello(
 /// logged and skipped, as is a peer whose hello exchange fails.
 #[allow(clippy::too_many_arguments)]
 async fn connect_to_roster_peers(
-    members: &[crate::membership::Member],
+    members: &MemberList,
     network_name: &str,
     net_pubkey: EndpointId,
     my_identity: EndpointId,
@@ -907,8 +907,8 @@ mod mesh_hello_reply_tests {
                 &mut send,
                 Some(network_key),
                 &ControlMsg::Welcome {
-                    members: Vec::new(),
-                    approved: Vec::new(),
+                    members: Default::default(),
+                    approved: Default::default(),
                     direct_key: None,
                     direct_record: None,
                     direct_record_published: false,
@@ -1122,11 +1122,11 @@ mod persist_config_tests {
         .unwrap();
 
         // Reconnect: re-persist from a blob roster that carries no exit policy.
-        let roster = vec![member(2, false), member(4, true)];
+        let roster = MemberList::from(vec![member(2, false), member(4, true)]);
         persist_join_config(
             "homelab",
             &roster,
-            &[],
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("umbrel".to_string()),
@@ -1165,8 +1165,8 @@ mod persist_config_tests {
 
         persist_join_config(
             "homelab",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("umbrel".to_string()),
@@ -1194,8 +1194,8 @@ mod persist_config_tests {
         let primary = id(5);
         persist_join_config(
             "paired",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("device".to_string()),
@@ -1207,8 +1207,8 @@ mod persist_config_tests {
         .unwrap();
         persist_join_config(
             "paired",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("device".to_string()),
@@ -1245,8 +1245,8 @@ mod persist_config_tests {
         let me = id(2);
         let result = persist_join_config(
             "homelab",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("umbrel".to_string()),

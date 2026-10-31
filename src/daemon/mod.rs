@@ -543,20 +543,20 @@ mod named_identity_tests;
 impl NetworkState {
     /// Snapshot the current member roster as an owned `Vec` (the members map is
     /// the single source of truth; callers take a copy to release the lock).
-    pub(crate) fn roster(&self) -> Vec<Member> {
-        self.members.all().cloned().collect()
+    pub(crate) fn roster(&self) -> MemberList {
+        self.members.clone()
     }
 
     /// Snapshot the current approved-but-not-yet-joined entries as an owned `Vec`.
-    fn approved_snapshot(&self) -> Vec<ApprovedEntry> {
-        self.approved.all().cloned().collect()
+    fn approved_snapshot(&self) -> ApprovedList {
+        self.approved.clone()
     }
 
     /// Hostnames currently claimed by other members (excluding `except`), used to
     /// resolve a rename/join collision against the roster.
     fn taken_hostnames(&self, except: EndpointId) -> Vec<String> {
         self.members
-            .all()
+            .iter()
             .filter(|m| m.identity != except)
             .filter_map(|m| m.hostname.clone())
             .collect()
@@ -1476,7 +1476,7 @@ async fn broadcast_member_sync(
 /// not known-offline. Split out from [`spawn_absent_member_sync`] so the choice
 /// of who gets dialed is testable without a live registry.
 fn absent_member_ips(
-    roster: &[Member],
+    roster: &MemberList,
     my_id: EndpointId,
     exclude_ip: Option<Ipv6Addr>,
     reached: &HashSet<EndpointId>,
@@ -1497,7 +1497,7 @@ fn absent_member_ips(
 /// prunes a member, so these are dialed whatever their recent dial history: unlike
 /// the `MemberSync` hint [`absent_member_ips`] serves, a leave is never retried.
 fn leave_recipients(
-    roster: &[Member],
+    roster: &MemberList,
     my_id: EndpointId,
     reached: &HashSet<EndpointId>,
 ) -> Vec<Ipv6Addr> {

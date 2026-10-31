@@ -131,8 +131,8 @@ pub(crate) struct CurrentSignedNetworkState {
     pub(crate) hash: blake3::Hash,
     pub(crate) packet: Vec<u8>,
     pub(crate) published: bool,
-    pub(crate) members: Vec<Member>,
-    pub(crate) approved: Vec<ApprovedEntry>,
+    pub(crate) members: MemberList,
+    pub(crate) approved: ApprovedList,
     pub(crate) key: SecretKey,
 }
 
@@ -568,7 +568,7 @@ impl NetworkRegistry {
     /// Seed the route map from a restored roster so the on-demand data path can
     /// lazily dial members before the first reconverge (self excluded by the
     /// caller-provided list, which should already omit us).
-    pub(crate) fn seed_route_map(&self, network: &str, members: &[Member]) {
+    pub(crate) fn seed_route_map(&self, network: &str, members: &MemberList) {
         let my_id = self.transport.identity.local_identity();
         let routes: Vec<peers::RouteMember> = members
             .iter()
@@ -750,10 +750,13 @@ impl NetworkRegistry {
                 standing.user_identity = standing.user_identity.or(member.user_identity);
             }
             standing.known = standing.known
-                || state.members.all().any(|m| m.user_identity == Some(remote))
+                || state
+                    .members
+                    .iter()
+                    .any(|m| m.user_identity == Some(remote))
                 || state
                     .approved
-                    .all()
+                    .iter()
                     .any(|e| e.identity == remote || e.user_identity == Some(remote));
         }
         // The paired primary need not share a roster with this device yet.
@@ -1376,8 +1379,8 @@ impl NetworkRegistry {
         let revoking = self.revocation_lock.lock().await;
         let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
 
-        let member_entries = to_member_entries(net_state.members.all());
-        let approved_entries = to_approved_entries(net_state.approved.all());
+        let member_entries = to_member_entries(net_state.members.iter());
+        let approved_entries = to_approved_entries(net_state.approved.iter());
         config::save_network(&config::NetworkConfig {
             name: name.clone(),
             group_mode: mode,
@@ -1668,7 +1671,11 @@ impl NetworkRegistry {
             }
             for entry in self.networks.iter() {
                 let state = entry.value().state.read().unwrap();
-                if let Some(m) = state.members.all().find(|m| derive_ipv6(&m.identity) == v6) {
+                if let Some(m) = state
+                    .members
+                    .iter()
+                    .find(|m| derive_ipv6(&m.identity) == v6)
+                {
                     return Some(m.identity);
                 }
             }
@@ -1735,7 +1742,7 @@ impl NetworkRegistry {
         let mut found = None;
         for entry in self.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            for member in state.members.all() {
+            for member in state.members.iter() {
                 if !member.identity.to_string().starts_with(short) {
                     continue;
                 }

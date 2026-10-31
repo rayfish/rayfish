@@ -197,12 +197,12 @@ impl NetworkRegistry {
 
     /// A network's roster, or empty if we don't have that network. Keeps the
     /// lookup-then-lock-then-clone dance (and the lock guard) out of the callers.
-    pub(crate) fn roster(&self, network: &str) -> Vec<Member> {
+    pub(crate) fn roster(&self, network: &str) -> MemberList {
         match self.networks.get(network) {
             // Cloned out (`NetworkState::roster`): callers must be free to work
             // (and to await) without holding the state lock.
             Some(handle) => handle.state.read().unwrap().roster(),
-            None => Vec::new(),
+            None => MemberList::new(),
         }
     }
 
@@ -212,7 +212,7 @@ impl NetworkRegistry {
         let state = handle.state.read().unwrap();
         state
             .members
-            .all()
+            .iter()
             .find(|m| m.matches_identity(id))
             .cloned()
     }

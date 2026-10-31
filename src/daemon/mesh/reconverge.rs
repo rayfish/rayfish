@@ -37,7 +37,7 @@ pub(crate) fn apply_suggested_firewall(
     network_name: &str,
     state: &std::sync::RwLock<NetworkState>,
 ) {
-    let (suggestions, members): (SuggestedFirewall, Vec<Member>) = {
+    let (suggestions, members): (SuggestedFirewall, MemberList) = {
         let s = state.read().unwrap();
         (s.suggested_firewall.clone(), s.roster())
     };
@@ -242,8 +242,8 @@ fn current_group_hash(state: &NetworkState) -> blake3::Hash {
 /// and refresh the snapshot. The caller holds `snapshot_commit` and the write
 /// guard, and has already revalidated the generation.
 fn adopt_blob(state: &mut NetworkState, data: crate::membership::GroupBlob, signed: blake3::Hash) {
-    state.members = MemberList::from_members(data.members);
-    state.approved = ApprovedList::from_entries(data.approved);
+    state.members = data.members;
+    state.approved = data.approved;
     state.suggested_firewall = data.suggested_firewall;
     state.group_name = data.name;
     state.reusable_keys = data.reusable_keys;
@@ -597,7 +597,7 @@ async fn commit_group_blob(
 /// network listing our key just gets us pruned there, not deauthorized everywhere.
 pub(crate) fn self_is_nullified(
     cert: &control::DeviceCert,
-    members: &[Member],
+    members: &MemberList,
     nullifiers: &std::collections::BTreeSet<EndpointId>,
 ) -> bool {
     nullifiers.contains(&cert.device_key)
@@ -691,7 +691,7 @@ pub(crate) fn revoke_peer_network(
 pub(crate) async fn attach_rejoined_peers(
     peers: &PeerTable,
     device_user_map: &peers::DeviceUserMap,
-    members: &[Member],
+    members: &MemberList,
     network_name: &str,
     my_identity: EndpointId,
 ) {
@@ -720,7 +720,7 @@ pub(crate) async fn attach_rejoined_peers(
 }
 
 pub(crate) async fn apply_roster_to_dns(
-    members: &[Member],
+    members: &MemberList,
     network_name: &str,
     my_identity: EndpointId,
     hostname_table: &dns::HostnameTable,
@@ -979,17 +979,17 @@ mod reconverge_tests {
         nulls.insert(device);
 
         // Our primary coordinates the network and listed us: self-unpair.
-        let roster = vec![member(primary.public(), true)];
+        let roster = MemberList::from(vec![member(primary.public(), true)]);
         assert!(self_is_nullified(&cert, &roster, &nulls));
 
         // Nullified, but the network is coordinated by someone else (foreign):
         // must NOT trigger a global teardown.
-        let foreign = vec![member(SecretKey::generate().public(), true)];
+        let foreign = MemberList::from(vec![member(SecretKey::generate().public(), true)]);
         assert!(!self_is_nullified(&cert, &foreign, &nulls));
 
         // Our primary is present but only as a plain member (not coordinator):
         // not authoritative here.
-        let noncoord = vec![member(primary.public(), false)];
+        let noncoord = MemberList::from(vec![member(primary.public(), false)]);
         assert!(!self_is_nullified(&cert, &noncoord, &nulls));
 
         // Not nullified at all.

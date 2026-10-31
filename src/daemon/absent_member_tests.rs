@@ -25,7 +25,7 @@ fn member(seed: u8) -> Member {
 /// links while staying reachable.
 #[test]
 fn unconnected_member_is_a_dial_candidate() {
-    let roster = vec![member(1), member(2)];
+    let roster = MemberList::from(vec![member(1), member(2)]);
     let reached: HashSet<EndpointId> = [id(1)].into_iter().collect();
     let got = absent_member_ips(&roster, id(9), None, &reached, |_| false);
     assert_eq!(got, vec![derive_ipv6(&id(2))]);
@@ -36,7 +36,7 @@ fn unconnected_member_is_a_dial_candidate() {
 /// the peer the caller deliberately skipped, the third already got it.
 #[test]
 fn self_excluded_and_reached_are_skipped() {
-    let roster = vec![member(1), member(2), member(3), member(4)];
+    let roster = MemberList::from(vec![member(1), member(2), member(3), member(4)]);
     let reached: HashSet<EndpointId> = [id(3)].into_iter().collect();
     let got = absent_member_ips(&roster, id(1), Some(derive_ipv6(&id(2))), &reached, |_| {
         false
@@ -49,7 +49,7 @@ fn self_excluded_and_reached_are_skipped() {
 /// edit and teach us nothing.
 #[test]
 fn known_offline_member_is_not_redialed() {
-    let roster = vec![member(1), member(2)];
+    let roster = MemberList::from(vec![member(1), member(2)]);
     let offline = id(1);
     let got = absent_member_ips(&roster, id(9), None, &HashSet::new(), |i| *i == offline);
     assert_eq!(got, vec![derive_ipv6(&id(2))]);
@@ -67,7 +67,12 @@ fn coordinator(seed: u8) -> Member {
 /// ordinary members learn of the leave from the coordinator's republish.
 #[test]
 fn a_leave_dials_only_the_coordinators_it_missed() {
-    let roster = vec![coordinator(1), coordinator(2), member(3), coordinator(4)];
+    let roster = MemberList::from(vec![
+        coordinator(1),
+        coordinator(2),
+        member(3),
+        coordinator(4),
+    ]);
     let reached: HashSet<EndpointId> = [id(2)].into_iter().collect();
     let got = leave_recipients(&roster, id(4), &reached);
     assert_eq!(got, vec![derive_ipv6(&id(1))]);

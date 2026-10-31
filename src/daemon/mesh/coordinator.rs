@@ -612,7 +612,7 @@ pub(crate) async fn gossip_to_coordinators(
     peers: &PeerTable,
     network: &str,
     net_pubkey: EndpointId,
-    members: &[Member],
+    members: &MemberList,
     me: EndpointId,
     msg: &ControlMsg,
 ) {
@@ -787,7 +787,7 @@ pub(crate) fn spawn_stale_member_pruner(
             let removed_members: Vec<EndpointId> = {
                 let s = state.read().unwrap();
                 s.members
-                    .all()
+                    .iter()
                     .filter(|m| {
                         should_prune(
                             m,
