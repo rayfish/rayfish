@@ -82,10 +82,20 @@ pub(super) struct Staged {
 impl Staged {
     /// Rename the written file to its name, or the first free `name (n).ext`,
     /// never replacing an existing file. Returns the name it got.
-    pub(super) fn commit(mut self) -> io::Result<OsString> {
+    /// `before_rename` is told each name just before the file is moved to it.
+    pub(super) fn commit(mut self, mut before_rename: impl FnMut(&str)) -> io::Result<OsString> {
         for attempt in 0..MAX_NAME_ATTEMPTS {
             let name = numbered_name(&self.wanted, attempt);
-            match rename_by_handle(&self.file, &self.dir.join(&name)) {
+            let to = self.dir.join(&name);
+            // Known to be taken: not worth telling `before_rename` about. The
+            // rename still refuses a name taken since.
+            match to.symlink_metadata() {
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            before_rename(&name);
+            match rename_by_handle(&self.file, &to) {
                 Ok(()) => {
                     self.committed = true;
                     // Flushing the handle also writes out the file's own
@@ -720,7 +730,7 @@ mod tests {
         // The same directory is fine when the caller could write it.
         let (staged, file) = create(tmp.path(), "f.bin", &temp(), me()).unwrap();
         drop(file);
-        assert_eq!(staged.commit().unwrap(), "f.bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f.bin");
     }
 
     #[test]
@@ -729,7 +739,7 @@ mod tests {
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
         let (staged, file) = create(tmp.path(), "f.bin", &temp(), configured()).unwrap();
         drop(file);
-        assert_eq!(staged.commit().unwrap(), "f (1).bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
     }
 
@@ -740,7 +750,7 @@ mod tests {
         for expected_suffix in [".txt", " (1).txt"] {
             let (staged, file) = create(tmp.path(), &long, &temp(), configured()).unwrap();
             drop(file);
-            let name = staged.commit().unwrap().into_string().unwrap();
+            let name = staged.commit(|_| {}).unwrap().into_string().unwrap();
             assert!(name.encode_utf16().count() <= 255, "{name}");
             assert!(name.ends_with(expected_suffix), "{name}");
         }
@@ -752,7 +762,7 @@ mod tests {
         std::fs::write(tmp.path().join("notes.txt"), b"keep").unwrap();
         let (staged, file) = create(tmp.path(), "notes.txt:hidden", &temp(), configured()).unwrap();
         drop(file);
-        assert_eq!(staged.commit().unwrap(), "notes.txt_hidden");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "notes.txt_hidden");
     }
 
     #[test]
@@ -774,7 +784,7 @@ mod tests {
         file.write_all(b"new").unwrap();
         drop(file);
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
-        assert_eq!(staged.commit().unwrap(), "f (1).bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
         assert_eq!(std::fs::read(tmp.path().join("f (1).bin")).unwrap(), b"new");
     }

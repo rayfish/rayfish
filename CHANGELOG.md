@@ -37,6 +37,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A receive cut short by a crash or power loss no longer leaves a hidden
   `.rayfish-*.part` file in the download folder for good: receiving the same
   offer again replaces it.
+- A daemon that stops just after saving a received file no longer saves it a
+  second time, as `name (1)`, when it starts again.
 - On a network with several coordinators, a coordinator that created the
   network or restarted now picks up changes another coordinator makes, instead
   of missing them until something else prompted a refresh.

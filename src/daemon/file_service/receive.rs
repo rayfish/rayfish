@@ -199,14 +199,22 @@ impl FileService {
         recipient: Recipient,
         policy: ResumePolicy,
     ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
-        let file = {
+        let (file, saved_as) = {
             let mut pending = self.pending_files.lock().unwrap();
             let Some(mut file) = take_pending(&mut pending, id) else {
                 return op_err(format!("no pending file with id {id}"));
             };
+            // A receive resumed into the same place keeps the name it was
+            // being saved under, which is how it finds a file already saved.
+            let saved_as = file
+                .accepted
+                .take()
+                .filter(|before| before.output == output)
+                .and_then(|before| before.saved_as);
             file.accepted = recipient.survives_restart().then(|| AcceptedReceive {
                 output: output.clone(),
                 recipient: recipient.clone(),
+                saved_as: saved_as.clone(),
             });
 
             let mut active = self.active_files.lock().unwrap();
@@ -215,7 +223,7 @@ impl FileService {
             if let Err(error) = save_pending_files(&durable) {
                 tracing::warn!(%error, "could not save accepted file; it will not resume after a restart");
             }
-            file
+            (file, saved_as)
         };
         let transfer_id = self.transfers.register_receive(
             file.from.fmt_short().to_string(),
@@ -241,7 +249,17 @@ impl FileService {
             .insert(transfer_id, cancel.clone());
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let service = Arc::clone(self);
-        let to = AcceptedReceive { output, recipient };
+        let to = AcceptedReceive {
+            output,
+            recipient,
+            saved_as,
+        };
+        let before_rename = {
+            let pending = Arc::clone(&self.pending_files);
+            let active = Arc::clone(&self.active_files);
+            let offer_id = file.offer_id;
+            move |name: &str| note_saving_as(&pending, &active, offer_id, name)
+        };
         tokio::spawn(async move {
             // Biased so a receive that finished in the same poll as a cancel
             // counts as finished.
@@ -254,10 +272,11 @@ impl FileService {
             // Naming the complete file is not canceled: once the rename has
             // happened, the outcome has to say so.
             let received = match written {
-                Ok(written) => written
-                    .commit()
+                Ok(Received::Written(written)) => written
+                    .commit(before_rename)
                     .await
                     .map_err(|e| format!("write failed: {e}")),
+                Ok(Received::Saved(path)) => Ok(path),
                 Err(error) => Err(error),
             };
             let outcome = service.finish_receive(offer, finish, received);
@@ -364,11 +383,15 @@ impl FileService {
         transfer_id: u64,
         to: AcceptedReceive,
         policy: ResumePolicy,
-    ) -> Result<Written, String> {
+    ) -> Result<Received, String> {
         // Checked again here, not only when the offer was queued: offers saved
         // by an older daemon were never validated.
         if !is_safe_file_name(&file.filename) {
             return Err(format!("invalid file name '{}'", file.filename));
+        }
+        if let Some(path) = already_saved(file, &to).await {
+            tracing::info!(file = %file.filename, "found the file saved before a restart");
+            return Ok(Received::Saved(path));
         }
         // Claim the blob before fetching it. `fetch` leaves what it downloads
         // untagged, so a GC triggered by some other transfer finishing mid-fetch
@@ -384,7 +407,7 @@ impl FileService {
             .await
             .map_err(|e| format!("blob store error: {e}"))?;
         self.fetch_resuming(file, transfer_id, policy).await?;
-        self.save_received(file, to).await
+        self.save_received(file, to).await.map(Received::Written)
     }
 
     /// Fetch until the blob is complete, waiting out interruptions.
@@ -604,6 +627,42 @@ fn span(duration: Duration) -> String {
     };
     let plural = if count == 1 { "" } else { "s" };
     format!("{count} {unit}{plural}")
+}
+
+/// How far a receive got.
+enum Received {
+    /// Written under its temporary name, still to be given its own.
+    Written(Written),
+    /// Already saved here by an earlier run that stopped before recording it.
+    Saved(PathBuf),
+}
+
+/// The file an earlier run of this receive saved, if it got as far as the
+/// rename but not as recording the delivery: the name it was being renamed to
+/// holds a plain file of the offered size, and its temporary file is gone.
+/// With the temporary file still there, the rename never happened and the
+/// receive writes it again. Anything unreadable counts as not saved, which
+/// at worst saves a second copy, as before.
+async fn already_saved(file: &PendingFile, to: &AcceptedReceive) -> Option<PathBuf> {
+    let name = to.saved_as.clone()?;
+    if !is_safe_file_name(&name) {
+        return None;
+    }
+    let dir = receive_dir(to.output.as_deref());
+    let temp = dest_name::TempName::for_offer(&file.from, file.offer_id);
+    let size = file.size;
+    tokio::task::spawn_blocking(move || {
+        match dir.join(temp.as_str()).symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        let path = dir.join(name);
+        let meta = path.symlink_metadata().ok()?;
+        (meta.is_file() && meta.len() == size).then_some(path)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// What a fetch attempt waits on next.
@@ -1028,7 +1087,11 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(
             saved[0].accepted,
-            Some(AcceptedReceive { output, recipient })
+            Some(AcceptedReceive {
+                output,
+                recipient,
+                saved_as: None,
+            })
         );
 
         // It starts again with the sender back, and nobody accepts it twice.
@@ -1053,6 +1116,70 @@ mod tests {
         assert_eq!(done.state, transfers::TransferState::Done, "{done:?}");
         assert_eq!(std::fs::read(downloads.join("big.bin")).unwrap(), data);
         assert!(load_pending_files().is_empty());
+    }
+
+    /// A daemon that stops between saving a file and recording the delivery
+    /// finds the file on restart instead of saving it a second time.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_receive_saved_before_a_restart_is_not_saved_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let data = payload();
+        let sender = SecretKey::generate().public();
+        let receiver = file_service(
+            file_endpoint(MemoryLookup::new()).await,
+            &tmp.path().join("r"),
+        )
+        .await;
+        // As the first run left it: the blob complete and tagged, the file
+        // renamed into place, the delivery not yet recorded.
+        let store = &receiver.transport.blob_store;
+        let blob = store.blobs().add_slice(&data).temp_tag().await.unwrap();
+        let hash = blob.hash_and_format();
+        store
+            .tags()
+            .set(blob_tags::recv(&hash.hash, 1), hash)
+            .await
+            .unwrap();
+        offer(&receiver, sender, &data);
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        std::fs::write(downloads.join("big.bin"), &data).unwrap();
+        let offer_id = {
+            let mut pending = receiver.pending_files.lock().unwrap();
+            pending[0].accepted = Some(AcceptedReceive {
+                output: Some(downloads.to_string_lossy().into_owned()),
+                recipient: Recipient {
+                    owner: None,
+                    caller_chose_dir: true,
+                },
+                saved_as: Some("big.bin".into()),
+            });
+            pending[0].offer_id
+        };
+
+        let mut changes = receiver.transfers.subscribe();
+        receiver.resume_accepted_receives();
+        let done = wait_for(&receiver, &mut changes, |t| {
+            t.state != transfers::TransferState::Transferring
+        })
+        .await;
+        assert_eq!(done.state, transfers::TransferState::Done, "{done:?}");
+        let names: Vec<_> = std::fs::read_dir(&downloads)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["big.bin"]);
+        assert!(load_pending_files().is_empty());
+        assert!(
+            receiver
+                .declines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.accepted && entry.offer_id == offer_id)
+        );
     }
 
     #[tokio::test]

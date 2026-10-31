@@ -45,11 +45,18 @@ pub(super) struct Staged {
 impl Staged {
     /// Move the written file to its name, or the first free `name (n).ext`,
     /// never replacing an existing entry. Returns the name it got.
-    pub(super) fn commit(mut self) -> io::Result<OsString> {
+    /// `before_rename` is told each name just before the file is moved to it.
+    pub(super) fn commit(mut self, mut before_rename: impl FnMut(&str)) -> io::Result<OsString> {
         let temp = c_name(&self.temp)?;
         for attempt in 0..MAX_NAME_ATTEMPTS {
             let name = numbered_name(&self.wanted, attempt);
             let to = c_name(OsStr::new(&name))?;
+            // Known to be taken: not worth telling `before_rename` about. The
+            // rename still refuses a name taken since.
+            if exists_at(&self.dir, &to)? {
+                continue;
+            }
+            before_rename(&name);
             match rename_no_replace(&self.dir, &temp, &to) {
                 Ok(()) => {
                     self.committed = true;
@@ -651,7 +658,7 @@ mod tests {
         let nested = tmp.path().join("new/sub");
         let (staged, _file) =
             create(&nested, "a.bin", &temp(), configured(Some((other, other)))).unwrap();
-        staged.commit().unwrap();
+        staged.commit(|_| {}).unwrap();
         assert!(nested.join("a.bin").exists());
     }
 
@@ -677,7 +684,7 @@ mod tests {
         // Through a link to their own directory, as a Downloads folder on
         // another disk would be, it still works.
         let (staged, _file) = create(&link, "f.bin", &temp(), configured(Some(me()))).unwrap();
-        staged.commit().unwrap();
+        staged.commit(|_| {}).unwrap();
         assert!(real.join("f.bin").exists());
     }
 
@@ -690,7 +697,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("f.bin")).unwrap();
         let (staged, _file) = create(&dir, "f.bin", &temp(), caller(me())).unwrap();
-        assert_eq!(staged.commit().unwrap(), "f (1).bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert!(dir.join("f.bin").symlink_metadata().unwrap().is_symlink());
     }
@@ -708,7 +715,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a/b");
         let (staged, _file) = create(&nested, "f.bin", &temp(), caller(me())).unwrap();
-        staged.commit().unwrap();
+        staged.commit(|_| {}).unwrap();
         let (uid, _) = me();
         assert_eq!(std::fs::metadata(tmp.path().join("a")).unwrap().uid(), uid);
         assert_eq!(std::fs::metadata(&nested).unwrap().uid(), uid);
@@ -733,7 +740,7 @@ mod tests {
         assert_eq!(during.len(), 1);
         assert!(during[0].starts_with(".rayfish-"), "{during:?}");
         drop(file);
-        assert_eq!(staged.commit().unwrap(), "f.bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f.bin");
         assert_eq!(names(tmp.path()), ["f.bin"]);
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"data");
     }
@@ -750,7 +757,7 @@ mod tests {
             let (staged, mut file) = create(tmp.path(), &long, &temp(), caller(me())).unwrap();
             file.write_all(b"data").unwrap();
             drop(file);
-            let name = staged.commit().unwrap().into_string().unwrap();
+            let name = staged.commit(|_| {}).unwrap().into_string().unwrap();
             assert!(name.len() <= 255, "{}", name.len());
             assert!(name.ends_with(".txt"), "{name}");
             assert_eq!(std::fs::read(tmp.path().join(&name)).unwrap(), b"data");
@@ -774,7 +781,7 @@ mod tests {
         let (staged, mut file) = create(tmp.path(), "f.bin", &temp, caller(me())).unwrap();
         file.write_all(b"full").unwrap();
         drop(file);
-        assert_eq!(staged.commit().unwrap(), "f.bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f.bin");
         assert_eq!(names(tmp.path()), ["f.bin"]);
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"full");
     }
@@ -816,13 +823,32 @@ mod tests {
         assert!(names(tmp.path()).is_empty());
     }
 
+    /// The name is announced before the file has it, so a crash between the
+    /// two leaves a note of where to look.
+    #[test]
+    fn commit_announces_the_name_before_the_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
+        let (staged, _file) = create(tmp.path(), "f.bin", &temp(), caller(me())).unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut announced = Vec::new();
+        let name = staged
+            .commit(|name| {
+                assert!(!dir.join(name).exists(), "{name} already renamed");
+                announced.push(name.to_string());
+            })
+            .unwrap();
+        assert_eq!(name, "f (1).bin");
+        assert_eq!(announced, ["f (1).bin"]);
+    }
+
     #[test]
     fn commit_never_replaces_a_file_that_appeared_meanwhile() {
         let tmp = tempfile::tempdir().unwrap();
         let (staged, mut file) = create(tmp.path(), "f.bin", &temp(), caller(me())).unwrap();
         file.write_all(b"new").unwrap();
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
-        assert_eq!(staged.commit().unwrap(), "f (1).bin");
+        assert_eq!(staged.commit(|_| {}).unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
         assert_eq!(std::fs::read(tmp.path().join("f (1).bin")).unwrap(), b"new");
         assert_eq!(names(tmp.path()), ["f (1).bin", "f.bin"]);
