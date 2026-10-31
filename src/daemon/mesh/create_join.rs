@@ -33,6 +33,8 @@ struct JoinContext<'a> {
     /// this build does not speak. Only [`VersionGate::Record`] can produce it,
     /// so it is always `None` on a fresh join.
     mismatch: Option<MeshVersionMismatch>,
+    /// This join's hold on `net_pubkey`, kept until the network is installed.
+    key_claim: &'a RegistrationClaim<EndpointId>,
 }
 
 /// What a mesh-protocol version mismatch means for the path that hit it.
@@ -560,14 +562,16 @@ impl NetworkRegistry {
     ) -> Result<TryJoin> {
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
-        // A network already live under another name must not be joined again:
-        // the dial registers its accept handler by key, over the live one's.
-        if initial
-            && let Some(live) = self
-                .networks
-                .iter()
-                .find(|handle| handle.network_key == net_pubkey)
-                .map(|handle| handle.name.clone())
+        // A network already live under another name must not be joined or
+        // restored again: the dial registers its accept handler by key, over
+        // the live one's. The key stays claimed until the handle is installed,
+        // so a second join of it under another name cannot pass this check
+        // while the first is still dialing.
+        let key_claim = self
+            .claim_network_key(net_pubkey)
+            .context("this network is already being joined or restored; try again shortly")?;
+        if let Some(live) = self.live_name_of_key(net_pubkey)
+            && Some(live.as_str()) != alias
         {
             anyhow::bail!("already in this network as '{live}'");
         }
@@ -687,6 +691,7 @@ impl NetworkRegistry {
             invite_lock: Arc::clone(&invite_lock),
             coordinator,
             mismatch,
+            key_claim: &key_claim,
         };
 
         // Establish the mesh link. A fresh join tries each coordinator in the
@@ -1044,12 +1049,12 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
     ) -> Result<bool> {
         let name = saved.name.as_str();
+        let key_claim = self
+            .claim_network_key(net_pubkey)
+            .with_context(|| format!("network '{name}' is already being joined or restored"))?;
         // Another path registered it meanwhile. `finalize_join` refuses too, but
         // the route seeding before it would already touch the live network.
-        anyhow::ensure!(
-            !self.networks.contains_key(name),
-            "already in network '{name}'"
-        );
+        self.ensure_not_live(name, net_pubkey)?;
         self.check_destruction(name, net_pubkey, None).await?;
         let persisted_hostname = saved.persisted_hostname.clone();
         let auto_accept_firewall = saved.auto_accept_firewall;
@@ -1105,6 +1110,7 @@ impl NetworkRegistry {
             // Not known without the record. The restore loop reads it once the
             // network is registered and flags the handle on a mismatch.
             mismatch: None,
+            key_claim: &key_claim,
         };
 
         let mesh = EstablishedMesh {
@@ -1165,6 +1171,18 @@ impl NetworkRegistry {
         .await
     }
 
+    /// Refuse a join whose name is taken, or whose network is live under
+    /// another name.
+    fn ensure_not_live(&self, display_name: &str, net_pubkey: EndpointId) -> Result<()> {
+        if self.networks.contains_key(display_name) {
+            anyhow::bail!("already in network '{display_name}'");
+        }
+        if let Some(live) = self.live_name_of_key(net_pubkey) {
+            anyhow::bail!("already in this network as '{live}'");
+        }
+        Ok(())
+    }
+
     /// Undo what a join that will not register left behind: its tasks, its
     /// accept handler, and the peers and routes it added under `display_name`.
     /// A live network with the same key or name owns what is registered under
@@ -1206,15 +1224,17 @@ impl NetworkRegistry {
             group_hash,
             invite_lock,
             mismatch,
+            key_claim,
             ..
         } = ctx;
 
-        // Never replace a live handle: its tasks would keep running on a second
-        // state for the same network. Checked before the config write too, so a
-        // losing registration does not rewrite the live one's record pointer.
-        if self.networks.contains_key(display_name) {
+        // Never replace a live handle, nor run a second one for the same key:
+        // its tasks would keep running on a second state for the same network.
+        // Checked before the config write too, so a losing registration does
+        // not rewrite the live one's record pointer.
+        if let Err(e) = self.ensure_not_live(display_name, net_pubkey) {
             self.abandon_join(display_name, net_pubkey, &cancel);
-            anyhow::bail!("already in network '{display_name}'");
+            return Err(e);
         }
 
         // Serialize the authority transition with every snapshot mutation. This
@@ -1288,10 +1308,12 @@ impl NetworkRegistry {
                 reconverge_worker,
                 my_hostname: Some(my_hostname),
                 dial,
+                key_claim,
             })
             .await;
         if !installed {
             self.abandon_join(display_name, net_pubkey, &cancel);
+            self.ensure_not_live(display_name, net_pubkey)?;
             anyhow::bail!("already in network '{display_name}'");
         }
         apply_suggested_firewall(
@@ -1797,6 +1819,7 @@ mod tests {
             reusable_keys: BTreeMap::new(),
             nullifiers: BTreeSet::new(),
         };
+        let key_claim = daemon.registry.claim_network_key(id(90)).unwrap();
         let context = JoinContext {
             display_name: "box",
             my_hostname: "studio",
@@ -1808,6 +1831,7 @@ mod tests {
             invite_lock: Arc::new(AsyncMutex::new(())),
             coordinator: None,
             mismatch: None,
+            key_claim: &key_claim,
         };
         let network_key = id(90).to_string();
         config::add_pending_join(config::PendingJoinEntry {

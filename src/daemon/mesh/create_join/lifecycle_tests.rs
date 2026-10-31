@@ -336,6 +336,18 @@ async fn a_queued_join_stops_retrying_once_the_network_is_live() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn a_fresh_join_refuses_a_network_live_under_another_name() {
+    refuses_a_network_live_under_another_name(true).await;
+}
+
+/// A restore of a saved name is refused the same way when the network is live
+/// under another one, as after a `ray join --name lab` of a saved `home`.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_restore_refuses_a_network_live_under_another_name() {
+    refuses_a_network_live_under_another_name(false).await;
+}
+
+async fn refuses_a_network_live_under_another_name(initial: bool) {
     let _config = ConfigDir::new();
     offline_discovery();
     let daemon = build_headless(false).await.unwrap();
@@ -352,13 +364,52 @@ async fn a_fresh_join_refuses_a_network_live_under_another_name() {
             None,
             false,
             false,
-            true,
+            initial,
         )
         .await;
     let Err(error) = joined else {
         panic!("a second join of a live network");
     };
     assert_eq!(error.to_string(), "already in this network as 'home'");
+    daemon.shutdown_and_close().await;
+}
+
+/// Two joins of one network under two names, as with `ray join --name a` and
+/// `--name b` of the same invite, or a restore of a saved name racing a join:
+/// the second is refused while the first is still dialing, before it can
+/// register an accept handler over the first's.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_join_waits_out_another_join_of_the_same_network() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    let _first = daemon.registry.claim_network_key(key).unwrap();
+
+    for initial in [true, false] {
+        let joined = daemon
+            .registry
+            .join_network_inner(
+                &key.to_string(),
+                Some("lab"),
+                None,
+                None,
+                None,
+                false,
+                false,
+                initial,
+            )
+            .await;
+        let Err(error) = joined else {
+            panic!("a second join of a network being joined");
+        };
+        assert!(
+            error.to_string().contains("already being joined"),
+            "{error:#}"
+        );
+    }
+    assert!(daemon.registry.claim_registration("lab").is_some());
     daemon.shutdown_and_close().await;
 }
 
@@ -653,7 +704,12 @@ async fn a_warm_resume_records_an_incompatible_mesh_version() {
     daemon.shutdown_and_close().await;
 }
 
-fn member_install(name: &str, key: EndpointId, state: SharedNetworkState) -> NetworkInstall<'_> {
+fn member_install<'a>(
+    name: &'a str,
+    key_claim: &'a RegistrationClaim<EndpointId>,
+    state: SharedNetworkState,
+) -> NetworkInstall<'a> {
+    let key = *key_claim.held();
     NetworkInstall {
         name,
         network_key: key,
@@ -665,6 +721,7 @@ fn member_install(name: &str, key: EndpointId, state: SharedNetworkState) -> Net
         reconverge_worker: None,
         my_hostname: None,
         dial: None,
+        key_claim,
     }
 }
 
@@ -685,9 +742,10 @@ async fn a_member_registered_from_the_blob_replaces_a_failed_handshakes_handler(
         .register(key, member_handler(registry, "home", key));
 
     let state = empty_state(key, "home");
+    let key_claim = registry.claim_network_key(key).unwrap();
     assert!(
         registry
-            .install_network(member_install("home", key, Arc::clone(&state)))
+            .install_network(member_install("home", &key_claim, Arc::clone(&state)))
             .await
     );
 
@@ -718,7 +776,8 @@ async fn a_losing_install_runs_nothing_on_its_state() {
         let _alive = alive;
         std::future::pending::<()>().await;
     });
-    let mut install = member_install("home", key, Arc::clone(&state));
+    let key_claim = registry.claim_network_key(key).unwrap();
+    let mut install = member_install("home", &key_claim, Arc::clone(&state));
     install.reconverge_worker = Some(worker);
     assert!(!registry.install_network(install).await);
 
@@ -753,7 +812,8 @@ async fn an_install_gives_way_to_a_live_network() {
     registry.conn.register(key, live_handler);
     let live_state = Arc::clone(&registry.networks.get("home").unwrap().state);
 
-    let install = member_install("home", key, empty_state(key, "home"));
+    let key_claim = registry.claim_network_key(key).unwrap();
+    let install = member_install("home", &key_claim, empty_state(key, "home"));
     let cancel = install.cancel.clone();
     assert!(!registry.install_network(install).await);
 
@@ -767,5 +827,61 @@ async fn an_install_gives_way_to_a_live_network() {
         panic!("the live handler stays registered");
     };
     assert!(Arc::ptr_eq(&handler.state, &live_handler_state));
+    daemon.shutdown_and_close().await;
+}
+
+/// Installing a live network's key under a second name is refused, and the
+/// first install keeps its handle, accept handler and tasks. The name claim
+/// alone let both go live: two handles on one key, each with a poller, and
+/// leaving either unregistered the handler the other relied on.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_second_install_of_a_live_key_is_refused() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    let key_claim = registry.claim_network_key(key).unwrap();
+
+    let home_state = empty_state(key, "home");
+    let home = member_install("home", &key_claim, Arc::clone(&home_state));
+    let home_cancel = home.cancel.clone();
+    assert!(registry.install_network(home).await);
+
+    let lab_state = empty_state(key, "lab");
+    let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::spawn(async move {
+        let _alive = alive;
+        std::future::pending::<()>().await;
+    });
+    let mut lab = member_install("lab", &key_claim, Arc::clone(&lab_state));
+    lab.reconverge_worker = Some(worker);
+    let lab_cancel = lab.cancel.clone();
+    assert!(!registry.install_network(lab).await, "the key is live");
+
+    assert!(lab_cancel.is_cancelled());
+    assert!(!registry.networks.contains_key("lab"));
+    assert_eq!(
+        Arc::strong_count(&lab_state),
+        1,
+        "no task holds the losing install's state"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), stopped)
+        .await
+        .expect("the losing install's worker is stopped");
+    assert!(ended.is_err(), "the worker was aborted, not finished");
+
+    assert!(!home_cancel.is_cancelled());
+    {
+        let handle = registry.networks.get("home").expect("home stays live");
+        assert!(Arc::ptr_eq(&handle.state, &home_state));
+        assert!(!handle.tasks.is_empty());
+        assert!(handle.tasks.iter().all(|task| !task.is_finished()));
+    }
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("home's member accept handler stays registered");
+    };
+    assert!(Arc::ptr_eq(&handler.state, &home_state));
     daemon.shutdown_and_close().await;
 }

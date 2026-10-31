@@ -275,6 +275,11 @@ impl NetworkRegistry {
             .clone()
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
+        // Held until the network is installed: a join of the same network under
+        // another name would otherwise go live beside this one.
+        let key_claim = self
+            .claim_network_key(net_public_key)
+            .with_context(|| format!("network '{name}' is already being joined or restored"))?;
         self.check_destruction(name, net_public_key, Some(&net_secret_key))
             .await?;
         let persisted_hostname = net_config.my_hostname.clone();
@@ -318,11 +323,14 @@ impl NetworkRegistry {
         let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
         // Another path may have registered this network while the roster was
         // resolving. Its state is the live one, so neither rewrite its config
-        // nor sign a record of ours.
+        // nor sign a record of ours. Under another name it is the same network.
         anyhow::ensure!(
             !self.networks.contains_key(name),
             "network '{name}' already active"
         );
+        if let Some(live) = self.live_name_of_key(net_public_key) {
+            anyhow::bail!("already in this network as '{live}'");
+        }
         let restored_hash_was_published = source_published && last_group_hash == source_hash;
 
         // Replace only the blob-derived projection on the latest saved config.
@@ -372,6 +380,7 @@ impl NetworkRegistry {
                 dial: Some(MemberDial {
                     my_hostname: persisted_hostname,
                 }),
+                key_claim: &key_claim,
             })
             .await;
         anyhow::ensure!(installed, "network '{name}' already active");
