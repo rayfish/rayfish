@@ -61,6 +61,21 @@ pub(super) struct ResumePolicy {
     pub(super) give_up_after: Duration,
 }
 
+/// How long a receive whose caller waits for it, the phone apps' accept, keeps
+/// trying without progress. Short, since the caller is blocked for all of it;
+/// what arrived is kept, so accepting again carries on from there.
+const BLOCKING_GIVE_UP_AFTER: Duration = Duration::from_secs(2 * 60);
+
+impl ResumePolicy {
+    /// This policy for a caller that blocks until the receive ends.
+    pub(super) fn for_blocking_call(self) -> Self {
+        Self {
+            give_up_after: self.give_up_after.min(BLOCKING_GIVE_UP_AFTER),
+            ..self
+        }
+    }
+}
+
 impl Default for ResumePolicy {
     fn default() -> Self {
         Self {
@@ -144,6 +159,7 @@ impl FileService {
         id: u64,
         output: Option<String>,
         recipient: Recipient,
+        policy: ResumePolicy,
     ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
         let filename = {
             let pending = self.pending_files.lock().unwrap();
@@ -161,17 +177,18 @@ impl FileService {
         if let Err(e) = usable {
             return op_err(format!("cannot save the file: {e}"));
         }
-        self.start_receive(id, output, recipient)
+        self.start_receive(id, output, recipient, policy)
     }
 
     /// Take pending offer `id` and start receiving it in a task the service
-    /// owns. The returned channel carries the outcome; dropping it leaves the
-    /// receive running.
+    /// owns, retrying as `policy` says. The returned channel carries the
+    /// outcome; dropping it leaves the receive running.
     pub(super) fn start_receive(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
         recipient: Recipient,
+        policy: ResumePolicy,
     ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
         let file = {
             let mut pending = self.pending_files.lock().unwrap();
@@ -182,6 +199,7 @@ impl FileService {
                 output: output.clone(),
                 recipient: recipient.clone(),
             });
+
             let mut active = self.active_files.lock().unwrap();
             active.push(file.clone());
             let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
@@ -214,12 +232,13 @@ impl FileService {
             .insert(transfer_id, cancel.clone());
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let service = Arc::clone(self);
+        let to = AcceptedReceive { output, recipient };
         tokio::spawn(async move {
             // Biased so a receive that finished in the same poll as a cancel
             // counts as finished.
             let written = tokio::select! {
                 biased;
-                written = service.run_receive(&file, transfer_id, output, recipient) => written,
+                written = service.run_receive(&file, transfer_id, to, policy) => written,
                 () = cancel.cancelled() => Err("receive canceled".to_string()),
             };
             service.receives.lock().unwrap().remove(&transfer_id);
@@ -261,7 +280,7 @@ impl FileService {
             .collect();
         for (id, to) in accepted {
             // Not awaited, as for auto-accept: the task logs its own outcome.
-            match self.start_receive(id, to.output, to.recipient) {
+            match self.start_receive(id, to.output, to.recipient, self.resume) {
                 Ok(_) => tracing::info!(id, "resuming accepted file receive"),
                 Err(error) => tracing::warn!(id, %error, "could not resume file receive"),
             }
@@ -334,8 +353,8 @@ impl FileService {
         &self,
         file: &PendingFile,
         transfer_id: u64,
-        output: Option<String>,
-        recipient: Recipient,
+        to: AcceptedReceive,
+        policy: ResumePolicy,
     ) -> Result<Written, String> {
         // Checked again here, not only when the offer was queued: offers saved
         // by an older daemon were never validated.
@@ -355,13 +374,17 @@ impl FileService {
             .set(&recv_tag, iroh_blobs::HashAndFormat::raw(file.blob_hash))
             .await
             .map_err(|e| format!("blob store error: {e}"))?;
-        self.fetch_resuming(file, transfer_id).await?;
-        self.save_received(file, output, recipient).await
+        self.fetch_resuming(file, transfer_id, policy).await?;
+        self.save_received(file, to).await
     }
 
     /// Fetch until the blob is complete, waiting out interruptions.
-    async fn fetch_resuming(&self, file: &PendingFile, transfer_id: u64) -> Result<(), String> {
-        let policy = self.resume;
+    async fn fetch_resuming(
+        &self,
+        file: &PendingFile,
+        transfer_id: u64,
+        policy: ResumePolicy,
+    ) -> Result<(), String> {
         let mut backoff = policy.first_backoff;
         let mut stalled = NoProgress::new(&policy);
         loop {
@@ -496,11 +519,10 @@ impl FileService {
     async fn save_received(
         &self,
         file: &PendingFile,
-        output: Option<String>,
-        recipient: Recipient,
+        to: AcceptedReceive,
     ) -> Result<Written, String> {
-        let dir = receive_dir(output.as_deref());
-        self.write_received(file.blob_hash, dir, &file.filename, recipient)
+        let dir = receive_dir(to.output.as_deref());
+        self.write_received(file.blob_hash, dir, &file.filename, to.recipient)
             .await
             .map_err(|e| format!("write failed: {e}"))
     }
@@ -633,6 +655,20 @@ mod tests {
         assert!(stalled.spent >= day - policy.max_backoff);
         stalled.reset();
         assert!(!stalled.exhausted(policy.max_backoff, day));
+    }
+
+    /// The Android accept blocks its caller, so it must not wait out a day.
+    #[test]
+    fn a_blocking_accept_gives_up_within_minutes() {
+        let policy = ResumePolicy::default();
+        let blocking = policy.for_blocking_call();
+        assert_eq!(blocking.give_up_after, BLOCKING_GIVE_UP_AFTER);
+        assert_eq!(blocking.max_backoff, policy.max_backoff);
+        let quick = quick_retries();
+        assert_eq!(
+            quick.for_blocking_call().give_up_after,
+            BLOCKING_GIVE_UP_AFTER
+        );
     }
 
     fn payload() -> Vec<u8> {
@@ -854,7 +890,7 @@ mod tests {
             caller_chose_dir: true,
         };
         let _outcome = receiver
-            .start_receive(1, output.clone(), recipient.clone())
+            .start_receive(1, output.clone(), recipient.clone(), quick_retries())
             .unwrap();
         stalled_rx.await.unwrap();
         wait_for(&receiver, &mut changes, |t| t.transferred > 0).await;

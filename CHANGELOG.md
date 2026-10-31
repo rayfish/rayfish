@@ -43,6 +43,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
   minute later. It shows as done once the recipient finishes it.
+- Android: a received file is moved to Downloads from a folder of its own, so
+  one whose name was already taken in the app's storage no longer moves the
+  older file instead. Accepting a file stops after two minutes without
+  progress rather than waiting up to a day; accepting it again carries on
+  from where it stopped.
 - Windows: a file accepted by a process running as SYSTEM into a folder it
   named resumes after a daemon restart instead of downloading again and then
   being refused.

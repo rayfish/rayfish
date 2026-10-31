@@ -907,7 +907,7 @@ impl FileService {
 
         // Only the start is awaited: an interrupted receive keeps retrying for
         // hours, and the receive task logs its own outcome.
-        match self.begin_receive(id, output, recipient).await {
+        match self.begin_receive(id, output, recipient, self.resume).await {
             Ok(_) => tracing::info!(from = %from.fmt_short(), "file auto-accepted"),
             Err(error) => {
                 tracing::warn!(from = %from.fmt_short(), %error, "file auto-accept failed");
@@ -924,6 +924,11 @@ impl FileService {
     /// The embedder entry point, which knows the caller only by uid. On
     /// Windows that identifies nobody, so a named directory is refused there;
     /// IPC goes through [`Self::accept_file_for`] with the pipe's caller.
+    ///
+    /// Its caller (the Android app) blocks until the receive ends, so it stops
+    /// retrying much sooner than a receive nobody waits on
+    /// ([`receive::ResumePolicy::for_blocking_call`]). An accept that gives up keeps
+    /// what arrived, and accepting again continues from there.
     pub(crate) async fn accept_file(
         self: &Arc<Self>,
         id: u64,
@@ -936,7 +941,8 @@ impl FileService {
             #[cfg(windows)]
             caller: WindowsCaller::Unknown,
         };
-        self.accept_file_for(id, output, recipient).await
+        let policy = self.resume.for_blocking_call();
+        self.wait_for_receive(id, output, recipient, policy).await
     }
 
     /// Like [`Self::accept_file`], but returns once the receive has started.
@@ -955,7 +961,10 @@ impl FileService {
             caller: WindowsCaller::Unknown,
         };
         // Dropping the outcome leaves the receive running; it logs the result.
-        drop(self.begin_receive(id, output, recipient).await?);
+        drop(
+            self.begin_receive(id, output, recipient, self.resume)
+                .await?,
+        );
         Ok(Done(format!(
             "receiving file {id}; see `ray files` for progress"
         )))
@@ -970,7 +979,18 @@ impl FileService {
         output: Option<String>,
         recipient: Recipient,
     ) -> OpResult<Done> {
-        let outcome = self.begin_receive(id, output, recipient).await?;
+        self.wait_for_receive(id, output, recipient, self.resume)
+            .await
+    }
+
+    async fn wait_for_receive(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        recipient: Recipient,
+        policy: receive::ResumePolicy,
+    ) -> OpResult<Done> {
+        let outcome = self.begin_receive(id, output, recipient, policy).await?;
         outcome
             .await
             .unwrap_or_else(|_| op_err("the receive stopped before reporting a result"))
