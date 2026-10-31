@@ -26,6 +26,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A received file is flushed to disk before it is reported as saved, so a
+  power loss right after cannot leave an empty file in its place.
 - On a network with several coordinators, a coordinator that created the
   network or restarted now picks up changes another coordinator makes, instead
   of missing them until something else prompted a refresh.

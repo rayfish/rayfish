@@ -13,8 +13,9 @@
 //! file itself is created with `O_CREAT | O_EXCL | O_NOFOLLOW`, so nothing that
 //! already exists at the name is ever opened, let alone followed.
 //!
-//! The file is written under a temporary name and moved to its real name only
-//! once every byte is on disk, without replacing anything already there. A
+//! The file is written under a temporary name, synced, and moved to its real
+//! name only once every byte is on disk, without replacing anything already
+//! there; the directory is synced after the rename so the name lasts too. A
 //! receive that is canceled or interrupted partway removes the temporary file,
 //! so it never leaves a truncated file under the name a retry would then have
 //! to number around.
@@ -50,6 +51,7 @@ impl Staged {
             match rename_no_replace(&self.dir, &temp, &to) {
                 Ok(()) => {
                     self.committed = true;
+                    sync_dir(&self.dir);
                     return Ok(OsString::from(name));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -503,6 +505,17 @@ fn exists_at(dir: &OwnedFd, name: &CStr) -> io::Result<bool> {
         return Ok(false);
     }
     Err(e)
+}
+
+/// Make a rename in `dir` durable. The file's bytes were synced before the
+/// rename; this is the directory entry that names them. Logged rather than
+/// returned: the file already has its name, and some filesystems (FUSE,
+/// Android's shared storage) refuse `fsync` on a directory outright.
+fn sync_dir(dir: &OwnedFd) {
+    // SAFETY: `dir` is an open directory descriptor for the call.
+    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+        tracing::debug!("sync directory: {}", io::Error::last_os_error());
+    }
 }
 
 fn unlink_at(dir: &OwnedFd, name: &CStr) -> io::Result<()> {

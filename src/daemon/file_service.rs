@@ -1026,6 +1026,10 @@ impl FileService {
         let mut out = tokio::fs::File::from_std(file);
         tokio::io::copy_buf(&mut reader, &mut out).await?;
         out.flush().await?;
+        // On disk before it gets its real name: once it has it, the delivery
+        // is confirmed and the sender drops its copy, so a power loss must
+        // not leave an empty file there instead.
+        out.sync_all().await?;
         drop(out);
         Ok(Written { staged, dir })
     }

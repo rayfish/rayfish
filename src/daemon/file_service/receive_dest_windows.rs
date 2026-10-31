@@ -26,8 +26,9 @@
 //! In place of the Unix `chown`, what is created for a caller carries an ACE
 //! granting that caller full control, on top of what it inherits.
 //!
-//! As on Unix, the file is written under a temporary name and renamed through
-//! its own handle once complete, without replacing an existing file. One
+//! As on Unix, the file is written under a temporary name, flushed to disk,
+//! and renamed through its own handle once complete, without replacing an
+//! existing file, then flushed again so the rename is on disk too. One
 //! dropped before that is deleted, so a canceled receive leaves nothing under
 //! the real name.
 
@@ -86,6 +87,12 @@ impl Staged {
             match rename_by_handle(&self.file, &self.dir.join(&name)) {
                 Ok(()) => {
                     self.committed = true;
+                    // Flushing the handle also writes out the file's own
+                    // record, which holds its new name. Logged rather than
+                    // returned: the file already has that name.
+                    if let Err(e) = self.file.sync_all() {
+                        tracing::debug!("flush {name:?} after rename: {e}");
+                    }
                     return Ok(OsString::from(name));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
