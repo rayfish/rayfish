@@ -170,12 +170,7 @@ pub(super) fn create(
     recipient: Recipient,
 ) -> io::Result<(Staged, File)> {
     let check = dir_check(&recipient)?;
-    let wanted = windows_file_name(file_name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("'{file_name}' is not a usable file name on Windows"),
-        )
-    })?;
+    let wanted = usable_name(file_name)?;
     let dir = open_dir(dir, &check)?;
     let (temp, file) = create_temp(&dir, check.caller_sid())?;
     let keep = match file.try_clone() {
@@ -195,6 +190,33 @@ pub(super) fn create(
     Ok((staged, file))
 }
 
+/// Check, without creating anything, that a file for `recipient` could be
+/// saved in `dir`: the caller is known, the name is usable, and the deepest
+/// existing directory passes the same check a write does. Lets an accept be
+/// refused before the download rather than after it.
+pub(super) fn check(dir: &Path, file_name: &str, recipient: &Recipient) -> io::Result<()> {
+    let check = dir_check(recipient)?;
+    usable_name(file_name)?;
+    let path = &absolute(dir)?;
+    let (dir, existing) = find_existing(path, &check)?;
+    let access = if missing_names(path, existing)?.is_empty() {
+        FILE_ADD_FILE
+    } else {
+        FILE_ADD_SUBDIRECTORY
+    };
+    check.require(&dir, access, path)
+}
+
+/// A peer's file name as it will be saved on Windows.
+fn usable_name(file_name: &str) -> io::Result<String> {
+    windows_file_name(file_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{file_name}' is not a usable file name on Windows"),
+        )
+    })
+}
+
 /// A directory held open, and the path it really has.
 struct OpenDir {
     handle: File,
@@ -211,10 +233,7 @@ fn open_dir(path: &Path, check: &DirCheck<'_>) -> io::Result<OpenDir> {
     // trace on disk. The caller's path may go through a link (a Downloads
     // folder redirected to another disk): what is checked is the directory
     // the handle ends up on.
-    let (mut dir, existing) = match check {
-        DirCheck::Configured => walk_without_links(path)?,
-        DirCheck::Trusted | DirCheck::Caller(_) => deepest_existing(path)?,
-    };
+    let (mut dir, existing) = find_existing(path, check)?;
     for name in missing_names(path, existing)? {
         check.require(&dir, FILE_ADD_SUBDIRECTORY, path)?;
         let child = dir.final_path.join(name);
@@ -223,6 +242,15 @@ fn open_dir(path: &Path, check: &DirCheck<'_>) -> io::Result<OpenDir> {
     }
     check.require(&dir, FILE_ADD_FILE, path)?;
     Ok(dir)
+}
+
+/// The deepest existing prefix of `path` and how many components it has,
+/// walked without links where `check` requires it.
+fn find_existing(path: &Path, check: &DirCheck<'_>) -> io::Result<(OpenDir, usize)> {
+    match check {
+        DirCheck::Configured => walk_without_links(path),
+        DirCheck::Trusted | DirCheck::Caller(_) => deepest_existing(path),
+    }
 }
 
 /// The deepest existing prefix of `path`, opened through any links in it,

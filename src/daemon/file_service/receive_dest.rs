@@ -116,24 +116,60 @@ pub(super) enum DirTrust {
     Configured(Option<u32>),
 }
 
+/// Check, without creating anything, that a file for `recipient` could be
+/// saved in `dir`: the part of it that exists passes the same check a write
+/// does, and the rest is plain names. Lets an accept be refused before the
+/// download rather than after it. Any plain file name is usable here.
+pub(super) fn check(dir: &Path, _file_name: &str, recipient: &Recipient) -> io::Result<()> {
+    let path = &absolute(dir)?;
+    let trust = recipient.dir_trust();
+    let found = find_existing(path, trust)?;
+    missing_names(path, found.existing)?;
+    check_dir(&found.dir, trust, found.link_free, path)
+}
+
+/// The deepest directory of a path that exists, opened.
+struct Existing {
+    dir: OwnedFd,
+    /// How many of the path's components it covers.
+    existing: usize,
+    /// Whether it was reached without following a link.
+    link_free: bool,
+}
+
+/// Find the deepest prefix of `path` that already exists, walking it without
+/// links when `trust` makes that matter.
+fn find_existing(path: &Path, trust: DirTrust) -> io::Result<Existing> {
+    if let DirTrust::Configured(_) = trust
+        && let Some((dir, existing)) = walk_without_links(path)?
+    {
+        return Ok(Existing {
+            dir,
+            existing,
+            link_free: true,
+        });
+    }
+    let (dir, existing) = deepest_existing(path)?;
+    Ok(Existing {
+        dir,
+        existing,
+        link_free: false,
+    })
+}
+
 /// Open `path` as a directory, creating its missing trailing components.
 fn open_dir(path: &Path, recipient: &Recipient) -> io::Result<OwnedFd> {
     // A relative path means the daemon's working directory, as it always has;
     // the walk below needs the absolute form to find an existing ancestor.
     let path = &absolute(path)?;
     let trust = recipient.dir_trust();
-    // Find the deepest prefix that already exists. Nothing is created until
-    // that directory has passed the check, so a refused request leaves no
-    // trace on disk.
-    let walked = match trust {
-        DirTrust::Configured(_) => walk_without_links(path)?,
-        DirTrust::Any | DirTrust::Owner(_) => None,
-    };
-    let link_free = walked.is_some();
-    let (mut dir, existing) = match walked {
-        Some(found) => found,
-        None => deepest_existing(path)?,
-    };
+    // Nothing is created until the deepest existing directory has passed the
+    // check, so a refused request leaves no trace on disk.
+    let Existing {
+        mut dir,
+        existing,
+        link_free,
+    } = find_existing(path, trust)?;
     let missing = missing_names(path, existing)?;
     check_dir(&dir, trust, link_free, path)?;
     for name in missing {

@@ -43,6 +43,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
   minute later. It shows as done once the recipient finishes it.
+- Accepting a file into a folder it cannot be saved in now fails right away,
+  before anything downloads. On macOS, where accepting returns as soon as the
+  download starts, a bad folder used to cost the whole download and then put
+  the file back in the list without saying why.
 - A file receive that is canceled, or stopped by a daemon restart, while the
   file is being written no longer leaves a truncated file under the file's
   name. The file is written under a hidden temporary name and appears under

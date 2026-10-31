@@ -91,6 +91,34 @@ pub(super) fn receive_slots() -> Semaphore {
 }
 
 impl FileService {
+    /// Check that offer `id` could be saved where it is going, then start
+    /// receiving it. A directory the file could never be saved in is refused
+    /// here, before anything is downloaded, with the offer left queued.
+    pub(super) async fn begin_receive(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        recipient: Recipient,
+    ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
+        let filename = {
+            let pending = self.pending_files.lock().unwrap();
+            let Some(file) = pending.iter().find(|file| file.id == id) else {
+                return op_err(format!("no pending file with id {id}"));
+            };
+            file.filename.clone()
+        };
+        let dir = receive_dir(output.as_deref());
+        let checked = recipient.clone();
+        let usable =
+            tokio::task::spawn_blocking(move || receive_dest::check(&dir, &filename, &checked))
+                .await
+                .map_err(|e| OpError::msg(format!("destination check failed: {e}")))?;
+        if let Err(e) = usable {
+            return op_err(format!("cannot save the file: {e}"));
+        }
+        self.start_receive(id, output, recipient)
+    }
+
     /// Take pending offer `id` and start receiving it in a task the service
     /// owns. The returned channel carries the outcome; dropping it leaves the
     /// receive running.
@@ -419,17 +447,23 @@ impl FileService {
         output: Option<String>,
         recipient: Recipient,
     ) -> Result<Written, String> {
-        let dir = match output {
-            Some(ref p) => PathBuf::from(p),
-            None => dirs::download_dir().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Downloads")
-            }),
-        };
+        let dir = receive_dir(output.as_deref());
         self.write_received(file.blob_hash, dir, &file.filename, recipient)
             .await
             .map_err(|e| format!("write failed: {e}"))
+    }
+}
+
+/// The directory a receive saves into: the one asked for, or the daemon
+/// user's Downloads.
+fn receive_dir(output: Option<&str>) -> PathBuf {
+    match output {
+        Some(p) => PathBuf::from(p),
+        None => dirs::download_dir().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Downloads")
+        }),
     }
 }
 
@@ -814,7 +848,10 @@ mod tests {
         offer(&receiver, key.public(), &data);
         let output = Some(tmp.path().join("downloads").to_string_lossy().into_owned());
 
-        let started = receiver.start_accepting_file(1, output, None).unwrap();
+        let started = receiver
+            .start_accepting_file(1, output, None)
+            .await
+            .unwrap();
         assert!(started.0.contains("receiving"), "{started:?}");
         assert!(receiver.pending_files.lock().unwrap().is_empty());
         let running = receive(&receiver);

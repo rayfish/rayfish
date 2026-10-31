@@ -880,9 +880,9 @@ impl FileService {
             caller: WindowsCaller::System,
         };
 
-        // Not awaited: an interrupted receive keeps retrying for hours, and
-        // the receive task logs its own outcome.
-        match self.start_receive(id, output, recipient) {
+        // Only the start is awaited: an interrupted receive keeps retrying for
+        // hours, and the receive task logs its own outcome.
+        match self.begin_receive(id, output, recipient).await {
             Ok(_) => tracing::info!(from = %from.fmt_short(), "file auto-accepted"),
             Err(error) => {
                 tracing::warn!(from = %from.fmt_short(), %error, "file auto-accept failed");
@@ -917,7 +917,7 @@ impl FileService {
     /// Like [`Self::accept_file`], but returns once the receive has started.
     /// For the apps, whose provider calls time out long before a large
     /// download ends; they follow it in the transfer list.
-    pub(crate) fn start_accepting_file(
+    pub(crate) async fn start_accepting_file(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
@@ -930,7 +930,7 @@ impl FileService {
             caller: WindowsCaller::Unknown,
         };
         // Dropping the outcome leaves the receive running; it logs the result.
-        drop(self.start_receive(id, output, recipient)?);
+        drop(self.begin_receive(id, output, recipient).await?);
         Ok(Done(format!(
             "receiving file {id}; see `ray files` for progress"
         )))
@@ -945,7 +945,7 @@ impl FileService {
         output: Option<String>,
         recipient: Recipient,
     ) -> OpResult<Done> {
-        let outcome = self.start_receive(id, output, recipient)?;
+        let outcome = self.begin_receive(id, output, recipient).await?;
         outcome
             .await
             .unwrap_or_else(|_| op_err("the receive stopped before reporting a result"))
@@ -2937,6 +2937,30 @@ mod tests {
         assert!(message.contains("not owned by uid"), "{message}");
         assert!(!downloads.join("sub").exists());
         assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+    }
+
+    /// The apps' accept returns as soon as the receive starts, so a folder
+    /// the file cannot go to has to be refused then, not after the whole
+    /// download. The sender here is unreachable: nothing could be fetched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn starting_an_accept_into_a_refused_directory_fails_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let file = pending(1);
+        service.queue_incoming_offer(file.from, file);
+        let (uid, gid) = current_cred();
+        let other = (uid.wrapping_add(1).max(1), gid);
+        let output = Some(tmp.path().join("downloads").to_string_lossy().into_owned());
+        let Err(error) = service.start_accepting_file(1, output, Some(other)).await else {
+            panic!("a directory owned by someone else must be refused before the download");
+        };
+        assert!(error.message().contains("not owned by uid"), "{error}");
+        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+        assert!(service.transfers.list().is_empty());
+        assert!(!tmp.path().join("downloads").exists());
     }
 
     /// A link planted at the file name must not redirect the daemon's write.
