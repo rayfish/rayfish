@@ -683,7 +683,7 @@ pub(crate) fn revoke_peer_network(
 /// arrives while the roster is still converging (a restart, a fresh join, a blob
 /// that lands after the link) is dropped and never retried: the connection then
 /// carries a network the peer table does not list. That is not cosmetic, the set
-/// is the in-band reachability wall, so `resolve_inbound_by_id` drops the
+/// is the in-band reachability wall, so `resolve_inbound` drops the
 /// network's inbound datagrams and `ray status` shows the peer `Idle` on it while
 /// it is plainly `Active` on another. Reconverge is the right place to repair it:
 /// it runs exactly when a verified roster arrives, which is the information that

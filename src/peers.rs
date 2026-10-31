@@ -291,7 +291,7 @@ impl PeerEntry {
     /// left a network while we were the coordinator, or without being able to
     /// tell us, stays in our set for good, since our own roster is the record
     /// nothing else corrects. The peer drops any datagram tagged with a network
-    /// it does not share ([`PeerTable::resolve_inbound_by_id`]), so tagging one
+    /// it does not share ([`PeerTable::resolve_inbound`]), so tagging one
     /// black-holes the peer entirely while its `.ray` names keep resolving from
     /// that same stale roster. `in_handles` is the peer's own statement of what
     /// this connection carries and is already on the wire, so preferring it
@@ -579,21 +579,22 @@ impl PeerTable {
         Some(Duration::from_millis(idle_ms.saturating_sub(elapsed_ms)))
     }
 
-    /// Resolve an inbound datagram from `peer_id` tagged with `handle` to the
-    /// peer's mesh IPv6 and its arrival network, enforcing the in-band
-    /// reachability wall in one lock pass: returns `Some` only when the peer is
-    /// known, the handle maps to a network the peer announced, **and** our own
-    /// shared-network set with this peer currently contains that network. An
-    /// unknown peer/handle or a network we don't share drops the datagram
-    /// (`None`).
-    pub fn resolve_inbound_by_id(
+    /// Resolve an inbound datagram tagged with `handle` from the peer at mesh
+    /// IPv6 `ip` to its arrival network, enforcing the in-band reachability wall
+    /// in one lock pass: returns `Some` only when the peer is known, the handle
+    /// maps to a network the peer announced, **and** our own shared-network set
+    /// with this peer currently contains that network. An unknown peer/handle or
+    /// a network we don't share drops the datagram (`None`).
+    ///
+    /// `ip` is the peer's [`membership::derive_ipv6`], which the caller derives
+    /// once per connection so the per-datagram path does no hashing.
+    pub fn resolve_inbound(
         &self,
-        peer_id: &EndpointId,
+        ip: &Ipv6Addr,
         conn: &Connection,
         handle: u16,
-    ) -> Option<(Ipv6Addr, SmolStr)> {
-        let ip = membership::derive_ipv6(peer_id);
-        let e = self.peers.get(&ip)?;
+    ) -> Option<SmolStr> {
+        let e = self.peers.get(ip)?;
         if !e.active.matches(conn) {
             return None;
         }
@@ -606,7 +607,7 @@ impl PeerTable {
         // past the reachability wall above, so spoofed or out-of-network traffic
         // can't hold an otherwise-idle connection open.
         e.active.last_active.store(now_ms(), Ordering::Relaxed);
-        Some((ip, network.clone()))
+        Some(network.clone())
     }
 
     /// Resolves a mesh IPv6 destination to a [`PeerRoute`], or `None` if no peer
@@ -740,7 +741,7 @@ impl PeerTable {
     /// while the roster is still converging (a restart, a fresh join) leaves the
     /// connection carrying a network the peer table doesn't know about. Nothing
     /// else repairs that: the entry is only rebuilt by a fresh dial, and until
-    /// then `resolve_inbound_by_id` drops the network's datagrams and `ray status`
+    /// then `resolve_inbound` drops the network's datagrams and `ray status`
     /// reports the peer `Idle` on it while it is plainly connected on another.
     ///
     /// [`handle_member_hello`]: crate::daemon::mesh
@@ -759,7 +760,7 @@ impl PeerTable {
     /// keyed by the peer's endpoint id. Upsert (not replace), so announcing one
     /// network's handle doesn't clobber the decode entries for the peer's other
     /// shared networks. A stale entry for a network we no longer share is harmless
-    /// (the reachability check in `resolve_inbound_by_id` drops its datagrams).
+    /// (the reachability check in `resolve_inbound` drops its datagrams).
     pub fn add_inbound_handle_by_id(
         &self,
         peer_id: &EndpointId,
@@ -1244,8 +1245,12 @@ mod tests {
                 let (handle, payload) = crate::forward::untag_datagram(&packet).unwrap();
                 assert_eq!(payload, b"ping");
                 assert_eq!(
-                    receiver.resolve_inbound_by_id(&source_id, receiving_conn, handle),
-                    Some((membership::derive_ipv6(&source_id), SmolStr::new(network)))
+                    receiver.resolve_inbound(
+                        &membership::derive_ipv6(&source_id),
+                        receiving_conn,
+                        handle
+                    ),
+                    Some(SmolStr::new(network))
                 );
             }
         }
@@ -1430,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_network_reopens_the_reachability_wall_for_that_network() {
-        // The missing network is not cosmetic: `resolve_inbound_by_id` drops every
+        // The missing network is not cosmetic: `resolve_inbound` drops every
         // datagram tagged with a network the peer entry does not list, so an
         // unrepaired entry silently blackholes that network's traffic.
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
@@ -1443,15 +1448,15 @@ mod tests {
         table.add_inbound_handle_by_id(&peer, &conn, 7, SmolStr::new("n2"));
 
         assert_eq!(
-            table.resolve_inbound_by_id(&peer, &conn, 7),
+            table.resolve_inbound(&ipv6, &conn, 7),
             None,
             "n2 datagrams must be dropped while the entry does not share n2"
         );
 
         table.attach_network(&ipv6, "n2");
         assert_eq!(
-            table.resolve_inbound_by_id(&peer, &conn, 7),
-            Some((ipv6, SmolStr::new("n2"))),
+            table.resolve_inbound(&ipv6, &conn, 7),
+            Some(SmolStr::new("n2")),
             "after the repair the same datagram must be accepted on n2"
         );
     }

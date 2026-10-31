@@ -457,10 +457,15 @@ pub fn mark_coordinator(members: &mut MemberList, identity: &EndpointId) {
 }
 
 /// Derives a stable IPv6 address from an [`EndpointId`] in the `200::/7` range.
-/// Uses blake3 to hash the identity, takes 15 bytes, and prepends `0x02`.
-/// The 120-bit address space makes collisions practically impossible.
+/// Uses blake3 to hash the identity's lowercase hex form (its `Display`), takes
+/// 15 bytes, and prepends `0x02`. The 120-bit address space makes collisions
+/// practically impossible. The hex is built on the stack, so the per-packet
+/// callers do not allocate.
 pub fn derive_ipv6(identity: &EndpointId) -> Ipv6Addr {
-    let hash = blake3::hash(identity.to_string().as_bytes());
+    let mut hex = [0u8; 64];
+    hex::encode_to_slice(identity.as_bytes(), &mut hex)
+        .expect("a 32-byte key always encodes to exactly 64 hex digits");
+    let hash = blake3::hash(&hex);
     let bytes = hash.as_bytes();
     let octets: [u8; 16] = [
         0x02, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -745,6 +750,23 @@ mod tests {
     fn test_derive_ipv6_deterministic() {
         let id = test_id(1);
         assert_eq!(derive_ipv6(&id), derive_ipv6(&id));
+    }
+
+    /// Mesh addresses are part of every deployed network: a peer's address must
+    /// never change across releases, whatever the derivation's implementation.
+    #[test]
+    fn derive_ipv6_is_pinned() {
+        let pinned: [(u8, &str); 2] = [
+            (1, "2c0:fecd:7844:6700:a562:1a3b:80ef:2ca3"),
+            (200, "242:9e7a:ab35:a7ff:974b:a076:2d2c:b5b6"),
+        ];
+        for (seed, expected) in pinned {
+            assert_eq!(
+                derive_ipv6(&test_id(seed)).to_string(),
+                expected,
+                "seed {seed}"
+            );
+        }
     }
 
     #[test]
