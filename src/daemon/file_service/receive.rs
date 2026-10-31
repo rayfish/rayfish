@@ -55,9 +55,9 @@ pub(super) struct ResumePolicy {
     /// moved no bytes.
     pub(super) first_backoff: Duration,
     pub(super) max_backoff: Duration,
-    /// How long to keep trying without receiving a single byte. Measured on
-    /// the monotonic clock, which stops while the machine sleeps, so a night
-    /// with the lid closed does not count against it.
+    /// How long to keep trying without receiving a single byte. Counted as
+    /// the time spent trying (see [`NoProgress`]), not as time elapsed, so a
+    /// night with the lid closed does not count against it on any platform.
     pub(super) give_up_after: Duration,
 }
 
@@ -70,6 +70,51 @@ impl Default for ResumePolicy {
             max_backoff: Duration::from_secs(60),
             give_up_after: Duration::from_secs(24 * 60 * 60),
         }
+    }
+}
+
+/// Time spent trying since a receive last moved a byte, for
+/// [`ResumePolicy::give_up_after`].
+///
+/// Not the time elapsed: whether a clock counts a suspend differs between
+/// platforms (Windows' can), and a laptop that sleeps through a night with one
+/// attempt pending must not come back to a receive it gave up on. So it adds
+/// up the backoff waits it asked for and each failed attempt's own duration,
+/// with an attempt capped at the longest one could take awake (a connect
+/// timeout, then an idle one). However long a suspend inside either lasts,
+/// it counts as at most that.
+#[derive(Debug)]
+struct NoProgress {
+    spent: Duration,
+    longest_attempt: Duration,
+}
+
+impl NoProgress {
+    fn new(policy: &ResumePolicy) -> Self {
+        Self {
+            spent: Duration::ZERO,
+            longest_attempt: policy.connect_timeout.saturating_add(policy.idle_timeout),
+        }
+    }
+
+    /// Bytes moved: start counting again.
+    fn reset(&mut self) {
+        self.spent = Duration::ZERO;
+    }
+
+    /// An attempt that moved nothing, as long as it took by the clock.
+    fn failed_attempt(&mut self, took: Duration) {
+        self.spent = self.spent.saturating_add(took.min(self.longest_attempt));
+    }
+
+    /// A backoff wait that was asked for.
+    fn waited(&mut self, wait: Duration) {
+        self.spent = self.spent.saturating_add(wait);
+    }
+
+    /// Whether waiting `next` more would go past `limit`.
+    fn exhausted(&self, next: Duration, limit: Duration) -> bool {
+        self.spent.saturating_add(next) > limit
     }
 }
 
@@ -318,15 +363,19 @@ impl FileService {
     async fn fetch_resuming(&self, file: &PendingFile, transfer_id: u64) -> Result<(), String> {
         let policy = self.resume;
         let mut backoff = policy.first_backoff;
-        let mut last_progress = Instant::now();
+        let mut stalled = NoProgress::new(&policy);
         loop {
-            let attempt = {
+            let (attempt, took) = {
                 let _slot = self
                     .receive_slots
                     .acquire()
                     .await
                     .map_err(|_| "file receives are shutting down".to_string())?;
-                self.fetch_once(file, transfer_id, &policy).await
+                // Timed once the slot is held: waiting for other receives to
+                // finish is not trying.
+                let started = Instant::now();
+                let attempt = self.fetch_once(file, transfer_id, &policy).await;
+                (attempt, started.elapsed())
             };
             let reason = match attempt {
                 Ok(()) => return Ok(()),
@@ -334,12 +383,14 @@ impl FileService {
                 Err(FetchError::Interrupted { reason, progressed }) => {
                     if progressed {
                         backoff = policy.first_backoff;
-                        last_progress = Instant::now();
+                        stalled.reset();
+                    } else {
+                        stalled.failed_attempt(took);
                     }
                     reason
                 }
             };
-            if last_progress.elapsed() + backoff > policy.give_up_after {
+            if stalled.exhausted(backoff, policy.give_up_after) {
                 return Err(format!(
                     "{reason}; gave up after {} hours without progress",
                     policy.give_up_after.as_secs() / 3600
@@ -354,6 +405,7 @@ impl FileService {
             );
             self.transfers.note_retrying(transfer_id, &reason);
             tokio::time::sleep(backoff).await;
+            stalled.waited(backoff);
             backoff = backoff.saturating_mul(2).min(policy.max_backoff);
         }
     }
@@ -560,6 +612,27 @@ mod tests {
             max_backoff: Duration::from_millis(200),
             give_up_after: Duration::from_secs(3600),
         }
+    }
+
+    /// A suspend in the middle of an attempt or a wait, however long, must
+    /// not use up the give-up window by itself.
+    #[test]
+    fn a_long_sleep_alone_does_not_give_up() {
+        let policy = ResumePolicy::default();
+        let day = policy.give_up_after;
+        let mut stalled = NoProgress::new(&policy);
+        // One attempt that the clock says took two days: the machine slept
+        // through it.
+        stalled.failed_attempt(2 * day);
+        assert!(!stalled.exhausted(policy.max_backoff, day));
+        // A day's worth of waiting that really happened does give up.
+        while !stalled.exhausted(policy.max_backoff, day) {
+            stalled.waited(policy.max_backoff);
+            stalled.failed_attempt(Duration::from_secs(1));
+        }
+        assert!(stalled.spent >= day - policy.max_backoff);
+        stalled.reset();
+        assert!(!stalled.exhausted(policy.max_backoff, day));
     }
 
     fn payload() -> Vec<u8> {
