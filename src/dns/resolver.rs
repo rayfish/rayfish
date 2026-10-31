@@ -28,7 +28,7 @@ use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
 /// legitimate upstream, and under a full tunnel it is the *best* one, being
 /// reachable only through the tunnel by construction. `MAGIC_DNS_V4` is here
 /// only because an older build may have left it in a file we then captured.
-fn is_own_resolver(ip: IpAddr) -> bool {
+pub(crate) fn is_own_resolver(ip: IpAddr) -> bool {
     ip == IpAddr::V6(MAGIC_DNS_V6) || ip == IpAddr::V4(MAGIC_DNS_V4)
 }
 
@@ -118,8 +118,9 @@ impl Resolver {
     /// resolver addresses to avoid recursion. Clearing this restores normal DNS.
     pub fn set_tunnel_upstreams(&self, addrs: Option<Vec<SocketAddr>>) {
         // An override that filters down to nothing becomes no override: `forward`
-        // reads an empty list as "no upstream configured" and refuses, where
-        // falling back to the captured ones at least resolves something.
+        // reads an empty list as "no upstream configured" and refuses.
+        // `exit_node::tunnel_upstreams` drops our own addresses itself, so an
+        // exit tunnel never reaches this and never falls back to the captured set.
         let addrs = addrs
             .map(|v| {
                 v.into_iter()
@@ -161,7 +162,8 @@ impl Resolver {
     }
 
     /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
-    /// avoid a forwarding loop. The desktop capture path uses this.
+    /// avoid a forwarding loop. The desktop capture holds IPv6 servers too and
+    /// goes through [`Self::set_upstream_addrs`] instead.
     pub fn set_upstreams(&self, servers: Vec<Ipv4Addr>) {
         self.set_upstream_addrs(servers.into_iter().map(|ip| SocketAddr::from((ip, 53u16))));
     }
@@ -472,22 +474,74 @@ where
 /// Lower an EDNS UDP size the reply could not fit back into the TUN to
 /// [`MAX_DNS_PAYLOAD`], so the upstream trims or truncates its answer itself
 /// instead of sending one we would have to drop. A query without EDNS (512
-/// bytes) or one we cannot parse goes out unchanged.
+/// bytes) or one we cannot walk goes out unchanged.
+///
+/// The size is the OPT record's CLASS field, patched in place. Re-encoding the
+/// query would drop what the encoder does not model (the EDNS version) and
+/// change the bytes a TSIG or SIG(0) signature covers.
 fn clamp_edns(query: &[u8]) -> Cow<'_, [u8]> {
-    let Ok(mut packet) = simple_dns::Packet::parse(query) else {
-        return Cow::Borrowed(query);
-    };
-    let Some(opt) = packet.opt_mut().as_mut() else {
-        return Cow::Borrowed(query);
-    };
     let max = u16::try_from(MAX_DNS_PAYLOAD).unwrap_or(u16::MAX);
-    if opt.udp_packet_size <= max {
+    let Some(at) = opt_size_offset(query) else {
+        return Cow::Borrowed(query);
+    };
+    let size = u16::from_be_bytes([query[at], query[at + 1]]);
+    if size <= max {
         return Cow::Borrowed(query);
     }
-    opt.udp_packet_size = max;
-    match packet.build_bytes_vec() {
-        Ok(bytes) => Cow::Owned(bytes),
-        Err(_) => Cow::Borrowed(query),
+    let mut out = query.to_vec();
+    out[at..at + 2].copy_from_slice(&max.to_be_bytes());
+    Cow::Owned(out)
+}
+
+/// The offset of the OPT record's CLASS (UDP payload size) in a raw query, or
+/// `None` if there is no OPT record or the message does not parse that far.
+fn opt_size_offset(msg: &[u8]) -> Option<usize> {
+    const OPT: u16 = 41;
+    let count = |at: usize| -> Option<usize> {
+        Some(usize::from(u16::from_be_bytes([
+            *msg.get(at)?,
+            *msg.get(at + 1)?,
+        ])))
+    };
+    let questions = count(4)?;
+    let additional_from = count(6)? + count(8)?;
+    let records = additional_from + count(10)?;
+    let mut at = 12;
+    for _ in 0..questions {
+        at = skip_name(msg, at)?.checked_add(4)?;
+    }
+    for index in 0..records {
+        let owner = at;
+        at = skip_name(msg, at)?;
+        let rtype = u16::from_be_bytes([*msg.get(at)?, *msg.get(at + 1)?]);
+        let rdlen = usize::from(u16::from_be_bytes([*msg.get(at + 8)?, *msg.get(at + 9)?]));
+        // OPT is only valid in the additional section, owned by the root.
+        if rtype == OPT && index >= additional_from && msg.get(owner) == Some(&0) {
+            return Some(at + 2);
+        }
+        at = at.checked_add(10 + rdlen)?;
+        if at > msg.len() {
+            return None;
+        }
+    }
+    None
+}
+
+/// The offset just past the name at `at`: labels up to the root, or up to and
+/// including a two-byte compression pointer.
+fn skip_name(msg: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let len = *msg.get(at)?;
+        match len & 0xc0 {
+            0x00 if len == 0 => return Some(at + 1),
+            0x00 => at += 1 + usize::from(len),
+            0xc0 => {
+                msg.get(at + 1)?;
+                return Some(at + 2);
+            }
+            // 0x40 and 0x80 are reserved label types.
+            _ => return None,
+        }
     }
 }
 
@@ -1146,6 +1200,44 @@ mod tests {
         assert!(pkt.answers.is_empty());
     }
 
+    /// Only the OPT record's UDP size changes. Re-encoding the query dropped
+    /// the EDNS version and would alter a signed (TSIG/SIG(0)) query, so every
+    /// other byte, the DO bit and a record after the OPT included, must be the
+    /// client's own.
+    #[test]
+    fn clamp_edns_rewrites_only_the_udp_size() {
+        #[rustfmt::skip]
+        let query: Vec<u8> = [
+            // Header: id, RD, one question, two additional records.
+            &[0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 2][..],
+            // example.com A IN
+            &[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1],
+            // OPT: root owner, size 4096, ext-rcode 0, version 1, DO, one option.
+            &[0, 0, 41, 0x10, 0x00, 0, 1, 0x80, 0, 0, 6, 0, 10, 0, 2, 0xab, 0xcd],
+            // A TSIG-shaped record after it, owner compressed to the qname.
+            &[0xc0, 12, 0, 250, 0, 255, 0, 0, 0, 0, 0, 4, 0xde, 0xad, 0xbe, 0xef],
+        ]
+        .concat();
+        let size_at = 12 + 17 + 3;
+
+        let clamped = clamp_edns(&query);
+        let mut want = query.clone();
+        let max = u16::try_from(MAX_DNS_PAYLOAD).expect("the payload fits a u16");
+        want[size_at..size_at + 2].copy_from_slice(&max.to_be_bytes());
+        assert_eq!(clamped.as_ref(), want.as_slice());
+
+        // At or under the limit, and without EDNS, the query is not touched.
+        assert!(matches!(clamp_edns(&want), Cow::Borrowed(_)));
+        let mut plain = query[..12 + 17].to_vec();
+        plain[11] = 0;
+        assert!(matches!(clamp_edns(&plain), Cow::Borrowed(_)));
+        // Truncated inside the OPT record: left alone, not patched blindly.
+        assert!(matches!(
+            clamp_edns(&query[..size_at + 1]),
+            Cow::Borrowed(_)
+        ));
+    }
+
     #[test]
     fn servfail_rejects_a_runt_packet() {
         // Shorter than a DNS header: there is nothing to turn into a response.
@@ -1302,7 +1394,7 @@ mod tests {
         assert_eq!(r.upstreams(), vec![peer]);
 
         // And the tunnel override, where dropping it is worst: an empty result
-        // becomes `None`, and the forwarder falls back to the captured IPv4
+        // becomes `None`, and the forwarder falls back to the captured
         // servers, which leave around the exit.
         r.set_tunnel_upstreams(Some(vec![peer]));
         assert_eq!(r.tunnel_upstreams(), Some(vec![peer]));

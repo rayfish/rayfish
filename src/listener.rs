@@ -50,7 +50,7 @@ pub(crate) fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
 /// for a single bad moment, and retrying at once on `EMFILE` is a busy loop,
 /// because the pending connection stays queued and the next accept fails the
 /// same way. So wait, doubling up to [`Self::MAX`], and start over after a
-/// success.
+/// success. A client giving up needs no wait (see [`Self::wait`]).
 pub(crate) struct AcceptBackoff {
     delay: Duration,
 }
@@ -69,7 +69,18 @@ impl AcceptBackoff {
     }
 
     /// Log a failed accept and sleep before the next attempt.
+    ///
+    /// A client that reset or abandoned its connection in the backlog is
+    /// routine, not a fault of the listener: the next accept can succeed at
+    /// once, so it is logged at debug and not waited on.
     pub(crate) async fn wait(&mut self, error: &io::Error, listener: &str) {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+        ) {
+            tracing::debug!(%error, listener, "client left before accept");
+            return;
+        }
         tracing::warn!(%error, listener, retry_in = ?self.delay, "accept failed");
         tokio::time::sleep(self.delay).await;
         self.delay = (self.delay * 2).min(Self::MAX);
@@ -127,6 +138,26 @@ mod tests {
         backoff.reset();
         let started = Instant::now();
         backoff.wait(&error, "test").await;
+        assert_eq!(started.elapsed(), AcceptBackoff::MIN);
+    }
+
+    /// A client that gave up in the backlog is routine: the next accept can
+    /// succeed at once, so there is no wait and the backoff does not grow.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_giving_up_is_not_backed_off() {
+        let mut backoff = AcceptBackoff::new();
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            let started = Instant::now();
+            backoff.wait(&io::Error::from(kind), "test").await;
+            assert_eq!(started.elapsed(), Duration::ZERO, "{kind:?}");
+        }
+        let started = Instant::now();
+        backoff
+            .wait(&io::Error::from_raw_os_error(24), "test")
+            .await;
         assert_eq!(started.elapsed(), AcceptBackoff::MIN);
     }
 

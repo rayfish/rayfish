@@ -79,6 +79,7 @@ use iroh::EndpointId;
 use ray_proto::SuggestedFirewall;
 use ray_proto::ipc::{FirewallRuleView, MachineHostname};
 use serde::{Deserialize, Serialize};
+use tokio::runtime::RuntimeFlavor;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -495,18 +496,33 @@ impl SharedFirewall {
     /// `persist` runs before the next edit starts, so the saved file ends in
     /// the same state as the live config. An `Err` from `edit` leaves both
     /// untouched.
+    ///
+    /// Waiting for the lock and the save are blocking work, and the callers are
+    /// async IPC and reconverge handlers. On a multi-thread runtime the worker
+    /// is handed off for the duration, so other tasks keep running.
     pub fn try_edit<T, E>(
         &self,
         edit: impl FnOnce(&mut FirewallConfig) -> std::result::Result<T, E>,
         persist: impl FnOnce(&FirewallConfig),
     ) -> std::result::Result<T, E> {
-        let _serialized = self.edits.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut config = (*self.inner.load_full()).clone();
-        let out = edit(&mut config)?;
-        let config = Arc::new(config);
-        self.inner.store(Arc::clone(&config));
-        persist(&config);
-        Ok(out)
+        let run = || {
+            let _serialized = self.edits.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut config = (*self.inner.load_full()).clone();
+            let out = edit(&mut config)?;
+            let config = Arc::new(config);
+            self.inner.store(Arc::clone(&config));
+            persist(&config);
+            Ok(out)
+        };
+        // `block_in_place` panics on a current-thread runtime; there, and
+        // outside any runtime, there is no other worker to hand off to.
+        let multi_thread = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == RuntimeFlavor::MultiThread);
+        if multi_thread {
+            tokio::task::block_in_place(run)
+        } else {
+            run()
+        }
     }
 
     /// [`Self::try_edit`] for an edit that cannot fail.

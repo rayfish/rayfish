@@ -19,9 +19,9 @@ pub mod config;
 pub mod packet;
 pub mod resolver;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use dashmap::DashMap;
 use tokio::sync::RwLock;
@@ -76,6 +76,29 @@ pub fn new_reverse_table() -> ReverseLookupTable {
     Arc::new(DashMap::new())
 }
 
+/// Roster names already reported by [`report_invalid_hostname`]. A name an
+/// older coordinator assigned stays on the roster, and every roster sync would
+/// otherwise warn about it again. Capped so a hostile roster cannot grow it;
+/// past the cap, new names log at debug only.
+static REPORTED_INVALID: LazyLock<Mutex<HashSet<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+const REPORTED_INVALID_MAX: usize = 1024;
+
+/// Say once per network and name that Magic DNS will not answer for `hostname`.
+fn report_invalid_hostname(network: &str, hostname: &str) {
+    let first = {
+        let mut seen = REPORTED_INVALID
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        seen.len() < REPORTED_INVALID_MAX && seen.insert((network.to_owned(), hostname.to_owned()))
+    };
+    if first {
+        tracing::warn!(%network, %hostname, "ignoring invalid hostname: Magic DNS will not answer for it");
+    } else {
+        tracing::debug!(%network, %hostname, "ignoring invalid hostname");
+    }
+}
+
 /// Update both the hostname table and reverse lookup table atomically.
 pub async fn update_hostname(
     table: &HostnameTable,
@@ -86,7 +109,7 @@ pub async fn update_hostname(
 ) {
     // A name with a dot would answer for another network's `<host>.<net>.ray`.
     if !crate::hostname::is_valid_hostname(hostname) {
-        tracing::warn!(%network, %hostname, "ignoring invalid hostname");
+        report_invalid_hostname(network, hostname);
         return;
     }
     {
@@ -150,7 +173,7 @@ pub async fn sync_network_hostnames(
     let mut hosts = HashMap::with_capacity(entries.len());
     for (name, v6) in entries {
         if !crate::hostname::is_valid_hostname(name) {
-            tracing::warn!(%network, hostname = %name, "ignoring invalid hostname");
+            report_invalid_hostname(network, name);
             continue;
         }
         hosts.insert(name.clone(), *v6);
@@ -919,5 +942,56 @@ mod tests {
         // Reverse lookup works
         let rev6 = reverse.get(&v6).map(|e| e.value().clone());
         assert_eq!(rev6, Some(("alice".to_string(), "gaming".to_string())));
+    }
+
+    /// A name an older coordinator handed out over the 63-byte label limit
+    /// (`resolve_collision` once added `-1` to a 63-character base) cannot be
+    /// served, but it is on the roster for good. Every roster sync used to warn
+    /// about it again; once per name is enough.
+    #[tokio::test]
+    async fn an_invalid_roster_name_is_reported_once() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("the log buffer is not poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (table, reverse) = (new_hostname_table(), new_reverse_table());
+        let long = format!("{}-1", "a".repeat(63));
+        let entries = [(long.clone(), v6(1)), ("bob".to_string(), v6(2))];
+        for _ in 0..3 {
+            sync_network_hostnames(&table, &reverse, "warn-once-net", &entries).await;
+        }
+        update_hostname(&table, &reverse, "warn-once-net", &long, v6(1)).await;
+
+        let text = String::from_utf8(logs.0.lock().expect("not poisoned").clone())
+            .expect("the log is UTF-8");
+        assert_eq!(
+            text.matches("ignoring invalid hostname").count(),
+            1,
+            "{text}"
+        );
+        assert!(table.read().await["warn-once-net"].contains_key("bob"));
     }
 }
