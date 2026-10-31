@@ -126,11 +126,10 @@ fn transfers_table(transfers: &[ipc::TransferFileInfo]) -> String {
         .iter()
         .map(|t| {
             let state = format!("{:?}", t.state).to_lowercase();
-            let action = if t.outgoing
-                && matches!(
-                    t.state,
-                    ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
-                ) {
+            let action = if matches!(
+                t.state,
+                ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
+            ) {
                 format!("ray files cancel-transfer {}", t.id)
             } else {
                 String::new()
@@ -594,6 +593,27 @@ mod tests {
         assert!(row.contains("1 KiB / 2 KiB"), "{out}");
         assert!(row.contains("notes.txt (transferring)"), "{out}");
         assert!(row.contains("ray files cancel-transfer 7"), "{out}");
+    }
+    #[test]
+    fn a_retrying_receive_can_be_canceled() {
+        style::set_plain(true);
+        let transfers = [ipc::TransferFileInfo {
+            error: Some("interrupted, retrying: the transfer stalled".into()),
+            id: 9,
+            outgoing: false,
+            peer: "laptop".into(),
+            filename: "notes.txt".into(),
+            size: 12,
+            transferred: 6,
+            state: ipc::TransferFileState::Transferring,
+            destination: None,
+        }];
+        let output = transfers_table(&transfers);
+        assert!(
+            output.contains("transferring: interrupted, retrying"),
+            "{output}"
+        );
+        assert!(output.contains("ray files cancel-transfer 9"), "{output}");
     }
     #[test]
     fn declined_transfer_displays_the_reason() {

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use tokio_util::io::ReaderStream;
 
+mod receive;
 #[cfg(unix)]
 mod receive_dest;
 
@@ -495,6 +496,12 @@ pub(crate) struct FileService {
     /// sweep racing a connect) can't deliver the same offer twice.
     flushing: Arc<DashSet<EndpointId>>,
     declines: Mutex<Vec<FileDecision>>,
+    /// Accepted receives still running, so they can be canceled.
+    receives: receive::ActiveReceives,
+    /// Bounds how many receives fetch at once.
+    receive_slots: tokio::sync::Semaphore,
+    /// Timing for retrying an interrupted receive.
+    resume: receive::ResumePolicy,
 }
 
 impl FileService {
@@ -545,6 +552,9 @@ impl FileService {
             outbox: Arc::new(Mutex::new(queued)),
             flushing: Arc::new(DashSet::new()),
             declines: Mutex::new(declines),
+            receives: Arc::default(),
+            receive_slots: receive::receive_slots(),
+            resume: receive::ResumePolicy::default(),
         }
     }
 
@@ -761,10 +771,10 @@ impl FileService {
             caller_chose_dir: false,
         };
 
-        match self.accept_file_for(id, output, recipient).await {
-            Ok(Done(message)) => {
-                tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted");
-            }
+        // Not awaited: an interrupted receive keeps retrying for hours, and
+        // the receive task logs its own outcome.
+        match self.start_receive(id, output, recipient) {
+            Ok(_) => tracing::info!(from = %from.fmt_short(), "file auto-accepted"),
             Err(error) => {
                 tracing::warn!(from = %from.fmt_short(), %error, "file auto-accept failed");
             }
@@ -789,201 +799,19 @@ impl FileService {
         self.accept_file_for(id, output, recipient).await
     }
 
+    /// Start the receive and wait for its outcome. The receive itself runs
+    /// in a task of its own (see [`receive`]), so it continues, and keeps
+    /// retrying, if this caller goes away.
     async fn accept_file_for(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
         recipient: Recipient,
     ) -> OpResult<Done> {
-        let pending_file = {
-            let mut pending = self.pending_files.lock().unwrap();
-            match take_pending(&mut pending, id) {
-                Some(file) => {
-                    self.active_files.lock().unwrap().push(file.clone());
-                    file
-                }
-                None => {
-                    return op_err(format!("no pending file with id {id}"));
-                }
-            }
-        };
-
-        let mut offer = ReceiveOfferGuard {
-            offer_id: pending_file.offer_id,
-            file: Some(pending_file),
-            pending: Arc::clone(&self.pending_files),
-            active: Arc::clone(&self.active_files),
-            transfers: Arc::clone(&self.transfers),
-            store: self.transport.blob_store.clone(),
-        };
-        let file = offer
-            .file
-            .as_ref()
-            .expect("the offer is held until the receive succeeds");
-        let peer = file.from;
-        let response = self.receive_file(file, output, recipient).await;
-        match response {
-            Ok(_) => {
-                if let Some(file) = offer.file.as_ref()
-                    && let Err(error) = self.record_completed_offer(file)
-                {
-                    return op_err(format!(
-                        "file saved but could not record delivery confirmation: {error}; retry with `ray files accept {id}`"
-                    ));
-                }
-                offer.file.take();
-                let pending = self.pending_files.lock().unwrap();
-                let mut active = self.active_files.lock().unwrap();
-                active.retain(|entry| entry.offer_id != offer.offer_id);
-                let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
-                if let Err(error) = save_pending_files(&durable) {
-                    tracing::warn!(%error, "could not persist completed incoming file");
-                }
-                drop(active);
-                drop(pending);
-                let service = Arc::clone(self);
-                tokio::spawn(async move { service.flush_outbox_for(peer).await });
-                response
-            }
-            Err(e) => op_err(format!("{e}; retry with `ray files accept {id}`")),
-        }
-    }
-
-    async fn receive_file(
-        &self,
-        pending_file: &PendingFile,
-        output: Option<String>,
-        recipient: Recipient,
-    ) -> OpResult<Done> {
-        // Checked again here, not only when the offer was queued: offers saved
-        // by an older daemon were never validated.
-        if !is_safe_file_name(&pending_file.filename) {
-            return op_err(format!("invalid file name '{}'", pending_file.filename));
-        }
-        let blob_hash = pending_file.blob_hash;
-        let peer_label = pending_file.from.fmt_short().to_string();
-        let transfer_id = self.transfers.register_receive(
-            peer_label,
-            pending_file.filename.clone(),
-            pending_file.size,
-        );
-        // The offer is gone from the queue, but the receive stays visible
-        // while the connection and fetch are in progress.
-        let finish_guard = transfers::FinishGuard::new(Arc::clone(&self.transfers), transfer_id);
-
-        // Claim the blob before fetching it. `fetch` leaves what it downloads
-        // untagged, so a GC triggered by some other transfer finishing mid-fetch
-        // would sweep the bytes out from under us. The tag is dropped again as
-        // soon as the file reaches its destination or the offer is rejected.
-        // Failed receives keep the tag so a retry can reuse the downloaded ranges.
-        let recv_tag = blob_tags::recv(&blob_hash, pending_file.id);
-        if let Err(e) = self
-            .transport
-            .blob_store
-            .tags()
-            .set(&recv_tag, iroh_blobs::HashAndFormat::raw(blob_hash))
+        let outcome = self.start_receive(id, output, recipient)?;
+        outcome
             .await
-        {
-            return op_err(format!("blob store error: {e}"));
-        }
-
-        let local = match self.transport.blob_store.remote().local(blob_hash).await {
-            Ok(local) => local,
-            Err(e) => return op_err(format!("blob store error: {e}")),
-        };
-        let downloaded = local.local_bytes();
-        self.transfers.note_progress(transfer_id, downloaded);
-        if !local.is_complete() {
-            let connect = transport::connect_to_peer_with_alpn(
-                &self.transport.endpoint,
-                pending_file.from,
-                iroh_blobs::protocol::ALPN,
-            );
-            let conn = match tokio::time::timeout(OFFER_CONNECT_TIMEOUT, connect).await {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => return op_err(format!("cannot reach sender: {e}")),
-                Err(_) => return op_err("cannot reach sender: connection timed out"),
-            };
-
-            // `fetch` returns a `GetProgress`: awaiting it directly discards the
-            // progress, so take the stream instead and report bytes as they land. It
-            // yields `Progress(n)` items (n = payload bytes read so far) and exactly
-            // one terminal `Done`/`Error` item. Note: reaching `Done` here means only
-            // the fetch succeeded, not the transfer; the registry is not finished
-            // until the file is written to disk below.
-            let mut stream = Box::pin(
-                self.transport
-                    .blob_store
-                    .remote()
-                    .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
-                    .stream(),
-            );
-            loop {
-                match stream.next().await {
-                    Some(GetProgressItem::Progress(n)) => self
-                        .transfers
-                        .note_progress(transfer_id, downloaded.saturating_add(n)),
-                    Some(GetProgressItem::Done(_)) => break,
-                    Some(GetProgressItem::Error(e)) => {
-                        return op_err(format!("blob fetch failed: {e}"));
-                    }
-                    None => {
-                        return op_err("blob fetch ended without a result".to_string());
-                    }
-                }
-            }
-        }
-
-        let dir = match output {
-            Some(ref p) => PathBuf::from(p),
-            None => dirs::download_dir().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Downloads")
-            }),
-        };
-
-        #[cfg(unix)]
-        let dest = match self
-            .write_received(blob_hash, dir, &pending_file.filename, recipient)
-            .await
-        {
-            Ok(dest) => dest,
-            Err(e) => return op_err(format!("write failed: {e}")),
-        };
-        #[cfg(not(unix))]
-        let dest = {
-            // Windows has no `openat`, so this still writes through the path
-            // the caller named; `recipient` only matters to the Unix ownership
-            // checks.
-            let _ = recipient;
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                return op_err(format!("cannot create directory '{}': {e}", dir.display()));
-            }
-            // Export straight from the blob store to the destination rather
-            // than through `get_bytes`, which holds the whole file in memory.
-            let dest = dir.join(&pending_file.filename);
-            if let Err(e) = self
-                .transport
-                .blob_store
-                .blobs()
-                .export(blob_hash, &dest)
-                .await
-            {
-                return op_err(format!("write failed: {e}"));
-            }
-            dest
-        };
-        // The file is where the user wanted it, so the store's copy is now pure
-        // duplication: every accepted file used to be kept twice, forever.
-        self.reclaim_blob(recv_tag);
-
-        // The file is fully on disk (chown failures are ignored, by design,
-        // and never fail the transfer): only now is the transfer really done.
-        let destination = std::fs::canonicalize(&dest).unwrap_or(dest.clone());
-        finish_guard.success(&destination);
-
-        Ok(Done(format!("saved to {}", dest.display())))
+            .unwrap_or_else(|_| op_err("the receive stopped before reporting a result"))
     }
 
     /// Write a fetched blob to `file_name` in `dir` for `recipient`, returning
@@ -1588,7 +1416,16 @@ impl FileService {
     /// Cancel an outgoing transfer after its offer was delivered. A packet
     /// already in flight may finish, but this transfer cannot be revived and
     /// the local blob is released for GC.
+    ///
+    /// For a receive, stops the fetch and any pending retry. The offer goes
+    /// back to the queue with what was downloaded, to accept or reject later.
     pub(crate) fn cancel_transfer(&self, id: u64) -> OpResult<Done> {
+        if let Some(cancel) = self.receives.lock().unwrap().get(&id) {
+            cancel.cancel();
+            return Ok(Done(format!(
+                "canceled file transfer {id}; the offer stays in `ray files`"
+            )));
+        }
         match self.transfers.cancel(id) {
             Some((hash, peer)) => {
                 let removed = {
@@ -1606,7 +1443,7 @@ impl FileService {
                 }
                 Ok(Done(format!("canceled file transfer {id}")))
             }
-            None => op_err(format!("no active outgoing transfer with id {id}")),
+            None => op_err(format!("no active transfer with id {id}")),
         }
     }
 
@@ -2039,7 +1876,7 @@ mod tests {
     use iroh_blobs::Hash;
     use std::time::Instant;
 
-    async fn file_service(endpoint: Endpoint, dir: &Path) -> Arc<FileService> {
+    pub(super) async fn file_service(endpoint: Endpoint, dir: &Path) -> Arc<FileService> {
         let store = FsStore::load(dir).await.unwrap();
         let registry = crate::daemon::accept_handler_tests::sample_registry(
             endpoint.clone(),
@@ -2055,7 +1892,9 @@ mod tests {
         ))
     }
 
-    async fn file_endpoint(lookup: iroh::address_lookup::memory::MemoryLookup) -> Endpoint {
+    pub(super) async fn file_endpoint(
+        lookup: iroh::address_lookup::memory::MemoryLookup,
+    ) -> Endpoint {
         Endpoint::builder(iroh::endpoint::presets::Minimal)
             .alpns(vec![transport::FILES_ALPN.to_vec()])
             .relay_mode(iroh::RelayMode::Disabled)
