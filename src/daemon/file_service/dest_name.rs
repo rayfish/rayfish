@@ -9,6 +9,33 @@ use std::path::{Component, Path};
 /// How many `name (n).ext` alternatives to try before giving up on a name.
 pub(super) const MAX_NAME_ATTEMPTS: u32 = 1000;
 
+/// Longest name, in bytes, a received file is saved under before a number
+/// is added. One directory entry holds 255 bytes on Linux and macOS and 255
+/// UTF-16 units on Windows, never fewer than the UTF-8 bytes, so a byte count
+/// is safe on both. Room is left for the ` (999)` that [`numbered_name`] adds
+/// at most.
+const MAX_SAVED_NAME: usize = 255 - " (999)".len();
+
+/// Longest extension kept when a name is cut to fit.
+const MAX_KEPT_EXTENSION: usize = 32;
+
+/// A peer's file name cut to fit one directory entry, numbered or not. The
+/// offer may name a file longer than this filesystem allows (APFS takes 255
+/// characters, not bytes), which would only fail once the whole file had
+/// downloaded. Cut at a character boundary, keeping a short extension.
+pub(super) fn fitted_name(file_name: &str) -> String {
+    if file_name.len() <= MAX_SAVED_NAME {
+        return file_name.to_string();
+    }
+    let ext = match file_name.rfind('.') {
+        Some(dot) if dot > 0 && file_name.len() - dot <= MAX_KEPT_EXTENSION => &file_name[dot..],
+        _ => "",
+    };
+    let stem = &file_name[..file_name.len() - ext.len()];
+    let cut = stem.floor_char_boundary(MAX_SAVED_NAME - ext.len());
+    format!("{}{ext}", &stem[..cut])
+}
+
 /// `report.pdf`, then `report (1).pdf`, `report (2).pdf`, ... A leading dot
 /// is part of the stem, so `.profile` becomes `.profile (1)`.
 pub(super) fn numbered_name(file_name: &str, attempt: u32) -> String {
@@ -110,6 +137,28 @@ mod tests {
         assert_eq!(numbered_name("a.tar.gz", 1), "a.tar (1).gz");
         assert_eq!(numbered_name(".profile", 1), ".profile (1)");
         assert_eq!(numbered_name("README", 1), "README (1)");
+    }
+
+    #[test]
+    fn long_names_are_cut_to_fit_with_their_number() {
+        assert_eq!(fitted_name("report.pdf"), "report.pdf");
+        // 300 bytes of two-byte characters, as APFS allows.
+        let long = format!("{}.txt", "é".repeat(148));
+        assert_eq!(long.len(), 300);
+        let fitted = fitted_name(&long);
+        assert!(fitted.len() <= MAX_SAVED_NAME, "{}", fitted.len());
+        assert!(fitted.ends_with(".txt"), "{fitted}");
+        assert!(fitted.starts_with("éé"), "{fitted}");
+        let last = numbered_name(&fitted, MAX_NAME_ATTEMPTS - 1);
+        assert!(last.len() <= 255, "{}", last.len());
+        assert!(last.ends_with(" (999).txt"), "{last}");
+        // An extension too long to be one is cut like the rest.
+        let odd = format!("a.{}", "x".repeat(400));
+        assert_eq!(fitted_name(&odd).len(), MAX_SAVED_NAME);
+        assert!(numbered_name(&fitted_name(&odd), 999).len() <= 255);
+        // Exactly at the limit, nothing changes.
+        let edge = "y".repeat(MAX_SAVED_NAME);
+        assert_eq!(fitted_name(&edge), edge);
     }
 
     #[test]

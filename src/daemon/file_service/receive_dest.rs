@@ -28,7 +28,9 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf, absolute};
 
 use super::Recipient;
-use super::dest_name::{MAX_NAME_ATTEMPTS, missing_names, numbered_name, root_len, temp_name};
+use super::dest_name::{
+    MAX_NAME_ATTEMPTS, fitted_name, missing_names, numbered_name, root_len, temp_name,
+};
 
 /// A received file being written under a temporary name in its directory.
 /// Dropping it before [`Staged::commit`] removes the temporary file.
@@ -94,7 +96,7 @@ pub(super) fn create(
     let staged = Staged {
         dir,
         temp,
-        wanted: file_name.to_string(),
+        wanted: fitted_name(file_name),
         committed: false,
     };
     Ok((staged, file))
@@ -121,7 +123,8 @@ pub(super) enum DirTrust {
 /// Check, without creating anything, that a file for `recipient` could be
 /// saved in `dir`: the part of it that exists passes the same check a write
 /// does, and the rest is plain names. Lets an accept be refused before the
-/// download rather than after it. Any plain file name is usable here.
+/// download rather than after it. Any plain file name is usable here: one
+/// too long for the filesystem is cut to fit ([`fitted_name`]).
 pub(super) fn check(dir: &Path, _file_name: &str, recipient: &Recipient) -> io::Result<()> {
     let path = &absolute(dir)?;
     let trust = recipient.dir_trust();
@@ -689,6 +692,27 @@ mod tests {
         assert_eq!(staged.commit().unwrap(), "f.bin");
         assert_eq!(names(tmp.path()), ["f.bin"]);
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"data");
+    }
+
+    /// A name longer than one directory entry holds, as APFS allows, is
+    /// saved cut to fit, numbered too when it is taken.
+    #[test]
+    fn a_name_too_long_for_the_filesystem_is_cut_to_fit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "é".repeat(148));
+        assert_eq!(long.len(), 300);
+        let mut saved = Vec::new();
+        for _ in 0..2 {
+            let (staged, mut file) = create(tmp.path(), &long, caller(me())).unwrap();
+            file.write_all(b"data").unwrap();
+            drop(file);
+            let name = staged.commit().unwrap().into_string().unwrap();
+            assert!(name.len() <= 255, "{}", name.len());
+            assert!(name.ends_with(".txt"), "{name}");
+            assert_eq!(std::fs::read(tmp.path().join(&name)).unwrap(), b"data");
+            saved.push(name);
+        }
+        assert!(saved[1].ends_with(" (1).txt"), "{saved:?}");
     }
 
     #[test]

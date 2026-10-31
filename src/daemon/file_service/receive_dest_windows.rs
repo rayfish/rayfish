@@ -60,7 +60,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::dest_name::{
-    MAX_NAME_ATTEMPTS, missing_names, numbered_name, root_len, temp_name, windows_file_name,
+    MAX_NAME_ATTEMPTS, fitted_name, missing_names, numbered_name, root_len, temp_name,
+    windows_file_name,
 };
 use super::{Recipient, WindowsCaller};
 use crate::windows_identity::ClientToken;
@@ -214,9 +215,10 @@ pub(super) fn check(dir: &Path, file_name: &str, recipient: &Recipient) -> io::R
     check.require(&dir, access, path)
 }
 
-/// A peer's file name as it will be saved on Windows.
+/// A peer's file name as it will be saved on Windows. Cut to fit first:
+/// what `windows_file_name` changes never makes a long name longer.
 fn usable_name(file_name: &str) -> io::Result<String> {
-    windows_file_name(file_name).ok_or_else(|| {
+    windows_file_name(&fitted_name(file_name)).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("'{file_name}' is not a usable file name on Windows"),
@@ -676,6 +678,19 @@ mod tests {
         drop(file);
         assert_eq!(staged.commit().unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_name_too_long_for_one_entry_is_cut_to_fit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "é".repeat(300));
+        for expected_suffix in [".txt", " (1).txt"] {
+            let (staged, file) = create(tmp.path(), &long, configured()).unwrap();
+            drop(file);
+            let name = staged.commit().unwrap().into_string().unwrap();
+            assert!(name.encode_utf16().count() <= 255, "{name}");
+            assert!(name.ends_with(expected_suffix), "{name}");
+        }
     }
 
     #[test]
