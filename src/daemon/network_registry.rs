@@ -899,9 +899,7 @@ impl NetworkRegistry {
             return false;
         };
         handle.cancel.cancel();
-        for task in handle.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        }
+        stop_network_tasks(name, handle.tasks, NETWORK_TASK_STOP_WAIT).await;
 
         // Drop this network from every peer's routing. A peer left sharing no
         // network at all is fully disconnected, so close its now-unused link with
@@ -2080,9 +2078,55 @@ pub(super) fn coordinator_tasks(
     ]
 }
 
+/// How long teardown waits for each cancelled network task before aborting it.
+const NETWORK_TASK_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait up to `wait` for each of a cancelled network's tasks, then abort the
+/// ones still running. Dropping a `JoinHandle` detaches its task: a poller
+/// still inside a sequential blob fetch only sees the cancel between ticks,
+/// and once it returns it could persist a hash or tear down by name a network
+/// rejoined under the same name meanwhile.
+async fn stop_network_tasks(network: &str, tasks: Vec<JoinHandle<()>>, wait: Duration) {
+    for (index, mut task) in tasks.into_iter().enumerate() {
+        if tokio::time::timeout(wait, &mut task).await.is_err() {
+            tracing::debug!(
+                network,
+                task = index,
+                "network task ignored cancellation; aborting it"
+            );
+            task.abort();
+            // Settled before teardown goes on, so nothing it does lands after.
+            let _ = task.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task that ignores the network's cancel is aborted once the wait runs
+    /// out, not left running detached; one that stops in time is left to end.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_aborts_a_task_that_ignores_cancellation() {
+        let (stuck_alive, stuck_gone) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _alive = stuck_alive;
+            std::future::pending::<()>().await;
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let prompt = tokio::spawn(async move {
+            let _ = done_tx.send(());
+        });
+
+        stop_network_tasks("home", vec![stuck, prompt], Duration::from_secs(5)).await;
+
+        let gone = tokio::time::timeout(Duration::from_secs(1), stuck_gone)
+            .await
+            .expect("the stuck task is no longer running");
+        assert!(gone.is_err(), "it was aborted, dropping its sender unsent");
+        assert_eq!(done_rx.await, Ok(()), "the prompt task finished on its own");
+    }
 
     #[test]
     fn network_selector_accepts_public_key_and_invite_code() {
