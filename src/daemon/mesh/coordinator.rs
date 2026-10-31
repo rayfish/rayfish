@@ -153,7 +153,11 @@ impl NetworkRegistry {
     /// member frame handler; a coordinator's handler ignores the message, so a node
     /// can never be made to leave a network it coordinates.
     pub(crate) async fn confirm_kick_and_leave(&self, network: &str) {
-        let Some(net_pubkey) = self.networks.get(network).map(|h| h.network_key) else {
+        let Some((net_pubkey, state)) = self
+            .networks
+            .get(network)
+            .map(|h| (h.network_key, Arc::clone(&h.state)))
+        else {
             return; // no longer active locally; nothing to settle
         };
         let my_id = self.transport.endpoint.id();
@@ -161,22 +165,31 @@ impl NetworkRegistry {
         // confirmation that it no longer lists us; on any failure (can't
         // resolve/fetch) we stay, never leaving on uncertainty.
         let removed = match resolve_signed(&self.transport.pkarr, net_pubkey).await {
-            // The timestamp is not consulted here: this only ever *confirms* a
-            // kick before leaving, and an older record listing us is a reason to
-            // stay, which is already the safe answer.
-            Some((signed, seeds, _ts)) => fetch_verified_blob(
-                &self.transport.endpoint,
-                &self.transport.blob_store,
-                &self.peers,
-                signed,
-                network,
-                &seeds,
-            )
-            .await
-            .is_some_and(|data| {
-                !data.members.iter().any(|m| m.identity == my_id)
-                    && !data.approved.iter().any(|a| a.identity == my_id)
-            }),
+            // Only a record newer than the last one applied can confirm the
+            // kick. A stale copy, say one from before we joined, does not list
+            // us either, and with it any coordinator's kick message would be
+            // enough to delete the network here.
+            Some((signed, seeds, ts))
+                if record_is_newer(ts, state.read().unwrap().last_record_timestamp) =>
+            {
+                fetch_verified_blob(
+                    &self.transport.endpoint,
+                    &self.transport.blob_store,
+                    &self.peers,
+                    signed,
+                    network,
+                    &seeds,
+                )
+                .await
+                .is_some_and(|data| {
+                    !data.members.iter().any(|m| m.identity == my_id)
+                        && !data.approved.iter().any(|a| a.identity == my_id)
+                })
+            }
+            Some(_) => {
+                tracing::debug!(network = %network, "kick not confirmed: the signed record is no newer than the last applied");
+                false
+            }
             None => false,
         };
         if removed {

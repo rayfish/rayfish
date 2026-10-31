@@ -104,6 +104,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A device paired or unpaired while the daemon runs now handles pushed roster
   updates under its current pairing, so it unpairs itself as soon as its
   primary revokes it instead of only at the next poll.
+- A kick message no longer makes a member leave on the strength of an old
+  roster served from discovery, such as one from before it joined. The member
+  leaves only when a roster newer than its own drops it.
 
 ### Security
 

@@ -529,6 +529,98 @@ async fn an_older_removal_keeps_membership_and_the_saved_network() {
     fx.finish().await;
 }
 
+/// A coordinator's kick is confirmed only by a record newer than the last one
+/// applied. A stale copy from before this node joined does not list it either,
+/// and taking that as the removal let the kick message alone delete the saved
+/// network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_kick_is_confirmed_only_by_a_newer_record() {
+    let fx = MemberFixture::start().await;
+    let registry = fx.registry();
+    let server = BlobServer::start(&fx.daemon).await;
+    let me = registry.transport.endpoint.id();
+    let without_us = {
+        let mut group = fx.state.read().unwrap().group.clone();
+        group.members.remove(&me);
+        group
+    };
+    let hash = server.serve(&without_us).await;
+    let packet =
+        dht::encode_network_record(&fx.key, &hash, &[server.id()]).expect("sign the record");
+    let ts = packet.timestamp().as_micros();
+    // Set before the record is published, so the fixture's poller cannot
+    // apply it either.
+    fx.state.write().unwrap().last_record_timestamp = Some(ts + 1);
+    dht::publish_record(&registry.transport.pkarr, &packet)
+        .await
+        .expect("publish the record");
+
+    registry.confirm_kick_and_leave(NETWORK).await;
+    assert!(registry.networks.contains_key(NETWORK));
+    assert!(config::load_network(NETWORK).unwrap().is_some());
+
+    fx.state.write().unwrap().last_record_timestamp = Some(ts - 1);
+    registry.confirm_kick_and_leave(NETWORK).await;
+    assert!(!registry.networks.contains_key(NETWORK));
+    assert!(config::load_network(NETWORK).unwrap().is_none());
+    server.finish().await;
+    fx.finish().await;
+}
+
+/// A peer that only serves blobs, reachable from the fixture's daemon.
+struct BlobServer {
+    router: Router,
+    store: FsStore,
+    _dir: tempfile::TempDir,
+}
+
+impl BlobServer {
+    async fn start(daemon: &Daemon) -> Self {
+        let dir = tempfile::tempdir().expect("temporary blob directory");
+        let store = FsStore::load(dir.path()).await.expect("blob server store");
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("loopback address")
+            .bind()
+            .await
+            .expect("blob server endpoint");
+        daemon
+            .transport
+            .warm_lookup
+            .add_endpoint_info(endpoint.addr());
+        let router = Router::builder(endpoint)
+            .accept(iroh_blobs::protocol::ALPN, BlobsProtocol::new(&store, None))
+            .spawn();
+        Self {
+            router,
+            store,
+            _dir: dir,
+        }
+    }
+
+    fn id(&self) -> EndpointId {
+        self.router.endpoint().id()
+    }
+
+    /// Store `group` where only this peer can serve it.
+    async fn serve(&self, group: &GroupBlob) -> blake3::Hash {
+        let bytes = crate::membership::canonical_group_bytes(group);
+        self.store
+            .blobs()
+            .add_slice(&bytes)
+            .await
+            .expect("store the blob");
+        blake3::hash(&bytes)
+    }
+
+    async fn finish(self) {
+        self.router.shutdown().await.expect("stop the blob server");
+    }
+}
+
 /// A daemon that created `NETWORK` and so coordinates it, next to a second
 /// coordinator of the same network that only serves blobs. Holds the config lock
 /// and the config directory for as long as it lives.
@@ -536,9 +628,7 @@ struct CoordinatorFixture {
     daemon: Arc<Daemon>,
     state: SharedNetworkState,
     key: SecretKey,
-    second: Router,
-    second_store: FsStore,
-    _second_dir: tempfile::TempDir,
+    second: BlobServer,
     _relay: Relay,
     _env: ConfigDir,
     _dir: tempfile::TempDir,
@@ -561,36 +651,12 @@ impl CoordinatorFixture {
             .network_secret_key
             .expect("a created network holds its key");
         let state = Arc::clone(&daemon.registry.networks.get(NETWORK).expect("live").state);
-
-        let second_dir = tempfile::tempdir().expect("temporary blob directory");
-        let second_store = FsStore::load(second_dir.path())
-            .await
-            .expect("second coordinator blob store");
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .relay_mode(iroh::RelayMode::Disabled)
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .expect("loopback address")
-            .bind()
-            .await
-            .expect("second coordinator endpoint");
-        daemon
-            .transport
-            .warm_lookup
-            .add_endpoint_info(endpoint.addr());
-        let second = Router::builder(endpoint)
-            .accept(
-                iroh_blobs::protocol::ALPN,
-                BlobsProtocol::new(&second_store, None),
-            )
-            .spawn();
+        let second = BlobServer::start(&daemon).await;
         Self {
             daemon,
             state,
             key,
             second,
-            second_store,
-            _second_dir: second_dir,
             _relay: relay,
             _env: env,
             _dir: dir,
@@ -601,33 +667,24 @@ impl CoordinatorFixture {
     /// The edit the second coordinator authors: the live roster plus itself as
     /// a coordinator, stored where only the second coordinator can serve it.
     async fn second_coordinators_edit(&self) -> blake3::Hash {
-        let bytes = {
-            let s = self.state.read().unwrap();
-            let mut group = s.group.clone();
+        let group = {
+            let mut group = self.state.read().unwrap().group.clone();
             group.members.add(Member {
                 is_coordinator: true,
-                ..laptop(self.second.endpoint().id())
+                ..laptop(self.second.id())
             });
-            crate::membership::canonical_group_bytes(&group)
+            group
         };
-        self.second_store
-            .blobs()
-            .add_slice(&bytes)
-            .await
-            .expect("store the edit");
-        blake3::hash(&bytes)
+        self.second.serve(&group).await
     }
 
     fn signed_by_second(&self, hash: blake3::Hash) -> SignedPacket {
-        dht::encode_network_record(&self.key, &hash, &[self.second.endpoint().id()])
+        dht::encode_network_record(&self.key, &hash, &[self.second.id()])
             .expect("sign the second coordinator's record")
     }
 
     async fn finish(self) {
-        self.second
-            .shutdown()
-            .await
-            .expect("stop the second coordinator");
+        self.second.finish().await;
         self.daemon.shutdown_and_close().await;
     }
 }
@@ -664,7 +721,7 @@ async fn a_coordinator_polls_an_edit_another_coordinator_published() {
             .unwrap()
             .group
             .members
-            .is_member(&fx.second.endpoint().id())
+            .is_member(&fx.second.id())
     );
     fx.finish().await;
 }
@@ -696,7 +753,7 @@ async fn a_coordinator_refuses_a_record_older_than_its_own_publish() {
 
     let record = SignedGroupRecord {
         hash: edit,
-        seeds: vec![fx.second.endpoint().id()],
+        seeds: vec![fx.second.id()],
         timestamp: stale.timestamp().as_micros(),
     };
     let outcome = apply_group_record(
