@@ -1665,16 +1665,9 @@ impl NetworkRegistry {
         if !snapshot_is_publishable(&self.transport.blob_store, &state, network, hash).await {
             return None;
         }
-        let (key, members, approved, packet) = {
-            let state = state.read().unwrap();
-            (
-                state.network_secret_key.clone()?,
-                state.roster(),
-                state.approved_snapshot(),
-                state.last_published_record.clone()?,
-            )
-        };
-        let (published_hash, _) = dht::decode_network_record(&packet).ok()?;
+        let state = state.read().unwrap();
+        let packet = state.last_published_record.as_ref()?;
+        let (published_hash, _) = dht::decode_network_record(packet).ok()?;
         if published_hash != hash {
             return None;
         }
@@ -1682,9 +1675,9 @@ impl NetworkRegistry {
             hash,
             packet: packet.as_bytes().to_vec(),
             published: net.last_group_hash == Some(hash) && net.last_group_hash_published,
-            members,
-            approved,
-            key,
+            members: state.roster(),
+            approved: state.approved_snapshot(),
+            key: state.network_secret_key.clone()?,
         })
     }
 

@@ -890,10 +890,12 @@ async fn a_delegated_join_never_falls_through_to_another_coordinator() {
         reusable_keys: BTreeMap::new(),
         nullifiers: BTreeSet::new(),
     };
+    let net_pubkey = SecretKey::generate().public();
+    let key_claim = daemon.registry.claim_network_key(net_pubkey).unwrap();
     let context = JoinContext {
         display_name: "box",
         my_hostname: "studio",
-        net_pubkey: SecretKey::generate().public(),
+        net_pubkey,
         group_hash: blake3::hash(b"test roster"),
         invite: Some(vec![7; 16]),
         auto_accept_firewall: false,
@@ -901,6 +903,7 @@ async fn a_delegated_join_never_falls_through_to_another_coordinator() {
         invite_lock: Arc::new(AsyncMutex::new(())),
         coordinator: Some(JoinCoordinator::Required(controller.id())),
         mismatch: None,
+        key_claim: &key_claim,
     };
 
     let outcome = tokio::time::timeout(
