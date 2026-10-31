@@ -30,6 +30,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `ray firewall ssh off` now succeeds in rootless mode instead of being
+  refused. `ssh on` still fails there, with a message saying mesh SSH is
+  unavailable in rootless mode.
 - A member whose coordinator handshake failed partway through a restart now
   picks up roster and firewall changes as they happen, instead of waiting for
   the next poll.
