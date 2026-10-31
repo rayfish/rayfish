@@ -142,11 +142,23 @@ impl FileService {
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let service = Arc::clone(self);
         tokio::spawn(async move {
-            let received = tokio::select! {
+            // Biased so a receive that finished in the same poll as a cancel
+            // counts as finished.
+            let written = tokio::select! {
+                biased;
+                written = service.run_receive(&file, transfer_id, output, recipient) => written,
                 () = cancel.cancelled() => Err("receive canceled".to_string()),
-                received = service.run_receive(&file, transfer_id, output, recipient) => received,
             };
             service.receives.lock().unwrap().remove(&transfer_id);
+            // Naming the complete file is not canceled: once the rename has
+            // happened, the outcome has to say so.
+            let received = match written {
+                Ok(written) => written
+                    .commit()
+                    .await
+                    .map_err(|e| format!("write failed: {e}")),
+                Err(error) => Err(error),
+            };
             let outcome = service.finish_receive(offer, finish, received);
             match &outcome {
                 Ok(Done(message)) => {
@@ -244,14 +256,14 @@ impl FileService {
     }
 
     /// Fetch the offer's blob, retrying interruptions, and write it to its
-    /// destination. Returns where the file was saved.
+    /// destination under a temporary name.
     async fn run_receive(
         &self,
         file: &PendingFile,
         transfer_id: u64,
         output: Option<String>,
         recipient: Recipient,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<Written, String> {
         // Checked again here, not only when the offer was queued: offers saved
         // by an older daemon were never validated.
         if !is_safe_file_name(&file.filename) {
@@ -406,7 +418,7 @@ impl FileService {
         file: &PendingFile,
         output: Option<String>,
         recipient: Recipient,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<Written, String> {
         let dir = match output {
             Some(ref p) => PathBuf::from(p),
             None => dirs::download_dir().unwrap_or_else(|| {

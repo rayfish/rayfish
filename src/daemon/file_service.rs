@@ -107,6 +107,24 @@ impl Recipient {
     }
 }
 
+/// A received file with every byte written, still under its temporary name.
+struct Written {
+    staged: receive_dest::Staged,
+    dir: PathBuf,
+}
+
+impl Written {
+    /// Move the file to its name, or a numbered variant when that is taken,
+    /// and return the path it was saved under.
+    async fn commit(self) -> std::io::Result<PathBuf> {
+        let Written { staged, dir } = self;
+        let name = tokio::task::spawn_blocking(move || staged.commit())
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(dir.join(name))
+    }
+}
+
 /// Upper bound on one background offer dial. `Endpoint::connect` retries
 /// discovery with no timeout of its own; the outbox retries on the next
 /// peer-connected event anyway, so a stuck dial must not pin the flush task.
@@ -927,24 +945,25 @@ impl FileService {
             .unwrap_or_else(|_| op_err("the receive stopped before reporting a result"))
     }
 
-    /// Write a fetched blob to `file_name` in `dir` for `recipient`, returning
-    /// the path it was saved under (a numbered variant when the name exists).
+    /// Write a fetched blob for `file_name` into `dir` for `recipient`,
+    /// under a temporary name until [`Written::commit`] gives it its own.
     ///
     /// Streamed from the blob store rather than read whole: `get_bytes` holds
     /// the entire file in memory, which on a phone sharing a video is a kill.
     /// Not `export` either, which writes through the path and so follows
-    /// whatever link sits there; see [`receive_dest`].
+    /// whatever link sits there; see [`receive_dest`]. Dropped partway, by a
+    /// cancel or a failed write, the temporary file is removed.
     async fn write_received(
         &self,
         hash: iroh_blobs::Hash,
         dir: PathBuf,
         file_name: &str,
         recipient: Recipient,
-    ) -> std::io::Result<PathBuf> {
+    ) -> std::io::Result<Written> {
         use tokio::io::AsyncWriteExt;
 
         let name = file_name.to_string();
-        let (dir, (dest, file)) = tokio::task::spawn_blocking(move || {
+        let (dir, (staged, file)) = tokio::task::spawn_blocking(move || {
             receive_dest::create(&dir, &name, recipient).map(|created| (dir, created))
         })
         .await
@@ -954,16 +973,10 @@ impl FileService {
             self.transport.blob_store.blobs().reader(hash),
         );
         let mut out = tokio::fs::File::from_std(file);
-        let written = async {
-            tokio::io::copy_buf(&mut reader, &mut out).await?;
-            out.flush().await
-        }
-        .await;
-        if let Err(e) = written {
-            dest.discard();
-            return Err(e);
-        }
-        Ok(dir.join(&dest.name))
+        tokio::io::copy_buf(&mut reader, &mut out).await?;
+        out.flush().await?;
+        drop(out);
+        Ok(Written { staged, dir })
     }
 
     /// This device's pairing cert, as the registry currently holds it.

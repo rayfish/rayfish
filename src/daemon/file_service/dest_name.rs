@@ -24,6 +24,13 @@ pub(super) fn numbered_name(file_name: &str, attempt: u32) -> String {
     }
 }
 
+/// A name for a file being received, until it is complete. Random, so two
+/// receives into one directory never share one, and short, so it fits however
+/// long the real name is. A leading dot keeps it out of most file listings.
+pub(super) fn temp_name() -> String {
+    format!(".rayfish-{:016x}.part", rand::random::<u64>())
+}
+
 /// How many leading components of `path` are its prefix and root, which the
 /// walk up to an existing directory never strips: `/` on Unix, `C:\` or
 /// `\\server\share\` on Windows. At least one, so the walk always stops.
