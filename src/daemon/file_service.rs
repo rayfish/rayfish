@@ -38,7 +38,8 @@ pub(crate) struct Recipient {
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) owner: Option<(u32, u32)>,
     /// `owner` named the directory, so it must be one they own. Off for the
-    /// root-configured auto-accept target.
+    /// root-configured auto-accept target, which is trusted as long as no
+    /// link redirects it.
     pub(crate) caller_chose_dir: bool,
     /// Who asked, on Windows, where there is no uid to compare: the daemon
     /// asks Windows whether this caller could write the directory themselves.
@@ -96,13 +97,17 @@ impl Recipient {
         }
     }
 
-    /// The uid the destination directory must belong to, if any. Root may
-    /// name any directory: it could write there anyway.
+    /// How far the destination directory is trusted. Root may name any
+    /// directory: it could write there anyway. A directory root configured
+    /// is trusted as long as nobody redirected it with a link.
     #[cfg(unix)]
-    fn required_dir_owner(&self) -> Option<u32> {
-        match self.owner {
-            Some((uid, _)) if self.caller_chose_dir && uid != 0 => Some(uid),
-            _ => None,
+    fn dir_trust(&self) -> receive_dest::DirTrust {
+        use receive_dest::DirTrust;
+        let uid = self.owner.map(|(uid, _)| uid).filter(|&uid| uid != 0);
+        match (self.caller_chose_dir, uid) {
+            (true, Some(uid)) => DirTrust::Owner(uid),
+            (true, None) => DirTrust::Any,
+            (false, uid) => DirTrust::Configured(uid),
         }
     }
 }
@@ -866,7 +871,8 @@ impl FileService {
         };
         let output = Some(dir.to_string_lossy().into_owned());
         // Root set both the directory and its user (`check_authorized`), so the
-        // directory is trusted; only the file name still comes from the peer.
+        // directory is trusted as configured. Its user may still own part of
+        // the path, so a link in it is not (see `receive_dest`).
         let recipient = Recipient {
             owner: cred,
             caller_chose_dir: false,

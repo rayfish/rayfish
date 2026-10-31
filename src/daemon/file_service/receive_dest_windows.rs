@@ -109,8 +109,13 @@ impl Drop for Staged {
 
 /// How far the destination directory has to be checked.
 enum DirCheck<'a> {
-    /// LocalSystem or the Administrator-configured auto-accept target.
+    /// LocalSystem chose it, and could write there anyway.
     Trusted,
+    /// An Administrator configured it as the auto-accept target. Trusted as
+    /// configured, so no component may be a junction or link: a user who can
+    /// replace part of the path (their own Downloads) could otherwise point
+    /// it at `C:\Windows\System32`.
+    Configured,
     /// The caller chose it: they must be able to write there themselves.
     Caller(&'a ClientToken),
 }
@@ -118,7 +123,7 @@ enum DirCheck<'a> {
 impl DirCheck<'_> {
     fn caller_sid(&self) -> Option<&str> {
         match self {
-            Self::Trusted => None,
+            Self::Trusted | Self::Configured => None,
             Self::Caller(token) => Some(token.sid()),
         }
     }
@@ -143,7 +148,7 @@ impl DirCheck<'_> {
 
 fn dir_check(recipient: &Recipient) -> io::Result<DirCheck<'_>> {
     if !recipient.caller_chose_dir {
-        return Ok(DirCheck::Trusted);
+        return Ok(DirCheck::Configured);
     }
     match &recipient.caller {
         WindowsCaller::System => Ok(DirCheck::Trusted),
@@ -201,22 +206,14 @@ fn open_dir(path: &Path, check: &DirCheck<'_>) -> io::Result<OpenDir> {
     // A relative path means the daemon's working directory, as it always has;
     // the walk below needs the absolute form to find an existing ancestor.
     let path = &absolute(path)?;
-    let components: Vec<Component<'_>> = path.components().collect();
     // Find the deepest prefix that already exists. Nothing is created until
     // that directory has passed the check, so a refused request leaves no
     // trace on disk. The caller's path may go through a link (a Downloads
     // folder redirected to another disk): what is checked is the directory
     // the handle ends up on.
-    let mut existing = components.len();
-    let mut dir = loop {
-        let prefix: PathBuf = components[..existing].iter().collect();
-        match open_dir_handle(&prefix, false) {
-            Ok(dir) => break dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound && existing > root_len(path) => {
-                existing -= 1
-            }
-            Err(e) => return Err(with_path(e, path)),
-        }
+    let (mut dir, existing) = match check {
+        DirCheck::Configured => walk_without_links(path)?,
+        DirCheck::Trusted | DirCheck::Caller(_) => deepest_existing(path)?,
     };
     for name in missing_names(path, existing)? {
         check.require(&dir, FILE_ADD_SUBDIRECTORY, path)?;
@@ -226,6 +223,43 @@ fn open_dir(path: &Path, check: &DirCheck<'_>) -> io::Result<OpenDir> {
     }
     check.require(&dir, FILE_ADD_FILE, path)?;
     Ok(dir)
+}
+
+/// The deepest existing prefix of `path`, opened through any links in it,
+/// and how many components it has.
+fn deepest_existing(path: &Path) -> io::Result<(OpenDir, usize)> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut existing = components.len();
+    loop {
+        let prefix: PathBuf = components[..existing].iter().collect();
+        match open_dir_handle(&prefix, false) {
+            Ok(dir) => return Ok((dir, existing)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && existing > root_len(path) => {
+                existing -= 1
+            }
+            Err(e) => return Err(with_path(e, path)),
+        }
+    }
+}
+
+/// Like [`deepest_existing`], but one component at a time from the root,
+/// refusing any that is a reparse point. Each directory stays open while the
+/// next is opened, and an open directory cannot be renamed, so the next
+/// component is looked up in the directory that was just checked.
+fn walk_without_links(path: &Path) -> io::Result<(OpenDir, usize)> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let root = root_len(path);
+    let mut prefix: PathBuf = components[..root].iter().collect();
+    let mut dir = open_dir_handle(&prefix, true).map_err(|e| with_path(e, path))?;
+    for (index, component) in components.iter().enumerate().skip(root) {
+        prefix.push(component);
+        match open_dir_handle(&prefix, true) {
+            Ok(next) => dir = next,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((dir, index)),
+            Err(e) => return Err(with_path(e, path)),
+        }
+    }
+    Ok((dir, components.len()))
 }
 
 /// Open a directory for reading its security and attributes. `no_follow`
@@ -266,7 +300,7 @@ fn open_dir_handle(path: &Path, no_follow: bool) -> io::Result<OpenDir> {
     if no_follow && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "a directory created for the file was replaced by a link",
+            "a link or junction where a plain directory was expected",
         ));
     }
     let final_path = final_path(&handle)?;
@@ -540,7 +574,7 @@ fn with_path(e: io::Error, path: &Path) -> io::Error {
 mod tests {
     use super::*;
 
-    fn trusted() -> Recipient {
+    fn configured() -> Recipient {
         Recipient {
             owner: None,
             caller_chose_dir: false,
@@ -603,7 +637,7 @@ mod tests {
     fn a_taken_name_gets_a_number_and_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
-        let (staged, file) = create(tmp.path(), "f.bin", trusted()).unwrap();
+        let (staged, file) = create(tmp.path(), "f.bin", configured()).unwrap();
         drop(file);
         assert_eq!(staged.commit().unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
@@ -613,7 +647,7 @@ mod tests {
     fn a_stream_name_becomes_a_plain_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.txt"), b"keep").unwrap();
-        let (staged, file) = create(tmp.path(), "notes.txt:hidden", trusted()).unwrap();
+        let (staged, file) = create(tmp.path(), "notes.txt:hidden", configured()).unwrap();
         drop(file);
         assert_eq!(staged.commit().unwrap(), "notes.txt_hidden");
     }
@@ -622,7 +656,7 @@ mod tests {
     fn missing_directories_are_created_and_a_dropped_file_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a").join("b");
-        let (staged, file) = create(&nested, "f.bin", trusted()).unwrap();
+        let (staged, file) = create(&nested, "f.bin", configured()).unwrap();
         drop(file);
         drop(staged);
         assert!(nested.is_dir());
@@ -633,12 +667,38 @@ mod tests {
     fn commit_never_replaces_a_file_that_appeared_meanwhile() {
         use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
-        let (staged, mut file) = create(tmp.path(), "f.bin", trusted()).unwrap();
+        let (staged, mut file) = create(tmp.path(), "f.bin", configured()).unwrap();
         file.write_all(b"new").unwrap();
         drop(file);
         std::fs::write(tmp.path().join("f.bin"), b"keep").unwrap();
         assert_eq!(staged.commit().unwrap(), "f (1).bin");
         assert_eq!(std::fs::read(tmp.path().join("f.bin")).unwrap(), b"keep");
         assert_eq!(std::fs::read(tmp.path().join("f (1).bin")).unwrap(), b"new");
+    }
+
+    /// A user who turns their configured Downloads into a junction must not
+    /// steer SYSTEM's write somewhere else.
+    #[test]
+    fn a_junction_in_a_configured_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let junction = tmp.path().join("Downloads");
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        for dir in [junction.clone(), junction.join("sub")] {
+            let Err(e) = create(&dir, "f.bin", configured()) else {
+                panic!("{dir:?} goes through a junction");
+            };
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        }
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
     }
 }

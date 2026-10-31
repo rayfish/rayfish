@@ -98,34 +98,112 @@ pub(super) fn create(
     Ok((staged, file))
 }
 
+/// How far the directory a file lands in is trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DirTrust {
+    /// Root asked, or an embedder that runs as the user anyway: root could
+    /// write there itself.
+    Any,
+    /// The caller with this uid named the directory. The path may go through
+    /// links (a Downloads folder on another disk), but the directory it ends
+    /// on must be theirs.
+    Owner(u32),
+    /// Root configured the directory, for this non-root uid if any. Trusted
+    /// as configured only when no component is a link: a user who can
+    /// replace part of the path (their own `~/Downloads`) could otherwise
+    /// point it at `/etc`. Through a link, it must end on the uid's own
+    /// directory, as for [`DirTrust::Owner`].
+    Configured(Option<u32>),
+}
+
 /// Open `path` as a directory, creating its missing trailing components.
 fn open_dir(path: &Path, recipient: &Recipient) -> io::Result<OwnedFd> {
     // A relative path means the daemon's working directory, as it always has;
     // the walk below needs the absolute form to find an existing ancestor.
     let path = &absolute(path)?;
-    let components: Vec<Component<'_>> = path.components().collect();
+    let trust = recipient.dir_trust();
     // Find the deepest prefix that already exists. Nothing is created until
-    // that directory has passed the owner check, so a refused request leaves
-    // no trace on disk.
+    // that directory has passed the check, so a refused request leaves no
+    // trace on disk.
+    let walked = match trust {
+        DirTrust::Configured(_) => walk_without_links(path)?,
+        DirTrust::Any | DirTrust::Owner(_) => None,
+    };
+    let link_free = walked.is_some();
+    let (mut dir, existing) = match walked {
+        Some(found) => found,
+        None => deepest_existing(path)?,
+    };
+    let missing = missing_names(path, existing)?;
+    check_dir(&dir, trust, link_free, path)?;
+    for name in missing {
+        make_dir_at(&dir, name, recipient.owner).map_err(|e| with_path(e, path))?;
+        dir = open_dir_at(Some(&dir), name, true).map_err(|e| with_path(e, path))?;
+        check_dir(&dir, trust, link_free, path)?;
+    }
+    Ok(dir)
+}
+
+/// The deepest existing prefix of `path`, opened through any links in it,
+/// and how many components it has.
+fn deepest_existing(path: &Path) -> io::Result<(OwnedFd, usize)> {
+    let components: Vec<Component<'_>> = path.components().collect();
     let mut existing = components.len();
-    let mut dir = loop {
+    loop {
         let prefix: PathBuf = components[..existing].iter().collect();
         match open_dir_at(None, prefix.as_os_str(), false) {
-            Ok(fd) => break fd,
+            Ok(fd) => return Ok((fd, existing)),
             Err(e) if e.kind() == io::ErrorKind::NotFound && existing > root_len(path) => {
                 existing -= 1
             }
             Err(e) => return Err(with_path(e, path)),
         }
-    };
-    let missing = missing_names(path, existing)?;
-    check_dir_owner(&dir, recipient, path)?;
-    for name in missing {
-        make_dir_at(&dir, name, recipient.owner).map_err(|e| with_path(e, path))?;
-        dir = open_dir_at(Some(&dir), name, true).map_err(|e| with_path(e, path))?;
-        check_dir_owner(&dir, recipient, path)?;
     }
-    Ok(dir)
+}
+
+/// Like [`deepest_existing`], but one component at a time from the root,
+/// each opened relative to the last without following a link. `None` when a
+/// component is a link.
+fn walk_without_links(path: &Path) -> io::Result<Option<(OwnedFd, usize)>> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let root = root_len(path);
+    let prefix: PathBuf = components[..root].iter().collect();
+    let mut dir = open_dir_at(None, prefix.as_os_str(), true).map_err(|e| with_path(e, path))?;
+    for (index, component) in components.iter().enumerate().skip(root) {
+        let name = component.as_os_str();
+        match open_dir_at(Some(&dir), name, true) {
+            Ok(next) => dir = next,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some((dir, index))),
+            Err(e) => {
+                if is_link_at(&dir, name)? {
+                    return Ok(None);
+                }
+                return Err(with_path(e, path));
+            }
+        }
+    }
+    Ok(Some((dir, components.len())))
+}
+
+/// Whether `name` in `dir` is a symbolic link.
+fn is_link_at(dir: &OwnedFd, name: &OsStr) -> io::Result<bool> {
+    let c = c_name(name)?;
+    // SAFETY: an all-zero `stat` is a valid value for the out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open directory descriptor, `c` a valid
+    // NUL-terminated string and `st` a writable `stat` for the call.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFLNK)
 }
 
 /// `mkdirat` one component, handing it to `owner` when this call created it.
@@ -181,10 +259,22 @@ fn open_dir_at(parent: Option<&OwnedFd>, name: &OsStr, no_follow: bool) -> io::R
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Refuse a directory the recipient does not own, when they chose it.
-fn check_dir_owner(dir: &OwnedFd, recipient: &Recipient, path: &Path) -> io::Result<()> {
-    let Some(uid) = recipient.required_dir_owner() else {
-        return Ok(());
+/// Refuse a directory `trust` does not allow. `link_free` is whether the
+/// path to it was walked without following a link.
+fn check_dir(dir: &OwnedFd, trust: DirTrust, link_free: bool, path: &Path) -> io::Result<()> {
+    let uid = match trust {
+        DirTrust::Any => return Ok(()),
+        DirTrust::Configured(_) if link_free => return Ok(()),
+        DirTrust::Owner(uid) | DirTrust::Configured(Some(uid)) => uid,
+        DirTrust::Configured(None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "'{}' goes through a link; set the download directory to the real path",
+                    path.display()
+                ),
+            ));
+        }
     };
     // SAFETY: an all-zero `stat` is a valid value for the out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -436,21 +526,63 @@ mod tests {
         assert!(!tmp.path().join("f.bin").exists());
     }
 
+    fn configured(owner: Option<(u32, u32)>) -> Recipient {
+        Recipient {
+            owner,
+            caller_chose_dir: false,
+        }
+    }
+
     #[test]
-    fn root_and_configured_targets_skip_the_owner_check() {
+    fn trust_follows_who_chose_the_directory() {
+        assert_eq!(caller((0, 0)).dir_trust(), DirTrust::Any);
+        assert_eq!(caller((7, 7)).dir_trust(), DirTrust::Owner(7));
+        assert_eq!(configured(None).dir_trust(), DirTrust::Configured(None));
+        assert_eq!(
+            configured(Some((0, 0))).dir_trust(),
+            DirTrust::Configured(None)
+        );
+        assert_eq!(
+            configured(Some((7, 7))).dir_trust(),
+            DirTrust::Configured(Some(7))
+        );
+    }
+
+    #[test]
+    fn a_configured_directory_without_links_is_trusted_whoever_owns_it() {
         let tmp = tempfile::tempdir().unwrap();
         let other = me().0.wrapping_add(1).max(1);
-        let configured = Recipient {
-            owner: None,
-            caller_chose_dir: false,
-        };
-        assert!(create(tmp.path(), "a.bin", configured).is_ok());
-        let auto = Recipient {
-            owner: Some((other, other)),
-            caller_chose_dir: false,
-        };
-        assert_eq!(auto.required_dir_owner(), None);
-        assert_eq!(caller((0, 0)).required_dir_owner(), None);
+        assert!(create(tmp.path(), "a.bin", configured(None)).is_ok());
+        let nested = tmp.path().join("new/sub");
+        let (staged, _file) = create(&nested, "a.bin", configured(Some((other, other)))).unwrap();
+        staged.commit().unwrap();
+        assert!(nested.join("a.bin").exists());
+    }
+
+    /// A user who replaces their configured Downloads with a link must not
+    /// steer root's write to a directory that is not theirs.
+    #[test]
+    fn a_configured_directory_through_a_link_must_be_the_users_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("Downloads");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let other = me().0.wrapping_add(1).max(1);
+        for recipient in [configured(Some((other, other))), configured(None)] {
+            for dir in [link.clone(), link.join("sub")] {
+                let Err(e) = create(&dir, "f.bin", recipient.clone()) else {
+                    panic!("{dir:?} leads to a directory that is not theirs");
+                };
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            }
+        }
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+        // Through a link to their own directory, as a Downloads folder on
+        // another disk would be, it still works.
+        let (staged, _file) = create(&link, "f.bin", configured(Some(me()))).unwrap();
+        staged.commit().unwrap();
+        assert!(real.join("f.bin").exists());
     }
 
     #[test]

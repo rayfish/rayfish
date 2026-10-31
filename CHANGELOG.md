@@ -139,6 +139,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Received files only go into a directory the accepting user owns, never
   through a link, and never over an existing file (the new one is saved as
   `name (1).ext`). Only root can set `download-dir` and `download-user`.
+- File auto-accept no longer follows a link in the configured download
+  directory to a directory its user does not own. A user who replaced their
+  `~/Downloads` with a link to `/etc` (or a junction to `System32` on Windows)
+  could have the daemon create a file there and hand it to them. A configured
+  directory reached without links works as before, whoever owns it.
 - A member no longer takes another member's name from that member's own
   claim. Names in the roster and Magic DNS come only from what the coordinator
   signed, so a peer cannot make others resolve it under a name it chose.
