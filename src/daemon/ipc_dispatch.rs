@@ -483,7 +483,6 @@ impl Daemon {
                 "this operation is unavailable in rootless mode; use the SOCKS5 proxy or explicit port exposure",
             );
         }
-        let peer_cred = peer.as_ref().and_then(PeerIdentity::unix_cred);
         match req {
             IpcMessage::Create {
                 mode,
@@ -669,7 +668,8 @@ impl Daemon {
             IpcMessage::CancelTransfer { id } => reply(self.files.cancel_transfer(id)),
             IpcMessage::ListFiles => self.list_files().into(),
             IpcMessage::AcceptFile { id, output } => {
-                reply(self.files.accept_file(id, output, peer_cred).await)
+                let recipient = file_service::Recipient::caller(peer.as_ref());
+                reply(self.files.accept_file_for(id, output, recipient).await)
             }
             IpcMessage::RejectFile { id } => reply(self.files.reject_file(id)),
             IpcMessage::StartPairing => reply_with(self.start_pairing(), |ticket| {

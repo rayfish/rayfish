@@ -5,6 +5,7 @@ fn peer(sid: &str, system: bool, admin: bool) -> PeerIdentity {
         sid: sid.to_owned(),
         is_local_system: system,
         is_elevated_admin: admin,
+        token: None,
     }
 }
 

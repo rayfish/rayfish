@@ -367,31 +367,9 @@ impl FileService {
                     .join("Downloads")
             }),
         };
-        #[cfg(unix)]
-        {
-            self.write_received(file.blob_hash, dir, &file.filename, recipient)
-                .await
-                .map_err(|e| format!("write failed: {e}"))
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows has no `openat`, so this still writes through the path
-            // the caller named; `recipient` only matters to the Unix ownership
-            // checks.
-            let _ = recipient;
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("cannot create directory '{}': {e}", dir.display()))?;
-            // Export straight from the blob store to the destination rather
-            // than through `get_bytes`, which holds the whole file in memory.
-            let dest = dir.join(&file.filename);
-            self.transport
-                .blob_store
-                .blobs()
-                .export(file.blob_hash, &dest)
-                .await
-                .map_err(|e| format!("write failed: {e}"))?;
-            Ok(dest)
-        }
+        self.write_received(file.blob_hash, dir, &file.filename, recipient)
+            .await
+            .map_err(|e| format!("write failed: {e}"))
     }
 }
 

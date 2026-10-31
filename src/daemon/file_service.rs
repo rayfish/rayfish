@@ -19,27 +19,70 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use tokio_util::io::ReaderStream;
 
+mod dest_name;
 mod receive;
 #[cfg(unix)]
+mod receive_dest;
+#[cfg(windows)]
+#[path = "file_service/receive_dest_windows.rs"]
 mod receive_dest;
 
 /// Who an accepted file is for, and how far the directory it lands in is
 /// trusted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Recipient {
     /// The user the file (and any directory created for it) is handed to.
-    /// `None` leaves it owned by the daemon.
+    /// `None` leaves it owned by the daemon. Unix only in effect: Windows
+    /// grants the file to `caller` instead.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) owner: Option<(u32, u32)>,
     /// `owner` named the directory, so it must be one they own. Off for the
     /// root-configured auto-accept target.
     pub(crate) caller_chose_dir: bool,
+    /// Who asked, on Windows, where there is no uid to compare: the daemon
+    /// asks Windows whether this caller could write the directory themselves.
+    #[cfg(windows)]
+    pub(crate) caller: WindowsCaller,
+}
+
+/// The Windows caller behind an accept, as far as the destination check
+/// needs to know.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(crate) enum WindowsCaller {
+    /// LocalSystem, the daemon's own account: it could write there anyway.
+    System,
+    /// A user whose token decides, through the directory's ACL.
+    User(Arc<crate::windows_identity::ClientToken>),
+    /// Nothing identified the caller. A directory they chose is refused.
+    Unknown,
 }
 
 impl Recipient {
+    /// A local caller accepting a file into a directory they named (or the
+    /// CLI defaulted to their Downloads).
+    pub(crate) fn caller(peer: Option<&PeerIdentity>) -> Self {
+        Self {
+            owner: peer.and_then(PeerIdentity::unix_cred),
+            caller_chose_dir: true,
+            #[cfg(windows)]
+            caller: match peer {
+                Some(PeerIdentity::Windows {
+                    is_local_system: true,
+                    ..
+                }) => WindowsCaller::System,
+                Some(PeerIdentity::Windows {
+                    token: Some(token), ..
+                }) => WindowsCaller::User(Arc::clone(token)),
+                _ => WindowsCaller::Unknown,
+            },
+        }
+    }
+
     /// The uid the destination directory must belong to, if any. Root may
     /// name any directory: it could write there anyway.
     #[cfg(unix)]
-    fn required_dir_owner(self) -> Option<u32> {
+    fn required_dir_owner(&self) -> Option<u32> {
         match self.owner {
             Some((uid, _)) if self.caller_chose_dir && uid != 0 => Some(uid),
             _ => None,
@@ -769,6 +812,8 @@ impl FileService {
         let recipient = Recipient {
             owner: cred,
             caller_chose_dir: false,
+            #[cfg(windows)]
+            caller: WindowsCaller::System,
         };
 
         // Not awaited: an interrupted receive keeps retrying for hours, and
@@ -786,6 +831,10 @@ impl FileService {
     /// must own that directory unless they are root: the write happens with
     /// the daemon's privileges. Failed receives stay queued with their
     /// downloaded ranges so the destination can retry.
+    ///
+    /// The embedder entry point, which knows the caller only by uid. On
+    /// Windows that identifies nobody, so a named directory is refused there;
+    /// IPC goes through [`Self::accept_file_for`] with the pipe's caller.
     pub(crate) async fn accept_file(
         self: &Arc<Self>,
         id: u64,
@@ -795,6 +844,8 @@ impl FileService {
         let recipient = Recipient {
             owner: peer_cred,
             caller_chose_dir: true,
+            #[cfg(windows)]
+            caller: WindowsCaller::Unknown,
         };
         self.accept_file_for(id, output, recipient).await
     }
@@ -802,7 +853,7 @@ impl FileService {
     /// Start the receive and wait for its outcome. The receive itself runs
     /// in a task of its own (see [`receive`]), so it continues, and keeps
     /// retrying, if this caller goes away.
-    async fn accept_file_for(
+    pub(crate) async fn accept_file_for(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
@@ -821,7 +872,6 @@ impl FileService {
     /// the entire file in memory, which on a phone sharing a video is a kill.
     /// Not `export` either, which writes through the path and so follows
     /// whatever link sits there; see [`receive_dest`].
-    #[cfg(unix)]
     async fn write_received(
         &self,
         hash: iroh_blobs::Hash,
