@@ -893,9 +893,10 @@ impl NetworkRegistry {
             mode: GroupMode::Restricted,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
-            // Cold restore: nothing has been applied yet, so there is no
-            // rollback to refuse. The first current signed record sets the floor.
-            last_record_timestamp: None,
+            // Cold restore and warm resume: the floor saved when it last rose,
+            // so a record from before then is still refused.
+            last_record_timestamp: saved_record_floor(ctx.display_name, ctx.net_pubkey),
+            last_published_record: None,
         };
         state.refresh_snapshot();
         Arc::new(std::sync::RwLock::new(state))
@@ -1229,9 +1230,13 @@ impl NetworkRegistry {
         // binds the durable key and provenance to one exact live generation.
         let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
-        let (held_key, converged_hash) = {
+        let (held_key, converged_hash, floor) = {
             let state = state.read().unwrap();
-            (state.network_secret_key.clone(), state.converged_hash)
+            (
+                state.network_secret_key.clone(),
+                state.converged_hash,
+                state.last_record_timestamp,
+            )
         };
 
         // Set the network public key on the state. It is not part of GroupBlob,
@@ -1254,6 +1259,7 @@ impl NetworkRegistry {
         // co-coordinator's key plus exact admitted hash in one transaction. The
         // key is not exposed through a coordinator handler until this succeeds.
         let persist_result = config::update_network(display_name, |net| {
+            raise_saved_record_floor(net, floor);
             apply_finalized_join_config(
                 net,
                 net_pubkey,

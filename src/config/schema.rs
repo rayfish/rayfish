@@ -235,6 +235,12 @@ pub struct NetworkConfig {
     /// were written only by already-running publishers/reconvergence.
     #[serde(default = "default_true")]
     pub last_group_hash_published: bool,
+    /// The replay floor (`NetworkState::last_record_timestamp`) as last raised,
+    /// so a restart keeps refusing records older than one already applied or
+    /// published. Absent in configs written before it existed, which start open
+    /// as they always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_record_timestamp: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportMode>,
     /// This node auto-installs coordinator-suggested firewall rules without a
@@ -484,6 +490,7 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         independent_paired_devices: vec![],
         last_group_hash: None,
         last_group_hash_published: true,
+        last_record_timestamp: None,
         transport: None,
         auto_accept_firewall: false,
         auto_accept_files: true,

@@ -43,6 +43,7 @@ fn hold_network(daemon: &Daemon, name: &str, members: &[(EndpointId, bool)]) {
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
         last_record_timestamp: None,
+        last_published_record: None,
     };
     state.refresh_snapshot();
     daemon.registry.networks.insert(

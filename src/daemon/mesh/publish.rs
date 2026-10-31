@@ -105,7 +105,10 @@ async fn synchronize_before_renewal(
         ReconvergeOutcome::Applied | ReconvergeOutcome::Current | ReconvergeOutcome::Stale => true,
         // A local edit landed meanwhile and now has priority.
         ReconvergeOutcome::Superseded => has_authored_snapshot(state, network),
-        ReconvergeOutcome::Unfetched | ReconvergeOutcome::Departed => false,
+        // `Unconfirmed` is for mesh records only; this one came from the relay.
+        ReconvergeOutcome::Unfetched
+        | ReconvergeOutcome::Departed
+        | ReconvergeOutcome::Unconfirmed => false,
     })
 }
 
@@ -484,9 +487,11 @@ fn write_group_hash_pointer(
     hash: blake3::Hash,
     published: bool,
 ) -> bool {
+    let floor = state.read().unwrap().last_record_timestamp;
     match config::update_network(network, |net| {
         net.last_group_hash = Some(hash);
         net.last_group_hash_published = published;
+        raise_saved_record_floor(net, floor);
         Ok(())
     }) {
         Ok(Some(_)) => {
@@ -579,8 +584,8 @@ pub(crate) async fn persist_group_hash_locked(
 /// against the pointer, and a commit may have moved it while the publish was in
 /// flight. `Ok(false)` means it did, and a newer record is owed.
 ///
-/// The record's timestamp also becomes this node's replay floor, under the same
-/// lock as the mark. The group poller reads this coordinator's own network
+/// The record's timestamp also becomes this node's replay floor, and the record
+/// the one it hands reconnecting members, under the same lock as the mark. The group poller reads this coordinator's own network
 /// record, and without the floor a stale copy served after this publish names
 /// an older blob, reads as newer than nothing, and is applied and then
 /// republished over our own edit.
@@ -594,26 +599,72 @@ pub(crate) async fn publish_signed_record(
     dht::publish_record(client, packet).await?;
     let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let _commit = commit.lock().await;
-    raise_record_floor(state, packet.timestamp().as_micros());
-    Ok(mark_group_hash_published(network, hash))
+    let published = packet.timestamp().as_micros();
+    raise_record_floor(state, packet);
+    Ok(mark_group_hash_published(network, hash, published))
 }
 
-/// Refuse any record authored before `published`, a record the relay took.
-fn raise_record_floor(state: &SharedNetworkState, published: u64) {
+/// Refuse any record authored before `packet`, a record the relay took, and
+/// keep it as the last published unless a later one is already held.
+fn raise_record_floor(state: &SharedNetworkState, packet: &SignedPacket) {
+    let published = packet.timestamp().as_micros();
     let mut state = state.write().unwrap();
     let floor = state
         .last_record_timestamp
         .map_or(published, |floor| floor.max(published));
     state.last_record_timestamp = Some(floor);
+    if state
+        .last_published_record
+        .as_ref()
+        .is_none_or(|held| held.timestamp() < packet.timestamp())
+    {
+        state.last_published_record = Some(packet.clone());
+    }
 }
 
-pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash) -> bool {
+/// Raise the saved replay floor, never lower it: a write carrying an older
+/// floor than the saved one keeps the saved one.
+pub(crate) fn raise_saved_record_floor(net: &mut config::NetworkConfig, floor: Option<u64>) {
+    net.last_record_timestamp = net.last_record_timestamp.max(floor);
+}
+
+/// Save a floor rise that no recovery pointer write carries: a renewal of the
+/// roster already held. A failure only costs the restart that floor.
+pub(crate) fn persist_record_floor(network: &str, floor: u64) {
+    if let Err(e) = config::update_network(network, |net| {
+        raise_saved_record_floor(net, Some(floor));
+        Ok(())
+    }) {
+        tracing::warn!(network, error = %format!("{e:#}"), "failed to save the record floor");
+    }
+}
+
+/// The replay floor saved for `network` under `key`, to seed a state rebuilt
+/// from config. `None` when nothing was saved, the saved network is another
+/// one, or the config cannot be read, which leaves the state as open as it was
+/// before the floor was saved at all.
+pub(crate) fn saved_record_floor(network: &str, key: EndpointId) -> Option<u64> {
+    match config::load_network(network) {
+        Ok(net) => net
+            .filter(|net| net.network_public_key == Some(key))
+            .and_then(|net| net.last_record_timestamp),
+        Err(e) => {
+            tracing::warn!(network, error = %format!("{e:#}"), "failed to read the saved record floor");
+            None
+        }
+    }
+}
+
+/// Mark `hash` published if it is still the recovery pointer, and save the
+/// floor its record (authored at `published`) raised either way.
+pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash, published: u64) -> bool {
     let mut current = false;
     match config::update_network(network, |net| {
         current = net.last_group_hash == Some(hash);
         if current {
             net.last_group_hash_published = true;
         }
+        raise_saved_record_floor(net, Some(published));
         Ok(())
     }) {
         Ok(Some(_)) => current,
@@ -857,6 +908,7 @@ mod tests {
             network_name: Some("test".to_string()),
             mode: GroupMode::Restricted,
             last_record_timestamp: None,
+            last_published_record: None,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         }))
@@ -1148,7 +1200,7 @@ mod tests {
         let pending = config::load_network("test").unwrap().unwrap();
         assert_eq!(pending.last_group_hash, Some(new_hash));
         assert!(!pending.last_group_hash_published);
-        assert!(mark_group_hash_published("test", new_hash));
+        assert!(mark_group_hash_published("test", new_hash, 1));
         assert!(
             config::load_network("test")
                 .unwrap()

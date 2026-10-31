@@ -29,6 +29,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Joining a network twice under two names at once, or while the daemon was
   restoring it under its saved name, no longer brings it up twice. The second
   join is refused, and leaving the network no longer cuts off a second copy.
+- After a restart, a member no longer deletes a saved network when someone
+  replays an old network record from before it joined.
+- On a network with several coordinators, a member reconnecting to one that
+  has not yet caught up no longer rolls back to its older roster and then
+  ignores the newer one.
 - On a network with several coordinators, a coordinator that created the
   network or restarted now picks up changes another coordinator makes, instead
   of missing them until something else prompted a refresh.

@@ -1431,6 +1431,7 @@ impl NetworkRegistry {
             independent_paired_devices: vec![],
             last_group_hash: Some(last_group_hash),
             last_group_hash_published: false,
+            last_record_timestamp: None,
             transport: None,
             auto_accept_firewall: false,
             // Own-device file offers are auto-accepted by default (identity-checked).
@@ -1543,6 +1544,7 @@ impl NetworkRegistry {
             pending: HashMap::new(),
             // Raised by each record this node publishes.
             last_record_timestamp: None,
+            last_published_record: None,
         })
     }
 
@@ -1638,12 +1640,13 @@ impl NetworkRegistry {
         update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await
     }
 
-    /// This coordinator's current network record, serialized as a signed pkarr
-    /// packet, for handing to a (re)connecting member over the mesh so it converges
-    /// to the live roster without waiting on a fresh (possibly stale) DHT lookup.
-    /// `None` when we are not a coordinator of `network` (no secret key) or have no
-    /// snapshot yet. Mirrors the record built by [`Self::store_and_publish_group`];
-    /// the receiver verifies it against the network key before trusting it.
+    /// The record this coordinator last published for its current roster, as
+    /// signed, for handing to a (re)connecting member over the mesh so it
+    /// converges without waiting on a fresh (possibly stale) DHT lookup. `None`
+    /// when we are not a coordinator of `network` (no secret key), or have not
+    /// published the current roster yet. Never signed afresh: its timestamp
+    /// would outrank a newer edit another coordinator published. The receiver
+    /// verifies it against the network key before trusting it.
     pub(crate) async fn current_signed_record(
         &self,
         network: &str,
@@ -1662,24 +1665,19 @@ impl NetworkRegistry {
         if !snapshot_is_publishable(&self.transport.blob_store, &state, network, hash).await {
             return None;
         }
-        let (key, members, approved) = {
+        let (key, members, approved, packet) = {
             let state = state.read().unwrap();
             (
                 state.network_secret_key.clone()?,
                 state.roster(),
                 state.approved_snapshot(),
+                state.last_published_record.clone()?,
             )
         };
-        let mut seed_peers: Vec<EndpointId> = self
-            .peers
-            .peers_for_network(network)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        seed_peers.push(self.transport.endpoint.id());
-        seed_peers.sort_by_key(|id| id.to_string());
-        seed_peers.dedup();
-        let packet = dht::encode_network_record(&key, &hash, &seed_peers).ok()?;
+        let (published_hash, _) = dht::decode_network_record(&packet).ok()?;
+        if published_hash != hash {
+            return None;
+        }
         Some(CurrentSignedNetworkState {
             hash,
             packet: packet.as_bytes().to_vec(),

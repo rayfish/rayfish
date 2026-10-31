@@ -1569,13 +1569,14 @@ impl MemberAcceptState {
         // floor only moves once the blob is in hand: a record whose blob we could
         // not fetch must stay acceptable to the next trigger.
         let device_cert = crate::identity::load_device_cert().ok().flatten();
-        let outcome = apply_group_record(
+        let outcome = apply_group_record_from(
             &self.endpoint,
             &self.registry,
             &self.network_name,
             &self.state,
             &device_cert,
             &record,
+            RecordSource::Mesh,
         )
         .await;
         if outcome == ReconvergeOutcome::Stale {
@@ -2565,6 +2566,7 @@ mod direct_grant_tests {
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             last_record_timestamp: None,
+            last_published_record: None,
         }))
     }
 
