@@ -29,6 +29,8 @@ const CONTROLLER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 mod compatibility_tests;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod scope_tests;
 
 impl Daemon {
     /// Inventory for embedders, including machines outside the local networks.
@@ -1133,6 +1135,23 @@ impl ManagementService {
         Ok(message)
     }
 
+    /// Whether `controller` is a coordinator in the signed roster this machine
+    /// holds for `network`. The management connection's remote id is the
+    /// controller's endpoint id, which is also the key its roster entry is
+    /// stored under. A network that is not active has no roster to check, so it
+    /// counts as not coordinated, and so does a poisoned state lock.
+    fn coordinates(&self, network: &str, controller: EndpointId) -> bool {
+        self.registry.networks.get(network).is_some_and(|handle| {
+            handle.state.read().is_ok_and(|state| {
+                state
+                    .group
+                    .members
+                    .get(&controller)
+                    .is_some_and(|member| member.is_coordinator)
+            })
+        })
+    }
+
     async fn apply_action(
         &self,
         controller: EndpointId,
@@ -1198,6 +1217,15 @@ impl ManagementService {
                         };
                     }
                 };
+                // `delegated_join` always mints the invite itself, so its
+                // coordinator field is the controller's own endpoint. Anything
+                // else would let a controller enroll this machine in a network
+                // it does not run.
+                if coordinator != controller {
+                    return ManagementResult::Error {
+                        message: "invite was not issued by this controller; a controller can only join networks it coordinates".to_string(),
+                    };
+                }
                 match self
                     .registry
                     .join_network(
@@ -1222,6 +1250,11 @@ impl ManagementService {
                 }
             }
             ManagementAction::Leave { network_name } => {
+                if !self.coordinates(network_name.as_ref(), controller) {
+                    return ManagementResult::Error {
+                        message: format!("controller does not coordinate network '{network_name}'"),
+                    };
+                }
                 match self.registry.leave_network(network_name.as_ref()).await {
                     Ok(Done(message)) => ManagementResult::Applied { message },
                     Err(e) => ManagementResult::Error {

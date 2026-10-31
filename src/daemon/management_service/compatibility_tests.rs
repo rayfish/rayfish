@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 // Frozen v1 shapes. In particular, Enrolled must remain a unit variant and
 // Request must never contain one of the receipt-only actions on this ALPN.
 #[derive(Debug, Serialize, Deserialize)]
-enum V1Message {
+pub(super) enum V1Message {
     Enroll {
         secret: EnrollmentSecret,
         hostname: MachineHostname,
@@ -29,7 +29,7 @@ enum V1Message {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum V1Action {
+pub(super) enum V1Action {
     Status,
     Join {
         invite: NetworkInvite,
@@ -43,7 +43,11 @@ enum V1Action {
     },
 }
 
-async fn exchange_v1<M: Serialize>(peer: &Endpoint, server: &Endpoint, message: &M) -> V1Message {
+pub(super) async fn exchange_v1<M: Serialize>(
+    peer: &Endpoint,
+    server: &Endpoint,
+    message: &M,
+) -> V1Message {
     tokio::time::timeout(Duration::from_secs(10), async {
         let connection = peer.connect(server.addr(), LEGACY_ALPN).await.unwrap();
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
