@@ -21,7 +21,11 @@
 //! An aborted pull does not end a send. The receiver resumes an interrupted
 //! receive by itself, for up to a day, and can accept it again after that, so
 //! the sender keeps the entry in progress with a note until the pull completes,
-//! the receiver confirms or declines, or the send is canceled.
+//! the receiver confirms or declines, or the send is canceled. Nothing tells
+//! the sender when the receiver gives up or cancels, which puts the offer back
+//! in its queue, so a send with no new pull for [`RESUME_WINDOW`] goes back to
+//! `Offered`: what it then is on both sides. It is not dropped, since the
+//! offer is still outstanding and has to stay cancelable here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,6 +76,9 @@ struct Entry {
     send: Option<SendKey>,
     /// When the transfer reached a terminal state, for TTL expiry.
     finished_at: Option<Instant>,
+    /// Outgoing only: when the peer's last pull stopped partway, until it
+    /// pulls again. See [`RESUME_WINDOW`].
+    interrupted_at: Option<Instant>,
 }
 
 /// Which provider events belong to an outgoing entry. An event must match both
@@ -87,6 +94,16 @@ struct SendKey {
 
 /// The note on a send whose pull stopped partway.
 pub(crate) const SEND_INTERRUPTED: &str = "interrupted; the recipient resumes it when it can";
+
+/// The note on a send whose interrupted pull was not resumed in time.
+pub(crate) const SEND_NOT_RESUMED: &str =
+    "the recipient stopped receiving; it can still accept the offer";
+
+/// How long an interrupted send waits for the recipient to pull again before
+/// it counts as offered rather than in progress: the receiver's own retry
+/// window, measured here as plain time since the sender cannot see the
+/// receiver's.
+const RESUME_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct TransferRegistry {
     entries: Mutex<HashMap<u64, Entry>>,
@@ -150,6 +167,7 @@ impl TransferRegistry {
                 },
                 send: Some(SendKey { hash, peer }),
                 finished_at: None,
+                interrupted_at: None,
             },
         );
         self.changed();
@@ -177,6 +195,7 @@ impl TransferRegistry {
                 },
                 send: None,
                 finished_at: None,
+                interrupted_at: None,
             },
         );
         self.changed();
@@ -275,6 +294,7 @@ impl TransferRegistry {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.state = TransferState::Transferring;
             e.info.error = None;
+            e.interrupted_at = None;
             self.changed();
         }
     }
@@ -285,13 +305,19 @@ impl TransferRegistry {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.transferred = end_offset.min(e.info.size);
             e.info.state = TransferState::Transferring;
+            e.interrupted_at = None;
             self.changed();
         }
     }
 
     /// A pull ended. A complete one finishes the send; an aborted one leaves
-    /// it in progress with [`SEND_INTERRUPTED`], since the recipient resumes it.
+    /// it in progress with [`SEND_INTERRUPTED`], since the recipient resumes
+    /// it, for up to [`RESUME_WINDOW`].
     pub fn provider_finished(&self, hash: Hash, peer: EndpointId, ok: bool) {
+        self.provider_finished_at(hash, peer, ok, Instant::now());
+    }
+
+    fn provider_finished_at(&self, hash: Hash, peer: EndpointId, ok: bool, now: Instant) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
@@ -299,6 +325,7 @@ impl TransferRegistry {
                 finish_entry(e, true);
             } else {
                 e.info.error = Some(SEND_INTERRUPTED.to_string());
+                e.interrupted_at = Some(now);
             }
             self.changed();
         }
@@ -362,9 +389,19 @@ impl Drop for FinishGuard {
 }
 
 /// Drop finished entries older than [`TERMINAL_TTL`], then the oldest finished
-/// ones past [`MAX_FINISHED`]. Runs on every insert as well as every listing,
-/// so the map stays bounded when nothing polls it.
+/// ones past [`MAX_FINISHED`], and return sends interrupted for longer than
+/// [`RESUME_WINDOW`] to `Offered`. Runs on every insert as well as every
+/// listing, so the map stays bounded when nothing polls it.
 fn prune_finished(entries: &mut HashMap<u64, Entry>, now: Instant) {
+    for e in entries.values_mut() {
+        if e.interrupted_at
+            .is_some_and(|at| now.duration_since(at) >= RESUME_WINDOW)
+        {
+            e.interrupted_at = None;
+            e.info.state = TransferState::Offered;
+            e.info.error = Some(SEND_NOT_RESUMED.to_string());
+        }
+    }
     entries.retain(|_, e| match e.finished_at {
         Some(at) => now.duration_since(at) < TERMINAL_TTL,
         None => true,
@@ -393,6 +430,7 @@ fn finish_entry(e: &mut Entry, ok: bool) {
         TransferState::Failed
     };
     e.finished_at = Some(Instant::now());
+    e.interrupted_at = None;
 }
 
 /// The transfer a provider event belongs to: the oldest outgoing, not-yet-finished
@@ -571,6 +609,30 @@ mod tests {
         assert_eq!(t.error, None);
         reg.provider_finished(hash(1), a, true);
         assert_eq!(reg.list()[0].state, TransferState::Done);
+    }
+
+    /// Nothing tells the sender that the recipient gave up or canceled, so an
+    /// interrupted send that is never pulled again must not stay in progress
+    /// for good. It is still an outstanding offer, cancelable here.
+    #[test]
+    fn an_interrupted_send_not_resumed_in_time_is_offered_again() {
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        let id = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_progress(hash(1), a, 40);
+        let now = Instant::now();
+        reg.provider_finished_at(hash(1), a, false, now);
+        let almost = now + RESUME_WINDOW - Duration::from_secs(1);
+        assert_eq!(reg.list_at(almost)[0].state, TransferState::Transferring);
+
+        let t = &reg.list_at(now + RESUME_WINDOW)[0];
+        assert_eq!(t.state, TransferState::Offered);
+        assert_eq!(t.error.as_deref(), Some(SEND_NOT_RESUMED));
+        // A pull later still shows, and the send can still be canceled.
+        reg.provider_started(hash(1), a);
+        assert_eq!(reg.list()[0].state, TransferState::Transferring);
+        assert_eq!(reg.cancel(id), Some((hash(1), a)));
     }
 
     #[test]

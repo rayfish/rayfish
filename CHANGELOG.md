@@ -42,7 +42,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   download kept going.
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
-  minute later. It shows as done once the recipient finishes it.
+  minute later. It shows as done once the recipient finishes it, and as
+  offered again if the recipient does not resume it within a day.
 - Android: a received file is moved to Downloads from a folder of its own, so
   one whose name was already taken in the app's storage no longer moves the
   older file instead. Accepting a file stops after two minutes without
