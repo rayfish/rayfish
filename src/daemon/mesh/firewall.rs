@@ -868,9 +868,6 @@ fn firewall_set_message(config: &firewall::FirewallConfig, key: FirewallKey) -> 
     }
 }
 
-/// Normalize an SSH allow rule's user list: a `*` (any user incl. root) collapses
-/// the whole list to just `*`; otherwise sort + dedupe. An empty list is left
-/// empty, meaning "any non-root user" (the secure default).
 /// Why this node cannot run mesh SSH, or `None` when it can. Windows has no
 /// embedded server, a build without `desktop` (Android, iOS) has none either,
 /// and a rootless instance cannot bind the mesh address.
@@ -886,6 +883,9 @@ fn mesh_ssh_unavailable(rootless: bool) -> Option<&'static str> {
     }
 }
 
+/// Normalize an SSH allow rule's user list: a `*` (any user incl. root) collapses
+/// the whole list to just `*`; otherwise sort + dedupe. An empty list is left
+/// empty, meaning "any non-root user" (the secure default).
 fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
     if users.iter().any(|u| u == "*") {
         return vec!["*".to_string()];
