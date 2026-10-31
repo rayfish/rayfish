@@ -728,12 +728,13 @@ mod tests {
         stalled_rx.await.unwrap();
         wait_for(&receiver, &mut changes, |t| t.transferred > 0).await;
 
-        // The daemon stops partway through.
+        // The daemon stops partway through. The offer guard puts the entry
+        // back in the queue and rewrites the file under the queue lock, so
+        // once it is back in memory the saved copy is the guard's.
         receiver.registry.shutdown_token.cancel();
-        wait_for(&receiver, &mut changes, |t| {
-            t.state == transfers::TransferState::Failed
-        })
-        .await;
+        while receiver.pending_files.lock().unwrap().is_empty() {
+            changes.changed().await.unwrap();
+        }
         first.router.endpoint().close().await;
         let saved = load_pending_files();
         assert_eq!(saved.len(), 1);
