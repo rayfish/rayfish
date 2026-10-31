@@ -21,9 +21,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf, absolute};
 
 use super::Recipient;
-
-/// How many `name (n).ext` alternatives to try before giving up on a name.
-const MAX_NAME_ATTEMPTS: u32 = 1000;
+use super::dest_name::{MAX_NAME_ATTEMPTS, missing_names, numbered_name, root_len};
 
 /// Where a newly created destination file sits: its directory and the name it
 /// was created under, after any collision suffix.
@@ -60,13 +58,13 @@ pub(super) fn create(
     file_name: &str,
     recipient: Recipient,
 ) -> io::Result<(Destination, File)> {
-    let dir = open_dir(dir, recipient)?;
+    let dir = open_dir(dir, &recipient)?;
     let (name, file) = create_file(&dir, file_name, recipient.owner)?;
     Ok((Destination { dir, name }, file))
 }
 
 /// Open `path` as a directory, creating its missing trailing components.
-fn open_dir(path: &Path, recipient: Recipient) -> io::Result<OwnedFd> {
+fn open_dir(path: &Path, recipient: &Recipient) -> io::Result<OwnedFd> {
     // A relative path means the daemon's working directory, as it always has;
     // the walk below needs the absolute form to find an existing ancestor.
     let path = &absolute(path)?;
@@ -79,20 +77,13 @@ fn open_dir(path: &Path, recipient: Recipient) -> io::Result<OwnedFd> {
         let prefix: PathBuf = components[..existing].iter().collect();
         match open_dir_at(None, prefix.as_os_str(), false) {
             Ok(fd) => break fd,
-            Err(e) if e.kind() == io::ErrorKind::NotFound && existing > 1 => existing -= 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && existing > root_len(path) => {
+                existing -= 1
+            }
             Err(e) => return Err(with_path(e, path)),
         }
     };
-    let missing = components[existing..]
-        .iter()
-        .map(|component| match component {
-            Component::Normal(name) => Ok(*name),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("'{}' leaves the directory it names", path.display()),
-            )),
-        })
-        .collect::<io::Result<Vec<&OsStr>>>()?;
+    let missing = missing_names(path, existing)?;
     check_dir_owner(&dir, recipient, path)?;
     for name in missing {
         make_dir_at(&dir, name, recipient.owner).map_err(|e| with_path(e, path))?;
@@ -156,7 +147,7 @@ fn open_dir_at(parent: Option<&OwnedFd>, name: &OsStr, no_follow: bool) -> io::R
 }
 
 /// Refuse a directory the recipient does not own, when they chose it.
-fn check_dir_owner(dir: &OwnedFd, recipient: Recipient, path: &Path) -> io::Result<()> {
+fn check_dir_owner(dir: &OwnedFd, recipient: &Recipient, path: &Path) -> io::Result<()> {
     let Some(uid) = recipient.required_dir_owner() else {
         return Ok(());
     };
@@ -218,21 +209,6 @@ fn create_file(
     ))
 }
 
-/// `report.pdf`, then `report (1).pdf`, `report (2).pdf`, ... A leading dot
-/// is part of the stem, so `.profile` becomes `.profile (1)`.
-fn numbered_name(file_name: &str, attempt: u32) -> String {
-    if attempt == 0 {
-        return file_name.to_string();
-    }
-    match file_name.rfind('.') {
-        Some(dot) if dot > 0 => {
-            let (stem, ext) = file_name.split_at(dot);
-            format!("{stem} ({attempt}){ext}")
-        }
-        _ => format!("{file_name} ({attempt})"),
-    }
-}
-
 fn c_name(name: &OsStr) -> io::Result<CString> {
     CString::new(name.to_os_string().into_vec())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
@@ -257,15 +233,6 @@ mod tests {
             owner: Some(owner),
             caller_chose_dir: true,
         }
-    }
-
-    #[test]
-    fn numbered_names_keep_the_extension() {
-        assert_eq!(numbered_name("a.txt", 0), "a.txt");
-        assert_eq!(numbered_name("a.txt", 2), "a (2).txt");
-        assert_eq!(numbered_name("a.tar.gz", 1), "a.tar (1).gz");
-        assert_eq!(numbered_name(".profile", 1), ".profile (1)");
-        assert_eq!(numbered_name("README", 1), "README (1)");
     }
 
     #[test]

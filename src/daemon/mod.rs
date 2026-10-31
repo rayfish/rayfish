@@ -108,6 +108,10 @@ pub(crate) enum PeerIdentity {
         sid: String,
         is_local_system: bool,
         is_elevated_admin: bool,
+        /// The caller's token, for asking Windows what they may write.
+        /// `None` when only the SID is known, which refuses a destination
+        /// directory the caller chose.
+        token: Option<Arc<crate::windows_identity::ClientToken>>,
     },
 }
 
@@ -118,6 +122,7 @@ fn windows_peer_authorized(peer: Option<&PeerIdentity>, operator: Option<&str>) 
             sid,
             is_local_system,
             is_elevated_admin,
+            ..
         } => {
             *is_local_system
                 || *is_elevated_admin

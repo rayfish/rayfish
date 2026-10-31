@@ -1756,6 +1756,7 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
         sid: identity.sid,
         is_local_system: identity.is_local_system,
         is_elevated_admin: identity.is_elevated_admin,
+        token: Some(Arc::new(identity.token)),
     });
     let mut framed = ipc::framed(stream);
     // A request this build cannot decode gets the reason back, the same as on

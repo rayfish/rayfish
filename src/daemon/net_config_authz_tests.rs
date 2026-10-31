@@ -82,6 +82,7 @@ fn windows_authorization_accepts_operator_system_and_elevated_admin_only() {
         sid: sid.to_owned(),
         is_local_system: system,
         is_elevated_admin: admin,
+        token: None,
     };
     let operator = "S-1-5-21-1-2-3-1001";
     let stranger = peer("S-1-5-21-1-2-3-1002", false, false);

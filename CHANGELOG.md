@@ -127,6 +127,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claim. Names in the roster and Magic DNS come only from what the coordinator
   signed, so a peer cannot make others resolve it under a name it chose.
   Renames still show up once the coordinator accepts them.
+- Windows: `ray files accept` only saves into a directory the accepting user
+  can write to, instead of anywhere the service account can. It never follows
+  a link at the file name and never overwrites an existing file. Characters
+  Windows reserves in a received file name, such as `:`, become `_`.
 
 ## [0.5.11] - 2026-10-27
 
