@@ -694,8 +694,14 @@ mod tests {
 
     fn state_with_snapshot(hash: blake3::Hash) -> SharedNetworkState {
         Arc::new(RwLock::new(NetworkState {
-            members: MemberList::new(),
-            approved: ApprovedList::new(),
+            group: GroupBlob {
+                members: MemberList::new(),
+                approved: ApprovedList::new(),
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some("test".to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: Some(GroupSnapshot {
                 hash,
                 msgpack_bytes: Vec::new(),
@@ -707,11 +713,7 @@ mod tests {
             network_secret_key: None,
             network_public_key: SecretKey::generate().public(),
             network_name: Some("test".to_string()),
-            group_name: Some("test".to_string()),
             mode: GroupMode::Restricted,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
             last_record_timestamp: None,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),

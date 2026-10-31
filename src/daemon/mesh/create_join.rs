@@ -883,8 +883,7 @@ impl NetworkRegistry {
         data: &crate::membership::GroupBlob,
     ) -> SharedNetworkState {
         let mut state = NetworkState {
-            members: data.members.clone(),
-            approved: data.approved.clone(),
+            group: data.clone(),
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -893,11 +892,7 @@ impl NetworkRegistry {
             network_secret_key: None,
             network_public_key: ctx.net_pubkey,
             network_name: Some(ctx.display_name.to_string()),
-            group_name: data.name.clone(),
             mode: GroupMode::Restricted,
-            suggested_firewall: data.suggested_firewall.clone(),
-            reusable_keys: data.reusable_keys.clone(),
-            nullifiers: data.nullifiers.clone(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             // Cold restore: nothing has been applied yet, so there is no

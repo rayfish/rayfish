@@ -128,7 +128,7 @@ impl NetworkRegistry {
         let id = key.id.clone();
         {
             let mut s = state.write().unwrap();
-            s.reusable_keys.insert(hash.clone(), key);
+            s.group.reusable_keys.insert(hash.clone(), key);
         }
         if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
             // The publisher retries whatever is live, so a key left in place
@@ -137,7 +137,7 @@ impl NetworkRegistry {
             // then picks up the state without it.
             {
                 let mut s = state.write().unwrap();
-                s.reusable_keys.remove(&hash);
+                s.group.reusable_keys.remove(&hash);
             }
             let _ =
                 update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
@@ -163,7 +163,7 @@ impl NetworkRegistry {
             (
                 Arc::clone(&handle.invite_lock),
                 s.network_secret_key.is_some(),
-                s.reusable_keys.clone(),
+                s.group.reusable_keys.clone(),
             )
         };
         if !has_key {
@@ -235,7 +235,7 @@ impl NetworkRegistry {
         // so the revocation propagates to every admin.
         let revoked_reusable = {
             let mut s = state.write().unwrap();
-            crate::membership::revoke_reusable(&mut s.reusable_keys, id).is_ok()
+            crate::membership::revoke_reusable(&mut s.group.reusable_keys, id).is_ok()
         };
         if revoked_reusable {
             // The revocation stays live even when it cannot be saved: undoing
@@ -316,7 +316,7 @@ impl NetworkRegistry {
             };
             let net_pubkey = handle.network_key;
             let mut s = handle.state.write().unwrap();
-            s.approved.approve(ApprovedEntry {
+            s.group.approved.approve(ApprovedEntry {
                 identity,
                 hostname: pj.hostname.clone(),
                 user_identity: user_id,
@@ -404,7 +404,7 @@ mod unsaved_snapshot_tests {
         let joiner = SecretKey::generate().public();
         {
             let mut s = state.write().unwrap();
-            s.reusable_keys.insert(hash.clone(), key);
+            s.group.reusable_keys.insert(hash.clone(), key);
             s.pending.insert(
                 joiner,
                 PendingJoin {
@@ -424,16 +424,16 @@ mod unsaved_snapshot_tests {
         let minted = registry.reusable_key_create("home", 3600, None).await;
         assert!(minted.is_err(), "{minted:?}");
         assert_eq!(
-            state.read().unwrap().reusable_keys.len(),
+            state.read().unwrap().group.reusable_keys.len(),
             1,
             "the key is rolled back"
         );
         let revoked = registry.invite_revoke("home", &reusable_id).await;
         assert!(warned(&revoked), "{revoked:?}");
-        assert!(state.read().unwrap().reusable_keys[&hash].revoked);
+        assert!(state.read().unwrap().group.reusable_keys[&hash].revoked);
         let accepted = reply(registry.accept_request("home", &joiner.to_string()).await);
         assert!(warned(&accepted), "{accepted:?}");
-        assert!(state.read().unwrap().approved.is_approved(&joiner));
+        assert!(state.read().unwrap().group.approved.is_approved(&joiner));
         let suggested = registry
             .firewall_suggest("home", SuggestedFirewall::default())
             .await;

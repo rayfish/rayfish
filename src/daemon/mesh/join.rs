@@ -233,19 +233,10 @@ pub(crate) async fn join_mesh_shared(
         } else {
             (None, None)
         };
-    let crate::membership::GroupBlob {
-        members,
-        approved,
-        suggested_firewall,
-        name: group_name,
-        reusable_keys,
-        nullifiers,
-    } = admitted_blob;
-
     persist_join_config(
         network_name,
-        &members,
-        &approved,
+        &admitted_blob.members,
+        &admitted_blob.approved,
         my_identity,
         net_pubkey,
         &my_hostname,
@@ -257,15 +248,12 @@ pub(crate) async fn join_mesh_shared(
 
     let remote_id = initial_conn.remote_id();
 
+    // The live state takes the blob; dialing the roster below still needs it.
+    let members = admitted_blob.members.clone();
     let live_state = build_member_state(
-        &members,
-        approved,
+        admitted_blob,
         net_pubkey,
         network_name,
-        group_name,
-        suggested_firewall,
-        reusable_keys,
-        nullifiers,
         &registry.transport.blob_store,
         direct_key.as_ref(),
         record_ts,
@@ -437,18 +425,11 @@ fn persist_join_config(
 }
 
 /// Build the in-memory `NetworkState` cell for a joined member from the admitted
-/// roster + blob-derived firewall/keys, refresh its snapshot, and seed the local
-/// blob store with those bytes.
-#[allow(clippy::too_many_arguments)]
+/// blob, refresh its snapshot, and seed the local blob store with those bytes.
 async fn build_member_state(
-    members: &MemberList,
-    approved: ApprovedList,
+    group: GroupBlob,
     net_pubkey: EndpointId,
     network_name: &str,
-    group_name: Option<String>,
-    suggested_firewall: SuggestedFirewall,
-    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
-    nullifiers: BTreeSet<EndpointId>,
     blob_store: &FsStore,
     // Present when we joined a `direct` network as a co-coordinator: seed the live
     // state with the network key so `finalize_join` registers us as a coordinator
@@ -461,8 +442,7 @@ async fn build_member_state(
     exact_group_hash: Option<blake3::Hash>,
 ) -> SharedNetworkState {
     let mut ns = NetworkState {
-        members: members.clone(),
-        approved,
+        group,
         snapshot: None,
         snapshot_commit: Arc::new(AsyncMutex::new(())),
         destroyed: false,
@@ -471,13 +451,9 @@ async fn build_member_state(
         network_secret_key: direct_key.cloned(),
         network_public_key: net_pubkey,
         network_name: Some(network_name.to_string()),
-        group_name,
         mode: GroupMode::Restricted,
-        suggested_firewall,
-        reusable_keys,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
-        nullifiers,
         last_record_timestamp: record_ts,
     };
     ns.refresh_snapshot();

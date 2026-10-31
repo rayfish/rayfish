@@ -136,7 +136,7 @@ impl NetworkRegistry {
         for net in &nets {
             if let Some(h) = self.networks.get(net.as_str())
                 && h.role.is_coordinator()
-                && let Some(m) = h.state.write().unwrap().members.get_mut(&member_id)
+                && let Some(m) = h.state.write().unwrap().group.members.get_mut(&member_id)
             {
                 m.last_seen = Some(now);
             }
@@ -201,7 +201,7 @@ impl NetworkRegistry {
         let member_id = self.device_user_map.resolve(&ev.endpoint_id);
         let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
-        state.write().unwrap().members.remove(&member_id);
+        state.write().unwrap().group.members.remove(&member_id);
         commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
         drop(commit_guard);
         dns::remove_hostname_by_ip(
@@ -251,7 +251,14 @@ impl NetworkRegistry {
         // one unauthenticated frame into mesh-wide work, since a control frame
         // reaches this handler on the strength of the network id alone and the
         // network id is public.
-        if state.write().unwrap().members.remove(&member_id).is_none() {
+        if state
+            .write()
+            .unwrap()
+            .group
+            .members
+            .remove(&member_id)
+            .is_none()
+        {
             tracing::debug!(peer = %member_id.fmt_short(), network, "leave from a peer the roster does not list; ignoring");
             return;
         }
@@ -287,7 +294,7 @@ impl NetworkRegistry {
         let mut is_paired = false;
         for entry in self.networks.iter() {
             let s = entry.value().state.read().unwrap();
-            if let Some(m) = s.members.get(&target)
+            if let Some(m) = s.group.members.get(&target)
                 && m.user_identity == Some(own_user)
             {
                 is_paired = true;
@@ -372,10 +379,13 @@ impl NetworkRegistry {
         for net in nets {
             let changed = {
                 let mut state = net.state.write().unwrap();
-                let nullified = state.nullifiers.insert(target);
-                let revoked =
-                    revoke_certificate_from_roster(&mut state.members, target, net.independent);
-                let unapproved = state.approved.remove(&target).is_some();
+                let nullified = state.group.nullifiers.insert(target);
+                let revoked = revoke_certificate_from_roster(
+                    &mut state.group.members,
+                    target,
+                    net.independent,
+                );
+                let unapproved = state.group.approved.remove(&target).is_some();
                 nullified || revoked || unapproved
             };
             if !changed {
@@ -637,6 +647,7 @@ pub(crate) fn sender_is_coordinator(state: &SharedNetworkState, peer: EndpointId
     state
         .read()
         .unwrap()
+        .group
         .members
         .get(&peer)
         .is_some_and(|m| m.is_coordinator)
@@ -677,8 +688,8 @@ pub(crate) async fn remove_member_roster_only(
 ) {
     {
         let mut s = state.write().unwrap();
-        s.members.remove(&member_id);
-        s.approved.remove(&member_id);
+        s.group.members.remove(&member_id);
+        s.group.approved.remove(&member_id);
     }
     dns::remove_hostname_by_ip(
         &registry.dns.hostname_table,
@@ -786,7 +797,8 @@ pub(crate) fn spawn_stale_member_pruner(
             // one, so carrying it alongside would be two names for the same fact.
             let removed_members: Vec<EndpointId> = {
                 let s = state.read().unwrap();
-                s.members
+                s.group
+                    .members
                     .iter()
                     .filter(|m| {
                         should_prune(
@@ -913,8 +925,14 @@ mod sender_authority_tests {
             list.add(m);
         }
         Arc::new(RwLock::new(NetworkState {
-            members: list,
-            approved: ApprovedList::new(),
+            group: GroupBlob {
+                members: list,
+                approved: ApprovedList::new(),
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some("test-net".to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -923,11 +941,7 @@ mod sender_authority_tests {
             network_secret_key: None,
             network_public_key: eid(200),
             network_name: Some("test-net".to_string()),
-            group_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             last_record_timestamp: None,

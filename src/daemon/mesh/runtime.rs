@@ -111,12 +111,7 @@ enum RestoreNext {
 /// The membership a coordinator restores at startup from the authoritative,
 /// network-key-signed `GroupBlob`.
 struct RestoredRoster {
-    members: MemberList,
-    approved: ApprovedList,
-    group_name: Option<String>,
-    suggested_firewall: SuggestedFirewall,
-    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
-    nullifiers: BTreeSet<EndpointId>,
+    group: GroupBlob,
     source_hash: blake3::Hash,
     source_published: bool,
 }
@@ -131,17 +126,16 @@ fn materialize_coordinator_roster(
     persisted_hostname: Option<String>,
 ) -> RestoredRoster {
     let RestoredGroupBlob {
-        blob: data,
+        blob: mut group,
         hash: source_hash,
         published: source_published,
     } = restored;
-    let mut members = data.members;
-    match members.get_mut(&local_identity) {
+    match group.members.get_mut(&local_identity) {
         Some(local) => {
             local.is_coordinator = true;
             local.last_seen = None;
         }
-        None => members.add(Member {
+        None => group.members.add(Member {
             identity: local_identity,
             is_coordinator: true,
             hostname: persisted_hostname,
@@ -153,12 +147,7 @@ fn materialize_coordinator_roster(
         }),
     }
     RestoredRoster {
-        members,
-        approved: data.approved,
-        group_name: data.name,
-        suggested_firewall: data.suggested_firewall,
-        reusable_keys: data.reusable_keys,
-        nullifiers: data.nullifiers,
+        group,
         source_hash,
         source_published,
     }
@@ -213,7 +202,7 @@ impl NetworkRegistry {
         );
         tracing::info!(
             network = %name,
-            members = restored.members.iter().len(),
+            members = restored.group.members.len(),
             "restored roster from complete group blob"
         );
         Ok(restored)
@@ -255,12 +244,7 @@ impl NetworkRegistry {
         // re-publish becomes a no-op instead of overwriting the roster with a
         // coordinator-only stub.
         let RestoredRoster {
-            members: member_list,
-            approved: approved_list,
-            group_name,
-            suggested_firewall,
-            reusable_keys,
-            nullifiers,
+            group,
             source_hash,
             source_published,
         } = self
@@ -268,8 +252,7 @@ impl NetworkRegistry {
             .await?;
 
         let mut net_state = NetworkState {
-            members: member_list,
-            approved: approved_list,
+            group,
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -278,11 +261,7 @@ impl NetworkRegistry {
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
-            group_name,
             mode,
-            suggested_firewall,
-            reusable_keys,
-            nullifiers,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             // A key holder authors records rather than applying them, so it keeps
@@ -307,8 +286,8 @@ impl NetworkRegistry {
             apply_coordinator_restore_to_config(
                 latest,
                 mode,
-                &net_state.members,
-                &net_state.approved,
+                &net_state.group.members,
+                &net_state.group.approved,
                 &net_secret_key,
                 Some(last_group_hash),
                 restored_hash_was_published,
@@ -377,14 +356,16 @@ impl NetworkRegistry {
             let state = handle.state.read().unwrap();
             let my_id = self.transport.endpoint.id();
             let is_coord = state
+                .group
                 .members
                 .get(&my_id)
                 .map(|m| m.is_coordinator)
                 .unwrap_or(false);
-            let others = state.members.iter().len() > 1;
+            let others = state.group.members.iter().len() > 1;
             // An offline coordinator still owns the network. Connectivity must
             // not turn a local departure into destruction for everyone else.
             let other_coordinators = state
+                .group
                 .members
                 .iter()
                 .any(|member| member.identity != my_id && member.is_coordinator);
@@ -453,7 +434,7 @@ impl NetworkRegistry {
                 .network_secret_key
                 .clone()
                 .context("network key is unavailable")?;
-            let mut members = state.members.clone();
+            let mut members = state.group.members.clone();
             let departing = members
                 .remove(&my_id)
                 .context("coordinator is absent from roster")?;
@@ -470,14 +451,10 @@ impl NetworkRegistry {
             // The departing daemon still serves blobs after leaving the mesh.
             // An offline coordinator needs this seed to fetch the new snapshot.
             seeds.push(my_id);
-            let bytes = canonical_group_bytes(
-                &members,
-                &state.approved,
-                &state.suggested_firewall,
-                state.group_name.as_deref(),
-                &state.reusable_keys,
-                &state.nullifiers,
-            );
+            let bytes = canonical_group_bytes(&GroupBlob {
+                members,
+                ..state.group.clone()
+            });
             (key, bytes, seeds)
         };
         let client = &self.transport.pkarr;
@@ -552,7 +529,7 @@ impl NetworkRegistry {
         // pairing (a stale row from a reinstall) is still kickable by its own id.
         let (targets, is_coord, display) = {
             let s = state.read().unwrap();
-            match kick_targets(&s.members, candidate, candidate_user) {
+            match kick_targets(&s.group.members, candidate, candidate_user) {
                 Some(t) => t,
                 None => {
                     return ipc_err(format!("'{peer}' is not a member of '{network}'"));
@@ -581,7 +558,7 @@ impl NetworkRegistry {
                 targets
                     .iter()
                     .map(|id| {
-                        let row = s.members.get(id);
+                        let row = s.group.members.get(id);
                         ipc::KickTarget {
                             hostname: row.and_then(|m| m.hostname.clone()),
                             short_id: id.fmt_short().to_string(),
@@ -2231,7 +2208,7 @@ mod coordinator_restore_tests {
         existing.exit_families = ExitFamilies::V6;
 
         let restored = materialize_coordinator_roster(restored(blob(vec![existing])), me, None);
-        let mine = restored.members.get(&me).unwrap();
+        let mine = restored.group.members.get(&me).unwrap();
 
         assert!(mine.is_coordinator);
         assert_eq!(mine.hostname.as_deref(), Some("signed-host"));
@@ -2251,9 +2228,9 @@ mod coordinator_restore_tests {
             Some("local-host".to_string()),
         );
 
-        assert_eq!(restored.members.iter().len(), 2);
-        assert!(restored.members.get(&peer).is_some());
-        let mine = restored.members.get(&me).unwrap();
+        assert_eq!(restored.group.members.iter().len(), 2);
+        assert!(restored.group.members.get(&peer).is_some());
+        let mine = restored.group.members.get(&me).unwrap();
         assert!(mine.is_coordinator);
         assert_eq!(mine.hostname.as_deref(), Some("local-host"));
     }
@@ -2278,11 +2255,11 @@ mod coordinator_restore_tests {
         let restored = materialize_coordinator_roster(restored(source), me, None);
 
         assert_eq!(
-            restored.approved.iter().collect::<Vec<_>>(),
+            restored.group.approved.iter().collect::<Vec<_>>(),
             vec![&approved]
         );
-        assert_eq!(restored.reusable_keys.get(&key_hash), Some(&key));
-        assert_eq!(restored.nullifiers, BTreeSet::from([nullified]));
+        assert_eq!(restored.group.reusable_keys.get(&key_hash), Some(&key));
+        assert_eq!(restored.group.nullifiers, BTreeSet::from([nullified]));
     }
 
     #[test]

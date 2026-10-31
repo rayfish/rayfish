@@ -898,7 +898,7 @@ impl Daemon {
         let id = self.resolve_peer_name(name).await?;
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state.members.get(&id) {
+            if let Some(m) = state.group.members.get(&id) {
                 let display = m
                     .hostname
                     .clone()
@@ -943,7 +943,7 @@ impl Daemon {
     fn member_ipv6(&self, id: &EndpointId) -> Option<Ipv6Addr> {
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if state.members.is_member(id) {
+            if state.group.members.is_member(id) {
                 return Some(derive_ipv6(id));
             }
         }

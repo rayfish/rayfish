@@ -112,6 +112,7 @@ impl NetworkRegistry {
                 for member in state
                     .read()
                     .map_err(|_| anyhow::anyhow!("network state lock poisoned"))?
+                    .group
                     .members
                     .iter()
                 {

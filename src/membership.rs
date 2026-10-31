@@ -310,10 +310,6 @@ impl MemberList {
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
     }
-
-    pub fn from_members(members: Vec<Member>) -> Self {
-        members.into_iter().collect()
-    }
 }
 
 impl From<Vec<Member>> for MemberList {
@@ -361,7 +357,7 @@ impl Serialize for MemberList {
 /// A repeated identity keeps its last entry, as [`MemberList::add`] does.
 impl<'de> Deserialize<'de> for MemberList {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Vec::deserialize(deserializer).map(Self::from_members)
+        Vec::deserialize(deserializer).map(Self::from)
     }
 }
 
@@ -420,19 +416,15 @@ impl ApprovedList {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-    pub fn from_entries(entries: Vec<ApprovedEntry>) -> Self {
-        let mut list = Self::new();
-        for e in entries {
-            list.entries.insert(e.identity, e);
-        }
-        list
-    }
 }
 
 impl From<Vec<ApprovedEntry>> for ApprovedList {
     fn from(entries: Vec<ApprovedEntry>) -> Self {
-        Self::from_entries(entries)
+        let mut list = Self::new();
+        for e in entries {
+            list.approve(e);
+        }
+        list
     }
 }
 
@@ -445,7 +437,7 @@ impl Serialize for ApprovedList {
 
 impl<'de> Deserialize<'de> for ApprovedList {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Vec::deserialize(deserializer).map(Self::from_entries)
+        Vec::deserialize(deserializer).map(Self::from)
     }
 }
 
@@ -618,42 +610,12 @@ impl GroupBlob {
 /// in it is ordered by key, so equal contents always encode to equal bytes.
 /// Identities order by their raw bytes, which is also their lowercase-hex
 /// string order, the order older builds sorted by.
-pub fn canonical_group_bytes(
-    members: &MemberList,
-    approved: &ApprovedList,
-    suggested_firewall: &SuggestedFirewall,
-    name: Option<&str>,
-    reusable_keys: &BTreeMap<String, ReusableKey>,
-    nullifiers: &BTreeSet<EndpointId>,
-) -> Vec<u8> {
-    let data = GroupBlob {
-        members: members.clone(),
-        approved: approved.clone(),
-        suggested_firewall: suggested_firewall.clone(),
-        name: name.map(|s| s.to_string()),
-        reusable_keys: reusable_keys.clone(),
-        nullifiers: nullifiers.clone(),
-    };
-    rmp_serde::to_vec(&data).expect("msgpack serialize")
+pub fn canonical_group_bytes(blob: &GroupBlob) -> Vec<u8> {
+    rmp_serde::to_vec(blob).expect("msgpack serialize")
 }
 
-pub fn group_blob_hash(
-    members: &MemberList,
-    approved: &ApprovedList,
-    suggested_firewall: &SuggestedFirewall,
-    name: Option<&str>,
-    reusable_keys: &BTreeMap<String, ReusableKey>,
-    nullifiers: &BTreeSet<EndpointId>,
-) -> blake3::Hash {
-    let bytes = canonical_group_bytes(
-        members,
-        approved,
-        suggested_firewall,
-        name,
-        reusable_keys,
-        nullifiers,
-    );
-    blake3::hash(&bytes)
+pub fn group_blob_hash(blob: &GroupBlob) -> blake3::Hash {
+    blake3::hash(&canonical_group_bytes(blob))
 }
 
 /// Whether `ip` is a rayfish overlay address: the IPv6 `200::/7` range mesh
@@ -941,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn test_approved_list_from_entries() {
+    fn test_approved_list_from_vec() {
         let entries = vec![
             ApprovedEntry {
                 identity: test_id(1),
@@ -956,7 +918,7 @@ mod tests {
                 device_cert: None,
             },
         ];
-        let list = ApprovedList::from_entries(entries);
+        let list = ApprovedList::from(entries);
         assert!(list.is_approved(&test_id(1)));
         assert!(list.is_approved(&test_id(2)));
         assert_eq!(list.iter().len(), 2);
@@ -1022,14 +984,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            canonical_group_bytes(
-                &members,
-                &approved,
-                &SuggestedFirewall::default(),
-                Some("lab"),
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-            ),
+            canonical_group_bytes(&GroupBlob {
+                members: members.clone(),
+                approved: approved.clone(),
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some("lab".into()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new()
+            }),
             string_sorted
         );
     }
@@ -1095,22 +1057,22 @@ mod tests {
     fn test_canonical_bytes_deterministic() {
         let members = make_member_list(&[1, 2, 3]);
         let approved = ApprovedList::new();
-        let a = canonical_group_bytes(
-            &members,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
-        let b = canonical_group_bytes(
-            &members,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let a = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
+        let b = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         assert_eq!(a, b);
     }
 
@@ -1120,22 +1082,22 @@ mod tests {
         let m2 = make_member_list(&[3, 1, 2]);
         let approved = ApprovedList::new();
         assert_eq!(
-            canonical_group_bytes(
-                &m1,
-                &approved,
-                &ray_proto::SuggestedFirewall::default(),
-                None,
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-            ),
-            canonical_group_bytes(
-                &m2,
-                &approved,
-                &ray_proto::SuggestedFirewall::default(),
-                None,
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-            ),
+            canonical_group_bytes(&GroupBlob {
+                members: m1.clone(),
+                approved: approved.clone(),
+                suggested_firewall: ray_proto::SuggestedFirewall::default(),
+                name: None,
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new()
+            }),
+            canonical_group_bytes(&GroupBlob {
+                members: m2.clone(),
+                approved: approved.clone(),
+                suggested_firewall: ray_proto::SuggestedFirewall::default(),
+                name: None,
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new()
+            }),
         );
     }
 
@@ -1143,23 +1105,23 @@ mod tests {
     fn test_group_blob_hash_changes_on_mutation() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let h1 = group_blob_hash(
-            &members,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let h1 = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let members2 = make_member_list(&[1, 2, 3]);
-        let h2 = group_blob_hash(
-            &members2,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let h2 = group_blob_hash(&GroupBlob {
+            members: members2.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         assert_ne!(h1, h2);
     }
 
@@ -1175,14 +1137,14 @@ mod tests {
             device_cert: None,
         });
 
-        let bytes = canonical_group_bytes(
-            &members,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let data = decode_group_blob(&bytes).unwrap();
         assert_eq!(data.members.len(), 2);
         assert_eq!(data.approved.len(), 1);
@@ -1192,22 +1154,22 @@ mod tests {
     fn test_verify_group_blob_ok() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_group_bytes(
-            &members,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
-        let hash = group_blob_hash(
-            &members,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
+        let hash = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.len(), 2);
     }
@@ -1237,14 +1199,14 @@ mod tests {
     fn test_verify_group_blob_bad_hash() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_group_bytes(
-            &members,
-            &approved,
-            &ray_proto::SuggestedFirewall::default(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: ray_proto::SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let bad_hash = blake3::hash(b"wrong data");
         let result = verify_group_blob(&bytes, &bad_hash);
         assert!(result.is_err());
@@ -1267,22 +1229,22 @@ mod tests {
         });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
-        let bytes = canonical_group_bytes(
-            &members,
-            &approved,
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
-        let hash = group_blob_hash(
-            &members,
-            &approved,
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
+        let hash = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.iter().next().unwrap().last_seen, Some(12345));
     }
@@ -1306,23 +1268,23 @@ mod tests {
         });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
-        let bytes = canonical_group_bytes(
-            &members,
-            &approved,
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         assert!(!String::from_utf8_lossy(&bytes).contains("last_seen"));
-        let hash = group_blob_hash(
-            &members,
-            &approved,
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let hash = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.iter().next().unwrap().last_seen, None);
     }
@@ -1339,41 +1301,41 @@ mod tests {
         sf.insert("subject".to_string(), hs);
 
         // Deterministic: BTreeMap keys canonicalize regardless of insert order.
-        let a = canonical_group_bytes(
-            &members,
-            &approved,
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
-        let b = canonical_group_bytes(
-            &members,
-            &approved,
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let a = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
+        let b = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         assert_eq!(a, b);
 
         // Suggestions are part of the signed content, so they change the hash.
-        let h_empty = group_blob_hash(
-            &members,
-            &approved,
-            &SuggestedFirewall::new(),
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
-        let h_sf = group_blob_hash(
-            &members,
-            &approved,
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let h_empty = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: SuggestedFirewall::new(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
+        let h_sf = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         assert_ne!(h_empty, h_sf);
     }
 
@@ -1399,14 +1361,14 @@ mod tests {
         let mut sf = SuggestedFirewall::new();
         sf.insert("*".to_string(), hs.clone());
 
-        let bytes = canonical_group_bytes(
-            &members,
-            &ApprovedList::new(),
-            &sf,
-            None,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: ApprovedList::new(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let blob = decode_group_blob(&bytes).expect("blob decodes");
         assert_eq!(blob.suggested_firewall.get("*"), Some(&hs));
     }
@@ -1548,14 +1510,14 @@ mod tests {
                 ipv6_only: false,
             });
         }
-        let compact = canonical_group_bytes(
-            &MemberList::from_members(members),
-            &ApprovedList::new(),
-            &SuggestedFirewall::new(),
-            Some("net"),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
+        let compact = canonical_group_bytes(&GroupBlob {
+            members: MemberList::from(members),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::new(),
+            name: Some("net".into()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        });
         let named = rmp_serde::to_vec_named(&ReleasedBlob {
             members: released,
             approved: vec![],
@@ -1787,14 +1749,14 @@ mod tests {
         let mut keys = BTreeMap::new();
         keys.insert(hash, key);
 
-        let bytes = canonical_group_bytes(
-            &members,
-            &approved,
-            &SuggestedFirewall::default(),
-            None,
-            &keys,
-            &BTreeSet::new(),
-        );
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: keys.clone(),
+            nullifiers: BTreeSet::new(),
+        });
         let blob = decode_group_blob(&bytes).unwrap();
         assert_eq!(blob.reusable_keys.len(), 1);
         // The decoded blob validates the secret it was built with.
@@ -1806,39 +1768,39 @@ mod tests {
         let members = make_member_list(&[1]);
         let approved = ApprovedList::new();
         let empty = BTreeMap::new();
-        let h0 = group_blob_hash(
-            &members,
-            &approved,
-            &SuggestedFirewall::default(),
-            None,
-            &empty,
-            &BTreeSet::new(),
-        );
+        let h0 = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: empty.clone(),
+            nullifiers: BTreeSet::new(),
+        });
 
         let secret = [3u8; 16];
         let (hash, key) = reusable_key_for(&secret, 9_999_999_999, false);
         let mut keys = BTreeMap::new();
         keys.insert(hash.clone(), key);
-        let h1 = group_blob_hash(
-            &members,
-            &approved,
-            &SuggestedFirewall::default(),
-            None,
-            &keys,
-            &BTreeSet::new(),
-        );
+        let h1 = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: keys.clone(),
+            nullifiers: BTreeSet::new(),
+        });
         assert_ne!(h0, h1, "adding a reusable key must change the signed hash");
 
         // Revoking is a content change → the hash must change again so peers reconverge.
         keys.get_mut(&hash).unwrap().revoked = true;
-        let h2 = group_blob_hash(
-            &members,
-            &approved,
-            &SuggestedFirewall::default(),
-            None,
-            &keys,
-            &BTreeSet::new(),
-        );
+        let h2 = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: keys.clone(),
+            nullifiers: BTreeSet::new(),
+        });
         assert_ne!(
             h1, h2,
             "revoking a reusable key must change the signed hash"
@@ -1852,15 +1814,36 @@ mod tests {
         let sf = SuggestedFirewall::default();
         let keys = BTreeMap::new();
 
-        let h0 = group_blob_hash(&members, &approved, &sf, None, &keys, &BTreeSet::new());
+        let h0 = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: keys.clone(),
+            nullifiers: BTreeSet::new(),
+        });
         let mut nullifiers = BTreeSet::new();
         nullifiers.insert(test_id(7));
-        let h1 = group_blob_hash(&members, &approved, &sf, None, &keys, &nullifiers);
+        let h1 = group_blob_hash(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: keys.clone(),
+            nullifiers: nullifiers.clone(),
+        });
         assert_ne!(h0, h1, "adding a nullifier must change the signed hash");
 
         // A blob encoded without the field decodes with an empty nullifier set
         // (serde default), so pre-nullifier blobs stay valid.
-        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &keys, &BTreeSet::new());
+        let bytes = canonical_group_bytes(&GroupBlob {
+            members: members.clone(),
+            approved: approved.clone(),
+            suggested_firewall: sf.clone(),
+            name: None,
+            reusable_keys: keys.clone(),
+            nullifiers: BTreeSet::new(),
+        });
         let blob = decode_group_blob(&bytes).unwrap();
         assert!(blob.nullifiers.is_empty());
     }

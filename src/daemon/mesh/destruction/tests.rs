@@ -189,8 +189,8 @@ async fn rename_restarts_a_live_network_under_its_new_name() {
     let roster = {
         let handle = daemon.registry.networks.get("home").unwrap();
         let mut state = handle.state.write().unwrap();
-        let template = state.members.iter().next().unwrap().clone();
-        state.members.add(Member {
+        let template = state.group.members.iter().next().unwrap().clone();
+        state.group.members.add(Member {
             identity: peer.id(),
             is_coordinator: false,
             hostname: Some("laptop".to_string()),
@@ -517,11 +517,11 @@ async fn last_coordinator_nuke_delivers_proof_and_preserves_shared_links() {
     let state = Arc::clone(&daemon.registry.networks.get("doomed").unwrap().state);
     {
         let mut state = state.write().unwrap();
-        let mut member = state.members.iter().next().unwrap().clone();
+        let mut member = state.group.members.iter().next().unwrap().clone();
         member.identity = peer.id();
         member.hostname = Some("member-node".to_string());
         member.is_coordinator = false;
-        state.members.add(member);
+        state.group.members.add(member);
     }
     assert!(matches!(
         daemon.registry.nuke_network("doomed", false).await,
@@ -618,8 +618,8 @@ async fn nuke_leaves_network_to_remaining_coordinator_even_when_offline() {
         let state = Arc::clone(&daemon.registry.networks.get(name).unwrap().state);
         {
             let mut state = state.write().unwrap();
-            let template = state.members.iter().next().unwrap().clone();
-            state.members.add(Member {
+            let template = state.group.members.iter().next().unwrap().clone();
+            state.group.members.add(Member {
                 identity: peer.id(),
                 is_coordinator: true,
                 hostname: Some("other-coordinator".to_string()),
@@ -739,9 +739,9 @@ async fn both_roles_accept_network_signed_proof_with_stale_roster() {
         {
             let handle = daemon.registry.networks.get("doomed").unwrap();
             let mut state = handle.state.write().unwrap();
-            let template = state.members.iter().next().unwrap().clone();
+            let template = state.group.members.iter().next().unwrap().clone();
             for (identity, is_coordinator) in [(coordinator, true), (member, false)] {
-                state.members.add(Member {
+                state.group.members.add(Member {
                     identity,
                     is_coordinator,
                     hostname: None,
@@ -780,7 +780,13 @@ async fn both_roles_accept_network_signed_proof_with_stale_roster() {
         assert!(daemon.registry.networks.contains_key("doomed"));
         let proof = destruction::encode(key).unwrap();
         let handle = daemon.registry.networks.get("doomed").unwrap();
-        handle.state.write().unwrap().members.remove(&coordinator);
+        handle
+            .state
+            .write()
+            .unwrap()
+            .group
+            .members
+            .remove(&coordinator);
         drop(handle);
         assert!(handler.handle_common(
             coordinator,
@@ -917,8 +923,8 @@ async fn leave_dials_a_coordinator_with_no_live_link() {
         handle.role = NetworkRole::Member;
         let mut state = handle.state.write().unwrap();
         state.network_secret_key = None;
-        let template = state.members.iter().next().unwrap().clone();
-        state.members.add(Member {
+        let template = state.group.members.iter().next().unwrap().clone();
+        state.group.members.add(Member {
             identity: coordinator.id(),
             is_coordinator: true,
             hostname: Some("laptop".to_string()),

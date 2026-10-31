@@ -214,6 +214,7 @@ impl ConnectService {
         self.registry.networks.get(network).is_some_and(|handle| {
             handle.state.read().is_ok_and(|state| {
                 state
+                    .group
                     .members
                     .iter()
                     .any(|member| member.matches_identity(recipient))

@@ -223,8 +223,9 @@ pub(crate) fn grants_direct_key(
         Some(peer) => peer == joiner,
         None => {
             let state = state.read().unwrap();
-            state.members.iter().len() <= 1
+            state.group.members.iter().len() <= 1
                 || state
+                    .group
                     .members
                     .get(&joiner)
                     .is_some_and(|member| member.is_coordinator)
@@ -339,7 +340,7 @@ impl CoordinatorAcceptState {
                 device_cert,
                 ..
             } => {
-                let is_member = self.state.read().unwrap().members.is_member(&peer_id);
+                let is_member = self.state.read().unwrap().group.members.is_member(&peer_id);
                 if is_member {
                     self.handle_member_hello(conn, send, peer_id, hostname, device_cert)
                         .await
@@ -426,6 +427,7 @@ impl CoordinatorAcceptState {
                 .state
                 .read()
                 .unwrap()
+                .group
                 .nullifiers
                 .contains(&cert.device_key)
             {
@@ -446,14 +448,27 @@ impl CoordinatorAcceptState {
         // reached a direct peer. Treat a repeated fresh JoinRequest from any
         // seated member as a reconnect; for the intended direct peer this replays
         // the same signed key grant instead of queueing it as an unknown join.
-        if self.state.read().unwrap().members.is_member(&remote_id) {
+        if self
+            .state
+            .read()
+            .unwrap()
+            .group
+            .members
+            .is_member(&remote_id)
+        {
             return self
                 .handle_member_hello(conn, send, remote_id, hostname, device_cert)
                 .await;
         }
 
         // A peer pre-approved via `ray accept` is admitted directly.
-        let is_approved = self.state.read().unwrap().approved.is_approved(&remote_id);
+        let is_approved = self
+            .state
+            .read()
+            .unwrap()
+            .group
+            .approved
+            .is_approved(&remote_id);
         if is_approved {
             // Live-approved name is joiner-chosen, not authoritative.
             return self
@@ -481,11 +496,13 @@ impl CoordinatorAcceptState {
                 // A device cert signed by this coordinator's own owner identity is
                 // one of our own paired devices: admit directly (no approval step).
                 // The same for a device of any seated member: see `member_admits`.
-                let admits =
-                    owner_admits(
-                        device_cert.as_ref(),
-                        self.registry.transport.identity.local_identity(),
-                    ) || member_admits(device_cert.as_ref(), &self.state.read().unwrap().members);
+                let admits = owner_admits(
+                    device_cert.as_ref(),
+                    self.registry.transport.identity.local_identity(),
+                ) || member_admits(
+                    device_cert.as_ref(),
+                    &self.state.read().unwrap().group.members,
+                );
                 if admits {
                     return self
                         .admit_peer(conn, send, remote_id, hostname, device_cert, false, false)
@@ -619,7 +636,7 @@ impl CoordinatorAcceptState {
             if state.unconfirmed_durable_hash.is_some() || !record_is_current {
                 None
             } else {
-                state.members.get(&remote_id).map(|member| {
+                state.group.members.get(&remote_id).map(|member| {
                     let membership = record
                         .as_ref()
                         .map(|signed| (signed.members.clone(), signed.approved.clone()))
@@ -685,7 +702,14 @@ impl CoordinatorAcceptState {
 
         let snapshot_commit = Arc::clone(&self.state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
-        if !self.state.read().unwrap().members.is_member(&remote_id) {
+        if !self
+            .state
+            .read()
+            .unwrap()
+            .group
+            .members
+            .is_member(&remote_id)
+        {
             return None;
         }
 
@@ -698,13 +722,14 @@ impl CoordinatorAcceptState {
                     .state
                     .read()
                     .unwrap()
+                    .group
                     .nullifiers
                     .contains(&cert.device_key)
         });
         let user_identity = verified_cert.as_ref().map(|cert| cert.user_identity);
         let cert_changed = {
             let mut state = self.state.write().unwrap();
-            let member = state.members.get_mut(&remote_id)?;
+            let member = state.group.members.get_mut(&remote_id)?;
             let changed =
                 member.user_identity != user_identity || member.device_cert != verified_cert;
             member.user_identity = user_identity;
@@ -742,6 +767,7 @@ impl CoordinatorAcceptState {
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
             let old = s
+                .group
                 .members
                 .get(&remote_id)
                 .and_then(|m| m.hostname.as_deref());
@@ -751,7 +777,7 @@ impl CoordinatorAcceptState {
 
         if changed {
             let mut s = self.state.write().unwrap();
-            if let Some(m) = s.members.get_mut(&remote_id) {
+            if let Some(m) = s.group.members.get_mut(&remote_id) {
                 m.hostname = Some(final_hostname.clone());
             }
         }
@@ -902,8 +928,12 @@ impl CoordinatorAcceptState {
                 // holder (no burn). The blob is the verified source of truth.
                 let reusable_id = {
                     let s = self.state.read().unwrap();
-                    crate::membership::validate_reusable_key(&s.reusable_keys, &secret, now_secs())
-                        .map(|k| k.id.clone())
+                    crate::membership::validate_reusable_key(
+                        &s.group.reusable_keys,
+                        &secret,
+                        now_secs(),
+                    )
+                    .map(|k| k.id.clone())
                 };
                 if let Some(key_id) = reusable_id {
                     tracing::info!(
@@ -1131,14 +1161,14 @@ impl CoordinatorAcceptState {
         };
         let (displaced_member, removed_approved, removed_pending) = {
             let mut s = self.state.write().unwrap();
-            let displaced_member = s.members.get(&remote_id).cloned();
+            let displaced_member = s.group.members.get(&remote_id).cloned();
             let removed_approved = if was_approved {
-                s.approved.remove(&remote_id)
+                s.group.approved.remove(&remote_id)
             } else {
                 None
             };
             let removed_pending = s.pending.remove(&remote_id);
-            s.members.add(tentative_member.clone());
+            s.group.members.add(tentative_member.clone());
             (displaced_member, removed_approved, removed_pending)
         };
         let committed = commit_current_snapshot(
@@ -1150,9 +1180,13 @@ impl CoordinatorAcceptState {
         if !committed {
             {
                 let mut s = self.state.write().unwrap();
-                if restore_displaced_member(&mut s.members, &tentative_member, displaced_member) {
+                if restore_displaced_member(
+                    &mut s.group.members,
+                    &tentative_member,
+                    displaced_member,
+                ) {
                     if let Some(approved) = removed_approved {
-                        s.approved.approve(approved);
+                        s.group.approved.approve(approved);
                     }
                     if let Some(pending) = removed_pending {
                         s.pending.insert(remote_id, pending);
@@ -1176,9 +1210,9 @@ impl CoordinatorAcceptState {
             // disk might recover H2 would later grant a supposedly denied peer.
             {
                 let mut s = self.state.write().unwrap();
-                s.approved.remove(&remote_id);
+                s.group.approved.remove(&remote_id);
                 s.pending.remove(&remote_id);
-                s.members.add(tentative_member.clone());
+                s.group.members.add(tentative_member.clone());
                 s.refresh_snapshot();
                 s.unconfirmed_durable_hash =
                     s.converged_hash.map(|hash| PendingSnapshotDurability {
@@ -1420,7 +1454,7 @@ impl MemberAcceptState {
                     device_cert: None,
                 };
                 let mut s = self.state.write().unwrap();
-                s.approved.approve(entry);
+                s.group.approved.approve(entry);
                 s.pending.remove(&identity);
                 None
             }
@@ -1607,8 +1641,8 @@ impl MemberAcceptState {
         let (is_member, is_approved) = {
             let s = self.state.read().unwrap();
             (
-                s.members.is_member(&peer_identity),
-                s.approved.is_approved(&peer_identity),
+                s.group.members.is_member(&peer_identity),
+                s.group.approved.is_approved(&peer_identity),
             )
         };
         let final_hostname = if let Some(desired) = valid_claim(peer_identity, hostname) {
@@ -1629,7 +1663,7 @@ impl MemberAcceptState {
             if let Some(h) = &final_hostname {
                 {
                     let mut s = self.state.write().unwrap();
-                    if let Some(m) = s.members.get_mut(&peer_identity) {
+                    if let Some(m) = s.group.members.get_mut(&peer_identity) {
                         m.hostname = Some(h.clone());
                     }
                 }
@@ -1693,13 +1727,13 @@ impl MemberAcceptState {
         }
         let (snap_bytes, member_ip) = {
             let mut s = self.state.write().unwrap();
-            s.approved.remove(&peer_identity);
+            s.group.approved.remove(&peer_identity);
             let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
             // The address is derived from the identity that dialed, so there is
             // nothing left for a peer to claim and nothing to cross-check it
             // against: the approved entry and the hello agree by construction.
             let member_ip = derive_ipv6(&peer_identity);
-            s.members.add(Member {
+            s.group.members.add(Member {
                 identity: peer_identity,
                 is_coordinator: false,
                 hostname: final_hostname.clone(),
@@ -1794,10 +1828,11 @@ impl MemberAcceptState {
             let mut s = self.state.write().unwrap();
             let previous_key = s.network_secret_key.replace(key.clone());
             let previous_coordinator = s
+                .group
                 .members
                 .get(&self.my_identity)
                 .is_some_and(|m| m.is_coordinator);
-            if let Some(m) = s.members.get_mut(&self.my_identity) {
+            if let Some(m) = s.group.members.get_mut(&self.my_identity) {
                 m.is_coordinator = true;
             }
             (previous_key, previous_coordinator)
@@ -1808,7 +1843,7 @@ impl MemberAcceptState {
             let (previous_key, previous_coordinator) = previous_authority;
             let mut s = self.state.write().unwrap();
             s.network_secret_key = previous_key;
-            if let Some(m) = s.members.get_mut(&self.my_identity) {
+            if let Some(m) = s.group.members.get_mut(&self.my_identity) {
                 m.is_coordinator = previous_coordinator;
             }
             s.refresh_snapshot();
@@ -1885,7 +1920,7 @@ impl AcceptHandler {
         let s = state.read().unwrap();
         [peer_id, user_id]
             .iter()
-            .any(|id| s.members.is_member(id) || s.approved.is_approved(id))
+            .any(|id| s.group.members.is_member(id) || s.group.approved.is_approved(id))
     }
 
     /// The local name of the network this handler serves. Used by the demux to map
@@ -2352,7 +2387,7 @@ mod admission_rollback_tests {
         let identity = SecretKey::generate().public();
         let old = member(identity, "old-name");
         let tentative = member(identity, "new-name");
-        let mut members = MemberList::from_members(vec![tentative.clone()]);
+        let mut members = MemberList::from(vec![tentative.clone()]);
 
         assert!(restore_displaced_member(
             &mut members,
@@ -2367,7 +2402,7 @@ mod admission_rollback_tests {
     fn failed_first_admission_removes_the_tentative_member() {
         let identity = SecretKey::generate().public();
         let tentative = member(identity, "new-name");
-        let mut members = MemberList::from_members(vec![tentative.clone()]);
+        let mut members = MemberList::from(vec![tentative.clone()]);
 
         assert!(restore_displaced_member(&mut members, &tentative, None));
 
@@ -2380,7 +2415,7 @@ mod admission_rollback_tests {
         let tentative = member(identity, "tentative-name");
         let concurrent = member(identity, "concurrent-name");
         let displaced = member(identity, "old-name");
-        let mut members = MemberList::from_members(vec![concurrent.clone()]);
+        let mut members = MemberList::from(vec![concurrent.clone()]);
 
         assert!(!restore_displaced_member(
             &mut members,
@@ -2523,8 +2558,14 @@ mod direct_grant_tests {
             });
         }
         Arc::new(RwLock::new(NetworkState {
-            members: list,
-            approved: ApprovedList::new(),
+            group: GroupBlob {
+                members: list,
+                approved: ApprovedList::new(),
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some("team-alex".to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -2533,11 +2574,7 @@ mod direct_grant_tests {
             network_secret_key: None,
             network_public_key: eid(200),
             network_name: Some("team-alex".to_string()),
-            group_name: Some("team-alex".to_string()),
             mode: GroupMode::Restricted,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             last_record_timestamp: None,
@@ -2588,6 +2625,7 @@ mod direct_grant_tests {
         state
             .write()
             .unwrap()
+            .group
             .members
             .get_mut(&peer)
             .unwrap()

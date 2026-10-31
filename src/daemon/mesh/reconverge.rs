@@ -39,7 +39,7 @@ pub(crate) fn apply_suggested_firewall(
 ) {
     let (suggestions, members): (SuggestedFirewall, MemberList) = {
         let s = state.read().unwrap();
-        (s.suggested_firewall.clone(), s.roster())
+        (s.group.suggested_firewall.clone(), s.roster())
     };
     // Derive my hostname from the member roster (the authoritative source) rather
     // than the join-time claim.
@@ -228,26 +228,14 @@ pub(crate) async fn fetch_verified_blob(
 /// publication cache and may lag mutations that have not reached
 /// `refresh_snapshot` yet, so it cannot safely guard an in-flight reconverge.
 fn current_group_hash(state: &NetworkState) -> blake3::Hash {
-    group_blob_hash(
-        &state.members,
-        &state.approved,
-        &state.suggested_firewall,
-        state.group_name.as_deref(),
-        &state.reusable_keys,
-        &state.nullifiers,
-    )
+    group_blob_hash(&state.group)
 }
 
 /// Replace the blob-derived fields of `state` with a verified blob at `signed`
 /// and refresh the snapshot. The caller holds `snapshot_commit` and the write
 /// guard, and has already revalidated the generation.
 fn adopt_blob(state: &mut NetworkState, data: crate::membership::GroupBlob, signed: blake3::Hash) {
-    state.members = data.members;
-    state.approved = data.approved;
-    state.suggested_firewall = data.suggested_firewall;
-    state.group_name = data.name;
-    state.reusable_keys = data.reusable_keys;
-    state.nullifiers = data.nullifiers;
+    state.group = data;
     state.refresh_snapshot();
     state.converged_hash = Some(signed);
 }
@@ -385,7 +373,7 @@ pub(crate) async fn apply_group_record(
         // (the drain no-ops unless `pending_hostname` is set).
         let (roster, nullifiers) = {
             let s = state.read().unwrap();
-            (s.roster(), s.nullifiers.clone())
+            (s.roster(), s.group.nullifiers.clone())
         };
         if let Some(cert) = device_cert
             && self_is_nullified(cert, &roster, &nullifiers)
@@ -620,7 +608,7 @@ pub(crate) fn prune_departed_peers(
     my_identity: EndpointId,
 ) {
     // Device keys nullified on this network (`ray unpair`), read once.
-    let nullifiers = state.read().unwrap().nullifiers.clone();
+    let nullifiers = state.read().unwrap().group.nullifiers.clone();
     for (peer_id, _ip, _conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
@@ -629,11 +617,12 @@ pub(crate) fn prune_departed_peers(
         // certificate can still authorize an independent membership.
         let nullified = nullifiers.contains(&peer_id);
         let roster = state.read().unwrap();
-        let still_member = roster.members.is_member(&peer_id) || roster.members.is_member(&user_id);
-        let independent_member = roster
-            .members
-            .get(&peer_id)
-            .is_some_and(|member| member.user_identity.is_none() && member.device_cert.is_none());
+        let still_member =
+            roster.group.members.is_member(&peer_id) || roster.group.members.is_member(&user_id);
+        let independent_member =
+            roster.group.members.get(&peer_id).is_some_and(|member| {
+                member.user_identity.is_none() && member.device_cert.is_none()
+            });
         drop(roster);
         if nullified && independent_member {
             device_user_map.remove(&peer_id);
@@ -917,8 +906,14 @@ mod reconverge_tests {
 
     fn state_with_members(members: Vec<Member>) -> SharedNetworkState {
         Arc::new(RwLock::new(NetworkState {
-            members: MemberList::from_members(members),
-            approved: ApprovedList::new(),
+            group: GroupBlob {
+                members: MemberList::from(members),
+                approved: ApprovedList::new(),
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some("test-network".to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -927,11 +922,7 @@ mod reconverge_tests {
             network_secret_key: None,
             network_public_key: SecretKey::generate().public(),
             network_name: Some("test-network".to_string()),
-            group_name: Some("test-network".to_string()),
             mode: GroupMode::Restricted,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             last_record_timestamp: None,

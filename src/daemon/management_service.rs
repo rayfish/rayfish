@@ -1088,6 +1088,7 @@ impl ManagementService {
                 .state
                 .read()
                 .unwrap()
+                .group
                 .members
                 .get(&controller)
                 .is_some_and(|member| member.is_coordinator)

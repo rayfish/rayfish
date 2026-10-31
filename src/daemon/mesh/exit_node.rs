@@ -211,6 +211,7 @@ impl NetworkRegistry {
         let handle = self.networks.get(network)?;
         let state = handle.state.read().unwrap();
         state
+            .group
             .members
             .iter()
             .find(|m| m.matches_identity(id))
@@ -228,9 +229,14 @@ impl NetworkRegistry {
     /// daemon-wide binding by saying hello on network B. The check has to be as
     /// wide as the map it protects.
     pub(crate) fn is_nullified_anywhere(&self, device_key: &EndpointId) -> bool {
-        self.networks
-            .iter()
-            .any(|h| h.state.read().unwrap().nullifiers.contains(device_key))
+        self.networks.iter().any(|h| {
+            h.state
+                .read()
+                .unwrap()
+                .group
+                .nullifiers
+                .contains(device_key)
+        })
     }
 
     /// Add or remove a peer from a network's exit-node allow list, then advertise
@@ -835,7 +841,7 @@ impl NetworkRegistry {
             // the datagram arrived under. Try both.
             let Some(id) = [sender, user_id]
                 .into_iter()
-                .find(|id| s.members.get(id).is_some())
+                .find(|id| s.group.members.get(id).is_some())
             else {
                 tracing::warn!(
                     network = %network,
@@ -844,7 +850,7 @@ impl NetworkRegistry {
                 );
                 return;
             };
-            match s.members.get_mut(&id) {
+            match s.group.members.get_mut(&id) {
                 Some(member) => set(member),
                 None => false,
             }

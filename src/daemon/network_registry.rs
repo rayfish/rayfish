@@ -745,16 +745,18 @@ impl NetworkRegistry {
             let Ok(state) = network.state.read() else {
                 continue;
             };
-            if let Some(member) = state.members.get(&remote) {
+            if let Some(member) = state.group.members.get(&remote) {
                 standing.known = true;
                 standing.user_identity = standing.user_identity.or(member.user_identity);
             }
             standing.known = standing.known
                 || state
+                    .group
                     .members
                     .iter()
                     .any(|m| m.user_identity == Some(remote))
                 || state
+                    .group
                     .approved
                     .iter()
                     .any(|e| e.identity == remote || e.user_identity == Some(remote));
@@ -784,7 +786,7 @@ impl NetworkRegistry {
             if state.network_secret_key.is_none() {
                 continue;
             }
-            let Some(member) = state.members.get(&device) else {
+            let Some(member) = state.group.members.get(&device) else {
                 continue;
             };
             if member.user_identity.is_none() {
@@ -1223,7 +1225,7 @@ impl NetworkRegistry {
     pub(crate) fn network_shared_with(&self, peer: &EndpointId) -> Option<String> {
         self.networks.iter().find_map(|h| {
             let s = h.state.read().ok()?;
-            s.members.is_member(peer).then(|| h.key().clone())
+            s.group.members.is_member(peer).then(|| h.key().clone())
         })
     }
 
@@ -1245,7 +1247,7 @@ impl NetworkRegistry {
                 return None;
             }
             let s = h.state.read().ok()?;
-            let has = s.members.is_member(peer) || s.approved.is_approved(peer);
+            let has = s.group.members.is_member(peer) || s.group.approved.is_approved(peer);
             has.then(|| h.key().clone())
         })
     }
@@ -1379,8 +1381,8 @@ impl NetworkRegistry {
         let revoking = self.revocation_lock.lock().await;
         let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
 
-        let member_entries = to_member_entries(net_state.members.iter());
-        let approved_entries = to_approved_entries(net_state.approved.iter());
+        let member_entries = to_member_entries(net_state.group.members.iter());
+        let approved_entries = to_approved_entries(net_state.group.approved.iter());
         config::save_network(&config::NetworkConfig {
             name: name.clone(),
             group_mode: mode,
@@ -1489,8 +1491,14 @@ impl NetworkRegistry {
         }
 
         Ok(NetworkState {
-            members: member_list,
-            approved,
+            group: GroupBlob {
+                members: member_list,
+                approved,
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some(name.to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -1499,12 +1507,7 @@ impl NetworkRegistry {
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_secret_key.public(),
             network_name: Some(name.to_string()),
-            group_name: Some(name.to_string()),
             mode,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            // Seeded from persisted `revoked_devices` by `seal_and_publish`.
-            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             // We author this network's records; there is nothing to replay to us.
@@ -1523,6 +1526,7 @@ impl NetworkRegistry {
         {
             let cfg = config::load().unwrap_or_default();
             net_state
+                .group
                 .nullifiers
                 .extend(config::revoked_device_ids(&cfg));
         }
@@ -1672,6 +1676,7 @@ impl NetworkRegistry {
             for entry in self.networks.iter() {
                 let state = entry.value().state.read().unwrap();
                 if let Some(m) = state
+                    .group
                     .members
                     .iter()
                     .find(|m| derive_ipv6(&m.identity) == v6)
@@ -1698,7 +1703,7 @@ impl NetworkRegistry {
         }
         for entry in self.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(id) = state.members.resolve_peer_literal(name) {
+            if let Some(id) = state.group.members.resolve_peer_literal(name) {
                 return Some(id);
             }
         }
@@ -1723,6 +1728,7 @@ impl NetworkRegistry {
             .state
             .read()
             .unwrap()
+            .group
             .members
             .resolve_peer_selector(selector)
     }
@@ -1742,7 +1748,7 @@ impl NetworkRegistry {
         let mut found = None;
         for entry in self.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            for member in state.members.iter() {
+            for member in state.group.members.iter() {
                 if !member.identity.to_string().starts_with(short) {
                     continue;
                 }
@@ -1768,13 +1774,13 @@ impl NetworkRegistry {
                     return None;
                 }
                 let state = entry.state.read().unwrap();
-                let independent_member = state.members.get(&peer).is_some_and(|member| {
+                let independent_member = state.group.members.get(&peer).is_some_and(|member| {
                     member.user_identity.is_none() && member.device_cert.is_none()
                 });
-                if state.nullifiers.contains(&peer) && !independent_member {
+                if state.group.nullifiers.contains(&peer) && !independent_member {
                     return None;
                 }
-                (state.members.is_member(&peer) || state.members.is_member(&user))
+                (state.group.members.is_member(&peer) || state.group.members.is_member(&user))
                     .then(|| SmolStr::new(entry.key()))
             })
             .collect()
@@ -1796,7 +1802,7 @@ impl NetworkRegistry {
                 .value()
                 .state
                 .read()
-                .map(|s| s.members.is_member(&identity))
+                .map(|s| s.group.members.is_member(&identity))
                 .unwrap_or(false);
             if is_member {
                 return true;
@@ -1956,7 +1962,7 @@ impl NetworkRegistry {
         for (net, state, dht_notify) in nets {
             let removed = {
                 let mut s = state.write().unwrap();
-                s.nullifiers.remove(&device)
+                s.group.nullifiers.remove(&device)
             };
             if !removed {
                 continue;

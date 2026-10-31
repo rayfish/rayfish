@@ -191,9 +191,15 @@ impl NetworkRegistry {
             if connected {
                 self.peers.shares_network_v6(&peer_ip, net)
             } else {
-                self.networks
-                    .get(net)
-                    .is_some_and(|handle| handle.state.read().unwrap().members.is_member(&device))
+                self.networks.get(net).is_some_and(|handle| {
+                    handle
+                        .state
+                        .read()
+                        .unwrap()
+                        .group
+                        .members
+                        .is_member(&device)
+                })
             }
         };
         let verdict = self.firewall.explain(direction, &info, &matched, shares);
@@ -211,7 +217,11 @@ impl NetworkRegistry {
             .iter()
             .find_map(|entry| {
                 let state = entry.state.read().unwrap();
-                state.members.get(&device).and_then(|m| m.hostname.clone())
+                state
+                    .group
+                    .members
+                    .get(&device)
+                    .and_then(|m| m.hostname.clone())
             })
             .unwrap_or_else(|| device.fmt_short().to_string());
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
@@ -261,7 +271,7 @@ impl NetworkRegistry {
         let count: usize = suggestions.len();
         {
             let mut s = state.write().unwrap();
-            s.suggested_firewall = suggestions;
+            s.group.suggested_firewall = suggestions;
         }
         // The suggestions are live either way, and the publisher retries a
         // failed save, so still nudge members and apply them here.
@@ -297,7 +307,7 @@ impl NetworkRegistry {
     pub(crate) fn firewall_suggestions(&self, network: &str) -> IpcMessage {
         match self.networks.get(network) {
             Some(h) => {
-                let suggestions = h.state.read().unwrap().suggested_firewall.clone();
+                let suggestions = h.state.read().unwrap().group.suggested_firewall.clone();
                 IpcMessage::FirewallSuggestionsResponse { suggestions }
             }
             None => ipc_err(format!("network '{network}' not found")),

@@ -79,8 +79,8 @@ use crate::ipc::{
     NetworkRole, NetworkStatus, NodeStatus, PeerState, PeerStatus, ipc_err,
 };
 use crate::membership::{
-    ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IrohIdentityProvider, Member, MemberList,
-    canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
+    ApprovedEntry, ApprovedList, ExitFamilies, GroupBlob, GroupMode, IrohIdentityProvider, Member,
+    MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
@@ -412,8 +412,24 @@ struct PendingSnapshotDurability {
 }
 
 pub(crate) struct NetworkState {
-    members: MemberList,
-    approved: ApprovedList,
+    /// What the signed group blob carries, exactly as this node would publish
+    /// it: [`Self::refresh_snapshot`] encodes it as is.
+    ///
+    /// On a coordinator it is what it publishes; on a member it is what it last
+    /// adopted from a verified blob. In it:
+    /// - `name` is the network's own name, which a local join alias must not
+    ///   replace, because a later promotion may make this node a publisher.
+    /// - `suggested_firewall` holds the coordinator's suggested rules (keyed by
+    ///   subject hostname, `*` for every node); a member materializes rules from
+    ///   it.
+    /// - `reusable_keys` are the join keys (keyed by hex `blake3(secret)`) that
+    ///   any network-key holder validates redemptions against, reloaded on every
+    ///   reconverge so any admin can admit and revocation propagates.
+    /// - `nullifiers` are device keys nullified on this network (`ray unpair`).
+    ///   A coordinator seeds them from its persisted `revoked_devices` and drops
+    ///   nullified devices from `members`; a member adopts them on reconverge.
+    ///   Admission, `MeshHello` and prune reject a cert whose device is listed.
+    group: GroupBlob,
     snapshot: Option<GroupSnapshot>,
     /// Serializes durable snapshot-pointer updates with DHT publication for this
     /// network. Clone the Arc under the state read lock, then await it separately.
@@ -445,29 +461,9 @@ pub(crate) struct NetworkState {
     network_public_key: EndpointId,
     /// Local config/runtime alias used to index this network on this device.
     network_name: Option<String>,
-    /// Name carried by the signed GroupBlob. It must not be replaced by a local
-    /// join alias, because a later promotion may make this node a publisher.
-    group_name: Option<String>,
     /// Access mode (open auto-admits; restricted gates unknown joiners). Only the
     /// coordinator's accept path consults this; members default to `Restricted`.
     mode: GroupMode,
-    /// Coordinator-suggested firewall rules carried in the blob (keyed by subject
-    /// hostname; the `*` subject targets every node). On a coordinator this is
-    /// what it publishes; on a member it is what it last received and
-    /// materializes rules from.
-    suggested_firewall: SuggestedFirewall,
-    /// Reusable join keys carried in the signed blob (keyed by hex
-    /// `blake3(secret)`). On a network-key holder this is what it publishes and
-    /// validates redemptions against; on a plain member it is what it last
-    /// received. Reloaded from the verified blob on every reconverge so any admin
-    /// can admit and revocation propagates.
-    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
-    /// Device keys nullified on this network (`ray unpair`). Carried in the signed
-    /// blob: a coordinator seeds it from its persisted `revoked_devices` and drops
-    /// nullified devices from `members`; a member adopts it from the verified blob
-    /// on every reconverge. Enforcement (admission, MeshHello, prune) rejects a
-    /// cert whose device key is listed.
-    nullifiers: BTreeSet<EndpointId>,
     /// Author timestamp (microseconds since the epoch) of the most recent signed
     /// pkarr record applied to this state, and the floor every later one has to
     /// clear.
@@ -544,18 +540,19 @@ impl NetworkState {
     /// Snapshot the current member roster as an owned `Vec` (the members map is
     /// the single source of truth; callers take a copy to release the lock).
     pub(crate) fn roster(&self) -> MemberList {
-        self.members.clone()
+        self.group.members.clone()
     }
 
     /// Snapshot the current approved-but-not-yet-joined entries as an owned `Vec`.
     fn approved_snapshot(&self) -> ApprovedList {
-        self.approved.clone()
+        self.group.approved.clone()
     }
 
     /// Hostnames currently claimed by other members (excluding `except`), used to
     /// resolve a rename/join collision against the roster.
     fn taken_hostnames(&self, except: EndpointId) -> Vec<String> {
-        self.members
+        self.group
+            .members
             .iter()
             .filter(|m| m.identity != except)
             .filter_map(|m| m.hostname.clone())
@@ -564,16 +561,9 @@ impl NetworkState {
 
     fn refresh_snapshot(&mut self) {
         self.pending.retain(|identity, _| {
-            !self.members.is_member(identity) && !self.approved.is_approved(identity)
+            !self.group.members.is_member(identity) && !self.group.approved.is_approved(identity)
         });
-        let bytes = canonical_group_bytes(
-            &self.members,
-            &self.approved,
-            &self.suggested_firewall,
-            self.group_name.as_deref(),
-            &self.reusable_keys,
-            &self.nullifiers,
-        );
+        let bytes = canonical_group_bytes(&self.group);
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot {
             hash,
@@ -1185,7 +1175,7 @@ impl Daemon {
 
         // Update our own member entry.
         if let Ok(mut s) = state.write()
-            && let Some(me) = s.members.get_mut(&my_identity)
+            && let Some(me) = s.group.members.get_mut(&my_identity)
         {
             me.hostname = Some(new_hostname.clone());
         }

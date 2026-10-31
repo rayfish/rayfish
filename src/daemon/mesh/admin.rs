@@ -64,7 +64,7 @@ impl NetworkRegistry {
                 return ipc_err(format!("network '{network}' not active"));
             };
             let mut s = handle.state.write().unwrap();
-            crate::membership::mark_coordinator(&mut s.members, &identity);
+            crate::membership::mark_coordinator(&mut s.group.members, &identity);
             s.refresh_snapshot();
         }
 

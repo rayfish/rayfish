@@ -52,7 +52,7 @@ async fn rejected_join_certificates_and_destroyed_networks_explain_the_refusal()
         (revoked, "device certificate has been revoked"),
     ] {
         if expected.contains("revoked") {
-            state.write().unwrap().nullifiers.insert(joiner.id());
+            state.write().unwrap().group.nullifiers.insert(joiner.id());
         }
         let reply = mesh_request_reply(
             &connection,
@@ -148,7 +148,7 @@ async fn member_replies_to_join_and_invalid_admin_grant() {
         store.clone(),
     );
     let state = make_network_state();
-    state.write().unwrap().members.add(seated(client.id()));
+    state.write().unwrap().group.members.add(seated(client.id()));
     let key = state.read().unwrap().network_public_key;
     let manager = Arc::new(ConnectionManager::new());
     manager.set_mesh_dispatch(MeshDispatch {
@@ -233,7 +233,7 @@ async fn member_replies_to_join_and_invalid_admin_grant() {
     assert!(
         matches!(reply, ControlMsg::JoinDenied { reason } if reason.contains("identity claim"))
     );
-    state.write().unwrap().members.remove(&client.id());
+    state.write().unwrap().group.members.remove(&client.id());
     let reply = mesh_request_reply(
         &connection,
         key,
@@ -269,7 +269,7 @@ async fn coordinator_acknowledges_repeated_grants_with_a_durable_key() {
     let secret = SecretKey::from_bytes(&[1; 32]);
     let key = secret.public();
     state.write().unwrap().network_secret_key = Some(secret.clone());
-    state.write().unwrap().members.add(seated(client.id()));
+    state.write().unwrap().group.members.add(seated(client.id()));
     config::save_network(&config::NetworkConfig {
         name: "test-net".to_string(),
         network_secret_key: Some(secret.clone()),

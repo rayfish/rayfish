@@ -42,8 +42,14 @@ impl Drop for ConfigDir {
 
 fn empty_state(net_pubkey: EndpointId, name: &str) -> SharedNetworkState {
     let mut state = NetworkState {
-        members: MemberList::new(),
-        approved: ApprovedList::new(),
+        group: GroupBlob {
+            members: MemberList::new(),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some(name.to_string()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        },
         snapshot: None,
         snapshot_commit: Arc::new(AsyncMutex::new(())),
         destroyed: false,
@@ -52,11 +58,7 @@ fn empty_state(net_pubkey: EndpointId, name: &str) -> SharedNetworkState {
         network_secret_key: None,
         network_public_key: net_pubkey,
         network_name: Some(name.to_string()),
-        group_name: Some(name.to_string()),
         mode: GroupMode::Restricted,
-        suggested_firewall: SuggestedFirewall::default(),
-        reusable_keys: BTreeMap::new(),
-        nullifiers: BTreeSet::new(),
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
         last_record_timestamp: None,
@@ -202,8 +204,8 @@ async fn a_promoted_member_prunes_stale_members() {
     let state = Arc::clone(&registry.networks.get("home").unwrap().state);
     {
         let mut state = state.write().unwrap();
-        state.members.add(roster_row(me, true, None));
-        state.members.add(roster_row(stale, false, Some(1)));
+        state.group.members.add(roster_row(me, true, None));
+        state.group.members.add(roster_row(stale, false, Some(1)));
         state.network_secret_key = Some(network_key.clone());
         state.refresh_snapshot();
     }
@@ -219,7 +221,7 @@ async fn a_promoted_member_prunes_stale_members() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(61)).await;
     let mut polls = 0;
-    while state.read().unwrap().members.get(&stale).is_some() {
+    while state.read().unwrap().group.members.get(&stale).is_some() {
         polls += 1;
         assert!(
             polls < 10_000,
@@ -417,14 +419,14 @@ async fn cache_member_network(
     for other in others {
         members.add(roster_row(*other, true, None));
     }
-    let bytes = crate::membership::canonical_group_bytes(
-        &members,
-        &ApprovedList::new(),
-        &SuggestedFirewall::default(),
-        Some(name),
-        &BTreeMap::new(),
-        &BTreeSet::new(),
-    );
+    let bytes = crate::membership::canonical_group_bytes(&GroupBlob {
+        members: members.clone(),
+        approved: ApprovedList::new(),
+        suggested_firewall: SuggestedFirewall::default(),
+        name: Some(name.to_string()),
+        reusable_keys: BTreeMap::new(),
+        nullifiers: BTreeSet::new(),
+    });
     let hash = blake3::hash(&bytes);
     registry
         .transport

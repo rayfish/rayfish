@@ -7,8 +7,14 @@ pub(crate) fn make_network_state() -> SharedNetworkState {
     let net_secret = SecretKey::from_bytes(&[1u8; 32]);
     let net_pub = net_secret.public();
     Arc::new(RwLock::new(NetworkState {
-        members: MemberList::new(),
-        approved: ApprovedList::new(),
+        group: GroupBlob {
+            members: MemberList::new(),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some("test-net".to_string()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        },
         snapshot: None,
         snapshot_commit: Arc::new(AsyncMutex::new(())),
         destroyed: false,
@@ -17,11 +23,7 @@ pub(crate) fn make_network_state() -> SharedNetworkState {
         network_secret_key: None,
         network_public_key: net_pub,
         network_name: Some("test-net".to_string()),
-        group_name: Some("test-net".to_string()),
         mode: GroupMode::Restricted,
-        suggested_firewall: SuggestedFirewall::default(),
-        reusable_keys: BTreeMap::new(),
-        nullifiers: BTreeSet::new(),
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
         last_record_timestamp: None,
@@ -34,7 +36,7 @@ fn local_network_alias_never_rewrites_the_signed_group_name() {
     let bytes = {
         let mut state = state.write().unwrap();
         state.network_name = Some("my-local-alias".to_string());
-        state.group_name = Some("signed-network-name".to_string());
+        state.group.name = Some("signed-network-name".to_string());
         state.refresh_snapshot();
         state.snapshot.as_ref().unwrap().msgpack_bytes.clone()
     };
@@ -61,13 +63,13 @@ fn roster_refresh_clears_requests_approved_by_another_coordinator() {
             },
         );
     }
-    state.approved.approve(ApprovedEntry {
+    state.group.approved.approve(ApprovedEntry {
         identity: approved,
         hostname: None,
         user_identity: None,
         device_cert: None,
     });
-    state.members.add(seated(joined));
+    state.group.members.add(seated(joined));
     state.refresh_snapshot();
     assert_eq!(state.pending.len(), 1);
     assert!(state.pending.contains_key(&waiting));
@@ -89,21 +91,21 @@ fn convergence_is_tracked_as_the_hash_we_accepted() {
     let state = make_network_state();
     let mut s = state.write().unwrap();
     let member_id = SecretKey::from_bytes(&[9u8; 32]).public();
-    s.members = MemberList::from_members(vec![seated(member_id)]);
+    s.group.members = MemberList::from(vec![seated(member_id)]);
     s.refresh_snapshot();
 
     // The mismatch this exists for needs no version skew: `network_name` is
     // hashed into the blob and is a *local* string, so a member that joined
     // with `ray join <code> --name <alias>` re-encodes a name the coordinator
     // never published and can never match its record.
-    let published = canonical_group_bytes(
-        &s.members,
-        &s.approved,
-        &s.suggested_firewall,
-        Some("what the coordinator published"),
-        &s.reusable_keys,
-        &s.nullifiers,
-    );
+    let published = canonical_group_bytes(&GroupBlob {
+        members: s.group.members.clone(),
+        approved: s.group.approved.clone(),
+        suggested_firewall: s.group.suggested_firewall.clone(),
+        name: Some("what the coordinator published".into()),
+        reusable_keys: s.group.reusable_keys.clone(),
+        nullifiers: s.group.nullifiers.clone(),
+    });
     assert_ne!(
         blake3::hash(&published),
         s.snapshot.as_ref().unwrap().hash,
@@ -168,7 +170,7 @@ async fn knows_sender_accepts_a_seated_member() {
     let h = sample_coordinator_handler().await;
     let (state, _) = handler_parts(&h);
     let member = SecretKey::from_bytes(&[9u8; 32]).public();
-    state.write().unwrap().members.add(seated(member));
+    state.write().unwrap().group.members.add(seated(member));
     assert!(h.knows_sender(member));
 }
 
@@ -181,7 +183,7 @@ async fn knows_sender_accepts_an_approved_peer() {
     let peer = SecretKey::from_bytes(&[10u8; 32]).public();
     {
         let mut s = state.write().unwrap();
-        s.approved.approve(ApprovedEntry {
+        s.group.approved.approve(ApprovedEntry {
             identity: peer,
             hostname: None,
             user_identity: None,
@@ -200,7 +202,7 @@ async fn knows_sender_resolves_a_device_to_its_roster_user() {
     let (state, registry) = handler_parts(&h);
     let user = SecretKey::from_bytes(&[11u8; 32]).public();
     let device = SecretKey::from_bytes(&[12u8; 32]).public();
-    state.write().unwrap().members.add(seated(user));
+    state.write().unwrap().group.members.add(seated(user));
     // Unmapped, the device key is a stranger.
     assert!(!h.knows_sender(device));
     registry.device_user_map.insert(device, user);
@@ -213,7 +215,7 @@ async fn knows_sender_refuses_a_stranger() {
     let h = sample_coordinator_handler().await;
     let (state, _) = handler_parts(&h);
     let member = SecretKey::from_bytes(&[13u8; 32]).public();
-    state.write().unwrap().members.add(seated(member));
+    state.write().unwrap().group.members.add(seated(member));
     let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
     assert!(!h.knows_sender(stranger));
 }
@@ -310,7 +312,7 @@ async fn authorization_uses_identity_memberships_not_connection_handles() {
     let box_state = make_network_state();
     let field_state = make_network_state();
     for (name, state) in [("box", &box_state), ("field", &field_state)] {
-        state.write().unwrap().members.add(seated(user));
+        state.write().unwrap().group.members.add(seated(user));
         registry.networks.insert(
             name.into(),
             NetworkHandle {
@@ -341,12 +343,12 @@ async fn authorization_uses_identity_memberships_not_connection_handles() {
     registry.pruned_peers.remove(&("box".into(), device));
 
     // A revoked device cannot inherit its still-authorized user's grant.
-    box_state.write().unwrap().nullifiers.insert(device);
+    box_state.write().unwrap().group.nullifiers.insert(device);
     assert_eq!(networks(), ["field"]);
-    box_state.write().unwrap().nullifiers.remove(&device);
+    box_state.write().unwrap().group.nullifiers.remove(&device);
     assert_eq!(networks(), ["box", "field"]);
 
-    box_state.write().unwrap().members = MemberList::new();
+    box_state.write().unwrap().group.members = MemberList::new();
     assert_eq!(networks(), ["field"]);
     registry.networks.remove("field");
     assert!(networks().is_empty());
@@ -372,7 +374,7 @@ async fn firewall_test_matches_the_identity_the_data_path_sees() {
     let device = SecretKey::from_bytes(&[52; 32]).public();
     registry.device_user_map.insert(device, user);
     let state = make_network_state();
-    state.write().unwrap().members.add(Member {
+    state.write().unwrap().group.members.add(Member {
         hostname: Some("phone".into()),
         user_identity: Some(user),
         ..seated(device)
@@ -593,10 +595,10 @@ pub(crate) fn hold_network(
     {
         let mut state = state.write().unwrap();
         for member in members {
-            state.members.add(member);
+            state.group.members.add(member);
         }
         for entry in approved {
-            state.approved.approve(entry);
+            state.group.approved.approve(entry);
         }
     }
     let network_key = state.read().unwrap().network_public_key;
@@ -1454,6 +1456,7 @@ async fn delivery_to_a_member_is_skipped() {
     state
         .write()
         .unwrap()
+        .group
         .members
         .add(roster_member(device, Some(user)));
     let message = reply_text(connect.deliver_invite("sample-net", user).await);
@@ -1640,7 +1643,12 @@ mod disconnect_recovery_tests {
             .peers
             .add(peer_ip, conn.clone(), remote.id(), "test-net");
         let state = make_network_state();
-        state.write().unwrap().members.add(seated(remote.id()));
+        state
+            .write()
+            .unwrap()
+            .group
+            .members
+            .add(seated(remote.id()));
         registry.networks.insert(
             "test-net".to_string(),
             NetworkHandle {
@@ -2037,7 +2045,7 @@ async fn reconnect_registration_survives_a_stopped_welcome_reply() {
         let (state, registry) = handler_parts(&handler);
         let mut member = seated(client.id());
         member.hostname = Some("member".to_string());
-        state.write().unwrap().members.add(member);
+        state.write().unwrap().group.members.add(member);
         let ip = derive_ipv6(&client.id());
         // The first network has already registered and announced itself.
         // The coordinator's hello adds a second network to this connection.
@@ -2132,7 +2140,7 @@ async fn exit_offer_is_recorded_by_every_handler_role() {
         {
             let mut s = state.write().unwrap();
             s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-            s.members.add(Member {
+            s.group.members.add(Member {
                 identity: sender,
                 is_coordinator: false,
                 hostname: None,
@@ -2177,6 +2185,7 @@ async fn exit_offer_is_recorded_by_every_handler_role() {
             let done = state
                 .read()
                 .unwrap()
+                .group
                 .members
                 .get(&sender)
                 .is_some_and(|m| m.exit_node && m.exit_families.carries_v6());
@@ -2285,7 +2294,7 @@ async fn exit_offer_over_the_wire_reaches_the_coordinator_roster() {
     {
         let mut s = state.write().unwrap();
         s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-        s.members.add(Member {
+        s.group.members.add(Member {
             identity: member_id,
             is_coordinator: false,
             hostname: None,
@@ -2347,6 +2356,7 @@ async fn exit_offer_over_the_wire_reaches_the_coordinator_roster() {
         if state
             .read()
             .unwrap()
+            .group
             .members
             .get(&member_id)
             .is_some_and(|m| m.exit_node)
@@ -2436,7 +2446,7 @@ async fn sync_exit_offers_delivers_over_the_retained_connection() {
     {
         let mut s = coord_state.write().unwrap();
         s.network_secret_key = Some(net_secret.clone());
-        s.members = MemberList::from_members(roster());
+        s.group.members = MemberList::from(roster());
     }
     coord_reg.networks.insert(
         "test-net".to_string(),
@@ -2474,7 +2484,7 @@ async fn sync_exit_offers_delivers_over_the_retained_connection() {
     {
         let mut s = member_state.write().unwrap();
         s.network_secret_key = None; // plain member
-        s.members = MemberList::from_members(roster());
+        s.group.members = MemberList::from(roster());
     }
     member_reg.networks.insert(
         "test-net".to_string(),
@@ -2520,6 +2530,7 @@ async fn sync_exit_offers_delivers_over_the_retained_connection() {
         if coord_state
             .read()
             .unwrap()
+            .group
             .members
             .get(&member_id)
             .is_some_and(|m| m.exit_node)
@@ -2544,7 +2555,7 @@ async fn set_hostname_reports_a_failed_save() {
     let daemon = build_headless(false).await.unwrap();
     let state = make_network_state();
     let me = daemon.transport.endpoint.id();
-    state.write().unwrap().members.add(seated(me));
+    state.write().unwrap().group.members.add(seated(me));
     let network_key = state.read().unwrap().network_public_key;
     daemon.registry.networks.insert(
         "test-net".into(),
@@ -2565,6 +2576,7 @@ async fn set_hostname_reports_a_failed_save() {
     let before = state
         .read()
         .unwrap()
+        .group
         .members
         .get(&me)
         .unwrap()
@@ -2573,7 +2585,14 @@ async fn set_hostname_reports_a_failed_save() {
     let reply = daemon.set_hostname("test-net", "renamed").await;
     assert!(reply.is_err(), "{reply:?}");
     assert_eq!(
-        state.read().unwrap().members.get(&me).unwrap().hostname,
+        state
+            .read()
+            .unwrap()
+            .group
+            .members
+            .get(&me)
+            .unwrap()
+            .hostname,
         before
     );
     daemon.registry.networks.remove("test-net");
@@ -2731,7 +2750,12 @@ async fn demux_handles_frames_for_different_networks_side_by_side() {
     // JoinRequest is queued for approval and answered with JoinPending.
     let state_a = make_network_state();
     let net_a = state_a.read().unwrap().network_public_key;
-    state_a.write().unwrap().members.add(seated(member_id));
+    state_a
+        .write()
+        .unwrap()
+        .group
+        .members
+        .add(seated(member_id));
     let state_b = make_network_state();
     let net_b = SecretKey::from_bytes(&[3u8; 32]).public();
     {

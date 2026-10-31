@@ -13,7 +13,7 @@ use std::net::IpAddr;
 use proptest::prelude::*;
 use rayfish::hostname::{admission_hostname, is_valid_hostname, resolve_collision};
 use rayfish::membership::{
-    ApprovedList, ExitFamilies, Member, MemberList, canonical_group_bytes, derive_ipv6,
+    ApprovedList, ExitFamilies, GroupBlob, Member, MemberList, canonical_group_bytes, derive_ipv6,
     group_blob_hash, is_overlay_ip,
 };
 
@@ -94,8 +94,7 @@ proptest! {
 proptest! {
     /// The blob hash is what members compare to decide whether they have
     /// converged, so it must depend on roster *content* only. Feeding the same
-    /// members in a different insertion order (different HashMap layout) must
-    /// produce identical bytes.
+    /// members in a different insertion order must produce identical bytes.
     #[test]
     fn canonical_bytes_ignore_insertion_order(
         roster in roster_strategy(10),
@@ -110,25 +109,17 @@ proptest! {
             }
         }
 
-        let build = |ms: Vec<Member>| {
-            let mut list = MemberList::new();
-            for m in ms {
-                list.add(m);
-            }
-            list
+        let blob = |members: Vec<Member>| GroupBlob {
+            members: MemberList::from(members),
+            approved: ApprovedList::new(),
+            suggested_firewall: Default::default(),
+            name: Some("net".into()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
         };
 
-        let approved = ApprovedList::new();
-        let firewall = Default::default();
-        let keys = BTreeMap::new();
-        let nullifiers = BTreeSet::new();
-
-        let a = canonical_group_bytes(
-            &build(roster), &approved, &firewall, Some("net"), &keys, &nullifiers,
-        );
-        let b = canonical_group_bytes(
-            &build(permuted), &approved, &firewall, Some("net"), &keys, &nullifiers,
-        );
+        let a = canonical_group_bytes(&blob(roster));
+        let b = canonical_group_bytes(&blob(permuted));
         prop_assert_eq!(a, b);
     }
 
@@ -136,19 +127,17 @@ proptest! {
     /// points can't drift apart.
     #[test]
     fn blob_hash_matches_canonical_bytes(roster in roster_strategy(8)) {
-        let mut list = MemberList::new();
-        for m in roster {
-            list.add(m);
-        }
-        let approved = ApprovedList::new();
-        let firewall = Default::default();
-        let keys = BTreeMap::new();
-        let nullifiers = BTreeSet::new();
+        let blob = GroupBlob {
+            members: MemberList::from(roster),
+            approved: ApprovedList::new(),
+            suggested_firewall: Default::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        };
 
-        let bytes = canonical_group_bytes(
-            &list, &approved, &firewall, None, &keys, &nullifiers,
-        );
-        let hash = group_blob_hash(&list, &approved, &firewall, None, &keys, &nullifiers);
+        let bytes = canonical_group_bytes(&blob);
+        let hash = group_blob_hash(&blob);
         prop_assert_eq!(hash, blake3::hash(&bytes));
     }
 }

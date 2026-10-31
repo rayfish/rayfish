@@ -110,7 +110,13 @@ impl Node {
     fn nullifies(&self, name: &str, device: EndpointId) -> bool {
         let daemon = self.daemon();
         let handle = daemon.registry.networks.get(name).expect("network is live");
-        handle.state.read().unwrap().nullifiers.contains(&device)
+        handle
+            .state
+            .read()
+            .unwrap()
+            .group
+            .nullifiers
+            .contains(&device)
     }
 
     async fn unpair_self(&self) -> OpResult<Done> {
@@ -224,8 +230,8 @@ async fn listed(primary: &Node, device: EndpointId, cert: control::DeviceCert) {
             create(&daemon, "home").await;
             let handle = daemon.registry.networks.get("home").unwrap();
             let mut state = handle.state.write().unwrap();
-            let template = state.members.iter().next().unwrap().clone();
-            state.members.add(Member {
+            let template = state.group.members.iter().next().unwrap().clone();
+            state.group.members.add(Member {
                 identity: device,
                 is_coordinator: false,
                 hostname: Some("phone".to_string()),
@@ -367,7 +373,13 @@ async fn a_primary_records_an_unpair_after_its_roster_dropped_the_device() {
     primary
         .run(async move {
             let handle = daemon.registry.networks.get("home").unwrap();
-            handle.state.write().unwrap().members.remove(&device_id);
+            handle
+                .state
+                .write()
+                .unwrap()
+                .group
+                .members
+                .remove(&device_id);
         })
         .await;
     introduce(&device, &primary);
@@ -812,8 +824,8 @@ async fn a_pairing_waits_for_a_network_being_destroyed() {
     {
         let handle = registry.networks.get("work").unwrap();
         let mut state = handle.state.write().unwrap();
-        let template = state.members.iter().next().unwrap().clone();
-        state.members.add(Member {
+        let template = state.group.members.iter().next().unwrap().clone();
+        state.group.members.add(Member {
             identity: member.id(),
             is_coordinator: false,
             hostname: Some("laptop".to_string()),

@@ -79,16 +79,16 @@ impl MemberFixture {
     ) -> (crate::membership::GroupBlob, blake3::Hash) {
         let bytes = {
             let s = self.state.read().unwrap();
-            let mut members = s.members.clone();
+            let mut members = s.group.members.clone();
             edit(&mut members);
-            crate::membership::canonical_group_bytes(
-                &members,
-                &s.approved,
-                &s.suggested_firewall,
-                s.group_name.as_deref(),
-                &s.reusable_keys,
-                &s.nullifiers,
-            )
+            crate::membership::canonical_group_bytes(&GroupBlob {
+                members: members.clone(),
+                approved: s.group.approved.clone(),
+                suggested_firewall: s.group.suggested_firewall.clone(),
+                name: s.group.name.clone(),
+                reusable_keys: s.group.reusable_keys.clone(),
+                nullifiers: s.group.nullifiers.clone(),
+            })
         };
         self.registry()
             .transport
