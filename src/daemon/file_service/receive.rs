@@ -597,8 +597,8 @@ fn span(duration: Duration) -> String {
     let secs = duration.as_secs();
     let (count, unit) = match secs {
         0 => (0, "second"),
-        _ if secs % 3600 == 0 => (secs / 3600, "hour"),
-        _ if secs % 60 == 0 => (secs / 60, "minute"),
+        _ if secs.is_multiple_of(3600) => (secs / 3600, "hour"),
+        _ if secs.is_multiple_of(60) => (secs / 60, "minute"),
         _ => (secs, "second"),
     };
     let plural = if count == 1 { "" } else { "s" };
