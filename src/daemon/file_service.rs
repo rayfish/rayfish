@@ -2315,7 +2315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_completion_persistence_keeps_the_saved_offer_retryable() {
+    async fn failed_completion_persistence_keeps_the_file_and_does_not_requeue() {
         let tmp = tempfile::tempdir().unwrap();
         config::set_thread_config_dir(tmp.path().join("config"));
         let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
@@ -2346,15 +2346,21 @@ mod tests {
             panic!("confirmation failure must be reported")
         };
         let message = error.to_string();
-        assert!(message.contains("file saved but could not record delivery confirmation"));
+        assert!(
+            message.contains("but could not record delivery confirmation"),
+            "{message}"
+        );
         assert_eq!(
             std::fs::read(tmp.path().join("downloads/file.bin")).unwrap(),
             b"payload"
         );
-        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+        // Not queued again: a second accept would save a second copy.
+        assert!(service.pending_files.lock().unwrap().is_empty());
         assert!(service.active_files.lock().unwrap().is_empty());
         assert!(service.declines.lock().unwrap().is_empty());
-        assert_eq!(load_pending_files().len(), 1);
+        assert!(load_pending_files().is_empty());
+        let receive = service.transfers.list().pop().unwrap();
+        assert_eq!(receive.state, transfers::TransferState::Failed);
     }
 
     #[tokio::test]

@@ -186,46 +186,61 @@ impl FileService {
     /// Settle a finished receive: on success record the delivery and drop the
     /// offer for good; on failure leave it to `offer`, which returns it to the
     /// queue with its downloaded data.
+    ///
+    /// The delivery is recorded before the transfer is marked done and the
+    /// blob released. If recording fails the file is still saved, so the offer
+    /// is not queued again: accepting it a second time would only download it
+    /// once more and save it beside the first copy.
     fn finish_receive(
         self: &Arc<Self>,
         mut offer: ReceiveOfferGuard,
         finish: transfers::FinishGuard,
         received: Result<PathBuf, String>,
     ) -> OpResult<Done> {
-        let Some(file) = offer.file.clone() else {
+        let Some(file) = offer.file.take() else {
             return op_err("receive lost its offer");
         };
         let id = file.id;
         let dest = match received {
             Ok(dest) => dest,
             Err(error) => {
+                offer.file = Some(file);
                 finish.fail(error.clone());
                 return op_err(format!("{error}; retry with `ray files accept {id}`"));
             }
         };
+        let recorded = self.record_completed_offer(&file);
+        self.forget_active(offer.offer_id);
+        // The file is where the user wanted it, so the store's copy is now pure
+        // duplication: every accepted file used to be kept twice, forever.
+        self.reclaim_blob(blob_tags::recv(&file.blob_hash, file.id));
+        if let Err(error) = recorded {
+            let reason = format!(
+                "saved to {} but could not record delivery confirmation: {error}",
+                dest.display()
+            );
+            finish.fail(reason.clone());
+            return op_err(reason);
+        }
         // The file is fully on disk (chown failures are ignored, by design,
         // and never fail the transfer): only now is the transfer really done.
         let destination = std::fs::canonicalize(&dest).unwrap_or_else(|_| dest.clone());
         finish.success(&destination);
-        if let Err(error) = self.record_completed_offer(&file) {
-            return op_err(format!(
-                "file saved but could not record delivery confirmation: {error}; retry with `ray files accept {id}`"
-            ));
-        }
-        offer.file.take();
-        {
-            let pending = self.pending_files.lock().unwrap();
-            let mut active = self.active_files.lock().unwrap();
-            active.retain(|entry| entry.offer_id != offer.offer_id);
-            let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
-            if let Err(error) = save_pending_files(&durable) {
-                tracing::warn!(%error, "could not persist completed incoming file");
-            }
-        }
         let service = Arc::clone(self);
         let peer = file.from;
         tokio::spawn(async move { service.flush_outbox_for(peer).await });
         Ok(Done(format!("saved to {}", dest.display())))
+    }
+
+    /// Drop a finished receive from the active list and the saved queue.
+    fn forget_active(&self, offer_id: control::FileOfferId) {
+        let pending = self.pending_files.lock().unwrap();
+        let mut active = self.active_files.lock().unwrap();
+        active.retain(|entry| entry.offer_id != offer_id);
+        let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
+        if let Err(error) = save_pending_files(&durable) {
+            tracing::warn!(%error, "could not persist completed incoming file");
+        }
     }
 
     /// Fetch the offer's blob, retrying interruptions, and write it to its
@@ -247,6 +262,7 @@ impl FileService {
         // would sweep the bytes out from under us. The tag is dropped again as
         // soon as the file reaches its destination or the offer is rejected.
         // Failed receives keep the tag so a retry can reuse the downloaded ranges.
+        // A finished one releases it in `finish_receive`.
         let recv_tag = blob_tags::recv(&file.blob_hash, file.id);
         self.transport
             .blob_store
@@ -255,11 +271,7 @@ impl FileService {
             .await
             .map_err(|e| format!("blob store error: {e}"))?;
         self.fetch_resuming(file, transfer_id).await?;
-        let dest = self.save_received(file, output, recipient).await?;
-        // The file is where the user wanted it, so the store's copy is now pure
-        // duplication: every accepted file used to be kept twice, forever.
-        self.reclaim_blob(recv_tag);
-        Ok(dest)
+        self.save_received(file, output, recipient).await
     }
 
     /// Fetch until the blob is complete, waiting out interruptions.

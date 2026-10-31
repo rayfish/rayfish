@@ -43,6 +43,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A send whose download was interrupted now shows in `ray files` on the
   sender as still in progress, with a note, instead of failed and then gone a
   minute later. It shows as done once the recipient finishes it.
+- A received file whose delivery could not be recorded is no longer put back
+  in the queue while showing as done, where accepting it again downloaded a
+  second copy. The receive fails with a message naming where the file was
+  saved.
 - A member whose coordinator handshake failed partway through a restart now
   picks up roster and firewall changes as they happen, instead of waiting for
   the next poll.
