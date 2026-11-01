@@ -26,6 +26,7 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`v4bridge/`](v4bridge) | 2 | A service listening on `0.0.0.0` answers over the IPv6-only mesh: the payload path by IP and by `.ray` name, the firewall still upstream of the bridge, loopback-only services declined, no bind/unbind flap across rescans, the setting + data-plane lifetime, and a new listener picked up from a kernel event rather than a timer (droplets only, see the scenario README). |
 | [`reliability/`](reliability) | 4 | Full-mesh packet-loss test: every pair probed both ways with `ping -c 1000 -i 0.01`, ICMP flood, and iperf3 UDP, over the rayfish tunnel vs the direct public-IP baseline. Fails when rayfish adds loss over the raw link. |
 | [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
+| [`file-resume/`](file-resume) | 2 | Interrupted file receives finish on their own with the right bytes: a network cut, a lid close (cut plus a frozen daemon), receiver and sender restarts and `kill -9` mid-fetch, a kill while writing the temp file and right after the rename, no `.part` left and no `(1)` copy, and a too-long UTF-8 name saved shortened. |
 | [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
 | [`churn/`](churn) | 4 | Lifecycle events under churn: repeated hard flap, simultaneous flap, `ray down`/`up` cycles (including one on a host with no `ip` binary, since link state goes over netlink), and a `kick`/`nuke` delivered while a member is offline (which must still converge from the signed blob). Ends with a no-panic/no-crash-restart sweep. |
 | [`mixed-version/`](mixed-version) | 4 | This build and an older release (`OLD_RAY_BIN`) in one mesh: joins and Magic DNS across versions, mixed co-coordinators converging an edit and renewing records without refusing each other's, kicks and restarts in both directions, `ray send` both ways, and a log sweep for panics and repeated protocol errors. Not part of `all`. |
@@ -41,7 +42,7 @@ tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 
 where `<scenario>` is `rootless`, `device-cert`, `connect`, `firewall`, `closed-net`,
 `apply`, `invites`, `dns`, `ssh`, `operator`, `v4bridge`, `reliability`, `restore-offline`,
-`unpair`, `churn`, `exit-node`, `mixed-version`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+`file-resume`, `unpair`, `churn`, `exit-node`, `mixed-version`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
