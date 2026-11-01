@@ -1278,6 +1278,8 @@ mod embedded_ipc_tests {
         };
         let root = PeerIdentity::Unix { uid: 0, gid: 0 };
         let owner = PeerIdentity::Unix { uid: 501, gid: 20 };
+        // Only Linux desktop builds have a third host to add.
+        #[cfg_attr(not(all(target_os = "linux", feature = "desktop")), allow(unused_mut))]
         let mut hosts = vec![IpcHost::Daemon, IpcHost::PacketTunnel { owner_uid: 501 }];
         #[cfg(all(target_os = "linux", feature = "desktop"))]
         hosts.push(IpcHost::Rootless { owner_uid: 501 });
