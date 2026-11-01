@@ -1283,4 +1283,62 @@ mod tests {
             }
         );
     }
+
+    mod frame_properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// What a newer build might put in a frame's `msg` slot.
+        #[derive(Clone, Debug, serde::Serialize)]
+        #[serde(untagged)]
+        enum FuturePayload {
+            Number(u64),
+            Text(String),
+            Bytes(Vec<u8>),
+            List(Vec<u64>),
+        }
+
+        fn future_payload() -> impl Strategy<Value = FuturePayload> {
+            prop_oneof![
+                any::<u64>().prop_map(FuturePayload::Number),
+                ".{0,16}".prop_map(FuturePayload::Text),
+                prop::collection::vec(any::<u8>(), 0..40).prop_map(FuturePayload::Bytes),
+                prop::collection::vec(any::<u64>(), 0..4).prop_map(FuturePayload::List),
+            ]
+        }
+
+        proptest! {
+            /// A frame whose message is a unit variant name, or a one-entry
+            /// map from a name to anything, either decodes or comes back as
+            /// that name, so the demux can answer `NotSupported` instead of
+            /// dropping it. Known names with a payload they do not take land
+            /// here too.
+            #[test]
+            fn a_named_message_decodes_or_is_named_back(
+                net in prop::option::of(any::<u8>()),
+                name in "[A-Za-z][A-Za-z0-9]{0,24}",
+                payload in prop::option::of(future_payload()),
+            ) {
+                let net = net.map(test_id);
+                let body = match payload {
+                    None => rmp_serde::to_vec(&(net, &name)),
+                    Some(payload) => rmp_serde::to_vec(&(net, HashMap::from([(&name, payload)]))),
+                }
+                .unwrap();
+                match decode_frame(&body) {
+                    Ok(FrameRead::Frame(_)) => {}
+                    Ok(FrameRead::Unknown { msg_kind }) => prop_assert_eq!(msg_kind, name),
+                    Err(e) => prop_assert!(false, "{name}: {e:#}"),
+                }
+            }
+
+            /// Any frame body a peer sends is decoded or refused, never a
+            /// panic.
+            #[test]
+            fn frame_bodies_never_panic(body in prop::collection::vec(any::<u8>(), 0..300)) {
+                let _ = decode_frame(&body);
+            }
+        }
+    }
 }
