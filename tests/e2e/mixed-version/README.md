@@ -42,6 +42,20 @@ both directions.
 6. **Logs.** On every host: IPC still answers, no panic, no crash restart, and
    no protocol warning repeated three or more times.
 
+Roster checks ask for membership, not a live connection: idle connections close
+after a couple of minutes and reopen on demand. The pings next to them cover the
+data plane.
+
+## KNOWN lines
+
+A `KNOWN` line is a defect of the older build that this tree fixes, printed and
+not counted. With v0.5.13 as the older build, the creating coordinator of a
+network (srv-b on `beta`) runs no group poller, so it learns another
+coordinator's edit only at its next renewal, through a path that updates the
+roster but not Magic DNS. So after srv-d kicks srv-c, srv-b keeps answering for
+`srv-c.beta.ray`. Both are in the `[Unreleased]` Fixed list, and the NEW side of
+each check is asserted.
+
 The mesh address check is not decoration: `derive_ipv6` was rewritten after the
 release, and a different result on either side would route packets to nowhere.
 

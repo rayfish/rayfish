@@ -65,20 +65,30 @@ join_with_invite(){
   on "$3" "ray join $code --hostname $4" 2>&1 | strip | sed "s/^/   $4| /"
 }
 
-# roster_online <ip> <net> <host...> : every named peer is online in <net>.
-roster_online(){
+# known <text> : a defect of the OLD build that this tree fixes. Printed, not
+# counted: the mixed mesh still works, and the NEW side of the same check is
+# asserted next to it.
+known(){ printf '  \033[33mKNOWN\033[0m %s\n' "$*"; }
+
+# roster_has <ip> <net> <host...> : every named peer is in <ip>'s roster for
+# <net>. Membership, not a live connection: idle connections close after a
+# couple of minutes and reopen on demand, so "online" is the wrong question for
+# convergence. The pings next to each roster check cover the data plane.
+roster_has(){
   local ip="$1" net="$2"; shift 2
   local h
-  for h in "$@"; do [[ "$(peer_online "$ip" "$h" "$net")" == 1 ]] || return 1; done
+  for h in "$@"; do peer_in_roster "$ip" "$h" "$net" || return 1; done
 }
 
-# wait_net_roster <ip> <net> <host...> : bounded wait, PASS/FAIL.
+# wait_net_roster [-t secs] <ip> <net> <host...> : bounded wait, PASS/FAIL.
 wait_net_roster(){
+  local secs=150
+  if [[ "$1" == -t ]]; then secs="$2"; shift 2; fi
   local ip="$1" net="$2"; shift 2
-  if retry_until 150 "roster_online '$ip' '$net' $*"; then
-    pass "${NAME[$ip]} sees $* online on $net"
+  if retry_until "$secs" "roster_has '$ip' '$net' $*"; then
+    pass "${NAME[$ip]} has $* in its $net roster"
   else
-    fail "${NAME[$ip]} does not see $* online on $net"
+    fail "${NAME[$ip]} is missing some of $* from its $net roster"
   fi
 }
 
@@ -249,12 +259,28 @@ join_with_invite "$B" "$NA" "$D" srv-d
 wait_net_roster "$A" "$NA" srv-b srv-c srv-d
 wait_net_roster "$C" "$NA" srv-a srv-b srv-d
 wait_net_roster "$D" "$NA" srv-a srv-b srv-c
+wait_dns "$A" srv-d "$NA"
+wait_dns "$C" srv-d "$NA"
+wait_dns "$D" srv-a "$NA"
 
 step "2d. an admission by the NEW co-coordinator converges: srv-d admits srv-a to $NB"
 join_with_invite "$D" "$NB" "$A" srv-a
-wait_net_roster "$B" "$NB" srv-a srv-c srv-d
+# srv-b created $NB, and the OLD build runs no group poller on the coordinator
+# that created a network: it learns another coordinator's edit at its next
+# renewal (up to 150s). Hence the longer wait on srv-b only.
+wait_net_roster -t 210 "$B" "$NB" srv-a srv-c srv-d
 wait_net_roster "$C" "$NB" srv-a srv-b srv-d
 wait_net_roster "$A" "$NB" srv-b srv-c srv-d
+wait_dns "$C" srv-a "$NB"
+wait_dns "$A" srv-d "$NB"
+# What srv-b learns at renewal goes through the OLD build's record-apply path,
+# which updates the roster but not Magic DNS (fixed here: "Roster updates
+# learned by polling now update .ray names and routes").
+if retry_until 30 "resolves '$B' srv-a.$NB.ray"; then
+  pass "srv-b (OLD) resolves srv-a.$NB.ray"
+else
+  known "srv-b (OLD creator of $NB) has no srv-a.$NB.ray name for an admission made by srv-d"
+fi
 
 step "2e. record renewal across versions (${RENEWAL_WAIT}s, two renewal cycles)"
 # Both coordinators of each network renew its record every 150s, each first
@@ -314,11 +340,13 @@ else
   fail "srv-d (NEW) still holds $NA after being kicked"
 fi
 has_net "$D" "$NB" && pass "srv-d kept $NB" || fail "srv-d lost $NB along with $NA"
-if retry_until 60 "! resolves '$A' srv-d.$NA.ray"; then
-  pass "srv-d.$NA.ray no longer resolves on srv-a"
-else
-  fail "srv-d.$NA.ray still resolves on srv-a"
-fi
+for h in "$A" "$C"; do
+  if retry_until 60 "! resolves '$h' srv-d.$NA.ray"; then
+    pass "srv-d.$NA.ray no longer resolves on ${NAME[$h]}"
+  else
+    fail "srv-d.$NA.ray still resolves on ${NAME[$h]}"
+  fi
+done
 
 step "3b. NEW coordinator kicks an OLD member: srv-d kicks srv-c from $NB"
 on "$D" "ray kick $NB srv-c --yes" 2>&1 | strip | sed 's/^/   srv-d| /'
@@ -335,10 +363,17 @@ else
   fail "srv-c (OLD) still holds $NB after being kicked"
 fi
 has_net "$C" "$NA" && pass "srv-c kept $NA" || fail "srv-c lost $NA along with $NB"
-if retry_until 60 "! resolves '$B' srv-c.$NB.ray"; then
-  pass "srv-c.$NB.ray no longer resolves on srv-b"
+if retry_until 60 "! resolves '$A' srv-c.$NB.ray"; then
+  pass "srv-c.$NB.ray no longer resolves on srv-a (NEW member)"
 else
-  fail "srv-c.$NB.ray still resolves on srv-b"
+  fail "srv-c.$NB.ray still resolves on srv-a (NEW member)"
+fi
+# The same two OLD-build defects as in 2d: srv-b drops srv-c from its roster
+# at renewal, through the path that leaves Magic DNS alone.
+if retry_until 60 "! resolves '$B' srv-c.$NB.ray"; then
+  pass "srv-c.$NB.ray no longer resolves on srv-b (OLD creator)"
+else
+  known "srv-c.$NB.ray still resolves on srv-b (OLD creator of $NB) after srv-d kicked srv-c"
 fi
 
 # ---------------------------------------------------------------------------
@@ -369,6 +404,8 @@ wait_net_roster "$C" "$NA" srv-a
 wait_net_roster "$B" "$NB" srv-a
 wait_ping "$C" "$IP_A" "srv-c (OLD) -> restarted srv-a"
 wait_ping "$A" "$IP_C" "restarted srv-a -> srv-c (OLD)"
+[[ "$(peer_online "$C" srv-a "$NA")" == 1 ]] && pass "srv-c holds a live connection to srv-a again" \
+  || fail "srv-c has no live connection to srv-a after the pings"
 
 restart_daemon "$D" && pass "srv-d (NEW co-coordinator of $NB) restarted" \
   || fail "srv-d did not come back from a restart"
@@ -380,6 +417,8 @@ wait_net_roster "$D" "$NB" srv-a srv-b
 wait_net_roster "$B" "$NB" srv-d
 wait_ping "$B" "$IP_D" "srv-b (OLD) -> restarted srv-d"
 wait_ping "$D" "$IP_B" "restarted srv-d -> srv-b (OLD)"
+[[ "$(peer_online "$B" srv-d "$NB")" == 1 ]] && pass "srv-b holds a live connection to srv-d again" \
+  || fail "srv-b has no live connection to srv-d after the pings"
 
 if retry_until 120 "rosters_equal '$NA' '$WANT_NA' '$A' '$B' '$C' && rosters_equal '$NB' '$WANT_NB' '$A' '$B' '$D'"; then
   pass "rosters agree on every host after the restarts ($NA=[$WANT_NA] $NB=[$WANT_NB])"
