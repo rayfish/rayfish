@@ -20,7 +20,7 @@
 //! unreadable is [`Verdict::Unknown`], which stays quiet: a wrong warning
 //! pointing at the firewall wastes more time than no warning at all.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::process::Command;
 
 /// What the host firewall would do to an inbound mesh connection.
@@ -259,7 +259,7 @@ fn verdict(blocked: bool, manager: Manager, tun: &str, port: u16) -> Verdict {
 }
 
 /// Which front-end owns the ruleset, if we can tell.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn detect_manager(run: &mut impl FnMut(&[&str]) -> Option<String>) -> Option<Manager> {
     if run(&["ufw", "status"]).is_some_and(|s| s.contains("Status: active")) {
         return Some(Manager::Ufw);
@@ -270,7 +270,8 @@ pub(crate) fn detect_manager(run: &mut impl FnMut(&[&str]) -> Option<String>) ->
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn run(argv: &[&str]) -> Option<String> {
     let out = Command::new(argv[0]).args(&argv[1..]).output().ok()?;
     if !out.status.success() {

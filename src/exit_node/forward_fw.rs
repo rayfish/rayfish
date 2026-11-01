@@ -1,7 +1,7 @@
 //! Host-firewall exceptions for the exit-node gateway's forwarded traffic.
 //!
 //! A host firewall that drops forwarding swallows every exit-node packet: Docker
-//! 27+ sets the ip6tables `FORWARD` policy to `DROP`, ufw does the same with
+//! 27+ sets the iptables `FORWARD` policy to `DROP`, ufw does the same with
 //! `DEFAULT_FORWARD_POLICY="DROP"`, and firewalld's nft forward chain ends in a
 //! reject. Our own nft table cannot override any of them (an `accept` ends only the
 //! chain it is in), so, as Tailscale does, we put two accepts at the top of the
@@ -24,6 +24,7 @@ const COMMENT_IN: &str = "rayfish-exit-in";
 const COMMENT_OUT: &str = "rayfish-exit-out";
 const COMMENT_PREFIX: &str = "rayfish-exit-";
 
+const IPTABLES_DUMP: [&str; 5] = ["iptables", "-w", "5", "-S", "FORWARD"];
 const IP6TABLES_DUMP: [&str; 5] = ["ip6tables", "-w", "5", "-S", "FORWARD"];
 pub(super) const NFT_RULESET: [&str; 4] = ["nft", "-j", "list", "ruleset"];
 
@@ -51,14 +52,16 @@ pub(super) fn allow(tun: &str) -> ForwardReport {
 
 /// The two dumps the exceptions are decided from.
 pub(super) struct ForwardDumps {
+    iptables: Option<String>,
     ip6tables: Option<String>,
     nft: Option<String>,
 }
 
 impl ForwardDumps {
-    /// Reads the ip6tables dump; `nft` is the ruleset the caller already holds.
+    /// Reads both iptables dumps; `nft` is the ruleset the caller already holds.
     pub(super) fn read(nft: Option<String>) -> Self {
         Self {
+            iptables: hostfw::run(&IPTABLES_DUMP),
             ip6tables: hostfw::run(&IP6TABLES_DUMP),
             nft,
         }
@@ -70,6 +73,7 @@ impl ForwardDumps {
     fn key(&self, tun: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
         tun.hash(&mut hasher);
+        self.iptables.hash(&mut hasher);
         self.ip6tables.hash(&mut hasher);
         self.nft
             .as_deref()
@@ -96,30 +100,35 @@ pub(super) fn reassert(tun: &str, dumps: &ForwardDumps) -> Option<String> {
 }
 
 fn needs_allow(tun: &str, dumps: &ForwardDumps) -> bool {
-    let ip6tables = dumps
-        .ip6tables
-        .as_deref()
-        .filter(|dump| ip6tables_forward_drops(dump))
-        .is_some_and(|dump| {
-            let ours: Vec<&str> = dump
-                .lines()
-                .map(str::trim)
-                .filter(|line| line.starts_with("-A FORWARD ") && line.contains(COMMENT_PREFIX))
-                .collect();
-            let names = |line: &str, flag: &str| {
-                line.split_whitespace()
-                    .collect::<Vec<_>>()
-                    .windows(2)
-                    .any(|w| w[0] == flag && w[1] == tun)
-            };
-            let has = |comment: &str, flag: &str| {
-                ours.iter()
-                    .any(|line| line.contains(comment) && names(line, flag))
-            };
-            ours.iter()
-                .any(|line| !names(line, "-i") && !names(line, "-o"))
-                || !has(COMMENT_IN, "-i")
-                || !has(COMMENT_OUT, "-o")
+    let tables = [&dumps.iptables, &dumps.ip6tables]
+        .into_iter()
+        .any(|table| {
+            table
+                .as_deref()
+                .filter(|dump| iptables_forward_drops(dump))
+                .is_some_and(|dump| {
+                    let ours: Vec<&str> = dump
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| {
+                            line.starts_with("-A FORWARD ") && line.contains(COMMENT_PREFIX)
+                        })
+                        .collect();
+                    let names = |line: &str, flag: &str| {
+                        line.split_whitespace()
+                            .collect::<Vec<_>>()
+                            .windows(2)
+                            .any(|w| w[0] == flag && w[1] == tun)
+                    };
+                    let has = |comment: &str, flag: &str| {
+                        ours.iter()
+                            .any(|line| line.contains(comment) && names(line, flag))
+                    };
+                    ours.iter()
+                        .any(|line| !names(line, "-i") && !names(line, "-o"))
+                        || !has(COMMENT_IN, "-i")
+                        || !has(COMMENT_OUT, "-o")
+                })
         });
     let nft = dumps.nft.as_deref().is_some_and(|json| {
         nft_dropping_forward_chains(json).iter().any(|chain| {
@@ -129,7 +138,7 @@ fn needs_allow(tun: &str, dumps: &ForwardDumps) -> bool {
                     .any(|c| !chain.ours.iter().any(|r| r.comment == *c))
         })
     });
-    ip6tables || nft
+    tables || nft
 }
 
 /// Remove every rule [`allow`] ever inserted, by comment. Best-effort.
@@ -137,8 +146,8 @@ pub fn remove() {
     remove_with(&mut hostfw::run)
 }
 
-/// The two ip6tables rule specs, after the chain name.
-fn ip6tables_specs(tun: &str) -> [Vec<&str>; 2] {
+/// The two iptables rule specs, after the chain name.
+fn iptables_specs(tun: &str) -> [Vec<&str>; 2] {
     [
         vec![
             "-i",
@@ -185,6 +194,7 @@ fn nft_rules(tun: &str) -> [(&'static str, String); 2] {
 
 fn allow_with(tun: &str, run: &mut impl FnMut(&[&str]) -> Option<String>) -> ForwardReport {
     let dumps = ForwardDumps {
+        iptables: run(&IPTABLES_DUMP),
         ip6tables: run(&IP6TABLES_DUMP),
         nft: run(&NFT_RULESET),
     };
@@ -199,29 +209,33 @@ fn allow_from(
     let mut report = ForwardReport::default();
     let mut failed: Vec<String> = Vec::new();
 
-    if let Some(dump) = dumps.ip6tables.as_deref()
-        && ip6tables_forward_drops(dump)
-    {
-        for del in ip6tables_deletions(dump) {
+    for (program, dump) in [
+        ("iptables", &dumps.iptables),
+        ("ip6tables", &dumps.ip6tables),
+    ] {
+        let Some(dump) = dump.as_deref().filter(|dump| iptables_forward_drops(dump)) else {
+            continue;
+        };
+        for del in iptables_deletions(dump) {
             if !del
                 .windows(2)
                 .any(|w| matches!(w[0].as_str(), "-i" | "-o") && w[1] == tun)
             {
-                ip6tables_delete(run, &del);
+                iptables_delete(run, program, &del);
             }
         }
-        for spec in ip6tables_specs(tun) {
-            let mut check = vec!["ip6tables", "-w", "5", "-C", "FORWARD"];
+        for spec in iptables_specs(tun) {
+            let mut check = vec![program, "-w", "5", "-C", "FORWARD"];
             check.extend(&spec);
             if run(&check).is_some() {
                 continue;
             }
-            let mut insert = vec!["ip6tables", "-w", "5", "-I", "FORWARD", "1"];
+            let mut insert = vec![program, "-w", "5", "-I", "FORWARD", "1"];
             insert.extend(&spec);
             if run(&insert).is_some() {
                 report.added += 1;
             } else {
-                failed.push(format!("ip6tables -I FORWARD 1 {}", spec.join(" ")));
+                failed.push(format!("{program} -I FORWARD 1 {}", spec.join(" ")));
             }
         }
     }
@@ -271,8 +285,9 @@ fn allow_from(
     }
     if !failed.is_empty() {
         report.manual_fix = Some(match hostfw::detect_manager(run) {
-            Some(manager) => manager_fix(manager, tun),
+            Some(manager @ (Manager::Ufw | Manager::Firewalld)) => manager_fix(manager, tun),
             None => failed.join(" && "),
+            Some(Manager::Iptables | Manager::Nftables) => failed.join(" && "),
         });
     }
     report
@@ -289,21 +304,16 @@ fn manager_fix(manager: Manager, tun: &str) -> String {
              firewall-cmd --permanent --policy rayfish-exit --add-ingress-zone=trusted \
              --add-egress-zone=ANY --set-target=ACCEPT && firewall-cmd --reload"
         ),
-        Manager::Iptables | Manager::Nftables => {
-            let [inbound, outbound] = ip6tables_specs(tun);
-            format!(
-                "ip6tables -I FORWARD 1 {} && ip6tables -I FORWARD 1 {}",
-                inbound.join(" "),
-                outbound.join(" ")
-            )
-        }
+        Manager::Iptables | Manager::Nftables => unreachable!("handled by the caller"),
     }
 }
 
 fn remove_with(run: &mut impl FnMut(&[&str]) -> Option<String>) {
-    if let Some(dump) = run(&IP6TABLES_DUMP) {
-        for del in ip6tables_deletions(&dump) {
-            ip6tables_delete(run, &del);
+    for (program, command) in [("iptables", IPTABLES_DUMP), ("ip6tables", IP6TABLES_DUMP)] {
+        if let Some(dump) = run(&command) {
+            for del in iptables_deletions(&dump) {
+                iptables_delete(run, program, &del);
+            }
         }
     }
     if let Some(json) = run(&NFT_RULESET) {
@@ -313,9 +323,9 @@ fn remove_with(run: &mut impl FnMut(&[&str]) -> Option<String>) {
     }
 }
 
-/// Run one `-D` argv from [`ip6tables_deletions`]. Best-effort.
-fn ip6tables_delete(run: &mut impl FnMut(&[&str]) -> Option<String>, del: &[String]) {
-    let mut args = vec!["ip6tables", "-w", "5"];
+/// Run one `-D` argv from [`iptables_deletions`]. Best-effort.
+fn iptables_delete(run: &mut impl FnMut(&[&str]) -> Option<String>, program: &str, del: &[String]) {
+    let mut args = vec![program, "-w", "5"];
     args.extend(del.iter().map(String::as_str));
     let _ = run(&args);
 }
@@ -335,9 +345,9 @@ fn nft_delete(run: &mut impl FnMut(&[&str]) -> Option<String>, rule: &NftRule) {
     ]);
 }
 
-/// Whether an `ip6tables -S FORWARD` dump drops what it does not accept: a `DROP`
+/// Whether an iptables `-S FORWARD` dump drops what it does not accept: a `DROP`
 /// policy, or an unconditional `DROP`/`REJECT` rule.
-pub(super) fn ip6tables_forward_drops(dump: &str) -> bool {
+pub(super) fn iptables_forward_drops(dump: &str) -> bool {
     dump.lines().map(str::trim).any(|line| {
         line == "-P FORWARD DROP"
             || line == "-A FORWARD -j DROP"
@@ -345,9 +355,8 @@ pub(super) fn ip6tables_forward_drops(dump: &str) -> bool {
     })
 }
 
-/// The `-D` argv (after `ip6tables -w 5`) for every rule of ours in an
-/// `ip6tables -S FORWARD` dump.
-pub(super) fn ip6tables_deletions(dump: &str) -> Vec<Vec<String>> {
+/// The `-D` argv for every rule of ours in an iptables `-S FORWARD` dump.
+pub(super) fn iptables_deletions(dump: &str) -> Vec<Vec<String>> {
     dump.lines()
         .map(str::trim)
         .filter(|line| line.starts_with("-A FORWARD ") && line.contains(COMMENT_PREFIX))
@@ -431,14 +440,12 @@ fn str_field<'a>(obj: &'a serde_json::Value, key: &str) -> &'a str {
     obj.get(key).and_then(|v| v.as_str()).unwrap_or_default()
 }
 
-/// The IPv6-reaching forward base chains in `nft -j list ruleset` output that
+/// The forward base chains in `nft -j list ruleset` output that
 /// drop by default: `policy drop`, or a last rule that drops or rejects
 /// unconditionally (firewalld's shape).
 ///
-/// iptables-nft's own `ip6 filter` `FORWARD` chain is skipped: the ip6tables
-/// pass already handles it, through the tool that owns it. So are `ip` tables,
-/// which never see the IPv6 the exit node carries, and our own table, which does
-/// not drop.
+/// iptables-nft's `filter FORWARD` chains are handled by their own tools. Our
+/// own table does not drop forwarded traffic.
 pub(super) fn nft_dropping_forward_chains(json: &str) -> Vec<NftChain> {
     struct Seen {
         chain: NftChain,
@@ -453,8 +460,8 @@ pub(super) fn nft_dropping_forward_chains(json: &str) -> Vec<NftChain> {
             let name = str_field(chain, "name");
             if str_field(chain, "hook") != "forward"
                 || str_field(chain, "type") != "filter"
-                || !matches!(family, "inet" | "ip6")
-                || (family == "ip6" && name == "FORWARD")
+                || !matches!(family, "inet" | "ip" | "ip6")
+                || (matches!(family, "ip" | "ip6") && table == "filter" && name == "FORWARD")
                 || table == super::SERVER_TABLE
             {
                 continue;
@@ -564,6 +571,7 @@ mod tests {
 ]}"#;
 
     struct Fake {
+        ipv4_forward: Option<String>,
         forward: Option<String>,
         nft: Option<String>,
         existing: Vec<String>,
@@ -574,6 +582,7 @@ mod tests {
     impl Fake {
         fn new(forward: Option<&str>, nft: Option<&str>) -> Self {
             Self {
+                ipv4_forward: None,
                 forward: forward.map(str::to_owned),
                 nft: nft.map(str::to_owned),
                 existing: Vec::new(),
@@ -586,6 +595,7 @@ mod tests {
             let line = args.join(" ");
             self.calls.push(line.clone());
             match args {
+                ["iptables", "-w", "5", "-S", "FORWARD"] => self.ipv4_forward.clone(),
                 ["ip6tables", "-w", "5", "-S", "FORWARD"] => self.forward.clone(),
                 ["nft", "-j", "list", "ruleset"] => self.nft.clone(),
                 ["ip6tables", "-w", "5", "-C", rest @ ..] => {
@@ -599,10 +609,38 @@ mod tests {
                     self.existing.push(format!("FORWARD {}", rest.join(" ")));
                     Some(String::new())
                 }
+                ["iptables", "-w", "5", "-C", ..] => None,
+                ["iptables", "-w", "5", "-I", "FORWARD", "1", ..] => {
+                    (!self.fail_inserts).then(String::new)
+                }
                 ["nft", "insert", ..] => (!self.fail_inserts).then(String::new),
                 _ => None,
             }
         }
+    }
+
+    #[test]
+    fn ipv4_drop_policy_gets_forwarding_exceptions() {
+        let mut fake = Fake::new(None, None);
+        fake.ipv4_forward = Some(DOCKER_FORWARD.to_string());
+        let report = allow_with("tun0", &mut |args| fake.run(args));
+        assert_eq!(report.added, 2);
+        assert!(
+            fake.calls
+                .iter()
+                .any(|call| call.starts_with("iptables -w 5 -I FORWARD 1 -i tun0 "))
+        );
+        assert!(
+            fake.calls
+                .iter()
+                .any(|call| call.starts_with("iptables -w 5 -I FORWARD 1 -o tun0 "))
+        );
+        let state = ForwardDumps {
+            iptables: Some(DOCKER_FORWARD.to_string()),
+            ip6tables: None,
+            nft: None,
+        };
+        assert!(needs_allow("tun0", &state));
     }
 
     #[test]
@@ -729,7 +767,7 @@ mod tests {
 -A FORWARD -i tun0 -j ACCEPT
 -A FORWARD -j DOCKER-USER
 ";
-        let dels: Vec<String> = ip6tables_deletions(dump)
+        let dels: Vec<String> = iptables_deletions(dump)
             .into_iter()
             .map(|d| d.join(" "))
             .collect();
@@ -744,17 +782,18 @@ mod tests {
 
     #[test]
     fn forward_drop_is_read_from_policy_or_a_catch_all() {
-        assert!(ip6tables_forward_drops(DOCKER_FORWARD));
-        assert!(ip6tables_forward_drops(
+        assert!(iptables_forward_drops(DOCKER_FORWARD));
+        assert!(iptables_forward_drops(
             "-P FORWARD ACCEPT\n-A FORWARD -j REJECT --reject-with icmp6-adm-prohibited\n"
         ));
-        assert!(!ip6tables_forward_drops(
+        assert!(!iptables_forward_drops(
             "-P FORWARD ACCEPT\n-A FORWARD -i eth0 -j DROP\n"
         ));
     }
 
     fn dumps(ip6tables: Option<&str>, nft: Option<&str>) -> ForwardDumps {
         ForwardDumps {
+            iptables: None,
             ip6tables: ip6tables.map(str::to_owned),
             nft: nft.map(str::to_owned),
         }

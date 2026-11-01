@@ -86,7 +86,7 @@ struct AppUITests {
         precondition(peer.title == "renamed (direct)")
         precondition(peer.representedObject as? String == "renamed.testnet.ray")
         precondition(network.title == "testnet (2 devices)")
-        precondition(row("connection-quality", in: menu)?.toolTip == "Connection quality is poor.")
+        precondition(row("connection-quality", in: menu) == nil)
         precondition(row("Connection Issue: Open Rayfish", in: menu)?.toolTip == "Test connection issue")
         print("PASS: peer updates preserve submenu and row identity")
 

@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- macOS: connection latency appears on each peer instead of a global slow connection warning.
+
+### Fixed
+
+- Linux exit nodes forward IPv4 traffic when the host firewall blocks forwarding by default.
+- macOS: keep the mesh and DNS route available while an exit node is selected.
+
 ## [0.5.13] - 2026-10-31
 
 ### Added
