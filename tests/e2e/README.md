@@ -28,6 +28,7 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
 | [`file-resume/`](file-resume) | 2 | Interrupted file receives finish on their own with the right bytes: a network cut, a lid close (cut plus a frozen daemon), receiver and sender restarts and `kill -9` mid-fetch, a kill while writing the temp file and right after the rename, no `.part` left and no `(1)` copy, and a too-long UTF-8 name saved shortened. |
 | [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
+| [`coordinators/`](coordinators) | 5 | Three coordinators on one network: an admit, kick and rename made on each one in turn reaches every host in bounded time, a restarted creator picks up another coordinator's edit by polling, a member reconnecting to a lagging coordinator does not roll back, a restarted member keeps its network and record floor, and concurrent joins of one network under two names (or racing its restore) bring it up once. |
 | [`churn/`](churn) | 4 | Lifecycle events under churn: repeated hard flap, simultaneous flap, `ray down`/`up` cycles (including one on a host with no `ip` binary, since link state goes over netlink), and a `kick`/`nuke` delivered while a member is offline (which must still converge from the signed blob). Ends with a no-panic/no-crash-restart sweep. |
 | [`mixed-version/`](mixed-version) | 4 | This build and an older release (`OLD_RAY_BIN`) in one mesh: joins and Magic DNS across versions, mixed co-coordinators converging an edit and renewing records without refusing each other's, kicks and restarts in both directions, `ray send` both ways, and a log sweep for panics and repeated protocol errors. Not part of `all`. |
 | [`exit-node/`](exit-node) | 3 | The internet-gateway path for IPv4 and IPv6: `allow`/`use` forwarding + NAT, full-tunnel egress, `SO_MARK` loop prevention, inbound SSH and established flows surviving, the client guard (LAN, a Docker-style bridge and a co-resident VPN stay reachable, uplink-bound new flows and route loss do not leak), the deny path, and teardown. |
@@ -42,7 +43,7 @@ tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 
 where `<scenario>` is `rootless`, `device-cert`, `connect`, `firewall`, `closed-net`,
 `apply`, `invites`, `dns`, `ssh`, `operator`, `v4bridge`, `reliability`, `restore-offline`,
-`file-resume`, `unpair`, `churn`, `exit-node`, `mixed-version`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+`file-resume`, `unpair`, `coordinators`, `churn`, `exit-node`, `mixed-version`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
