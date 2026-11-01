@@ -42,6 +42,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   power loss right after cannot leave an empty file in its place.
 - A received file whose name is too long for the disk (as macOS allows) is
   saved under a shortened name instead of failing after the whole download.
+- On Windows, a received file named like a port device with a superscript
+  digit (`COM¹.txt`) is saved as a normal file, and a long name that needs a
+  device prefix still fits once numbered.
 - A file offer whose real size differs from the size it claims now fails as
   soon as the download starts, instead of filling the disk with a larger file.
 - A receive that gives up after a few minutes without progress says so,

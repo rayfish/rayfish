@@ -532,7 +532,7 @@ restart_check "sender kill -9" skill.bin "$RECV/9" "$A" kill
 # ---------------------------------------------------------------------------
 step "10. a name too long to save as is gets shortened; a second copy is numbered"
 # 83 three-byte characters plus `.bin`: 253 bytes, the most ext4 on the sender
-# allows is 255, and the receiver keeps names to 249 so ` (999)` still fits.
+# allows is 255, and the receiver keeps names to 248 so ` (999)` and a `_` still fit.
 LONG="$(python3 -c 'print("あ" * 83 + ".bin")')"
 OUT="$RECV/10"
 SHA="$(make_src "$LONG" 4194304)"
@@ -548,7 +548,7 @@ if [[ ${#SAVED[@]} -eq 2 ]]; then
   FIRST="${SAVED[0]}"; SECOND="${SAVED[1]}"
   [[ "$FIRST" == *" (1).bin" ]] && { FIRST="${SAVED[1]}"; SECOND="${SAVED[0]}"; }
   STEM="${LONG%.bin}"; SHORT_STEM="${FIRST%.bin}"
-  if (( $(printf '%s' "$FIRST" | wc -c) <= 249 )) && [[ "$FIRST" == *.bin && "$STEM" == "$SHORT_STEM"* && "$FIRST" != "$LONG" ]] \
+  if (( $(printf '%s' "$FIRST" | wc -c) <= 248 )) && [[ "$FIRST" == *.bin && "$STEM" == "$SHORT_STEM"* && "$FIRST" != "$LONG" ]] \
      && python3 -c 'import sys; sys.argv[1].encode("utf-8", "strict")' "$FIRST" 2>/dev/null; then
     pass "long name: saved as a ${#FIRST}-character, $(printf '%s' "$FIRST" | wc -c)-byte prefix keeping .bin"
   else

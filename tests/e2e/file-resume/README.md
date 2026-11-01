@@ -43,7 +43,7 @@ carries no leftover "interrupted" note).
 9. **Sender `kill -9`, then start** mid-transfer.
 10. **Long name.** A 253-byte name (83 three-byte characters plus `.bin`;
     ext4 on the sender allows 255) is saved cut at a character boundary to
-    at most 249 bytes, keeping `.bin`. A second copy lands as
+    at most 248 bytes, keeping `.bin`. A second copy lands as
     `<short> (1).bin` without replacing the first.
 11. A size-mismatched offer is **skipped**: the daemon sizes an offer from the
     blob it imports, so the real CLI cannot produce one. The unit test

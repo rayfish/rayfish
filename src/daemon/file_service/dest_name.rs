@@ -17,8 +17,8 @@ pub(super) const MAX_NAME_ATTEMPTS: u32 = 1000;
 /// is added. One directory entry holds 255 bytes on Linux and macOS and 255
 /// UTF-16 units on Windows, never fewer than the UTF-8 bytes, so a byte count
 /// is safe on both. Room is left for the ` (999)` that [`numbered_name`] adds
-/// at most.
-const MAX_SAVED_NAME: usize = 255 - " (999)".len();
+/// at most, and the `_` [`windows_file_name`] puts before a device name.
+const MAX_SAVED_NAME: usize = 255 - " (999)".len() - "_".len();
 
 /// Longest extension kept when a name is cut to fit.
 const MAX_KEPT_EXTENSION: usize = 32;
@@ -133,14 +133,15 @@ pub(super) fn windows_file_name(name: &str) -> Option<String> {
         return None;
     }
     let stem = cleaned.split('.').next().unwrap_or(cleaned).trim_end();
-    let numbered_device = match stem.as_bytes() {
-        [a, b, c, digit] => {
-            let prefix = [*a, *b, *c];
-            (prefix.eq_ignore_ascii_case(b"COM") || prefix.eq_ignore_ascii_case(b"LPT"))
-                && digit.is_ascii_digit()
-        }
-        _ => false,
-    };
+    // Windows counts the superscripts `¹²³` as port digits too.
+    let numbered_device = stem.get(..3).is_some_and(|prefix| {
+        let mut digit = stem[3..].chars();
+        (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+            && matches!(
+                (digit.next(), digit.next()),
+                (Some(d), None) if d.is_ascii_digit() || matches!(d, '¹' | '²' | '³')
+            )
+    });
     if numbered_device || RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
         return Some(format!("_{cleaned}"));
     }
@@ -149,6 +150,8 @@ pub(super) fn windows_file_name(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -239,6 +242,7 @@ mod tests {
         assert_eq!(windows_file_name("nul.txt").as_deref(), Some("_nul.txt"));
         assert_eq!(windows_file_name("com1.log").as_deref(), Some("_com1.log"));
         assert_eq!(windows_file_name("Lpt9").as_deref(), Some("_Lpt9"));
+        assert_eq!(windows_file_name("COM¹.txt").as_deref(), Some("_COM¹.txt"));
         assert_eq!(
             windows_file_name("console.txt").as_deref(),
             Some("console.txt")
@@ -247,5 +251,82 @@ mod tests {
         assert_eq!(windows_file_name("aaé").as_deref(), Some("aaé"));
         assert_eq!(windows_file_name("..."), None);
         assert_eq!(windows_file_name(" "), None);
+    }
+
+    /// Names as a peer could offer them: the characters that matter to the
+    /// rules (dots, spaces, Windows-reserved, multi-byte), sometimes after a
+    /// device name, often long enough to be cut.
+    fn offered_name() -> impl Strategy<Value = String> {
+        let c = prop_oneof![
+            any::<char>(),
+            prop::sample::select(vec![
+                '.', ' ', ':', '*', '?', '"', '<', '|', 'é', '語', '\t'
+            ]),
+            Just('a'),
+        ];
+        let device = prop::sample::select(vec!["", "", "CON", "nul", "Com1", "LPT9", "COM¹"]);
+        let body = prop_oneof![
+            prop::collection::vec(c, 1..140).prop_map(|chars| chars.into_iter().collect()),
+            (240usize..260).prop_map(|n| format!(".{}", "a".repeat(n))),
+        ];
+        (device, body).prop_map(|(device, body): (&str, String)| format!("{device}{body}"))
+    }
+
+    /// Names Windows gives a device, whatever follows the first dot. The
+    /// superscript digits count as digits there.
+    fn is_windows_device(name: &str) -> bool {
+        let stem = name.split('.').next().unwrap_or(name).trim_end();
+        let upper = stem.to_ascii_uppercase();
+        if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&upper.as_str()) {
+            return true;
+        }
+        let mut chars = upper.chars();
+        let prefix: String = chars.by_ref().take(3).collect();
+        let digit: Vec<char> = chars.collect();
+        (prefix == "COM" || prefix == "LPT")
+            && matches!(digit.as_slice(), [d] if d.is_ascii_digit() || matches!(d, '¹' | '²' | '³'))
+    }
+
+    const ATTEMPTS: [u32; 6] = [0, 1, 9, 10, 100, MAX_NAME_ATTEMPTS - 1];
+
+    proptest! {
+        /// A safe offered name stays one plain component after it is cut and
+        /// numbered, and every numbered name fits one directory entry.
+        #[test]
+        fn saved_names_stay_one_entry(name in offered_name()) {
+            prop_assume!(super::super::is_safe_file_name(&name));
+            let fitted = fitted_name(&name);
+            prop_assert!(fitted.len() <= MAX_SAVED_NAME);
+            if name.len() <= MAX_SAVED_NAME {
+                prop_assert_eq!(&fitted, &name);
+            }
+            for attempt in ATTEMPTS {
+                let numbered = numbered_name(&fitted, attempt);
+                prop_assert!(super::super::is_safe_file_name(&numbered), "{numbered:?}");
+                prop_assert!(numbered.len() <= 255, "{} bytes", numbered.len());
+            }
+        }
+
+        /// On Windows the saved name, and every numbered one, has no stream
+        /// or reserved character, no trailing dot or space, is not a device,
+        /// and fits 255 UTF-16 units.
+        #[test]
+        fn windows_names_stay_plain_files(name in offered_name()) {
+            prop_assume!(super::super::is_safe_file_name(&name));
+            let Some(cleaned) = windows_file_name(&fitted_name(&name)) else {
+                return Ok(());
+            };
+            for attempt in ATTEMPTS {
+                let saved = numbered_name(&cleaned, attempt);
+                prop_assert!(
+                    !saved.chars().any(|c| c < ' ' || "<>:\"/\\|?*".contains(c)),
+                    "{saved:?}"
+                );
+                prop_assert!(!saved.ends_with(['.', ' ']), "{saved:?}");
+                prop_assert!(!is_windows_device(&saved), "{saved:?}");
+                let units = saved.encode_utf16().count();
+                prop_assert!(units <= 255, "{saved:?} is {units} UTF-16 units");
+            }
+        }
     }
 }
