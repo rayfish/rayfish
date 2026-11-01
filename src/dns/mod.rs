@@ -115,6 +115,9 @@ pub async fn update_hostname(
     {
         let mut t = table.write().await;
         let hosts = t.entry(network.to_string()).or_default();
+        // One address carries one name per network: a peer that rejoined under
+        // a new name must stop answering for its old one.
+        hosts.retain(|name, addr| name == hostname || *addr != ipv6);
         hosts.insert(hostname.to_string(), ipv6);
     }
     reverse.insert(ipv6, (hostname.to_string(), network.to_string()));
@@ -522,6 +525,27 @@ mod tests {
         }
         let result = resolve_name("alice.gaming.ray", SUFFIX, &table).await;
         assert_eq!(result, Some(v6(5)));
+    }
+
+    /// A peer that rejoins under a new name is seated by hostname alone, with
+    /// no roster sync to drop the name it had before.
+    #[tokio::test]
+    async fn a_renamed_peer_stops_answering_for_its_old_name() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v6 = |n: u16| Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, n);
+        update_hostname(&table, &reverse, "home", "old", v6(1)).await;
+        update_hostname(&table, &reverse, "home", "other", v6(2)).await;
+        update_hostname(&table, &reverse, "home", "new", v6(1)).await;
+        assert_eq!(resolve_name("old.home.ray", SUFFIX, &table).await, None);
+        assert_eq!(
+            resolve_name("new.home.ray", SUFFIX, &table).await,
+            Some(v6(1))
+        );
+        assert_eq!(
+            resolve_name("other.home.ray", SUFFIX, &table).await,
+            Some(v6(2))
+        );
     }
 
     /// A member named `web.prod` on one network must not answer for host
