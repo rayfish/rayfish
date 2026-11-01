@@ -103,7 +103,7 @@ pub(crate) async fn ipc_join(
     spinner.finish_and_clear();
     match resp {
         ipc::IpcMessage::Ok { message } => {
-            println!("{}", message);
+            println!("{}", style::printable_lines(&message));
         }
         ipc::IpcMessage::Joined { name, my_ipv6 } => {
             let dns = format!("{name}.{DNS_DOMAIN}");
@@ -154,7 +154,7 @@ pub(crate) async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
 /// asks. `--yes` sends the confirmed request straight away.
 pub(crate) async fn ipc_kick(network: &str, peer: &str, yes: bool) -> Result<()> {
     match send_kick(network, peer, yes).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", style::printable_lines(&message)),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         ipc::IpcMessage::KickConfirm {
             network: net,

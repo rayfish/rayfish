@@ -167,6 +167,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- `ray files`, `ray send` and other commands show control characters and bidi
+  overrides in names a peer sent as visible escapes, so a file name can no
+  longer rewrite or retitle your terminal.
 - A managed machine only lets its controller remove it from networks that
   controller coordinates, and only joins a network when that controller is one
   of its coordinators and admits the machine itself. Before, a controller could

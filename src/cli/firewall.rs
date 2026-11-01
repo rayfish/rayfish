@@ -598,23 +598,23 @@ fn rule_row(index: usize, r: &ipc::FirewallRuleView) -> Vec<layout::Cell> {
     } else {
         style::green(&action_s)
     };
-    let sugg = r
-        .suggested_by
+    let suggested_by = r.suggested_by.as_deref().map(style::printable);
+    let sugg = suggested_by
         .as_ref()
         .map(|s| style::marker(&format!("suggested by {s}")))
         .unwrap_or_default();
-    let sugg_plain = r
-        .suggested_by
+    let sugg_plain = suggested_by
         .as_ref()
         .map(|s| format!("·suggested by {s}·"))
         .unwrap_or_default();
+    let peer = style::printable(&r.peer);
     vec![
         layout::Cell::new(index.to_string(), style::faint(&index.to_string())),
         layout::Cell::new(direction.clone(), style::value(&direction)),
         layout::Cell::new(action_s.clone(), action),
         layout::Cell::new(protocol.clone(), style::value(&protocol)),
         layout::Cell::right(r.port.clone(), style::value(&r.port)),
-        layout::Cell::new(r.peer.clone(), style::value(&r.peer)),
+        layout::Cell::new(peer.to_string(), style::value(&peer)),
         layout::Cell::new(r.network.clone(), style::faint(&r.network)),
         layout::Cell::new(sugg_plain, sugg),
     ]

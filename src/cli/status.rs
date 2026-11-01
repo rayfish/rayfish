@@ -38,7 +38,7 @@ pub(crate) fn format_bytes(b: u64) -> String {
 pub(crate) fn print_error(title: &str, detail: &str, hint: Option<&str>) {
     eprintln!("  {} {}", style::cross(), style::bold(title));
     if !detail.is_empty() {
-        eprintln!("    {}", style::value(detail));
+        eprintln!("    {}", style::value(&style::printable_lines(detail)));
     }
     let hint = hint.map(str::to_string).or_else(|| infer_hint(detail));
     if let Some(h) = hint {
@@ -86,10 +86,12 @@ pub(crate) struct MessageOutput<'a> {
 
 impl DisplayOut for MessageOutput<'_> {
     fn print_human(&self) {
+        // Daemon messages quote peer-supplied names (files, hosts).
+        let message = style::printable_lines(self.message);
         if self.checked {
-            println!("  {} {}", style::check(), style::value(self.message));
+            println!("  {} {}", style::check(), style::value(&message));
         } else {
-            println!("{}", self.message);
+            println!("{message}");
         }
     }
 }
@@ -976,7 +978,8 @@ fn user_parent_row(
 ) -> Vec<layout::Cell> {
     let active = devices.iter().filter(|d| d.state.is_active()).count();
     let reachable = devices.iter().filter(|d| !d.state.is_offline()).count();
-    let name = user_display_name(net, uid, devices, alias_by_identity);
+    let name =
+        style::printable(&user_display_name(net, uid, devices, alias_by_identity)).into_owned();
     // Glyph rolls up the group: any active device is online, else any idle device
     // is idle (presumed reachable), else offline.
     let (glyph_plain, glyph_styled) = if active > 0 {
@@ -1063,13 +1066,18 @@ fn device_row(
         up_w,
         down_w,
     } = *format;
-    let base = peer.hostname.clone().unwrap_or_else(|| {
-        if with_ips {
-            peer.ipv6.to_string()
-        } else {
-            peer.endpoint_id.fmt_short().to_string()
-        }
-    });
+    let base = peer
+        .hostname
+        .as_deref()
+        .map(style::printable)
+        .map(String::from)
+        .unwrap_or_else(|| {
+            if with_ips {
+                peer.ipv6.to_string()
+            } else {
+                peer.endpoint_id.fmt_short().to_string()
+            }
+        });
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
         None => base,

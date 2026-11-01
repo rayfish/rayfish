@@ -208,7 +208,7 @@ pub(crate) async fn ipc_delegated_join(
         auto_accept_files,
     )
     .await?;
-    println!("{message}");
+    println!("{}", style::printable_lines(&message));
     Ok(())
 }
 
@@ -235,7 +235,7 @@ pub(crate) async fn ipc_delegated_leave(
     network: &ipc::NetworkName,
 ) -> Result<()> {
     let message = ipc_delegated_leave_request(machine, network).await?;
-    println!("{message}");
+    println!("{}", style::printable_lines(&message));
     Ok(())
 }
 

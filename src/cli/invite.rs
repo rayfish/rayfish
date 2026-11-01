@@ -51,8 +51,14 @@ impl DisplayOut for InviteListOutput<'_> {
                 } else {
                     "single-use"
                 };
-                let host = inv.hostname.clone().unwrap_or_else(|| "—".to_string());
-                let who = inv.redeemer.clone().unwrap_or_else(|| "—".to_string());
+                let host = inv
+                    .hostname
+                    .as_deref()
+                    .map_or_else(|| "—".to_string(), |h| style::printable(h).into_owned());
+                let who = inv
+                    .redeemer
+                    .as_deref()
+                    .map_or_else(|| "—".to_string(), |h| style::printable(h).into_owned());
                 vec![
                     layout::Cell::new(inv.id.to_string(), style::rose(inv.id)),
                     layout::Cell::new(inv.status.to_string(), style::value(inv.status)),

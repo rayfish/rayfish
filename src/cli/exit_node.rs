@@ -113,7 +113,7 @@ async fn clear_all_exit_selections() -> Result<()> {
         })
         .await?;
         match reply {
-            ipc::IpcMessage::Ok { message } => println!("{message}"),
+            ipc::IpcMessage::Ok { message } => println!("{}", style::printable_lines(&message)),
             ipc::IpcMessage::Error { message } => {
                 print_error("exit-node", &format!("{network}: {message}"), None);
                 failed += 1;

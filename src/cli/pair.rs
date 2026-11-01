@@ -16,7 +16,10 @@ impl DisplayOut for PairedDevicesOutput<'_> {
             .0
             .iter()
             .map(|d| {
-                let host = d.hostname.clone().unwrap_or_else(|| "—".to_string());
+                let host = d
+                    .hostname
+                    .as_deref()
+                    .map_or_else(|| "—".to_string(), |h| style::printable(h).into_owned());
                 let nets = if d.networks.is_empty() {
                     "—".to_string()
                 } else {

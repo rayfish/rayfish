@@ -70,14 +70,16 @@ impl DisplayOut for FilesOutput<'_> {
                 .iter()
                 .map(|f| {
                     let accept = format!("ray files accept {}", f.id);
+                    let from = style::printable(f.from);
+                    let filename = style::printable(f.filename);
                     vec![
                         layout::Cell::new(f.id.to_string(), style::rose(&f.id.to_string())),
-                        layout::Cell::new(f.from.to_string(), style::value(f.from)),
+                        layout::Cell::new(from.to_string(), style::value(&from)),
                         layout::Cell::right(
                             format_size(f.size),
                             style::faint(&format_size(f.size)),
                         ),
-                        layout::Cell::new(f.filename.to_string(), style::value(f.filename)),
+                        layout::Cell::new(filename.to_string(), style::value(&filename)),
                         layout::Cell::new(accept.clone(), style::faint(&accept)),
                     ]
                 })
@@ -91,14 +93,16 @@ impl DisplayOut for FilesOutput<'_> {
                 .iter()
                 .map(|f| {
                     let cancel = format!("ray files cancel {}", f.id);
+                    let to = style::printable(f.to);
+                    let filename = style::printable(f.filename);
                     vec![
                         layout::Cell::new(f.id.to_string(), style::rose(&f.id.to_string())),
-                        layout::Cell::new(f.to.to_string(), style::value(f.to)),
+                        layout::Cell::new(to.to_string(), style::value(&to)),
                         layout::Cell::right(
                             format_size(f.size),
                             style::faint(&format_size(f.size)),
                         ),
-                        layout::Cell::new(f.filename.to_string(), style::value(f.filename)),
+                        layout::Cell::new(filename.to_string(), style::value(&filename)),
                         layout::Cell::new(cancel.clone(), style::faint(&cancel)),
                     ]
                 })
@@ -135,17 +139,20 @@ fn transfers_table(transfers: &[ipc::TransferFileInfo]) -> String {
                 String::new()
             };
             let progress = format!("{} / {}", format_size(t.transferred), format_size(t.size));
+            // The error can carry a peer's decline reason.
             let state = match &t.error {
-                Some(error) => format!("({state}: {error})"),
+                Some(error) => format!("({state}: {})", style::printable(error)),
                 None => format!("({state})"),
             };
+            let peer = style::printable(&t.peer);
+            let filename = style::printable(&t.filename);
             vec![
                 layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
-                layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
+                layout::Cell::new(peer.to_string(), style::value(&peer)),
                 layout::Cell::right(progress.clone(), style::faint(&progress)),
                 layout::Cell::new(
-                    format!("{} {state}", t.filename),
-                    format!("{} {}", style::value(&t.filename), style::faint(&state)),
+                    format!("{filename} {state}"),
+                    format!("{} {}", style::value(&filename), style::faint(&state)),
                 ),
                 layout::Cell::new(action.clone(), style::faint(&action)),
             ]
@@ -216,7 +223,7 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
         }
     };
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", style::printable_lines(&message)),
         // Returned, not exited: [`ipc_send_files`] calls this once per file and
         // is written to keep going, so ending the process here would drop every
         // file after the first rejected one. The caller prints this with the
@@ -281,7 +288,7 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     )
     .await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => println!("{}", style::printable_lines(&message)),
         // Returned, not exited, for the same reason as the Unix path.
         ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!(unexpected_detail(&other)),
