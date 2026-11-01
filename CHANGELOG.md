@@ -31,6 +31,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Joining a network twice under two names at once, or while the daemon was
   restoring it under its saved name, no longer brings it up twice. The second
   join is refused, and leaving the network no longer cuts off a second copy.
+- A peer that leaves and rejoins a network under a new name no longer keeps
+  answering Magic DNS under its old name.
 - After a restart, a member no longer deletes a saved network when someone
   replays an old network record from before it joined.
 - On a network with several coordinators, a member reconnecting to one that
