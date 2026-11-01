@@ -18,6 +18,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- macOS: connection latency appears on each peer instead of a global slow connection warning.
 - Under `--json`, commands that print a daemon confirmation now print
   `{"message": ...}`, and `ray invite`, `ray pair` and the `ray files`
   settings commands print JSON. `ray status --json` exits non-zero with the
@@ -26,6 +27,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Linux exit nodes forward IPv4 traffic when the host firewall blocks forwarding by default.
+- macOS: keep the mesh and DNS route available while an exit node is selected.
 - Files sent together no longer sit as offered for minutes when some were queued
   while the first ones were still being delivered.
 - Joining a network twice under two names at once, or while the daemon was

@@ -176,9 +176,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Rayfish has no single tunnel server; macOS still requires a numeric IP here.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         let ipv6 = NEIPv6Settings(addresses: [address], networkPrefixLengths: [128])
-        ipv6.includedRoutes = exitSelected
-            ? [NEIPv6Route(destinationAddress: "::", networkPrefixLength: 0)]
-            : [NEIPv6Route(destinationAddress: "200::", networkPrefixLength: 7)]
+        ipv6.includedRoutes = [NEIPv6Route(destinationAddress: "200::", networkPrefixLength: 7)]
+        if exitSelected {
+            ipv6.includedRoutes?.append(NEIPv6Route(destinationAddress: "::", networkPrefixLength: 0))
+        }
         settings.ipv6Settings = ipv6
         if exitSelected {
             let ipv4 = NEIPv4Settings(addresses: ["192.0.0.2"], subnetMasks: ["255.255.255.255"])

@@ -1007,8 +1007,11 @@ fn snapshot_path() -> Option<PathBuf> {
         .map(|d| d.join("exit-forward.snapshot"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod forward_fw;
+#[cfg(all(test, not(target_os = "linux")))]
+const SERVER_TABLE: &str = "rayfish_exit";
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
