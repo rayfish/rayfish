@@ -1580,10 +1580,20 @@ impl MemberAcceptState {
         )
         .await;
         if outcome == ReconvergeOutcome::Stale {
-            tracing::warn!(
-                record_ts = record.timestamp,
-                "rejecting a signed record older than the last one applied (replay)"
-            );
+            // Coordinators that publish one edit at once sign records a few
+            // milliseconds apart, and the floor keeps one of them: a copy of
+            // another at that same instant is no replay.
+            if Some(record.timestamp) == self.state.read().unwrap().last_record_timestamp {
+                tracing::debug!(
+                    record_ts = record.timestamp,
+                    "ignoring a signed record as old as the last one applied"
+                );
+            } else {
+                tracing::warn!(
+                    record_ts = record.timestamp,
+                    "rejecting a signed record older than the last one applied (replay)"
+                );
+            }
         }
     }
 

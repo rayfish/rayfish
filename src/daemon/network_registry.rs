@@ -1671,6 +1671,15 @@ impl NetworkRegistry {
         if published_hash != hash {
             return None;
         }
+        // Another coordinator published the same roster later, and our floor
+        // took its timestamp: a member that saw that record would refuse ours.
+        let published_ts = packet.timestamp().as_micros();
+        if state
+            .last_record_timestamp
+            .is_some_and(|floor| published_ts < floor)
+        {
+            return None;
+        }
         Some(CurrentSignedNetworkState {
             hash,
             packet: packet.as_bytes().to_vec(),

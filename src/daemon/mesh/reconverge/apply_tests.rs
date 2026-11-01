@@ -965,3 +965,32 @@ async fn a_coordinator_hands_out_the_record_it_published() {
     assert!(handed.packet == published);
     fx.finish().await;
 }
+
+/// A coordinator whose floor moved past its own record, because another
+/// coordinator published the same roster later, hands out nothing: a member
+/// holding that later record would refuse its older copy on every reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_coordinator_withholds_a_record_older_than_its_floor() {
+    let fx = CoordinatorFixture::start().await;
+    let registry = Arc::clone(&fx.daemon.registry);
+    let own = fx
+        .state
+        .read()
+        .unwrap()
+        .converged_hash
+        .expect("a created network has a converged hash");
+    let published = registry
+        .publish_group_hash(NETWORK, &fx.key, own, &fx.state)
+        .await
+        .expect("the coordinator publishes its roster");
+    let published_ts = dht::verify_network_record(&published, fx.key.public())
+        .expect("the published record verifies")
+        .timestamp()
+        .as_micros();
+    assert!(registry.current_signed_record(NETWORK).await.is_some());
+
+    fx.state.write().unwrap().last_record_timestamp = Some(published_ts + 1);
+    assert!(registry.current_signed_record(NETWORK).await.is_none());
+    fx.finish().await;
+}
