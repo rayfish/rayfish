@@ -12,9 +12,9 @@ do_teardown(){
   # The region column doubles as the backend marker (the docker backend writes
   # `docker`). Feeding a docker fleet to `doctl droplet delete` would fail on
   # every row and then delete the only record of it.
-  if grep -qE '^[^ ]+ [^ ]+ [^ ]+ docker$' "$SERVERS"; then
-    echo "Refusing: $SERVERS was written by the docker backend." >&2
-    echo "Tear it down with: E2E_BACKEND=docker tests/e2e.sh <scenario> teardown" >&2
+  if grep -qE '^[^ ]+ [^ ]+ [^ ]+ (docker|boat)$' "$SERVERS"; then
+    echo "Refusing: $SERVERS was written by the docker or boat backend." >&2
+    echo "Tear it down with: E2E_BACKEND=<docker|boat> tests/e2e.sh <scenario> teardown" >&2
     exit 1
   fi
 
