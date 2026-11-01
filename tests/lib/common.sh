@@ -35,7 +35,9 @@ summary(){
 # -n: never read stdin, so calling `on` inside a `while read` loop can't eat it.
 on(){ local ip="$1"; shift
   [[ -n "${E2E_TRACE:-}" ]] && echo "$(date -u +%T) -> $ip: $*" >> "$E2E_TRACE"
-  ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"
+  # ssh forwards LC_ALL by default; a locale the node lacks makes every bash
+  # there warn on stderr, which `2>&1` callers then parse as output.
+  env -u LC_ALL ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"
   local rc=$?
   [[ -n "${E2E_TRACE:-}" ]] && echo "$(date -u +%T) <- $ip rc=$rc" >> "$E2E_TRACE"
   return $rc
