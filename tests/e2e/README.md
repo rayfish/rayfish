@@ -28,6 +28,7 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
 | [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
 | [`churn/`](churn) | 4 | Lifecycle events under churn: repeated hard flap, simultaneous flap, `ray down`/`up` cycles (including one on a host with no `ip` binary, since link state goes over netlink), and a `kick`/`nuke` delivered while a member is offline (which must still converge from the signed blob). Ends with a no-panic/no-crash-restart sweep. |
+| [`mixed-version/`](mixed-version) | 4 | This build and an older release (`OLD_RAY_BIN`) in one mesh: joins and Magic DNS across versions, mixed co-coordinators converging an edit and renewing records without refusing each other's, kicks and restarts in both directions, `ray send` both ways, and a log sweep for panics and repeated protocol errors. Not part of `all`. |
 | [`exit-node/`](exit-node) | 3 | The internet-gateway path for IPv4 and IPv6: `allow`/`use` forwarding + NAT, full-tunnel egress, `SO_MARK` loop prevention, inbound SSH and established flows surviving, the client guard (LAN, a Docker-style bridge and a co-resident VPN stay reachable, uplink-bound new flows and route loss do not leak), the deny path, and teardown. |
 
 Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
@@ -40,7 +41,7 @@ tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 
 where `<scenario>` is `rootless`, `device-cert`, `connect`, `firewall`, `closed-net`,
 `apply`, `invites`, `dns`, `ssh`, `operator`, `v4bridge`, `reliability`, `restore-offline`,
-`unpair`, `churn`, `exit-node`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+`unpair`, `churn`, `exit-node`, `mixed-version`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
@@ -150,6 +151,7 @@ against a direct-public-IP baseline that on one host is the same bridge.
 | `DO_SSH_KEYS` | every key on the account | comma-separated key ids/fingerprints (provision) |
 | `SSH_KEY` | `~/.ssh/id_ed25519` | private key for `root@<ip>` |
 | `KEEP_STATE` | `0` | `1` skips the per-run rayfish state wipe |
+| `OLD_RAY_BIN` | none | local `ray` binary that `mixed-version` installs on its older hosts |
 | `E2E_DOCKER_REUSE` | `0` | `1` keeps a live container fleet instead of recreating it |
 | `E2E_DOCKER_REBUILD` | `0` | `1` rebuilds the node image |
 | `E2E_DOCKER_MDNS` | `0` | `1` leaves mDNS enabled on the nodes |

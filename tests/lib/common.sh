@@ -125,6 +125,25 @@ deploy_all(){
   done
 }
 
+# deploy_old <bin> <ip...> : install a prebuilt `ray` from a local file (an
+# older release, for mixed-version runs) on each host, the way `just scp`
+# installs the cross build. Run it after deploy_all, or on hosts deploy_all
+# skipped; other scenarios never call it. Aborts on failure.
+deploy_old(){
+  local bin="$1"; shift
+  step "deploy the older ray ($(basename "$bin")) to: $*"
+  [[ -f "$bin" ]] || { fail "older binary not found: $bin"; echo "aborting"; exit 1; }
+  local ip
+  for ip in "$@"; do
+    if rsync -az -e "ssh ${SSH_OPTS[*]} -i $KEY" "$bin" "root@$ip:/tmp/ray-old" \
+       && on "$ip" "getent group rayfish >/dev/null || groupadd rayfish; install -m 755 /tmp/ray-old /usr/local/bin/ray && (systemctl restart rayfish 2>/dev/null || ray up)" >/dev/null; then
+      pass "deploy older ray to $ip"
+    else
+      fail "deploy older ray to $ip"; echo "aborting"; exit 1
+    fi
+  done
+}
+
 # daemon_ready <ip> : require an IPC-backed status response. `ray status` exits
 # successfully even when the daemon is absent and prints its config fallback.
 # Standby daemons are ready too: .active must be boolean, not necessarily true.

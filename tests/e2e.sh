@@ -21,10 +21,13 @@
 #                 member is offline, health sweep (tests/e2e/churn)
 #   exit-node     3-peer internet-gateway test: forwarding/NAT, full-tunnel egress,
 #                 SO_MARK loop prevention, deny path (tests/e2e/exit-node)
+#   mixed-version 4-peer mesh of this build and an older release: joins, co-
+#                 coordinators, renewal, kicks, restarts, files (tests/e2e/mixed-version).
+#                 Needs OLD_RAY_BIN, so not part of `all`
 #   rootless      local ordinary-user mesh proxies, no TUN (tests/e2e/rootless)
 #   bench         throughput / latency benchmark        (tests/bench)
-#   all           every scenario above except bench: provision, run, then tear
-#                 each fleet down before the next (one fleet live at a time)
+#   all           every scenario above except bench and mixed-version: provision,
+#                 run, then tear each fleet down before the next (one live at a time)
 #
 # Actions:
 #   run           (default) provision instances if needed, then run the scenario
@@ -66,7 +69,7 @@ fi
 # variable would silently drop back to digitalocean halfway through.
 export E2E_BACKEND="${E2E_BACKEND:-digitalocean}"
 
-usage(){ sed -n '2,39p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+usage(){ sed -n '2,42p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
 # Scenarios the docker backend cannot run faithfully (see tests/e2e/README.md).
 DOCKER_UNSUPPORTED=(exit-node reliability bench)
@@ -123,6 +126,9 @@ scenario_meta(){
                  LABELS=(srv-a srv-b srv-c) ;;
     churn)       DIR="$ROOT/tests/e2e/churn"
                  NAMES=(rayfish-churn-a rayfish-churn-b rayfish-churn-c rayfish-churn-d)
+                 LABELS=(srv-a srv-b srv-c srv-d) ;;
+    mixed-version) DIR="$ROOT/tests/e2e/mixed-version"
+                 NAMES=(rayfish-mixed-a rayfish-mixed-b rayfish-mixed-c rayfish-mixed-d)
                  LABELS=(srv-a srv-b srv-c srv-d) ;;
     exit-node)   DIR="$ROOT/tests/e2e/exit-node"
                  NAMES=(rayfish-exit-a rayfish-exit-b rayfish-exit-c)

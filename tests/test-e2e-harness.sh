@@ -283,6 +283,21 @@ EOF
   python3 -c 'import socket, sys; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.bind(("::",int(sys.argv[1])))' "$port"
 ) ; }
 
+old_binary_deploy(){ (
+  # deploy_old copies the named file, not the cross build, and a missing file
+  # aborts before any host is touched.
+  local calls="$TEST_TMP/deploy-old-calls"
+  : > "$calls"
+  rsync(){ echo "rsync $*" >> "$calls"; }
+  on(){ echo "on $1 $2" >> "$calls"; }
+  if ( deploy_old "$TEST_TMP/missing-ray" host-a ) >/dev/null 2>&1; then return 1; fi
+  [[ ! -s "$calls" ]] || return 1
+  : > "$TEST_TMP/old-ray"
+  deploy_old "$TEST_TMP/old-ray" host-a host-b >/dev/null || return 1
+  [[ $(grep -c "^rsync .*$TEST_TMP/old-ray root@host-[ab]:/tmp/ray-old$" "$calls") == 2 ]] || return 1
+  [[ $(grep -c '^on host-[ab] .*install -m 755 /tmp/ray-old /usr/local/bin/ray' "$calls") == 2 && $FAILS == 0 ]]
+) ; }
+
 check activation
 check activation_failure
 check daemon_readiness
@@ -299,3 +314,4 @@ check bash "$ROOT/tests/test-e2e-cleanup.sh"
 check bash "$ROOT/tests/test-e2e-connect.sh"
 check bash "$ROOT/tests/test-e2e-invites.sh"
 check abandoned_udp_receiver
+check old_binary_deploy
