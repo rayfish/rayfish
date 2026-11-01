@@ -12,6 +12,7 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
 FAILS=0
 pass(){ printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS+1)); }
+skip(){ printf '  \033[33mSKIP\033[0m %s\n' "$*"; }
 # Same complaint, on stderr and without the tally. For helpers whose every caller
 # reads them through `$(...)`: on stdout the message is captured into the command
 # line the caller is building instead of leaving it empty, so the caller's own
@@ -137,7 +138,7 @@ deploy_old(){
   [[ -f "$bin" ]] || { fail "older binary not found: $bin"; echo "aborting"; exit 1; }
   local ip
   for ip in "$@"; do
-    if rsync -az -e "ssh ${SSH_OPTS[*]} -i $KEY" "$bin" "root@$ip:/tmp/ray-old" \
+    if rsync -az -e "ssh ${SSH_OPTS[*]} -i $KEY" "$bin" "root@$([[ $ip == *:* ]] && echo "[$ip]" || echo "$ip"):/tmp/ray-old" \
        && on "$ip" "getent group rayfish >/dev/null || groupadd rayfish; install -m 755 /tmp/ray-old /usr/local/bin/ray && (systemctl restart rayfish 2>/dev/null || ray up)" >/dev/null; then
       pass "deploy older ray to $ip"
     else

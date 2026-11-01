@@ -98,6 +98,23 @@ names one, so the provisioner passes every key on the account by default
 That matches what the harness needs: `just scp` runs bare `rsync`/`ssh` with no
 `-i`, so the hosts have to accept ssh's default identity.
 
+### `boat`
+
+```bash
+E2E_BACKEND=boat tests/e2e.sh <scenario>
+```
+
+Each host is a [Boat](https://boat.dev) VM (KVM, systemd, `/dev/net/tun`). Needs the
+`boat` CLI signed in and `jq`. The harness reaches each VM as root over its public
+IPv6, so that address goes in `.servers`; IPv4 leaves through a public address of the
+VM's own behind NAT, which is what `exit-node` checks. ufw is turned off so a VM is
+as open as a droplet. Teardown deletes the VMs.
+
+Inbound IPv4 never reaches a VM, so `exit-node` skips its long-lived TCP flow checks
+here. Two VMs can land on one physical host, and the links between hosts can drop
+packets with no tunnel at all, so a `reliability` failure here needs a run of the
+previous release on Boat to compare against.
+
 ### `docker`
 
 ```bash
@@ -147,7 +164,7 @@ against a direct-public-IP baseline that on one host is the same bridge.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `E2E_BACKEND` | `digitalocean` | `digitalocean` or `docker` |
+| `E2E_BACKEND` | `digitalocean` | `digitalocean`, `boat` or `docker` |
 | `E2E_AUTO_TEARDOWN` | `0` | `1` tears down the active backend's fleet after `run`; intended for unattended CI. Docker failures dump diagnostics first; with DigitalOcean this destroys the provisioned droplets. Default `0` preserves the fleet for interactive inspection. |
 | `REGION` | `fra1` | droplet region (provision) |
 | `SIZE` | `s-1vcpu-1gb` | droplet size slug (provision) |
@@ -156,6 +173,8 @@ against a direct-public-IP baseline that on one host is the same bridge.
 | `SSH_KEY` | `~/.ssh/id_ed25519` | private key for `root@<ip>` |
 | `KEEP_STATE` | `0` | `1` skips the per-run rayfish state wipe |
 | `OLD_RAY_BIN` | none | local `ray` binary that `mixed-version` installs on its older hosts |
+| `BOAT_TYPE` | `default` | Boat machine type (provision) |
+| `BOAT_HOURS` | `3` | how long each Boat VM stays on (provision) |
 | `E2E_DOCKER_REUSE` | `0` | `1` keeps a live container fleet instead of recreating it |
 | `E2E_DOCKER_REBUILD` | `0` | `1` rebuilds the node image |
 | `E2E_DOCKER_MDNS` | `0` | `1` leaves mDNS enabled on the nodes |

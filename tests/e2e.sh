@@ -46,6 +46,8 @@
 #   docker        local containers on one bridge (needs docker + /dev/net/tun).
 #                 exit-node, reliability and bench need real hosts: distinct
 #                 public IPs and a WAN baseline one bridge cannot provide.
+#   boat          Boat VMs (https://boat.dev), reached as root over their public
+#                 IPv6 (needs boat + jq). Runs every scenario a droplet does.
 #
 # Each scenario's fleet (instance names + role labels) is declared in the
 # registry below; the actual run steps live in <dir>/run.sh. The shared
@@ -212,6 +214,10 @@ provision(){
     DOCKER_ACTION=provision
     # shellcheck source=lib/docker.sh
     source "$ROOT/tests/lib/docker.sh"        # consumes NAMES/LABELS/SERVERS/NEXT
+  elif [[ "$E2E_BACKEND" == "boat" ]]; then
+    BOAT_ACTION=provision
+    # shellcheck source=lib/boat.sh
+    source "$ROOT/tests/lib/boat.sh"          # consumes NAMES/LABELS/SERVERS/NEXT
   else
     # shellcheck source=lib/provision.sh
     source "$ROOT/tests/lib/provision.sh"     # consumes NAMES/LABELS/SERVERS/NEXT
@@ -223,6 +229,10 @@ teardown(){
     DOCKER_ACTION=teardown
     # shellcheck source=lib/docker.sh
     source "$ROOT/tests/lib/docker.sh"      # consumes SERVERS/NAMES
+  elif [[ "$E2E_BACKEND" == "boat" ]]; then
+    BOAT_ACTION=teardown
+    # shellcheck source=lib/boat.sh
+    source "$ROOT/tests/lib/boat.sh"        # consumes SERVERS
   else
     # shellcheck source=lib/teardown.sh
     source "$ROOT/tests/lib/teardown.sh"    # consumes SERVERS

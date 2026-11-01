@@ -51,7 +51,6 @@ SRC=/root/fr-src                # sender's files
 RECV=/root/fr-recv              # receiver's output dirs, one per check
 STATE=/etc/rayfish
 
-skip(){ printf '  \033[33mSKIP\033[0m %s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 # Host helpers

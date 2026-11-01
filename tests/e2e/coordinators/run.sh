@@ -55,7 +55,6 @@ NET=coord
 EDIT_WAIT="${COORD_EDIT_WAIT:-120}"
 RENEWAL=150
 
-skip(){ printf '  \033[33mSKIP\033[0m %s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 # Status helpers

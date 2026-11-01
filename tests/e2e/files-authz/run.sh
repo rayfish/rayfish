@@ -52,7 +52,6 @@ OPH=/home/$OP
 NOH=/home/$NO
 IPC=/usr/local/bin/ray-ipc
 
-skip(){ printf '  \033[33mSKIP\033[0m %s\n' "$*"; }
 
 # as <ip> <user> <command...> : run a command on <ip> as an unprivileged local
 # user, combined output on stdout, the command's own exit status returned.
