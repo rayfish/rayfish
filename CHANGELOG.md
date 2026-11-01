@@ -26,6 +26,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Files sent together no longer sit as offered for minutes when some were queued
+  while the first ones were still being delivered.
 - Joining a network twice under two names at once, or while the daemon was
   restoring it under its saved name, no longer brings it up twice. The second
   join is refused, and leaving the network no longer cuts off a second copy.

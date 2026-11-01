@@ -13,6 +13,7 @@ use super::*;
 use std::hint::black_box;
 use std::path::{Component, PathBuf};
 
+use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 use iroh_blobs::api::remote::GetProgressItem;
 use serde::{Deserialize, Serialize};
@@ -169,14 +170,68 @@ const OFFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// sweep only catches offers whose delivery failed transiently while the
 /// connection stayed up.
 pub(crate) const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Peers with a flush pass running. The value is the rerun mark: a trigger
+/// that finds the pass already running sets it instead of starting its own,
+/// and the running pass goes round again so the trigger's offer is attempted.
+type FlushMarks = DashMap<EndpointId, bool>;
+
+/// Ownership of one peer's flush. Dropping it (cancellation, panic) releases
+/// the peer; the normal exit is [`FlushGuard::release_unless_rerun`].
 struct FlushGuard {
-    flushing: Arc<DashSet<EndpointId>>,
+    flushing: Arc<FlushMarks>,
     peer: EndpointId,
+    held: bool,
+}
+
+impl FlushGuard {
+    /// Take the peer's flush, or mark the running one for a rerun and return
+    /// `None`.
+    fn acquire(flushing: &Arc<FlushMarks>, peer: EndpointId) -> Option<Self> {
+        match flushing.entry(peer) {
+            Entry::Occupied(mut running) => {
+                *running.get_mut() = true;
+                None
+            }
+            Entry::Vacant(free) => {
+                free.insert(false);
+                Some(Self {
+                    flushing: Arc::clone(flushing),
+                    peer,
+                    held: true,
+                })
+            }
+        }
+    }
+
+    /// Release the peer unless a rerun was requested during the pass; then
+    /// clear the mark, keep the peer, and return `false`. Checking the mark
+    /// and releasing happen under one shard lock, so a trigger either lands
+    /// before (and gets the rerun) or after (and starts its own pass).
+    fn release_unless_rerun(&mut self) -> bool {
+        match self.flushing.entry(self.peer) {
+            Entry::Occupied(mut running) if *running.get() => {
+                *running.get_mut() = false;
+                false
+            }
+            Entry::Occupied(running) => {
+                running.remove();
+                self.held = false;
+                true
+            }
+            Entry::Vacant(_) => {
+                self.held = false;
+                true
+            }
+        }
+    }
 }
 
 impl Drop for FlushGuard {
     fn drop(&mut self) {
-        self.flushing.remove(&self.peer);
+        if self.held {
+            self.flushing.remove(&self.peer);
+        }
     }
 }
 
@@ -664,8 +719,9 @@ pub(crate) struct FileService {
     /// Ids come from `file_id_counter`, shared with inbound pending offers.
     outbox: Arc<Mutex<Vec<OutboxEntry>>>,
     /// Peers with a flush in flight, so a burst of connect events (or the
-    /// sweep racing a connect) can't deliver the same offer twice.
-    flushing: Arc<DashSet<EndpointId>>,
+    /// sweep racing a connect) can't deliver the same offer twice, plus each
+    /// one's rerun mark so a collapsed trigger is not lost.
+    flushing: Arc<FlushMarks>,
     declines: Mutex<Vec<FileDecision>>,
     /// Accepted receives still running, so they can be canceled.
     receives: receive::ActiveReceives,
@@ -721,7 +777,7 @@ impl FileService {
             device_user_map,
             transfers,
             outbox: Arc::new(Mutex::new(queued)),
-            flushing: Arc::new(DashSet::new()),
+            flushing: Arc::new(DashMap::new()),
             declines: Mutex::new(declines),
             receives: Arc::default(),
             receive_slots: receive::receive_slots(),
@@ -1441,14 +1497,28 @@ impl FileService {
     /// mesh-connection hook, the enqueue path, and the periodic sweep; the
     /// `flushing` guard collapses concurrent triggers so an offer can't be
     /// delivered twice.
+    ///
+    /// A collapsed trigger marks the running pass for a rerun, and the pass
+    /// re-reads the outbox before releasing the peer, so an offer queued
+    /// mid-pass is always attempted. Only triggers set the mark, never a
+    /// failed delivery, so reruns are bounded by real events (sends,
+    /// connects, sweeps) and a failing peer costs at most one extra pass per
+    /// pass, however many triggers piled up behind it.
     pub(crate) async fn flush_outbox_for(self: Arc<Self>, peer: EndpointId) {
-        if !self.flushing.insert(peer) {
+        let Some(mut guard) = FlushGuard::acquire(&self.flushing, peer) else {
             return;
-        }
-        let _guard = FlushGuard {
-            flushing: Arc::clone(&self.flushing),
-            peer,
         };
+        loop {
+            self.flush_pass(peer).await;
+            if guard.release_unless_rerun() {
+                return;
+            }
+        }
+    }
+
+    /// One pass over `peer`'s queued offers and undelivered decisions, as
+    /// they stand when it starts.
+    async fn flush_pass(&self, peer: EndpointId) {
         let entries: Vec<_> = self
             .outbox
             .lock()
@@ -2205,6 +2275,64 @@ mod tests {
         let saved = load_outbox();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].offer_id, queued[0].offer_id);
+    }
+
+    #[tokio::test]
+    async fn an_offer_queued_during_a_running_flush_is_delivered_by_that_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let sender_endpoint = file_endpoint(lookup.clone()).await;
+        let receiver_endpoint = file_endpoint(lookup.clone()).await;
+        lookup.add_endpoint_info(sender_endpoint.addr());
+        lookup.add_endpoint_info(receiver_endpoint.addr());
+        let sender = file_service(sender_endpoint, &tmp.path().join("sender")).await;
+        let receiver = file_service(receiver_endpoint.clone(), &tmp.path().join("receiver")).await;
+        let peer = receiver_endpoint.id();
+        sender
+            .outbox
+            .lock()
+            .unwrap()
+            .push(outgoing(&sender, peer, 1));
+
+        // The first offer's connection is held unanswered, so the pass is
+        // still in flight when the second offer is queued and its trigger
+        // arrives. Every later connection is answered normally.
+        let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
+        let accept_rest = {
+            let receiver = Arc::clone(&receiver);
+            let receiver_endpoint = receiver_endpoint.clone();
+            tokio::spawn(async move {
+                let first = receiver_endpoint.accept().await.unwrap().await.unwrap();
+                conn_tx.send(first).unwrap();
+                while let Some(incoming) = receiver_endpoint.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        receiver.accept_file_offer(conn).await;
+                    }
+                }
+            })
+        };
+        let ((), ()) = tokio::join!(Arc::clone(&sender).flush_outbox_for(peer), async {
+            let conn = conn_rx.await.unwrap();
+            sender
+                .outbox
+                .lock()
+                .unwrap()
+                .push(outgoing(&sender, peer, 2));
+            // Collapses into the running pass: the guard is held.
+            Arc::clone(&sender).flush_outbox_for(peer).await;
+            receiver.accept_file_offer(conn).await;
+        });
+        accept_rest.abort();
+
+        let outbox = sender.outbox.lock().unwrap();
+        assert_eq!(outbox.len(), 2);
+        assert!(
+            outbox.iter().all(|entry| entry.delivered),
+            "every queued offer gets a delivery attempt"
+        );
+        assert_eq!(receiver.pending_files.lock().unwrap().len(), 2);
+        assert!(sender.flushing.is_empty());
     }
 
     #[tokio::test]
