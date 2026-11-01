@@ -235,13 +235,11 @@ verify(){
   if retry_until 60 "sender_delivered '$name'"; then
     rows="$(send_rows "$name" | tr '\n' ';')"
     pass "$label: sender recorded the delivery (sender view: ${rows:-entry expired})"
-    # PRODUCT BUG: a send whose pull was interrupted and then completed keeps
-    # its "interrupted" note next to `done`, because finish_entry
-    # (src/daemon/transfers.rs) never clears `error`. It shows when the old
-    # pull's abort is seen after the resumed pull started, which a receiver
-    # `kill -9` (no connection close) produces in practice.
+    # A send whose pull was interrupted and then completed must not keep its
+    # "interrupted" note next to `done`. A receiver `kill -9` (no connection
+    # close) makes the old pull's abort arrive after the resumed pull started.
     if grep -q '^done .' <<< "$(send_rows "$name")"; then
-      fail "$label: KNOWN PRODUCT BUG: sender shows done with a stale note: $(grep '^done .' <<< "$(send_rows "$name")" | head -1)"
+      fail "$label: sender shows done with a stale note: $(grep '^done .' <<< "$(send_rows "$name")" | head -1)"
     fi
   else
     rows="$(send_rows "$name" | tr '\n' ';')"

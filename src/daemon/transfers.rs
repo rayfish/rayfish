@@ -425,6 +425,9 @@ fn prune_finished(entries: &mut HashMap<u64, Entry>, now: Instant) {
 fn finish_entry(e: &mut Entry, ok: bool) {
     e.info.state = if ok {
         e.info.transferred = e.info.size;
+        // An abort the provider reports late, after the recipient's next pull
+        // began, leaves its "interrupted" note on the entry that pull completes.
+        e.info.error = None;
         TransferState::Done
     } else {
         TransferState::Failed
@@ -583,6 +586,22 @@ mod tests {
         assert_eq!(t.state, TransferState::Done);
         // A completed transfer reads as 100%, whatever the last progress event said.
         assert_eq!(t.transferred, 100);
+    }
+
+    #[test]
+    fn a_late_abort_does_not_outlive_the_pull_that_completes_the_send() {
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        // The recipient restarted and pulls again; the dead pull's abort
+        // only arrives now.
+        reg.provider_started(hash(1), a);
+        reg.provider_finished(hash(1), a, false);
+        reg.provider_finished(hash(1), a, true);
+        let t = &reg.list()[0];
+        assert_eq!(t.state, TransferState::Done);
+        assert_eq!(t.error, None);
     }
 
     #[test]

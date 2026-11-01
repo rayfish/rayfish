@@ -53,13 +53,12 @@ Checks 6 and 7 race the daemon on purpose. When the kill lands too late for
 the state they aim at, they print `SKIP` with what happened and still check the
 end state.
 
-## Known product bug
+## Stale sender note
 
-The sender's `done` check fails on the receiver `kill -9` check (check 5): when
-the aborted pull's end is seen after the resumed pull has started, the entry finishes as `done` but keeps
-"interrupted; the recipient resumes it when it can", since `finish_entry` in
-`src/daemon/transfers.rs` never clears `error`. The failure line says
-`KNOWN PRODUCT BUG`.
+Check 5 also asserts the sender's `done` row carries no note. A receiver
+`kill -9` leaves the old connection open, so the aborted pull's end reaches the
+sender after the resumed pull has started and marks the entry "interrupted".
+The completed pull must clear it.
 
 ## How it interrupts
 
