@@ -502,6 +502,11 @@ fileprivate struct FfiConverterString: FfiConverter {
  */
 public protocol NodeProtocol: AnyObject, Sendable {
 
+    /**
+     * Start receiving a file offer. Returns once the destination is checked
+     * and the receive has started, not when the download ends; the app
+     * follows it in the status file list.
+     */
     func acceptFile(id: UInt64, directory: String, uid: UInt32, gid: UInt32) throws
 
     func acceptInvitation(id: String) throws
@@ -681,6 +686,11 @@ public convenience init(configDir: String) {
 
 
 
+    /**
+     * Start receiving a file offer. Returns once the destination is checked
+     * and the receive has started, not when the download ends; the app
+     * follows it in the status file list.
+     */
 open func acceptFile(id: UInt64, directory: String, uid: UInt32, gid: UInt32)throws   {try rustCallWithError(FfiConverterTypeAppleError_lift) {
     uniffi_ray_apple_fn_method_node_accept_file(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(id),
@@ -3368,7 +3378,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_ray_apple_checksum_method_node_accept_file() != 37470) {
+    if (uniffi_ray_apple_checksum_method_node_accept_file() != 17065) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_apple_checksum_method_node_accept_invitation() != 42431) {

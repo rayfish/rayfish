@@ -813,7 +813,7 @@ public protocol NodeProtocol: AnyObject, Sendable {
 
     /**
      * Join an existing network by invite code (or a bare room id / network
-     * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+     * pubkey). Maps the core's join result to a [`NetworkInfo`].
      */
     func join(code: String) throws  -> NetworkInfo
 
@@ -1415,7 +1415,7 @@ open func isPaired() -> Bool  {
 
     /**
      * Join an existing network by invite code (or a bare room id / network
-     * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+     * pubkey). Maps the core's join result to a [`NetworkInfo`].
      */
 open func join(code: String)throws  -> NetworkInfo  {
     return try  FfiConverterTypeNetworkInfo_lift(try rustCallWithError(FfiConverterTypeRayError_lift) {
@@ -4685,7 +4685,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_mobile_checksum_method_node_is_paired() != 7476) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_mobile_checksum_method_node_join() != 21543) {
+    if (uniffi_ray_mobile_checksum_method_node_join() != 15351) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_mobile_checksum_method_node_leave() != 29006) {
