@@ -1659,7 +1659,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_is_paired() != 7476.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_join() != 21543.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_join() != 15351.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_leave() != 29006.toShort()) {
@@ -2611,7 +2611,7 @@ public interface NodeInterface {
 
     /**
      * Join an existing network by invite code (or a bare room id / network
-     * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+     * pubkey). Maps the core's join result to a [`NetworkInfo`].
      */
     fun `join`(`code`: kotlin.String): NetworkInfo
 
@@ -3341,7 +3341,7 @@ open class Node :
 
     /**
      * Join an existing network by invite code (or a bare room id / network
-     * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+     * pubkey). Maps the core's join result to a [`NetworkInfo`].
      */
     @Throws(RayException::class)
     override fun `join`(`code`: kotlin.String): NetworkInfo =

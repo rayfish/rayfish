@@ -653,9 +653,12 @@ mod tests {
     #[test]
     fn a_configured_directory_without_links_is_trusted_whoever_owns_it() {
         let tmp = tempfile::tempdir().unwrap();
+        // Resolved, because macOS puts temporary directories under `/var`,
+        // which is a link to `/private/var`.
+        let dir = tmp.path().canonicalize().unwrap();
         let other = me().0.wrapping_add(1).max(1);
-        assert!(create(tmp.path(), "a.bin", &temp(), configured(None)).is_ok());
-        let nested = tmp.path().join("new/sub");
+        assert!(create(&dir, "a.bin", &temp(), configured(None)).is_ok());
+        let nested = dir.join("new/sub");
         let (staged, _file) =
             create(&nested, "a.bin", &temp(), configured(Some((other, other)))).unwrap();
         staged.commit(|_| {}).unwrap();
