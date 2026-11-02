@@ -782,12 +782,17 @@ fn stream_refusal(error: &GetError) -> Option<VarInt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use iroh::address_lookup::memory::MemoryLookup;
+    #[cfg(not(windows))]
     use iroh::protocol::Router;
+    #[cfg(not(windows))]
     use iroh_blobs::provider::events::{EventMask, EventSender, ProviderMessage, ThrottleMode};
 
+    #[cfg(not(windows))]
     use crate::daemon::file_service::tests::{file_endpoint, file_service};
 
+    #[cfg(not(windows))]
     /// Chunks the first sender lets through before it holds the transfer.
     const CHUNKS_BEFORE_STALL: usize = 32;
 
@@ -846,15 +851,18 @@ mod tests {
         assert_eq!(span(Duration::ZERO), "0 seconds");
     }
 
+    #[cfg(not(windows))]
     fn payload() -> Vec<u8> {
         (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect()
     }
 
+    #[cfg(not(windows))]
     struct Sender {
         router: Router,
         _store: FsStore,
     }
 
+    #[cfg(not(windows))]
     /// A blobs provider under `key`, holding `data` if given. With `allow`,
     /// it lets that many chunks through, signals `stalled`, and then holds
     /// the transfer without closing it.
@@ -922,11 +930,13 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     /// Queue an offer of `data` from `from` as pending file 1.
     fn offer(service: &FileService, from: EndpointId, data: &[u8]) {
         offer_sized(service, from, data, u64::try_from(data.len()).unwrap());
     }
 
+    #[cfg(not(windows))]
     /// Queue an offer of `data` that claims to be `size` bytes.
     fn offer_sized(service: &FileService, from: EndpointId, data: &[u8], size: u64) {
         service.pending_files.lock().unwrap().push(PendingFile {
@@ -941,6 +951,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(windows))]
     fn receive(service: &FileService) -> transfers::TransferInfo {
         service
             .transfers
@@ -950,6 +961,7 @@ mod tests {
             .expect("the receive is registered")
     }
 
+    #[cfg(not(windows))]
     /// Wait on the registry's change feed until the receive matches `done`.
     async fn wait_for(
         service: &FileService,
@@ -969,12 +981,16 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn retrying(info: &transfers::TransferInfo) -> bool {
         info.error
             .as_deref()
             .is_some_and(|e| e.starts_with("interrupted, retrying"))
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn an_interrupted_receive_resumes_without_a_second_accept() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1182,6 +1198,9 @@ mod tests {
         );
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn starting_an_accept_returns_before_the_download_ends() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1222,6 +1241,9 @@ mod tests {
         receiver.cancel_transfer(running.id).unwrap();
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_sender_without_the_blob_ends_the_receive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1249,6 +1271,9 @@ mod tests {
 
     /// An offer that understates its size must not get to write the rest:
     /// it fails at once, with nothing saved and no retry.
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_blob_larger_than_offered_ends_the_receive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1281,6 +1306,9 @@ mod tests {
         assert_eq!(receiver.pending_files.lock().unwrap().len(), 1);
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_stalled_receive_is_retried_until_canceled() {
         let tmp = tempfile::tempdir().unwrap();

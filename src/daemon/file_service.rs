@@ -2492,6 +2492,9 @@ mod tests {
         assert_eq!(load_pending_files().len(), 2);
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_cached_receive_completes_the_sender_without_a_provider_event() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2552,6 +2555,9 @@ mod tests {
         );
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn failed_completion_persistence_keeps_the_file_and_does_not_requeue() {
         let tmp = tempfile::tempdir().unwrap();
