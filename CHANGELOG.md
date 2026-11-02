@@ -24,6 +24,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   settings commands print JSON. `ray status --json` exits non-zero with the
   error on stderr when the daemon is down or refuses the connection.
 - `ray pair <ticket>` with a subcommand is now an error.
+- IPv4 exit nodes now use Mullvad's range, so their addresses no longer look
+  like part of your own networks: a client's tunnel gets `10.64.0.2` instead of
+  `192.0.0.2`, and an exit node hands out `10.65.0.0/16` instead of
+  `198.19.0.0/16`. A route broader than that pool, such as `10.0.0.0/8`, no
+  longer turns IPv4 exit off. Old and new versions still work together in
+  either role, and existing address leases are kept.
 
 ### Fixed
 

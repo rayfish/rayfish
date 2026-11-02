@@ -5,6 +5,7 @@ use crate::firewall::Action;
 use crate::membership::ExitFamilies;
 use iroh::SecretKey;
 use smol_str::SmolStr;
+use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
 #[tokio::test]
@@ -1024,7 +1025,7 @@ fn ipv4_transit_requires_canonical_source_and_network_permission() {
     let peer = iroh::SecretKey::generate().public();
     let fw = inbound_fw(Action::Deny, vec![]);
     let exit = no_exit();
-    let packet = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
+    let packet = make_tcp_packet_v4(ipv4::WIRE_CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
     assert!(matches!(
         evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
         InboundDecision::DropExit
@@ -1043,19 +1044,24 @@ fn ipv4_transit_requires_canonical_source_and_network_permission() {
         [10, 0, 0, 1],
         [169, 254, 169, 254],
         [192, 0, 0, 2],
+        [10, 64, 0, 2],
+        [10, 65, 0, 1],
         [198, 19, 0, 1],
     ] {
-        let packet = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), destination, 443);
+        let packet = make_tcp_packet_v4(ipv4::WIRE_CLIENT_ADDR.octets(), destination, 443);
         assert!(!matches!(
             evaluate_inbound(&packet, &fw, &exit, &peer, TEST_V6, "example"),
             InboundDecision::Accept(_)
         ));
     }
-    let spoof = make_tcp_packet_v4([192, 0, 0, 3], [8, 8, 8, 8], 443);
-    assert!(matches!(
-        evaluate_inbound(&spoof, &fw, &exit, &peer, TEST_V6, "example"),
-        InboundDecision::DropSpoof
-    ));
+    // The local address never belongs on the wire: a client translates it first.
+    for source in [[192, 0, 0, 3], ipv4::LOCAL_CLIENT_ADDR.octets()] {
+        let spoof = make_tcp_packet_v4(source, [8, 8, 8, 8], 443);
+        assert!(matches!(
+            evaluate_inbound(&spoof, &fw, &exit, &peer, TEST_V6, "example"),
+            InboundDecision::DropSpoof
+        ));
+    }
 }
 
 #[test]
@@ -1064,13 +1070,15 @@ fn ipv4_return_traffic_requires_selected_gateway_and_open_flow() {
     let other = iroh::SecretKey::generate().public();
     let fw = SharedFirewall::new(firewall::FirewallConfig::default());
     let exit = exit_via(peer);
-    let mut reply = make_tcp_packet_v4([8, 8, 8, 8], ipv4::CLIENT_ADDR.octets(), 50000);
+    let mut reply = make_tcp_packet_v4([8, 8, 8, 8], ipv4::WIRE_CLIENT_ADDR.octets(), 50000);
     reply[20..22].copy_from_slice(&443u16.to_be_bytes());
     assert!(matches!(
         evaluate_inbound(&reply, &fw, &exit, &peer, TEST_V6, "test-net"),
         InboundDecision::DropFirewall(_)
     ));
-    let mut request = make_tcp_packet_v4(ipv4::CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
+    // The firewall sees our outbound flow before translation, from the local
+    // address, and still admits its reply to the wire address.
+    let mut request = make_tcp_packet_v4(ipv4::LOCAL_CLIENT_ADDR.octets(), [8, 8, 8, 8], 443);
     request[20..22].copy_from_slice(&50000u16.to_be_bytes());
     let info = firewall::parse_packet_info(&request).unwrap();
     assert!(
@@ -1079,12 +1087,140 @@ fn ipv4_return_traffic_requires_selected_gateway_and_open_flow() {
     );
     assert!(matches!(
         evaluate_inbound(&reply, &fw, &exit, &peer, TEST_V6, "test-net"),
-        InboundDecision::Accept(_)
+        InboundDecision::Accept(info) if info.dst_ip == IpAddr::V4(ipv4::WIRE_CLIENT_ADDR)
     ));
     assert!(matches!(
         evaluate_inbound(&reply, &fw, &exit, &other, OTHER_V6, "test-net"),
         InboundDecision::DropSpoof
     ));
+    // A reply to the local address did not come from a gateway.
+    let mut local = make_tcp_packet_v4([8, 8, 8, 8], ipv4::LOCAL_CLIENT_ADDR.octets(), 50000);
+    local[20..22].copy_from_slice(&443u16.to_be_bytes());
+    assert!(matches!(
+        evaluate_inbound(&local, &fw, &exit, &peer, TEST_V6, "test-net"),
+        InboundDecision::DropSpoof
+    ));
+}
+
+/// A whole IPv4 TCP segment with valid IP and TCP checksums, which
+/// [`ipv4::rewrite`] needs (it refuses a truncated TCP header).
+pub(super) fn checksummed_tcp_v4(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    flags: u8,
+) -> Bytes {
+    let mut p = vec![0u8; 40];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&40u16.to_be_bytes());
+    p[8] = 64;
+    p[9] = 6;
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    p[20..22].copy_from_slice(&src_port.to_be_bytes());
+    p[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    p[32] = 0x50;
+    p[33] = flags;
+    p[34..36].copy_from_slice(&4096u16.to_be_bytes());
+    let check = tcp_v4_checksum(&p);
+    p[36..38].copy_from_slice(&check.to_be_bytes());
+    let check = crate::reject::icmpv4_checksum(&p[..20]);
+    p[10..12].copy_from_slice(&check.to_be_bytes());
+    Bytes::from(p)
+}
+
+/// The TCP checksum over `p`'s pseudo-header and segment: 0 when it is valid.
+pub(super) fn tcp_v4_checksum(p: &[u8]) -> u16 {
+    let mut pseudo = p[12..20].to_vec();
+    pseudo.extend([0, 6]);
+    pseudo.extend(((p.len() - 20) as u16).to_be_bytes());
+    pseudo.extend_from_slice(&p[20..]);
+    crate::reject::icmpv4_checksum(&pseudo)
+}
+
+/// Old clients put the wire address on their TUN; new ones keep the local one
+/// and translate at the mesh boundary. A gateway cannot tell them apart, and
+/// its returns reach either.
+#[tokio::test]
+async fn old_and_new_ipv4_exit_clients_look_the_same_to_a_gateway() {
+    let client = SecretKey::generate().public();
+    let gateway_id = SecretKey::generate().public();
+    let internet = Ipv4Addr::new(8, 8, 8, 8);
+    let local = checksummed_tcp_v4(ipv4::LOCAL_CLIENT_ADDR, internet, 50000, 443, 2);
+    let old_wire = checksummed_tcp_v4(ipv4::WIRE_CLIENT_ADDR, internet, 50000, 443, 2);
+    let new_wire = ipv4::client_to_wire(local.clone()).unwrap();
+    assert_eq!(
+        new_wire, old_wire,
+        "the new client's packet is the old one's"
+    );
+
+    // The gateway, unchanged on the wire: it accepts transit from the wire
+    // address and leases it an address in the new pool.
+    let gateway = no_exit();
+    gateway
+        .server
+        .reload([("example", &[client.to_string()][..])]);
+    let dir = tempfile::tempdir().unwrap();
+    gateway
+        .server
+        .ipv4
+        .initialize(dir.path().join("leases.json"))
+        .unwrap();
+    let gateway_fw = inbound_fw(Action::Deny, vec![]);
+    assert!(matches!(
+        evaluate_inbound(
+            &old_wire,
+            &gateway_fw,
+            &gateway,
+            &client,
+            TEST_V6,
+            "example"
+        ),
+        InboundDecision::Accept(_)
+    ));
+    let leased = gateway
+        .server
+        .ipv4
+        .outbound(old_wire, TEST_V6, "example".into())
+        .await
+        .unwrap();
+    let lease = Ipv4Addr::new(leased[12], leased[13], leased[14], leased[15]);
+    assert!(ipv4::is_server_addr(lease), "{lease}");
+    assert_eq!(lease.octets()[..2], [10, 65]);
+    assert_eq!(tcp_v4_checksum(&leased), 0);
+
+    // The internet answers the lease; the gateway restores the wire address,
+    // which is what an old client holds and a new one expects.
+    let answer = checksummed_tcp_v4(internet, lease, 443, 50000, 0x12);
+    let returned = ipv4::rewrite(answer, lease, ipv4::WIRE_CLIENT_ADDR).unwrap();
+    assert_eq!(&returned[16..20], &ipv4::WIRE_CLIENT_ADDR.octets());
+
+    // The new client admits it against the flow its firewall saw leave from
+    // the local address, then delivers it there.
+    let client_fw = SharedFirewall::new(firewall::FirewallConfig::default());
+    let info = firewall::parse_packet_info(&local).unwrap();
+    assert!(
+        client_fw
+            .evaluate_packet(Direction::Out, &info, &gateway_id, |name| name
+                == "test-net")
+            .is_allow()
+    );
+    assert!(matches!(
+        evaluate_inbound(
+            &returned,
+            &client_fw,
+            &exit_via(gateway_id),
+            &gateway_id,
+            TEST_V6,
+            "test-net"
+        ),
+        InboundDecision::Accept(_)
+    ));
+    let delivered = ipv4::client_from_wire(returned).unwrap();
+    assert_eq!(&delivered[16..20], &ipv4::LOCAL_CLIENT_ADDR.octets());
+    assert_eq!(crate::reject::icmpv4_checksum(&delivered[..20]), 0);
+    assert_eq!(tcp_v4_checksum(&delivered), 0);
 }
 
 #[test]

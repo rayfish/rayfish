@@ -1306,15 +1306,15 @@ mod tests {
     fn gateway_rules_masquerade_each_uplink_and_admit_only_replies() {
         assert_eq!(
             pf::gateway_rules("utun9", Some("en0"), Some("en1")),
-            "nat on en0 inet from 198.19.0.0/16 to any -> (en0)\n\
+            "nat on en0 inet from 10.65.0.0/16 to any -> (en0)\n\
              nat on en1 inet6 from 200::/7 to any -> (en1)\n\
-             block drop in quick on ! utun9 inet to 198.19.0.0/16\n\
+             block drop in quick on ! utun9 inet to 10.65.0.0/16\n\
              block drop in quick on ! utun9 inet6 to 200::/7\n"
         );
         // No uplink is nothing to masquerade, not an error. The blocks stay.
         assert_eq!(
             pf::gateway_rules("utun9", None, None),
-            "block drop in quick on ! utun9 inet to 198.19.0.0/16\n\
+            "block drop in quick on ! utun9 inet to 10.65.0.0/16\n\
              block drop in quick on ! utun9 inet6 to 200::/7\n"
         );
     }
@@ -1520,6 +1520,19 @@ unreachable default metric 4294967295 table 29793
         );
     }
 
+    /// The TUN's IPv4 address must never get a "leave via main" source rule:
+    /// tunnel traffic is sourced from it, so such a rule would send every exit
+    /// flow straight out the physical uplink. It sits inside 10/8, which a host
+    /// address on a LAN otherwise would.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_client_addresses_never_bypass_the_tunnel() {
+        assert!(!is_bypass_source(IpAddr::V4(ipv4::LOCAL_CLIENT_ADDR)));
+        assert!(!is_bypass_source(IpAddr::V4(ipv4::WIRE_CLIENT_ADDR)));
+        assert!(is_bypass_source("10.64.0.3".parse().unwrap()));
+        assert!(is_bypass_source("192.0.2.10".parse().unwrap()));
+    }
+
     /// nft refuses a set with overlapping intervals, so covered prefixes and
     /// duplicates go, and the two families never cover each other.
     #[cfg(target_os = "linux")]
@@ -1718,7 +1731,7 @@ unreachable default metric 4294967295 table 29793
         );
         // The overlay routes no IPv4, so there is no `ip saddr` rule to write.
         assert!(!rules.contains("100.64.0.0/10"), "{rules}");
-        assert!(rules.contains("ip saddr 198.19.0.0/16"), "{rules}");
+        assert!(rules.contains("ip saddr 10.65.0.0/16"), "{rules}");
     }
 
     #[test]

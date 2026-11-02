@@ -290,10 +290,10 @@ fn evaluate_inbound(
     // IP) is dropped before the firewall or any in-daemon listener sees it, so
     // identity-from-source-IP (used by mesh SSH) stays trustworthy.
     //
-    // IPv4 clients use a local source address only for exit transit. Gateway
+    // IPv4 clients use the shared wire address only for exit transit. Gateway
     // translation assigns a lease to the authenticated peer and network.
     let src_ok = matches!(info.src_ip, IpAddr::V6(v6) if v6 == peer_ipv6)
-        || (info.src_ip == IpAddr::V4(ipv4::CLIENT_ADDR) && is_transitable(info.dst_ip));
+        || (info.src_ip == IpAddr::V4(ipv4::WIRE_CLIENT_ADDR) && is_transitable(info.dst_ip));
     let mut returning = false;
     if !src_ok {
         // Exit-node client return traffic: replies to our internet-bound flows come
@@ -313,7 +313,7 @@ fn evaluate_inbound(
         // gateway or ISP can; that is what TLS is for. Reaching a service we never
         // dialed is a different matter, and it can't.)
         let dst_is_me = matches!(info.dst_ip, IpAddr::V6(v6) if v6 == exit.my_v6)
-            || (info.dst_ip == IpAddr::V4(ipv4::CLIENT_ADDR)
+            || (info.dst_ip == IpAddr::V4(ipv4::WIRE_CLIENT_ADDR)
                 && exit
                     .client
                     .selection()
@@ -377,7 +377,9 @@ fn evaluate_inbound(
         Some(f) if is_ssh_fragment(&f.info, ssh_port()) => InboundDecision::DropFragment,
         whole_or_first => {
             let admitted = if returning {
-                firewall.admits_reply(&info)
+                // Our outbound flow was tracked before its source became the
+                // wire address, so look the reply up as the TUN will see it.
+                firewall.admits_reply(&delivered_info(info))
             } else {
                 !firewall
                     .evaluate_packet(Direction::In, &info, peer_id, shares_network)
@@ -391,6 +393,19 @@ fn evaluate_inbound(
             }
             InboundDecision::Accept(info)
         }
+    }
+}
+
+/// An IPv4 exit return as it reaches our TUN: addressed to the local client
+/// address rather than the wire one. Other packets are unchanged.
+fn delivered_info(info: firewall::PacketInfo) -> firewall::PacketInfo {
+    if info.dst_ip == IpAddr::V4(ipv4::WIRE_CLIENT_ADDR) {
+        firewall::PacketInfo {
+            dst_ip: IpAddr::V4(ipv4::LOCAL_CLIENT_ADDR),
+            ..info
+        }
+    } else {
+        info
     }
 }
 
@@ -711,12 +726,12 @@ impl<R: crate::tun::TunRead> MeshForwarder<R> {
                     stats.record_drop(DropReason::Spoof);
                     continue;
                 }
-                let Ok(pkt) = ipv4::rewrite(pkt, dst, ipv4::CLIENT_ADDR) else {
+                let Ok(pkt) = ipv4::rewrite(pkt, dst, ipv4::WIRE_CLIENT_ADDR) else {
                     stats.record_drop(DropReason::Malformed);
                     continue;
                 };
                 let info = firewall::PacketInfo {
-                    dst_ip: IpAddr::V4(ipv4::CLIENT_ADDR),
+                    dst_ip: IpAddr::V4(ipv4::WIRE_CLIENT_ADDR),
                     ..info
                 };
                 let ctx = SendCtx {
@@ -1018,6 +1033,21 @@ async fn prepare_datagrams(
     } else {
         pkt
     };
+    // An IPv4 exit packet leaves with the wire client address every gateway
+    // expects. Done last, so the firewall, its conntrack and any reject or PMTU
+    // reply above all saw the address our TUN holds.
+    let pkt = if info.src_ip == IpAddr::V4(ipv4::LOCAL_CLIENT_ADDR) {
+        match ipv4::client_to_wire(pkt) {
+            Ok(pkt) => pkt,
+            // A fragment or a truncated header: no gateway would take it either.
+            Err(_) => {
+                ctx.stats.record_drop(DropReason::Malformed);
+                return None;
+            }
+        }
+    } else {
+        pkt
+    };
     // Prefix the network handle so the receiver, which shares one connection for all
     // our networks, can recover which network this datagram belongs to for
     // reachability and exit routing. `handle == 0` means we have no handle for the routed
@@ -1252,6 +1282,20 @@ pub fn spawn_peer_reader(
                                 Err(error) => {
                                     tracing::debug!(%error, "IPv4 exit translation failed");
                                     stats.record_drop(DropReason::ExitDenied);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            datagram
+                        };
+                        // An IPv4 exit return carries the wire client address;
+                        // our TUN holds the local one. Only a return can be
+                        // accepted with that destination.
+                        let datagram = if info.dst_ip == IpAddr::V4(ipv4::WIRE_CLIENT_ADDR) {
+                            match ipv4::client_from_wire(datagram) {
+                                Ok(packet) => packet,
+                                Err(_) => {
+                                    stats.record_drop(DropReason::Malformed);
                                     continue;
                                 }
                             }

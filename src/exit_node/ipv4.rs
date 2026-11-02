@@ -1,4 +1,11 @@
-//! IPv4 exit traffic uses a local client address and gateway-owned NAT leases.
+//! IPv4 exit traffic uses a fixed client address and gateway-owned NAT leases.
+//!
+//! A client's TUN holds [`LOCAL_CLIENT_ADDR`], but on the mesh its packets carry
+//! [`WIRE_CLIENT_ADDR`]: the forwarder swaps the two at the mesh boundary, after
+//! the firewall on the way out and before delivery on the way back. The wire
+//! address is what every gateway checks and restores, so it cannot change without
+//! breaking older peers; the local one can. Both live in ranges a gateway never
+//! forwards to.
 //!
 //! Leases belong to authenticated mesh identities and networks, not packet
 //! source addresses. They are persisted, and an address is only handed to a new
@@ -27,10 +34,18 @@ use crate::membership::now_secs;
 use crate::peers::FastDashMap;
 use crate::reject::icmpv4_checksum as checksum;
 
-pub const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 0, 2);
-pub const SERVER_PREFIX: &str = "198.19.0.0/16";
+/// The source of a client's IPv4 exit packets on the mesh, and the destination
+/// of their returns. A wire contract: gateways only accept transit from it and
+/// rewrite returns to it, so changing it needs a mesh ALPN bump.
+pub const WIRE_CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 0, 2);
+/// The IPv4 address on a client's TUN while it uses an exit node. Inside
+/// Mullvad's `10.64.0.0/10`, so it does not look like one of the user's own
+/// networks. Never sent to a peer: see [`client_to_wire`].
+pub const LOCAL_CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 2);
+/// The gateway's lease pool, also inside `10.64.0.0/10`.
+pub const SERVER_PREFIX: &str = "10.65.0.0/16";
 /// [`SERVER_PREFIX`] as a network address and mask.
-const SERVER_NET: u32 = u32::from_be_bytes([198, 19, 0, 0]);
+const SERVER_NET: u32 = u32::from_be_bytes([10, 65, 0, 0]);
 const SERVER_MASK: u32 = u32::MAX << (32 - 16);
 const MAX_LEASES: usize = 65534;
 
@@ -78,7 +93,8 @@ pub enum Error {
 }
 
 /// One address of the pool, as the lease file stores it: index `i` of the file
-/// is the address `198.19.0.1 + i`.
+/// is the address `10.65.0.1 + i`. Only the index is stored, so a file written
+/// while the pool was elsewhere maps each lease to the same slot here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Slot {
     lease: Lease,
@@ -227,8 +243,20 @@ impl Nat {
                 tokio::task::spawn_blocking(move || nat.allocate(lease)).await??
             }
         };
-        rewrite(packet, CLIENT_ADDR, addr)
+        rewrite(packet, WIRE_CLIENT_ADDR, addr)
     }
+}
+
+/// A client's outbound IPv4 exit packet, as it goes on the mesh: its local
+/// source becomes [`WIRE_CLIENT_ADDR`]. Anything else passes unchanged.
+pub fn client_to_wire(packet: Bytes) -> Result<Bytes, Error> {
+    rewrite(packet, LOCAL_CLIENT_ADDR, WIRE_CLIENT_ADDR)
+}
+
+/// An IPv4 exit return as the client's TUN should see it: its wire
+/// destination becomes [`LOCAL_CLIENT_ADDR`].
+pub fn client_from_wire(packet: Bytes) -> Result<Bytes, Error> {
+    rewrite(packet, WIRE_CLIENT_ADDR, LOCAL_CLIENT_ADDR)
 }
 
 fn address(index: usize) -> Ipv4Addr {
@@ -310,12 +338,15 @@ fn replace_checksum(p: &mut [u8], off: usize, old: u16, new: u16, udp: bool) {
     p[off..off + 2].copy_from_slice(&updated.to_be_bytes());
 }
 
-/// Whether a specific route overlaps the gateway lease pool. Defaults and split
-/// defaults do not count. The client address is not checked: a host that already
-/// routes `192.0.0.2` elsewhere is rare enough to leave broken.
+/// Whether a route takes part of the gateway lease pool: the pool itself, or a
+/// prefix inside it. A broader route, such as a LAN or VPN's `10.0.0.0/8`, does
+/// not count: the pool's own `/16` is more specific and wins, so it only stops
+/// the gateway reaching hosts that route numbers inside the pool. The client
+/// address is not checked: a host that already routes `10.64.0.2` elsewhere is
+/// rare enough to leave broken.
 pub fn conflicts_with_route(cidr: &str) -> bool {
     let (ip, bits) = cidr.split_once('/').unwrap_or((cidr, "32"));
-    // BSD route tables abbreviate network addresses, such as 198.19/16.
+    // BSD route tables abbreviate network addresses, such as 10.65/16.
     let mut ip = ip.to_owned();
     while ip.bytes().filter(|b| *b == b'.').count() < 3 {
         ip.push_str(".0");
@@ -326,13 +357,7 @@ pub fn conflicts_with_route(cidr: &str) -> bool {
     let Ok(bits) = bits.parse::<u32>() else {
         return false;
     };
-    if !(2..=32).contains(&bits) {
-        return false;
-    }
-    let mask = u32::MAX << (32 - bits);
-    let first = u32::from(ip) & mask;
-    let last = first | !mask;
-    first <= SERVER_NET | !SERVER_MASK && last >= SERVER_NET
+    bits >= SERVER_MASK.leading_ones() && bits <= 32 && u32::from(ip) & SERVER_MASK == SERVER_NET
 }
 
 /// The first line of a route table that overlaps the gateway lease pool. A line
@@ -364,7 +389,7 @@ mod tests {
         p[2..4].copy_from_slice(&len.to_be_bytes());
         p[8] = 64;
         p[9] = protocol;
-        p[12..16].copy_from_slice(&CLIENT_ADDR.octets());
+        p[12..16].copy_from_slice(&WIRE_CLIENT_ADDR.octets());
         p[16..20].copy_from_slice(&[203, 0, 113, 1]);
         p[20..22].copy_from_slice(&12345u16.to_be_bytes());
         p[22..24].copy_from_slice(&443u16.to_be_bytes());
@@ -398,7 +423,9 @@ mod tests {
         assert_eq!(Ipv4Addr::from(SERVER_NET), net.parse::<Ipv4Addr>().unwrap());
         assert_eq!(SERVER_MASK.leading_ones(), len.parse::<u32>().unwrap());
         assert!(is_server_addr(address(0)) && is_server_addr(address(MAX_LEASES - 1)));
-        assert!(!is_server_addr(Ipv4Addr::new(198, 18, 255, 255)));
+        assert!(!is_server_addr(Ipv4Addr::new(10, 64, 255, 255)));
+        assert!(!is_server_addr(Ipv4Addr::new(10, 66, 0, 0)));
+        assert!(!is_server_addr(LOCAL_CLIENT_ADDR) && !is_server_addr(WIRE_CLIENT_ADDR));
     }
 
     #[test]
@@ -406,18 +433,18 @@ mod tests {
         for protocol in [6, 17] {
             let original = packet(protocol);
             assert_eq!(transport_checksum(&original), 0);
-            let translated = rewrite(original.clone(), CLIENT_ADDR, address(7)).unwrap();
+            let translated = rewrite(original.clone(), WIRE_CLIENT_ADDR, address(7)).unwrap();
             assert_eq!(&translated[12..16], &address(7).octets());
             assert_eq!(checksum(&translated[..20]), 0);
             assert_eq!(transport_checksum(&translated), 0);
             assert_eq!(
-                rewrite(translated, address(7), CLIENT_ADDR).unwrap(),
+                rewrite(translated, address(7), WIRE_CLIENT_ADDR).unwrap(),
                 original
             );
         }
         let mut no_checksum = packet(17).to_vec();
         no_checksum[26..28].fill(0);
-        let translated = rewrite(Bytes::from(no_checksum), CLIENT_ADDR, address(2)).unwrap();
+        let translated = rewrite(Bytes::from(no_checksum), WIRE_CLIENT_ADDR, address(2)).unwrap();
         assert_eq!(&translated[26..28], &[0, 0]);
     }
 
@@ -425,7 +452,7 @@ mod tests {
     fn icmp_errors_restore_the_quoted_flow_and_its_checksums() {
         for protocol in [6, 17] {
             let original = packet(protocol);
-            let mapped = rewrite(original.clone(), CLIENT_ADDR, address(7)).unwrap();
+            let mapped = rewrite(original.clone(), WIRE_CLIENT_ADDR, address(7)).unwrap();
             for quote_len in [28, mapped.len()] {
                 let mut error = vec![0; 28];
                 error[0] = 0x45;
@@ -443,10 +470,10 @@ mod tests {
                 error[10..12].copy_from_slice(&check.to_be_bytes());
                 let check = checksum(&error[20..]);
                 error[22..24].copy_from_slice(&check.to_be_bytes());
-                let restored = rewrite(Bytes::from(error), address(7), CLIENT_ADDR).unwrap();
+                let restored = rewrite(Bytes::from(error), address(7), WIRE_CLIENT_ADDR).unwrap();
                 assert_eq!(checksum(&restored[..20]), 0);
                 assert_eq!(checksum(&restored[20..]), 0);
-                assert_eq!(&restored[16..20], &CLIENT_ADDR.octets());
+                assert_eq!(&restored[16..20], &WIRE_CLIENT_ADDR.octets());
                 assert_eq!(&restored[28..], &original[..quote_len]);
             }
         }
@@ -457,18 +484,18 @@ mod tests {
         for flags in [0x2000u16, 1] {
             let mut p = packet(6).to_vec();
             p[6..8].copy_from_slice(&flags.to_be_bytes());
-            assert!(rewrite(Bytes::from(p), CLIENT_ADDR, address(0)).is_err());
+            assert!(rewrite(Bytes::from(p), WIRE_CLIENT_ADDR, address(0)).is_err());
         }
         let mut p = packet(6).to_vec();
         p[0] = 0x46;
-        assert!(rewrite(Bytes::from(p), CLIENT_ADDR, address(0)).is_err());
+        assert!(rewrite(Bytes::from(p), WIRE_CLIENT_ADDR, address(0)).is_err());
         for len in 0..40 {
             let mut p = packet(6).slice(..len).to_vec();
             if len >= 4 {
                 p[2..4].copy_from_slice(&(len as u16).to_be_bytes());
             }
             // At least the full TCP header is required for unquoted packets.
-            assert!(rewrite(Bytes::from(p), CLIENT_ADDR, address(0)).is_err());
+            assert!(rewrite(Bytes::from(p), WIRE_CLIENT_ADDR, address(0)).is_err());
         }
     }
 
@@ -591,7 +618,7 @@ mod tests {
 
     #[test]
     fn route_conflicts_leave_other_vpns_alone() {
-        for prefix in ["198.19.0.0/16", "198.18.0.0/15", "198.19.2.3", "198.19/16"] {
+        for prefix in ["10.65.0.0/16", "10.65.4.0/24", "10.65.2.3", "10.65/16"] {
             assert!(conflicts_with_route(prefix), "{prefix}");
         }
         for prefix in [
@@ -601,7 +628,15 @@ mod tests {
             "128.0.0.0/1",
             "100.64.0.0/10",
             "192.168.0.0/16",
-            "198.18.0.0/16",
+            // Broader than the pool: its /16 still wins.
+            "10.0.0.0/8",
+            "10/8",
+            "10.64.0.0/10",
+            "10.64.0.0/15",
+            "10.64.0.0/16",
+            "10.64.0.2",
+            "10.66.0.0/16",
+            "198.19.0.0/16",
             "192.0.0.2",
         ] {
             assert!(!conflicts_with_route(prefix), "{prefix}");
@@ -610,17 +645,84 @@ mod tests {
 
     #[test]
     fn a_route_table_scan_skips_our_own_routes_and_reads_only_destinations() {
-        let routes = "default via 10.0.0.1 dev eth0\n\
-                      198.19.0.0/16 dev tun0\n\
-                      unreachable 198.19.4.0/24\n";
+        let routes = "default via 192.168.1.1 dev eth0\n\
+                      10.65.0.0/16 dev tun0\n\
+                      unreachable 10.65.4.0/24\n";
         let ours = |fields: &[&str]| fields.windows(2).any(|pair| pair == ["dev", "tun0"]);
         assert_eq!(
             conflicting_route(routes, 2, ours),
-            Some("unreachable 198.19.4.0/24")
+            Some("unreachable 10.65.4.0/24")
         );
         assert_eq!(conflicting_route(routes, 1, ours), None);
         // A gateway in the pool is not a destination.
-        let bsd = "Destination Gateway Flags Netif\n10.0.0.0/8 198.19.0.9 UGS en0\n";
+        let bsd = "Destination Gateway Flags Netif\n172.16.0.0/12 10.65.0.9 UGS en0\n";
         assert_eq!(conflicting_route(bsd, 1, |_| false), None);
+    }
+
+    /// A client sends from its local address and receives at it, while the mesh
+    /// only ever sees the wire address, and every checksum stays valid both ways.
+    #[test]
+    fn the_client_rewrite_round_trips_with_valid_checksums() {
+        for protocol in [6, 17] {
+            let mut local = packet(protocol).to_vec();
+            // `packet` builds a wire packet; turn it into what the TUN hands us.
+            local = rewrite(Bytes::from(local), WIRE_CLIENT_ADDR, LOCAL_CLIENT_ADDR)
+                .unwrap()
+                .to_vec();
+            assert_eq!(&local[12..16], &LOCAL_CLIENT_ADDR.octets());
+            let local = Bytes::from(local);
+            let wire = client_to_wire(local.clone()).unwrap();
+            assert_eq!(
+                wire,
+                packet(protocol),
+                "the wire packet is the old client's"
+            );
+            assert_eq!(checksum(&wire[..20]), 0);
+            assert_eq!(transport_checksum(&wire), 0);
+
+            let mut reply = wire.to_vec();
+            reply.copy_within(12..16, 16);
+            reply[12..16].copy_from_slice(&[203, 0, 113, 1]);
+            let delivered = client_from_wire(Bytes::from(reply)).unwrap();
+            assert_eq!(&delivered[16..20], &LOCAL_CLIENT_ADDR.octets());
+            assert_eq!(checksum(&delivered[..20]), 0);
+            assert_eq!(transport_checksum(&delivered), 0);
+        }
+        // Not ours: the other direction's address is left alone.
+        let wire = packet(6);
+        assert_eq!(client_to_wire(wire.clone()).unwrap(), wire);
+    }
+
+    /// A lease file only stores slots, so one written while the pool was
+    /// `198.19.0.0/16` keeps every owner on the same index, now in `10.65/16`.
+    #[test]
+    fn an_existing_lease_file_keeps_its_index_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.json");
+        let stamp = now_secs();
+        let file = format!(
+            r#"[{{"lease":{{"peer":"200::1","network":"home"}},"last_used":{stamp}}},
+                {{"lease":{{"peer":"200::2","network":"work"}},"last_used":{stamp}}}]"#
+        );
+        fs::write(&path, file).unwrap();
+        let nat = Nat::default();
+        nat.initialize(path).unwrap();
+        assert_eq!(address(0), Ipv4Addr::new(10, 65, 0, 1));
+        assert_eq!(address(1), Ipv4Addr::new(10, 65, 0, 2));
+        assert_eq!(
+            address(MAX_LEASES - 1),
+            Ipv4Addr::new(10, 65, 255, 254),
+            "the last lease stops short of the pool's broadcast address"
+        );
+        let first = nat.return_lease(address(0)).unwrap();
+        assert_eq!(first.peer, "200::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(first.network, "home");
+        assert_eq!(nat.return_lease(address(1)).unwrap().network, "work");
+        assert!(nat.return_lease(Ipv4Addr::new(198, 19, 0, 1)).is_none());
+        let lease = Lease {
+            peer: "200::2".parse().unwrap(),
+            network: "work".into(),
+        };
+        assert_eq!(nat.allocate(lease).unwrap(), address(1));
     }
 }

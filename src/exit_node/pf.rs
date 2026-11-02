@@ -438,7 +438,9 @@ fn ensure_ipv4_space(tun: &str) -> Result<()> {
 
 /// Give the TUN the client IPv4 address. Idempotent.
 pub fn add_client_ipv4(tun: &str) -> Result<()> {
-    let addr = ipv4::CLIENT_ADDR.to_string();
+    // Builds before 10.64.0.2 aliased the wire address instead.
+    remove_alias(tun, ipv4::WIRE_CLIENT_ADDR);
+    let addr = ipv4::LOCAL_CLIENT_ADDR.to_string();
     let existing = Command::new("ifconfig").args([tun, "inet"]).output()?;
     if existing.status.success()
         && String::from_utf8_lossy(&existing.stdout)
@@ -463,7 +465,13 @@ pub fn add_client_ipv4(tun: &str) -> Result<()> {
 
 /// Remove the client IPv4 address. Best-effort: it may already be gone.
 pub fn remove_client_ipv4(tun: &str) {
+    remove_alias(tun, ipv4::LOCAL_CLIENT_ADDR);
+    remove_alias(tun, ipv4::WIRE_CLIENT_ADDR);
+}
+
+/// Best-effort: the alias may not be there.
+fn remove_alias(tun: &str, addr: Ipv4Addr) {
     let _ = Command::new("ifconfig")
-        .args([tun, "inet", &ipv4::CLIENT_ADDR.to_string(), "-alias"])
+        .args([tun, "inet", &addr.to_string(), "-alias"])
         .output();
 }

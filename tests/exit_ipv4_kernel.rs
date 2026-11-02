@@ -123,9 +123,12 @@ while True:
     socket.send(b"example payload").await?;
     let request = read_ipv4(&mut client_read).await?;
     anyhow::ensure!(
-        request[12..16] == ipv4::CLIENT_ADDR.octets(),
+        request[12..16] == ipv4::LOCAL_CLIENT_ADDR.octets(),
         "client route source"
     );
+    // The forwarder's two halves: the client puts the wire address on, the
+    // gateway leases it an address from the pool.
+    let request = ipv4::client_to_wire(request)?;
     let mapped = server
         .ipv4
         .outbound(request, "200::2".parse()?, "example".into())
@@ -134,7 +137,8 @@ while True:
     client_write.write_packet(&mapped).await?;
     let reply = read_ipv4(&mut client_read).await?;
     anyhow::ensure!(reply[16..20] == alias.octets(), "kernel NAT return route");
-    let restored = ipv4::rewrite(reply, alias, ipv4::CLIENT_ADDR)?;
+    let restored = ipv4::rewrite(reply, alias, ipv4::WIRE_CLIENT_ADDR)?;
+    let restored = ipv4::client_from_wire(restored)?;
     client_write.write_packet(&restored).await?;
     let mut response = [0; 128];
     let length = timeout(Duration::from_secs(3), socket.recv(&mut response)).await??;
@@ -260,7 +264,7 @@ while True:
     install_client_routing(&client_name)?;
 
     // A route overlapping the lease pool turns off IPv4 transit, not the gateway.
-    run(&["ip", "route", "add", "198.18.0.0/15", "dev", "uplink"])?;
+    run(&["ip", "route", "add", "10.65.4.0/24", "dev", "uplink"])?;
     if let Some(error) = server.apply_os(&client_name) {
         anyhow::bail!("overlapping route disabled the gateway: {error}");
     }
@@ -272,11 +276,25 @@ while True:
         !String::from_utf8_lossy(&pool.stdout).contains(&client_name),
         "lease pool routed over a conflicting route"
     );
-    run(&["ip", "route", "del", "198.18.0.0/15", "dev", "uplink"])?;
+    run(&["ip", "route", "del", "10.65.4.0/24", "dev", "uplink"])?;
     if let Some(error) = server.apply_os(&client_name) {
         anyhow::bail!("{error}");
     }
     anyhow::ensure!(server.offers_v4(), "IPv4 transit restored");
+    // A broader 10/8 route cannot shadow the pool's /16, so it costs nothing.
+    run(&["ip", "route", "add", "10.0.0.0/8", "dev", "uplink"])?;
+    if let Some(error) = server.apply_os(&client_name) {
+        anyhow::bail!("{error}");
+    }
+    anyhow::ensure!(server.offers_v4(), "a 10/8 route disabled IPv4 transit");
+    let pool = Command::new("ip")
+        .args(["-4", "route", "get", "10.65.0.1"])
+        .output()?;
+    anyhow::ensure!(
+        String::from_utf8_lossy(&pool.stdout).contains(&client_name),
+        "a 10/8 route shadowed the lease pool"
+    );
+    run(&["ip", "route", "del", "10.0.0.0/8", "dev", "uplink"])?;
 
     teardown_client_routing(Some(&client_name));
     disable();
@@ -292,8 +310,10 @@ while True:
     let addresses = Command::new("ip")
         .args(["-4", "addr", "show", "dev", &client_name])
         .output()?;
+    let addresses = String::from_utf8_lossy(&addresses.stdout);
     anyhow::ensure!(
-        !String::from_utf8_lossy(&addresses.stdout).contains("192.0.0.2"),
+        !addresses.contains(&ipv4::LOCAL_CLIENT_ADDR.to_string())
+            && !addresses.contains(&ipv4::WIRE_CLIENT_ADDR.to_string()),
         "client address removed"
     );
     let routes = Command::new("ip").args(["-4", "route", "show"]).output()?;
