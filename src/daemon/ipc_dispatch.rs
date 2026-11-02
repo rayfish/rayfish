@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// The refusal a non-root caller gets for [`Daemon::is_root_only_setting`].
+#[cfg(unix)]
+pub(crate) const ROOT_ONLY_DOWNLOAD_SETTING: &str = "permission denied: download-dir and download-user decide where the daemon \
+     writes received files, so only root may set them (re-run with sudo)";
+
+/// A path send makes the daemon open the path with its own privileges.
+pub(crate) const ROOT_ONLY_PATH_SEND: &str = "permission denied: sending a file by path requires root; \
+     update the ray CLI, which sends an open file instead";
+
 impl Daemon {
     pub(crate) fn is_open_read(req: &IpcMessage) -> bool {
         matches!(
@@ -59,6 +68,14 @@ impl Daemon {
             return None;
         }
 
+        // A path-based send makes the daemon open the path with its own
+        // privileges, so an operator could send any file on the machine. Only
+        // root, who could read it anyway, may use it; everyone else passes an
+        // open descriptor (`SendFileFd`) or the bytes (`SendFileBegin`).
+        if matches!(req, IpcMessage::SendFile { .. }) {
+            return Some(ipc_err(ROOT_ONLY_PATH_SEND));
+        }
+
         // Granting operator access is reserved for root.
         if matches!(req, IpcMessage::SetOperator { .. }) {
             #[cfg(unix)]
@@ -78,6 +95,22 @@ impl Daemon {
                  terminal with: ray set-operator <user>"
                     .to_string(),
             ));
+        }
+
+        // Where auto-accepted files land, and whose they become, steer the
+        // daemon's own writes. An operator who could set them could have a peer
+        // drop a file anywhere root can write, so they are root's to set.
+        if Self::is_root_only_setting(req) {
+            #[cfg(unix)]
+            return Some(ipc_err(ROOT_ONLY_DOWNLOAD_SETTING.to_string()));
+            #[cfg(windows)]
+            if !windows_peer_authorized(peer, None) {
+                return Some(ipc_err(
+                    "permission denied: set download-dir and download-user from an \
+                     Administrator terminal"
+                        .to_string(),
+                ));
+            }
         }
 
         #[cfg(windows)]
@@ -109,6 +142,19 @@ impl Daemon {
              Grant access from an Administrator terminal with: ray set-operator <user>"
                 .to_string(),
         ))
+    }
+
+    /// Settings only root may change, even when an operator is configured:
+    /// the auto-accept target directory and the user it writes for.
+    pub(crate) fn is_root_only_setting(req: &IpcMessage) -> bool {
+        matches!(
+            req,
+            IpcMessage::ConfigSet { key, .. } | IpcMessage::ConfigUnset { key }
+                if matches!(
+                    key,
+                    NodeKey::Global(GlobalKey::DownloadDir | GlobalKey::DownloadUser)
+                )
+        )
     }
 
     /// Persist the operator UID so that user can run mutating `ray` commands
@@ -157,9 +203,9 @@ impl Daemon {
     }
 
     /// Persist an exact peer's file auto-accept permission and apply it now.
-    pub async fn set_file_auto_accept(self: &Arc<Self>, peer: &str, allow: bool) -> IpcMessage {
+    pub async fn set_file_auto_accept(self: &Arc<Self>, peer: &str, allow: bool) -> OpResult<Done> {
         if peer.trim().is_empty() || peer.contains(',') || peer.starts_with('-') {
-            return ipc_err("a single peer name or identity is required");
+            return op_err("a single peer name or identity is required");
         }
         self.config_apply(
             NodeKey::Global(GlobalKey::FileAutoAcceptPeers),
@@ -172,7 +218,7 @@ impl Daemon {
 
     /// `ray config set <key> <value>` for an embedder, with the same live
     /// effects as the CLI.
-    pub async fn config_set(self: &Arc<Self>, key: GlobalKey, value: &str) -> IpcMessage {
+    pub async fn config_set(self: &Arc<Self>, key: GlobalKey, value: &str) -> OpResult<Done> {
         self.config_apply(NodeKey::Global(key), value, false, false)
             .await
     }
@@ -184,13 +230,13 @@ impl Daemon {
         key: GlobalKey,
         peer: &str,
         remove: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         if !key.is_peer_list() {
-            return ipc_err(format!("{} is not a peer list", key.name()));
+            return op_err(format!("{} is not a peer list", key.name()));
         }
         match settings::peer_list_edit(peer, remove) {
             Ok(value) => self.config_set(key, &value).await,
-            Err(e) => ipc_err(e.to_string()),
+            Err(e) => op_err(e.to_string()),
         }
     }
 
@@ -213,7 +259,7 @@ impl Daemon {
         value: &str,
         replace: bool,
         reset: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let resolved_value;
         let value =
             if matches!(key, NodeKey::Global(k) if k.is_peer_list()) && !value.trim().is_empty() {
@@ -227,7 +273,7 @@ impl Daemon {
                         Ok(peer) => peer,
                         Err(_) => match self.registry.resolve_peer_flexible(name).await {
                             Some(peer) => peer,
-                            None => return ipc_err(format!("unknown peer '{name}'")),
+                            None => return op_err(format!("unknown peer '{name}'")),
                         },
                     };
                     identities.push(format!("{}{peer}", if remove { "-" } else { "" }));
@@ -270,53 +316,48 @@ impl Daemon {
                 | GlobalKey::Blocked),
             ) => k,
         };
-        let app_config = match save_global(key, value, replace) {
-            Ok(cfg) => cfg,
-            Err(response) => return response,
-        };
+        let app_config = save_global(key, value, replace)?;
         if key == GlobalKey::FileAutoAcceptPeers {
             self.files.drain_auto_acceptable().await;
         }
         if key == GlobalKey::Blocked {
             self.connect.drop_blocked(&app_config.blocked).await;
         }
-        IpcMessage::Ok {
-            message: global_set_message(&app_config, key, reset),
-        }
+        Ok(Done(global_set_message(&app_config, key, reset)))
     }
 
-    async fn mdns_config_set(&self, value: &str) -> IpcMessage {
+    async fn mdns_config_set(&self, value: &str) -> OpResult<Done> {
         let mut requested = AppConfig::default();
         if let Err(error) = settings::apply_global(&mut requested, GlobalKey::Mdns, value, false) {
-            return ipc_err(error.to_string());
+            return op_err(error.to_string());
         }
         match self.set_mdns_enabled(requested.mdns_enabled).await {
-            Ok(()) => IpcMessage::Ok {
-                message: global_set_message(&requested, GlobalKey::Mdns, false),
-            },
-            Err(error) => ipc_err(error.to_string()),
+            Ok(()) => Ok(Done(global_set_message(&requested, GlobalKey::Mdns, false))),
+            Err(error) => op_err(error.to_string()),
         }
     }
 
     /// Persist the setting and change discovery on the existing endpoint.
     pub async fn set_mdns_enabled(&self, enabled: bool) -> Result<()> {
-        self.mdns.set_enabled(enabled, &self.shutdown_token).await
+        self.mdns
+            .set_enabled(enabled, &self.registry.shutdown_token)
+            .await
     }
 
     /// Apply `ray dns on|off` immediately. Unlike the other settings, DNS owns
     /// host state that must be restored before the command reports success.
-    async fn dns_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mode = match save_global(GlobalKey::Dns, value, false) {
-            Ok(cfg) => cfg.dns_mode,
-            Err(response) => return response,
-        };
-        let tun_name = self.tun_name.load().as_str().to_owned();
-        self.dns.resolver.set_short_names(mode.short_names());
+    async fn dns_config_set(self: &Arc<Self>, value: &str) -> OpResult<Done> {
+        let mode = save_global(GlobalKey::Dns, value, false)?.dns_mode;
+        let tun_name = self.registry.tun_name.load().as_str().to_owned();
+        self.registry
+            .dns
+            .resolver
+            .set_short_names(mode.short_names());
         if !mode.enabled() {
-            self.dns.revert(&tun_name).await;
-            return IpcMessage::Ok {
-                message: "DNS disabled and Rayfish's system DNS configuration removed.".to_string(),
-            };
+            self.registry.dns.revert(&tun_name).await;
+            return Ok(Done(
+                "DNS disabled and Rayfish's system DNS configuration removed.".to_string(),
+            ));
         }
         self.registry.refresh_search_domains().await;
         let state = if mode == config::DnsMode::Partial {
@@ -325,18 +366,18 @@ impl Daemon {
             "DNS enabled."
         };
         if !self.active.load(Ordering::SeqCst) {
-            return IpcMessage::Ok {
-                message: format!("{state} It will be configured when Rayfish is up."),
-            };
+            return Ok(Done(format!(
+                "{state} It will be configured when Rayfish is up."
+            )));
         }
         let mut warnings = Vec::new();
-        self.dns.configure(&tun_name, &mut warnings).await;
+        self.registry.dns.configure(&tun_name, &mut warnings).await;
         let mut message = state.to_string();
         if !warnings.is_empty() {
             message.push(' ');
             message.push_str(&warnings.join(" "));
         }
-        IpcMessage::Ok { message }
+        Ok(Done(message))
     }
 
     /// Read node config rows for `ray config get` from the daemon's own config.
@@ -371,7 +412,7 @@ impl Daemon {
         network: &str,
         key: NetworkKey,
         value: &str,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let mut validation_error = None;
         let updated = config::update_network(network, |net| {
             settings::apply_network(net, key, value).inspect_err(|e| {
@@ -380,11 +421,11 @@ impl Daemon {
         });
         let net = match updated {
             Ok(Some(net)) => net,
-            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Ok(None) => return op_err(format!("network '{network}' not found")),
             Err(_) if validation_error.is_some() => {
-                return ipc_err(validation_error.unwrap());
+                return op_err(validation_error.unwrap());
             }
-            Err(e) => return ipc_err(format!("failed to save config: {e}")),
+            Err(e) => return op_err(format!("failed to save config: {e}")),
         };
         // Run the live re-materialization the key implies, then confirm.
         match key {
@@ -396,9 +437,7 @@ impl Daemon {
             // beyond the write.
             NetworkKey::AutoAcceptFiles | NetworkKey::EphemeralTtl => {}
         }
-        IpcMessage::Ok {
-            message: net_set_message(&net, network, key),
-        }
+        Ok(Done(net_set_message(&net, network, key)))
     }
 
     /// Read one or every per-network setting.
@@ -444,36 +483,54 @@ impl Daemon {
                 "this operation is unavailable in rootless mode; use the SOCKS5 proxy or explicit port exposure",
             );
         }
-        let peer_cred = peer.as_ref().and_then(PeerIdentity::unix_cred);
         match req {
             IpcMessage::Create {
                 mode,
                 name,
                 hostname,
-                transport: _,
-            } => self.create_network(mode, name, hostname).await,
+                transport,
+            } => {
+                if let Err(e) = ensure_transport_supported(transport.as_ref()) {
+                    return ipc_err(format!("{e:#}"));
+                }
+                let created = match self.create_network(mode, name, hostname).await {
+                    Ok(created) => created,
+                    Err(e) => return e.into(),
+                };
+                if let Err(e) = save_network_transport(&created.name, transport.as_ref()) {
+                    return ipc_err(format!("created, but could not save the transport: {e:#}"));
+                }
+                created.into()
+            }
             IpcMessage::Join {
                 network_key,
                 name,
                 hostname,
-                transport: _,
+                transport,
                 invite,
                 coordinator,
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
-                self.join_network(
-                    &network_key,
-                    name.as_deref(),
-                    hostname,
-                    invite,
-                    coordinator,
-                    auto_accept_firewall,
-                    auto_accept_files,
+                if let Err(e) = ensure_transport_supported(transport.as_ref()) {
+                    return ipc_err(format!("{e:#}"));
+                }
+                reply(
+                    self.registry
+                        .join_network(
+                            &network_key,
+                            name.as_deref(),
+                            hostname,
+                            invite,
+                            coordinator.map(JoinCoordinator::Preferred),
+                            auto_accept_firewall,
+                            auto_accept_files,
+                            transport,
+                        )
+                        .await,
                 )
-                .await
             }
-            IpcMessage::Leave { name } => self.leave_network(&name).await,
+            IpcMessage::Leave { name } => reply(self.leave_network(&name).await),
             IpcMessage::RenameNetwork { network, new_name } => {
                 let resp = self.registry.rename_network(&network, &new_name).await;
                 // The live SSH allow-lists are filed under the network's name.
@@ -489,12 +546,12 @@ impl Daemon {
                 peer,
                 confirm,
             } => self.registry.kick_member(&network, &peer, confirm).await,
-            IpcMessage::Status => self.status(),
-            IpcMessage::Report => self.build_report(peer.as_ref()),
+            IpcMessage::Status => IpcMessage::StatusResponse(self.status()),
+            IpcMessage::Report => self.build_report(peer.as_ref()).await,
             IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
-                self.shutdown_token.cancel();
+                self.registry.shutdown_token.cancel();
                 IpcMessage::Ok {
                     message: "shutting down".to_string(),
                 }
@@ -506,7 +563,7 @@ impl Daemon {
                 port,
                 peer,
                 network,
-            } => {
+            } => reply(
                 self.registry
                     .firewall_add(
                         direction,
@@ -516,10 +573,10 @@ impl Daemon {
                         peer.as_deref(),
                         network.as_deref(),
                     )
-                    .await
-            }
-            IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
-            IpcMessage::FirewallShow => self.registry.firewall_show(),
+                    .await,
+            ),
+            IpcMessage::FirewallRemove { index } => reply(self.registry.firewall_remove(index)),
+            IpcMessage::FirewallShow => self.registry.firewall_show().into(),
             IpcMessage::FirewallTest {
                 peer,
                 direction,
@@ -553,7 +610,7 @@ impl Daemon {
                 peer,
                 users,
                 allow,
-            } => self.firewall_ssh_allow(&network, &peer, users, allow).await,
+            } => reply(self.firewall_ssh_allow(&network, &peer, users, allow).await),
             IpcMessage::FirewallSshShow => self.firewall_ssh_show(),
             IpcMessage::ExitNodeAllow {
                 network,
@@ -579,7 +636,7 @@ impl Daemon {
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
             IpcMessage::SetHostname { network, hostname } => {
-                self.set_hostname(&network, &hostname).await
+                reply(self.set_hostname(&network, &hostname).await)
             }
             IpcMessage::AliasSet {
                 network,
@@ -590,22 +647,22 @@ impl Daemon {
                 self.registry.remove_alias(&network, &alias)
             }
             IpcMessage::AliasList { network } => self.registry.list_aliases(&network),
-            IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
+            IpcMessage::SendFile { path, peer } => reply(self.send_file(&path, &peer).await),
             IpcMessage::SendFileStaged {
                 path,
                 filename,
                 peer,
-            } => {
+            } => reply(
                 self.files
                     .send_file_named(&path, Some(&filename), &peer)
-                    .await
-            }
+                    .await,
+            ),
             IpcMessage::SendFileFd { filename, peer } => {
                 #[cfg(unix)]
                 {
                     let mut fds = fds;
                     match fds.pop() {
-                        Some(fd) => self.files.send_file_fd(fd, &filename, &peer).await,
+                        Some(fd) => reply(self.files.send_file_fd(fd, &filename, &peer).await),
                         None => ipc_err("SendFileFd request carried no file descriptor"),
                     }
                 }
@@ -615,18 +672,24 @@ impl Daemon {
                     ipc_err("SendFileFd is unavailable on this platform")
                 }
             }
-            IpcMessage::CancelSend { id } => self.files.cancel_send(id),
-            IpcMessage::CancelTransfer { id } => self.files.cancel_transfer(id),
-            IpcMessage::ListFiles => self.list_files(),
+            IpcMessage::CancelSend { id } => reply(self.files.cancel_send(id)),
+            IpcMessage::CancelTransfer { id } => reply(self.files.cancel_transfer(id)),
+            IpcMessage::ListFiles => self.list_files().into(),
             IpcMessage::AcceptFile { id, output } => {
-                self.files.accept_file(id, output, peer_cred).await
+                let recipient = file_service::Recipient::caller(peer.as_ref());
+                reply(self.files.accept_file_for(id, output, recipient).await)
             }
-            IpcMessage::RejectFile { id } => self.files.reject_file(id),
-            IpcMessage::StartPairing => self.start_pairing(),
+            IpcMessage::RejectFile { id } => reply(self.files.reject_file(id)),
+            IpcMessage::StartPairing => reply_with(self.start_pairing(), |ticket| {
+                IpcMessage::PairingTicket { ticket }
+            }),
             IpcMessage::PairWithDevice {
                 endpoint_id,
                 secret,
-            } => self.pair_with_device(endpoint_id, secret).await,
+            } => reply_with(
+                self.pair_with_device(endpoint_id, secret).await,
+                |user_identity| IpcMessage::PairingComplete { user_identity },
+            ),
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
             IpcMessage::BackupIdentity {
                 password,
@@ -658,7 +721,7 @@ impl Daemon {
                     Err(error) => ipc_err(error.to_string()),
                 }
             }
-            IpcMessage::Unpair { device } => self.unpair(&device).await,
+            IpcMessage::Unpair { device } => reply(self.unpair(&device).await),
             IpcMessage::MachineEnrollmentCreate {
                 expires_in,
                 reusable,
@@ -674,7 +737,11 @@ impl Daemon {
             IpcMessage::ControllerRevoke { identity } => {
                 self.management.revoke_controller(identity.as_ref()).await
             }
-            IpcMessage::ManagedMachines { probe } => self.management.list_machines(probe).await,
+            IpcMessage::ManagedMachines { probe } => {
+                reply_with(self.management.list_machines(probe).await, |machines| {
+                    IpcMessage::ManagedMachinesResponse { machines }
+                })
+            }
             IpcMessage::ManagedMachineConfirm { machine } => {
                 self.management.confirm_machine(machine).await
             }
@@ -716,52 +783,66 @@ impl Daemon {
                 key,
                 value,
                 replace,
-            } => self.config_apply(key, &value, replace, false).await,
-            IpcMessage::ConfigUnset { key } => self.config_apply(key, "", false, true).await,
+            } => reply(self.config_apply(key, &value, replace, false).await),
+            IpcMessage::ConfigUnset { key } => reply(self.config_apply(key, "", false, true).await),
             IpcMessage::ConfigGet { key } => self.config_get(key),
             IpcMessage::NetConfigSet {
                 network,
                 key,
                 value,
-            } => self.net_config_apply(&network, key, &value).await,
+            } => reply(self.net_config_apply(&network, key, &value).await),
             IpcMessage::NetConfigGet { network, key } => self.net_config_get(&network, key),
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,
                 hostname,
                 reusable,
-            } => {
+            } => reply(
                 self.registry
                     .invite_create(&network, expires_secs, hostname, reusable)
-                    .await
-            }
+                    .await,
+            ),
             IpcMessage::InviteList { network } => self.registry.invite_list(&network).await,
             IpcMessage::InviteRevoke { network, id } => {
                 self.registry.invite_revoke(&network, &id).await
             }
-            IpcMessage::Requests { network } => self.registry.list_requests(&network),
-            IpcMessage::AcceptRequest { network, id } => {
-                self.registry.accept_request(&network, &id).await
+            IpcMessage::Requests { network } => {
+                reply_with(self.registry.list_requests(&network), |requests| {
+                    IpcMessage::PendingRequests { requests }
+                })
             }
-            IpcMessage::DenyRequest { network, id } => self.registry.deny_request(&network, &id),
+            IpcMessage::AcceptRequest { network, id } => {
+                reply(self.registry.accept_request(&network, &id).await)
+            }
+            IpcMessage::DenyRequest { network, id } => {
+                reply(self.registry.deny_request(&network, &id))
+            }
             IpcMessage::AdminAdd { network, identity } => {
                 self.registry.admin_add(&network, &identity).await
             }
             IpcMessage::AdminList { network } => self.registry.admin_list(&network),
-            IpcMessage::Connect { peer, hostname } => self.connect(&peer, hostname).await,
-            IpcMessage::Connections => self.list_connections(),
-            IpcMessage::ApproveConnection { id } => self.approve_connection(&id).await,
-            IpcMessage::ConnectDeny { id } => self.connect.deny_connection(&id).await,
-            IpcMessage::Invitations => self.connect.list_invitations().await,
-            IpcMessage::InviteDeliver { network, recipient } => {
+            IpcMessage::Connect { peer, hostname } => reply(self.connect(&peer, hostname).await),
+            IpcMessage::Connections => IpcMessage::PendingRequests {
+                requests: self.list_connections(),
+            },
+            IpcMessage::ApproveConnection { id } => reply(self.approve_connection(&id).await),
+            IpcMessage::ConnectDeny { id } => reply(self.connect.deny_connection(&id).await),
+            IpcMessage::Invitations => {
+                reply_with(self.connect.list_invitations().await, |invitations| {
+                    IpcMessage::InvitationsResponse { invitations }
+                })
+            }
+            IpcMessage::InviteDeliver { network, recipient } => reply(
                 self.connect
                     .deliver_invite(network.as_ref(), recipient)
-                    .await
-            }
+                    .await,
+            ),
             IpcMessage::InvitationAccept { id, hostname } => {
-                self.connect.accept_invitation(&id, hostname).await
+                reply(self.connect.accept_invitation(&id, hostname).await)
             }
-            IpcMessage::InvitationDecline { id } => self.connect.decline_invitation(&id).await,
+            IpcMessage::InvitationDecline { id } => {
+                reply(self.connect.decline_invitation(&id).await)
+            }
             IpcMessage::Ping {
                 peer,
                 count,
@@ -773,15 +854,10 @@ impl Daemon {
     }
 }
 
-/// Validate and persist one plain global key. A rejected value is reported
-/// as-is, ahead of any save failure, so the user sees why the value was wrong
-/// rather than a generic write error.
-#[allow(clippy::result_large_err)]
-fn save_global(
-    key: GlobalKey,
-    value: &str,
-    replace: bool,
-) -> std::result::Result<AppConfig, IpcMessage> {
+/// Validate and persist one global key. A rejected value is reported as-is,
+/// ahead of any save failure, so the user sees why the value was wrong rather
+/// than a generic write error.
+pub(super) fn save_global(key: GlobalKey, value: &str, replace: bool) -> OpResult<AppConfig> {
     let mut set_err = None;
     let saved = config::update_settings(|cfg| {
         if let Err(e) = config::config_set(cfg, key, value, replace) {
@@ -791,12 +867,14 @@ fn save_global(
         Ok(())
     });
     if let Some(e) = set_err {
-        return Err(ipc_err(e));
+        return op_err(e);
     }
-    saved.map_err(|e| ipc_err(format!("failed to save config: {e}")))
+    saved.map_err(|e| OpError::msg(format!("failed to save config: {e}")))
 }
 
 /// Host listeners, exit routing and service updates belong to the system instance.
+/// `ssh` is not listed: its setter refuses `on` in rootless mode and lets `off`
+/// through, the same as on any node without mesh SSH.
 fn rootless_request_supported(req: &IpcMessage) -> bool {
     match req {
         IpcMessage::SetOperator { .. }
@@ -806,8 +884,7 @@ fn rootless_request_supported(req: &IpcMessage) -> bool {
         IpcMessage::ConfigSet { key, .. } | IpcMessage::ConfigUnset { key } => !matches!(
             key,
             NodeKey::Global(
-                GlobalKey::Ssh
-                    | GlobalKey::SshPort
+                GlobalKey::SshPort
                     | GlobalKey::V4Bridge
                     | GlobalKey::AutoUpdate
                     | GlobalKey::PfPassthrough
@@ -826,7 +903,6 @@ mod tests {
     #[test]
     fn rootless_rejects_host_network_mutations() {
         for key in [
-            GlobalKey::Ssh,
             GlobalKey::V4Bridge,
             GlobalKey::AutoUpdate,
             GlobalKey::Dns,
@@ -844,6 +920,23 @@ mod tests {
         }));
         assert!(rootless_request_supported(&IpcMessage::Status));
         assert!(rootless_request_supported(&IpcMessage::Down));
+    }
+
+    /// `ssh off` and `config unset ssh` reach `ssh_config_set` in rootless mode,
+    /// which accepts them as a no-op and refuses `on` itself. The blanket
+    /// rootless rejection used to fail `off` too.
+    #[test]
+    fn rootless_passes_ssh_to_its_setter() {
+        for value in ["on", "off"] {
+            assert!(rootless_request_supported(&IpcMessage::ConfigSet {
+                key: NodeKey::Global(GlobalKey::Ssh),
+                value: value.into(),
+                replace: false
+            }));
+        }
+        assert!(rootless_request_supported(&IpcMessage::ConfigUnset {
+            key: NodeKey::Global(GlobalKey::Ssh)
+        }));
     }
 
     #[test]
@@ -882,5 +975,50 @@ mod tests {
         };
         assert!(Daemon::is_open_read(&request));
         assert!(Daemon::check_authorized(&request, None).is_none());
+    }
+
+    /// An operator may change most settings, but not the ones that choose
+    /// where the root daemon writes auto-accepted files.
+    #[cfg(unix)]
+    #[test]
+    fn download_target_settings_are_root_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().to_path_buf());
+        config::update_settings(|cfg| {
+            cfg.operator_uid = Some(4242);
+            Ok(())
+        })
+        .unwrap();
+        let operator = PeerIdentity::Unix {
+            uid: 4242,
+            gid: 4242,
+        };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        for key in [GlobalKey::DownloadDir, GlobalKey::DownloadUser] {
+            for request in [
+                IpcMessage::ConfigSet {
+                    key: NodeKey::Global(key),
+                    value: "/etc".into(),
+                    replace: false,
+                },
+                IpcMessage::ConfigUnset {
+                    key: NodeKey::Global(key),
+                },
+            ] {
+                let Some(IpcMessage::Error { message }) =
+                    Daemon::check_authorized(&request, Some(&operator))
+                else {
+                    panic!("an operator must not set {key:?}");
+                };
+                assert!(message.contains("only root"), "{message}");
+                assert!(Daemon::check_authorized(&request, Some(&root)).is_none());
+            }
+        }
+        let other = IpcMessage::ConfigSet {
+            key: NodeKey::Global(GlobalKey::AutoUpdate),
+            value: "on".into(),
+            replace: false,
+        };
+        assert!(Daemon::check_authorized(&other, Some(&operator)).is_none());
     }
 }

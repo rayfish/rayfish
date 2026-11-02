@@ -1,10 +1,11 @@
 //! CLI firewall + declarative-apply handlers and their parsers/renderers.
 
 use std::collections::{BTreeSet, HashSet};
+use std::io::IsTerminal;
 
 use crate::*;
 use firewall::Action;
-use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
+use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey, NodeStatus};
 
 #[derive(serde::Serialize)]
 struct FirewallStateOutput<'a> {
@@ -226,11 +227,8 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         };
         return ipc_firewall_test(req, probe).await;
     }
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    let resp = ipc::recv(&mut stream).await?;
-    match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+    match ipc_request(req).await? {
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallState {
             default_inbound,
             default_outbound,
@@ -261,9 +259,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
 
 /// `ray firewall test`: send the request [`to_ipc`] built and print the verdict.
 async fn ipc_firewall_test(req: ipc::IpcMessage, probe: Probe) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(req).await? {
         ipc::IpcMessage::FirewallTestResult {
             peer_name,
             identity,
@@ -447,11 +443,9 @@ pub(crate) async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
         _ => None,
     };
     let req = ssh_to_ipc(action);
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, req).await?;
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = ipc_request(req).await?;
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_message(&message)?,
         ipc::IpcMessage::FirewallSshState {
             enabled,
             port,
@@ -604,23 +598,23 @@ fn rule_row(index: usize, r: &ipc::FirewallRuleView) -> Vec<layout::Cell> {
     } else {
         style::green(&action_s)
     };
-    let sugg = r
-        .suggested_by
+    let suggested_by = r.suggested_by.as_deref().map(style::printable);
+    let sugg = suggested_by
         .as_ref()
         .map(|s| style::marker(&format!("suggested by {s}")))
         .unwrap_or_default();
-    let sugg_plain = r
-        .suggested_by
+    let sugg_plain = suggested_by
         .as_ref()
         .map(|s| format!("·suggested by {s}·"))
         .unwrap_or_default();
+    let peer = style::printable(&r.peer);
     vec![
         layout::Cell::new(index.to_string(), style::faint(&index.to_string())),
         layout::Cell::new(direction.clone(), style::value(&direction)),
         layout::Cell::new(action_s.clone(), action),
         layout::Cell::new(protocol.clone(), style::value(&protocol)),
         layout::Cell::right(r.port.clone(), style::value(&r.port)),
-        layout::Cell::new(r.peer.clone(), style::value(&r.peer)),
+        layout::Cell::new(peer.to_string(), style::value(&peer)),
         layout::Cell::new(r.network.clone(), style::faint(&r.network)),
         layout::Cell::new(sugg_plain, sugg),
     ]
@@ -629,22 +623,19 @@ fn rule_row(index: usize, r: &ipc::FirewallRuleView) -> Vec<layout::Cell> {
 /// `ray firewall pending`: fetch the queued suggestions, then either run the
 /// interactive picker (TTY) or print a static table (piped / `--json`).
 pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallPending {
-            network: network.to_string(),
-        },
-    )
+    let pending = ipc_request(ipc::IpcMessage::FirewallPending {
+        network: network.to_string(),
+    })
     .await?;
-    let rules = match ipc::recv(&mut stream).await? {
+    let rules = match pending {
         ipc::IpcMessage::FirewallPendingResponse { rules, .. } => rules,
         ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
         other => fail_unexpected(&other),
     };
 
     // JSON and non-interactive output stop before the picker can mutate rules.
-    if json_enabled() || rules.is_empty() || !style::is_enabled() {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !use_pending_picker(json_enabled(), rules.is_empty(), interactive) {
         printout(&PendingFirewallOutput {
             network,
             rules: &rules,
@@ -661,17 +652,13 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         println!("  {}", style::faint("no changes"));
         return Ok(());
     }
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallResolveSuggestions {
-            network: network.to_string(),
-            accept: resolution.accept,
-            deny: resolution.deny,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::FirewallResolveSuggestions {
+        network: network.to_string(),
+        accept: resolution.accept,
+        deny: resolution.deny,
+    })
+    .await?
+    {
         ipc::IpcMessage::Ok { message } => {
             println!("  {} {}", style::check(), style::value(&message));
         }
@@ -679,6 +666,14 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         other => fail_unexpected(&other),
     }
     Ok(())
+}
+
+/// Whether `ray firewall pending` opens the picker. It reads keys from stdin
+/// and draws on stdout, so it needs both to be a terminal; colour being off
+/// (`NO_COLOR`) is no reason to skip it, and colour being forced on a pipe is
+/// no reason to start it.
+fn use_pending_picker(json: bool, no_rules: bool, interactive: bool) -> bool {
+    !json && !no_rules && interactive
 }
 
 /// Parse a `--allow`/`--deny` value into `(peer, proto:ports-list)`.
@@ -721,15 +716,11 @@ pub(crate) async fn ipc_firewall_suggest(
 ) -> Result<()> {
     use ray_proto::HostSuggestions;
 
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallSuggestions {
-            network: network.to_string(),
-        },
-    )
-    .await?;
-    let mut suggestions = match ipc::recv(&mut stream).await? {
+    let mut suggestions = match ipc_request(ipc::IpcMessage::FirewallSuggestions {
+        network: network.to_string(),
+    })
+    .await?
+    {
         ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => suggestions,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
@@ -853,6 +844,8 @@ pub(crate) async fn ipc_apply(
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
     let mut removal_failures = false;
     let mut ssh_failures = false;
+    let mut network_failures = false;
+    let mut invite_failures = false;
     for (net_name, net_firewall) in &expanded.networks {
         let is_active = active_names.contains(net_name.as_str());
         // Create-if-absent (always a closed network).
@@ -863,6 +856,7 @@ pub(crate) async fn ipc_apply(
                 style::bold(net_name),
             );
             if let Err(e) = ipc_apply_create(net_name).await {
+                network_failures = true;
                 eprintln!("{}  create failed: {e}", style::red("  !"));
                 continue;
             }
@@ -878,26 +872,22 @@ pub(crate) async fn ipc_apply(
         // spec's set; without it, merge into the live set (so `apply` never
         // silently drops subjects authored out-of-band - use --prune for that).
         let to_publish = if prune {
-            apply::suggested_firewall(net_firewall)
+            Ok(apply::suggested_firewall(net_firewall))
         } else {
-            let mut live = ipc_firewall_suggestions_get(net_name)
-                .await
-                .unwrap_or_default();
-            // Merge spec subjects over live (spec wins on conflict).
-            for (subj, rules) in net_firewall {
-                live.insert(
-                    subj.clone(),
-                    ray_proto::policy::HostSuggestions {
-                        allows: rules.allows.clone(),
-                        denies: rules.denies.clone(),
-                    },
-                );
-            }
-            live
+            merge_live_suggestions(ipc_firewall_suggestions_get(net_name).await, net_firewall)
         };
-        match ipc_firewall_suggest_set(net_name, to_publish).await {
-            Ok(msg) => println!("{}   {msg}", style::faint("→")),
-            Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
+        match to_publish {
+            Ok(to_publish) => match ipc_firewall_suggest_set(net_name, to_publish).await {
+                Ok(msg) => println!("{}   {msg}", style::faint("→")),
+                Err(e) => {
+                    network_failures = true;
+                    eprintln!("{}   suggest failed: {e}", style::red("  !"));
+                }
+            },
+            Err(e) => {
+                network_failures = true;
+                eprintln!("{}   suggest skipped: {e:#}", style::red("  !"));
+            }
         }
 
         // Reconcile this network's concrete hostnames against both the
@@ -1098,11 +1088,14 @@ pub(crate) async fn ipc_apply(
                         cmd,
                         style::faint(&format!("→ {code}"))
                     ),
-                    Err(e) => eprintln!(
-                        "  {}  {cmd}  {}",
-                        style::red(host),
-                        style::red(&e.to_string())
-                    ),
+                    Err(e) => {
+                        invite_failures = true;
+                        eprintln!(
+                            "  {}  {cmd}  {}",
+                            style::red(host),
+                            style::red(&e.to_string())
+                        );
+                    }
                 }
             } else {
                 println!("  {}  {cmd}", style::bold(host));
@@ -1126,10 +1119,28 @@ pub(crate) async fn ipc_apply(
         }
         false
     };
+    anyhow::ensure!(
+        !network_failures,
+        "some networks could not be created or published"
+    );
     anyhow::ensure!(!removal_failures, "some members could not be removed");
     anyhow::ensure!(!ssh_failures, "some SSH grants could not be applied");
     anyhow::ensure!(!delivery_failures, "some invitations could not be queued");
+    anyhow::ensure!(!invite_failures, "some invites could not be minted");
     Ok(())
+}
+
+/// The suggestion set `ray apply` publishes without `--prune`: the live set
+/// with the spec's subjects merged over it (spec wins on conflict), so
+/// subjects authored out-of-band survive. If the live set cannot be read the
+/// merge fails: publishing the spec alone would silently drop those subjects.
+fn merge_live_suggestions(
+    live: Result<ray_proto::SuggestedFirewall>,
+    spec: &apply::DeployNetwork,
+) -> Result<ray_proto::SuggestedFirewall> {
+    let mut live = live.context("reading the live suggestions to merge into")?;
+    live.extend(apply::suggested_firewall(spec));
+    Ok(live)
 }
 
 /// One private invitation planned by `ray apply --invite-missing`.
@@ -1337,13 +1348,7 @@ fn membership_diff_for_apply(
 }
 
 async fn ipc_managed_machines_for_apply() -> Result<Vec<ipc::ManagedMachineInfo>> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::ManagedMachines { probe: true },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::ManagedMachines { probe: true }).await? {
         ipc::IpcMessage::ManagedMachinesResponse { machines } => Ok(machines),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected managed-machines response: {other:?}"),
@@ -1489,14 +1494,12 @@ pub(crate) fn resolve_host_identity(
 /// plus every network's roster. The identity is needed to resolve an alias that
 /// names the coordinator itself.
 pub(crate) async fn ipc_status_full() -> Result<(EndpointId, Vec<ipc::NetworkStatus>)> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::StatusResponse {
+    match ipc_request(ipc::IpcMessage::Status).await? {
+        ipc::IpcMessage::StatusResponse(NodeStatus {
             endpoint_id,
             networks,
             ..
-        } => Ok((endpoint_id, networks)),
+        }) => Ok((endpoint_id, networks)),
         other => anyhow::bail!("unexpected status response: {other:?}"),
     }
 }
@@ -1553,18 +1556,14 @@ fn resolve_identity_hosts(
 }
 
 pub(crate) async fn ipc_apply_create(name: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Create {
-            mode: ray_proto::GroupMode::Restricted,
-            name: Some(name.to_string()),
-            hostname: None,
-            transport: None,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::Create {
+        mode: ray_proto::GroupMode::Restricted,
+        name: Some(name.to_string()),
+        hostname: None,
+        transport: None,
+    })
+    .await?
+    {
         ipc::IpcMessage::Created { name: n, .. } => {
             println!("{}   created '{n}'", style::faint("→"));
             Ok(())
@@ -1577,15 +1576,11 @@ pub(crate) async fn ipc_apply_create(name: &str) -> Result<()> {
 pub(crate) async fn ipc_firewall_suggestions_get(
     network: &str,
 ) -> Result<ray_proto::SuggestedFirewall> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallSuggestions {
-            network: network.to_string(),
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::FirewallSuggestions {
+        network: network.to_string(),
+    })
+    .await?
+    {
         ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => Ok(suggestions),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected suggestions response: {other:?}"),
@@ -1596,16 +1591,12 @@ pub(crate) async fn ipc_firewall_suggest_set(
     network: &str,
     suggestions: ray_proto::SuggestedFirewall,
 ) -> Result<String> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::FirewallSuggest {
-            network: network.to_string(),
-            suggestions,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::FirewallSuggest {
+        network: network.to_string(),
+        suggestions,
+    })
+    .await?
+    {
         ipc::IpcMessage::Ok { message } => Ok(message),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected suggest response: {other:?}"),
@@ -1613,18 +1604,14 @@ pub(crate) async fn ipc_firewall_suggest_set(
 }
 
 pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> Result<String> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::InviteCreate {
-            network: network.to_string(),
-            expires_secs: 7 * 24 * 3600,
-            hostname,
-            reusable: false,
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::InviteCreate {
+        network: network.to_string(),
+        expires_secs: 7 * 24 * 3600,
+        hostname,
+        reusable: false,
+    })
+    .await?
+    {
         ipc::IpcMessage::InviteCreated { code, .. } => Ok(code),
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected invite response: {other:?}"),
@@ -1651,6 +1638,35 @@ networks:
         ))
         .unwrap();
         (spec, invited)
+    }
+
+    #[test]
+    fn pending_picker_needs_a_terminal_not_colour() {
+        assert!(use_pending_picker(false, false, true));
+        assert!(!use_pending_picker(false, false, false));
+        assert!(!use_pending_picker(true, false, true));
+        assert!(!use_pending_picker(false, true, true));
+    }
+
+    /// Without `--prune`, a failed read of the live set must stop the publish
+    /// rather than replace the live set with the spec alone.
+    #[test]
+    fn merge_fails_when_live_suggestions_cannot_be_read() {
+        let spec: apply::DeployNetwork =
+            serde_yml::from_str("server:\n  allows:\n    bob: tcp:22\n").unwrap();
+        assert!(merge_live_suggestions(Err(anyhow::anyhow!("daemon down")), &spec).is_err());
+
+        let mut live = ray_proto::SuggestedFirewall::new();
+        live.insert(
+            "other".into(),
+            ray_proto::policy::HostSuggestions {
+                allows: [("*".to_string(), "icmp".to_string())].into(),
+                denies: Default::default(),
+            },
+        );
+        let merged = merge_live_suggestions(Ok(live), &spec).unwrap();
+        assert!(merged.contains_key("other"));
+        assert_eq!(merged["server"].allows["bob"], "tcp:22");
     }
 
     #[test]

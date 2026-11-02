@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::SecretKey;
-use ray_proto::ipc::{self, IpcMessage};
+use ray_proto::ipc::{self, IpcMessage, NodeStatus};
 use tokio::time::timeout;
 use tun_rs::{AsyncDevice, DeviceBuilder};
 use windows_sys::Win32::UI::Shell::{CSIDL_PROGRAM_FILES, SHGFP_TYPE_CURRENT, SHGetFolderPathW};
@@ -61,9 +61,9 @@ async fn require_disposable_standby() -> Result<()> {
     .await
     .context("the installed service did not answer its status")??;
     ensure!(
-        matches!(response, IpcMessage::StatusResponse {
+        matches!(response, IpcMessage::StatusResponse(NodeStatus {
         active: false, networks, inactive_networks, pending_networks, ..
-    } if networks.is_empty() && inactive_networks.is_empty() && pending_networks.is_empty()),
+    }) if networks.is_empty() && inactive_networks.is_empty() && pending_networks.is_empty()),
         "the kernel echo test requires an empty installed service on standby"
     );
     Ok(())

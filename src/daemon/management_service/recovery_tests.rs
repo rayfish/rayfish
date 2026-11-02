@@ -65,7 +65,11 @@ pub(super) async fn peer(key: &SecretKey) -> Endpoint {
         .unwrap()
 }
 
-async fn exchange(peer: &Endpoint, server: &Endpoint, message: ManagementMsg) -> ManagementMsg {
+pub(super) async fn exchange(
+    peer: &Endpoint,
+    server: &Endpoint,
+    message: ManagementMsg,
+) -> ManagementMsg {
     tokio::time::timeout(Duration::from_secs(10), async {
         let connection = peer
             .connect(server.addr(), crate::management::ALPN)

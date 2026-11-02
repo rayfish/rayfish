@@ -48,7 +48,7 @@ pub(crate) fn outgoing_hostname(network_name: &str) -> Option<String> {
 /// reads the hello regardless of which side first established the mesh link.
 /// Runs only while a rename is in flight, so steady state does no extra dialing.
 pub(crate) async fn drain_pending_rename(
-    roster: &[Member],
+    roster: &MemberList,
     network_name: &str,
     my_identity: EndpointId,
     device_cert: &Option<control::DeviceCert>,

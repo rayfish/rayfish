@@ -25,6 +25,30 @@ type ServedFramed<S> = Framed<S, MsgpackCodec<IpcMessage>>;
 /// briefly unreachable doesn't stay flagged offline forever without a re-probe.
 const STATUS_OFFLINE_WINDOW: Duration = Duration::from_secs(300);
 
+/// Most probes one `ray ping` sends.
+const PING_MAX_COUNT: u32 = 100;
+/// Longest wait between two probes of one `ray ping`. With the count cap it
+/// bounds how long one request can hold its IPC connection and the daemon task
+/// serving it.
+const PING_MAX_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many probes a `ray ping` sends and how far apart, after clamping what
+/// the client asked for.
+#[derive(Debug, PartialEq, Eq)]
+struct PingPlan {
+    count: u32,
+    interval: Duration,
+}
+
+impl PingPlan {
+    fn new(count: u32, interval_ms: u64) -> Self {
+        Self {
+            count: count.clamp(1, PING_MAX_COUNT),
+            interval: Duration::from_millis(interval_ms).min(PING_MAX_INTERVAL),
+        }
+    }
+}
+
 const RTT_WINDOW: usize = 32;
 const RTT_MIN_SAMPLES: usize = 8;
 const HIGH_RTT_MS: f64 = 150.0;
@@ -349,8 +373,8 @@ mod connection_quality_tests {
 impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// snapshot the daemon's status (identity, networks, peers).
-    pub fn status(&self) -> IpcMessage {
-        let hostname_snapshot = self.dns.hostname_table.try_read().ok();
+    pub fn status(&self) -> NodeStatus {
+        let hostname_snapshot = self.registry.dns.hostname_table.try_read().ok();
         let my_id = self.transport.endpoint.id();
         let saved = config::load().ok();
         // Direct-connection networks are flagged in config; collect their names
@@ -465,7 +489,7 @@ impl Daemon {
             }
         }
 
-        IpcMessage::StatusResponse {
+        NodeStatus {
             endpoint_id: self.transport.endpoint.id(),
             mdns_enabled: self.mdns.enabled(),
             auto_update: self.auto_update,
@@ -473,10 +497,10 @@ impl Daemon {
             identity: Some(self.registry.own_identity()),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             networks: statuses,
-            packets_rx: self.stats.packets_rx.get(),
-            packets_tx: self.stats.packets_tx.get(),
-            bytes_rx: self.stats.bytes_rx.get(),
-            bytes_tx: self.stats.bytes_tx.get(),
+            packets_rx: self.transport.stats.packets_rx.get(),
+            packets_tx: self.transport.stats.packets_tx.get(),
+            bytes_rx: self.transport.stats.bytes_rx.get(),
+            bytes_tx: self.transport.stats.bytes_tx.get(),
             pending_files: self.files.pending_files.lock().unwrap().len(),
             pending_connects: self.connect.pending_connects.len(),
             connection_errors: {
@@ -587,11 +611,7 @@ impl Daemon {
             .collect();
         // Our own user identity: the cert's user id on a paired device, else our
         // own endpoint id (mirrors the `try_auto_accept_file` "own device" rule).
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or(my_id);
+        let own_user = self.registry.own_identity();
         // The exit peer we route internet traffic through (`ray exit-node use`),
         // matched the way the roster keys members: by device id, or by the user
         // identity a paired multi-device peer is stored under.
@@ -693,7 +713,10 @@ impl Daemon {
     /// Sanitization: the bundle is built only from already-public material: the
     /// `StatusResponse` (which never carries secret keys), counters, and the log
     /// files. It never touches `secret_key` or `network_secret_key`.
-    pub(crate) fn build_report(&self, peer: Option<&PeerIdentity>) -> IpcMessage {
+    ///
+    /// Running `uname`, reading the logs and compressing the bundle all block,
+    /// so that part runs on the blocking pool rather than an async worker.
+    pub(crate) async fn build_report(&self, peer: Option<&PeerIdentity>) -> IpcMessage {
         use std::fmt::Write as _;
 
         let requester = peer.map(PeerIdentity::report_requester);
@@ -702,28 +725,17 @@ impl Daemon {
         let version = env!("CARGO_PKG_VERSION");
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
-        let uname = std::process::Command::new("uname")
-            .arg("-a")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
         let uptime = self.start.elapsed().as_secs();
         let active = self.active.load(Ordering::SeqCst);
+        // Everything after the `uname` line, which the blocking part fills in.
         let mut sysinfo = String::new();
-        let _ = writeln!(sysinfo, "rayfish {version}");
-        let _ = writeln!(sysinfo, "os: {os}  arch: {arch}");
-        if !uname.is_empty() {
-            let _ = writeln!(sysinfo, "uname: {uname}");
-        }
         let _ = writeln!(sysinfo, "endpoint_id: {}", self.transport.endpoint.id());
         let _ = writeln!(sysinfo, "uptime_secs: {uptime}");
         let _ = writeln!(sysinfo, "active: {active}");
         let _ = writeln!(sysinfo, "networks: {}", self.registry.networks.len());
 
         // --- metrics.txt ---
-        let snap = self.stats.snapshot(self.start);
+        let snap = self.transport.stats.snapshot(self.start);
         let total_drops: u64 = snap.drops.iter().map(|(_, c)| c).sum();
         let mut metrics = String::new();
         let _ = writeln!(metrics, "packets_rx: {}", snap.packets_rx);
@@ -738,29 +750,48 @@ impl Daemon {
         // --- status.txt (sanitized: StatusResponse carries no secrets) ---
         let status = format!("{:#?}", self.status());
 
-        // --- collect files for the tarball ---
-        let mut files: Vec<(String, Vec<u8>)> = vec![
-            ("sysinfo.txt".to_string(), sysinfo.into_bytes()),
-            ("metrics.txt".to_string(), metrics.into_bytes()),
-            ("status.txt".to_string(), status.into_bytes()),
-        ];
-        files.extend(collect_recent_logs());
-        let has_panics = files.iter().any(|(name, _)| name == "logs/panic.log");
+        let written = tokio::task::spawn_blocking(move || {
+            let uname = std::process::Command::new("uname")
+                .arg("-a")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let mut head = String::new();
+            let _ = writeln!(head, "rayfish {version}");
+            let _ = writeln!(head, "os: {os}  arch: {arch}");
+            if !uname.is_empty() {
+                let _ = writeln!(head, "uname: {uname}");
+            }
 
-        // --- write the gzipped tarball ---
-        // The daemon is root and the temp directory is attacker-controlled, so
-        // allocation, writes, permissions, and ownership all stay on one
-        // exclusively-created file descriptor. A random name also prevents
-        // same-second collisions.
-        #[cfg(unix)]
-        let dir = std::path::PathBuf::from("/tmp");
-        // No fixed `/tmp` on Windows, and the service account's own temp
-        // directory is where a LocalSystem process may write.
-        #[cfg(windows)]
-        let dir = std::env::temp_dir();
-        let path = match create_report_bundle(&dir, &files, requester.as_ref()) {
-            Ok(path) => path,
-            Err(e) => return ipc_err(format!("failed to write report bundle: {e}")),
+            // --- collect files for the tarball ---
+            let mut files: Vec<(String, Vec<u8>)> = vec![
+                ("sysinfo.txt".to_string(), (head + &sysinfo).into_bytes()),
+                ("metrics.txt".to_string(), metrics.into_bytes()),
+                ("status.txt".to_string(), status.into_bytes()),
+            ];
+            files.extend(collect_recent_logs());
+            let has_panics = files.iter().any(|(name, _)| name == "logs/panic.log");
+
+            // --- write the gzipped tarball ---
+            // The daemon is root and the temp directory is attacker-controlled,
+            // so allocation, writes, permissions, and ownership all stay on one
+            // exclusively-created file descriptor. A random name also prevents
+            // same-second collisions.
+            #[cfg(unix)]
+            let dir = std::path::PathBuf::from("/tmp");
+            // No fixed `/tmp` on Windows, and the service account's own temp
+            // directory is where a LocalSystem process may write.
+            #[cfg(windows)]
+            let dir = std::env::temp_dir();
+            create_report_bundle(&dir, &files, requester.as_ref()).map(|path| (path, has_panics))
+        })
+        .await;
+        let (path, has_panics) = match written {
+            Ok(Ok(written)) => written,
+            Ok(Err(e)) => return ipc_err(format!("failed to write report bundle: {e}")),
+            Err(e) => return ipc_err(format!("report task failed: {e}")),
         };
 
         let issue_title = if has_panics {
@@ -867,7 +898,7 @@ impl Daemon {
         let id = self.resolve_peer_name(name).await?;
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state.members.get(&id) {
+            if let Some(m) = state.group.members.get(&id) {
                 let display = m
                     .hostname
                     .clone()
@@ -912,7 +943,7 @@ impl Daemon {
     fn member_ipv6(&self, id: &EndpointId) -> Option<Ipv6Addr> {
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if state.members.is_member(id) {
+            if state.group.members.is_member(id) {
                 return Some(derive_ipv6(id));
             }
         }
@@ -952,9 +983,10 @@ impl Daemon {
         };
         let network = route.network.to_string();
         drop(route);
+        let plan = PingPlan::new(count, interval_ms);
         let run = super::ping::run_probes(
-            count,
-            interval_ms,
+            plan.count,
+            plan.interval,
             self.protocol_router.pending_pongs(),
             || self.registry.peers.lookup_v6(&ip).map(|route| route.conn),
         )
@@ -1472,6 +1504,26 @@ pub(crate) fn saved_network_status(
 #[cfg(test)]
 mod log_tests {
     use super::*;
+
+    /// A client cannot ask for a ping that sleeps without bound between probes.
+    #[test]
+    fn ping_plan_clamps_count_and_interval() {
+        assert_eq!(
+            PingPlan::new(5, 250),
+            PingPlan {
+                count: 5,
+                interval: Duration::from_millis(250),
+            }
+        );
+        assert_eq!(
+            PingPlan::new(u32::MAX, u64::MAX),
+            PingPlan {
+                count: PING_MAX_COUNT,
+                interval: PING_MAX_INTERVAL,
+            }
+        );
+        assert_eq!(PingPlan::new(0, 0).count, 1);
+    }
 
     const CUTOFF: &str = "2026-08-15T12:00:00.000000Z";
 

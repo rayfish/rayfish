@@ -3,13 +3,20 @@
 use super::*;
 
 /// Read the most recent rolling log files from [`crate::logdir::log_dir`],
-/// newest first, capped at ~3 MB total so report bundles stay small. Returns
+/// newest first, capped at 3 MB total so report bundles stay small. Returns
 /// `(archive_name, bytes)` entries placed under `logs/` in the tarball.
+/// Blocking file I/O: call it off the async workers.
 pub(super) fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
     const MAX_TOTAL: u64 = 3 * 1024 * 1024;
 
-    let dir = crate::logdir::log_dir();
-    let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+    collect_recent_logs_in(&crate::logdir::log_dir(), MAX_TOTAL)
+}
+
+/// [`collect_recent_logs`] over `dir`, reading at most `max_total` bytes. A
+/// file that does not fit in what is left contributes its newest bytes, its
+/// tail, and is never read past that.
+fn collect_recent_logs_in(dir: &Path, max_total: u64) -> Vec<(String, Vec<u8>)> {
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -27,20 +34,34 @@ pub(super) fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
     entries.reverse();
 
     let mut out = Vec::new();
-    let mut total = 0u64;
+    let mut remaining = max_total;
     for path in entries {
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        total += bytes.len() as u64;
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            out.push((format!("logs/{name}"), bytes));
-        }
-        if total >= MAX_TOTAL {
+        if remaining == 0 {
             break;
         }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(bytes) = read_tail(&path, remaining) else {
+            continue;
+        };
+        remaining = remaining.saturating_sub(bytes.len() as u64);
+        out.push((format!("logs/{name}"), bytes));
     }
     out
+}
+
+/// The last `limit` bytes of the file at `path`, or all of it when shorter.
+fn read_tail(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(limit);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Write `files` as a gzipped tar archive at a new, non-symlink `path`.
@@ -133,6 +154,8 @@ fn hand_bundle_to_requester(file: &File, owner: Option<&ReportRequester>) -> std
 
     let given_to_requester = match owner {
         Some(ReportRequester::Unix { uid, gid }) => {
+            // SAFETY: `fchown` only reads its integer arguments, and the fd
+            // belongs to `file`, which is open for the whole call.
             let rc = unsafe { libc::fchown(file.as_raw_fd(), *uid, *gid) };
             if rc == 0 {
                 true
@@ -177,6 +200,8 @@ fn requester_tag(owner: Option<&ReportRequester>) -> String {
 fn requester_uid(owner: Option<&ReportRequester>) -> u32 {
     match owner {
         Some(ReportRequester::Unix { uid, .. }) => *uid,
+        // SAFETY: `geteuid` takes no arguments, cannot fail and touches no
+        // memory of ours.
         None => unsafe { libc::geteuid() },
     }
 }
@@ -286,7 +311,10 @@ pub(super) fn create_report_bundle(
 
 #[cfg(test)]
 mod report_tests {
-    use super::{ReportRequester, collect_recent_logs, requester_tag, sweep_prior_bundles};
+    use super::{
+        ReportRequester, collect_recent_logs, collect_recent_logs_in, requester_tag,
+        sweep_prior_bundles,
+    };
 
     /// Some principal that is not this process, for asserting the sweep leaves
     /// other people's bundles alone.
@@ -355,6 +383,25 @@ mod report_tests {
         assert!(!stale.exists(), "the caller's previous bundle was kept");
         assert!(theirs.exists(), "another principal's bundle was deleted");
         assert!(unrelated.exists(), "an unrelated file was deleted");
+    }
+
+    /// The cap holds per file: a log bigger than what is left contributes only
+    /// its newest bytes, and older files past the cap are left out.
+    #[test]
+    fn collected_logs_stay_within_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let newest: Vec<u8> = (0..100u8).collect();
+        std::fs::write(dir.path().join("rayfish.log.2026-01-02"), &newest).unwrap();
+        std::fs::write(dir.path().join("rayfish.log.2026-01-01"), [7u8; 50]).unwrap();
+
+        let logs = collect_recent_logs_in(dir.path(), 40);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].0, "logs/rayfish.log.2026-01-02");
+        assert_eq!(logs[0].1, newest[60..]);
+
+        let logs = collect_recent_logs_in(dir.path(), 120);
+        let sizes: Vec<usize> = logs.iter().map(|(_, bytes)| bytes.len()).collect();
+        assert_eq!(sizes, [100, 20]);
     }
 
     #[test]

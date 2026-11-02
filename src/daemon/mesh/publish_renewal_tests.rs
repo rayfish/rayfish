@@ -1,26 +1,19 @@
-use super::*;
+//! A coordinator's lease renewal first adopts a newer canonical record, so it
+//! cannot republish over another coordinator's edit. The daemon's own pkarr
+//! client talks to a local relay whose reply each scenario picks.
+
+use std::sync::Mutex;
+
 use iroh::{RelayMode, endpoint::presets, protocol::Router};
-use std::ffi::OsString;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::oneshot,
 };
 use url::Url;
 
-struct ConfigEnv(Option<OsString>);
-
-impl Drop for ConfigEnv {
-    fn drop(&mut self) {
-        // SAFETY: each fixture retains CONFIG_ENV_LOCK until this guard drops.
-        unsafe {
-            match &self.0 {
-                Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
-                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
-            }
-        }
-    }
-}
+use super::*;
+use crate::daemon::mesh::destruction::tests::ConfigDir;
 
 enum CanonicalReply {
     Record(SignedPacket),
@@ -28,98 +21,145 @@ enum CanonicalReply {
     Unavailable,
 }
 
+/// The canonical reply is set after the daemon starts, since the record names
+/// a blob that holds the daemon's own identity.
+type Canonical = Arc<Mutex<CanonicalReply>>;
+
 struct TestRelay {
     url: Url,
+    canonical: Canonical,
     published: oneshot::Receiver<SignedPacket>,
-    stop: CancellationToken,
     task: JoinHandle<()>,
 }
 
+impl Drop for TestRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl TestRelay {
-    async fn start(network: EndpointId, canonical: CanonicalReply) -> Self {
+    async fn start(network: EndpointId) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap())
             .parse()
             .unwrap();
         let (published, receiver) = oneshot::channel();
-        let stop = CancellationToken::new();
-        let token = stop.clone();
-        let task = tokio::spawn(async move {
-            let mut published = Some(published);
-            loop {
-                let accepted = tokio::select! {
-                    _ = token.cancelled() => break,
-                    accepted = listener.accept() => accepted,
-                };
-                let (mut stream, _) = accepted.unwrap();
-                let mut request = Vec::new();
-                let body_start = loop {
-                    if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                        break index + 4;
-                    }
-                    let mut chunk = [0; 2048];
-                    let count = stream.read(&mut chunk).await.unwrap();
-                    assert_ne!(count, 0, "an HTTP request must include its headers");
-                    request.extend_from_slice(&chunk[..count]);
-                    assert!(request.len() <= 8192);
-                };
-                let header = String::from_utf8(request[..body_start].to_vec()).unwrap();
-                let body_length = header
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                assert!(body_length <= SignedPacket::MAX_BYTES);
-                while request.len() < body_start + body_length {
-                    let mut chunk = [0; 2048];
-                    let count = stream.read(&mut chunk).await.unwrap();
-                    assert_ne!(count, 0, "an HTTP body must be complete");
-                    request.extend_from_slice(&chunk[..count]);
+        let published = Arc::new(Mutex::new(Some(published)));
+        let canonical: Canonical = Arc::new(Mutex::new(CanonicalReply::Missing));
+        let task = tokio::spawn({
+            let canonical = Arc::clone(&canonical);
+            async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        continue;
+                    };
+                    let canonical = Arc::clone(&canonical);
+                    let published = Arc::clone(&published);
+                    // The daemon's other discovery traffic shares this relay; one
+                    // connection it drops must not stop the others being served.
+                    tokio::spawn(async move {
+                        let _ = serve(stream, network, &canonical, &published).await;
+                    });
                 }
-                let first = header.lines().next().unwrap();
-                let is_network = first
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .ends_with(&network.to_z32());
-                let (status, body) = if first.starts_with("PUT ") && is_network {
-                    let packet = SignedPacket::from_relay_payload(
-                        &network,
-                        &request[body_start..body_start + body_length],
-                    )
-                    .unwrap();
-                    if let Some(sender) = published.take() {
-                        sender.send(packet).unwrap();
-                    }
-                    ("200 OK", Vec::new())
-                } else if is_network {
-                    match &canonical {
-                        CanonicalReply::Record(packet) => ("200 OK", packet.to_relay_payload()),
-                        CanonicalReply::Missing => ("404 Not Found", Vec::new()),
-                        CanonicalReply::Unavailable => ("503 Service Unavailable", Vec::new()),
-                    }
-                } else {
-                    // The separate destruction-discovery record is absent.
-                    ("404 Not Found", Vec::new())
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-                stream.write_all(&body).await.unwrap();
             }
         });
         Self {
             url,
+            canonical,
             published: receiver,
-            stop,
             task,
         }
     }
+
+    fn reply(&self, reply: CanonicalReply) {
+        *self.canonical.lock().unwrap() = reply;
+    }
+
+    /// Point the daemon's discovery (and so its pkarr client) at this relay.
+    fn configure(&self) {
+        config::update_settings(|cfg| {
+            cfg.mdns_enabled = false;
+            cfg.discovery_dns = config::ServerOverride {
+                servers: vec![self.url.to_string()],
+                replace: true,
+            };
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+async fn serve(
+    mut stream: TcpStream,
+    network: EndpointId,
+    canonical: &Mutex<CanonicalReply>,
+    published: &Mutex<Option<oneshot::Sender<SignedPacket>>>,
+) -> Result<()> {
+    let mut request = Vec::new();
+    let body_start = loop {
+        if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            break index + 4;
+        }
+        let mut chunk = [0; 2048];
+        let count = stream.read(&mut chunk).await?;
+        anyhow::ensure!(count != 0, "an HTTP request must include its headers");
+        request.extend_from_slice(&chunk[..count]);
+        anyhow::ensure!(request.len() <= 8192, "oversized test request");
+    };
+    let header = String::from_utf8(request[..body_start].to_vec())?;
+    let body_length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    anyhow::ensure!(
+        body_length <= SignedPacket::MAX_BYTES,
+        "oversized test body"
+    );
+    while request.len() < body_start + body_length {
+        let mut chunk = [0; 2048];
+        let count = stream.read(&mut chunk).await?;
+        anyhow::ensure!(count != 0, "an HTTP body must be complete");
+        request.extend_from_slice(&chunk[..count]);
+    }
+    let first = header.lines().next().unwrap_or_default();
+    let is_network = first
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|path| path.ends_with(&network.to_z32()));
+    let (status, body) = if first.starts_with("PUT ") && is_network {
+        let packet = SignedPacket::from_relay_payload(
+            &network,
+            &request[body_start..body_start + body_length],
+        )?;
+        if let Some(sender) = published.lock().unwrap().take() {
+            let _ = sender.send(packet);
+        }
+        ("200 OK", Vec::new())
+    } else if first.starts_with("PUT ") {
+        ("200 OK", Vec::new())
+    } else if is_network {
+        match &*canonical.lock().unwrap() {
+            CanonicalReply::Record(packet) => ("200 OK", packet.to_relay_payload().to_vec()),
+            CanonicalReply::Missing => ("404 Not Found", Vec::new()),
+            CanonicalReply::Unavailable => ("503 Service Unavailable", Vec::new()),
+        }
+    } else {
+        // The separate destruction-discovery record is absent.
+        ("404 Not Found", Vec::new())
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    Ok(())
 }
 
 fn member(identity: EndpointId, coordinator: bool) -> Member {
@@ -137,8 +177,14 @@ fn member(identity: EndpointId, coordinator: bool) -> Member {
 
 fn network_state(key: &SecretKey, members: Vec<Member>) -> SharedNetworkState {
     let mut state = NetworkState {
-        members: MemberList::from_members(members),
-        approved: ApprovedList::new(),
+        group: GroupBlob {
+            members: MemberList::from(members),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some("test".into()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        },
         snapshot: None,
         snapshot_commit: Arc::new(AsyncMutex::new(())),
         destroyed: false,
@@ -147,12 +193,9 @@ fn network_state(key: &SecretKey, members: Vec<Member>) -> SharedNetworkState {
         network_secret_key: Some(key.clone()),
         network_public_key: key.public(),
         network_name: Some("test".into()),
-        group_name: Some("test".into()),
         mode: GroupMode::Restricted,
-        suggested_firewall: SuggestedFirewall::default(),
-        reusable_keys: BTreeMap::new(),
-        nullifiers: BTreeSet::new(),
         last_record_timestamp: None,
+        last_published_record: None,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
     };
@@ -174,11 +217,11 @@ async fn renewal_scenario(scenario: Scenario) {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let directory = tempfile::tempdir().unwrap();
-    let _env = ConfigEnv(std::env::var_os("RAYFISH_CONFIG_DIR"));
-    // SAFETY: CONFIG_ENV_LOCK serializes every fixture using this override.
-    unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", directory.path()) };
-    let daemon = build_headless(false).await.unwrap();
+    let _env = ConfigDir::set(directory.path());
     let key = SecretKey::generate();
+    let mut relay = TestRelay::start(key.public()).await;
+    relay.configure();
+    let daemon = build_headless(false).await.unwrap();
     let me = daemon.transport.endpoint.id();
     let admitted = SecretKey::generate().public();
     let local = network_state(&key, vec![member(me, true)]);
@@ -227,12 +270,11 @@ async fn renewal_scenario(scenario: Scenario) {
         )
         .spawn();
     let record = dht::encode_network_record(&key, &new_hash, &[provider_id]).unwrap();
-    let reply = match scenario {
+    relay.reply(match scenario {
         Scenario::NewCanonical | Scenario::UnpublishedLocal => CanonicalReply::Record(record),
         Scenario::MissingCanonical => CanonicalReply::Missing,
         Scenario::UnavailableCanonical => CanonicalReply::Unavailable,
-    };
-    let relay = TestRelay::start(key.public(), reply).await;
+    });
     config::save_network(&config::NetworkConfig {
         network_public_key: Some(key.public()),
         network_secret_key: Some(key.clone()),
@@ -257,10 +299,9 @@ async fn renewal_scenario(scenario: Scenario) {
             incompatible: None,
         },
     );
-    let client = dht::create_pkarr_client(&daemon.transport.endpoint, &relay.url).unwrap();
     if matches!(scenario, Scenario::UnavailableCanonical) {
         assert!(
-            synchronize_before_renewal(&client, &local, &daemon.registry, "test", key.public())
+            synchronize_before_renewal(&local, &daemon.registry, "test", key.public())
                 .await
                 .is_err()
         );
@@ -275,7 +316,6 @@ async fn renewal_scenario(scenario: Scenario) {
     } else {
         let mut publication = daemon.registry.records_published.subscribe();
         let publisher = spawn_network_publisher(
-            client,
             key.clone(),
             Arc::clone(&local),
             Arc::clone(&daemon.registry),
@@ -284,7 +324,7 @@ async fn renewal_scenario(scenario: Scenario) {
             notify,
             token.clone(),
         );
-        let packet = tokio::time::timeout(Duration::from_secs(5), relay.published)
+        let packet = tokio::time::timeout(Duration::from_secs(5), &mut relay.published)
             .await
             .unwrap()
             .unwrap();
@@ -311,24 +351,26 @@ async fn renewal_scenario(scenario: Scenario) {
             Some(expected)
         );
         if matches!(scenario, Scenario::NewCanonical) {
-            assert!(local.read().unwrap().members.is_member(&admitted));
+            assert!(local.read().unwrap().group.members.is_member(&admitted));
+            // The pre-renewal roster, authored before what this node then
+            // published, cannot roll the admission back.
             assert_eq!(
-                fetch_and_apply_blob(
+                apply_group_record(
                     &daemon.transport.endpoint,
-                    &daemon.transport.blob_store,
-                    &daemon.registry.peers,
-                    &daemon.registry.firewall,
                     &daemon.registry,
-                    &local,
                     "test",
-                    old_hash,
-                    &[provider_id],
-                    packet.timestamp().as_micros().checked_sub(1).unwrap(),
+                    &local,
+                    &None,
+                    &SignedGroupRecord {
+                        hash: old_hash,
+                        seeds: vec![provider_id],
+                        timestamp: packet.timestamp().as_micros().checked_sub(1).unwrap(),
+                    },
                 )
                 .await,
-                ReconvergeOutcome::Superseded
+                ReconvergeOutcome::Stale
             );
-            assert!(local.read().unwrap().members.is_member(&admitted));
+            assert!(local.read().unwrap().group.members.is_member(&admitted));
             assert_eq!(
                 config::load_network("test")
                     .unwrap()
@@ -340,8 +382,7 @@ async fn renewal_scenario(scenario: Scenario) {
         token.cancel();
         publisher.await.unwrap();
     }
-    relay.stop.cancel();
-    relay.task.await.unwrap();
+    drop(relay);
     router.shutdown().await.unwrap();
     daemon.shutdown_and_close().await;
 }

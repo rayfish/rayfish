@@ -15,10 +15,14 @@ use rayfish::config::settings::GlobalKey;
 use rayfish::config::{DnsMode, QuicEngine};
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{
+    DaemonState, Done, FileQueues, FirewallView, OpError, OpResult, build_headless,
+};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
-use rayfish::ipc::{ConnectionIssue, InvitationStatus, IpcMessage, TransferFileState};
+use rayfish::ipc::{
+    self, ConnectionIssue, InvitationInfo, InvitationStatus, IpcMessage, TransferFileState,
+};
 use rayfish::membership;
 use rayfish::membership::GroupMode;
 use thiserror::Error;
@@ -52,6 +56,12 @@ pub enum AppleError {
     AlreadyStarted,
     #[error("{0}")]
     Network(String),
+}
+
+impl From<OpError> for AppleError {
+    fn from(error: OpError) -> Self {
+        Self::Network(error.to_string())
+    }
 }
 
 impl AppleError {
@@ -307,19 +317,15 @@ impl Node {
 
     fn edit_blocked(&self, peer: &str, remove: bool) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove)),
-            "block list",
-        )
+        self.runtime
+            .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove))?;
+        Ok(())
     }
 
     fn set_global(&self, key: GlobalKey, value: &str) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.config_set(key, value)),
-            "setting",
-        )
+        self.runtime.block_on(state.config_set(key, value))?;
+        Ok(())
     }
 }
 
@@ -387,35 +393,27 @@ impl Node {
     /// The stable mesh address that the packet tunnel assigns to this device.
     pub fn ipv6_address(&self) -> Result<String, AppleError> {
         let state = self.state()?;
-        let IpcMessage::StatusResponse { endpoint_id, .. } = state.status() else {
-            return Err(AppleError::Network(
-                "node returned an invalid status response".to_owned(),
-            ));
-        };
-        Ok(membership::derive_ipv6(&endpoint_id).to_string())
+        Ok(membership::derive_ipv6(&state.status().endpoint_id).to_string())
     }
 
     /// A UI-ready snapshot of the running node.
     pub fn status(&self) -> Result<NodeStatus, AppleError> {
         let state = self.state()?;
-        let IpcMessage::StatusResponse {
+        let ipc::NodeStatus {
             endpoint_id,
             active,
             networks,
             identity,
             mdns_enabled: mdns_active,
             ..
-        } = state.status()
-        else {
-            return Err(AppleError::Network(
-                "node returned an invalid status response".to_owned(),
-            ));
-        };
+        } = state.status();
         let pending_requests = networks
             .iter()
             .filter(|network| network.pending_requests > 0)
-            .flat_map(|network| match state.list_requests(&network.name) {
-                IpcMessage::PendingRequests { requests } => requests
+            .flat_map(|network| {
+                state
+                    .list_requests(&network.name)
+                    .unwrap_or_default()
                     .into_iter()
                     .map(|request| JoinRequest {
                         network: network.name.clone(),
@@ -423,8 +421,6 @@ impl Node {
                         hostname: request.hostname,
                         waiting_secs: request.waiting_secs,
                     })
-                    .collect(),
-                _ => Vec::new(),
             })
             .collect();
         let settings = config::load().map_err(AppleError::network)?;
@@ -444,26 +440,21 @@ impl Node {
                 Vec::new()
             }
         };
-        let connection_requests = match state.list_connections() {
-            IpcMessage::PendingRequests { requests } => requests
-                .into_iter()
-                .map(|request| ConnectionRequest {
-                    id: request.short_id,
-                    hostname: request.hostname,
-                    waiting_secs: request.waiting_secs,
-                })
-                .collect(),
-            response => {
-                expect_ok(response, "connection requests")?;
-                Vec::new()
-            }
-        };
+        let connection_requests = state
+            .list_connections()
+            .into_iter()
+            .map(|request| ConnectionRequest {
+                id: request.short_id,
+                hostname: request.hostname,
+                waiting_secs: request.waiting_secs,
+            })
+            .collect();
         let requests = NodeRequestStatus {
             pending_requests,
             identity: identity.map(|id| id.to_string()),
             connection_requests,
         };
-        let files = incoming_files(state.list_files())?;
+        let files = incoming_files(state.list_files());
         let inbound = NodeInboundStatus {
             policy: settings.inbound.into(),
             blocked: settings.blocked.iter().map(ToString::to_string).collect(),
@@ -622,26 +613,21 @@ impl Node {
     /// Probe enrolled machines separately so an offline machine cannot delay status.
     pub fn machines(&self) -> Result<Vec<ManagedMachine>, AppleError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.list_managed_machines(true)) {
-            IpcMessage::ManagedMachinesResponse { machines } => Ok(machines
-                .into_iter()
-                .map(|machine| ManagedMachine {
-                    identity: machine.identity.to_string(),
-                    hostname: machine.hostname.to_string(),
-                    ipv6: membership::derive_ipv6(&machine.identity).to_string(),
-                    state: <&str>::from(machine.state).to_owned(),
-                    networks: machine
-                        .networks
-                        .into_iter()
-                        .map(|name| name.to_string())
-                        .collect(),
-                })
-                .collect()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "invalid machine inventory response".to_owned(),
-            )),
-        }
+        let machines = self.runtime.block_on(state.list_managed_machines(true))?;
+        Ok(machines
+            .into_iter()
+            .map(|machine| ManagedMachine {
+                identity: machine.identity.to_string(),
+                hostname: machine.hostname.to_string(),
+                ipv6: membership::derive_ipv6(&machine.identity).to_string(),
+                state: <&str>::from(machine.state).to_owned(),
+                networks: machine
+                    .networks
+                    .into_iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            })
+            .collect())
     }
 
     /// Persist an embedder-owned setting using the same keys as `ray config`.
@@ -650,10 +636,8 @@ impl Node {
         let state = self.state()?;
         if matches!(key, GlobalSetting::Ssh) {
             return self.runtime.block_on(async {
-                expect_ok(
-                    state.ssh_config_set(if enabled { "on" } else { "off" }),
-                    "SSH setting",
-                )
+                state.ssh_config_set(if enabled { "on" } else { "off" })?;
+                Ok(())
             });
         }
         if matches!(key, GlobalSetting::Mdns) {
@@ -697,11 +681,9 @@ impl Node {
             })
             .map_err(AppleError::network)?;
         }
-        expect_ok(
-            self.runtime
-                .block_on(state.set_file_auto_accept(&peer, allow)),
-            "file auto-accept",
-        )
+        self.runtime
+            .block_on(state.set_file_auto_accept(&peer, allow))?;
+        Ok(())
     }
 
     pub fn set_ssh_rule(
@@ -711,26 +693,21 @@ impl Node {
         users: Vec<String>,
         allow: bool,
     ) -> Result<(), AppleError> {
-        expect_ok(
-            self.runtime.block_on(
-                self.state()?
-                    .firewall_ssh_allow(&network, &peer, users, allow),
-            ),
-            "SSH access",
-        )
+        self.runtime.block_on(
+            self.state()?
+                .firewall_ssh_allow(&network, &peer, users, allow),
+        )?;
+        Ok(())
     }
 
     pub fn firewall_show(&self) -> Result<FirewallState, AppleError> {
-        let IpcMessage::FirewallState {
+        let FirewallView {
             default_inbound,
             default_outbound,
             disabled,
             rules,
             ..
-        } = self.state()?.firewall_show()
-        else {
-            return Err(AppleError::Network("invalid firewall response".to_owned()));
-        };
+        } = self.state()?.firewall_show();
         Ok(FirewallState {
             default_inbound: default_inbound.to_string(),
             default_outbound: default_outbound.to_string(),
@@ -762,29 +739,26 @@ impl Node {
         let action: Action = action.parse().map_err(AppleError::network)?;
         let protocol: Protocol = protocol.parse().map_err(AppleError::network)?;
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.firewall_add(
-                direction,
-                action,
-                protocol,
-                port.as_deref(),
-                peer.as_deref(),
-                network.as_deref(),
-            )),
-            "firewall rule",
-        )
+        self.runtime.block_on(state.firewall_add(
+            direction,
+            action,
+            protocol,
+            port.as_deref(),
+            peer.as_deref(),
+            network.as_deref(),
+        ))?;
+        Ok(())
     }
 
     pub fn firewall_remove(&self, index: u32) -> Result<(), AppleError> {
-        expect_ok(
-            self.state()?.firewall_remove(index as usize),
-            "firewall rule",
-        )
+        self.state()?.firewall_remove(index as usize)?;
+        Ok(())
     }
 
     pub fn firewall_set_default_inbound(&self, action: String) -> Result<(), AppleError> {
         let action: Action = action.parse().map_err(AppleError::network)?;
-        expect_ok(self.state()?.firewall_default(action), "firewall default")
+        self.state()?.firewall_default(action)?;
+        Ok(())
     }
 
     pub fn connect_peer(
@@ -793,52 +767,40 @@ impl Node {
         hostname: Option<String>,
     ) -> Result<String, AppleError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.connect(&peer, hostname)) {
-            IpcMessage::Ok { message } => Ok(message),
-            IpcMessage::Joined { name, .. } => Ok(format!("Connected on {name}")),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network("invalid connect response".to_owned())),
-        }
+        Ok(self
+            .runtime
+            .block_on(state.connect(&peer, hostname))?
+            .summary())
     }
 
     pub fn approve_connection(&self, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.approve_connection(&id)),
-            "connection approval",
-        )
+        self.runtime.block_on(state.approve_connection(&id))?;
+        Ok(())
     }
 
     pub fn reject_connection(&self, id: String) -> Result<(), AppleError> {
-        expect_ok(self.state()?.reject_connect(&id), "connection rejection")
+        self.state()?.reject_connect(&id)?;
+        Ok(())
     }
 
     /// Drop a pending connection request and block the requester.
     pub fn block_connection(&self, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.deny_connection(&id)),
-            "connection block",
-        )
+        self.runtime.block_on(state.deny_connection(&id))?;
+        Ok(())
     }
 
     pub fn accept_invitation(&self, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.accept_invitation(&id, None)) {
-            IpcMessage::Ok { .. } | IpcMessage::Joined { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid invitation response".to_owned(),
-            )),
-        }
+        self.runtime.block_on(state.accept_invitation(&id, None))?;
+        Ok(())
     }
 
     pub fn decline_invitation(&self, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.decline_invitation(&id)),
-            "invitation",
-        )
+        self.runtime.block_on(state.decline_invitation(&id))?;
+        Ok(())
     }
 
     /// Deliver an invite for `network` to `recipient`'s identity. An offline
@@ -846,16 +808,10 @@ impl Node {
     pub fn send_invite(&self, network: String, recipient: String) -> Result<String, AppleError> {
         let recipient: EndpointId = recipient.trim().parse().map_err(AppleError::network)?;
         let state = self.state()?;
-        match self
+        let Done(message) = self
             .runtime
-            .block_on(state.deliver_invite(&network, recipient))
-        {
-            IpcMessage::Ok { message } => Ok(message),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid invite response".to_owned(),
-            )),
-        }
+            .block_on(state.deliver_invite(&network, recipient))?;
+        Ok(message)
     }
 
     pub fn set_inbound_policy(&self, policy: InboundPolicy) -> Result<(), AppleError> {
@@ -872,6 +828,9 @@ impl Node {
         self.edit_blocked(&peer, true)
     }
 
+    /// Start receiving a file offer. Returns once the destination is checked
+    /// and the receive has started, not when the download ends; the app
+    /// follows it in the status file list.
     pub fn accept_file(
         &self,
         id: u64,
@@ -879,17 +838,17 @@ impl Node {
         uid: u32,
         gid: u32,
     ) -> Result<(), AppleError> {
-        expect_ok(
-            self.runtime.block_on(
-                self.state()?
-                    .accept_file(id, Some(directory), Some((uid, gid))),
-            ),
-            "file acceptance",
-        )
+        let state = self.state()?;
+        // The destination is checked before this returns, so a folder the
+        // file cannot be saved in fails here rather than after the download.
+        self.runtime
+            .block_on(state.start_accepting_file(id, Some(directory), Some((uid, gid))))?;
+        Ok(())
     }
 
     pub fn reject_file(&self, id: u64) -> Result<(), AppleError> {
-        expect_ok(self.state()?.reject_file(id), "file rejection")
+        self.state()?.reject_file(id)?;
+        Ok(())
     }
 
     pub fn create_network(
@@ -898,16 +857,9 @@ impl Node {
         hostname: Option<String>,
     ) -> Result<(), AppleError> {
         let state = self.state()?;
-        match self
-            .runtime
-            .block_on(state.create_network(GroupMode::default(), name, hostname))
-        {
-            IpcMessage::Created { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid create response".to_owned(),
-            )),
-        }
+        self.runtime
+            .block_on(state.create_network(GroupMode::default(), name, hostname))?;
+        Ok(())
     }
 
     pub fn join_network(&self, code: String, hostname: Option<String>) -> Result<(), AppleError> {
@@ -920,7 +872,7 @@ impl Node {
             ),
             Err(_) => (code, None, None),
         };
-        match self.runtime.block_on(state.join_network(
+        self.runtime.block_on(state.join_network(
             &network_key,
             None,
             hostname,
@@ -928,58 +880,42 @@ impl Node {
             coordinator,
             false,
             true,
-        )) {
-            IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid join response".to_owned(),
-            )),
-        }
+        ))?;
+        Ok(())
     }
 
     /// Mint a single-use invite that expires after seven days.
     pub fn create_invite(&self, network: String) -> Result<String, AppleError> {
         let state = self.state()?;
-        match self
-            .runtime
-            .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false))
-        {
-            IpcMessage::InviteCreated { code, .. } => Ok(code),
-            IpcMessage::Error { message } => Err(AppleError::Network(message)),
-            _ => Err(AppleError::Network(
-                "node returned an invalid invite response".to_owned(),
-            )),
-        }
+        let invite =
+            self.runtime
+                .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false))?;
+        Ok(invite.code)
     }
 
     pub fn leave_network(&self, network: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.leave_network(&network)),
-            "leave",
-        )
+        self.runtime.block_on(state.leave_network(&network))?;
+        Ok(())
     }
 
     pub fn set_hostname(&self, network: String, hostname: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.set_hostname(&network, &hostname)),
-            "hostname",
-        )
+        self.runtime
+            .block_on(state.set_hostname(&network, &hostname))?;
+        Ok(())
     }
 
     pub fn accept_request(&self, network: String, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.accept_request(&network, &id)),
-            "approval",
-        )
+        self.runtime.block_on(state.accept_request(&network, &id))?;
+        Ok(())
     }
 
     pub fn deny_request(&self, network: String, id: String) -> Result<(), AppleError> {
         let state = self.state()?;
-        expect_ok(state.deny_request(&network, &id), "denial")
+        state.deny_request(&network, &id)?;
+        Ok(())
     }
 
     /// Attach the system packet tunnel and start forwarding packets.
@@ -1084,14 +1020,9 @@ impl Node {
     }
 }
 
-fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError> {
-    let IpcMessage::FileList {
-        files, transfers, ..
-    } = response
-    else {
-        return Err(AppleError::Network("invalid file list response".into()));
-    };
-    Ok(files
+fn incoming_files(queues: FileQueues) -> Vec<IncomingFile> {
+    queues
+        .incoming
         .into_iter()
         .map(|file| IncomingFile {
             id: file.id,
@@ -1102,7 +1033,7 @@ fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError>
             state: IncomingFileState::Pending,
             destination: None,
         })
-        .chain(transfers.into_iter().filter_map(|file| {
+        .chain(queues.transfers.into_iter().filter_map(|file| {
             (!file.outgoing
                 && matches!(
                     file.state,
@@ -1124,14 +1055,14 @@ fn incoming_files(response: IpcMessage) -> Result<Vec<IncomingFile>, AppleError>
                     .map(|path| path.to_string_lossy().into_owned()),
             })
         }))
-        .collect())
+        .collect()
 }
 
 /// The invitations in a status snapshot. An unreadable inbox shows none
 /// rather than failing the whole status, which would blank the app.
-fn invitations(response: IpcMessage) -> Vec<Invitation> {
-    match response {
-        IpcMessage::InvitationsResponse { invitations } => invitations
+fn invitations(listed: OpResult<Vec<InvitationInfo>>) -> Vec<Invitation> {
+    match listed {
+        Ok(invitations) => invitations
             .into_iter()
             .map(|invitation| Invitation {
                 id: invitation.id,
@@ -1141,17 +1072,15 @@ fn invitations(response: IpcMessage) -> Vec<Invitation> {
                 state: invitation.status.into(),
             })
             .collect(),
-        IpcMessage::Error { message } => {
-            tracing::warn!(%message, "could not read invitations");
-            Vec::new()
-        }
-        _ => {
-            tracing::warn!("node returned an invalid invitations response");
+        Err(error) => {
+            tracing::warn!(%error, "could not read invitations");
             Vec::new()
         }
     }
 }
 
+/// Check an operation that still answers with an IPC reply (the exit-node
+/// operations), turning anything but `Ok` into an error.
 fn expect_ok(response: IpcMessage, operation: &str) -> Result<(), AppleError> {
     match response {
         IpcMessage::Ok { .. } => Ok(()),
@@ -1189,9 +1118,7 @@ mod tests {
 
     #[test]
     fn unreadable_invitations_leave_the_status_usable() {
-        let failed = IpcMessage::Error {
-            message: "parsing invitations.toml".to_owned(),
-        };
+        let failed = Err(OpError::msg("parsing invitations.toml"));
         assert!(invitations(failed).is_empty());
     }
 
@@ -1202,17 +1129,31 @@ mod tests {
                 IpcMessage::Ok {
                     message: "done".into()
                 },
-                "leave"
+                "exit-node selection"
             )
             .is_ok()
         );
         assert!(matches!(
-            expect_ok(IpcMessage::Error { message: "denied".into() }, "leave"),
+            expect_ok(
+                IpcMessage::Error {
+                    message: "denied".into()
+                },
+                "exit-node selection"
+            ),
             Err(AppleError::Network(message)) if message == "denied"
         ));
         assert!(matches!(
-            expect_ok(IpcMessage::Status, "leave"),
-            Err(AppleError::Network(message)) if message == "node returned an invalid leave response"
+            expect_ok(IpcMessage::Status, "exit-node selection"),
+            Err(AppleError::Network(message))
+                if message == "node returned an invalid exit-node selection response"
+        ));
+    }
+
+    #[test]
+    fn command_errors_keep_the_daemon_message() {
+        assert!(matches!(
+            AppleError::from(OpError::msg("denied")),
+            AppleError::Network(message) if message == "denied"
         ));
     }
 
@@ -1220,8 +1161,8 @@ mod tests {
     fn file_status_includes_offers_and_active_or_successful_receives() {
         use rayfish::ipc::{PendingFileInfo, TransferFileInfo};
 
-        let files = incoming_files(IpcMessage::FileList {
-            files: vec![PendingFileInfo {
+        let files = incoming_files(FileQueues {
+            incoming: vec![PendingFileInfo {
                 id: 1,
                 from: "sender".into(),
                 filename: "offer.txt".into(),
@@ -1276,8 +1217,7 @@ mod tests {
                     destination: None,
                 },
             ],
-        })
-        .unwrap();
+        });
         assert_eq!(files.len(), 3);
         assert!(matches!(files[0].state, IncomingFileState::Pending));
         assert_eq!(files[1].filename, "received.txt");
@@ -1385,10 +1325,7 @@ mod tests {
 
                 // A self-dial fails immediately, providing an offline inventory
                 // entry without relying on an external machine or a network.
-                let IpcMessage::StatusResponse { endpoint_id, .. } = node.state().unwrap().status()
-                else {
-                    panic!("expected node status");
-                };
+                let endpoint_id = node.state().unwrap().status().endpoint_id;
                 config::update_settings(|settings| {
                     settings.managed_machines.push(config::ManagedMachine {
                         identity: endpoint_id,

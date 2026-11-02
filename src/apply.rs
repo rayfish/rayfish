@@ -159,13 +159,21 @@ fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
 }
 
 /// Structural validation independent of live state: a name may not be defined as
-/// both a group and an alias (resolution would be ambiguous).
+/// both a group and an alias (resolution would be ambiguous), and a group lists
+/// aliases and hostnames only. Expansion is one level deep, so a nested group
+/// name would otherwise be published as a literal hostname.
 fn validate_names(spec: &DeploySpec) -> Result<()> {
-    for name in spec.groups.keys() {
+    for (name, members) in &spec.groups {
         anyhow::ensure!(
             !spec.aliases.contains_key(name),
             "`{name}` is defined as both a group and an alias; names must be unique"
         );
+        if let Some(nested) = members.iter().find(|m| spec.groups.contains_key(*m)) {
+            anyhow::bail!(
+                "group '{name}' contains group '{nested}'; groups cannot be nested, \
+                 list its aliases and hostnames instead"
+            );
+        }
     }
     for firewall in spec.networks.values() {
         for (subject, rules) in firewall {
@@ -772,6 +780,20 @@ networks:
         assert!(
             parse("groups:\n  admins: ['*']\nnetworks:\n  sample-net:\n    host:\n      allows:\n        '*-admins': 'tcp:12345'\n")
                 .is_err()
+        );
+    }
+
+    /// A group naming another group must be rejected: expansion is one level
+    /// deep and would publish the inner group's name as a hostname.
+    #[test]
+    fn nested_groups_are_rejected() {
+        let error = parse(
+            "groups:\n  admins: [laptop]\n  staff: [admins, phone]\nnetworks:\n  sample-net:\n    host:\n      allows:\n        staff: 'tcp:22'\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot be nested"),
+            "{error:#}"
         );
     }
 

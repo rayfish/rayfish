@@ -16,15 +16,25 @@
 #   v4bridge      2-peer IPv4-only listener bridge over the mesh (tests/e2e/v4bridge)
 #   reliability   4-peer full-mesh packet-loss test (ping + iperf3 UDP) (tests/e2e/reliability)
 #   restore-offline 3-peer member-restore-with-coordinator-offline test (tests/e2e/restore-offline)
+#   file-resume   2-peer interrupted file receives resume and finish (tests/e2e/file-resume)
+#   files-authz   2-peer who may send files and where received files land (tests/e2e/files-authz)
 #   unpair        3-peer `ray unpair` device-cert revocation test (tests/e2e/unpair)
+#   manage        3-peer remote management: enrollment, delegated join/leave and
+#                 SSH grants, refused outside networks the controller coordinates
+#                 (tests/e2e/manage)
+#   coordinators  5-peer multi-coordinator network: edits on each coordinator,
+#                 restarts, a lagging coordinator, racing joins (tests/e2e/coordinators)
 #   churn         4-peer churn test: repeated flap, kick + nuke delivered while a
 #                 member is offline, health sweep (tests/e2e/churn)
 #   exit-node     3-peer internet-gateway test: forwarding/NAT, full-tunnel egress,
 #                 SO_MARK loop prevention, deny path (tests/e2e/exit-node)
+#   mixed-version 4-peer mesh of this build and an older release: joins, co-
+#                 coordinators, renewal, kicks, restarts, files (tests/e2e/mixed-version).
+#                 Needs OLD_RAY_BIN, so not part of `all`
 #   rootless      local ordinary-user mesh proxies, no TUN (tests/e2e/rootless)
 #   bench         throughput / latency benchmark        (tests/bench)
-#   all           every scenario above except bench: provision, run, then tear
-#                 each fleet down before the next (one fleet live at a time)
+#   all           every scenario above except bench and mixed-version: provision,
+#                 run, then tear each fleet down before the next (one live at a time)
 #
 # Actions:
 #   run           (default) provision instances if needed, then run the scenario
@@ -36,6 +46,8 @@
 #   docker        local containers on one bridge (needs docker + /dev/net/tun).
 #                 exit-node, reliability and bench need real hosts: distinct
 #                 public IPs and a WAN baseline one bridge cannot provide.
+#   boat          Boat VMs (https://boat.dev), reached as root over their public
+#                 IPv6 (needs boat + jq). Runs every scenario a droplet does.
 #
 # Each scenario's fleet (instance names + role labels) is declared in the
 # registry below; the actual run steps live in <dir>/run.sh. The shared
@@ -66,7 +78,7 @@ fi
 # variable would silently drop back to digitalocean halfway through.
 export E2E_BACKEND="${E2E_BACKEND:-digitalocean}"
 
-usage(){ sed -n '2,39p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+usage(){ sed -n '2,56p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
 # Scenarios the docker backend cannot run faithfully (see tests/e2e/README.md).
 DOCKER_UNSUPPORTED=(exit-node reliability bench)
@@ -118,11 +130,26 @@ scenario_meta(){
     restore-offline) DIR="$ROOT/tests/e2e/restore-offline"
                  NAMES=(rayfish-restore-a rayfish-restore-b rayfish-restore-c)
                  LABELS=(srv-a srv-b srv-c) ;;
+    file-resume) DIR="$ROOT/tests/e2e/file-resume"
+                 NAMES=(rayfish-fresume-a rayfish-fresume-b)
+                 LABELS=(srv-a srv-b) ;;
+    manage)      DIR="$ROOT/tests/e2e/manage"
+                 NAMES=(rayfish-manage-c rayfish-manage-m rayfish-manage-y)
+                 LABELS=(srv-c srv-m srv-y) ;;
+    files-authz) DIR="$ROOT/tests/e2e/files-authz"
+                 NAMES=(rayfish-fauthz-a rayfish-fauthz-b)
+                 LABELS=(srv-a srv-b) ;;
     unpair)      DIR="$ROOT/tests/e2e/unpair"
                  NAMES=(rayfish-unpair-a rayfish-unpair-b rayfish-unpair-c)
                  LABELS=(srv-a srv-b srv-c) ;;
+    coordinators) DIR="$ROOT/tests/e2e/coordinators"
+                 NAMES=(rayfish-coord-a rayfish-coord-b rayfish-coord-c rayfish-coord-d rayfish-coord-e)
+                 LABELS=(srv-a srv-b srv-c srv-d srv-e) ;;
     churn)       DIR="$ROOT/tests/e2e/churn"
                  NAMES=(rayfish-churn-a rayfish-churn-b rayfish-churn-c rayfish-churn-d)
+                 LABELS=(srv-a srv-b srv-c srv-d) ;;
+    mixed-version) DIR="$ROOT/tests/e2e/mixed-version"
+                 NAMES=(rayfish-mixed-a rayfish-mixed-b rayfish-mixed-c rayfish-mixed-d)
                  LABELS=(srv-a srv-b srv-c srv-d) ;;
     exit-node)   DIR="$ROOT/tests/e2e/exit-node"
                  NAMES=(rayfish-exit-a rayfish-exit-b rayfish-exit-c)
@@ -142,7 +169,7 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 # dispatcher per scenario (provision-if-needed + run, then teardown). Prints a
 # pass/fail summary and exits non-zero if any scenario failed.
 if [[ "$scenario" == all ]]; then
-  all_scenarios=(rootless device-cert connect firewall closed-net apply invites dns ssh operator v4bridge reliability restore-offline unpair churn exit-node)
+  all_scenarios=(rootless device-cert connect firewall closed-net apply invites dns ssh operator v4bridge reliability restore-offline file-resume files-authz manage unpair coordinators churn exit-node)
   passed=(); failed=(); skipped=()
   hint="check 'doctl compute droplet list'"
   [[ "$E2E_BACKEND" == "docker" ]] && hint="check 'docker ps -a'"
@@ -187,6 +214,10 @@ provision(){
     DOCKER_ACTION=provision
     # shellcheck source=lib/docker.sh
     source "$ROOT/tests/lib/docker.sh"        # consumes NAMES/LABELS/SERVERS/NEXT
+  elif [[ "$E2E_BACKEND" == "boat" ]]; then
+    BOAT_ACTION=provision
+    # shellcheck source=lib/boat.sh
+    source "$ROOT/tests/lib/boat.sh"          # consumes NAMES/LABELS/SERVERS/NEXT
   else
     # shellcheck source=lib/provision.sh
     source "$ROOT/tests/lib/provision.sh"     # consumes NAMES/LABELS/SERVERS/NEXT
@@ -198,6 +229,10 @@ teardown(){
     DOCKER_ACTION=teardown
     # shellcheck source=lib/docker.sh
     source "$ROOT/tests/lib/docker.sh"      # consumes SERVERS/NAMES
+  elif [[ "$E2E_BACKEND" == "boat" ]]; then
+    BOAT_ACTION=teardown
+    # shellcheck source=lib/boat.sh
+    source "$ROOT/tests/lib/boat.sh"        # consumes SERVERS
   else
     # shellcheck source=lib/teardown.sh
     source "$ROOT/tests/lib/teardown.sh"    # consumes SERVERS

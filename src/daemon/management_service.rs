@@ -29,10 +29,15 @@ const CONTROLLER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 mod compatibility_tests;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod scope_tests;
 
 impl Daemon {
     /// Inventory for embedders, including machines outside the local networks.
-    pub async fn list_managed_machines(&self, probe: bool) -> IpcMessage {
+    pub async fn list_managed_machines(
+        &self,
+        probe: bool,
+    ) -> OpResult<Vec<ipc::ManagedMachineInfo>> {
         self.management.list_machines(probe).await
     }
 }
@@ -594,25 +599,26 @@ impl ManagementService {
     }
 
     /// Lists enrolled machines and optionally probes their current status.
-    pub(crate) async fn list_machines(&self, probe: bool) -> IpcMessage {
+    pub(crate) async fn list_machines(
+        &self,
+        probe: bool,
+    ) -> OpResult<Vec<ipc::ManagedMachineInfo>> {
         let machines = match config::load() {
             Ok(settings) => settings.managed_machines,
-            Err(error) => return ipc_err(format!("failed to load managed machines: {error}")),
+            Err(error) => return op_err(format!("failed to load managed machines: {error}")),
         };
         if !probe {
-            return IpcMessage::ManagedMachinesResponse {
-                machines: machines
-                    .into_iter()
-                    .map(|machine| ipc::ManagedMachineInfo {
-                        identity: machine.identity,
-                        hostname: machine.hostname,
-                        enrolled_at: machine.enrolled_at,
-                        last_seen: machine.last_seen,
-                        state: ipc::ManagedMachineState::Unknown,
-                        networks: Vec::new(),
-                    })
-                    .collect(),
-            };
+            return Ok(machines
+                .into_iter()
+                .map(|machine| ipc::ManagedMachineInfo {
+                    identity: machine.identity,
+                    hostname: machine.hostname,
+                    enrolled_at: machine.enrolled_at,
+                    last_seen: machine.last_seen,
+                    state: ipc::ManagedMachineState::Unknown,
+                    networks: Vec::new(),
+                })
+                .collect());
         }
         let results = join_all(machines.into_iter().map(|machine| async move {
             let status = tokio::time::timeout(
@@ -644,7 +650,7 @@ impl ManagementService {
             info
         }))
         .await;
-        IpcMessage::ManagedMachinesResponse { machines: results }
+        Ok(results)
     }
 
     /// Asks an enrolled machine to join a network controlled by this node.
@@ -675,9 +681,8 @@ impl ManagementService {
             )
             .await
         {
-            IpcMessage::InviteCreated { code, .. } => code,
-            IpcMessage::Error { message } => return ipc_err(message),
-            other => return ipc_err(format!("unexpected invite response: {other:?}")),
+            Ok(invite) => invite.code,
+            Err(e) => return e.into(),
         };
         match self
             .send_request(
@@ -711,6 +716,12 @@ impl ManagementService {
         let target = match self.resolve_machine(machine) {
             Ok(target) => target,
             Err(error) => return ipc_err(error),
+        };
+        // As for a join: the machine knows the network by the exact name it
+        // joined under, not by however the operator typed it here.
+        let network = &match self.registry.active_network_name(network.as_ref()) {
+            Some(name) => NetworkName::new(name),
+            None => return ipc_err(format!("network '{network}' not active")),
         };
         let remote_result = self
             .send_request(
@@ -1085,6 +1096,7 @@ impl ManagementService {
                 .state
                 .read()
                 .unwrap()
+                .group
                 .members
                 .get(&controller)
                 .is_some_and(|member| member.is_coordinator)
@@ -1103,13 +1115,12 @@ impl ManagementService {
         let enable_note = if grants.is_empty() {
             None
         } else {
-            match owner.ssh_config_set("on") {
-                IpcMessage::Ok { message } => message
-                    .split_once("\n\n")
-                    .map(|(_, warning)| warning.to_string()),
-                IpcMessage::Error { message } => return Err(message),
-                other => return Err(format!("unexpected SSH enable response: {other:?}")),
-            }
+            let Done(message) = owner
+                .ssh_config_set("on")
+                .map_err(|error| error.to_string())?;
+            message
+                .split_once("\n\n")
+                .map(|(_, warning)| warning.to_string())
         };
         let count = grants.len();
         config::update_network(network_name.as_ref(), |network| {
@@ -1128,6 +1139,23 @@ impl ManagementService {
             message.push_str(&warning);
         }
         Ok(message)
+    }
+
+    /// Whether `controller` is a coordinator in the signed roster this machine
+    /// holds for `network`. The management connection's remote id is the
+    /// controller's endpoint id, which is also the key its roster entry is
+    /// stored under. A network that is not active has no roster to check, so it
+    /// counts as not coordinated, and so does a poisoned state lock.
+    fn coordinates(&self, network: &str, controller: EndpointId) -> bool {
+        self.registry.networks.get(network).is_some_and(|handle| {
+            handle.state.read().is_ok_and(|state| {
+                state
+                    .group
+                    .members
+                    .get(&controller)
+                    .is_some_and(|member| member.is_coordinator)
+            })
+        })
     }
 
     async fn apply_action(
@@ -1195,6 +1223,18 @@ impl ManagementService {
                         };
                     }
                 };
+                // `delegated_join` always mints the invite itself, so its
+                // coordinator field is the controller's own endpoint. Anything
+                // else would let a controller enroll this machine in a network
+                // it does not run. The field alone proves nothing, since the
+                // controller wrote it: `Required` makes the join dial only the
+                // controller, and only if the signed roster names it a
+                // coordinator.
+                if coordinator != controller {
+                    return ManagementResult::Error {
+                        message: "invite was not issued by this controller; a controller can only join networks it coordinates".to_string(),
+                    };
+                }
                 match self
                     .registry
                     .join_network(
@@ -1202,28 +1242,32 @@ impl ManagementService {
                         Some(network_name.as_ref()),
                         Some(hostname.into()),
                         Some(secret),
-                        Some(coordinator),
+                        Some(JoinCoordinator::Required(coordinator)),
                         auto_accept_firewall,
                         auto_accept_files,
+                        None,
                     )
                     .await
                 {
-                    IpcMessage::Joined { name, .. } => ManagementResult::Applied {
-                        message: format!("managed machine joined '{name}'"),
+                    Ok(JoinOutcome::Joined(joined)) => ManagementResult::Applied {
+                        message: format!("managed machine joined '{}'", joined.name),
                     },
-                    IpcMessage::Ok { message } => ManagementResult::Applied { message },
-                    IpcMessage::Error { message } => ManagementResult::Error { message },
-                    other => ManagementResult::Error {
-                        message: format!("unexpected join response: {other:?}"),
+                    Ok(JoinOutcome::Queued(Done(message))) => ManagementResult::Applied { message },
+                    Err(e) => ManagementResult::Error {
+                        message: e.to_string(),
                     },
                 }
             }
             ManagementAction::Leave { network_name } => {
+                if !self.coordinates(network_name.as_ref(), controller) {
+                    return ManagementResult::Error {
+                        message: format!("controller does not coordinate network '{network_name}'"),
+                    };
+                }
                 match self.registry.leave_network(network_name.as_ref()).await {
-                    IpcMessage::Ok { message } => ManagementResult::Applied { message },
-                    IpcMessage::Error { message } => ManagementResult::Error { message },
-                    other => ManagementResult::Error {
-                        message: format!("unexpected leave response: {other:?}"),
+                    Ok(Done(message)) => ManagementResult::Applied { message },
+                    Err(e) => ManagementResult::Error {
+                        message: e.to_string(),
                     },
                 }
             }

@@ -181,12 +181,12 @@ impl NetworkRegistry {
 
     /// A network's roster, or empty if we don't have that network. Keeps the
     /// lookup-then-lock-then-clone dance (and the lock guard) out of the callers.
-    pub(crate) fn roster(&self, network: &str) -> Vec<Member> {
+    pub(crate) fn roster(&self, network: &str) -> MemberList {
         match self.networks.get(network) {
             // Cloned out (`NetworkState::roster`): callers must be free to work
             // (and to await) without holding the state lock.
             Some(handle) => handle.state.read().unwrap().roster(),
-            None => Vec::new(),
+            None => MemberList::new(),
         }
     }
 
@@ -195,9 +195,9 @@ impl NetworkRegistry {
         let handle = self.networks.get(network)?;
         let state = handle.state.read().unwrap();
         state
+            .group
             .members
-            .all()
-            .into_iter()
+            .iter()
             .find(|m| m.matches_identity(id))
             .cloned()
     }
@@ -213,9 +213,14 @@ impl NetworkRegistry {
     /// daemon-wide binding by saying hello on network B. The check has to be as
     /// wide as the map it protects.
     pub(crate) fn is_nullified_anywhere(&self, device_key: &EndpointId) -> bool {
-        self.networks
-            .iter()
-            .any(|h| h.state.read().unwrap().nullifiers.contains(device_key))
+        self.networks.iter().any(|h| {
+            h.state
+                .read()
+                .unwrap()
+                .group
+                .nullifiers
+                .contains(device_key)
+        })
     }
 
     /// Add or remove a peer from a network's exit-node allow list, then advertise
@@ -755,7 +760,7 @@ impl NetworkRegistry {
             // the datagram arrived under. Try both.
             let Some(id) = [sender, user_id]
                 .into_iter()
-                .find(|id| s.members.get(id).is_some())
+                .find(|id| s.group.members.get(id).is_some())
             else {
                 tracing::warn!(
                     network = %network,
@@ -764,7 +769,7 @@ impl NetworkRegistry {
                 );
                 return;
             };
-            match s.members.get_mut(&id) {
+            match s.group.members.get_mut(&id) {
                 Some(member) => set(member),
                 None => false,
             }

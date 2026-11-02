@@ -25,16 +25,16 @@ pub(crate) enum JoinResult {
         direct_exact_hash: Option<blake3::Hash>,
         /// Publication provenance for that exact signed hash.
         direct_hash_published: Option<bool>,
+        /// The worker behind the member accept handler this join registered.
+        reconverge_worker: JoinHandle<()>,
     },
     /// Queued for live approval on a closed network; the caller should retry.
     Pending,
 }
 
-/// Outcome of one `join_network_inner` attempt. The reply is boxed because
-/// `IpcMessage` is far larger than the `Pending` case, and this enum is returned
-/// through the whole join/retry path.
+/// Outcome of one `join_network_inner` attempt.
 pub(crate) enum TryJoin {
-    Joined(Box<IpcMessage>),
+    Joined(JoinedNetwork),
     Pending,
 }
 
@@ -141,13 +141,9 @@ pub(crate) async fn join_mesh_shared(
     initial_conn: Connection,
     ep: &Endpoint,
     network_name: &str,
-    ctx: MeshCtx,
+    registry: Arc<NetworkRegistry>,
     params: JoinParams,
     token: CancellationToken,
-    // The network-owning service: the per-peer control reader calls
-    // `registry.promote_to_coordinator` on itself after persisting an
-    // `AdminGrant` key (was the `promote_tx` hand-off to the daemon loop).
-    registry: Arc<NetworkRegistry>,
     // Guards the single-use invite ledger. Shared with the NetworkHandle so the
     // member accept handler's `InviteShare`/`InviteUsed` handling (a co-coordinator
     // learning of invites it didn't mint) is serialized with mint/redeem.
@@ -156,15 +152,6 @@ pub(crate) async fn join_mesh_shared(
     // per-connection demux dispatches control frames (incl. ping/pong).
     protocol_router: Arc<ProtocolRouter>,
 ) -> Result<JoinResult> {
-    // A whole-bundle clone for the debounced reconverge worker, which forwards
-    // the ctx straight to `reconverge_and_apply`.
-    let worker_ctx = ctx.clone();
-    let MeshCtx {
-        identity,
-        peers,
-        blob_store,
-        ..
-    } = ctx;
     let JoinParams {
         my_hostname,
         net_pubkey,
@@ -176,7 +163,7 @@ pub(crate) async fn join_mesh_shared(
         initial,
         dial_claim,
     } = params;
-    let my_identity = identity.local_identity();
+    let my_identity = registry.transport.identity.local_identity();
     let join_certificate_issuer = if initial
         && invite_secret.is_none()
         && !group_blob
@@ -192,10 +179,10 @@ pub(crate) async fn join_mesh_shared(
     let (mut admitted_blob, direct, mut record_ts) = match perform_join_handshake(
         &initial_conn,
         ep,
-        &registry.transport.pkarr_relay_url,
+        &registry.transport.pkarr,
         network_name,
-        &blob_store,
-        &peers,
+        &registry.transport.blob_store,
+        &registry.peers,
         net_pubkey,
         my_identity,
         initial,
@@ -223,8 +210,8 @@ pub(crate) async fn join_mesh_shared(
     let (exact_group_hash, exact_hash_published) = if let Some(Admission { record, .. }) = direct {
         let data = fetch_verified_blob(
             ep,
-            &blob_store,
-            &peers,
+            &registry.transport.blob_store,
+            &registry.peers,
             record.hash,
             network_name,
             &record.seeds,
@@ -244,19 +231,10 @@ pub(crate) async fn join_mesh_shared(
     } else {
         (None, None)
     };
-    let crate::membership::GroupBlob {
-        members,
-        approved,
-        suggested_firewall,
-        name: group_name,
-        reusable_keys,
-        nullifiers,
-    } = admitted_blob;
-
     persist_join_config(
         network_name,
-        &members,
-        &approved,
+        &admitted_blob.members,
+        &admitted_blob.approved,
         my_identity,
         net_pubkey,
         &my_hostname,
@@ -268,16 +246,13 @@ pub(crate) async fn join_mesh_shared(
 
     let remote_id = initial_conn.remote_id();
 
+    // The live state takes the blob; dialing the roster below still needs it.
+    let members = admitted_blob.members.clone();
     let live_state = build_member_state(
-        &members,
-        approved,
+        admitted_blob,
         net_pubkey,
         network_name,
-        group_name,
-        suggested_firewall,
-        reusable_keys,
-        nullifiers,
-        &blob_store,
+        &registry.transport.blob_store,
         direct_key.as_ref(),
         record_ts,
         exact_group_hash,
@@ -287,26 +262,23 @@ pub(crate) async fn join_mesh_shared(
     // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this single
     // debounced task. The notify is shared with the member accept handler below.
     let reconverge_notify = Arc::new(tokio::sync::Notify::new());
-    spawn_reconverge_worker(
+    let reconverge_task = spawn_reconverge_worker(
         Arc::clone(&reconverge_notify),
         token.clone(),
         Arc::clone(&live_state),
         network_name.to_string(),
-        worker_ctx.clone(),
+        registry.clone(),
         ep.clone(),
-        my_identity,
         net_pubkey,
-        device_cert.clone(),
     );
 
     // Register this network's member accept handler so the per-connection demux
     // dispatches coordinator broadcasts + other members' hellos to it. A node that
     // already holds the network key is overwritten with a coordinator handler by
-    // `finalize_join`.
+    // `install_network`.
     protocol_router.register(
         net_pubkey,
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx: worker_ctx.clone(),
             network_name: network_name.to_string(),
             state: Arc::clone(&live_state),
             net_pubkey,
@@ -322,7 +294,7 @@ pub(crate) async fn join_mesh_shared(
     // rest of the roster the same way (one connection per peer identity).
     crate::spawn_path_logger(initial_conn.clone(), remote_id.fmt_short().to_string());
     register_dialed_peer(
-        &worker_ctx,
+        &registry,
         &protocol_router,
         initial_conn,
         remote_id,
@@ -330,23 +302,29 @@ pub(crate) async fn join_mesh_shared(
     )
     .await;
     drop(dial_claim);
-    connect_to_roster_peers(
+    if let Err(error) = connect_to_roster_peers(
         &members,
         network_name,
         net_pubkey,
         my_identity,
         remote_id,
         &device_cert,
-        &worker_ctx,
-        &protocol_router,
         &registry,
+        &protocol_router,
     )
-    .await?;
+    .await
+    {
+        // No network will own this state, so its worker must not keep
+        // reconverging it.
+        reconverge_task.abort();
+        return Err(error);
+    }
 
     Ok(JoinResult::Joined {
         state: live_state,
         direct_exact_hash: exact_group_hash,
         direct_hash_published: exact_hash_published,
+        reconverge_worker: reconverge_task,
     })
 }
 
@@ -355,19 +333,19 @@ pub(crate) async fn join_mesh_shared(
 /// can decode our tagged datagrams. Shared by the coordinator connection and each
 /// roster peer.
 pub(crate) async fn register_dialed_peer(
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     router: &Arc<ProtocolRouter>,
     conn: Connection,
     peer_id: EndpointId,
     network_name: &str,
 ) {
-    let conn_changed = ctx.register_peer_conn(&conn, peer_id, network_name);
+    let conn_changed = registry.register_peer_conn(&conn, peer_id, network_name);
     if conn_changed {
         let router = Arc::clone(router);
         let dconn = conn.clone();
         tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
     }
-    announce_network_handles(&ctx.peers, &conn, derive_ipv6(&peer_id)).await;
+    announce_network_handles(&registry.peers, &conn, derive_ipv6(&peer_id)).await;
 }
 
 /// Persist this network's membership to config after a successful handshake.
@@ -377,8 +355,8 @@ pub(crate) async fn register_dialed_peer(
 #[allow(clippy::too_many_arguments)]
 fn persist_join_config(
     network_name: &str,
-    members: &[crate::membership::Member],
-    approved: &[ApprovedEntry],
+    members: &MemberList,
+    approved: &ApprovedList,
     my_identity: EndpointId,
     net_pubkey: EndpointId,
     my_hostname: &Option<String>,
@@ -424,6 +402,10 @@ fn persist_join_config(
             // same transaction as the exact complete recovery hash it governs.
             net.network_secret_key = None;
         }
+        // A floor saved for another network under this name orders nothing here.
+        if net.network_public_key != Some(net_pubkey) {
+            net.last_record_timestamp = None;
+        }
         net.network_public_key = Some(net_pubkey);
         if initial {
             net.auto_accept_firewall = auto_accept_firewall;
@@ -444,18 +426,11 @@ fn persist_join_config(
 }
 
 /// Build the in-memory `NetworkState` cell for a joined member from the admitted
-/// roster + blob-derived firewall/keys, refresh its snapshot, and seed the local
-/// blob store with those bytes.
-#[allow(clippy::too_many_arguments)]
+/// blob, refresh its snapshot, and seed the local blob store with those bytes.
 async fn build_member_state(
-    members: &[crate::membership::Member],
-    approved: Vec<ApprovedEntry>,
+    group: GroupBlob,
     net_pubkey: EndpointId,
     network_name: &str,
-    group_name: Option<String>,
-    suggested_firewall: SuggestedFirewall,
-    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
-    nullifiers: BTreeSet<EndpointId>,
     blob_store: &FsStore,
     // Present when we joined a `direct` network as a co-coordinator: seed the live
     // state with the network key so `finalize_join` registers us as a coordinator
@@ -468,8 +443,7 @@ async fn build_member_state(
     exact_group_hash: Option<blake3::Hash>,
 ) -> SharedNetworkState {
     let mut ns = NetworkState {
-        members: MemberList::from_members(members.to_vec()),
-        approved: ApprovedList::from_entries(approved),
+        group,
         snapshot: None,
         snapshot_commit: Arc::new(AsyncMutex::new(())),
         destroyed: false,
@@ -478,14 +452,13 @@ async fn build_member_state(
         network_secret_key: direct_key.cloned(),
         network_public_key: net_pubkey,
         network_name: Some(network_name.to_string()),
-        group_name,
         mode: GroupMode::Restricted,
-        suggested_firewall,
-        reusable_keys,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
-        nullifiers,
-        last_record_timestamp: record_ts,
+        // A reconnect whose roster came from config has no record of its own,
+        // and even one that does may be older than the floor saved last run.
+        last_record_timestamp: record_ts.max(saved_record_floor(network_name, net_pubkey)),
+        last_published_record: None,
     };
     ns.refresh_snapshot();
     if let Some(hash) = exact_group_hash {
@@ -558,15 +531,14 @@ pub(crate) async fn send_mesh_hello(
 /// logged and skipped, as is a peer whose hello exchange fails.
 #[allow(clippy::too_many_arguments)]
 async fn connect_to_roster_peers(
-    members: &[crate::membership::Member],
+    members: &MemberList,
     network_name: &str,
     net_pubkey: EndpointId,
     my_identity: EndpointId,
     skip_id: EndpointId,
     device_cert: &Option<control::DeviceCert>,
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     router: &Arc<ProtocolRouter>,
-    registry: &NetworkRegistry,
 ) -> Result<()> {
     for member in members {
         if member.identity == my_identity || member.identity == skip_id {
@@ -591,7 +563,7 @@ async fn connect_to_roster_peers(
                     tracing::warn!(peer = %member.identity.fmt_short(), error = %error, "mesh peer hello did not complete");
                     continue;
                 }
-                register_dialed_peer(ctx, router, conn, member.identity, network_name).await;
+                register_dialed_peer(registry, router, conn, member.identity, network_name).await;
                 drop(claim);
                 tracing::info!(peer_ip = %derive_ipv6(&member.identity), "connected to mesh peer");
             }
@@ -615,7 +587,7 @@ async fn connect_to_roster_peers(
 async fn perform_join_handshake(
     initial_conn: &Connection,
     ep: &Endpoint,
-    relay_url: &url::Url,
+    pkarr: &PkarrRelayClient,
     network_name: &str,
     blob_store: &FsStore,
     peers: &PeerTable,
@@ -766,7 +738,7 @@ async fn perform_join_handshake(
         // second resolve/fetch fails, retain the complete blob already verified
         // by `join_network_inner`; the config roster is a lossy display cache and
         // must never become publishable after a later promotion.
-        let (blob, record_ts) = match resolve_signed(ep, relay_url, net_pubkey).await {
+        let (blob, record_ts) = match resolve_signed(pkarr, net_pubkey).await {
             Some((signed, seeds, ts)) => {
                 match fetch_verified_blob(ep, blob_store, peers, signed, network_name, &seeds).await
                 {
@@ -792,18 +764,20 @@ async fn perform_join_handshake(
 /// collapses into one pkarr resolve + reconverge, and a slow reconverge never
 /// blocks the control listener's accept loop. The network-key-signed record stays
 /// the source of truth, so converging once per burst suffices.
-#[allow(clippy::too_many_arguments)]
-fn spawn_reconverge_worker(
+///
+/// Every live member network needs exactly one, wired to its member accept
+/// handler's notify: [`join_mesh_shared`] starts it for a handshake, and
+/// `finalize_join` for a network registered without one (warm resume, a
+/// restore whose coordinator was unreachable). It ends with `token`.
+pub(crate) fn spawn_reconverge_worker(
     notify: Arc<tokio::sync::Notify>,
     token: CancellationToken,
     live_state: SharedNetworkState,
     network_name: String,
-    ctx_w: MeshCtx,
+    registry_w: Arc<NetworkRegistry>,
     endpoint_w: Endpoint,
-    my_identity_w: EndpointId,
     net_pubkey_w: EndpointId,
-    device_cert_w: Option<control::DeviceCert>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Backstop tick so a queued rename is retried even on a quiet
         // network that sends no `MemberSync`/`BlobUpdated` triggers. It does
@@ -821,7 +795,7 @@ fn spawn_reconverge_worker(
                     // not reflect yet (its delivery missed every coordinator).
                     // Otherwise idle until the next real trigger.
                     if !has_pending_hostname(&network_name)
-                        && !ctx_w.registry.exit_offer_out_of_sync(&network_name)
+                        && !registry_w.exit_offer_out_of_sync(&network_name)
                     {
                         continue;
                     }
@@ -838,18 +812,20 @@ fn spawn_reconverge_worker(
                 _ = token.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
             }
+            // Read per run, as the poller does: the device may have been
+            // paired or unpaired since this worker started.
+            let device_cert = registry_w.current_device_cert();
             reconverge_and_apply(
                 &endpoint_w,
-                &ctx_w,
+                &registry_w,
                 net_pubkey_w,
                 &network_name,
                 &live_state,
-                my_identity_w,
-                &device_cert_w,
+                &device_cert,
             )
             .await;
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -858,7 +834,8 @@ mod mesh_hello_reply_tests {
     use iroh::RelayMode;
     use iroh::endpoint::{SendStream, presets};
     use iroh_dns::pkarr::SignedPacket;
-    use std::ffi::OsString;
+
+    use crate::daemon::mesh::destruction::tests::ConfigDir;
 
     fn record_at(packet: &SignedPacket, key: &SecretKey, timestamp: u64) -> SignedPacket {
         let dns = &packet.as_bytes()[104..];
@@ -869,20 +846,6 @@ mod mesh_hello_reply_tests {
         bytes.extend_from_slice(&timestamp.to_be_bytes());
         bytes.extend_from_slice(dns);
         SignedPacket::from_bytes(&bytes).unwrap()
-    }
-
-    struct ConfigEnv(Option<OsString>);
-
-    impl Drop for ConfigEnv {
-        fn drop(&mut self) {
-            // SAFETY: the test retains CONFIG_ENV_LOCK until this guard drops.
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
-                    None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
-                }
-            }
-        }
     }
 
     #[tokio::test]
@@ -901,9 +864,7 @@ mod mesh_hello_reply_tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let directory = tempfile::tempdir().unwrap();
-        let _env = ConfigEnv(std::env::var_os("RAYFISH_CONFIG_DIR"));
-        // SAFETY: CONFIG_ENV_LOCK serializes tests using this override.
-        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", directory.path()) };
+        let _env = ConfigDir::set(directory.path());
         let daemon = build_headless(false).await.unwrap();
         let server = Endpoint::builder(presets::N0)
             .alpns(vec![transport::mesh_alpn()])
@@ -940,21 +901,21 @@ mod mesh_hello_reply_tests {
             exit_families: ExitFamilies::Unknown,
         };
         let fallback = crate::membership::GroupBlob {
-            members: vec![coordinator.clone()],
-            approved: Vec::new(),
+            members: MemberList::from(vec![coordinator.clone()]),
+            approved: ApprovedList::new(),
             suggested_firewall: SuggestedFirewall::default(),
             name: Some("test-network".into()),
             reusable_keys: BTreeMap::new(),
             nullifiers: BTreeSet::new(),
         };
         let mut admitted = fallback.clone();
-        admitted.members.push(Member {
+        admitted.members.add(Member {
             identity: me,
             is_coordinator: false,
             hostname: Some("workstation".into()),
             ..coordinator
         });
-        let bytes = rmp_serde::to_vec(&admitted).unwrap();
+        let bytes = crate::membership::canonical_group_bytes(&admitted);
         daemon
             .transport
             .blob_store
@@ -993,7 +954,7 @@ mod mesh_hello_reply_tests {
                     Some(network_key),
                     &ControlMsg::Welcome {
                         members: admitted.members,
-                        approved: Vec::new(),
+                        approved: ApprovedList::new(),
                         direct_key: None,
                         direct_record: Some(packet.as_bytes().to_vec()),
                         direct_record_published: true,
@@ -1015,7 +976,7 @@ mod mesh_hello_reply_tests {
             outgoing,
             &daemon.transport.endpoint,
             "test-network",
-            daemon.registry.mesh_ctx(),
+            Arc::clone(&daemon.registry),
             JoinParams {
                 my_hostname: Some("workstation".into()),
                 net_pubkey: network_key,
@@ -1028,7 +989,6 @@ mod mesh_hello_reply_tests {
                 dial_claim: None,
             },
             token.clone(),
-            Arc::clone(&daemon.registry),
             Arc::new(AsyncMutex::new(())),
             Arc::clone(&daemon.protocol_router),
         )
@@ -1049,8 +1009,8 @@ mod mesh_hello_reply_tests {
             Some(admitted_timestamp)
         );
         assert!(state.read().unwrap().network_secret_key.is_none());
-        assert!(state.read().unwrap().members.is_member(&me));
-        let old_bytes = rmp_serde::to_vec(&fallback).unwrap();
+        assert!(state.read().unwrap().group.members.is_member(&me));
+        let old_bytes = crate::membership::canonical_group_bytes(&fallback);
         daemon
             .transport
             .blob_store
@@ -1059,26 +1019,25 @@ mod mesh_hello_reply_tests {
             .await
             .unwrap();
         assert_eq!(
-            fetch_and_apply_blob(
+            apply_group_record(
                 &daemon.transport.endpoint,
-                &daemon.transport.blob_store,
-                &daemon.registry.peers,
-                &daemon.registry.firewall,
                 &daemon.registry,
-                &state,
                 "test-network",
-                blake3::hash(&old_bytes),
-                &[provider_id],
-                admitted_timestamp.checked_sub(1).unwrap(),
+                &state,
+                &None,
+                &SignedGroupRecord {
+                    hash: blake3::hash(&old_bytes),
+                    seeds: vec![provider_id],
+                    timestamp: admitted_timestamp.checked_sub(1).unwrap(),
+                },
             )
             .await,
-            ReconvergeOutcome::Superseded
+            ReconvergeOutcome::Stale
         );
-        assert!(state.read().unwrap().members.is_member(&me));
+        assert!(state.read().unwrap().group.members.is_member(&me));
         assert!(config::load_network("test-network").unwrap().is_some());
 
         let handler = MemberAcceptState {
-            ctx: daemon.registry.mesh_ctx(),
             network_name: "test-network".into(),
             state: Arc::clone(&state),
             net_pubkey: network_key,
@@ -1101,7 +1060,7 @@ mod mesh_hello_reply_tests {
         );
         handler.apply_signed_record(replay.as_bytes()).await;
         assert_eq!(state.read().unwrap().last_record_timestamp, Some(300));
-        assert!(state.read().unwrap().members.is_member(&me));
+        assert!(state.read().unwrap().group.members.is_member(&me));
         assert!(config::load_network("test-network").unwrap().is_some());
         token.cancel();
         router.shutdown().await.unwrap();
@@ -1166,8 +1125,8 @@ mod mesh_hello_reply_tests {
                 &mut send,
                 Some(network_key),
                 &ControlMsg::Welcome {
-                    members: Vec::new(),
-                    approved: Vec::new(),
+                    members: Default::default(),
+                    approved: Default::default(),
                     direct_key: None,
                     direct_record: None,
                     direct_record_published: false,
@@ -1386,6 +1345,7 @@ mod persist_config_tests {
             independent_paired_devices: vec![],
             last_group_hash: Some(cached_hash),
             last_group_hash_published: true,
+            last_record_timestamp: None,
             transport: None,
             auto_accept_firewall: true,
             auto_accept_files: true,
@@ -1402,11 +1362,11 @@ mod persist_config_tests {
         .unwrap();
 
         // Reconnect: re-persist from a blob roster that carries no exit policy.
-        let roster = vec![member(2, false), member(4, true)];
+        let roster = MemberList::from(vec![member(2, false), member(4, true)]);
         persist_join_config(
             "homelab",
             &roster,
-            &[],
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("umbrel".to_string()),
@@ -1445,8 +1405,8 @@ mod persist_config_tests {
 
         persist_join_config(
             "homelab",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("umbrel".to_string()),
@@ -1474,8 +1434,8 @@ mod persist_config_tests {
         let primary = id(5);
         persist_join_config(
             "paired",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("device".to_string()),
@@ -1487,8 +1447,8 @@ mod persist_config_tests {
         .unwrap();
         persist_join_config(
             "paired",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("device".to_string()),
@@ -1525,8 +1485,8 @@ mod persist_config_tests {
         let me = id(2);
         let result = persist_join_config(
             "homelab",
-            &[member(2, false), member(4, true)],
-            &[],
+            &MemberList::from(vec![member(2, false), member(4, true)]),
+            &ApprovedList::new(),
             me,
             net_pubkey,
             &Some("umbrel".to_string()),

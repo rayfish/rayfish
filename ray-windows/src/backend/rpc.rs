@@ -231,7 +231,7 @@ mod tests {
     use std::future::pending;
     use std::sync::atomic::AtomicUsize;
 
-    use ray_proto::ipc::{InactiveNetwork, SshAllowView};
+    use ray_proto::ipc::{InactiveNetwork, NodeStatus, SshAllowView};
     use tokio::io::duplex;
 
     use crate::model::{SshRule, SshState, Status};
@@ -392,7 +392,7 @@ mod tests {
         let endpoint_id = network.peers[0].endpoint_id;
         let mut saved = network.clone();
         saved.name = "saved-example".into();
-        let response = IpcMessage::StatusResponse {
+        let response = IpcMessage::StatusResponse(NodeStatus {
             endpoint_id,
             mdns_enabled: true,
             auto_update: true,
@@ -414,7 +414,7 @@ mod tests {
                 saved: Some(saved),
             }],
             lan_peers: Vec::new(),
-        };
+        });
         let (client, server) = duplex(8192);
         let daemon = async move {
             let mut connection = ipc::framed(server);

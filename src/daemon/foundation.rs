@@ -37,6 +37,9 @@ pub(crate) struct Transport {
     /// with the endpoint prevents a later embedded daemon from inheriting a
     /// prior instance's process-global setting.
     pub(crate) pkarr_relay_url: Url,
+    /// The one HTTP client for that relay, shared by every publisher and
+    /// resolver so they reuse its connection pool.
+    pub(crate) pkarr: PkarrRelayClient,
     /// Phones go outgoing-only after an idle period: mesh peer links close and
     /// the relay is dropped, so nothing unsolicited reaches the radio. Shared
     /// with mDNS, which skips its windows while this is set.
@@ -73,8 +76,9 @@ impl Transport {
         blob_store: FsStore,
         stats: Arc<ForwardMetrics>,
         bootstrap: TransportBootstrap,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let pkarr = dht::create_pkarr_client(&endpoint, &bootstrap.pkarr_relay_url)?;
+        Ok(Self {
             endpoint,
             identity,
             blob_store,
@@ -82,6 +86,7 @@ impl Transport {
             lan_peers: bootstrap.lan_peers,
             warm_lookup: bootstrap.warm_lookup,
             pkarr_relay_url: bootstrap.pkarr_relay_url,
+            pkarr,
             #[cfg(any(target_os = "android", target_os = "ios"))]
             suspended: bootstrap.suspended,
             #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -90,7 +95,14 @@ impl Transport {
             relay_map: bootstrap.relay_map,
             #[cfg(any(target_os = "android", target_os = "ios"))]
             relay_toggle: Arc::new(AsyncMutex::new(())),
-        }
+        })
+    }
+
+    /// Point this transport at another pkarr relay.
+    #[cfg(test)]
+    pub(crate) fn set_pkarr_relay(&mut self, url: Url) {
+        self.pkarr = dht::create_pkarr_client(&self.endpoint, &url).expect("endpoint is open");
+        self.pkarr_relay_url = url;
     }
 
     #[cfg(any(target_os = "android", target_os = "ios"))]

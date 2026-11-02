@@ -166,13 +166,14 @@ fn connection_replaced(previous: Option<&WeakConnectionHandle>, current: &Connec
     })
 }
 
+/// Send `count` probes `interval` apart. The caller has already clamped both
+/// (`PingPlan` in `diagnostics`).
 pub(super) async fn run_probes(
     count: u32,
-    interval_ms: u64,
+    interval: Duration,
     pending: &PendingPongs,
     mut current_connection: impl FnMut() -> Option<Connection>,
 ) -> PingRun {
-    let count = count.clamp(1, 100);
     let mut run = PingRun {
         probes: Vec::with_capacity(count as usize),
         details: Vec::with_capacity(count as usize),
@@ -182,7 +183,7 @@ pub(super) async fn run_probes(
     let mut previous_connection: Option<WeakConnectionHandle> = None;
     for seq in 0..count {
         if seq > 0 {
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            tokio::time::sleep(interval).await;
         }
         // Re-read the live route for every probe. A background reconnect must
         // not leave the rest of this run probing a retired connection handle.
@@ -281,7 +282,7 @@ mod tests {
         let pending = PendingPongs::default();
         let reply = tokio::spawn(reply_once(remote, current.clone(), Arc::clone(&pending)));
         let mut routes = [Some(old), None, Some(current.clone())].into_iter();
-        let run = run_probes(3, 0, &pending, || routes.next().unwrap()).await;
+        let run = run_probes(3, Duration::ZERO, &pending, || routes.next().unwrap()).await;
         assert_eq!(run.probes.len(), 3);
         assert_eq!(run.details[0].outcome, PingProbeOutcome::ConnectionClosed);
         assert_eq!(run.details[1].outcome, PingProbeOutcome::NoConnection);

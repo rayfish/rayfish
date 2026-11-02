@@ -84,7 +84,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         let (tun_reader, tun_writer, tun_name) = tun::create(my_ipv6)
             .await
             .context("failed to create TUN device")?;
-        daemon.tun_name.store(Arc::new(tun_name));
+        daemon.registry.tun_name.store(Arc::new(tun_name));
         daemon.fatal.arm();
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
@@ -112,7 +112,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // (the self-replacing updater is not built into the Android lib).
     #[cfg(feature = "desktop")]
     if daemon.auto_update {
-        spawn_auto_update(daemon.shutdown_token.clone());
+        spawn_auto_update(daemon.registry.shutdown_token.clone());
     }
 
     let result = serve_ipc(&daemon, token, ipc).await;
@@ -606,37 +606,30 @@ async fn build_daemon_inner(
             #[cfg(any(target_os = "android", target_os = "ios"))]
             relay_map: transport::configured_relay_map(&app_config.relay)?,
         },
-    ));
+    )?);
     // The per-peer connection driver is built once here and shared by the
     // ProtocolRouter (which delegates the mesh ALPN to it) and the
     // NetworkRegistry (which re-registers a network's handler on promotion).
     let conn = Arc::new(ConnectionManager::new());
-    // Networks map is shared with the NetworkRegistry service (M5 seam): both
-    // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
-    let networks = Arc::new(DashMap::new());
     // Daemon-wide disconnect channel: every per-connection data reader reports
     // peer drops here, drained by the single connection supervisor. Built here
-    // (before the registry) so both the registry's MeshCtx builder and the
-    // Daemon literal share the one sender.
+    // (before the registry) so the supervisor can own the receiver.
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
-    let pruned_peers = Arc::new(DashSet::new());
-    let registry = Arc::new(NetworkRegistry::new(
-        Arc::clone(&networks),
-        Arc::clone(&transport),
-        peers.clone(),
-        Arc::clone(&conn),
-        Arc::clone(&dns),
-        Arc::clone(&tun_name),
-        device_cert.clone(),
-        token.clone(),
-        shared_firewall.clone(),
-        device_user_map.clone(),
-        Arc::clone(&tun_tx),
-        Arc::clone(&pruned_peers),
-        disconnect_tx.clone(),
+    let registry = Arc::new(NetworkRegistry::new(RegistryHandles {
+        transport: Arc::clone(&transport),
+        peers: peers.clone(),
+        conn: Arc::clone(&conn),
+        dns: Arc::clone(&dns),
+        tun_name: Arc::clone(&tun_name),
+        device_cert: device_cert.clone(),
+        shutdown_token: token.clone(),
+        firewall: shared_firewall.clone(),
+        device_user_map: device_user_map.clone(),
+        tun_tx: Arc::clone(&tun_tx),
+        disconnect_tx,
         on_demand,
-        app_config.idle_timeout(),
-    ));
+        idle_timeout: app_config.idle_timeout(),
+    }));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
     // calling NetworkRegistry directly (was the reauth_tx hand-off channel), so it
@@ -645,7 +638,6 @@ async fn build_daemon_inner(
         key.clone(),
         Arc::clone(&transport),
         Arc::clone(&registry),
-        device_cert.clone(),
         device_user_map.clone(),
         Arc::clone(&transfers),
     ));
@@ -681,7 +673,7 @@ async fn build_daemon_inner(
     ));
     // The registry (re)connect paths drive a dialed connection's demux through the
     // router; install it now that it exists (the registry was built before it).
-    registry.set_protocol_router(Arc::clone(&protocol_router));
+    registry.set_protocol_router(&protocol_router);
     // Single daemon-wide connection supervisor: consumes every data reader's
     // disconnect and, per dropped identity, prunes departed peers we coordinate and
     // reconnects the rest across all their shared networks. Spawned here (not in
@@ -708,27 +700,29 @@ async fn build_daemon_inner(
     // support. No separate reaper task.
 
     // Install the daemon-wide mesh dispatch context and spawn the protocol Router
-    // *before* building the Daemon. The dispatch is built from the registry (the
-    // single `MeshCtx` builder), and the Router only needs the services
+    // *before* building the Daemon. The dispatch holds the registry, and the Router only needs the services
     // (registry/files/connect/blobs), not the Daemon struct, so ordering it here
     // lets `router` be a plain owned field instead of a set-after-construction
     // `Option`. Dispatch must be installed before the accept loop starts handing
     // out connections, hence the order.
     protocol_router.set_mesh_dispatch(MeshDispatch {
-        ctx: registry.mesh_ctx(),
+        registry: Arc::downgrade(&registry),
         token: token.clone(),
         on_peer_connected: {
             // Deliver queued `ray send` offers the moment their peer connects.
-            let files = Arc::clone(&files);
-            let registry = Arc::clone(&registry);
+            // Weak, as the dispatch is: the registry owns it.
+            let files = Arc::downgrade(&files);
+            let registry = Arc::downgrade(&registry);
             Arc::new(move |peer| {
+                let (Some(files), Some(registry)) = (files.upgrade(), registry.upgrade()) else {
+                    return;
+                };
                 if registry
                     .current_device_cert()
                     .is_some_and(|cert| cert.user_identity == peer)
                 {
                     registry.poll_nudge.notify_waiters();
                 }
-                let files = Arc::clone(&files);
                 tokio::spawn(async move { files.flush_outbox_for(peer).await });
             })
         },
@@ -788,15 +782,10 @@ async fn build_daemon_inner(
         registry,
         connection_history: Mutex::new(Default::default()),
         paired_network_joins: Arc::new(DashSet::new()),
-        stats: Arc::clone(&stats),
         start: Instant::now(),
-        tun_tx,
-        shutdown_token: token.clone(),
         protocol_router: Arc::clone(&protocol_router),
-        dns,
         mdns,
         auto_update,
-        tun_name,
         tun_tasks: Mutex::new(None),
         #[cfg(target_os = "macos")]
         external_exit_tun: AtomicBool::new(false),
@@ -810,7 +799,6 @@ async fn build_daemon_inner(
         transfers,
         connect,
         management,
-        device_cert,
         active: Arc::clone(&active),
         #[cfg(windows)]
         data_plane_lifecycle: AsyncMutex::new(()),
@@ -833,6 +821,14 @@ async fn build_daemon_inner(
 
     // File auto-accept is evaluated inline by `FileService::accept_file_offer`
     // (no worker channel), so nothing to spawn here.
+
+    // Receives that were running when the daemon stopped pick up where they
+    // were. Not on Android: the app saves into a staging directory and moves
+    // the file to Downloads after its own accept call returns, so a receive
+    // finished without it would never reach Downloads. There the offer comes
+    // back to the queue, as before.
+    #[cfg(not(target_os = "android"))]
+    daemon.files.resume_accepted_receives();
 
     // Device-cert revocation is now carried per-network in the signed blob's
     // nullifier set (`ray unpair`); no separate pkarr record or background
@@ -907,7 +903,7 @@ pub async fn start_embedded_ipc(daemon: &Arc<Daemon>, owner_uid: u32) -> Result<
         if let Err(error) = accept_ipc(
             socket,
             &daemon,
-            daemon.shutdown_token.clone(),
+            daemon.registry.shutdown_token.clone(),
             IpcHost::PacketTunnel { owner_uid },
         )
         .await
@@ -933,6 +929,12 @@ enum IpcHost {
 #[cfg(unix)]
 impl IpcHost {
     fn check_authorized(self, req: &IpcMessage, peer: Option<&PeerIdentity>) -> Option<IpcMessage> {
+        // Only the Windows pipe handler builds these, after staging the bytes
+        // itself. From a client, `SendFileStaged` is a path send that skips the
+        // root-only rule below.
+        if is_internal_file_frame(req) {
+            return Some(ipc_err(INTERNAL_FILE_FRAME));
+        }
         #[cfg(all(target_os = "linux", feature = "desktop"))]
         if let Self::Rootless { owner_uid } = self {
             return authorize_rootless(owner_uid, peer);
@@ -948,9 +950,23 @@ impl IpcHost {
                 "The Rayfish app manages access to its packet tunnel; no operator setting is needed",
             ));
         }
-        if peer.is_some_and(
-            |peer| matches!(peer, PeerIdentity::Unix { uid, .. } if *uid == 0 || *uid == owner_uid),
-        ) {
+        let uid = peer.map(|peer| match peer {
+            PeerIdentity::Unix { uid, .. } => *uid,
+        });
+        if uid == Some(0) {
+            return None;
+        }
+        // The extension reads as root, so a path send stays root's here too.
+        if matches!(req, IpcMessage::SendFile { .. }) {
+            return Some(ipc_err(crate::daemon::ipc_dispatch::ROOT_ONLY_PATH_SEND));
+        }
+        // The extension writes as root, so the same settings stay root's here.
+        if Daemon::is_root_only_setting(req) {
+            return Some(ipc_err(
+                crate::daemon::ipc_dispatch::ROOT_ONLY_DOWNLOAD_SETTING,
+            ));
+        }
+        if uid == Some(owner_uid) {
             return None;
         }
         Some(ipc_err(
@@ -1247,6 +1263,36 @@ mod embedded_ipc_tests {
         );
     }
 
+    /// `SendFileStaged` names a path just like `SendFile`, so a client must not
+    /// reach it on any host, and a path send stays root's on every host.
+    #[test]
+    fn path_sends_are_root_only_on_every_unix_host() {
+        let staged = IpcMessage::SendFileStaged {
+            path: "/etc/shadow".into(),
+            filename: "x".into(),
+            peer: "peer".into(),
+        };
+        let by_path = IpcMessage::SendFile {
+            path: "/etc/shadow".into(),
+            peer: "peer".into(),
+        };
+        let root = PeerIdentity::Unix { uid: 0, gid: 0 };
+        let owner = PeerIdentity::Unix { uid: 501, gid: 20 };
+        // Only Linux desktop builds have a third host to add.
+        #[cfg_attr(not(all(target_os = "linux", feature = "desktop")), allow(unused_mut))]
+        let mut hosts = vec![IpcHost::Daemon, IpcHost::PacketTunnel { owner_uid: 501 }];
+        #[cfg(all(target_os = "linux", feature = "desktop"))]
+        hosts.push(IpcHost::Rootless { owner_uid: 501 });
+        for host in hosts {
+            for caller in [&root, &owner] {
+                assert!(host.check_authorized(&staged, Some(caller)).is_some());
+            }
+        }
+        let tunnel = IpcHost::PacketTunnel { owner_uid: 501 };
+        assert!(tunnel.check_authorized(&by_path, Some(&owner)).is_some());
+        assert!(tunnel.check_authorized(&by_path, Some(&root)).is_none());
+    }
+
     #[tokio::test]
     async fn socket_ownership_and_cleanup() {
         let dir = tempfile::tempdir().unwrap();
@@ -1325,7 +1371,7 @@ mod embedded_ipc_tests {
             accept_ipc(
                 socket,
                 &server_daemon,
-                server_daemon.shutdown_token.clone(),
+                server_daemon.registry.shutdown_token.clone(),
                 IpcHost::PacketTunnel {
                     owner_uid: unsafe { libc::geteuid() },
                 },
@@ -1347,7 +1393,10 @@ mod embedded_ipc_tests {
             request(&path, IpcMessage::Status)
         );
         for response in [first, second] {
-            assert!(matches!(response, IpcMessage::StatusResponse { .. }));
+            assert!(matches!(
+                response,
+                IpcMessage::StatusResponse(NodeStatus { .. })
+            ));
         }
         assert_eq!(config::load().unwrap().operator_uid, None);
         let response = request(
@@ -1379,7 +1428,7 @@ mod embedded_ipc_tests {
             assert!(
                 matches!(response, IpcMessage::Error { message } if message.contains("Rayfish app"))
             );
-            assert!(!daemon.shutdown_token.is_cancelled());
+            assert!(!daemon.registry.shutdown_token.is_cancelled());
         }
         daemon.shutdown_and_close().await;
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -1489,7 +1538,7 @@ async fn handle_ipc_client(
                 &mut framed,
                 since,
                 follow,
-                &daemon.shutdown_token,
+                &daemon.registry.shutdown_token,
             )
             .await;
         }
@@ -1498,7 +1547,7 @@ async fn handle_ipc_client(
             &mut framed,
             since,
             follow,
-            &daemon.shutdown_token,
+            &daemon.registry.shutdown_token,
         )
         .await;
     }
@@ -1639,7 +1688,9 @@ fn is_ipc_upload_temp_name(name: &str) -> bool {
     name.starts_with(IPC_UPLOAD_PREFIX) && name.ends_with(IPC_UPLOAD_SUFFIX)
 }
 
-#[cfg(windows)]
+const INTERNAL_FILE_FRAME: &str =
+    "internal file-transfer frame is not accepted at the IPC boundary";
+
 fn is_internal_file_frame(message: &IpcMessage) -> bool {
     matches!(
         message,
@@ -1736,6 +1787,7 @@ async fn read_windows_request(
         sid: identity.sid,
         is_local_system: identity.is_local_system,
         is_elevated_admin: identity.is_elevated_admin,
+        token: Some(Arc::new(identity.token)),
     };
     Ok(IdentifiedRequest { message, peer })
 }
@@ -1759,8 +1811,7 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
         ipc::send(
             &mut framed,
             IpcMessage::Error {
-                message: "internal file-transfer frame is not accepted at the IPC boundary"
-                    .to_owned(),
+                message: INTERNAL_FILE_FRAME.to_owned(),
             },
         )
         .await?;
@@ -1781,7 +1832,7 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
             &mut framed,
             since,
             follow,
-            &daemon.shutdown_token,
+            &daemon.registry.shutdown_token,
         )
         .await;
     }
@@ -1915,7 +1966,7 @@ fn boottime() -> Option<Duration> {
 #[cfg(target_os = "linux")]
 fn spawn_resume_watch(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
-        let token = daemon.shutdown_token.clone();
+        let token = daemon.registry.shutdown_token.clone();
         let Some(mut last_boot) = boottime() else {
             return;
         };
@@ -2170,7 +2221,9 @@ mod windows_ipc_tests {
             sid,
             is_local_system,
             is_elevated_admin,
+            token,
         } = received.peer;
+        assert!(token.is_some(), "the request must carry the client's token");
         assert!(
             sid == expected_sid,
             "The request did not preserve the client's SID."

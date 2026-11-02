@@ -88,15 +88,11 @@ async fn alias_remove(network: &str, alias: &str) -> Result<()> {
 }
 
 async fn alias_list(network: &str) -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::AliasList {
-            network: network.to_string(),
-        },
-    )
-    .await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::AliasList {
+        network: network.to_string(),
+    })
+    .await?
+    {
         ipc::IpcMessage::AliasListResponse { aliases } => {
             printout(&AliasesOutput(&aliases))?;
         }

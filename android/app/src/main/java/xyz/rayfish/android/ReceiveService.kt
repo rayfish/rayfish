@@ -144,23 +144,26 @@ class ReceiveService : Service() {
      * the wrong location. */
     private fun accept(id: ULong, filename: String, peer: String, size: ULong, mime: String) {
         val ctx = applicationContext
-        val saveDir = ctx.getExternalFilesDir(null)?.absolutePath ?: ctx.filesDir.absolutePath
+        val stage = receiveStagingDir(ctx)
         val key = TransferKey(peer, filename, size)
         DownloadsOutcome.markPending(key)
         try {
-            NodeHolder.get(ctx).acceptFileOffer(id, saveDir)
+            NodeHolder.get(ctx).acceptFileOffer(id, stage.absolutePath)
         } catch (t: Throwable) {
             // The accept failed, so no Downloads outcome is ever coming for this
             // key: stop treating it as pending rather than making the result
             // notification wait out the timeout for a failure already known.
             DownloadsOutcome.clearPending(key)
+            stage.delete()
             throw t
         }
         // Re-stamp now that the download is done and the copy is about to start.
         // The first mark only had to cover the wait for DONE to appear, and the
         // download itself can run far longer than the pending timeout.
         DownloadsOutcome.markPending(key)
-        val reached = moveToDownloads(ctx, File(saveDir, filename), filename, mime)
+        val reached = moveToDownloads(ctx, File(stage, filename), filename, mime)
+        // Empty once the file moved; otherwise the file stays in it.
+        if (reached) stage.delete()
         DownloadsOutcome.record(key, reached)
         Log.i(TAG, "saved $filename from $peer (downloads=$reached)")
     }

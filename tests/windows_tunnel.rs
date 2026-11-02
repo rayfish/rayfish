@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use ray_proto::GroupMode;
-use ray_proto::ipc::{self, IpcMessage};
+use ray_proto::ipc::{self, IpcMessage, NodeStatus};
 use rayfish::dns::MAGIC_DNS_V6;
 use simple_dns::{CLASS, Name, Packet, PacketFlag, QTYPE, Question, RCODE, TYPE, rdata::RData};
 use tokio::runtime::{Builder, Runtime};
@@ -53,13 +53,13 @@ fn mutation(runtime: &Runtime, message: IpcMessage) -> Result<()> {
 
 fn require_clean_standby(runtime: &Runtime) -> Result<()> {
     match request(runtime, IpcMessage::Status)? {
-        IpcMessage::StatusResponse {
+        IpcMessage::StatusResponse(NodeStatus {
             active,
             networks,
             pending_networks,
             inactive_networks,
             ..
-        } => ensure!(
+        }) => ensure!(
             !active
                 && networks.is_empty()
                 && pending_networks.is_empty()

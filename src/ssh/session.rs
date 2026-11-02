@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use super::login::LoginInfo;
 use super::session_env::{
-    drop_privs, login_env, login_program, prepare_pts, shell_launch, tty_name,
+    drop_privs, login_env, login_program, prepare_pts, session_dir, shell_launch, tty_name,
 };
 use super::{ChildProc, Origin, PtyReq};
 
@@ -231,7 +231,7 @@ pub(super) async fn run_pty_session(
         .envs(tty.map(|tty| ("SSH_TTY".to_string(), tty)))
         .envs(env);
     if handoff.is_none() {
-        cmd = cmd.current_dir(&info.home);
+        cmd = cmd.current_dir(session_dir(&info.home));
     }
     // SAFETY: one setrlimit call, async-signal-safe.
     #[cfg(target_os = "linux")]
@@ -298,7 +298,7 @@ pub(super) async fn run_pipe_session(
     let launch = shell_launch(&info, command.as_deref()).await;
     let mut cmd = Command::new(&launch.program);
     cmd.args(&launch.args)
-        .current_dir(&info.home)
+        .current_dir(session_dir(&info.home))
         .env_clear()
         .envs(login_env(&info.home, &info.shell, &info.name))
         .envs(env)

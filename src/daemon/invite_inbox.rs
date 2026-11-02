@@ -255,20 +255,16 @@ impl ConnectService {
         .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn list_invitations(&self) -> IpcMessage {
-        let listed = self
-            .read_inbox(|inbox| {
-                Ok(inbox
-                    .invitations
-                    .iter()
-                    .map(ReceivedInvitation::info)
-                    .collect())
-            })
-            .await;
-        match listed {
-            Ok(invitations) => IpcMessage::InvitationsResponse { invitations },
-            Err(e) => ipc_err(e.to_string()),
-        }
+    pub(super) async fn list_invitations(&self) -> OpResult<Vec<InvitationInfo>> {
+        self.read_inbox(|inbox| {
+            Ok(inbox
+                .invitations
+                .iter()
+                .map(ReceivedInvitation::info)
+                .collect())
+        })
+        .await
+        .map_err(|e| OpError::msg(e.to_string()))
     }
 
     /// Join the invitation's network, pinned to the coordinator that sent it.
@@ -277,7 +273,7 @@ impl ConnectService {
         &self,
         id: &str,
         hostname: Option<MachineHostname>,
-    ) -> IpcMessage {
+    ) -> OpResult<JoinOutcome> {
         let _answer = self.answer_lock.lock().await;
         let found = self
             .read_inbox(|inbox| {
@@ -286,13 +282,9 @@ impl ConnectService {
                 Ok(entry.clone())
             })
             .await;
-        let invitation = match found {
-            Ok(entry) => entry,
-            Err(e) => return ipc_err(e.to_string()),
-        };
-        let decoded = match invitation.code.decode() {
-            Ok(decoded) => decoded,
-            Err(_) => return ipc_err("invitation code is invalid".to_string()),
+        let invitation = found.map_err(|e| OpError::msg(e.to_string()))?;
+        let Ok(decoded) = invitation.code.decode() else {
+            return op_err("invitation code is invalid");
         };
         let reply = self
             .registry
@@ -301,9 +293,10 @@ impl ConnectService {
                 None,
                 hostname.map(|h| h.to_string()),
                 Some(decoded.secret),
-                Some(invitation.coordinator),
+                Some(JoinCoordinator::Preferred(invitation.coordinator)),
                 false,
                 false,
+                None,
             )
             .await;
         self.settle_accept(&invitation, reply).await
@@ -313,11 +306,11 @@ impl ConnectService {
     pub(super) async fn settle_accept(
         &self,
         invitation: &ReceivedInvitation,
-        reply: IpcMessage,
-    ) -> IpcMessage {
-        // `Ok` is a closed network that queued the join; its retry loop now
-        // holds the secret, so a second accept must not start another.
-        if matches!(reply, IpcMessage::Joined { .. } | IpcMessage::Ok { .. }) {
+        joined: OpResult<JoinOutcome>,
+    ) -> OpResult<JoinOutcome> {
+        // A queued join's retry loop now holds the secret, so a second accept
+        // must not start another.
+        if joined.is_ok() {
             let saved = self
                 .edit_inbox(|inbox| {
                     // An entry that aged out during the join is gone; the join stands.
@@ -331,17 +324,17 @@ impl ConnectService {
                 tracing::warn!(error = %e, "joined, but could not mark the invitation accepted");
             }
         }
-        match reply {
-            IpcMessage::Error { message } if crate::invite::is_dead_invite(&message) => {
-                self.drop_dead_invitation(invitation).await
+        match joined {
+            Err(e) if crate::invite::is_dead_invite(e.message()) => {
+                Err(self.drop_dead_invitation(invitation).await)
             }
-            reply => reply,
+            joined => joined,
         }
     }
 
     /// The coordinator refused the invitation's code: it was revoked, used or
     /// has expired. Nothing can redeem it, so it leaves the inbox.
-    async fn drop_dead_invitation(&self, invitation: &ReceivedInvitation) -> IpcMessage {
+    async fn drop_dead_invitation(&self, invitation: &ReceivedInvitation) -> OpError {
         let dropped = self
             .edit_inbox(|inbox| {
                 inbox.invitations.retain(|i| i.id != invitation.id);
@@ -351,7 +344,7 @@ impl ConnectService {
         if let Err(e) = dropped {
             tracing::warn!(error = %e, "could not drop a revoked invitation");
         }
-        ipc_err(format!(
+        OpError::msg(format!(
             "the invitation to {} was revoked or has expired; ask {} for a new one",
             invitation.network,
             invitation.coordinator.fmt_short()
@@ -366,7 +359,7 @@ impl ConnectService {
     }
 
     /// Refuse an invitation and block its sender on the connect channel.
-    pub(super) async fn decline_invitation(&self, id: &str) -> IpcMessage {
+    pub(super) async fn decline_invitation(&self, id: &str) -> OpResult<Done> {
         let _answer = self.answer_lock.lock().await;
         let declined = self
             .edit_inbox(|inbox| {
@@ -376,19 +369,14 @@ impl ConnectService {
                 Ok(entry.coordinator)
             })
             .await;
-        let coordinator = match declined {
-            Ok(coordinator) => coordinator,
-            Err(e) => return ipc_err(e.to_string()),
-        };
+        let coordinator = declined.map_err(|e| OpError::msg(e.to_string()))?;
         if let Err(e) = self.block(coordinator).await {
-            return ipc_err(format!("declined, but blocking the sender failed: {e:#}"));
+            return op_err(format!("declined, but blocking the sender failed: {e:#}"));
         }
-        IpcMessage::Ok {
-            message: format!(
-                "declined and blocked {} (undo with: ray unblock {coordinator})",
-                coordinator.fmt_short()
-            ),
-        }
+        Ok(Done(format!(
+            "declined and blocked {} (undo with: ray unblock {coordinator})",
+            coordinator.fmt_short()
+        )))
     }
 
     /// Drop pending offers from blocked senders.

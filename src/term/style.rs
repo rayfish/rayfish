@@ -4,7 +4,9 @@
 //! (honoring the <https://no-color.org> convention). `CLICOLOR_FORCE` overrides
 //! the TTY check so piped/captured output can still be colorized on request.
 
+use std::borrow::Cow;
 use std::fmt;
+use std::fmt::Write;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +43,49 @@ pub fn is_enabled() -> bool {
         let _ = enable_ansi_support::enable_ansi_support();
         std::io::stdout().is_terminal()
     })
+}
+
+/// Text a peer controls (file names, decline reasons, host names), made safe
+/// to print: control characters (C0, DEL, C1) and bidi overrides come out as
+/// visible `\x1b` / `\u{202e}` escapes, so a name cannot move the cursor,
+/// retitle the terminal, or reorder the line it sits in. Escapes newlines too;
+/// see [`printable_lines`] for multi-line daemon messages. Display only: JSON
+/// output and saved names keep the original text.
+pub fn printable(s: &str) -> Cow<'_, str> {
+    escape_unprintable(s, false)
+}
+
+/// [`printable`] that keeps line breaks, for daemon messages that span lines.
+pub fn printable_lines(s: &str) -> Cow<'_, str> {
+    escape_unprintable(s, true)
+}
+
+fn escape_unprintable(s: &str, keep_newlines: bool) -> Cow<'_, str> {
+    let unsafe_char = |c: char| (c.is_control() && !(keep_newlines && c == '\n')) || is_bidi(c);
+    if !s.chars().any(unsafe_char) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if !unsafe_char(c) {
+            out.push(c);
+        } else if c.is_ascii() {
+            // Writing to a String cannot fail.
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        } else {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Bidi embedding, override, isolate and mark characters: invisible, and they
+/// reorder the text around them.
+fn is_bidi(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn paint(code: &'static str, s: &str) -> String {
@@ -159,4 +204,28 @@ pub fn latency(ms: f64) -> String {
         "38;5;203" // red
     };
     paint(code, &text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printable_escapes_terminal_controls_and_bidi_overrides() {
+        let osc = "\x1b]0;owned\x07evil\x1b[2K.txt";
+        assert_eq!(printable(osc), "\\x1b]0;owned\\x07evil\\x1b[2K.txt");
+        assert_eq!(
+            printable("invoice\u{202e}fdp.exe"),
+            "invoice\\u{202e}fdp.exe"
+        );
+        assert_eq!(printable("a\u{9b}31m\u{7f}"), "a\\u{9b}31m\\x7f");
+        assert_eq!(printable("two\nlines"), "two\\x0alines");
+        assert_eq!(printable_lines("two\nlines\r"), "two\nlines\\x0d");
+    }
+
+    #[test]
+    fn printable_leaves_ordinary_text_borrowed() {
+        let name = "Résumé (final) 日本.pdf";
+        assert!(matches!(printable(name), Cow::Borrowed(text) if text == name));
+    }
 }

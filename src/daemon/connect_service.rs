@@ -65,6 +65,19 @@ pub(crate) fn evict_oldest_connect(
     Some(oldest)
 }
 
+/// Marks a peer's connect retry loop as running until the loop ends, however
+/// it ends.
+struct RetryRunning {
+    retries: Arc<DashSet<EndpointId>>,
+    peer: EndpointId,
+}
+
+impl Drop for RetryRunning {
+    fn drop(&mut self) {
+        self.retries.remove(&self.peer);
+    }
+}
+
 struct ConnectDecision {
     reply: control::ConnectMsg,
     rejection: Option<Instant>,
@@ -82,6 +95,9 @@ pub(crate) struct ConnectService {
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
     pub(crate) outgoing_connects: DashSet<EndpointId>,
+    /// Peers with a connect retry loop running, so asking again while one
+    /// waits for approval does not start a second loop for the same peer.
+    connect_retries: Arc<DashSet<EndpointId>>,
     /// Rejected requests remain terminal when a cooperative requester polls.
     rejected_connects: DashMap<EndpointId, Instant>,
     connect_decision_lock: Mutex<()>,
@@ -106,6 +122,7 @@ impl ConnectService {
             pending_connects: DashMap::new(),
             approved_connects: DashMap::new(),
             outgoing_connects: DashSet::new(),
+            connect_retries: Arc::new(DashSet::new()),
             rejected_connects: DashMap::new(),
             connect_decision_lock: Mutex::new(()),
             connection_errors: DashMap::new(),
@@ -143,19 +160,14 @@ impl ConnectService {
     /// restricted 2-peer network with the requester pre-approved (idempotent if
     /// already linked; defers to the higher endpoint id on a simultaneous
     /// cross-connect). The initiator's connect-retry loop then joins it.
-    pub(crate) async fn approve_connection(&self, selector: &str) -> IpcMessage {
-        let req = match self.find_pending(selector) {
-            Ok(req) => req,
-            Err(message) => return ipc_err(message),
-        };
+    pub(crate) async fn approve_connection(&self, selector: &str) -> OpResult<Done> {
+        let req = self.find_pending(selector).map_err(OpError::msg)?;
         let peer = req.from_endpoint;
 
         // Idempotency: already linked on a direct network -> reuse it.
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
             self.pending_connects.remove(&peer);
-            return IpcMessage::Ok {
-                message: format!("already connected to this peer on '{name}'"),
-            };
+            return Ok(Done(format!("already connected to this peer on '{name}'")));
         }
 
         // Concurrency tie-break: if we also initiated a connect to this peer and
@@ -164,9 +176,9 @@ impl ConnectService {
         let we_initiated = self.outgoing_connects.contains(&peer);
         if we_initiated && self.transport.endpoint.id().to_string() < peer.to_string() {
             self.pending_connects.remove(&peer);
-            return IpcMessage::Ok {
-                message: "connection will be established by the other peer".to_string(),
-            };
+            return Ok(Done(
+                "connection will be established by the other peer".to_string(),
+            ));
         }
 
         // Decide our own hostname once so the network name (`<me>-<peer>`) and our
@@ -178,13 +190,9 @@ impl ConnectService {
             config::load().ok().and_then(|c| c.default_hostname),
             req.hostname.as_deref().as_slice(),
         );
-        let name = match self
+        let name = self
             .registry
-            .direct_network_name(&my_host, req.hostname.as_deref())
-        {
-            Ok(name) => name,
-            Err(e) => return ipc_err(format!("{e:#}")),
-        };
+            .direct_network_name(&my_host, req.hostname.as_deref())?;
         match self
             .registry
             .create_network_inner(
@@ -196,18 +204,17 @@ impl ConnectService {
             )
             .await
         {
-            Ok(IpcMessage::Created {
+            Ok(CreatedNetwork {
                 name, network_key, ..
             }) => {
                 self.pending_connects.remove(&peer);
                 self.approved_connects
                     .insert(peer, (network_key, self.transport.endpoint.id()));
-                IpcMessage::Ok {
-                    message: format!("approved — direct connection '{name}' created"),
-                }
+                Ok(Done(format!(
+                    "approved — direct connection '{name}' created"
+                )))
             }
-            Ok(other) => other,
-            Err(e) => ipc_err(format!("failed to create direct network: {e:#}")),
+            Err(e) => op_err(format!("failed to create direct network: {e:#}")),
         }
     }
 
@@ -221,16 +228,13 @@ impl ConnectService {
         self: &Arc<Self>,
         peer: &str,
         hostname: Option<String>,
-    ) -> IpcMessage {
-        let peer = match self.resolve_connect_target(peer) {
-            Ok(peer) => peer,
-            Err(message) => return ipc_err(message),
-        };
+    ) -> OpResult<ConnectOutcome> {
+        let peer = self.resolve_connect_target(peer).map_err(OpError::msg)?;
         self.connection_errors.remove(&peer);
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
-            return IpcMessage::Ok {
-                message: format!("already connected to this peer on '{name}'"),
-            };
+            return Ok(ConnectOutcome::Done(Done(format!(
+                "already connected to this peer on '{name}'"
+            ))));
         }
         self.outgoing_connects.insert(peer);
         match self.send_connect_request(peer, hostname.clone()).await {
@@ -239,22 +243,24 @@ impl ConnectService {
                 coordinator,
             }) => {
                 self.outgoing_connects.remove(&peer);
-                self.join_direct(room_id, coordinator, hostname).await
+                Ok(ConnectOutcome::Joined(
+                    self.join_direct(room_id, coordinator, hostname).await?,
+                ))
             }
             Ok(control::ConnectMsg::Pending) => {
                 self.spawn_connect_retry(peer, hostname);
-                IpcMessage::Ok {
-                    message: "connect request sent — waiting for approval".to_string(),
-                }
+                Ok(ConnectOutcome::Done(Done(
+                    "connect request sent — waiting for approval".to_string(),
+                )))
             }
             Ok(control::ConnectMsg::Denied { reason }) => {
                 self.outgoing_connects.remove(&peer);
-                ipc_err(format!("connection denied: {reason}"))
+                op_err(format!("connection denied: {reason}"))
             }
-            Ok(_) => ipc_err("unexpected response from peer".to_string()),
+            Ok(_) => op_err("unexpected response from peer".to_string()),
             Err(e) => {
                 self.outgoing_connects.remove(&peer);
-                ipc_err(format!("failed to reach peer: {e}"))
+                op_err(format!("failed to reach peer: {e}"))
             }
         }
     }
@@ -296,7 +302,7 @@ impl ConnectService {
         room_id: EndpointId,
         coordinator: EndpointId,
         hostname: Option<String>,
-    ) -> IpcMessage {
+    ) -> OpResult<JoinOutcome> {
         let resp = self
             .registry
             .join_network(
@@ -304,13 +310,14 @@ impl ConnectService {
                 None,
                 hostname,
                 None,
-                Some(coordinator),
+                Some(JoinCoordinator::Preferred(coordinator)),
                 false,
                 false,
+                None,
             )
             .await;
-        if let IpcMessage::Joined { name, .. } = &resp {
-            let _ = config::update_network(name, |net| {
+        if let Ok(JoinOutcome::Joined(joined)) = &resp {
+            let _ = config::update_network(&joined.name, |net| {
                 net.direct = true;
                 Ok(())
             });
@@ -319,13 +326,23 @@ impl ConnectService {
     }
 
     /// Retry a pending connect request on a backoff until approved/denied.
+    /// One loop per peer: while one runs, a repeated `ray connect` to the same
+    /// peer starts nothing and returns `None`.
     pub(crate) fn spawn_connect_retry(
         self: &Arc<Self>,
         peer: EndpointId,
         hostname: Option<String>,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.connect_retries.insert(peer) {
+            return None;
+        }
         let me = Arc::clone(self);
-        tokio::spawn(async move {
+        let running = RetryRunning {
+            retries: Arc::clone(&self.connect_retries),
+            peer,
+        };
+        Some(tokio::spawn(async move {
+            let _running = running;
             let mut backoff = BACKOFF_INITIAL;
             loop {
                 tokio::select! {
@@ -338,17 +355,14 @@ impl ConnectService {
                         room_id,
                         coordinator,
                     }) => match me.join_direct(room_id, coordinator, hostname.clone()).await {
-                        IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
+                        Ok(_) => {
                             tracing::info!(peer = %peer.fmt_short(), "direct connect join ok");
                             me.connection_errors.remove(&peer);
                             me.outgoing_connects.remove(&peer);
                             return;
                         }
-                        IpcMessage::Error { message } => {
-                            tracing::warn!(peer = %peer.fmt_short(), error = %message, "direct connect join failed");
-                        }
-                        other => {
-                            tracing::warn!(peer = %peer.fmt_short(), response = ?other, "direct connect join: unexpected response");
+                        Err(e) => {
+                            tracing::warn!(peer = %peer.fmt_short(), error = %e, "direct connect join failed");
                         }
                     },
                     Ok(control::ConnectMsg::Denied { reason }) => {
@@ -360,22 +374,20 @@ impl ConnectService {
                     _ => {} // Pending or transient error, keep retrying.
                 }
             }
-        });
+        }))
     }
 
     /// List pending incoming `ray connect` requests awaiting approval.
-    pub(crate) fn list_connections(&self) -> IpcMessage {
+    pub(crate) fn list_connections(&self) -> Vec<ipc::PendingRequestInfo> {
         let now = Instant::now();
-        let requests = self
-            .pending_connects
+        self.pending_connects
             .iter()
             .map(|p| ipc::PendingRequestInfo {
                 short_id: p.from_endpoint.fmt_short().to_string(),
                 hostname: p.hostname.clone(),
                 waiting_secs: now.saturating_duration_since(p.requested_at).as_secs(),
             })
-            .collect();
-        IpcMessage::PendingRequests { requests }
+            .collect()
     }
 
     /// Forget anything queued from a now-blocked identity, including the
@@ -402,40 +414,34 @@ impl ConnectService {
 
     /// Drop a pending request without blocking the requester. The app Reject
     /// buttons use this: they have no way to unblock, so they must not block.
-    pub(crate) fn reject_connection(&self, selector: &str) -> IpcMessage {
-        if let Err(message) = self.reject_pending_with(selector, || {}) {
-            return ipc_err(message);
-        }
-        IpcMessage::Ok {
-            message: format!("declined connection request '{selector}'"),
-        }
+    pub(crate) fn reject_connection(&self, selector: &str) -> OpResult<Done> {
+        self.reject_pending_with(selector, || {})
+            .map_err(OpError::msg)?;
+        Ok(Done(format!("declined connection request '{selector}'")))
     }
 
     /// `ray connect deny`: drop a pending request by hostname or endpoint
     /// prefix and block the requester, so it cannot simply ask again.
-    pub(crate) async fn deny_connection(&self, selector: &str) -> IpcMessage {
-        let req = match self.reject_pending_with(selector, || {}) {
-            Ok(req) => req,
-            Err(message) => return ipc_err(message),
-        };
+    pub(crate) async fn deny_connection(&self, selector: &str) -> OpResult<Done> {
+        let req = self
+            .reject_pending_with(selector, || {})
+            .map_err(OpError::msg)?;
         let rejection = self
             .rejected_connects
             .get(&req.from_endpoint)
             .map(|entry| *entry.value());
         if let Err(e) = self.block(req.from_endpoint).await {
-            return ipc_err(format!("request dropped, but blocking failed: {e:#}"));
+            return op_err(format!("request dropped, but blocking failed: {e:#}"));
         }
         if let Some(rejection) = rejection {
             self.rejected_connects
                 .remove_if(&req.from_endpoint, |_, remembered| *remembered == rejection);
         }
-        IpcMessage::Ok {
-            message: format!(
-                "denied and blocked {} (undo with: ray unblock {})",
-                req.from_endpoint.fmt_short(),
-                req.from_endpoint
-            ),
-        }
+        Ok(Done(format!(
+            "denied and blocked {} (undo with: ray unblock {})",
+            req.from_endpoint.fmt_short(),
+            req.from_endpoint
+        )))
     }
 
     fn connect_reply(
@@ -461,7 +467,8 @@ impl ConnectService {
         let already = self
             .approved_connects
             .get(&from_endpoint)
-            .map(|r| *r.value());
+            .map(|r| *r.value())
+            .or_else(|| self.coordinated_direct_network_with(from_endpoint));
         let rejection = self
             .rejected_connects
             .get(&from_endpoint)
@@ -503,6 +510,22 @@ impl ConnectService {
             control::ConnectMsg::Pending
         };
         Ok(ConnectDecision { reply, rejection })
+    }
+
+    /// The approval a restart forgot: `approved_connects` lives in memory, but
+    /// the direct network this node minted for `peer` is saved. While it
+    /// exists, a retry from `peer` is answered with it rather than queued as a
+    /// new request that `approve` would then call already connected.
+    fn coordinated_direct_network_with(
+        &self,
+        peer: EndpointId,
+    ) -> Option<(EndpointId, EndpointId)> {
+        let name = self.registry.existing_direct_network_with(&peer)?;
+        let handle = self.registry.networks.get(&name)?;
+        handle
+            .role
+            .is_coordinator()
+            .then(|| (handle.network_key, self.transport.endpoint.id()))
     }
 
     fn reject_pending_with(
@@ -815,6 +838,109 @@ mod pending_connect_cap_tests {
             assert!(matches!(decision.reply, control::ConnectMsg::Denied { .. }));
             assert!(service.pending_connects.is_empty());
         });
+        endpoint.close().await;
+    }
+
+    /// A connect service over a fresh endpoint and config tree in `tmp`.
+    async fn test_service(tmp: &std::path::Path) -> (Endpoint, Arc<ConnectService>) {
+        config::set_thread_config_dir(tmp.join("config"));
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let store = FsStore::load(tmp.join("blobs")).await.unwrap();
+        let registry = crate::daemon::accept_handler_tests::sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(endpoint.id()),
+            store,
+        );
+        (endpoint, Arc::new(ConnectService::new(registry)))
+    }
+
+    /// Asking again while a request waits for approval must not start a second
+    /// endless retry loop for the same peer; once the loop ends, a new one can.
+    #[tokio::test]
+    async fn one_connect_retry_loop_per_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        let peer = eid(7);
+        let first = service
+            .spawn_connect_retry(peer, None)
+            .expect("the first request starts a loop");
+        assert!(service.spawn_connect_retry(peer, None).is_none());
+        let other = service
+            .spawn_connect_retry(eid(8), None)
+            .expect("another peer gets its own loop");
+        service.registry.shutdown_token.cancel();
+        first.await.unwrap();
+        other.await.unwrap();
+        let again = service
+            .spawn_connect_retry(peer, None)
+            .expect("a finished loop frees its peer");
+        again.await.unwrap();
+        endpoint.close().await;
+    }
+
+    /// The approver restarted after minting the direct network, so its
+    /// in-memory approval is gone. The requester's retry still gets the
+    /// network instead of waiting forever behind a new pending request.
+    #[tokio::test]
+    async fn a_retry_after_the_approver_restarts_gets_the_saved_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        let requester = eid(42);
+        config::save_network(&config::NetworkConfig {
+            name: "me-them".to_string(),
+            direct: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let state = crate::daemon::accept_handler_tests::hold_network(
+            &service.registry,
+            "me-them",
+            NetworkRole::Coordinator,
+            Vec::new(),
+            vec![crate::membership::ApprovedEntry {
+                identity: requester,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+            }],
+        );
+        let network_key = state.read().unwrap().network_public_key;
+
+        let decision = service.connect_reply(requester, None, false).unwrap();
+        assert!(
+            matches!(
+                decision.reply,
+                control::ConnectMsg::Approved { room_id, coordinator }
+                    if room_id == network_key && coordinator == endpoint.id()
+            ),
+            "{:?}",
+            decision.reply
+        );
+        assert!(service.pending_connects.is_empty());
+        endpoint.close().await;
+    }
+
+    /// A finished delivery does not leave its recipient's lock behind.
+    #[tokio::test]
+    async fn invite_delivery_locks_are_dropped_when_idle() {
+        use crate::daemon::invite_delivery::Mint;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, service) = test_service(tmp.path()).await;
+        for seed in 1..=3 {
+            // No such network here, so each delivery fails at once.
+            let delivered = service
+                .deliver_locked("missing", eid(seed), Mint::Never)
+                .await;
+            assert!(delivered.is_err());
+        }
+        assert!(service.delivery_locks.is_empty());
         endpoint.close().await;
     }
 

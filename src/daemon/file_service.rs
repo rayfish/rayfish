@@ -10,16 +10,155 @@
 
 use super::transfers;
 use super::*;
-#[cfg(unix)]
-use std::ffi::CString;
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
+use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 use iroh_blobs::api::remote::GetProgressItem;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use tokio_util::io::ReaderStream;
+
+mod dest_name;
+mod receive;
+#[cfg(unix)]
+mod receive_dest;
+#[cfg(windows)]
+#[path = "file_service/receive_dest_windows.rs"]
+mod receive_dest;
+
+/// Who an accepted file is for, and how far the directory it lands in is
+/// trusted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(not(windows), derive(PartialEq, Eq))]
+pub(crate) struct Recipient {
+    /// The user the file (and any directory created for it) is handed to.
+    /// `None` leaves it owned by the daemon. Unix only in effect: Windows
+    /// grants the file to `caller` instead.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) owner: Option<(u32, u32)>,
+    /// `owner` named the directory, so it must be one they own. Off for the
+    /// root-configured auto-accept target, which is trusted as long as no
+    /// link redirects it.
+    pub(crate) caller_chose_dir: bool,
+    /// Who asked, on Windows, where there is no uid to compare: the daemon
+    /// asks Windows whether this caller could write the directory themselves.
+    /// Saved only as whether it was LocalSystem: a user's token cannot
+    /// outlive the daemon, so that receive is not saved at all (see
+    /// [`Recipient::survives_restart`]) and anything else loads as `Unknown`.
+    #[cfg(windows)]
+    #[serde(default, rename = "caller_is_system", with = "saved_caller")]
+    pub(crate) caller: WindowsCaller,
+}
+
+/// The Windows caller behind an accept, as far as the destination check
+/// needs to know.
+#[cfg(windows)]
+#[derive(Clone, Debug, Default)]
+pub(crate) enum WindowsCaller {
+    /// LocalSystem, the daemon's own account: it could write there anyway.
+    System,
+    /// A user whose token decides, through the directory's ACL.
+    User(Arc<crate::windows_identity::ClientToken>),
+    /// Nothing identified the caller. A directory they chose is refused.
+    #[default]
+    Unknown,
+}
+
+/// [`WindowsCaller`] in `pending-files.json`: whether it was LocalSystem.
+#[cfg(windows)]
+mod saved_caller {
+    use super::WindowsCaller;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        caller: &WindowsCaller,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bool(matches!(caller, WindowsCaller::System))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<WindowsCaller, D::Error> {
+        Ok(if bool::deserialize(deserializer)? {
+            WindowsCaller::System
+        } else {
+            WindowsCaller::Unknown
+        })
+    }
+}
+
+impl Recipient {
+    /// Whether a receive for this recipient can restart after the daemon does.
+    /// On Windows a directory the caller chose is checked against their token,
+    /// which is gone after a restart, so such a receive is not saved and its
+    /// offer comes back to the queue instead.
+    pub(crate) fn survives_restart(&self) -> bool {
+        #[cfg(windows)]
+        if self.caller_chose_dir && !matches!(self.caller, WindowsCaller::System) {
+            return false;
+        }
+        true
+    }
+
+    /// A local caller accepting a file into a directory they named (or the
+    /// CLI defaulted to their Downloads).
+    pub(crate) fn caller(peer: Option<&PeerIdentity>) -> Self {
+        Self {
+            owner: peer.and_then(PeerIdentity::unix_cred),
+            caller_chose_dir: true,
+            #[cfg(windows)]
+            caller: match peer {
+                Some(PeerIdentity::Windows {
+                    is_local_system: true,
+                    ..
+                }) => WindowsCaller::System,
+                Some(PeerIdentity::Windows {
+                    token: Some(token), ..
+                }) => WindowsCaller::User(Arc::clone(token)),
+                _ => WindowsCaller::Unknown,
+            },
+        }
+    }
+
+    /// How far the destination directory is trusted. Root may name any
+    /// directory: it could write there anyway. A directory root configured
+    /// is trusted as long as nobody redirected it with a link.
+    #[cfg(unix)]
+    fn dir_trust(&self) -> receive_dest::DirTrust {
+        use receive_dest::DirTrust;
+        let uid = self.owner.map(|(uid, _)| uid).filter(|&uid| uid != 0);
+        match (self.caller_chose_dir, uid) {
+            (true, Some(uid)) => DirTrust::Owner(uid),
+            (true, None) => DirTrust::Any,
+            (false, uid) => DirTrust::Configured(uid),
+        }
+    }
+}
+
+/// A received file with every byte written, still under its temporary name.
+struct Written {
+    staged: receive_dest::Staged,
+    dir: PathBuf,
+}
+
+impl Written {
+    /// Move the file to its name, or a numbered variant when that is taken,
+    /// and return the path it was saved under. `before_rename` is told each
+    /// name just before the file is moved to it.
+    async fn commit(
+        self,
+        before_rename: impl FnMut(&str) + Send + 'static,
+    ) -> std::io::Result<PathBuf> {
+        let Written { staged, dir } = self;
+        let name = tokio::task::spawn_blocking(move || staged.commit(before_rename))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(dir.join(name))
+    }
+}
 
 /// Upper bound on one background offer dial. `Endpoint::connect` retries
 /// discovery with no timeout of its own; the outbox retries on the next
@@ -31,14 +170,68 @@ const OFFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// sweep only catches offers whose delivery failed transiently while the
 /// connection stayed up.
 pub(crate) const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Peers with a flush pass running. The value is the rerun mark: a trigger
+/// that finds the pass already running sets it instead of starting its own,
+/// and the running pass goes round again so the trigger's offer is attempted.
+type FlushMarks = DashMap<EndpointId, bool>;
+
+/// Ownership of one peer's flush. Dropping it (cancellation, panic) releases
+/// the peer; the normal exit is [`FlushGuard::release_unless_rerun`].
 struct FlushGuard {
-    flushing: Arc<DashSet<EndpointId>>,
+    flushing: Arc<FlushMarks>,
     peer: EndpointId,
+    held: bool,
+}
+
+impl FlushGuard {
+    /// Take the peer's flush, or mark the running one for a rerun and return
+    /// `None`.
+    fn acquire(flushing: &Arc<FlushMarks>, peer: EndpointId) -> Option<Self> {
+        match flushing.entry(peer) {
+            Entry::Occupied(mut running) => {
+                *running.get_mut() = true;
+                None
+            }
+            Entry::Vacant(free) => {
+                free.insert(false);
+                Some(Self {
+                    flushing: Arc::clone(flushing),
+                    peer,
+                    held: true,
+                })
+            }
+        }
+    }
+
+    /// Release the peer unless a rerun was requested during the pass; then
+    /// clear the mark, keep the peer, and return `false`. Checking the mark
+    /// and releasing happen under one shard lock, so a trigger either lands
+    /// before (and gets the rerun) or after (and starts its own pass).
+    fn release_unless_rerun(&mut self) -> bool {
+        match self.flushing.entry(self.peer) {
+            Entry::Occupied(mut running) if *running.get() => {
+                *running.get_mut() = false;
+                false
+            }
+            Entry::Occupied(running) => {
+                running.remove();
+                self.held = false;
+                true
+            }
+            Entry::Vacant(_) => {
+                self.held = false;
+                true
+            }
+        }
+    }
 }
 
 impl Drop for FlushGuard {
     fn drop(&mut self) {
-        self.flushing.remove(&self.peer);
+        if self.held {
+            self.flushing.remove(&self.peer);
+        }
     }
 }
 
@@ -118,8 +311,12 @@ fn reclaim_blob(store: FsStore, tag: String) {
 }
 
 /// Return an unsuccessful receive to the queue, including when its task is canceled.
+///
+/// A receive stopped by daemon shutdown keeps its accepted destination, so the
+/// next start resumes it; any other failure makes it a plain pending offer.
 struct ReceiveOfferGuard {
     file: Option<PendingFile>,
+    shutdown: CancellationToken,
     pending: Arc<Mutex<Vec<PendingFile>>>,
     active: Arc<Mutex<Vec<PendingFile>>>,
     offer_id: control::FileOfferId,
@@ -129,9 +326,18 @@ struct ReceiveOfferGuard {
 
 impl Drop for ReceiveOfferGuard {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
+        if let Some(mut file) = self.file.take() {
             let mut queue = self.pending.lock().unwrap();
             let mut active = self.active.lock().unwrap();
+            if self.shutdown.is_cancelled() {
+                // The active entry is the latest word on where it is going,
+                // including any name it was being saved under.
+                if let Some(current) = active.iter().find(|entry| entry.offer_id == self.offer_id) {
+                    file.accepted.clone_from(&current.accepted);
+                }
+            } else {
+                file.accepted = None;
+            }
             active.retain(|entry| entry.offer_id != self.offer_id);
             make_room(&mut queue, &self.store);
             queue.push(file);
@@ -230,16 +436,36 @@ pub(crate) struct OutboxEntry {
     pub(crate) blob_hash: blake3::Hash,
 }
 
-/// A received file offer awaiting `ray files accept`.
+/// A received file offer awaiting `ray files accept`, or one being received.
+///
+/// Saved in `pending-files.json` together with the receives in progress, so
+/// both survive a restart. `accepted` marks a receive in progress; files saved
+/// before it existed load as plain offers.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct PendingFile {
     offer_id: control::FileOfferId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<AcceptedReceive>,
     pub(crate) id: u64,
     pub(crate) from: EndpointId,
     pub(crate) filename: String,
     pub(crate) size: u64,
     pub(crate) mime_type: String,
     pub(crate) blob_hash: iroh_blobs::Hash,
+}
+
+/// Where an accepted receive is going, kept so it can restart after the daemon
+/// does. The directory ownership check runs again when the file is written.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(not(windows), derive(PartialEq, Eq))]
+struct AcceptedReceive {
+    output: Option<String>,
+    recipient: Recipient,
+    /// The name the complete file was being renamed to, saved just before
+    /// the rename. A restart between the rename and recording the delivery
+    /// finds the file under it rather than saving it a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved_as: Option<String>,
 }
 
 fn pending_files_path() -> Option<PathBuf> {
@@ -270,6 +496,32 @@ fn load_pending_files() -> Vec<PendingFile> {
     }
 }
 
+/// Save that accepted receive `offer_id` is about to be renamed to `name`,
+/// for [`AcceptedReceive::saved_as`]. Runs on the blocking pool with the
+/// rename. A failure is logged and the rename goes ahead: failing the receive
+/// would put the offer back to be downloaded and saved again anyway.
+fn note_saving_as(
+    pending: &Mutex<Vec<PendingFile>>,
+    active: &Mutex<Vec<PendingFile>>,
+    offer_id: control::FileOfferId,
+    name: &str,
+) {
+    let pending = pending.lock().unwrap();
+    let mut active = active.lock().unwrap();
+    let Some(accepted) = active
+        .iter_mut()
+        .find(|entry| entry.offer_id == offer_id)
+        .and_then(|entry| entry.accepted.as_mut())
+    else {
+        return;
+    };
+    accepted.saved_as = Some(name.to_string());
+    let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
+    if let Err(error) = save_pending_files(&durable) {
+        tracing::warn!(%error, "could not note the name a received file is saved under");
+    }
+}
+
 fn save_pending_files(pending: &[PendingFile]) -> Result<(), String> {
     let path = pending_files_path().ok_or_else(|| "cannot resolve config directory".to_string())?;
     let bytes = serde_json::to_vec(pending).map_err(|error| error.to_string())?;
@@ -294,6 +546,21 @@ pub(crate) struct PairingSession {
 /// accept`, so an evicted entry costs nothing that was not already the sender's
 /// to retry.
 pub(crate) const MAX_PENDING_FILES: usize = 256;
+
+/// Whether a peer-supplied file name is a single plain path component. The
+/// name is joined onto the receiver's download directory by a root daemon, so
+/// anything that could climb out of it (`..`, separators of either platform,
+/// a drive prefix) or name the directory itself is refused outright.
+fn is_safe_file_name(name: &str) -> bool {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(part)), None) if part == name
+    )
+}
 
 /// Drop the oldest queued offer when `pending` is at `cap`, returning it.
 /// Offers are pushed in arrival order, so the oldest is the front.
@@ -443,8 +710,6 @@ pub(crate) struct FileService {
     transport: Arc<Transport>,
     /// The network-owning service, for the own-device auto-accept membership gate.
     registry: Arc<NetworkRegistry>,
-    /// This device's cert (if paired), to resolve our own user identity.
-    device_cert: Option<control::DeviceCert>,
     /// Transport-key → user-identity map, to resolve a file sender's owner.
     device_user_map: peers::DeviceUserMap,
     /// In-flight transfers, for progress reporting.
@@ -454,9 +719,16 @@ pub(crate) struct FileService {
     /// Ids come from `file_id_counter`, shared with inbound pending offers.
     outbox: Arc<Mutex<Vec<OutboxEntry>>>,
     /// Peers with a flush in flight, so a burst of connect events (or the
-    /// sweep racing a connect) can't deliver the same offer twice.
-    flushing: Arc<DashSet<EndpointId>>,
+    /// sweep racing a connect) can't deliver the same offer twice, plus each
+    /// one's rerun mark so a collapsed trigger is not lost.
+    flushing: Arc<FlushMarks>,
     declines: Mutex<Vec<FileDecision>>,
+    /// Accepted receives still running, so they can be canceled.
+    receives: receive::ActiveReceives,
+    /// Bounds how many receives fetch at once.
+    receive_slots: tokio::sync::Semaphore,
+    /// Timing for retrying an interrupted receive.
+    resume: receive::ResumePolicy,
 }
 
 impl FileService {
@@ -464,7 +736,6 @@ impl FileService {
         secret_key: SecretKey,
         transport: Arc<Transport>,
         registry: Arc<NetworkRegistry>,
-        device_cert: Option<control::DeviceCert>,
         device_user_map: peers::DeviceUserMap,
         transfers: Arc<transfers::TransferRegistry>,
     ) -> Self {
@@ -503,12 +774,14 @@ impl FileService {
             secret_key,
             transport,
             registry,
-            device_cert,
             device_user_map,
             transfers,
             outbox: Arc::new(Mutex::new(queued)),
-            flushing: Arc::new(DashSet::new()),
+            flushing: Arc::new(DashMap::new()),
             declines: Mutex::new(declines),
+            receives: Arc::default(),
+            receive_slots: receive::receive_slots(),
+            resume: receive::ResumePolicy::default(),
         }
     }
 
@@ -543,6 +816,7 @@ impl FileService {
                     PendingFile {
                         id: self.file_id_counter.fetch_add(1, Ordering::Relaxed),
                         offer_id,
+                        accepted: None,
                         from,
                         filename,
                         size,
@@ -606,6 +880,9 @@ impl FileService {
         let offer_id = file.offer_id;
         if file.from != remote {
             return FileOfferOutcome::declined(offer_id, "file offer sender identity mismatch");
+        }
+        if !is_safe_file_name(&file.filename) {
+            return FileOfferOutcome::declined(offer_id, "invalid file name");
         }
         let decisions = self.declines.lock().unwrap();
         if let Some(decision) = decisions
@@ -672,12 +949,7 @@ impl FileService {
     /// node uses its endpoint id as its own user identity, so a stranger can
     /// never match. Shared by `try_auto_accept_file` and `list_files`.
     pub(crate) fn is_own_device_sender(&self, from: EndpointId) -> bool {
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.transport.endpoint.id());
-        self.device_user_map.resolve(&from) == own_user
+        self.device_user_map.resolve(&from) == self.registry.own_identity()
     }
 
     pub(crate) fn should_auto_accept_file(&self, from: EndpointId) -> bool {
@@ -720,227 +992,149 @@ impl FileService {
             }
         };
         let output = Some(dir.to_string_lossy().into_owned());
+        // Root set both the directory and its user (`check_authorized`), so the
+        // directory is trusted as configured. Its user may still own part of
+        // the path, so a link in it is not (see `receive_dest`).
+        let recipient = Recipient {
+            owner: cred,
+            caller_chose_dir: false,
+            #[cfg(windows)]
+            caller: WindowsCaller::System,
+        };
 
-        match self.accept_file(id, output, cred).await {
-            IpcMessage::Ok { message } => {
-                tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted");
+        // Only the start is awaited: an interrupted receive keeps retrying for
+        // hours, and the receive task logs its own outcome.
+        match self.begin_receive(id, output, recipient, self.resume).await {
+            Ok(_) => tracing::info!(from = %from.fmt_short(), "file auto-accepted"),
+            Err(error) => {
+                tracing::warn!(from = %from.fmt_short(), %error, "file auto-accept failed");
             }
-            IpcMessage::Error { message } => {
-                tracing::warn!(from = %from.fmt_short(), %message, "file auto-accept failed");
-            }
-            _ => {}
         }
     }
 
     /// Fetch a pending file's blob from its sender, write it to disk, and (when a
-    /// `peer_cred` is given) chown it to that user. Failed receives stay queued
-    /// with their downloaded ranges so the destination can retry.
+    /// `peer_cred` is given) hand it to that user. A caller who names `output`
+    /// must own that directory unless they are root: the write happens with
+    /// the daemon's privileges. Failed receives stay queued with their
+    /// downloaded ranges so the destination can retry.
+    ///
+    /// The embedder entry point, which knows the caller only by uid. On
+    /// Windows that identifies nobody, so a named directory is refused there;
+    /// IPC goes through [`Self::accept_file_for`] with the pipe's caller.
+    ///
+    /// Its caller (the Android app) blocks until the receive ends, so it stops
+    /// retrying much sooner than a receive nobody waits on
+    /// ([`receive::ResumePolicy::for_blocking_call`]). An accept that gives up keeps
+    /// what arrived, and accepting again continues from there.
     pub(crate) async fn accept_file(
         self: &Arc<Self>,
         id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
-    ) -> IpcMessage {
-        let pending_file = {
-            let mut pending = self.pending_files.lock().unwrap();
-            match take_pending(&mut pending, id) {
-                Some(file) => {
-                    self.active_files.lock().unwrap().push(file.clone());
-                    file
-                }
-                None => {
-                    return ipc_err(format!("no pending file with id {id}"));
-                }
-            }
+    ) -> OpResult<Done> {
+        let recipient = Recipient {
+            owner: peer_cred,
+            caller_chose_dir: true,
+            #[cfg(windows)]
+            caller: WindowsCaller::Unknown,
         };
-
-        let mut offer = ReceiveOfferGuard {
-            offer_id: pending_file.offer_id,
-            file: Some(pending_file),
-            pending: Arc::clone(&self.pending_files),
-            active: Arc::clone(&self.active_files),
-            transfers: Arc::clone(&self.transfers),
-            store: self.transport.blob_store.clone(),
-        };
-        let file = offer
-            .file
-            .as_ref()
-            .expect("the offer is held until the receive succeeds");
-        let peer = file.from;
-        let response = self.receive_file(file, output, peer_cred).await;
-        match response {
-            IpcMessage::Ok { .. } => {
-                if let Some(file) = offer.file.as_ref()
-                    && let Err(error) = self.record_completed_offer(file)
-                {
-                    return ipc_err(format!(
-                        "file saved but could not record delivery confirmation: {error}; retry with `ray files accept {id}`"
-                    ));
-                }
-                offer.file.take();
-                let pending = self.pending_files.lock().unwrap();
-                let mut active = self.active_files.lock().unwrap();
-                active.retain(|entry| entry.offer_id != offer.offer_id);
-                let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
-                if let Err(error) = save_pending_files(&durable) {
-                    tracing::warn!(%error, "could not persist completed incoming file");
-                }
-                drop(active);
-                drop(pending);
-                let service = Arc::clone(self);
-                tokio::spawn(async move { service.flush_outbox_for(peer).await });
-                response
-            }
-            IpcMessage::Error { message } => {
-                ipc_err(format!("{message}; retry with `ray files accept {id}`"))
-            }
-            other => other,
-        }
+        let policy = self.resume.for_blocking_call();
+        self.wait_for_receive(id, output, recipient, policy).await
     }
 
-    async fn receive_file(
-        &self,
-        pending_file: &PendingFile,
+    /// Like [`Self::accept_file`], but returns once the receive has started.
+    /// For the apps, whose provider calls time out long before a large
+    /// download ends; they follow it in the transfer list.
+    pub(crate) async fn start_accepting_file(
+        self: &Arc<Self>,
+        id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
-    ) -> IpcMessage {
-        #[cfg(windows)]
-        let _ = peer_cred;
-        let blob_hash = pending_file.blob_hash;
-        let peer_label = pending_file.from.fmt_short().to_string();
-        let transfer_id = self.transfers.register_receive(
-            peer_label,
-            pending_file.filename.clone(),
-            pending_file.size,
+    ) -> OpResult<Done> {
+        let recipient = Recipient {
+            owner: peer_cred,
+            caller_chose_dir: true,
+            #[cfg(windows)]
+            caller: WindowsCaller::Unknown,
+        };
+        // Dropping the outcome leaves the receive running; it logs the result.
+        drop(
+            self.begin_receive(id, output, recipient, self.resume)
+                .await?,
         );
-        // The offer is gone from the queue, but the receive stays visible
-        // while the connection and fetch are in progress.
-        let finish_guard = transfers::FinishGuard::new(Arc::clone(&self.transfers), transfer_id);
-
-        // Claim the blob before fetching it. `fetch` leaves what it downloads
-        // untagged, so a GC triggered by some other transfer finishing mid-fetch
-        // would sweep the bytes out from under us. The tag is dropped again as
-        // soon as the file reaches its destination or the offer is rejected.
-        // Failed receives keep the tag so a retry can reuse the downloaded ranges.
-        let recv_tag = blob_tags::recv(&blob_hash, pending_file.id);
-        if let Err(e) = self
-            .transport
-            .blob_store
-            .tags()
-            .set(&recv_tag, iroh_blobs::HashAndFormat::raw(blob_hash))
-            .await
-        {
-            return ipc_err(format!("blob store error: {e}"));
-        }
-
-        let local = match self.transport.blob_store.remote().local(blob_hash).await {
-            Ok(local) => local,
-            Err(e) => return ipc_err(format!("blob store error: {e}")),
-        };
-        let downloaded = local.local_bytes();
-        self.transfers.note_progress(transfer_id, downloaded);
-        if !local.is_complete() {
-            let connect = transport::connect_to_peer_with_alpn(
-                &self.transport.endpoint,
-                pending_file.from,
-                iroh_blobs::protocol::ALPN,
-            );
-            let conn = match tokio::time::timeout(OFFER_CONNECT_TIMEOUT, connect).await {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => return ipc_err(format!("cannot reach sender: {e}")),
-                Err(_) => return ipc_err("cannot reach sender: connection timed out"),
-            };
-
-            // `fetch` returns a `GetProgress`: awaiting it directly discards the
-            // progress, so take the stream instead and report bytes as they land. It
-            // yields `Progress(n)` items (n = payload bytes read so far) and exactly
-            // one terminal `Done`/`Error` item. Note: reaching `Done` here means only
-            // the fetch succeeded, not the transfer; the registry is not finished
-            // until the file is written to disk below.
-            let mut stream = Box::pin(
-                self.transport
-                    .blob_store
-                    .remote()
-                    .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
-                    .stream(),
-            );
-            loop {
-                match stream.next().await {
-                    Some(GetProgressItem::Progress(n)) => self
-                        .transfers
-                        .note_progress(transfer_id, downloaded.saturating_add(n)),
-                    Some(GetProgressItem::Done(_)) => break,
-                    Some(GetProgressItem::Error(e)) => {
-                        return ipc_err(format!("blob fetch failed: {e}"));
-                    }
-                    None => {
-                        return ipc_err("blob fetch ended without a result".to_string());
-                    }
-                }
-            }
-        }
-
-        let dir = match output {
-            Some(ref p) => PathBuf::from(p),
-            None => dirs::download_dir().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Downloads")
-            }),
-        };
-
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return ipc_err(format!("cannot create directory '{}': {e}", dir.display()));
-        }
-
-        // Export straight from the blob store to the destination. The obvious
-        // alternative, `get_bytes` + `fs::write`, materializes the whole file in
-        // memory first (iroh-blobs documents it as "will run out of memory when
-        // called for very large blobs"), which on a phone sharing a video is a
-        // kill, not a slowdown. The fetch above already streamed the bytes to
-        // disk, so there is no reason to route them through RAM again.
-        let dest = dir.join(&pending_file.filename);
-        if let Err(e) = self
-            .transport
-            .blob_store
-            .blobs()
-            .export(blob_hash, &dest)
-            .await
-        {
-            return ipc_err(format!("write failed: {e}"));
-        }
-        // The file is where the user wanted it, so the store's copy is now pure
-        // duplication: every accepted file used to be kept twice, forever.
-        self.reclaim_blob(recv_tag);
-
-        #[cfg(unix)]
-        if let Some((uid, gid)) = peer_cred {
-            use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            }
-            if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            }
-        }
-
-        // The file is fully on disk (chown failures are ignored, by design,
-        // and never fail the transfer): only now is the transfer really done.
-        let destination = std::fs::canonicalize(&dest).unwrap_or(dest.clone());
-        finish_guard.success(&destination);
-
-        IpcMessage::Ok {
-            message: format!("saved to {}", dest.display()),
-        }
+        Ok(Done(format!(
+            "receiving file {id}; see `ray files` for progress"
+        )))
     }
 
-    /// This device's pairing cert. On-disk authoritative (a cleanly-absent file
-    /// means unpaired); only a genuine read error falls back to the boot copy.
+    /// Start the receive and wait for its outcome. The receive itself runs
+    /// in a task of its own (see [`receive`]), so it continues, and keeps
+    /// retrying, if this caller goes away.
+    pub(crate) async fn accept_file_for(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        recipient: Recipient,
+    ) -> OpResult<Done> {
+        self.wait_for_receive(id, output, recipient, self.resume)
+            .await
+    }
+
+    async fn wait_for_receive(
+        self: &Arc<Self>,
+        id: u64,
+        output: Option<String>,
+        recipient: Recipient,
+        policy: receive::ResumePolicy,
+    ) -> OpResult<Done> {
+        let outcome = self.begin_receive(id, output, recipient, policy).await?;
+        outcome
+            .await
+            .unwrap_or_else(|_| op_err("the receive stopped before reporting a result"))
+    }
+
+    /// Write a fetched blob for `file_name` into `dir` for `recipient`,
+    /// under a temporary name until [`Written::commit`] gives it its own.
+    ///
+    /// Streamed from the blob store rather than read whole: `get_bytes` holds
+    /// the entire file in memory, which on a phone sharing a video is a kill.
+    /// Not `export` either, which writes through the path and so follows
+    /// whatever link sits there; see [`receive_dest`]. Dropped partway, by a
+    /// cancel or a failed write, the temporary file is removed.
+    async fn write_received(
+        &self,
+        hash: iroh_blobs::Hash,
+        dir: PathBuf,
+        file_name: &str,
+        temp: dest_name::TempName,
+        recipient: Recipient,
+    ) -> std::io::Result<Written> {
+        use tokio::io::AsyncWriteExt;
+
+        let name = file_name.to_string();
+        let (dir, (staged, file)) = tokio::task::spawn_blocking(move || {
+            receive_dest::create(&dir, &name, &temp, recipient).map(|created| (dir, created))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        let mut reader = tokio::io::BufReader::with_capacity(
+            1 << 20,
+            self.transport.blob_store.blobs().reader(hash),
+        );
+        let mut out = tokio::fs::File::from_std(file);
+        tokio::io::copy_buf(&mut reader, &mut out).await?;
+        out.flush().await?;
+        // On disk before it gets its real name: once it has it, the delivery
+        // is confirmed and the sender drops its copy, so a power loss must
+        // not leave an empty file there instead.
+        out.sync_all().await?;
+        drop(out);
+        Ok(Written { staged, dir })
+    }
+
+    /// This device's pairing cert, as the registry currently holds it.
     fn current_device_cert(&self) -> Option<control::DeviceCert> {
-        match identity::load_device_cert() {
-            Ok(cert) => cert,
-            Err(_) => self.device_cert.clone(),
-        }
+        self.registry.current_device_cert()
     }
 
     /// `ray pair list`: enumerate this user's other paired devices as roster
@@ -987,7 +1181,7 @@ impl FileService {
     /// The read happens daemon-side, so this only works for paths the daemon
     /// itself can see; IPC clients use `send_file_fd`. Kept for in-process
     /// callers (ray-mobile), where daemon and app share one privilege domain.
-    pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> IpcMessage {
+    pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> OpResult<Done> {
         self.send_file_named(path, None, peer).await
     }
 
@@ -996,14 +1190,14 @@ impl FileService {
         path: &str,
         requested_filename: Option<&str>,
         peer: &str,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let file_path = Path::new(path);
         // Same guard the fd path applies: a FIFO or a character device would
         // stall or balloon the import.
         let size = match std::fs::metadata(file_path) {
             Ok(m) if m.is_file() => m.len(),
-            Ok(_) => return ipc_err(format!("not a regular file: '{}'", file_path.display())),
-            Err(e) => return ipc_err(format!("cannot read '{}': {e}", file_path.display())),
+            Ok(_) => return op_err(format!("not a regular file: '{}'", file_path.display())),
+            Err(e) => return op_err(format!("cannot read '{}': {e}", file_path.display())),
         };
         let filename = requested_filename
             .and_then(|name| Path::new(name).file_name())
@@ -1017,7 +1211,7 @@ impl FileService {
 
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
             Some(id) => id,
-            None => return ipc_err(format!("unknown peer '{peer}'")),
+            None => return op_err(format!("unknown peer '{peer}'")),
         };
         // `add_path` streams the file into the blob store a chunk at a time (and
         // reflinks instead of copying where the filesystem supports it). Reading
@@ -1033,7 +1227,7 @@ impl FileService {
             .await
         {
             Ok(t) => t,
-            Err(e) => return ipc_err(format!("blob store error: {e}")),
+            Err(e) => return op_err(format!("blob store error: {e}")),
         };
         self.queue_offer(peer_id, peer, filename, size, temp).await
     }
@@ -1048,14 +1242,14 @@ impl FileService {
         fd: OwnedFd,
         filename: &str,
         peer: &str,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let file = File::from(fd);
         // fstat before reading: an fd is attacker-chosen input, and reading a
         // FIFO or a device (/dev/zero) here would stall or balloon the daemon.
         let size = match file.metadata() {
             Ok(m) if m.is_file() => m.len(),
-            Ok(_) => return ipc_err("not a regular file"),
-            Err(e) => return ipc_err(format!("cannot stat file: {e}")),
+            Ok(_) => return op_err("not a regular file"),
+            Err(e) => return op_err(format!("cannot stat file: {e}")),
         };
         // The client names the file; keep only the basename so a hostile
         // client can't smuggle path components into the offer.
@@ -1066,7 +1260,7 @@ impl FileService {
 
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
             Some(id) => id,
-            None => return ipc_err(format!("unknown peer '{peer}'")),
+            None => return op_err(format!("unknown peer '{peer}'")),
         };
         // There is no path to hand `add_path` here, only the caller's fd, so feed
         // the store a chunk stream off the descriptor. Same reason as the path
@@ -1082,7 +1276,7 @@ impl FileService {
             .await
         {
             Ok(t) => t,
-            Err(e) => return ipc_err(format!("blob store error: {e}")),
+            Err(e) => return op_err(format!("blob store error: {e}")),
         };
         self.queue_offer(peer_id, peer, filename, size, temp).await
     }
@@ -1106,15 +1300,15 @@ impl FileService {
         filename: String,
         size: u64,
         temp: iroh_blobs::api::TempTag,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         if self.outbox.lock().unwrap().len() >= MAX_PENDING_FILES {
-            return ipc_err("file send queue is full; cancel a pending send first");
+            return op_err("file send queue is full; cancel a pending send first");
         }
         let hash = temp.hash();
         let offer_id = control::FileOfferId::new();
         let blob_tag = blob_tags::send_offer(&hash, &peer_id, offer_id);
         if let Err(e) = self.tag_blob(blob_tag.clone(), temp).await {
-            return ipc_err(e);
+            return op_err(e);
         }
 
         // Register the transfer now, before the peer can possibly learn the hash:
@@ -1144,7 +1338,7 @@ impl FileService {
                 drop(outbox);
                 self.transfers.fail_offer(transfer_id);
                 self.reclaim_blob(blob_tag);
-                return ipc_err("file send queue is full; cancel a pending send first");
+                return op_err("file send queue is full; cancel a pending send first");
             }
             outbox.push(entry);
         }
@@ -1155,7 +1349,7 @@ impl FileService {
                 .retain(|entry| entry.offer_id != offer_id);
             self.transfers.fail_offer(transfer_id);
             self.reclaim_blob(blob_tag);
-            return ipc_err(format!("could not save queued file offer: {error}"));
+            return op_err(format!("could not save queued file offer: {error}"));
         }
 
         // Kick delivery in the background either way: even a peer with no live
@@ -1174,7 +1368,7 @@ impl FileService {
                 peer
             )
         };
-        IpcMessage::Ok { message }
+        Ok(Done(message))
     }
 
     /// The peer finished pulling a blob we offered it: our copy has done its job,
@@ -1303,14 +1497,28 @@ impl FileService {
     /// mesh-connection hook, the enqueue path, and the periodic sweep; the
     /// `flushing` guard collapses concurrent triggers so an offer can't be
     /// delivered twice.
+    ///
+    /// A collapsed trigger marks the running pass for a rerun, and the pass
+    /// re-reads the outbox before releasing the peer, so an offer queued
+    /// mid-pass is always attempted. Only triggers set the mark, never a
+    /// failed delivery, so reruns are bounded by real events (sends,
+    /// connects, sweeps) and a failing peer costs at most one extra pass per
+    /// pass, however many triggers piled up behind it.
     pub(crate) async fn flush_outbox_for(self: Arc<Self>, peer: EndpointId) {
-        if !self.flushing.insert(peer) {
+        let Some(mut guard) = FlushGuard::acquire(&self.flushing, peer) else {
             return;
-        }
-        let _guard = FlushGuard {
-            flushing: Arc::clone(&self.flushing),
-            peer,
         };
+        loop {
+            self.flush_pass(peer).await;
+            if guard.release_unless_rerun() {
+                return;
+            }
+        }
+    }
+
+    /// One pass over `peer`'s queued offers and undelivered decisions, as
+    /// they stand when it starts.
+    async fn flush_pass(&self, peer: EndpointId) {
         let entries: Vec<_> = self
             .outbox
             .lock()
@@ -1476,7 +1684,7 @@ impl FileService {
     }
 
     /// `ray files cancel <id>`: drop a queued send that hasn't been delivered.
-    pub(crate) fn cancel_send(&self, id: u64) -> IpcMessage {
+    pub(crate) fn cancel_send(&self, id: u64) -> OpResult<Done> {
         let removed = {
             let mut outbox = self.outbox.lock().unwrap();
             let i = outbox.iter().position(|e| e.id == id && !e.delivered);
@@ -1487,22 +1695,29 @@ impl FileService {
                 self.transfers.fail_offer(entry.transfer_id);
                 self.save_outbox();
                 self.reclaim_send(&entry);
-                IpcMessage::Ok {
-                    message: format!(
-                        "canceled queued send of {} to {}",
-                        entry.filename,
-                        entry.peer.fmt_short()
-                    ),
-                }
+                Ok(Done(format!(
+                    "canceled queued send of {} to {}",
+                    entry.filename,
+                    entry.peer.fmt_short()
+                )))
             }
-            None => ipc_err(format!("no queued send with id {id}")),
+            None => op_err(format!("no queued send with id {id}")),
         }
     }
 
     /// Cancel an outgoing transfer after its offer was delivered. A packet
     /// already in flight may finish, but this transfer cannot be revived and
     /// the local blob is released for GC.
-    pub(crate) fn cancel_transfer(&self, id: u64) -> IpcMessage {
+    ///
+    /// For a receive, stops the fetch and any pending retry. The offer goes
+    /// back to the queue with what was downloaded, to accept or reject later.
+    pub(crate) fn cancel_transfer(&self, id: u64) -> OpResult<Done> {
+        if let Some(cancel) = self.receives.lock().unwrap().get(&id) {
+            cancel.cancel();
+            return Ok(Done(format!(
+                "canceled file transfer {id}; the offer stays in `ray files`"
+            )));
+        }
         match self.transfers.cancel(id) {
             Some((hash, peer)) => {
                 let removed = {
@@ -1518,11 +1733,9 @@ impl FileService {
                 } else {
                     self.reclaim_send_if_unused(hash, peer);
                 }
-                IpcMessage::Ok {
-                    message: format!("canceled file transfer {id}"),
-                }
+                Ok(Done(format!("canceled file transfer {id}")))
             }
-            None => ipc_err(format!("no active outgoing transfer with id {id}")),
+            None => op_err(format!("no active transfer with id {id}")),
         }
     }
 
@@ -1544,7 +1757,7 @@ impl FileService {
 
     /// List pending file offers awaiting `ray files accept`, tagging each with
     /// whether it came from one of our own paired devices.
-    pub(crate) fn list_files(&self) -> IpcMessage {
+    pub(crate) fn list_files(&self) -> FileQueues {
         let pending = self.pending_files.lock().unwrap();
         let files = pending
             .iter()
@@ -1591,8 +1804,8 @@ impl FileService {
                 error: t.error,
             })
             .collect();
-        IpcMessage::FileList {
-            files,
+        FileQueues {
+            incoming: files,
             outbox,
             transfers,
         }
@@ -1600,10 +1813,10 @@ impl FileService {
 
     /// Decline a pending file offer: drop it from the queue without fetching the
     /// blob. Release any data retained from an unsuccessful receive.
-    pub(crate) fn reject_file(self: &Arc<Self>, id: u64) -> IpcMessage {
+    pub(crate) fn reject_file(self: &Arc<Self>, id: u64) -> OpResult<Done> {
         let mut pending = self.pending_files.lock().unwrap();
         let Some(file) = pending.iter().find(|file| file.id == id) else {
-            return ipc_err(format!("no pending file with id {id}"));
+            return op_err(format!("no pending file with id {id}"));
         };
         {
             let mut declines = self.declines.lock().unwrap();
@@ -1611,7 +1824,7 @@ impl FileService {
                 if let Some(index) = declines.iter().position(|entry| entry.delivered) {
                     declines.remove(index);
                 } else {
-                    return ipc_err("file decline queue is full; retry after peers reconnect");
+                    return op_err("file decline queue is full; retry after peers reconnect");
                 }
             }
             declines.push(FileDecision {
@@ -1626,7 +1839,7 @@ impl FileService {
                 .lock()
                 .unwrap()
                 .retain(|entry| entry.peer != file.from || entry.offer_id != file.offer_id);
-            return ipc_err(format!("could not save file decline: {error}"));
+            return op_err(format!("could not save file decline: {error}"));
         }
         let file =
             take_pending(&mut pending, id).expect("the offer remains locked until it is taken");
@@ -1642,9 +1855,11 @@ impl FileService {
         let service = Arc::clone(self);
         let peer = file.from;
         tokio::spawn(async move { service.flush_outbox_for(peer).await });
-        IpcMessage::Ok {
-            message: format!("declined {} from {}", file.filename, peer.fmt_short()),
-        }
+        Ok(Done(format!(
+            "declined {} from {}",
+            file.filename,
+            peer.fmt_short()
+        )))
     }
 
     fn record_completed_offer(&self, file: &PendingFile) -> Result<(), String> {
@@ -1700,9 +1915,9 @@ impl FileService {
     /// Mint a pairing ticket for this device. Only a primary (holding no cert of
     /// its own) may mint device certs; a secondary is refused so a new device
     /// can't be bound to the wrong identity.
-    pub(crate) fn start_pairing(&self) -> IpcMessage {
+    pub(crate) fn start_pairing(&self) -> OpResult<String> {
         if self.current_device_cert().is_some() {
-            return ipc_err(
+            return op_err(
                 "this device is already paired; add new devices from your primary device"
                     .to_string(),
             );
@@ -1722,7 +1937,7 @@ impl FileService {
         });
 
         tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
-        IpcMessage::PairingTicket { ticket }
+        Ok(ticket)
     }
 
     /// `PAIR_ALPN`: complete a device-pairing handshake. Verifies the dialer's
@@ -1953,7 +2168,7 @@ mod tests {
     use iroh_blobs::Hash;
     use std::time::Instant;
 
-    async fn file_service(endpoint: Endpoint, dir: &Path) -> Arc<FileService> {
+    pub(super) async fn file_service(endpoint: Endpoint, dir: &Path) -> Arc<FileService> {
         let store = FsStore::load(dir).await.unwrap();
         let registry = crate::daemon::accept_handler_tests::sample_registry(
             endpoint.clone(),
@@ -1964,13 +2179,14 @@ mod tests {
             SecretKey::generate(),
             Arc::clone(&registry.transport),
             registry,
-            None,
             peers::DeviceUserMap::new(),
             Arc::new(transfers::TransferRegistry::new()),
         ))
     }
 
-    async fn file_endpoint(lookup: iroh::address_lookup::memory::MemoryLookup) -> Endpoint {
+    pub(super) async fn file_endpoint(
+        lookup: iroh::address_lookup::memory::MemoryLookup,
+    ) -> Endpoint {
         Endpoint::builder(iroh::endpoint::presets::Minimal)
             .alpns(vec![transport::FILES_ALPN.to_vec()])
             .relay_mode(iroh::RelayMode::Disabled)
@@ -2059,6 +2275,64 @@ mod tests {
         let saved = load_outbox();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].offer_id, queued[0].offer_id);
+    }
+
+    #[tokio::test]
+    async fn an_offer_queued_during_a_running_flush_is_delivered_by_that_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let sender_endpoint = file_endpoint(lookup.clone()).await;
+        let receiver_endpoint = file_endpoint(lookup.clone()).await;
+        lookup.add_endpoint_info(sender_endpoint.addr());
+        lookup.add_endpoint_info(receiver_endpoint.addr());
+        let sender = file_service(sender_endpoint, &tmp.path().join("sender")).await;
+        let receiver = file_service(receiver_endpoint.clone(), &tmp.path().join("receiver")).await;
+        let peer = receiver_endpoint.id();
+        sender
+            .outbox
+            .lock()
+            .unwrap()
+            .push(outgoing(&sender, peer, 1));
+
+        // The first offer's connection is held unanswered, so the pass is
+        // still in flight when the second offer is queued and its trigger
+        // arrives. Every later connection is answered normally.
+        let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
+        let accept_rest = {
+            let receiver = Arc::clone(&receiver);
+            let receiver_endpoint = receiver_endpoint.clone();
+            tokio::spawn(async move {
+                let first = receiver_endpoint.accept().await.unwrap().await.unwrap();
+                conn_tx.send(first).unwrap();
+                while let Some(incoming) = receiver_endpoint.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        receiver.accept_file_offer(conn).await;
+                    }
+                }
+            })
+        };
+        let ((), ()) = tokio::join!(Arc::clone(&sender).flush_outbox_for(peer), async {
+            let conn = conn_rx.await.unwrap();
+            sender
+                .outbox
+                .lock()
+                .unwrap()
+                .push(outgoing(&sender, peer, 2));
+            // Collapses into the running pass: the guard is held.
+            Arc::clone(&sender).flush_outbox_for(peer).await;
+            receiver.accept_file_offer(conn).await;
+        });
+        accept_rest.abort();
+
+        let outbox = sender.outbox.lock().unwrap();
+        assert_eq!(outbox.len(), 2);
+        assert!(
+            outbox.iter().all(|entry| entry.delivered),
+            "every queued offer gets a delivery attempt"
+        );
+        assert_eq!(receiver.pending_files.lock().unwrap().len(), 2);
+        assert!(sender.flushing.is_empty());
     }
 
     #[tokio::test]
@@ -2197,6 +2471,7 @@ mod tests {
         let file = take_pending(&mut service.pending_files.lock().unwrap(), 1).unwrap();
         service.active_files.lock().unwrap().push(file.clone());
         let guard = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(file),
             offer_id,
             pending: Arc::clone(&service.pending_files),
@@ -2217,6 +2492,9 @@ mod tests {
         assert_eq!(load_pending_files().len(), 2);
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_cached_receive_completes_the_sender_without_a_provider_event() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2259,7 +2537,7 @@ mod tests {
                 sender.accept_file_offer(conn).await;
             }
         );
-        assert!(matches!(response, IpcMessage::Ok { .. }));
+        assert!(response.is_ok());
         assert_eq!(
             std::fs::read(tmp.path().join("downloads/file.bin")).unwrap(),
             b"payload"
@@ -2277,8 +2555,11 @@ mod tests {
         );
     }
 
+    // Calls the apps' accept, which Windows refuses: it has no caller
+    // token for the chosen directory. Windows accepts through `Recipient::caller`.
+    #[cfg(not(windows))]
     #[tokio::test]
-    async fn failed_completion_persistence_keeps_the_saved_offer_retryable() {
+    async fn failed_completion_persistence_keeps_the_file_and_does_not_requeue() {
         let tmp = tempfile::tempdir().unwrap();
         config::set_thread_config_dir(tmp.path().join("config"));
         let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
@@ -2305,18 +2586,25 @@ mod tests {
                 None,
             )
             .await;
-        let IpcMessage::Error { message } = response else {
+        let Err(error) = response else {
             panic!("confirmation failure must be reported")
         };
-        assert!(message.contains("file saved but could not record delivery confirmation"));
+        let message = error.to_string();
+        assert!(
+            message.contains("but could not record delivery confirmation"),
+            "{message}"
+        );
         assert_eq!(
             std::fs::read(tmp.path().join("downloads/file.bin")).unwrap(),
             b"payload"
         );
-        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+        // Not queued again: a second accept would save a second copy.
+        assert!(service.pending_files.lock().unwrap().is_empty());
         assert!(service.active_files.lock().unwrap().is_empty());
         assert!(service.declines.lock().unwrap().is_empty());
-        assert_eq!(load_pending_files().len(), 1);
+        assert!(load_pending_files().is_empty());
+        let receive = service.transfers.list().pop().unwrap();
+        assert_eq!(receive.state, transfers::TransferState::Failed);
     }
 
     #[tokio::test]
@@ -2419,6 +2707,7 @@ mod tests {
     fn pending(id: u64) -> PendingFile {
         PendingFile {
             offer_id: control::FileOfferId([id as u8; 32]),
+            accepted: None,
             id,
             from: SecretKey::from([id as u8; 32]).public(),
             filename: format!("file{id}.bin"),
@@ -2426,6 +2715,72 @@ mod tests {
             mime_type: "application/octet-stream".to_string(),
             blob_hash: blake3::hash(b"payload").into(),
         }
+    }
+
+    #[test]
+    fn only_plain_file_names_are_safe() {
+        for name in ["photo.jpg", ".hidden", "a b..c", "..."] {
+            assert!(is_safe_file_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "/etc/passwd",
+            "a\\b",
+            "..\\x",
+            "a\0b",
+        ] {
+            assert!(!is_safe_file_name(name), "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offer_with_a_traversing_name_is_declined() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let mut file = pending(1);
+        file.filename = "../../etc/cron.d/evil".into();
+        let outcome = service.queue_incoming_offer(file.from, file);
+        assert!(matches!(outcome.reply, control::FileReply::Declined { .. }));
+        assert!(service.pending_files.lock().unwrap().is_empty());
+        assert!(load_pending_files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_saved_offer_with_a_traversing_name_is_not_exported() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let mut file = pending(1);
+        file.filename = "../escaped.bin".into();
+        file.size = 7;
+        let source = tmp.path().join("cached.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let _tag = service
+            .transport
+            .blob_store
+            .blobs()
+            .add_path(&source)
+            .temp_tag()
+            .await
+            .unwrap();
+        // As if loaded from a queue an older daemon saved without validation.
+        service.pending_files.lock().unwrap().push(file);
+        let response = service
+            .accept_file(
+                1,
+                Some(tmp.path().join("downloads").to_string_lossy().into_owned()),
+                None,
+            )
+            .await;
+        assert!(response.is_err());
+        assert!(!tmp.path().join("escaped.bin").exists());
     }
 
     /// `ray files accept` and `ray files reject` both consume the offer, so a
@@ -2473,6 +2828,7 @@ mod tests {
         let transfers = Arc::new(transfers::TransferRegistry::new());
         let mut changes = transfers.subscribe();
         let offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: take_pending(&mut queue.lock().unwrap(), 1),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2504,6 +2860,7 @@ mod tests {
         let store = FsStore::load(tmp.path()).await.unwrap();
         let queue = Arc::new(Mutex::new(vec![pending(2)]));
         let mut offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(pending(1)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2536,6 +2893,7 @@ mod tests {
         files[0].blob_hash = hash;
         let queue = Arc::new(Mutex::new(files));
         let offer = ReceiveOfferGuard {
+            shutdown: CancellationToken::new(),
             file: Some(pending(999)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
@@ -2548,6 +2906,32 @@ mod tests {
         assert!(take_pending(&mut queue.lock().unwrap(), 1).is_none());
         assert!(take_pending(&mut queue.lock().unwrap(), 999).is_some());
         collected(&store, hash, "the evicted receive").await;
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pending_files_saved_without_an_accepted_destination_still_load() {
+        let old = serde_json::to_string(&[pending(1)]).unwrap();
+        assert!(!old.contains("accepted"), "{old}");
+        let loaded: Vec<PendingFile> = serde_json::from_str(&old).unwrap();
+        assert_eq!(loaded[0].accepted, None);
+        let mut file = pending(2);
+        file.accepted = Some(AcceptedReceive {
+            output: Some("/path/to/work".into()),
+            recipient: Recipient {
+                owner: Some((1000, 1000)),
+                caller_chose_dir: true,
+            },
+            saved_as: None,
+        });
+        let saved = serde_json::to_string(&[file.clone()]).unwrap();
+        assert!(!saved.contains("saved_as"), "{saved}");
+        if let Some(accepted) = file.accepted.as_mut() {
+            accepted.saved_as = Some("report.pdf".into());
+        }
+        let saved = serde_json::to_vec(&[file.clone()]).unwrap();
+        let loaded: Vec<PendingFile> = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(loaded[0].accepted, file.accepted);
     }
 
     /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`
@@ -2724,6 +3108,180 @@ mod tests {
             "gc must still protect tagged blobs despite a dangling tag"
         );
         assert!(!store.blobs().has(absent).await.unwrap());
+    }
+
+    /// A receiver holding `payload` as offer 1 named `file.bin`, with no
+    /// sender needed since the blob is already complete locally.
+    #[cfg(unix)]
+    async fn cached_offer(tmp: &Path) -> Arc<FileService> {
+        config::set_thread_config_dir(tmp.join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.join("receiver")).await;
+        let mut file = pending(1);
+        file.filename = "file.bin".into();
+        file.size = 7;
+        let source = tmp.join("cached.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let tag = service
+            .transport
+            .blob_store
+            .blobs()
+            .add_path(&source)
+            .temp_tag()
+            .await
+            .unwrap();
+        // Keep the blob past this helper; the receive tags it itself.
+        std::mem::forget(tag);
+        service.queue_incoming_offer(file.from, file);
+        service
+    }
+
+    #[cfg(unix)]
+    fn current_cred() -> (u32, u32) {
+        // SAFETY: getuid and getgid cannot fail and touch no memory.
+        unsafe { (libc::getuid(), libc::getgid()) }
+    }
+
+    /// The daemon writes as root, so an operator naming a directory they do
+    /// not own (`/etc`, another user's home) must be refused, with nothing
+    /// written and the offer left to retry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_output_dir_the_caller_does_not_own_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = cached_offer(tmp.path()).await;
+        let (uid, gid) = current_cred();
+        let other = (uid.wrapping_add(1).max(1), gid);
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let response = service
+            .accept_file(
+                1,
+                Some(downloads.join("sub").to_string_lossy().into_owned()),
+                Some(other),
+            )
+            .await;
+        let Err(error) = response else {
+            panic!("a directory owned by someone else must be refused");
+        };
+        let message = error.to_string();
+        assert!(message.contains("not owned by uid"), "{message}");
+        assert!(!downloads.join("sub").exists());
+        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+    }
+
+    /// The apps' accept returns as soon as the receive starts, so a folder
+    /// the file cannot go to has to be refused then, not after the whole
+    /// download. The sender here is unreachable: nothing could be fetched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn starting_an_accept_into_a_refused_directory_fails_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let file = pending(1);
+        service.queue_incoming_offer(file.from, file);
+        let (uid, gid) = current_cred();
+        let other = (uid.wrapping_add(1).max(1), gid);
+        let output = Some(tmp.path().join("downloads").to_string_lossy().into_owned());
+        let Err(error) = service.start_accepting_file(1, output, Some(other)).await else {
+            panic!("a directory owned by someone else must be refused before the download");
+        };
+        assert!(error.message().contains("not owned by uid"), "{error}");
+        assert_eq!(service.pending_files.lock().unwrap().len(), 1);
+        assert!(service.transfers.list().is_empty());
+        assert!(!tmp.path().join("downloads").exists());
+    }
+
+    /// LocalSystem's receive is saved to resume after a restart, so it has
+    /// to come back as LocalSystem's, or the resumed receive downloads the
+    /// whole file and is then refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_saved_system_caller_loads_as_system() {
+        let saved = |caller| {
+            let recipient = Recipient {
+                owner: None,
+                caller_chose_dir: true,
+                caller,
+            };
+            let json = serde_json::to_string(&recipient).unwrap();
+            serde_json::from_str::<Recipient>(&json).unwrap().caller
+        };
+        assert!(matches!(
+            saved(WindowsCaller::System),
+            WindowsCaller::System
+        ));
+        assert!(matches!(
+            saved(WindowsCaller::Unknown),
+            WindowsCaller::Unknown
+        ));
+        let older: Recipient =
+            serde_json::from_str(r#"{"owner":null,"caller_chose_dir":true}"#).unwrap();
+        assert!(matches!(older.caller, WindowsCaller::Unknown));
+    }
+
+    /// A link planted at the file name must not redirect the daemon's write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_at_the_destination_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = cached_offer(tmp.path()).await;
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        std::os::unix::fs::symlink(&victim, downloads.join("file.bin")).unwrap();
+        let response = service
+            .accept_file(
+                1,
+                Some(downloads.to_string_lossy().into_owned()),
+                Some(current_cred()),
+            )
+            .await;
+        let Ok(Done(message)) = response else {
+            panic!("the receive should land next to the link: {response:?}");
+        };
+        assert!(message.contains("file (1).bin"), "{message}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(
+            downloads
+                .join("file.bin")
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(downloads.join("file (1).bin")).unwrap(),
+            b"payload"
+        );
+    }
+
+    /// The ordinary case: the caller's own directory, created if missing, and
+    /// both it and the file end up theirs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_receive_into_the_callers_own_dir_is_theirs() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let service = cached_offer(tmp.path()).await;
+        let (uid, gid) = current_cred();
+        let downloads = tmp.path().join("downloads");
+        let response = service
+            .accept_file(
+                1,
+                Some(downloads.to_string_lossy().into_owned()),
+                Some((uid, gid)),
+            )
+            .await;
+        assert!(response.is_ok(), "{response:?}");
+        let saved = downloads.join("file.bin");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"payload");
+        assert_eq!(std::fs::metadata(&saved).unwrap().uid(), uid);
+        assert_eq!(std::fs::metadata(&downloads).unwrap().uid(), uid);
+        assert!(service.pending_files.lock().unwrap().is_empty());
     }
 }
 

@@ -12,20 +12,25 @@ use super::super::*;
 /// coordinator never lets its five-minute pkarr lease expire.
 const RECORD_REPUBLISH_INTERVAL: Duration = Duration::from_secs((dht::RECORD_TTL / 2) as u64);
 
-/// Sign a durable current snapshot while the caller holds snapshot_commit.
-/// Remember its timestamp before publication can clear the authored marker.
+/// Sign a record for the current snapshot while the caller holds
+/// `snapshot_commit`, refusing a snapshot a reconverge has since replaced.
+///
+/// The replay floor is not raised here but by [`publish_signed_record`], once
+/// the relay has taken the record and under the same lock that clears the
+/// authored marker. Raising it at signing would, when the publish then fails,
+/// refuse another coordinator's newer record the relay still holds, and the
+/// retry would publish over that edit.
 pub(crate) fn sign_current_network_record(
     state: &SharedNetworkState,
     key: &SecretKey,
     hash: blake3::Hash,
     seeds: &[EndpointId],
 ) -> Result<SignedPacket> {
-    let packet = dht::encode_network_record(key, &hash, seeds)?;
     anyhow::ensure!(
-        observe_current_record(state, hash, packet.timestamp().as_micros()),
+        !state.read().unwrap().needs_reconverge(hash),
         "cannot sign a group snapshot that is no longer current"
     );
-    Ok(packet)
+    dht::encode_network_record(key, &hash, seeds)
 }
 
 fn has_authored_snapshot(state: &SharedNetworkState, network: &str) -> bool {
@@ -33,10 +38,15 @@ fn has_authored_snapshot(state: &SharedNetworkState, network: &str) -> bool {
     durability_pending || pending_authored_group_hash(state, network).is_some()
 }
 
-/// A clean publisher must learn the canonical roster before renewing its lease.
-/// Unpublished local mutations retain their existing publication priority.
+/// A clean publisher learns the canonical roster before renewing its lease, so
+/// a renewal cannot republish over an edit another coordinator made since this
+/// node's group poller last looked. Unpublished local mutations keep their
+/// publication priority. `Ok(false)` defers the renewal.
+///
+/// The record goes through [`apply_group_record`], the same routine as the
+/// poller, so the floor, the authored-snapshot guard and our own removal are
+/// handled once.
 async fn synchronize_before_renewal(
-    client: &PkarrRelayClient,
     state: &SharedNetworkState,
     registry: &Arc<NetworkRegistry>,
     network: &str,
@@ -45,10 +55,13 @@ async fn synchronize_before_renewal(
     if has_authored_snapshot(state, network) {
         return Ok(true);
     }
-    let resolved = tokio::time::timeout(Duration::from_secs(15), client.resolve(network_key))
-        .await
-        .context("timed out checking the canonical network record")
-        .and_then(|result| result.map_err(anyhow::Error::new));
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(15),
+        registry.transport.pkarr.resolve(network_key),
+    )
+    .await
+    .context("timed out checking the canonical network record")
+    .and_then(|result| result.map_err(anyhow::Error::new));
     let packet = match resolved {
         Ok(packet) => packet,
         Err(_) if has_authored_snapshot(state, network) => return Ok(true),
@@ -68,28 +81,35 @@ async fn synchronize_before_renewal(
         return Ok(false);
     }
     let (hash, seeds) = dht::decode_network_record(&packet)?;
-    let timestamp = packet.timestamp().as_micros();
-    if has_authored_snapshot(state, network)
-        || observe_current_record(state, hash, timestamp)
-        || !record_is_newer(timestamp, state.read().unwrap().last_record_timestamp)
-    {
+    if has_authored_snapshot(state, network) {
         return Ok(true);
     }
-    let outcome = fetch_and_apply_blob(
-        &registry.transport.endpoint,
-        &registry.transport.blob_store,
-        &registry.peers,
-        &registry.firewall,
-        registry,
-        state,
-        network,
+    let record = SignedGroupRecord {
         hash,
-        &seeds,
-        timestamp,
+        seeds,
+        timestamp: packet.timestamp().as_micros(),
+    };
+    let device_cert = crate::identity::load_device_cert().ok().flatten();
+    let outcome = apply_group_record(
+        &registry.transport.endpoint,
+        registry,
+        network,
+        state,
+        &device_cert,
+        &record,
     )
     .await;
-    Ok(outcome == ReconvergeOutcome::Applied
-        || outcome == ReconvergeOutcome::Superseded && has_authored_snapshot(state, network))
+    Ok(match outcome {
+        // Adopted the canonical roster, already held it, or it is older than
+        // what this node last published: renew.
+        ReconvergeOutcome::Applied | ReconvergeOutcome::Current | ReconvergeOutcome::Stale => true,
+        // A local edit landed meanwhile and now has priority.
+        ReconvergeOutcome::Superseded => has_authored_snapshot(state, network),
+        // `Unconfirmed` is for mesh records only; this one came from the relay.
+        ReconvergeOutcome::Unfetched
+        | ReconvergeOutcome::Departed
+        | ReconvergeOutcome::Unconfirmed => false,
+    })
 }
 
 /// Re-import verified bytes to mint the permanent tag that protects membership
@@ -245,9 +265,31 @@ fn next_attempt_deadline(
     }
 }
 
+/// The proof that this network was destroyed, if there is one: the copy saved
+/// locally, else the one on the relay. A saved proof that cannot be read falls
+/// back to the relay rather than stopping publication for good. `Err` only when
+/// the relay cannot answer either.
+async fn destruction_proof(
+    client: &PkarrRelayClient,
+    key: &SecretKey,
+) -> Result<Option<SignedPacket>> {
+    match config::destruction::load(key.public()) {
+        Ok(Some(packet)) => return Ok(Some(packet)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "cannot read local network destruction status; asking the relay");
+        }
+    }
+    dht::destruction::resolve(
+        client,
+        dht::destruction::discovery_key(key).public(),
+        key.public(),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_network_publisher(
-    client: PkarrRelayClient,
     net_secret_key: SecretKey,
     state: SharedNetworkState,
     registry: Arc<NetworkRegistry>,
@@ -280,28 +322,16 @@ pub(crate) fn spawn_network_publisher(
                 if state.read().map(|s| s.destroyed).unwrap_or(true) {
                     break;
                 }
-                let proof = match config::destruction::load(net_secret_key.public()) {
-                    Ok(Some(packet)) => Some(packet),
-                    Ok(None) => match dht::destruction::resolve(
-                        &client,
-                        dht::destruction::discovery_key(&net_secret_key).public(),
-                        net_secret_key.public(),
-                    )
+                let proof = match destruction_proof(&registry.transport.pkarr, &net_secret_key)
                     .await
-                    {
-                        Ok(proof) => proof,
-                        Err(error) => {
-                            tracing::warn!(%error, "cannot verify network destruction status");
-                            if let Some(hash) = target {
-                                retry =
-                                    Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
-                            }
-                            continue;
-                        }
-                    },
+                {
+                    Ok(proof) => proof,
                     Err(error) => {
-                        tracing::warn!(%error, "cannot read local network destruction status");
-                        return;
+                        tracing::warn!(%error, "cannot verify network destruction status");
+                        if let Some(hash) = target {
+                            retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        }
+                        continue;
                     }
                 };
                 if let Some(packet) = proof {
@@ -309,7 +339,6 @@ pub(crate) fn spawn_network_publisher(
                     break;
                 }
                 match synchronize_before_renewal(
-                    &client,
                     &state,
                     &registry,
                     &network_name,
@@ -381,8 +410,14 @@ pub(crate) fn spawn_network_publisher(
                 drop(commit_guard);
 
                 if let Some((hash, packet, seed_count)) = prepared {
-                    match publish_signed_record(&client, &commit, &network_name, hash, &packet)
-                        .await
+                    match publish_signed_record(
+                        &registry.transport.pkarr,
+                        &state,
+                        &network_name,
+                        hash,
+                        &packet,
+                    )
+                    .await
                     {
                         Ok(true) => {
                             tracing::info!(peers = seed_count, "published network record");
@@ -452,9 +487,11 @@ fn write_group_hash_pointer(
     hash: blake3::Hash,
     published: bool,
 ) -> bool {
+    let floor = state.read().unwrap().last_record_timestamp;
     match config::update_network(network, |net| {
         net.last_group_hash = Some(hash);
         net.last_group_hash_published = published;
+        raise_saved_record_floor(net, floor);
         Ok(())
     }) {
         Ok(Some(_)) => {
@@ -541,30 +578,93 @@ pub(crate) async fn persist_group_hash_locked(
     write_group_hash_pointer(state, network, hash, published)
 }
 
-/// Publish a record signed under `commit`, then mark its generation published
-/// if it is still the recovery pointer. No lock is held across the relay call.
-/// The mark takes `commit` again because it compares against the pointer, and
-/// a commit may have moved it while the publish was in flight. `Ok(false)`
-/// means it did, and a newer record is owed.
+/// Publish a record signed under `state`'s commit lock, then mark its
+/// generation published if it is still the recovery pointer. No lock is held
+/// across the relay call. The mark takes the lock again because it compares
+/// against the pointer, and a commit may have moved it while the publish was in
+/// flight. `Ok(false)` means it did, and a newer record is owed.
+///
+/// The record's timestamp also becomes this node's replay floor, and the record
+/// the one it hands reconnecting members, under the same lock as the mark. The group poller reads this coordinator's own network
+/// record, and without the floor a stale copy served after this publish names
+/// an older blob, reads as newer than nothing, and is applied and then
+/// republished over our own edit.
 pub(crate) async fn publish_signed_record(
     client: &PkarrRelayClient,
-    commit: &AsyncMutex<()>,
+    state: &SharedNetworkState,
     network: &str,
     hash: blake3::Hash,
     packet: &SignedPacket,
 ) -> Result<bool> {
     dht::publish_record(client, packet).await?;
+    let commit = Arc::clone(&state.read().unwrap().snapshot_commit);
     let _commit = commit.lock().await;
-    Ok(mark_group_hash_published(network, hash))
+    let published = packet.timestamp().as_micros();
+    raise_record_floor(state, packet);
+    Ok(mark_group_hash_published(network, hash, published))
 }
 
-pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash) -> bool {
+/// Refuse any record authored before `packet`, a record the relay took, and
+/// keep it as the last published unless a later one is already held.
+fn raise_record_floor(state: &SharedNetworkState, packet: &SignedPacket) {
+    let published = packet.timestamp().as_micros();
+    let mut state = state.write().unwrap();
+    let floor = state
+        .last_record_timestamp
+        .map_or(published, |floor| floor.max(published));
+    state.last_record_timestamp = Some(floor);
+    if state
+        .last_published_record
+        .as_ref()
+        .is_none_or(|held| held.timestamp() < packet.timestamp())
+    {
+        state.last_published_record = Some(packet.clone());
+    }
+}
+
+/// Raise the saved replay floor, never lower it: a write carrying an older
+/// floor than the saved one keeps the saved one.
+pub(crate) fn raise_saved_record_floor(net: &mut config::NetworkConfig, floor: Option<u64>) {
+    net.last_record_timestamp = net.last_record_timestamp.max(floor);
+}
+
+/// Save a floor rise that no recovery pointer write carries: a renewal of the
+/// roster already held. A failure only costs the restart that floor.
+pub(crate) fn persist_record_floor(network: &str, floor: u64) {
+    if let Err(e) = config::update_network(network, |net| {
+        raise_saved_record_floor(net, Some(floor));
+        Ok(())
+    }) {
+        tracing::warn!(network, error = %format!("{e:#}"), "failed to save the record floor");
+    }
+}
+
+/// The replay floor saved for `network` under `key`, to seed a state rebuilt
+/// from config. `None` when nothing was saved, the saved network is another
+/// one, or the config cannot be read, which leaves the state as open as it was
+/// before the floor was saved at all.
+pub(crate) fn saved_record_floor(network: &str, key: EndpointId) -> Option<u64> {
+    match config::load_network(network) {
+        Ok(net) => net
+            .filter(|net| net.network_public_key == Some(key))
+            .and_then(|net| net.last_record_timestamp),
+        Err(e) => {
+            tracing::warn!(network, error = %format!("{e:#}"), "failed to read the saved record floor");
+            None
+        }
+    }
+}
+
+/// Mark `hash` published if it is still the recovery pointer, and save the
+/// floor its record (authored at `published`) raised either way.
+pub(crate) fn mark_group_hash_published(network: &str, hash: blake3::Hash, published: u64) -> bool {
     let mut current = false;
     match config::update_network(network, |net| {
         current = net.last_group_hash == Some(hash);
         if current {
             net.last_group_hash_published = true;
         }
+        raise_saved_record_floor(net, Some(published));
         Ok(())
     }) {
         Ok(Some(_)) => current,
@@ -696,6 +796,23 @@ pub(crate) async fn commit_current_snapshot(
     ready_to_publish
 }
 
+/// The IPC reply for a change that reached live state but whose snapshot could
+/// not be stored or its recovery pointer saved. The publisher keeps retrying,
+/// so the change is not lost, but it is not published yet either.
+pub(crate) fn unsaved_snapshot_error(network: &str) -> OpError {
+    OpError::msg(format!(
+        "could not save the updated roster for '{network}'; it is not published yet and will be retried"
+    ))
+}
+
+/// The note appended to the reply for a change that stays live although its
+/// snapshot could not be saved. See [`unsaved_snapshot_error`].
+pub(crate) fn unsaved_snapshot_warning(network: &str) -> String {
+    format!(
+        "warning: could not save the updated roster for '{network}'; it is not published yet and will be retried"
+    )
+}
+
 pub(crate) async fn update_snapshot_and_publish(
     state: &SharedNetworkState,
     blob_store: &FsStore,
@@ -708,34 +825,34 @@ pub(crate) async fn update_snapshot_and_publish(
 
 impl Daemon {
     /// `ray connect <identity>`: request a direct connection to that identity.
-    pub async fn connect(&self, peer: &str, hostname: Option<String>) -> IpcMessage {
+    pub async fn connect(&self, peer: &str, hostname: Option<String>) -> OpResult<ConnectOutcome> {
         self.connect.connect(peer, hostname).await
     }
 
     /// `ray connect`: list pending incoming connect requests.
-    pub fn list_connections(&self) -> IpcMessage {
+    pub fn list_connections(&self) -> Vec<ipc::PendingRequestInfo> {
         self.connect.list_connections()
     }
 
     /// Decline a pending connect request: drop it without minting a network or
     /// blocking. The requester's retry loop eventually times out.
-    pub fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
+    pub fn reject_connect(&self, id_prefix: &str) -> OpResult<Done> {
         self.connect.reject_connection(id_prefix)
     }
 
     /// `ray connect approve <id>`: approve a pending connect request, minting
     /// a 2-peer network with the requester pre-approved.
-    pub async fn approve_connection(&self, id_prefix: &str) -> IpcMessage {
+    pub async fn approve_connection(&self, id_prefix: &str) -> OpResult<Done> {
         self.connect.approve_connection(id_prefix).await
     }
 
     /// `ray connect deny <id>`: drop a pending request and block the requester.
-    pub async fn deny_connection(&self, id_prefix: &str) -> IpcMessage {
+    pub async fn deny_connection(&self, id_prefix: &str) -> OpResult<Done> {
         self.connect.deny_connection(id_prefix).await
     }
 
     /// `ray invitations`: invitations received from coordinators.
-    pub async fn list_invitations(&self) -> IpcMessage {
+    pub async fn list_invitations(&self) -> OpResult<Vec<ipc::InvitationInfo>> {
         self.connect.list_invitations().await
     }
 
@@ -744,17 +861,17 @@ impl Daemon {
         &self,
         id: &str,
         hostname: Option<ipc::MachineHostname>,
-    ) -> IpcMessage {
+    ) -> OpResult<JoinOutcome> {
         self.connect.accept_invitation(id, hostname).await
     }
 
     /// `ray invitations decline <id>`.
-    pub async fn decline_invitation(&self, id: &str) -> IpcMessage {
+    pub async fn decline_invitation(&self, id: &str) -> OpResult<Done> {
         self.connect.decline_invitation(id).await
     }
 
     /// Deliver an invite for `network` straight to `recipient`'s identity.
-    pub async fn deliver_invite(&self, network: &str, recipient: EndpointId) -> IpcMessage {
+    pub async fn deliver_invite(&self, network: &str, recipient: EndpointId) -> OpResult<Done> {
         self.connect.deliver_invite(network, recipient).await
     }
 }
@@ -770,8 +887,14 @@ mod tests {
 
     fn state_with_snapshot(hash: blake3::Hash) -> SharedNetworkState {
         Arc::new(RwLock::new(NetworkState {
-            members: MemberList::new(),
-            approved: ApprovedList::new(),
+            group: GroupBlob {
+                members: MemberList::new(),
+                approved: ApprovedList::new(),
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some("test".to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: Some(GroupSnapshot {
                 hash,
                 msgpack_bytes: Vec::new(),
@@ -783,12 +906,9 @@ mod tests {
             network_secret_key: None,
             network_public_key: SecretKey::generate().public(),
             network_name: Some("test".to_string()),
-            group_name: Some("test".to_string()),
             mode: GroupMode::Restricted,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
             last_record_timestamp: None,
+            last_published_record: None,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         }))
@@ -1080,7 +1200,7 @@ mod tests {
         let pending = config::load_network("test").unwrap().unwrap();
         assert_eq!(pending.last_group_hash, Some(new_hash));
         assert!(!pending.last_group_hash_published);
-        assert!(mark_group_hash_published("test", new_hash));
+        assert!(mark_group_hash_published("test", new_hash, 1));
         assert!(
             config::load_network("test")
                 .unwrap()
@@ -1102,5 +1222,35 @@ mod tests {
                 None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
             }
         }
+    }
+
+    /// A saved proof that cannot be read is a reason to ask the relay, not to
+    /// stop publishing: the publisher used to return for good on this error and
+    /// the network's record expired.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unreadable_saved_proof_falls_back_to_the_relay() {
+        use super::super::destruction::tests::{ConfigDir, Relay};
+
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ConfigDir::set(dir.path());
+        let key = SecretKey::from([12; 32]);
+        let saved = dir.path().join("destroyed-networks");
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::write(saved.join(format!("{}.pkarr", key.public())), b"garbage").unwrap();
+        assert!(config::destruction::load(key.public()).is_err());
+        let relay = Relay::start().await;
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let client = dht::create_pkarr_client(&endpoint, &relay.url).unwrap();
+
+        let proof = destruction_proof(&client, &key).await.unwrap();
+
+        assert!(proof.is_none());
+        endpoint.close().await;
     }
 }

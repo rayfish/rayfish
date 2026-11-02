@@ -109,17 +109,6 @@ impl Display for ControllersOutput<'_> {
     }
 }
 
-#[derive(serde::Serialize)]
-struct ManagementMessageOutput<'a> {
-    message: &'a str,
-}
-
-impl Display for ManagementMessageOutput<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.message)
-    }
-}
-
 pub(crate) async fn ipc_machines(action: Option<MachinesAction>) -> Result<()> {
     let request = match action {
         None => ipc::IpcMessage::ManagedMachines { probe: true },
@@ -219,7 +208,7 @@ pub(crate) async fn ipc_delegated_join(
         auto_accept_files,
     )
     .await?;
-    println!("{message}");
+    println!("{}", style::printable_lines(&message));
     Ok(())
 }
 
@@ -246,7 +235,7 @@ pub(crate) async fn ipc_delegated_leave(
     network: &ipc::NetworkName,
 ) -> Result<()> {
     let message = ipc_delegated_leave_request(machine, network).await?;
-    println!("{message}");
+    println!("{}", style::printable_lines(&message));
     Ok(())
 }
 
@@ -260,12 +249,6 @@ pub(crate) async fn ipc_delegated_leave_request(
     })
     .await?;
     result_message(response)
-}
-
-pub(crate) async fn ipc_request(request: ipc::IpcMessage) -> Result<ipc::IpcMessage> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, request).await?;
-    ipc::recv(&mut stream).await
 }
 
 pub(crate) async fn ipc_management_overview(
@@ -299,7 +282,7 @@ fn print_simple_response(response: ipc::IpcMessage) -> Result<()> {
 }
 
 fn print_management_message(message: &str) -> Result<()> {
-    printout(&ManagementMessageOutput { message })
+    print_message(message)
 }
 
 fn enrollment_ttl(reusable: bool, expires: Option<&str>) -> Result<Duration> {

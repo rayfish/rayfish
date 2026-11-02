@@ -70,14 +70,16 @@ impl DisplayOut for FilesOutput<'_> {
                 .iter()
                 .map(|f| {
                     let accept = format!("ray files accept {}", f.id);
+                    let from = style::printable(f.from);
+                    let filename = style::printable(f.filename);
                     vec![
                         layout::Cell::new(f.id.to_string(), style::rose(&f.id.to_string())),
-                        layout::Cell::new(f.from.to_string(), style::value(f.from)),
+                        layout::Cell::new(from.to_string(), style::value(&from)),
                         layout::Cell::right(
                             format_size(f.size),
                             style::faint(&format_size(f.size)),
                         ),
-                        layout::Cell::new(f.filename.to_string(), style::value(f.filename)),
+                        layout::Cell::new(filename.to_string(), style::value(&filename)),
                         layout::Cell::new(accept.clone(), style::faint(&accept)),
                     ]
                 })
@@ -91,14 +93,16 @@ impl DisplayOut for FilesOutput<'_> {
                 .iter()
                 .map(|f| {
                     let cancel = format!("ray files cancel {}", f.id);
+                    let to = style::printable(f.to);
+                    let filename = style::printable(f.filename);
                     vec![
                         layout::Cell::new(f.id.to_string(), style::rose(&f.id.to_string())),
-                        layout::Cell::new(f.to.to_string(), style::value(f.to)),
+                        layout::Cell::new(to.to_string(), style::value(&to)),
                         layout::Cell::right(
                             format_size(f.size),
                             style::faint(&format_size(f.size)),
                         ),
-                        layout::Cell::new(f.filename.to_string(), style::value(f.filename)),
+                        layout::Cell::new(filename.to_string(), style::value(&filename)),
                         layout::Cell::new(cancel.clone(), style::faint(&cancel)),
                     ]
                 })
@@ -126,27 +130,29 @@ fn transfers_table(transfers: &[ipc::TransferFileInfo]) -> String {
         .iter()
         .map(|t| {
             let state = format!("{:?}", t.state).to_lowercase();
-            let action = if t.outgoing
-                && matches!(
-                    t.state,
-                    ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
-                ) {
+            let action = if matches!(
+                t.state,
+                ipc::TransferFileState::Offered | ipc::TransferFileState::Transferring
+            ) {
                 format!("ray files cancel-transfer {}", t.id)
             } else {
                 String::new()
             };
             let progress = format!("{} / {}", format_size(t.transferred), format_size(t.size));
+            // The error can carry a peer's decline reason.
             let state = match &t.error {
-                Some(error) => format!("({state}: {error})"),
+                Some(error) => format!("({state}: {})", style::printable(error)),
                 None => format!("({state})"),
             };
+            let peer = style::printable(&t.peer);
+            let filename = style::printable(&t.filename);
             vec![
                 layout::Cell::new(t.id.to_string(), style::rose(&t.id.to_string())),
-                layout::Cell::new(t.peer.clone(), style::value(&t.peer)),
+                layout::Cell::new(peer.to_string(), style::value(&peer)),
                 layout::Cell::right(progress.clone(), style::faint(&progress)),
                 layout::Cell::new(
-                    format!("{} {state}", t.filename),
-                    format!("{} {}", style::value(&t.filename), style::faint(&state)),
+                    format!("{filename} {state}"),
+                    format!("{} {}", style::value(&filename), style::faint(&state)),
                 ),
                 layout::Cell::new(action.clone(), style::faint(&action)),
             ]
@@ -205,22 +211,19 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
         // A daemon predating `SendFileFd` fails to decode the request and
         // drops the connection without a reply (never with an `Error`
         // response). Retry once the old way, path over IPC, so an updated CLI
-        // keeps working until the daemon restarts onto the new binary.
+        // keeps working until the daemon restarts onto the new binary. The new
+        // daemon refuses path sends from anyone but root, so this only helps
+        // across the upgrade.
         Err(_) => {
-            let mut stream = ipc::connect().await?;
-            ipc::send(
-                &mut stream,
-                ipc::IpcMessage::SendFile {
-                    path: path.to_string_lossy().to_string(),
-                    peer: peer.to_string(),
-                },
-            )
-            .await?;
-            ipc::recv(&mut stream).await?
+            ipc_request(ipc::IpcMessage::SendFile {
+                path: path.to_string_lossy().to_string(),
+                peer: peer.to_string(),
+            })
+            .await?
         }
     };
     match resp {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", style::printable_lines(&message)),
         // Returned, not exited: [`ipc_send_files`] calls this once per file and
         // is written to keep going, so ending the process here would drop every
         // file after the first rejected one. The caller prints this with the
@@ -285,9 +288,10 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     )
     .await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => println!("{}", style::printable_lines(&message)),
+        // Returned, not exited, for the same reason as the Unix path.
         ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
-        other => eprintln!("Unexpected response: {other:?}"),
+        other => anyhow::bail!(unexpected_detail(&other)),
     }
     Ok(())
 }
@@ -297,9 +301,7 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
 /// absent row renders as the empty string, which is how every settings key
 /// spells unset.
 async fn config_row(key: NodeKey) -> Result<String> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key: Some(key) }).await?;
-    match ipc::recv(&mut stream).await? {
+    match ipc_request(ipc::IpcMessage::ConfigGet { key: Some(key) }).await? {
         ipc::IpcMessage::ConfigValues { rows } => {
             Ok(rows.into_iter().next().map(|(_, v)| v).unwrap_or_default())
         }
@@ -329,6 +331,60 @@ pub(crate) async fn peer_list(key: GlobalKey) -> Result<Vec<String>> {
         .collect())
 }
 
+/// `ray files auto-accept list`: a JSON array, or one peer per line.
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct PeerListOutput(Vec<String>);
+
+impl DisplayOut for PeerListOutput {
+    fn print_human(&self) {
+        for peer in &self.0 {
+            println!("{peer}");
+        }
+    }
+}
+
+/// `ray files download-dir`: `null` in JSON when unset.
+#[derive(serde::Serialize)]
+struct DownloadDirOutput<'a> {
+    download_dir: Option<&'a str>,
+}
+
+impl DisplayOut for DownloadDirOutput<'_> {
+    fn print_human(&self) {
+        println!("download-dir = {}", self.download_dir.unwrap_or("<unset>"));
+    }
+}
+
+/// `ray files download-user`: the uid, `null` in JSON when unset.
+#[derive(serde::Serialize)]
+struct DownloadUserOutput {
+    download_user: Option<u32>,
+}
+
+impl DownloadUserOutput {
+    /// The settings row renders the uid as text, empty when unset.
+    fn parse(row: &str) -> Result<Self> {
+        let download_user = match row {
+            "" => None,
+            uid => Some(
+                uid.parse()
+                    .with_context(|| format!("daemon reported an invalid download-user '{uid}'"))?,
+            ),
+        };
+        Ok(Self { download_user })
+    }
+}
+
+impl DisplayOut for DownloadUserOutput {
+    fn print_human(&self) {
+        match self.download_user {
+            Some(uid) => println!("download-user = uid {uid}"),
+            None => println!("download-user = <unset>"),
+        }
+    }
+}
+
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     // These subcommands change (or read) global settings the daemon owns. They
     // route through the daemon so the write lands in the config dir the daemon
@@ -342,12 +398,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         return match action {
             crate::FilesAutoAcceptAction::Add { peer } => edit_peer_list(key, peer, false).await,
             crate::FilesAutoAcceptAction::Remove { peer } => edit_peer_list(key, peer, true).await,
-            crate::FilesAutoAcceptAction::List => {
-                for peer in peer_list(key).await? {
-                    println!("{peer}");
-                }
-                Ok(())
-            }
+            crate::FilesAutoAcceptAction::List => printout(&PeerListOutput(peer_list(key).await?)),
         };
     }
     match &action {
@@ -373,11 +424,9 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 .await;
             }
             let dir = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await?;
-            println!(
-                "download-dir = {}",
-                if dir.is_empty() { "<unset>" } else { &dir }
-            );
-            return Ok(());
+            return printout(&DownloadDirOutput {
+                download_dir: (!dir.is_empty()).then_some(dir.as_str()),
+            });
         }
         Some(FilesAction::DownloadUser { user, clear }) => {
             if *clear {
@@ -399,12 +448,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 .await;
             }
             let uid = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await?;
-            if uid.is_empty() {
-                println!("download-user = <unset>");
-            } else {
-                println!("download-user = uid {uid}");
-            }
-            return Ok(());
+            return printout(&DownloadUserOutput::parse(&uid)?);
         }
         _ => {}
     }
@@ -427,6 +471,12 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             }
         }
         Some(FilesAction::Accept { id, output }) => {
+            // The daemon resolves a relative path against its own working
+            // directory, not the caller's, so send it absolute.
+            let output = output
+                .map(|dir| std::path::absolute(&dir).map(|p| p.to_string_lossy().to_string()))
+                .transpose()
+                .context("resolve the output directory")?;
             let output = output.or_else(|| {
                 dirs::download_dir()
                     .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
@@ -439,9 +489,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             let resp = ipc::recv(&mut stream).await?;
             spinner.finish_and_clear();
             match resp {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -451,9 +499,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             // drops the entry and answers.
             ipc::send(&mut stream, ipc::IpcMessage::RejectFile { id }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -461,9 +507,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         Some(FilesAction::Cancel { id }) => {
             ipc::send(&mut stream, ipc::IpcMessage::CancelSend { id }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -471,9 +515,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         Some(FilesAction::CancelTransfer { id }) => {
             ipc::send(&mut stream, ipc::IpcMessage::CancelTransfer { id }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message))
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -493,9 +535,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             .await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
-                ipc::IpcMessage::Ok { message } => {
-                    println!("  {} {}", style::check(), style::value(&message));
-                }
+                ipc::IpcMessage::Ok { message } => print_checked_message(&message)?,
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => fail_unexpected(&other),
             }
@@ -521,6 +561,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn files_settings_reads_serialize_for_json() {
+        let peers = PeerListOutput(vec!["laptop".into()]);
+        assert_eq!(
+            serde_json::to_value(&peers).unwrap(),
+            serde_json::json!(["laptop"])
+        );
+        let dir = DownloadDirOutput { download_dir: None };
+        assert_eq!(
+            serde_json::to_value(&dir).unwrap(),
+            serde_json::json!({ "download_dir": null })
+        );
+        let user = DownloadUserOutput::parse("1000").unwrap();
+        assert_eq!(
+            serde_json::to_value(&user).unwrap(),
+            serde_json::json!({ "download_user": 1000 })
+        );
+        assert_eq!(DownloadUserOutput::parse("").unwrap().download_user, None);
+        assert!(DownloadUserOutput::parse("bob").is_err());
+    }
+
+    #[test]
     fn transfers_table_shows_progress_and_state() {
         style::set_plain(true);
         let transfers = [ipc::TransferFileInfo {
@@ -539,6 +600,27 @@ mod tests {
         assert!(row.contains("1 KiB / 2 KiB"), "{out}");
         assert!(row.contains("notes.txt (transferring)"), "{out}");
         assert!(row.contains("ray files cancel-transfer 7"), "{out}");
+    }
+    #[test]
+    fn a_retrying_receive_can_be_canceled() {
+        style::set_plain(true);
+        let transfers = [ipc::TransferFileInfo {
+            error: Some("interrupted, retrying: the transfer stalled".into()),
+            id: 9,
+            outgoing: false,
+            peer: "laptop".into(),
+            filename: "notes.txt".into(),
+            size: 12,
+            transferred: 6,
+            state: ipc::TransferFileState::Transferring,
+            destination: None,
+        }];
+        let output = transfers_table(&transfers);
+        assert!(
+            output.contains("transferring: interrupted, retrying"),
+            "{output}"
+        );
+        assert!(output.contains("ray files cancel-transfer 9"), "{output}");
     }
     #[test]
     fn declined_transfer_displays_the_reason() {

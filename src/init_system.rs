@@ -158,23 +158,31 @@ impl InitSystem {
         }
     }
 
+    /// Best-effort: the caller confirms the start by waiting for the daemon.
     pub fn start(self) {
-        self.action("start");
+        if let Err(error) = self.action("start") {
+            eprintln!("warning: {error:#}");
+        }
     }
 
-    pub fn stop(self) {
-        self.action("stop");
+    /// Stop the service. Nothing after this can confirm the stop, so a failure
+    /// is returned rather than warned about.
+    pub fn stop(self) -> Result<()> {
+        self.action("stop")
     }
 
+    /// Best-effort: the caller confirms the restart by waiting for the daemon.
     pub fn restart(self) {
-        self.action("restart");
+        if let Err(error) = self.action("restart") {
+            eprintln!("warning: {error:#}");
+        }
     }
 
-    fn action(self, verb: &str) {
+    fn action(self, verb: &str) -> Result<()> {
         match self {
-            Self::Systemd => run("systemctl", &[verb, SERVICE_NAME]),
-            Self::OpenRc => run("rc-service", &[SERVICE_NAME, verb]),
-            Self::SysVInit => run(INITD_SCRIPT, &[verb]),
+            Self::Systemd => run_checked("systemctl", &[verb, SERVICE_NAME]),
+            Self::OpenRc => run_checked("rc-service", &[SERVICE_NAME, verb]),
+            Self::SysVInit => run_checked(INITD_SCRIPT, &[verb]),
         }
     }
 
@@ -223,6 +231,20 @@ fn run(program: &str, args: &[&str]) {
     }
 }
 
+/// Run a command, failing on a non-zero exit.
+fn run_checked(program: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run {program}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "{program} {} exited with {status}",
+        args.join(" ")
+    );
+    Ok(())
+}
+
 /// Run a command, ignoring output and exit status (best-effort teardown, or a
 /// tool that may not exist on this distro flavour).
 fn run_quiet(program: &str, args: &[&str]) {
@@ -236,6 +258,13 @@ fn run_quiet(program: &str, args: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_runs_fail_on_a_non_zero_exit() {
+        assert!(run_checked("true", &[]).is_ok());
+        assert!(run_checked("false", &[]).is_err());
+        assert!(run_checked("/nonexistent/rayfish-test-binary", &[]).is_err());
+    }
 
     /// Every template must carry the placeholder the installer rewrites; a
     /// typo there would silently install a unit pointing at a binary that may

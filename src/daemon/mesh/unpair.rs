@@ -292,15 +292,15 @@ impl NetworkRegistry {
     /// [`Self::on_unpaired_notice`] and [`Self::unpair_nullified`], by the
     /// primary's notice and a signed blob that nullifies this device. A device
     /// with no cert (a primary) has nothing to unpair.
-    pub(crate) async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
+    pub(crate) async fn unpair_self(self: &Arc<Self>) -> OpResult<Done> {
         let _guard = self.unpair_lock.lock().await;
         self.unpair_self_locked().await
     }
 
     /// [`Self::unpair_self`], for a caller holding the unpair lock.
-    async fn unpair_self_locked(self: &Arc<Self>) -> IpcMessage {
+    async fn unpair_self_locked(self: &Arc<Self>) -> OpResult<Done> {
         let Some(cert) = self.current_device_cert() else {
-            return ipc_err("this device is not paired to a primary".to_string());
+            return op_err("this device is not paired to a primary".to_string());
         };
         // Saved before any of the work, so a restart finishes it.
         if let Err(error) = config::update_settings(|cfg| {
@@ -312,7 +312,7 @@ impl NetworkRegistry {
             });
             Ok(())
         }) {
-            return ipc_err(format!("could not save the unpair: {error:#}"));
+            return op_err(format!("could not save the unpair: {error:#}"));
         }
         let left = self.finish_cleanup_locked(&cert).await;
         self.unpair_nudge.notify_one();
@@ -321,18 +321,15 @@ impl NetworkRegistry {
 
     /// The cleanup of the saved unpair from `cert`, made durable and moved on to
     /// its request. Caller holds the unpair lock.
-    async fn finish_cleanup_locked(self: &Arc<Self>, cert: &control::DeviceCert) -> IpcMessage {
-        let left = self.leave_certificate_networks(cert).await;
-        if !matches!(left, IpcMessage::Ok { .. }) {
-            return left;
-        }
+    async fn finish_cleanup_locked(self: &Arc<Self>, cert: &control::DeviceCert) -> OpResult<Done> {
+        let left = self.leave_certificate_networks(cert).await?;
         if let Err(error) = complete_cleanup(cert) {
-            return ipc_err(format!(
+            return op_err(format!(
                 "left the primary's networks and deleted its certificate, but could not \
                  save that ({error:#}); it is retried"
             ));
         }
-        left
+        Ok(left)
     }
 
     /// The primary's notice that this device is unpaired, from `sender`:
@@ -410,17 +407,15 @@ impl NetworkRegistry {
     /// Finish the cleanup of any saved unpair still in that phase, which only a
     /// start that failed to finish it leaves, so that a pairing never starts
     /// under one. Caller holds the unpair lock.
-    pub(crate) async fn finish_cleanups_locked(self: &Arc<Self>) -> Result<(), String> {
+    pub(crate) async fn finish_cleanups_locked(self: &Arc<Self>) -> OpResult<()> {
         let pending = config::load()
-            .map_err(|error| format!("could not read saved unpairs: {error:#}"))?
+            .map_err(|error| OpError::msg(format!("could not read saved unpairs: {error:#}")))?
             .pending_unpairs;
         for entry in pending {
             if entry.phase != UnpairPhase::Cleanup {
                 continue;
             }
-            if let IpcMessage::Error { message } = self.finish_cleanup_locked(&entry.cert).await {
-                return Err(message);
-            }
+            self.finish_cleanup_locked(&entry.cert).await?;
         }
         Ok(())
     }
@@ -454,9 +449,8 @@ impl NetworkRegistry {
         for entry in pending {
             let primary = entry.cert.user_identity;
             if entry.phase == UnpairPhase::Cleanup {
-                if let IpcMessage::Error { message } = self.finish_cleanup_locked(&entry.cert).await
-                {
-                    tracing::warn!(primary = %primary.fmt_short(), %message, "could not finish an unpair");
+                if let Err(error) = self.finish_cleanup_locked(&entry.cert).await {
+                    tracing::warn!(primary = %primary.fmt_short(), %error, "could not finish an unpair");
                 } else {
                     // Its request is next, without waiting for the pause.
                     self.unpair_nudge.notify_one();

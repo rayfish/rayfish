@@ -572,8 +572,46 @@ use macos::MacosDynamicStoreDns;
 /// See [`crate::daemon::dns_service::DnsService::run_upstream_refresh`], which
 /// polls this and re-points the forwarder at whatever currently answers.
 #[cfg(target_os = "macos")]
-pub fn live_system_upstreams() -> Vec<std::net::Ipv4Addr> {
+pub fn live_system_upstreams() -> Vec<IpAddr> {
     macos::capture_system_upstreams()
+}
+
+/// The nameservers of `resolver #1` (macOS's primary resolver) in
+/// `scutil --dns` output, IPv4 and IPv6 alike, minus our own magic addresses.
+/// A scoped link-local address (`fe80::1%en0`) is skipped: an `IpAddr` cannot
+/// carry the zone, and without it the address is unreachable.
+#[cfg(any(target_os = "macos", test))]
+fn parse_scutil_dns_upstreams(out: &str) -> Vec<IpAddr> {
+    let magic = [
+        IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+        IpAddr::V6(crate::dns::MAGIC_DNS_V6),
+    ];
+    let mut ups = Vec::new();
+    let mut in_first = false;
+    for line in out.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("resolver #") {
+            // Stop once we pass the first resolver block; take only #1.
+            if in_first {
+                break;
+            }
+            in_first = rest.trim() == "1";
+            continue;
+        }
+        // `nameserver[0] : 2001:db8::1`: split at the first colon only, since
+        // an IPv6 address is full of them.
+        if in_first
+            && t.starts_with("nameserver[")
+            && let Some(ip) = t
+                .split_once(':')
+                .and_then(|(_, v)| v.trim().parse::<IpAddr>().ok())
+            && !magic.contains(&ip)
+            && !ups.contains(&ip)
+        {
+            ups.push(ip);
+        }
+    }
+    ups
 }
 
 #[cfg(target_os = "macos")]
@@ -650,10 +688,37 @@ mod tests {
         MAX_NAMESERVERS, NmQuietOutcome, Reassert, SearchDomain, StaleBackup, first_nameserver,
         foreign_mesh_resolver, join_domains, merge_search_domains, nm_dns_none_dropin,
         nm_quiet_outcome, other_overlay_resolver, parse_resolv_nameservers, parse_resolv_search,
-        reassert_decision, render_direct_resolv_conf, render_direct_resolv_conf_with,
-        resolv_conf_is_ours, resolvectl_domain_args, resolved_link_domains, search_domains_for,
-        stale_backup_action, strip_our_resolv_entries,
+        parse_scutil_dns_upstreams, reassert_decision, render_direct_resolv_conf,
+        render_direct_resolv_conf_with, resolv_conf_is_ours, resolvectl_domain_args,
+        resolved_link_domains, search_domains_for, stale_backup_action, strip_our_resolv_entries,
     };
+
+    #[test]
+    fn scutil_upstreams_include_ipv6() {
+        let out = "\
+DNS configuration
+
+resolver #1
+  search domain[0] : lan
+  nameserver[0] : 192.168.1.1
+  nameserver[1] : 2001:db8::53
+  nameserver[2] : fe80::1%en0
+  nameserver[3] : 200::53
+  nameserver[4] : 100.100.100.53
+  flags    : Request A records, Request AAAA records
+
+resolver #2
+  domain   : local
+  nameserver[0] : 10.0.0.1
+";
+        assert_eq!(
+            parse_scutil_dns_upstreams(out),
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                "2001:db8::53".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
 
     /// Domains as the host had them, i.e. read back from its own config.
     fn host(domains: &[&str]) -> Vec<SearchDomain> {

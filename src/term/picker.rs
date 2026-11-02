@@ -147,8 +147,9 @@ fn render(
         let sugg = r
             .suggested_by
             .as_ref()
-            .map(|s| format!("·{s}·"))
+            .map(|s| format!("·{}·", style::printable(s)))
             .unwrap_or_default();
+        let peer = style::printable(&r.peer);
         rows.push(vec![
             layout::Cell::new(pointer, style::rose(pointer)),
             layout::Cell::new(mark_plain, mark_styled),
@@ -162,7 +163,7 @@ fn render(
                 style::value(&r.protocol.to_string()),
             ),
             layout::Cell::right(port, style::value(port)),
-            layout::Cell::new(r.peer.clone(), style::value(&r.peer)),
+            layout::Cell::new(peer.to_string(), style::value(&peer)),
             layout::Cell::new(r.network.clone(), style::faint(&r.network)),
             layout::Cell::new(sugg.clone(), style::faint(&sugg)),
         ]);

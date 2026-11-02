@@ -261,7 +261,7 @@ deploy ip:
 # Copy an already-built release binary to a host + (re)start the daemon. No build.
 # Use after `just cross` when deploying the same binary to several hosts.
 scp ip:
-    rsync -az --progress {{cross_dir}}/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
+    rsync -az --progress {{cross_dir}}/{{target}}/release/{{binary}} {{user}}@{{ if ip =~ ':' { '[' + ip + ']' } else { ip } }}:/tmp/
     ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}}"
 
@@ -271,7 +271,7 @@ deploy-dev ip:
 
 # Debug counterpart of `scp`: copy an already-built debug binary, no build.
 scp-dev ip:
-    rsync -az --progress {{cross_dir}}/{{target}}/debug/{{binary}} {{user}}@{{ip}}:/tmp/
+    rsync -az --progress {{cross_dir}}/{{target}}/debug/{{binary}} {{user}}@{{ if ip =~ ':' { '[' + ip + ']' } else { ip } }}:/tmp/
     ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}} (debug build)"
 

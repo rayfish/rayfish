@@ -6,14 +6,207 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- An accepted file whose download is interrupted (the sender drops off, or the
+  laptop sleeps) now resumes by itself where it stopped, with no second
+  `ray files accept`. It shows as transferring with the reason in `ray files`,
+  keeps retrying for up to a day without progress, and stops at once if the
+  sender no longer has the file. A daemon restart picks it up again into the
+  same folder. `ray files cancel-transfer` stops it and puts the offer back in
+  the queue.
+
 ### Changed
 
 - macOS: connection latency appears on each peer instead of a global slow connection warning.
+- Under `--json`, commands that print a daemon confirmation now print
+  `{"message": ...}`, and `ray invite`, `ray pair` and the `ray files`
+  settings commands print JSON. `ray status --json` exits non-zero with the
+  error on stderr when the daemon is down or refuses the connection.
+- `ray pair <ticket>` with a subcommand is now an error.
 
 ### Fixed
 
 - Linux exit nodes forward IPv4 traffic when the host firewall blocks forwarding by default.
 - macOS: keep the mesh and DNS route available while an exit node is selected.
+- Files sent together no longer sit as offered for minutes when some were queued
+  while the first ones were still being delivered.
+- Joining a network twice under two names at once, or while the daemon was
+  restoring it under its saved name, no longer brings it up twice. The second
+  join is refused, and leaving the network no longer cuts off a second copy.
+- A peer that leaves and rejoins a network under a new name no longer keeps
+  answering Magic DNS under its old name.
+- After a restart, a member no longer deletes a saved network when someone
+  replays an old network record from before it joined.
+- On a network with several coordinators, a member reconnecting to one that
+  has not yet caught up no longer rolls back to its older roster and then
+  ignores the newer one.
+- A received file is flushed to disk before it is reported as saved, so a
+  power loss right after cannot leave an empty file in its place.
+- A received file whose name is too long for the disk (as macOS allows) is
+  saved under a shortened name instead of failing after the whole download.
+- On Windows, a received file named like a port device with a superscript
+  digit (`COM¹.txt`) is saved as a normal file, and a long name that needs a
+  device prefix still fits once numbered.
+- A file offer whose real size differs from the size it claims now fails as
+  soon as the download starts, instead of filling the disk with a larger file.
+- A receive that gives up after a few minutes without progress says so,
+  instead of "gave up after 0 hours".
+- A receive cut short by a crash or power loss no longer leaves a hidden
+  `.rayfish-*.part` file in the download folder for good: receiving the same
+  offer again replaces it.
+- A send that finished after the recipient restarted no longer shows as done
+  with an "interrupted" note in `ray files`.
+- A daemon that stops just after saving a received file no longer saves it a
+  second time, as `name (1)`, when it starts again.
+- On a network with several coordinators, a coordinator that created the
+  network or restarted now picks up changes another coordinator makes, instead
+  of missing them until something else prompted a refresh.
+- `ray firewall ssh off` now succeeds in rootless mode instead of being
+  refused. `ssh on` still fails there, with a message saying mesh SSH is
+  unavailable in rootless mode.
+- macOS: saving a file returns as soon as the download starts, with progress in
+  the file list, instead of reporting a timeout after five minutes while the
+  download kept going.
+- With an exit node selected, a `dns-upstreams` replacement naming only
+  Rayfish's own resolver address no longer sends lookups to the system
+  resolvers outside the tunnel. They go to public resolvers through the exit.
+- Magic DNS forwards a query with a large EDNS buffer size unchanged apart
+  from that size, so its EDNS version and any TSIG or SIG(0) signature
+  survive the trip upstream.
+- A peer that an older coordinator named past 63 characters (a long name
+  plus `-1`) is left out of Magic DNS with one warning in the log, not one on
+  every roster update. `ray hostname` on that peer gives it a name that
+  resolves.
+- A send whose download was interrupted now shows in `ray files` on the
+  sender as still in progress, with a note, instead of failed and then gone a
+  minute later. It shows as done once the recipient finishes it, and as
+  offered again if the recipient does not resume it within a day.
+- Android: a received file is moved to Downloads from a folder of its own, so
+  one whose name was already taken in the app's storage no longer moves the
+  older file instead. Accepting a file stops after two minutes without
+  progress rather than waiting up to a day; accepting it again carries on
+  from where it stopped.
+- Windows: a file accepted by a process running as SYSTEM into a folder it
+  named resumes after a daemon restart instead of downloading again and then
+  being refused.
+- Accepting a file into a folder it cannot be saved in now fails right away,
+  before anything downloads. On macOS, where accepting returns as soon as the
+  download starts, a bad folder used to cost the whole download and then put
+  the file back in the list without saying why.
+- A file receive that is canceled, or stopped by a daemon restart, while the
+  file is being written no longer leaves a truncated file under the file's
+  name. The file is written under a hidden temporary name and appears under
+  its own name only once complete, without replacing a file that is already
+  there.
+- A received file whose delivery could not be recorded is no longer put back
+  in the queue while showing as done, where accepting it again downloaded a
+  second copy. The receive fails with a message naming where the file was
+  saved.
+- A member whose coordinator handshake failed partway through a restart now
+  picks up roster and firewall changes as they happen, instead of waiting for
+  the next poll.
+- `ray create --tor` and `ray join --tor` now use Tor (after a daemon restart)
+  instead of silently ignoring the flag, and fail on builds without Tor. A
+  `--tor` join still waiting for approval keeps Tor across a restart, and a
+  repeated `ray join` for a queued network says a request is already queued.
+- Members resumed at startup apply roster and firewall updates as soon as a
+  peer pushes them, instead of waiting for the next poll.
+- Roster updates learned by polling now update `.ray` names and routes, an
+  older signed roster can no longer roll back a newer one, and a node removed
+  from a network leaves it.
+- A failed roster fetch no longer blocks the same update from applying later.
+- Joining a network while it is being restored no longer leaves two copies of
+  it running, and a closed-network join retries once per network.
+- `ray join` for a network already joined under another name is refused
+  instead of taking over the live network's connections.
+- A promoted co-coordinator now prunes expired ephemeral members.
+- A network running an incompatible mesh version is flagged after a restart.
+- Concurrent firewall edits no longer drop rules.
+- Coordinator changes that could not be saved now say so. Minting a reusable
+  key or granting admin fails; accepting a request, revoking a reusable key or
+  suggesting firewall rules takes effect and warns that publishing will be
+  retried.
+- One unreadable destruction proof no longer stops republishing the others.
+- A stalled peer stream no longer blocks that peer's connection.
+- File auto-accept and `ray status` follow pairing and unpairing without a
+  restart.
+- `ray hostname` reports a failed save.
+- `ray report` no longer stalls the daemon, and logs stay within the size cap.
+- Ambiguous or empty short peer ids are rejected instead of picking a peer.
+- `ray connect` runs one retry per peer and completes after the approver
+  restarts.
+- Mobile: rebuilding the node no longer leaks the previous one.
+- PTR lookups keep working for a peer shared by two networks.
+- Large forwarded DNS replies are truncated instead of dropped.
+- macOS: IPv6 DNS upstreams are used.
+- macOS and FreeBSD: an exit node re-enables pf after an unclean shutdown.
+- macOS: one failed SSH connection no longer ends the helper's other sessions.
+- SSH sessions start in `/` when the user's home directory is missing.
+- Rootless proxies and the IPv4 bridge keep listening after accept errors, and
+  the bridge caps connections per port.
+- Metrics stop exporting peers that left.
+- Android: reading status while stopped no longer creates an identity.
+- `ray gui` no longer hangs on commands with large output.
+- `ray open` join links auto-accept own-device files, like `ray join`.
+- `ray apply` exits non-zero on failed steps, keeps live suggestions when they
+  cannot be read, and rejects nested groups.
+- `ray ephemeral` exits non-zero on an invalid duration, and durations that
+  overflow are refused.
+- A refused daemon socket is reported as "not authorized" rather than "not
+  running", and the hint names `sudo ray up`.
+- Windows: `ray send` exits non-zero on an unexpected daemon reply.
+- Linux and Windows: `ray stop` fails when the service manager cannot stop the
+  service. `ray uninstall` requires root.
+- The firewall pending picker opens only on a terminal.
+- Tab completion no longer creates or migrates config.
+- `ray files accept -o <dir>` resolves a relative directory against the
+  current directory.
+- A peer renamed to an invalid name no longer keeps answering PTR lookups.
+- A join or restore that loses the race to an already running copy of the
+  network no longer applies its own roster, which could overwrite the running
+  network's saved state or make it leave.
+- A device paired or unpaired while the daemon runs now handles pushed roster
+  updates under its current pairing, so it unpairs itself as soon as its
+  primary revokes it instead of only at the next poll.
+- A kick message no longer makes a member leave on the strength of an old
+  roster served from discovery, such as one from before it joined. The member
+  leaves only when a roster newer than its own drops it.
+
+### Security
+
+- `ray files`, `ray send` and other commands show control characters and bidi
+  overrides in names a peer sent as visible escapes, so a file name can no
+  longer rewrite or retitle your terminal.
+- A managed machine only lets its controller remove it from networks that
+  controller coordinates, and only joins a network when that controller is one
+  of its coordinators and admits the machine itself. Before, a controller could
+  make it leave any network, or join one it did not run with an invite meant
+  for someone else.
+- Received files whose names would leave the download directory are refused.
+- Only root can ask the daemon to send a file by path, so operators cannot
+  read files they have no access to.
+- Peer hostnames must be a single valid DNS label, so a member cannot claim a
+  name such as `web.prod` and take over another network's `.ray` name.
+- Received files only go into a directory the accepting user owns, never
+  through a link, and never over an existing file (the new one is saved as
+  `name (1).ext`). Only root can set `download-dir` and `download-user`.
+- File auto-accept no longer follows a link in the configured download
+  directory to a directory its user does not own. A user who replaced their
+  `~/Downloads` with a link to `/etc` (or a junction to `System32` on Windows)
+  could have the daemon create a file there and hand it to them. A configured
+  directory reached without links works as before, whoever owns it.
+- A member no longer takes another member's name from that member's own
+  claim. Names in the roster and Magic DNS come only from what the coordinator
+  signed, so a peer cannot make others resolve it under a name it chose.
+  Renames still show up once the coordinator accepts them.
+- Windows: `ray files accept` only saves into a directory the accepting user
+  can write to, instead of anywhere the service account can. It never follows
+  a link at the file name and never overwrites an existing file. Characters
+  Windows reserves in a received file name, such as `:`, become `_`.
+- Anyone who knows a network's id can no longer make its members repeat
+  config writes and roster messages by resending the network's current signed
+  record. A copy no newer than the one already applied is ignored.
 
 ## [0.5.13] - 2026-10-31
 

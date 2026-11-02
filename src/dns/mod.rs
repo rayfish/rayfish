@@ -19,9 +19,9 @@ pub mod config;
 pub mod packet;
 pub mod resolver;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use dashmap::DashMap;
 use tokio::sync::RwLock;
@@ -76,6 +76,29 @@ pub fn new_reverse_table() -> ReverseLookupTable {
     Arc::new(DashMap::new())
 }
 
+/// Roster names already reported by [`report_invalid_hostname`]. A name an
+/// older coordinator assigned stays on the roster, and every roster sync would
+/// otherwise warn about it again. Capped so a hostile roster cannot grow it;
+/// past the cap, new names log at debug only.
+static REPORTED_INVALID: LazyLock<Mutex<HashSet<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+const REPORTED_INVALID_MAX: usize = 1024;
+
+/// Say once per network and name that Magic DNS will not answer for `hostname`.
+fn report_invalid_hostname(network: &str, hostname: &str) {
+    let first = {
+        let mut seen = REPORTED_INVALID
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        seen.len() < REPORTED_INVALID_MAX && seen.insert((network.to_owned(), hostname.to_owned()))
+    };
+    if first {
+        tracing::warn!(%network, %hostname, "ignoring invalid hostname: Magic DNS will not answer for it");
+    } else {
+        tracing::debug!(%network, %hostname, "ignoring invalid hostname");
+    }
+}
+
 /// Update both the hostname table and reverse lookup table atomically.
 pub async fn update_hostname(
     table: &HostnameTable,
@@ -84,9 +107,17 @@ pub async fn update_hostname(
     hostname: &str,
     ipv6: Ipv6Addr,
 ) {
+    // A name with a dot would answer for another network's `<host>.<net>.ray`.
+    if !crate::hostname::is_valid_hostname(hostname) {
+        report_invalid_hostname(network, hostname);
+        return;
+    }
     {
         let mut t = table.write().await;
         let hosts = t.entry(network.to_string()).or_default();
+        // One address carries one name per network: a peer that rejoined under
+        // a new name must stop answering for its old one.
+        hosts.retain(|name, addr| name == hostname || *addr != ipv6);
         hosts.insert(hostname.to_string(), ipv6);
     }
     reverse.insert(ipv6, (hostname.to_string(), network.to_string()));
@@ -101,14 +132,33 @@ pub async fn remove_hostname_by_ip(
 ) {
     let mut t = table.write().await;
     if let Some(hosts) = t.get_mut(network) {
-        hosts.retain(|_, v6| {
-            if *v6 == ipv6 {
-                reverse.remove(&ipv6);
-                false
-            } else {
-                true
-            }
-        });
+        hosts.retain(|_, v6| *v6 != ipv6);
+    }
+    repoint_reverse(&t, reverse, ipv6);
+}
+
+/// Point the reverse entry for `ipv6` at whichever network still holds it, or
+/// drop it when none does. A peer in two networks has the same mesh address in
+/// both, so leaving one must not take its PTR away from the other.
+fn repoint_reverse(
+    table: &HashMap<String, HashMap<String, HostnameEntry>>,
+    reverse: &ReverseLookupTable,
+    ipv6: Ipv6Addr,
+) {
+    let holder = table
+        .iter()
+        .filter_map(|(network, hosts)| {
+            let (name, _) = hosts.iter().find(|(_, v6)| **v6 == ipv6)?;
+            Some((network, name))
+        })
+        .min();
+    match holder {
+        Some((network, name)) => {
+            reverse.insert(ipv6, (name.clone(), network.clone()));
+        }
+        None => {
+            reverse.remove(&ipv6);
+        }
     }
 }
 
@@ -123,18 +173,28 @@ pub async fn sync_network_hostnames(
     entries: &[(String, Ipv6Addr)],
 ) {
     let mut t = table.write().await;
-    // Drop reverse entries for the network's previous set before rebuilding.
-    if let Some(old) = t.get(network) {
-        for v6 in old.values() {
-            reverse.remove(v6);
-        }
-    }
     let mut hosts = HashMap::with_capacity(entries.len());
     for (name, v6) in entries {
+        if !crate::hostname::is_valid_hostname(name) {
+            report_invalid_hostname(network, name);
+            continue;
+        }
         hosts.insert(name.clone(), *v6);
         reverse.insert(*v6, (name.clone(), network.to_string()));
     }
-    t.insert(network.to_string(), hosts);
+    // Addresses the network no longer holds may still belong to another one.
+    // Held means held by a valid name: a peer renamed to an invalid one is
+    // gone from `hosts`, and its PTR must stop answering the old name.
+    let previous = t.insert(network.to_string(), hosts);
+    let current = &t[network];
+    let dropped: Vec<Ipv6Addr> = previous
+        .into_iter()
+        .flat_map(HashMap::into_values)
+        .filter(|v6| !current.values().any(|new| new == v6))
+        .collect();
+    for v6 in dropped {
+        repoint_reverse(&t, reverse, v6);
+    }
 }
 
 /// Remove all hostnames for a network from both tables.
@@ -142,7 +202,7 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
     let mut t = table.write().await;
     if let Some(hosts) = t.remove(network) {
         for (_, ipv6) in hosts {
-            reverse.remove(&ipv6);
+            repoint_reverse(&t, reverse, ipv6);
         }
     }
 }
@@ -467,6 +527,41 @@ mod tests {
         assert_eq!(result, Some(v6(5)));
     }
 
+    /// A peer that rejoins under a new name is seated by hostname alone, with
+    /// no roster sync to drop the name it had before.
+    #[tokio::test]
+    async fn a_renamed_peer_stops_answering_for_its_old_name() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v6 = |n: u16| Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, n);
+        update_hostname(&table, &reverse, "home", "old", v6(1)).await;
+        update_hostname(&table, &reverse, "home", "other", v6(2)).await;
+        update_hostname(&table, &reverse, "home", "new", v6(1)).await;
+        assert_eq!(resolve_name("old.home.ray", SUFFIX, &table).await, None);
+        assert_eq!(
+            resolve_name("new.home.ray", SUFFIX, &table).await,
+            Some(v6(1))
+        );
+        assert_eq!(
+            resolve_name("other.home.ray", SUFFIX, &table).await,
+            Some(v6(2))
+        );
+    }
+
+    /// A member named `web.prod` on one network must not answer for host
+    /// `web` on network `prod`.
+    #[tokio::test]
+    async fn a_dotted_hostname_never_enters_the_table() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v6 = |n: u16| Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, n);
+        update_hostname(&table, &reverse, "home", "web.prod", v6(1)).await;
+        sync_network_hostnames(&table, &reverse, "lab", &[("web.prod".to_string(), v6(2))]).await;
+        assert_eq!(resolve_name("web.prod.ray", SUFFIX, &table).await, None);
+        assert!(reverse.get(&v6(1)).is_none());
+        assert!(reverse.get(&v6(2)).is_none());
+    }
+
     #[tokio::test]
     async fn test_sync_network_hostnames_rename_and_remove() {
         let table = new_hostname_table();
@@ -504,6 +599,54 @@ mod tests {
             reverse.get(&v6(1)).map(|e| e.0.clone()),
             Some("laptop".to_string())
         );
+    }
+
+    /// A rename to an invalid name drops the peer from the table, so its PTR
+    /// must go too rather than keep answering the old name.
+    #[tokio::test]
+    async fn a_rename_to_an_invalid_name_drops_the_ptr() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        sync_network_hostnames(&table, &reverse, "net", &[("alice".to_string(), v6(1))]).await;
+        assert!(reverse.get(&v6(1)).is_some());
+
+        sync_network_hostnames(&table, &reverse, "net", &[("web.prod".to_string(), v6(1))]).await;
+        assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, None);
+        assert!(reverse.get(&v6(1)).is_none());
+    }
+
+    #[tokio::test]
+    async fn ptr_survives_leaving_one_of_two_networks() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let ip = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 7);
+        let name = |reverse: &ReverseLookupTable| reverse.get(&ip).map(|e| e.value().clone());
+
+        update_hostname(&table, &reverse, "alpha", "box", ip).await;
+        update_hostname(&table, &reverse, "beta", "box", ip).await;
+
+        remove_network(&table, &reverse, "beta").await;
+        assert_eq!(
+            name(&reverse),
+            Some(("box".to_string(), "alpha".to_string()))
+        );
+
+        update_hostname(&table, &reverse, "beta", "box", ip).await;
+        sync_network_hostnames(&table, &reverse, "beta", &[]).await;
+        assert_eq!(
+            name(&reverse),
+            Some(("box".to_string(), "alpha".to_string()))
+        );
+
+        update_hostname(&table, &reverse, "beta", "box", ip).await;
+        remove_hostname_by_ip(&table, &reverse, "beta", ip).await;
+        assert_eq!(
+            name(&reverse),
+            Some(("box".to_string(), "alpha".to_string()))
+        );
+
+        remove_hostname_by_ip(&table, &reverse, "alpha", ip).await;
+        assert_eq!(name(&reverse), None);
     }
 
     #[tokio::test]
@@ -823,5 +966,56 @@ mod tests {
         // Reverse lookup works
         let rev6 = reverse.get(&v6).map(|e| e.value().clone());
         assert_eq!(rev6, Some(("alice".to_string(), "gaming".to_string())));
+    }
+
+    /// A name an older coordinator handed out over the 63-byte label limit
+    /// (`resolve_collision` once added `-1` to a 63-character base) cannot be
+    /// served, but it is on the roster for good. Every roster sync used to warn
+    /// about it again; once per name is enough.
+    #[tokio::test]
+    async fn an_invalid_roster_name_is_reported_once() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("the log buffer is not poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (table, reverse) = (new_hostname_table(), new_reverse_table());
+        let long = format!("{}-1", "a".repeat(63));
+        let entries = [(long.clone(), v6(1)), ("bob".to_string(), v6(2))];
+        for _ in 0..3 {
+            sync_network_hostnames(&table, &reverse, "warn-once-net", &entries).await;
+        }
+        update_hostname(&table, &reverse, "warn-once-net", &long, v6(1)).await;
+
+        let text = String::from_utf8(logs.0.lock().expect("not poisoned").clone())
+            .expect("the log is UTF-8");
+        assert_eq!(
+            text.matches("ignoring invalid hostname").count(),
+            1,
+            "{text}"
+        );
+        assert!(table.read().await["warn-once-net"].contains_key("bob"));
     }
 }

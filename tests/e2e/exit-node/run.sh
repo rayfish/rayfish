@@ -395,9 +395,17 @@ retry_until 10 "on '$A' \"ss -ltn 'sport = :$FLOW_PORT'\" 2>/dev/null | grep -q 
   || fail "the echo server on srv-a never listened on port $FLOW_PORT"
 on "$B" "setsid nohup python3 /tmp/exit-flow.py >/tmp/exit-flow.log 2>&1 < /dev/null &" >/dev/null 2>&1
 flow_count(){ on "$B" "grep -c '^ok' /tmp/exit-flow.log" 2>/dev/null; }
-retry_until 15 "[[ \"\$(flow_count)\" -ge 2 ]]" \
-  && pass "baseline: srv-b's long-lived TCP flow to srv-a is running" \
-  || fail "baseline: the long-lived TCP flow to srv-a never started"
+# A Boat VM's IPv4 is NAT with no inbound port mapping, so nothing can connect
+# to srv-a over it; the flow checks need a host that takes inbound IPv4.
+FLOW=1
+if retry_until 15 "[[ \"\$(flow_count)\" -ge 2 ]]"; then
+  pass "baseline: srv-b's long-lived TCP flow to srv-a is running"
+elif [[ "$E2E_BACKEND" == boat ]]; then
+  FLOW=0
+  skip "the long-lived TCP flow: srv-a's public IPv4 takes no inbound connections on Boat"
+else
+  fail "baseline: the long-lived TCP flow to srv-a never started"
+fi
 
 # The LAN, read before the selection: srv-a's VPC address.
 A_PRIV="$(private4 "$A")"
@@ -510,7 +518,9 @@ grep -q "policy drop" <<<"$B_CLIENT_NFT" \
 flow_before="$(flow_count)"
 sleep 4
 flow_after="$(flow_count)"
-if on "$B" "grep -q '^ERR' /tmp/exit-flow.log" 2>/dev/null; then
+if [[ "$FLOW" == 0 ]]; then
+  :
+elif on "$B" "grep -q '^ERR' /tmp/exit-flow.log" 2>/dev/null; then
   fail "the TCP flow opened before the selection broke: $(on "$B" "grep '^ERR' /tmp/exit-flow.log | head -1")"
 elif [[ "${flow_after:-0}" -gt "${flow_before:-0}" ]]; then
   pass "the TCP flow opened before the selection is still answered ($flow_before -> $flow_after)"

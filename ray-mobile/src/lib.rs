@@ -9,9 +9,11 @@
 //!
 //! No platform specifics leak into the core: the fd handling lives in
 //! [`android_tun`], and everything else is a thin map from the core's
-//! `IpcMessage` results to the UniFFI records below.
+//! typed results to the UniFFI records below.
 
-#[cfg(target_os = "android")]
+// Also built for Linux tests, which exercise the fd handling on a pipe.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod android_tun;
 mod diag;
 mod file_events;
@@ -78,13 +80,13 @@ use rayfish::config::QuicEngine as CoreQuicEngine;
 use rayfish::config::settings::GlobalKey;
 use rayfish::control;
 use rayfish::daemon::transfers;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{DaemonState, Done, FirewallView, JoinOutcome, OpError, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
 use rayfish::identity;
 use rayfish::invite;
-use rayfish::ipc::{self, IpcMessage};
+use rayfish::ipc;
 use rayfish::keybackup;
 use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
@@ -496,40 +498,29 @@ impl Node {
 
     fn edit_blocked(&self, peer: &str, remove: bool) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove)),
-            "block list",
-        )
+        self.runtime
+            .block_on(state.edit_peer_list(GlobalKey::Blocked, peer, remove))?;
+        Ok(())
     }
 
     fn set_global(&self, key: GlobalKey, value: &str) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.config_set(key, value)),
-            "settings",
-        )
+        self.runtime.block_on(state.config_set(key, value))?;
+        Ok(())
     }
 
     /// This node's endpoint id, read from a fresh `status()` snapshot.
     fn node_id(state: &Arc<DaemonState>) -> String {
-        match state.status() {
-            IpcMessage::StatusResponse { endpoint_id, .. } => endpoint_id.to_string(),
-            _ => String::new(),
-        }
+        state.status().endpoint_id.to_string()
     }
 }
 
 /// The reply to a command that answers only success or failure. A daemon
 /// error passes through as [`RayError::Network`]; any other reply is reported
 /// as unexpected for `what`.
-fn expect_ok(response: IpcMessage, what: &str) -> Result<(), RayError> {
-    match response {
-        IpcMessage::Ok { .. } => Ok(()),
-        IpcMessage::Error { message } => Err(RayError::Network(message)),
-        other => Err(RayError::Network(format!(
-            "unexpected {what} response: {other:?}"
-        ))),
+impl From<OpError> for RayError {
+    fn from(error: OpError) -> Self {
+        Self::Network(error.to_string())
     }
 }
 
@@ -635,12 +626,13 @@ fn saved_networks_status() -> Status {
     // Derive this device's stable identity-based fields off disk. Without a
     // persisted identity there are no saved networks to show either, so fall
     // back to the empty snapshot.
-    let (node_id, device_ipv6) = match identity::load_or_create() {
-        Ok(secret) => {
+    // Read only: a status poll must never be what mints this device's identity.
+    let (node_id, device_ipv6) = match identity::load_existing() {
+        Ok(Some(secret)) => {
             let id = secret.public();
             (id.to_string(), membership::derive_ipv6(&id).to_string())
         }
-        Err(_) => return empty,
+        Ok(None) | Err(_) => return empty,
     };
     // Same stable alphabetical order as the live snapshot below.
     let mut sorted = cfg.networks.clone();
@@ -764,7 +756,7 @@ impl Node {
     }
 
     /// Join an existing network by invite code (or a bare room id / network
-    /// pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+    /// pubkey). Maps the core's join result to a [`NetworkInfo`].
     pub fn join(&self, code: String) -> Result<NetworkInfo, RayError> {
         let state = self.state()?;
 
@@ -790,25 +782,21 @@ impl Node {
             true,  // auto_accept_files (own-device offers, identity-checked)
         ));
 
-        match result {
-            IpcMessage::Joined { name, my_ipv6 } => Ok(NetworkInfo {
-                name,
+        match result.map_err(|e| RayError::JoinFailed(e.to_string()))? {
+            JoinOutcome::Joined(joined) => Ok(NetworkInfo {
+                name: joined.name,
                 node_id: Self::node_id(&state),
-                ipv6: my_ipv6.to_string(),
+                ipv6: joined.my_ipv6.to_string(),
                 pending: false,
             }),
             // Closed network without a valid invite: queued for coordinator approval
             // and retried in the background. Report it as pending so the UI can say so.
-            IpcMessage::Ok { .. } => Ok(NetworkInfo {
+            JoinOutcome::Queued(_) => Ok(NetworkInfo {
                 name: network_key,
                 node_id: Self::node_id(&state),
                 ipv6: String::new(),
                 pending: true,
             }),
-            IpcMessage::Error { message } => Err(RayError::JoinFailed(message)),
-            other => Err(RayError::JoinFailed(format!(
-                "unexpected join response: {other:?}"
-            ))),
         }
     }
 
@@ -819,62 +807,41 @@ impl Node {
 
         // Default (CLOSED) membership: `GroupMode::Restricted`. No `--open`
         // affordance on mobile.
-        let result = self
-            .runtime
-            .block_on(state.create_network(GroupMode::default(), name, None));
-
-        match result {
-            IpcMessage::Created { name, my_ipv6, .. } => Ok(NetworkInfo {
-                name,
-                node_id: Self::node_id(&state),
-                ipv6: my_ipv6.to_string(),
-                pending: false,
-            }),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected create response: {other:?}"
-            ))),
-        }
+        let created =
+            self.runtime
+                .block_on(state.create_network(GroupMode::default(), name, None))?;
+        Ok(NetworkInfo {
+            name: created.name,
+            node_id: Self::node_id(&state),
+            ipv6: created.my_ipv6.to_string(),
+            pending: false,
+        })
     }
 
     /// Mint a single-use invite code for `network` (default 7d TTL), to share.
     pub fn invite(&self, network: String) -> Result<String, RayError> {
         let state = self.state()?;
         // 7 days, single-use, coordinator-picked hostname (None).
-        let result =
+        let invite =
             self.runtime
-                .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false));
-        match result {
-            IpcMessage::InviteCreated { code, .. } => Ok(code),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected invite response: {other:?}"
-            ))),
-        }
+                .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false))?;
+        Ok(invite.code)
     }
 
     /// Leave `network`: tears down its runtime and removes it from config.
     pub fn leave(&self, network: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.leave_network(&network)),
-            "leave",
-        )
+        self.runtime.block_on(state.leave_network(&network))?;
+        Ok(())
     }
 
     /// Set this device's hostname on `network`. Validated by the core.
     pub fn set_hostname(&self, network: String, hostname: String) -> Result<(), RayError> {
         let state = self.state()?;
-        match self
-            .runtime
+        self.runtime
             .block_on(state.set_hostname(&network, &hostname))
-        {
-            IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(RayError::BadCode(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected set_hostname response: {other:?}"
-            ))),
-        }
+            .map_err(|e| RayError::BadCode(e.to_string()))?;
+        Ok(())
     }
 
     /// The device's default hostname (seeds every join, incl. pairing
@@ -940,18 +907,13 @@ impl Node {
     /// Current firewall posture and rules.
     pub fn firewall_show(&self) -> Result<FirewallStateInfo, RayError> {
         let state = self.state()?;
-        let IpcMessage::FirewallState {
+        let FirewallView {
             default_inbound,
             default_outbound,
             disabled,
             rules,
             ..
-        } = state.firewall_show()
-        else {
-            return Err(RayError::Network(
-                "unexpected firewall response".to_string(),
-            ));
-        };
+        } = state.firewall_show();
         Ok(FirewallStateInfo {
             default_inbound: default_inbound.to_string(),
             default_outbound: default_outbound.to_string(),
@@ -992,13 +954,15 @@ impl Node {
             peer.as_deref(),
             network.as_deref(),
         ));
-        expect_ok(result, "firewall")
+        result?;
+        Ok(())
     }
 
     /// Remove the rule at the given index (as shown by firewall_show).
     pub fn firewall_remove(&self, index: u32) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.firewall_remove(index as usize), "firewall")
+        state.firewall_remove(index as usize)?;
+        Ok(())
     }
 
     /// Set the inbound default action ("allow" or "deny"). The outbound default
@@ -1006,7 +970,8 @@ impl Node {
     pub fn firewall_set_default_inbound(&self, action: String) -> Result<(), RayError> {
         let state = self.state()?;
         let action: Action = action.parse().map_err(RayError::Network)?;
-        expect_ok(state.firewall_default(action), "firewall")
+        state.firewall_default(action)?;
+        Ok(())
     }
 
     // --- Notifications: pending file offers, connect requests, join requests ---
@@ -1048,7 +1013,8 @@ impl Node {
 
     pub fn send_file(&self, path: String, peer: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(self.runtime.block_on(state.send_file(&path, &peer)), "send")
+        self.runtime.block_on(state.send_file(&path, &peer))?;
+        Ok(())
     }
 
     /// Subscribe to file/transfer changes, including one initial reconciliation.
@@ -1064,23 +1030,19 @@ impl Node {
     /// Incoming file offers waiting to be accepted or declined.
     pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
         let state = self.state()?;
-        match state.list_files() {
-            IpcMessage::FileList { files, .. } => Ok(files
-                .into_iter()
-                .map(|f| FileOffer {
-                    id: f.id,
-                    from: f.from,
-                    filename: f.filename,
-                    size: f.size,
-                    mime_type: f.mime_type,
-                    own_device: f.own_device,
-                })
-                .collect()),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected files response: {other:?}"
-            ))),
-        }
+        Ok(state
+            .list_files()
+            .incoming
+            .into_iter()
+            .map(|f| FileOffer {
+                id: f.id,
+                from: f.from,
+                filename: f.filename,
+                size: f.size,
+                mime_type: f.mime_type,
+                own_device: f.own_device,
+            })
+            .collect())
     }
 
     /// Outbound sends still sitting in the daemon's outbox, waiting for their
@@ -1089,21 +1051,17 @@ impl Node {
     /// recipient's to accept or decline.
     pub fn list_queued_sends(&self) -> Result<Vec<QueuedSend>, RayError> {
         let state = self.state()?;
-        match state.list_files() {
-            IpcMessage::FileList { outbox, .. } => Ok(outbox
-                .into_iter()
-                .map(|e| QueuedSend {
-                    id: e.id,
-                    peer: e.peer,
-                    filename: e.filename,
-                    size: e.size,
-                })
-                .collect()),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected files response: {other:?}"
-            ))),
-        }
+        Ok(state
+            .list_files()
+            .outbox
+            .into_iter()
+            .map(|e| QueuedSend {
+                id: e.id,
+                peer: e.peer,
+                filename: e.filename,
+                size: e.size,
+            })
+            .collect())
     }
 
     /// Call off a queued send, by the id from [`Node::list_queued_sends`].
@@ -1111,13 +1069,15 @@ impl Node {
     /// left on this side to withdraw.
     pub fn cancel_send(&self, id: u64) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.cancel_send(id), "cancel")
+        state.cancel_send(id)?;
+        Ok(())
     }
 
     /// Cancel an outgoing transfer that has already been offered or started.
     pub fn cancel_transfer(&self, id: u64) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.cancel_transfer(id), "cancel")
+        state.cancel_transfer(id)?;
+        Ok(())
     }
 
     /// In-flight and recently finished transfers, both directions. Terminal entries
@@ -1153,102 +1113,76 @@ impl Node {
         } else {
             Some(output_dir)
         };
-        expect_ok(
-            self.runtime.block_on(state.accept_file(id, out, None)),
-            "files",
-        )
+        self.runtime.block_on(state.accept_file(id, out, None))?;
+        Ok(())
     }
 
     /// Decline a file offer without downloading it.
     pub fn reject_file_offer(&self, id: u64) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.reject_file(id), "files")
+        state.reject_file(id)?;
+        Ok(())
     }
 
     /// Incoming `ray connect` friend requests waiting for a decision.
     pub fn list_connect_requests(&self) -> Result<Vec<PendingRequest>, RayError> {
         let state = self.state()?;
-        match state.list_connections() {
-            IpcMessage::PendingRequests { requests } => {
-                Ok(requests.into_iter().map(PendingRequest::from).collect())
-            }
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected connections response: {other:?}"
-            ))),
-        }
+        Ok(state
+            .list_connections()
+            .into_iter()
+            .map(PendingRequest::from)
+            .collect())
     }
 
     /// Approve an incoming connect request (mints a direct 2-peer network).
     pub fn approve_connect_request(&self, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.approve_connection(&short_id)),
-            "connections",
-        )
+        self.runtime.block_on(state.approve_connection(&short_id))?;
+        Ok(())
     }
 
     /// Decline an incoming connect request.
     pub fn reject_connect_request(&self, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.reject_connect(&short_id), "connections")
+        state.reject_connect(&short_id)?;
+        Ok(())
     }
 
     /// Decline an incoming connect request and block the requester.
     pub fn block_connect_request(&self, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.deny_connection(&short_id)),
-            "connections",
-        )
+        self.runtime.block_on(state.deny_connection(&short_id))?;
+        Ok(())
     }
 
     /// Ask the user behind `peer` (an identity) for a direct connection. They
     /// must approve it before a private network is created.
     pub fn connect_peer(&self, peer: String, hostname: Option<String>) -> Result<String, RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.connect(peer.trim(), hostname)) {
-            IpcMessage::Ok { message } => Ok(message),
-            IpcMessage::Joined { name, .. } => Ok(format!("Connected on {name}")),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected connect response: {other:?}"
-            ))),
-        }
+        Ok(self
+            .runtime
+            .block_on(state.connect(peer.trim(), hostname))?
+            .summary())
     }
 
     /// Invitations coordinators delivered to this node, newest state included.
     pub fn list_invitations(&self) -> Result<Vec<Invitation>, RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.list_invitations()) {
-            IpcMessage::InvitationsResponse { invitations } => {
-                Ok(invitations.into_iter().map(Invitation::from).collect())
-            }
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected invitations response: {other:?}"
-            ))),
-        }
+        let invitations = self.runtime.block_on(state.list_invitations())?;
+        Ok(invitations.into_iter().map(Invitation::from).collect())
     }
 
     /// Join the network an invitation names.
     pub fn accept_invitation(&self, id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.accept_invitation(&id, None)) {
-            IpcMessage::Ok { .. } | IpcMessage::Joined { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected invitation response: {other:?}"
-            ))),
-        }
+        self.runtime.block_on(state.accept_invitation(&id, None))?;
+        Ok(())
     }
 
     pub fn decline_invitation(&self, id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime.block_on(state.decline_invitation(&id)),
-            "invitations",
-        )
+        self.runtime.block_on(state.decline_invitation(&id))?;
+        Ok(())
     }
 
     /// Deliver an invite for `network` to `recipient`'s identity. An offline
@@ -1256,16 +1190,10 @@ impl Node {
     pub fn send_invite(&self, network: String, recipient: String) -> Result<String, RayError> {
         let recipient: EndpointId = recipient.trim().parse().map_err(RayError::network)?;
         let state = self.state()?;
-        match self
+        let Done(message) = self
             .runtime
-            .block_on(state.deliver_invite(&network, recipient))
-        {
-            IpcMessage::Ok { message } => Ok(message),
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected invite response: {other:?}"
-            ))),
-        }
+            .block_on(state.deliver_invite(&network, recipient))?;
+        Ok(message)
     }
 
     /// Who may send connect requests and invitations, and who is blocked.
@@ -1294,31 +1222,23 @@ impl Node {
     /// Join requests awaiting approval on a network we coordinate.
     pub fn list_join_requests(&self, network: String) -> Result<Vec<PendingRequest>, RayError> {
         let state = self.state()?;
-        match state.list_requests(&network) {
-            IpcMessage::PendingRequests { requests } => {
-                Ok(requests.into_iter().map(PendingRequest::from).collect())
-            }
-            IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!(
-                "unexpected requests response: {other:?}"
-            ))),
-        }
+        let requests = state.list_requests(&network)?;
+        Ok(requests.into_iter().map(PendingRequest::from).collect())
     }
 
     /// Approve a pending join request on a network we coordinate.
     pub fn accept_join_request(&self, network: String, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(
-            self.runtime
-                .block_on(state.accept_request(&network, &short_id)),
-            "requests",
-        )
+        self.runtime
+            .block_on(state.accept_request(&network, &short_id))?;
+        Ok(())
     }
 
     /// Deny a pending join request on a network we coordinate.
     pub fn deny_join_request(&self, network: String, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        expect_ok(state.deny_request(&network, &short_id), "requests")
+        state.deny_request(&network, &short_id)?;
+        Ok(())
     }
 
     /// Whether this device already holds a device cert (it was paired to a
@@ -1335,13 +1255,9 @@ impl Node {
     /// scan and call `pair`.
     pub fn start_pairing(&self) -> Result<String, RayError> {
         let state = self.state()?;
-        match state.start_pairing() {
-            IpcMessage::PairingTicket { ticket } => Ok(ticket),
-            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
-            other => Err(RayError::PairFailed(format!(
-                "unexpected pairing response: {other:?}"
-            ))),
-        }
+        state
+            .start_pairing()
+            .map_err(|error| RayError::PairFailed(error.to_string()))
     }
 
     /// Pair this device with a primary device using a scanned/pasted pairing
@@ -1352,17 +1268,10 @@ impl Node {
         let (endpoint, secret) = control::decode_pairing_ticket(&ticket)
             .map_err(|e| RayError::BadCode(e.to_string()))?;
 
-        let result = self
-            .runtime
-            .block_on(state.pair_with_device(endpoint, secret.to_vec()));
-
-        match result {
-            IpcMessage::PairingComplete { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
-            other => Err(RayError::PairFailed(format!(
-                "unexpected pair response: {other:?}"
-            ))),
-        }
+        self.runtime
+            .block_on(state.pair_with_device(endpoint, secret.to_vec()))
+            .map(drop)
+            .map_err(|error| RayError::PairFailed(error.to_string()))
     }
 
     /// Unpair this device from its primary: leave every network it joined under
@@ -1371,13 +1280,10 @@ impl Node {
     /// no cert returns an error. Requires [`Node::start`].
     pub fn unpair(&self) -> Result<(), RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.unpair_self()) {
-            IpcMessage::Ok { .. } => Ok(()),
-            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
-            other => Err(RayError::PairFailed(format!(
-                "unexpected unpair response: {other:?}"
-            ))),
-        }
+        self.runtime
+            .block_on(state.unpair_self())
+            .map(drop)
+            .map_err(|error| RayError::PairFailed(error.to_string()))
     }
 
     /// Whether this device has an identity on disk yet.
@@ -1643,7 +1549,7 @@ impl Node {
             return saved_networks_status();
         };
 
-        let IpcMessage::StatusResponse {
+        let ipc::NodeStatus {
             endpoint_id,
             active,
             networks,
@@ -1651,13 +1557,7 @@ impl Node {
             inactive_networks,
             identity,
             ..
-        } = state.status()
-        else {
-            // Not the reply we asked for. Fall back to the saved networks rather
-            // than a blank snapshot: an empty list is indistinguishable from
-            // having joined none, which is the worst thing to show here.
-            return saved_networks_status();
-        };
+        } = state.status();
 
         let mut detail = Vec::with_capacity(networks.len() + inactive_networks.len());
         let mut flat_peers = Vec::new();
@@ -1784,6 +1684,25 @@ mod device_name_tests {
             "Wrong password, or the backup is damaged"
         );
         assert_eq!(error_message(RayError::Network(String::new())), "");
+    }
+
+    #[test]
+    fn stopped_status_does_not_create_an_identity() {
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("rayfish-noid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = Node::new(dir.to_string_lossy().to_string());
+
+        let status = node.status();
+        assert!(!status.running);
+        assert!(status.node_id.is_empty());
+        assert!(
+            identity::load_existing().unwrap().is_none(),
+            "reading status minted an identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

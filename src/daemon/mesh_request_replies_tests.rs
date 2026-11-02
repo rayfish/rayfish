@@ -33,7 +33,6 @@ async fn rejected_join_certificates_and_destroyed_networks_explain_the_refusal()
     let key = state.read().unwrap().network_public_key;
     let accepting = serve_coordinator(
         &coordinator,
-        &store,
         &registry,
         vec![ServedNetwork {
             key,
@@ -53,7 +52,7 @@ async fn rejected_join_certificates_and_destroyed_networks_explain_the_refusal()
         (revoked, "device certificate has been revoked"),
     ] {
         if expected.contains("revoked") {
-            state.write().unwrap().nullifiers.insert(joiner.id());
+            state.write().unwrap().group.nullifiers.insert(joiner.id());
         }
         let reply = mesh_request_reply(
             &connection,
@@ -110,7 +109,7 @@ async fn unavailable_network_returns_a_retryable_error_instead_of_dropping_the_j
         IrohIdentityProvider::new(server.id()),
         store.clone(),
     );
-    let accepting = serve_coordinator(&server, &store, &registry, Vec::new());
+    let accepting = serve_coordinator(&server, &registry, Vec::new());
     let connection = client.connect(server.addr(), &alpn).await.unwrap();
     let reply = mesh_request_reply(
         &connection,
@@ -149,23 +148,17 @@ async fn member_replies_to_join_and_invalid_admin_grant() {
         store.clone(),
     );
     let state = make_network_state();
-    state.write().unwrap().members.add(seated(client.id()));
+    state.write().unwrap().group.members.add(seated(client.id()));
     let key = state.read().unwrap().network_public_key;
-    let ctx = sample_mesh_ctx(
-        IrohIdentityProvider::new(server.id()),
-        store.clone(),
-        Arc::clone(&registry),
-    );
     let manager = Arc::new(ConnectionManager::new());
     manager.set_mesh_dispatch(MeshDispatch {
-        ctx: ctx.clone(),
+        registry: Arc::downgrade(&registry),
         token: CancellationToken::new(),
         on_peer_connected: Arc::new(|_| {}),
     });
     manager.register(
         key,
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx,
             network_name: "test-net".to_string(),
             state: Arc::clone(&state),
             net_pubkey: key,
@@ -240,7 +233,7 @@ async fn member_replies_to_join_and_invalid_admin_grant() {
     assert!(
         matches!(reply, ControlMsg::JoinDenied { reason } if reason.contains("identity claim"))
     );
-    state.write().unwrap().members.remove(&client.id());
+    state.write().unwrap().group.members.remove(&client.id());
     let reply = mesh_request_reply(
         &connection,
         key,
@@ -276,7 +269,7 @@ async fn coordinator_acknowledges_repeated_grants_with_a_durable_key() {
     let secret = SecretKey::from_bytes(&[1; 32]);
     let key = secret.public();
     state.write().unwrap().network_secret_key = Some(secret.clone());
-    state.write().unwrap().members.add(seated(client.id()));
+    state.write().unwrap().group.members.add(seated(client.id()));
     config::save_network(&config::NetworkConfig {
         name: "test-net".to_string(),
         network_secret_key: Some(secret.clone()),
@@ -286,7 +279,6 @@ async fn coordinator_acknowledges_repeated_grants_with_a_durable_key() {
     .unwrap();
     let accepting = serve_coordinator(
         &server,
-        &store,
         &registry,
         vec![ServedNetwork {
             key,
@@ -314,6 +306,61 @@ async fn coordinator_acknowledges_repeated_grants_with_a_durable_key() {
         );
     }
     accepting.abort();
+    client.close().await;
+    server.close().await;
+    store.shutdown().await.unwrap();
+}
+
+/// A peer that opens a control stream and never finishes its frame must not
+/// hold the connection's demux loop: shutdown still ends it.
+#[tokio::test]
+async fn stalled_control_stream_does_not_block_shutdown() {
+    use iroh::address_lookup::memory::MemoryLookup;
+
+    let env = TestConfigDir::new();
+    let alpn = transport::mesh_alpn();
+    let server = loopback_endpoint_on(MemoryLookup::new(), vec![alpn.clone()]).await;
+    let client = loopback_endpoint_on(MemoryLookup::new(), vec![alpn.clone()]).await;
+    let store = FsStore::load(env.dir.path().join("blobs")).await.unwrap();
+    let registry = sample_registry(
+        server.clone(),
+        IrohIdentityProvider::new(server.id()),
+        store.clone(),
+    );
+    let token = CancellationToken::new();
+    let manager = Arc::new(ConnectionManager::new());
+    manager.set_mesh_dispatch(MeshDispatch {
+        registry: Arc::downgrade(&registry),
+        token: token.clone(),
+        on_peer_connected: Arc::new(|_| {}),
+    });
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let driving = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let _ = accepted_tx.send(conn.clone());
+            manager.drive_mesh_connection(conn, false).await;
+        })
+    };
+    let connection = client.connect(server.addr(), &alpn).await.unwrap();
+    let server_conn = accepted_rx.await.unwrap();
+    // Half a length prefix: the stream reaches the server, the frame never does.
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    send.write_all(&[0, 0]).await.unwrap();
+    // Wait until the server has the stream, so the demux loop is reading it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server_conn.stats().frame_rx.stream < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server received the stalled stream");
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(5), driving)
+        .await
+        .expect("the demux loop sees shutdown while a stream stalls")
+        .unwrap();
     client.close().await;
     server.close().await;
     store.shutdown().await.unwrap();

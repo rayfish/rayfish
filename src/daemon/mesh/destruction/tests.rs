@@ -7,10 +7,10 @@ use url::Url;
 
 use super::*;
 
-struct ConfigDir(Option<OsString>);
+pub(in crate::daemon::mesh) struct ConfigDir(Option<OsString>);
 
 impl ConfigDir {
-    fn set(path: &Path) -> Self {
+    pub(in crate::daemon::mesh) fn set(path: &Path) -> Self {
         let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
         unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", path) };
         Self(previous)
@@ -70,7 +70,7 @@ impl Relay {
         }
     }
 
-    fn configure(&self) {
+    pub(in crate::daemon::mesh) fn configure(&self) {
         config::update_settings(|cfg| {
             cfg.mdns_enabled = false;
             cfg.discovery_dns = config::ServerOverride {
@@ -148,7 +148,7 @@ async fn serve(
     Ok(())
 }
 
-async fn create(daemon: &Daemon, name: &str) -> config::NetworkConfig {
+pub(in crate::daemon::mesh) async fn create(daemon: &Daemon, name: &str) -> config::NetworkConfig {
     let result = daemon
         .create_network(
             GroupMode::Restricted,
@@ -156,7 +156,7 @@ async fn create(daemon: &Daemon, name: &str) -> config::NetworkConfig {
             Some("test-node".to_string()),
         )
         .await;
-    assert!(matches!(result, IpcMessage::Created { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     config::load_network(name).unwrap().unwrap()
 }
 
@@ -189,8 +189,8 @@ async fn rename_restarts_a_live_network_under_its_new_name() {
     let roster = {
         let handle = daemon.registry.networks.get("home").unwrap();
         let mut state = handle.state.write().unwrap();
-        let template = state.members.all()[0].clone();
-        state.members.add(Member {
+        let template = state.group.members.iter().next().unwrap().clone();
+        state.group.members.add(Member {
             identity: peer.id(),
             is_coordinator: false,
             hostname: Some("laptop".to_string()),
@@ -332,10 +332,11 @@ async fn rename_moves_live_state_filed_under_the_name() {
         .pruned_peers
         .insert(("home".to_string(), user));
     assert!(daemon.registry.exit_server.allows("home", &user));
-    let code = match daemon.invite_create("home", 3600, None, false).await {
-        IpcMessage::InviteCreated { code, .. } => code,
-        other => panic!("{other:?}"),
-    };
+    let code = daemon
+        .invite_create("home", 3600, None, false)
+        .await
+        .unwrap()
+        .code;
 
     let rename = IpcMessage::RenameNetwork {
         network: "home".to_string(),
@@ -522,11 +523,11 @@ async fn last_coordinator_nuke_delivers_proof_and_preserves_shared_links() {
     let state = Arc::clone(&daemon.registry.networks.get("doomed").unwrap().state);
     {
         let mut state = state.write().unwrap();
-        let mut member = state.members.all()[0].clone();
+        let mut member = state.group.members.iter().next().unwrap().clone();
         member.identity = peer.id();
         member.hostname = Some("member-node".to_string());
         member.is_coordinator = false;
-        state.members.add(member);
+        state.group.members.add(member);
     }
     assert!(matches!(
         daemon.registry.nuke_network("doomed", false).await,
@@ -623,8 +624,8 @@ async fn nuke_leaves_network_to_remaining_coordinator_even_when_offline() {
         let state = Arc::clone(&daemon.registry.networks.get(name).unwrap().state);
         {
             let mut state = state.write().unwrap();
-            let template = state.members.all()[0].clone();
-            state.members.add(Member {
+            let template = state.group.members.iter().next().unwrap().clone();
+            state.group.members.add(Member {
                 identity: peer.id(),
                 is_coordinator: true,
                 hostname: Some("other-coordinator".to_string()),
@@ -744,9 +745,9 @@ async fn both_roles_accept_network_signed_proof_with_stale_roster() {
         {
             let handle = daemon.registry.networks.get("doomed").unwrap();
             let mut state = handle.state.write().unwrap();
-            let template = state.members.all()[0].clone();
+            let template = state.group.members.iter().next().unwrap().clone();
             for (identity, is_coordinator) in [(coordinator, true), (member, false)] {
-                state.members.add(Member {
+                state.group.members.add(Member {
                     identity,
                     is_coordinator,
                     hostname: None,
@@ -765,7 +766,6 @@ async fn both_roles_accept_network_signed_proof_with_stale_roster() {
             })
             .unwrap();
             AcceptHandler::Member(Arc::new(MemberAcceptState {
-                ctx: daemon.registry.mesh_ctx(),
                 network_name: "doomed".to_string(),
                 state: Arc::clone(&handle.state),
                 net_pubkey: key.public(),
@@ -786,7 +786,13 @@ async fn both_roles_accept_network_signed_proof_with_stale_roster() {
         assert!(daemon.registry.networks.contains_key("doomed"));
         let proof = destruction::encode(key).unwrap();
         let handle = daemon.registry.networks.get("doomed").unwrap();
-        handle.state.write().unwrap().members.remove(&coordinator);
+        handle
+            .state
+            .write()
+            .unwrap()
+            .group
+            .members
+            .remove(&coordinator);
         drop(handle);
         assert!(handler.handle_common(
             coordinator,
@@ -867,11 +873,10 @@ async fn member_poller_learns_destruction_without_a_broadcast() {
         handle.role = NetworkRole::Member;
         handle.state.write().unwrap().network_secret_key = None;
         let poller = spawn_group_poller(
-            dht::create_pkarr_client(&daemon.transport.endpoint, &relay.url).unwrap(),
             key.public(),
             Arc::clone(&handle.state),
             daemon.transport.endpoint.clone(),
-            daemon.registry.mesh_ctx(),
+            Arc::clone(&daemon.registry),
             "missed-notice".to_string(),
             handle.cancel.clone(),
         );
@@ -924,8 +929,8 @@ async fn leave_dials_a_coordinator_with_no_live_link() {
         handle.role = NetworkRole::Member;
         let mut state = handle.state.write().unwrap();
         state.network_secret_key = None;
-        let template = state.members.all()[0].clone();
-        state.members.add(Member {
+        let template = state.group.members.iter().next().unwrap().clone();
+        state.group.members.add(Member {
             identity: coordinator.id(),
             is_coordinator: true,
             hostname: Some("laptop".to_string()),
@@ -967,7 +972,7 @@ async fn leave_dials_a_coordinator_with_no_live_link() {
     })
     .await
     .unwrap();
-    assert!(matches!(result, IpcMessage::Ok { .. }), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(left, Some(net_pubkey));
     assert!(!daemon.registry.networks.contains_key("home"));
     assert!(config::load_network("home").unwrap().is_none());

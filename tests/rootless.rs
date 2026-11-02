@@ -127,13 +127,8 @@ async fn cli(directory: &Path, args: &[&str]) -> Output {
 
 fn live_status(output: &Output) -> Option<serde_json::Value> {
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
-    // A missing daemon currently renders human output even with --json.
-    if stdout
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        == Some("\u{2717} daemon not running")
-    {
+    // A missing daemon prints nothing on stdout: the error goes to stderr.
+    if stdout.trim().is_empty() {
         return None;
     }
     Some(serde_json::from_str(stdout).expect("a running daemon must return valid status JSON"))
@@ -180,7 +175,9 @@ async fn independent_rootless_instances_have_private_state_and_safe_lifecycle() 
     let second_path = temporary.path().join("second");
     let missing_path = temporary.path().join("missing");
     let missing = cli(&missing_path, &["status", "--json"]).await;
-    assert!(String::from_utf8_lossy(&missing.stdout).contains("daemon not running"));
+    // `--json` must not fall back to styled text or report success.
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("daemon not running"));
     assert!(live_status(&missing).is_none());
     assert!(!missing_path.exists(), "a CLI read must not create state");
     let first = start(&first_path).await;

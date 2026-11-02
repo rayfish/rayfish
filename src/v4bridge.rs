@@ -53,6 +53,7 @@ use std::time::Duration;
 
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +61,7 @@ use tracing::{debug, info, warn};
 
 use crate::forward::{self, SSH_LISTEN_PORT};
 use crate::listen_events;
-use crate::listener::bind_listener;
+use crate::listener::{AcceptBackoff, bind_listener};
 use crate::membership::is_cgnat_range;
 
 /// How often the host's listening sockets are re-enumerated where nothing
@@ -400,30 +401,59 @@ fn host_v4_addrs() -> Vec<Ipv4Addr> {
     Vec::new()
 }
 
+/// How many bridged connections one port carries at once. Past it the port
+/// stops accepting, so further clients wait in the listen backlog instead of
+/// each costing two more descriptors.
+const MAX_CONNECTIONS_PER_PORT: usize = 256;
+
 /// Accept on one bridged port until the token is cancelled.
 fn spawn_port(port: u16, listener: TcpListener, upstream: Upstream, token: CancellationToken) {
+    spawn_port_with_limit(port, listener, upstream, token, MAX_CONNECTIONS_PER_PORT);
+}
+
+fn spawn_port_with_limit(
+    port: u16,
+    listener: TcpListener,
+    upstream: Upstream,
+    token: CancellationToken,
+    limit: usize,
+) {
     tokio::spawn(async move {
+        let permits = Arc::new(Semaphore::new(limit));
+        let mut backoff = AcceptBackoff::new();
         loop {
-            tokio::select! {
+            let permit = tokio::select! {
                 _ = token.cancelled() => break,
-                accepted = listener.accept() => {
-                    let (inbound, from) = match accepted {
-                        Ok(v) => v,
-                        Err(e) => {
-                            debug!(port, error = %e, "v4 bridge: accept failed");
-                            continue;
-                        }
-                    };
-                    let token = token.child_token();
-                    let upstream = upstream.clone();
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            _ = token.cancelled() => {},
-                            _ = bridge_conn(inbound, from, port, upstream) => {},
-                        }
-                    });
+                permit = Arc::clone(&permits).acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
+            let accepted = tokio::select! {
+                _ = token.cancelled() => break,
+                accepted = listener.accept() => accepted,
+            };
+            let (inbound, from) = match accepted {
+                Ok(v) => {
+                    backoff.reset();
+                    v
                 }
-            }
+                Err(e) => {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = backoff.wait(&e, "v4 bridge") => continue,
+                    }
+                }
+            };
+            let token = token.child_token();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                tokio::select! {
+                    _ = token.cancelled() => {},
+                    _ = bridge_conn(inbound, from, port, upstream) => {},
+                }
+            });
         }
         debug!(port, "v4 bridge: listener stopped");
     });
@@ -953,6 +983,63 @@ tcp6       0      0  {MESH}.4000            *.*                    LISTEN
             .expect("the bridge left the connection open")
             .expect("read to end");
         assert!(buf.is_empty());
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_port_past_its_connection_cap_waits_for_a_slot() {
+        let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the IPv4 service");
+        let port = echo.local_addr().expect("service address").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = echo.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = socket.split();
+                    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                });
+            }
+        });
+        let listener =
+            bind_listener(IpAddr::V6(Ipv6Addr::LOCALHOST), port).expect("bind the IPv6 bridge");
+        let address = listener.local_addr().expect("bridge address");
+        let token = CancellationToken::new();
+        spawn_port_with_limit(
+            port,
+            listener,
+            Upstream::Fixed(Ipv4Addr::LOCALHOST),
+            token.clone(),
+            1,
+        );
+
+        let mut first = TcpStream::connect(address).await.expect("first client");
+        first.write_all(b"one!").await.expect("send on the first");
+        let mut bytes = [0; 4];
+        timeout(CONNECT_TIMEOUT, first.read_exact(&mut bytes))
+            .await
+            .expect("the first client is bridged")
+            .expect("read the first echo");
+
+        // The kernel completes the handshake from the backlog, but the bridge
+        // must not take the second client while the first holds the only slot.
+        let mut second = TcpStream::connect(address).await.expect("second client");
+        second.write_all(b"two!").await.expect("send on the second");
+        assert!(
+            timeout(Duration::from_millis(300), second.read_exact(&mut bytes))
+                .await
+                .is_err(),
+            "a client past the cap was bridged"
+        );
+
+        drop(first);
+        timeout(CONNECT_TIMEOUT, second.read_exact(&mut bytes))
+            .await
+            .expect("the second client is bridged once a slot frees")
+            .expect("read the second echo");
+        assert_eq!(&bytes, b"two!");
         token.cancel();
     }
 

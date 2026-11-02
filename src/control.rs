@@ -12,7 +12,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::invite::InviteCode;
-use crate::membership::{ApprovedEntry, ExitFamilies, Member};
+use crate::membership::{ApprovedList, ExitFamilies, MemberList};
 use ray_proto::ipc::NetworkName;
 
 /// Certificate proving a device belongs to a user identity.
@@ -221,7 +221,7 @@ pub enum ControlMsg {
         reason: String,
     },
     JoinApproved {
-        members: Vec<Member>,
+        members: MemberList,
     },
     JoinDenied {
         reason: String,
@@ -256,8 +256,8 @@ pub enum ControlMsg {
         device_cert: Option<DeviceCert>,
     },
     Welcome {
-        members: Vec<Member>,
-        approved: Vec<ApprovedEntry>,
+        members: MemberList,
+        approved: ApprovedList,
         /// The per-network secret key, present only when the coordinator admits a
         /// pre-approved peer onto a `direct` (`ray connect`) 2-peer network. A
         /// direct link is symmetric, so the requester is made a co-coordinator on
@@ -696,6 +696,7 @@ pub fn decode_pairing_ticket(s: &str) -> Result<(EndpointId, [u8; 32])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::membership::Member;
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -715,7 +716,8 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-            }],
+            }]
+            .into(),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -1039,13 +1041,15 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-            }],
+            }]
+            .into(),
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-            }],
+            }]
+            .into(),
             direct_key: Some([7u8; 32]),
             direct_record: Some(vec![1, 2, 3]),
             direct_record_published: true,
@@ -1278,5 +1282,63 @@ mod tests {
                 exit_families: ExitFamilies::Unknown,
             }
         );
+    }
+
+    mod frame_properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// What a newer build might put in a frame's `msg` slot.
+        #[derive(Clone, Debug, serde::Serialize)]
+        #[serde(untagged)]
+        enum FuturePayload {
+            Number(u64),
+            Text(String),
+            Bytes(Vec<u8>),
+            List(Vec<u64>),
+        }
+
+        fn future_payload() -> impl Strategy<Value = FuturePayload> {
+            prop_oneof![
+                any::<u64>().prop_map(FuturePayload::Number),
+                ".{0,16}".prop_map(FuturePayload::Text),
+                prop::collection::vec(any::<u8>(), 0..40).prop_map(FuturePayload::Bytes),
+                prop::collection::vec(any::<u64>(), 0..4).prop_map(FuturePayload::List),
+            ]
+        }
+
+        proptest! {
+            /// A frame whose message is a unit variant name, or a one-entry
+            /// map from a name to anything, either decodes or comes back as
+            /// that name, so the demux can answer `NotSupported` instead of
+            /// dropping it. Known names with a payload they do not take land
+            /// here too.
+            #[test]
+            fn a_named_message_decodes_or_is_named_back(
+                net in prop::option::of(any::<u8>()),
+                name in "[A-Za-z][A-Za-z0-9]{0,24}",
+                payload in prop::option::of(future_payload()),
+            ) {
+                let net = net.map(test_id);
+                let body = match payload {
+                    None => rmp_serde::to_vec(&(net, &name)),
+                    Some(payload) => rmp_serde::to_vec(&(net, HashMap::from([(&name, payload)]))),
+                }
+                .unwrap();
+                match decode_frame(&body) {
+                    Ok(FrameRead::Frame(_)) => {}
+                    Ok(FrameRead::Unknown { msg_kind }) => prop_assert_eq!(msg_kind, name),
+                    Err(e) => prop_assert!(false, "{name}: {e:#}"),
+                }
+            }
+
+            /// Any frame body a peer sends is decoded or refused, never a
+            /// panic.
+            #[test]
+            fn frame_bodies_never_panic(body in prop::collection::vec(any::<u8>(), 0..300)) {
+                let _ = decode_frame(&body);
+            }
+        }
     }
 }

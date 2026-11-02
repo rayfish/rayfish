@@ -26,8 +26,13 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`v4bridge/`](v4bridge) | 2 | A service listening on `0.0.0.0` answers over the IPv6-only mesh: the payload path by IP and by `.ray` name, the firewall still upstream of the bridge, loopback-only services declined, no bind/unbind flap across rescans, the setting + data-plane lifetime, and a new listener picked up from a kernel event rather than a timer (droplets only, see the scenario README). |
 | [`reliability/`](reliability) | 4 | Full-mesh packet-loss test: every pair probed both ways with `ping -c 1000 -i 0.01`, ICMP flood, and iperf3 UDP, over the rayfish tunnel vs the direct public-IP baseline. Fails when rayfish adds loss over the raw link. |
 | [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
+| [`file-resume/`](file-resume) | 2 | Interrupted file receives finish on their own with the right bytes: a network cut, a lid close (cut plus a frozen daemon), receiver and sender restarts and `kill -9` mid-fetch, a kill while writing the temp file and right after the rename, no `.part` left and no `(1)` copy, and a too-long UTF-8 name saved shortened. |
+| [`manage/`](manage) | 3 | Remote management: enrollment (`ray machines enroll` + `ray controller add`, one-time ticket), `ray join`/`ray leave --delegate` and `ray apply` SSH grants on a network the controller coordinates, all three refused on a network it only belongs to as a member, the grant across a machine restart, and `ray controller revoke`. |
+| [`files-authz/`](files-authz) | 2 | Who may send files and where they land: sends need root or the operator and never make the daemon open a path for anyone else, `--output` only into a directory the accepting user owns (a link only when it ends on one, nothing created on refusal), no overwrite or link-follow on a name collision, peer-chosen names (path tricks, dots, control characters, escape sequences in `ray files`), open reads, and auto-accept only where root configured it. |
 | [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
+| [`coordinators/`](coordinators) | 5 | Three coordinators on one network: an admit, kick and rename made on each one in turn reaches every host in bounded time, a restarted creator picks up another coordinator's edit by polling, a member reconnecting to a lagging coordinator does not roll back, a restarted member keeps its network and record floor, and concurrent joins of one network under two names (or racing its restore) bring it up once. |
 | [`churn/`](churn) | 4 | Lifecycle events under churn: repeated hard flap, simultaneous flap, `ray down`/`up` cycles (including one on a host with no `ip` binary, since link state goes over netlink), and a `kick`/`nuke` delivered while a member is offline (which must still converge from the signed blob). Ends with a no-panic/no-crash-restart sweep. |
+| [`mixed-version/`](mixed-version) | 4 | This build and an older release (`OLD_RAY_BIN`) in one mesh: joins and Magic DNS across versions, mixed co-coordinators converging an edit and renewing records without refusing each other's, kicks and restarts in both directions, `ray send` both ways, and a log sweep for panics and repeated protocol errors. Not part of `all`. |
 | [`exit-node/`](exit-node) | 3 | The internet-gateway path for IPv4 and IPv6: `allow`/`use` forwarding + NAT, full-tunnel egress, `SO_MARK` loop prevention, inbound SSH and established flows surviving, the client guard (LAN, a Docker-style bridge and a co-resident VPN stay reachable, uplink-bound new flows and route loss do not leak), the deny path, and teardown. |
 
 Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
@@ -40,7 +45,7 @@ tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 
 where `<scenario>` is `rootless`, `device-cert`, `connect`, `firewall`, `closed-net`,
 `apply`, `invites`, `dns`, `ssh`, `operator`, `v4bridge`, `reliability`, `restore-offline`,
-`unpair`, `churn`, `exit-node`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+`file-resume`, `files-authz`, `manage`, `unpair`, `coordinators`, `churn`, `exit-node`, `mixed-version`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
@@ -93,6 +98,23 @@ names one, so the provisioner passes every key on the account by default
 That matches what the harness needs: `just scp` runs bare `rsync`/`ssh` with no
 `-i`, so the hosts have to accept ssh's default identity.
 
+### `boat`
+
+```bash
+E2E_BACKEND=boat tests/e2e.sh <scenario>
+```
+
+Each host is a [Boat](https://boat.dev) VM (KVM, systemd, `/dev/net/tun`). Needs the
+`boat` CLI signed in and `jq`. The harness reaches each VM as root over its public
+IPv6, so that address goes in `.servers`; IPv4 leaves through a public address of the
+VM's own behind NAT, which is what `exit-node` checks. ufw is turned off so a VM is
+as open as a droplet. Teardown deletes the VMs.
+
+Inbound IPv4 never reaches a VM, so `exit-node` skips its long-lived TCP flow checks
+here. Two VMs can land on one physical host, and the links between hosts can drop
+packets with no tunnel at all, so a `reliability` failure here needs a run of the
+previous release on Boat to compare against.
+
 ### `docker`
 
 ```bash
@@ -142,7 +164,7 @@ against a direct-public-IP baseline that on one host is the same bridge.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `E2E_BACKEND` | `digitalocean` | `digitalocean` or `docker` |
+| `E2E_BACKEND` | `digitalocean` | `digitalocean`, `boat` or `docker` |
 | `E2E_AUTO_TEARDOWN` | `0` | `1` tears down the active backend's fleet after `run`; intended for unattended CI. Docker failures dump diagnostics first; with DigitalOcean this destroys the provisioned droplets. Default `0` preserves the fleet for interactive inspection. |
 | `REGION` | `fra1` | droplet region (provision) |
 | `SIZE` | `s-1vcpu-1gb` | droplet size slug (provision) |
@@ -150,6 +172,9 @@ against a direct-public-IP baseline that on one host is the same bridge.
 | `DO_SSH_KEYS` | every key on the account | comma-separated key ids/fingerprints (provision) |
 | `SSH_KEY` | `~/.ssh/id_ed25519` | private key for `root@<ip>` |
 | `KEEP_STATE` | `0` | `1` skips the per-run rayfish state wipe |
+| `OLD_RAY_BIN` | none | local `ray` binary that `mixed-version` installs on its older hosts |
+| `BOAT_TYPE` | `default` | Boat machine type (provision) |
+| `BOAT_HOURS` | `3` | how long each Boat VM stays on (provision) |
 | `E2E_DOCKER_REUSE` | `0` | `1` keeps a live container fleet instead of recreating it |
 | `E2E_DOCKER_REBUILD` | `0` | `1` rebuilds the node image |
 | `E2E_DOCKER_MDNS` | `0` | `1` leaves mDNS enabled on the nodes |

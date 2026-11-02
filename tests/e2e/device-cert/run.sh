@@ -113,7 +113,7 @@ step "5. wait for roster convergence (A, B, C all visible)"
 # wait_roster (common.sh) blocks until the coordinator sees both members online
 # (parsed from `ray status --json`, not table-grep) and PASS/FAILs.
 wait_roster "$A" srv-b srv-c
-SA="$(on "$A" 'ray status' | strip)"; SB="$(on "$B" 'ray status' | strip)"; SC="$(on "$C" 'ray status' | strip)"
+SA="$(on "$A" 'ray status --ips' | strip)"; SB="$(on "$B" 'ray status --ips' | strip)"; SC="$(on "$C" 'ray status --ips' | strip)"
 echo "---- srv-a status ----"; echo "$SA" | sed 's/^/   a| /'
 echo "---- srv-b status ----"; echo "$SB" | sed 's/^/   b| /'
 echo "---- srv-c status ----"; echo "$SC" | sed 's/^/   c| /'

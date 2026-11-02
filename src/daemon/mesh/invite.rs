@@ -12,21 +12,21 @@ impl Daemon {
         expires_secs: u64,
         hostname: Option<String>,
         reusable: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<CreatedInvite> {
         self.registry
             .invite_create(network, expires_secs, hostname, reusable)
             .await
     }
 
-    pub fn list_requests(&self, network: &str) -> IpcMessage {
+    pub fn list_requests(&self, network: &str) -> OpResult<Vec<ipc::PendingRequestInfo>> {
         self.registry.list_requests(network)
     }
 
-    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
+    pub async fn accept_request(&self, network: &str, selector: &str) -> OpResult<Done> {
         self.registry.accept_request(network, selector).await
     }
 
-    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
+    pub fn deny_request(&self, network: &str, selector: &str) -> OpResult<Done> {
         self.registry.deny_request(network, selector)
     }
 }
@@ -39,69 +39,52 @@ impl NetworkRegistry {
         expires_secs: u64,
         hostname: Option<String>,
         reusable: bool,
-    ) -> IpcMessage {
+    ) -> OpResult<CreatedInvite> {
         if reusable {
             return self
                 .reusable_key_create(network, expires_secs, hostname)
                 .await;
         }
-        let (net_pubkey, lock) = match self.coordinator_handle(network) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
+        let (net_pubkey, lock) = self.coordinator_handle(network)?;
         let minted = {
             let _guard = lock.lock().await;
             crate::invite::InviteStore::load(network)
                 .and_then(|mut store| store.mint(Duration::from_secs(expires_secs), hostname))
         };
-        match minted {
-            Ok((secret, id)) => {
-                let code = crate::invite::encode_invite_code(
-                    &net_pubkey,
-                    &self.transport.endpoint.id(),
-                    &secret,
-                );
-                // Gossip the new invite (hash only, never the secret) to other
-                // coordinators so any of them can later redeem it. The wire field
-                // carries the hex hash's UTF-8 bytes; receivers decode back to the
-                // ledger's hex `String`.
-                let secret_hash = crate::invite::hash_secret(&secret);
-                let expires = now_secs().saturating_add(expires_secs);
-                if let Some(handle) = self.networks.get(network) {
-                    let members: Vec<crate::membership::Member> = handle
-                        .state
-                        .read()
-                        .unwrap()
-                        .members
-                        .all()
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                    let me = self.transport.endpoint.id();
-                    let net_pubkey = handle.network_key;
-                    drop(handle);
-                    gossip_to_coordinators(
-                        &self.peers,
-                        network,
-                        net_pubkey,
-                        &members,
-                        me,
-                        &ControlMsg::InviteShare {
-                            id: id.clone(),
-                            secret_hash: secret_hash.into_bytes(),
-                            expires,
-                        },
-                    )
-                    .await;
-                }
-                IpcMessage::InviteCreated {
-                    code,
-                    id,
-                    expires_secs,
-                }
-            }
-            Err(e) => ipc_err(format!("failed to mint invite: {e:#}")),
+        let (secret, id) =
+            minted.map_err(|e| OpError::msg(format!("failed to mint invite: {e:#}")))?;
+        let code =
+            crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
+        // Gossip the new invite (hash only, never the secret) to other
+        // coordinators so any of them can later redeem it. The wire field
+        // carries the hex hash's UTF-8 bytes; receivers decode back to the
+        // ledger's hex `String`.
+        let secret_hash = crate::invite::hash_secret(&secret);
+        let expires = now_secs().saturating_add(expires_secs);
+        if let Some(handle) = self.networks.get(network) {
+            let members = handle.state.read().unwrap().roster();
+            let me = self.transport.endpoint.id();
+            let net_pubkey = handle.network_key;
+            drop(handle);
+            gossip_to_coordinators(
+                &self.peers,
+                network,
+                net_pubkey,
+                &members,
+                me,
+                &ControlMsg::InviteShare {
+                    id: id.clone(),
+                    secret_hash: secret_hash.into_bytes(),
+                    expires,
+                },
+            )
+            .await;
         }
+        Ok(CreatedInvite {
+            code,
+            id,
+            expires_secs,
+        })
     }
 
     /// Mint a reusable join key: insert its hash into the signed blob and
@@ -113,13 +96,12 @@ impl NetworkRegistry {
         network: &str,
         expires_secs: u64,
         hostname: Option<String>,
-    ) -> IpcMessage {
+    ) -> OpResult<CreatedInvite> {
         if hostname.is_some() {
-            return ipc_err(
+            return Err(OpError::msg(
                 "a reusable key cannot bind a hostname (a multi-use key admits many \
-                          machines); drop --hostname or omit --reusable"
-                    .to_string(),
-            );
+                 machines); drop --hostname or omit --reusable",
+            ));
         }
         let (state, dht_notify, net_pubkey, has_key) = match self.networks.get(network) {
             Some(h) => {
@@ -132,13 +114,13 @@ impl NetworkRegistry {
                 )
             }
             None => {
-                return ipc_err(format!("network '{network}' not active"));
+                return Err(OpError::msg(format!("network '{network}' not active")));
             }
         };
         if !has_key {
-            return ipc_err(
-                "only a coordinator (network key holder) can mint a reusable key".to_string(),
-            );
+            return Err(OpError::msg(
+                "only a coordinator (network key holder) can mint a reusable key",
+            ));
         }
         let secret = crate::invite::generate_secret();
         let (hash, key) =
@@ -146,16 +128,28 @@ impl NetworkRegistry {
         let id = key.id.clone();
         {
             let mut s = state.write().unwrap();
-            s.reusable_keys.insert(hash, key);
+            s.group.reusable_keys.insert(hash.clone(), key);
         }
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+        if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
+            // The publisher retries whatever is live, so a key left in place
+            // would be published later while its secret was never shown. Take
+            // it back out. Its own commit may fail too; the publisher's retry
+            // then picks up the state without it.
+            {
+                let mut s = state.write().unwrap();
+                s.group.reusable_keys.remove(&hash);
+            }
+            let _ =
+                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+            return Err(unsaved_snapshot_error(network));
+        }
         let code =
             crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
-        IpcMessage::InviteCreated {
+        Ok(CreatedInvite {
             code,
             id,
             expires_secs,
-        }
+        })
     }
 
     pub(crate) async fn invite_list(&self, network: &str) -> IpcMessage {
@@ -169,7 +163,7 @@ impl NetworkRegistry {
             (
                 Arc::clone(&handle.invite_lock),
                 s.network_secret_key.is_some(),
-                s.reusable_keys.clone(),
+                s.group.reusable_keys.clone(),
             )
         };
         if !has_key {
@@ -241,13 +235,16 @@ impl NetworkRegistry {
         // so the revocation propagates to every admin.
         let revoked_reusable = {
             let mut s = state.write().unwrap();
-            crate::membership::revoke_reusable(&mut s.reusable_keys, id).is_ok()
+            crate::membership::revoke_reusable(&mut s.group.reusable_keys, id).is_ok()
         };
         if revoked_reusable {
-            update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-            return IpcMessage::Ok {
-                message: format!("revoked reusable key '{id}' (propagating to all admins)"),
-            };
+            // The revocation stays live even when it cannot be saved: undoing
+            // it would let the key admit again. The publisher retries.
+            let mut message = format!("revoked reusable key '{id}' (propagating to all admins)");
+            if !update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await {
+                message = format!("{message}\n{}", unsaved_snapshot_warning(network));
+            }
+            return IpcMessage::Ok { message };
         }
         // Fall back to the local single-use invite ledger.
         let result = {
@@ -262,12 +259,12 @@ impl NetworkRegistry {
         }
     }
 
-    pub fn list_requests(&self, network: &str) -> IpcMessage {
+    pub fn list_requests(&self, network: &str) -> OpResult<Vec<ipc::PendingRequestInfo>> {
         let Some(handle) = self.networks.get(network) else {
-            return ipc_err(format!("network '{network}' not active"));
+            return op_err(format!("network '{network}' not active"));
         };
         if !handle.role.is_coordinator() {
-            return ipc_err(format!(
+            return op_err(format!(
                 "only the coordinator of '{network}' has join requests"
             ));
         }
@@ -282,17 +279,15 @@ impl NetworkRegistry {
                 waiting_secs: pj.requested_at.elapsed().as_secs(),
             })
             .collect();
-        IpcMessage::PendingRequests { requests }
+        Ok(requests)
     }
 
-    pub async fn accept_request(&self, network: &str, selector: &str) -> IpcMessage {
-        if let Err(e) = self.coordinator_handle(network) {
-            return e;
-        }
+    pub async fn accept_request(&self, network: &str, selector: &str) -> OpResult<Done> {
+        self.coordinator_handle(network)?;
         // Find and remove the pending request matching its hostname or id.
         let pending = {
             let Some(handle) = self.networks.get(network) else {
-                return ipc_err(format!("network '{network}' not active"));
+                return op_err(format!("network '{network}' not active"));
             };
             let mut s = handle.state.write().unwrap();
             let found = resolve_named_identity(
@@ -305,23 +300,23 @@ impl NetworkRegistry {
             let found = match found {
                 Ok(found) => found,
                 Err(()) => {
-                    return ipc_err(format!("pending request '{selector}' is ambiguous"));
+                    return op_err(format!("pending request '{selector}' is ambiguous"));
                 }
             };
             found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
         };
         let Some((identity, pj)) = pending else {
-            return ipc_err(format!("no pending request matching '{selector}'"));
+            return op_err(format!("no pending request matching '{selector}'"));
         };
 
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
         let net_pubkey = {
             let Some(handle) = self.networks.get(network) else {
-                return ipc_err(format!("network '{network}' not active"));
+                return op_err(format!("network '{network}' not active"));
             };
             let net_pubkey = handle.network_key;
             let mut s = handle.state.write().unwrap();
-            s.approved.approve(ApprovedEntry {
+            s.group.approved.approve(ApprovedEntry {
                 identity,
                 hostname: pj.hostname.clone(),
                 user_identity: user_id,
@@ -330,7 +325,10 @@ impl NetworkRegistry {
             s.refresh_snapshot();
             net_pubkey
         };
-        self.store_and_publish_group(network).await;
+        // The joiner is approved in live state either way, so tell the other
+        // admins and the caller. Failing here instead left the request gone, a
+        // retried `ray accept` with nothing to match, and no broadcast.
+        let saved = self.store_and_publish_group(network).await;
         broadcast_control_msg(
             &self.peers,
             net_pubkey,
@@ -342,17 +340,17 @@ impl NetworkRegistry {
             },
         )
         .await;
-        IpcMessage::Ok {
-            message: format!("accepted {} — they'll join shortly", identity.fmt_short()),
+        let mut message = format!("accepted {} — they'll join shortly", identity.fmt_short());
+        if !saved {
+            message = format!("{message}\n{}", unsaved_snapshot_warning(network));
         }
+        Ok(Done(message))
     }
 
-    pub fn deny_request(&self, network: &str, selector: &str) -> IpcMessage {
-        if let Err(e) = self.coordinator_handle(network) {
-            return e;
-        }
+    pub fn deny_request(&self, network: &str, selector: &str) -> OpResult<Done> {
+        self.coordinator_handle(network)?;
         let Some(handle) = self.networks.get(network) else {
-            return ipc_err(format!("network '{network}' not active"));
+            return op_err(format!("network '{network}' not active"));
         };
         let mut s = handle.state.write().unwrap();
         let found = resolve_named_identity(
@@ -367,12 +365,79 @@ impl NetworkRegistry {
                 if let Some(request) = s.pending.get_mut(&id) {
                     request.denied = true;
                 }
-                IpcMessage::Ok {
-                    message: format!("denied {}", id.fmt_short()),
-                }
+                Ok(Done(format!("denied {}", id.fmt_short())))
             }
-            Ok(None) => ipc_err(format!("no pending request matching '{selector}'")),
-            Err(()) => ipc_err(format!("pending request '{selector}' is ambiguous")),
+            Ok(None) => op_err(format!("no pending request matching '{selector}'")),
+            Err(()) => op_err(format!("pending request '{selector}' is ambiguous")),
         }
+    }
+}
+
+#[cfg(test)]
+mod unsaved_snapshot_tests {
+    use iroh::SecretKey;
+
+    use super::*;
+    use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
+
+    /// A coordinator change whose snapshot cannot be saved says so. A minted
+    /// reusable key is taken back out and reported as an error, since its
+    /// secret is never shown. A revocation, an accepted request and firewall
+    /// suggestions stay live, warn, and still reach the other members: an
+    /// accept used to fail after moving the joiner out of the pending list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_failed_snapshot_commit_is_reported() {
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ConfigDir::set(dir.path());
+        let relay = Relay::start().await;
+        relay.configure();
+        let daemon = build_headless(false).await.unwrap();
+        create(&daemon, "home").await;
+        let registry = &daemon.registry;
+        let state = Arc::clone(&registry.networks.get("home").unwrap().state);
+        let (hash, key) = crate::membership::ReusableKey::from_secret(b"secret", now_secs(), 3600);
+        let reusable_id = key.id.clone();
+        let joiner = SecretKey::generate().public();
+        {
+            let mut s = state.write().unwrap();
+            s.group.reusable_keys.insert(hash.clone(), key);
+            s.pending.insert(
+                joiner,
+                PendingJoin {
+                    denied: false,
+                    hostname: None,
+                    device_cert: None,
+                    requested_at: Instant::now(),
+                },
+            );
+        }
+        // Without its config the recovery pointer cannot be written, so every
+        // snapshot commit fails.
+        assert!(config::delete_network("home").unwrap());
+
+        let warned = |reply: &IpcMessage| matches!(reply, IpcMessage::Ok { message } if message.contains("will be retried"));
+
+        let minted = registry.reusable_key_create("home", 3600, None).await;
+        assert!(minted.is_err(), "{minted:?}");
+        assert_eq!(
+            state.read().unwrap().group.reusable_keys.len(),
+            1,
+            "the key is rolled back"
+        );
+        let revoked = registry.invite_revoke("home", &reusable_id).await;
+        assert!(warned(&revoked), "{revoked:?}");
+        assert!(state.read().unwrap().group.reusable_keys[&hash].revoked);
+        let accepted = reply(registry.accept_request("home", &joiner.to_string()).await);
+        assert!(warned(&accepted), "{accepted:?}");
+        assert!(state.read().unwrap().group.approved.is_approved(&joiner));
+        let suggested = registry
+            .firewall_suggest("home", SuggestedFirewall::default())
+            .await;
+        assert!(warned(&suggested), "{suggested:?}");
+        daemon.shutdown_and_close().await;
     }
 }

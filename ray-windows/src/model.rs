@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use ray_proto::Action;
 use ray_proto::ipc::{
     ConnectionErrorInfo, FirewallRuleView, InactiveNetwork, IpcMessage, ManagedMachineInfo,
-    NetworkStatus,
+    NetworkStatus, NodeStatus,
 };
 use serde_json::{Map, Value};
 
@@ -21,7 +21,7 @@ pub(crate) struct Status {
 impl Status {
     pub fn from_response(response: IpcMessage) -> Result<Self> {
         match response {
-            IpcMessage::StatusResponse {
+            IpcMessage::StatusResponse(NodeStatus {
                 active,
                 identity,
                 networks,
@@ -31,7 +31,7 @@ impl Status {
                 pending_files,
                 pending_connects,
                 ..
-            } => Ok(Self {
+            }) => Ok(Self {
                 active,
                 identity: identity.map(|identity| identity.to_string()),
                 networks,
@@ -234,7 +234,7 @@ mod tests {
         let fixture = crate::preview::fixture(true).status;
         let mut saved = fixture.networks[0].clone();
         saved.name = "saved-example".into();
-        IpcMessage::StatusResponse {
+        IpcMessage::StatusResponse(NodeStatus {
             endpoint_id: "5866666666666666666666666666666666666666666666666666666666666666"
                 .parse()
                 .unwrap(),
@@ -258,7 +258,7 @@ mod tests {
                 saved: Some(saved),
             }],
             lan_peers: Vec::new(),
-        }
+        })
     }
 
     #[test]

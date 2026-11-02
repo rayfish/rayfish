@@ -136,7 +136,7 @@ impl NetworkRegistry {
         for net in &nets {
             if let Some(h) = self.networks.get(net.as_str())
                 && h.role.is_coordinator()
-                && let Some(m) = h.state.write().unwrap().members.get_mut(&member_id)
+                && let Some(m) = h.state.write().unwrap().group.members.get_mut(&member_id)
             {
                 m.last_seen = Some(now);
             }
@@ -153,36 +153,43 @@ impl NetworkRegistry {
     /// member frame handler; a coordinator's handler ignores the message, so a node
     /// can never be made to leave a network it coordinates.
     pub(crate) async fn confirm_kick_and_leave(&self, network: &str) {
-        let Some(net_pubkey) = self.networks.get(network).map(|h| h.network_key) else {
+        let Some((net_pubkey, state)) = self
+            .networks
+            .get(network)
+            .map(|h| (h.network_key, Arc::clone(&h.state)))
+        else {
             return; // no longer active locally; nothing to settle
         };
         let my_id = self.transport.endpoint.id();
         // Resolve + fetch the current signed blob and leave only on a positive
         // confirmation that it no longer lists us; on any failure (can't
         // resolve/fetch) we stay, never leaving on uncertainty.
-        let removed = match resolve_signed(
-            &self.transport.endpoint,
-            &self.transport.pkarr_relay_url,
-            net_pubkey,
-        )
-        .await
-        {
-            // The timestamp is not consulted here: this only ever *confirms* a
-            // kick before leaving, and an older record listing us is a reason to
-            // stay, which is already the safe answer.
-            Some((signed, seeds, _ts)) => fetch_verified_blob(
-                &self.transport.endpoint,
-                &self.transport.blob_store,
-                &self.peers,
-                signed,
-                network,
-                &seeds,
-            )
-            .await
-            .is_some_and(|data| {
-                !data.members.iter().any(|m| m.identity == my_id)
-                    && !data.approved.iter().any(|a| a.identity == my_id)
-            }),
+        let removed = match resolve_signed(&self.transport.pkarr, net_pubkey).await {
+            // Only a record newer than the last one applied can confirm the
+            // kick. A stale copy, say one from before we joined, does not list
+            // us either, and with it any coordinator's kick message would be
+            // enough to delete the network here.
+            Some((signed, seeds, ts))
+                if record_is_newer(ts, state.read().unwrap().last_record_timestamp) =>
+            {
+                fetch_verified_blob(
+                    &self.transport.endpoint,
+                    &self.transport.blob_store,
+                    &self.peers,
+                    signed,
+                    network,
+                    &seeds,
+                )
+                .await
+                .is_some_and(|data| {
+                    !data.members.iter().any(|m| m.identity == my_id)
+                        && !data.approved.iter().any(|a| a.identity == my_id)
+                })
+            }
+            Some(_) => {
+                tracing::debug!(network = %network, "kick not confirmed: the signed record is no newer than the last applied");
+                false
+            }
             None => false,
         };
         if removed {
@@ -207,7 +214,7 @@ impl NetworkRegistry {
         let member_id = self.device_user_map.resolve(&ev.endpoint_id);
         let snapshot_commit = Arc::clone(&state.read().unwrap().snapshot_commit);
         let commit_guard = snapshot_commit.lock().await;
-        state.write().unwrap().members.remove(&member_id);
+        state.write().unwrap().group.members.remove(&member_id);
         commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
         drop(commit_guard);
         dns::remove_hostname_by_ip(
@@ -257,7 +264,14 @@ impl NetworkRegistry {
         // one unauthenticated frame into mesh-wide work, since a control frame
         // reaches this handler on the strength of the network id alone and the
         // network id is public.
-        if state.write().unwrap().members.remove(&member_id).is_none() {
+        if state
+            .write()
+            .unwrap()
+            .group
+            .members
+            .remove(&member_id)
+            .is_none()
+        {
             tracing::debug!(peer = %member_id.fmt_short(), network, "leave from a peer the roster does not list; ignoring");
             return;
         }
@@ -293,7 +307,7 @@ impl NetworkRegistry {
         let mut is_paired = false;
         for entry in self.networks.iter() {
             let s = entry.value().state.read().unwrap();
-            if let Some(m) = s.members.get(&target)
+            if let Some(m) = s.group.members.get(&target)
                 && m.user_identity == Some(own_user)
             {
                 is_paired = true;
@@ -378,10 +392,13 @@ impl NetworkRegistry {
         for net in nets {
             let changed = {
                 let mut state = net.state.write().unwrap();
-                let nullified = state.nullifiers.insert(target);
-                let revoked =
-                    revoke_certificate_from_roster(&mut state.members, target, net.independent);
-                let unapproved = state.approved.remove(&target).is_some();
+                let nullified = state.group.nullifiers.insert(target);
+                let revoked = revoke_certificate_from_roster(
+                    &mut state.group.members,
+                    target,
+                    net.independent,
+                );
+                let unapproved = state.group.approved.remove(&target).is_some();
                 nullified || revoked || unapproved
             };
             if !changed {
@@ -505,9 +522,7 @@ impl NetworkRegistry {
             {
                 continue;
             }
-            let conn_changed = self
-                .mesh_ctx()
-                .register_peer_conn(&conn, peer_id, &t.network);
+            let conn_changed = self.register_peer_conn(&conn, peer_id, &t.network);
             if conn_changed
                 && self
                     .peers
@@ -515,9 +530,9 @@ impl NetworkRegistry {
                     .is_some_and(|selected| selected.stable_id() == conn.stable_id())
             {
                 tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
-                let router = Arc::clone(self.protocol_router());
-                let dconn = conn.clone();
-                tokio::spawn(router.drive_mesh_connection(dconn, true));
+                if let Some(router) = self.protocol_router() {
+                    tokio::spawn(router.drive_mesh_connection(conn.clone(), true));
+                }
             }
             announce_network_handles(&self.peers, &conn, peer_ip).await;
         }
@@ -620,7 +635,7 @@ pub(crate) async fn gossip_to_coordinators(
     peers: &PeerTable,
     network: &str,
     net_pubkey: EndpointId,
-    members: &[Member],
+    members: &MemberList,
     me: EndpointId,
     msg: &ControlMsg,
 ) {
@@ -645,6 +660,7 @@ pub(crate) fn sender_is_coordinator(state: &SharedNetworkState, peer: EndpointId
     state
         .read()
         .unwrap()
+        .group
         .members
         .get(&peer)
         .is_some_and(|m| m.is_coordinator)
@@ -678,19 +694,19 @@ const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 
 /// [`finalize_removal`] so several removals collapse into one publish. Shared by
 /// the manual kick handler and the ephemeral pruner.
 pub(crate) async fn remove_member_roster_only(
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     network: &str,
     state: &SharedNetworkState,
     member_id: EndpointId,
 ) {
     {
         let mut s = state.write().unwrap();
-        s.members.remove(&member_id);
-        s.approved.remove(&member_id);
+        s.group.members.remove(&member_id);
+        s.group.approved.remove(&member_id);
     }
     dns::remove_hostname_by_ip(
-        &ctx.hostname_table,
-        &ctx.reverse_table,
+        &registry.dns.hostname_table,
+        &registry.dns.reverse_table,
         network,
         derive_ipv6(&member_id),
     )
@@ -703,7 +719,7 @@ pub(crate) async fn remove_member_roster_only(
 /// [`remove_member_roster_only`] edits. Other members drop removed peers when they
 /// reconverge from the freshly published record (`prune_departed_peers`).
 pub(crate) async fn finalize_removal(
-    ctx: &MeshCtx,
+    registry: &Arc<NetworkRegistry>,
     network: &str,
     state: &SharedNetworkState,
     dht_notify: &Option<Arc<tokio::sync::Notify>>,
@@ -715,20 +731,21 @@ pub(crate) async fn finalize_removal(
     // Revoke local authorization before any publication or broadcast I/O. The
     // roster has already been edited, so new hellos are rejected; removing the
     // route here also stops data on an existing connection immediately.
-    for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
-        let resolved = ctx.device_user_map.resolve(&pid);
+    for (pid, ip, conn) in registry.peers.peers_for_network_with_conn(network) {
+        let resolved = registry.device_user_map.resolve(&pid);
         if removed_members
             .iter()
             .any(|removed| *removed == pid || *removed == resolved)
         {
             let close_after_notice =
-                revoke_peer_network(&ctx.peers, &ctx.pruned_peers, network, pid, ip).is_some();
+                revoke_peer_network(&registry.peers, &registry.pruned_peers, network, pid, ip)
+                    .is_some();
             removed_connections.push((conn, close_after_notice));
         }
     }
 
-    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
-    broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
+    update_snapshot_and_publish(state, &registry.transport.blob_store, dht_notify).await;
+    broadcast_member_sync(registry, net_pubkey, network, None).await;
     for (conn, close_after_notice) in removed_connections {
         // Authoritative, network-scoped kick: tell the removed member in-band so
         // it can confirm against the signed record and leave just this network (a
@@ -757,7 +774,7 @@ pub(crate) async fn finalize_removal(
 /// config each tick so `ray ephemeral` takes effect without a restart. Reuses
 /// the exact kick teardown, batched into one publish per sweep.
 pub(crate) fn spawn_stale_member_pruner(
-    ctx: MeshCtx,
+    registry: Arc<NetworkRegistry>,
     network: String,
     state: SharedNetworkState,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
@@ -782,8 +799,8 @@ pub(crate) fn spawn_stale_member_pruner(
             };
             let Some(ttl) = ttl else { continue };
             let now = crate::membership::now_secs();
-            let me = ctx.identity.local_identity();
-            let connected: std::collections::HashSet<EndpointId> = ctx
+            let me = registry.transport.identity.local_identity();
+            let connected: std::collections::HashSet<EndpointId> = registry
                 .peers
                 .peers_for_network_with_conn(&network)
                 .into_iter()
@@ -793,9 +810,9 @@ pub(crate) fn spawn_stale_member_pruner(
             // one, so carrying it alongside would be two names for the same fact.
             let removed_members: Vec<EndpointId> = {
                 let s = state.read().unwrap();
-                s.members
-                    .all()
-                    .into_iter()
+                s.group
+                    .members
+                    .iter()
                     .filter(|m| {
                         should_prune(
                             m,
@@ -812,10 +829,10 @@ pub(crate) fn spawn_stale_member_pruner(
                 continue;
             }
             for id in &removed_members {
-                remove_member_roster_only(&ctx, &network, &state, *id).await;
+                remove_member_roster_only(&registry, &network, &state, *id).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
-            finalize_removal(&ctx, &network, &state, &dht_notify, &removed_members).await;
+            finalize_removal(&registry, &network, &state, &dht_notify, &removed_members).await;
         }
     })
 }
@@ -921,8 +938,14 @@ mod sender_authority_tests {
             list.add(m);
         }
         Arc::new(RwLock::new(NetworkState {
-            members: list,
-            approved: ApprovedList::new(),
+            group: GroupBlob {
+                members: list,
+                approved: ApprovedList::new(),
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some("test-net".to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -931,14 +954,11 @@ mod sender_authority_tests {
             network_secret_key: None,
             network_public_key: eid(200),
             network_name: Some("test-net".to_string()),
-            group_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
             last_record_timestamp: None,
+            last_published_record: None,
         }))
     }
 

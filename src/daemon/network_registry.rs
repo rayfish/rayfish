@@ -17,8 +17,9 @@ use futures::future::BoxFuture;
 use iroh::TransportAddr;
 use iroh::endpoint::PathEvent;
 use iroh_dns::pkarr::SignedPacket;
+use std::hash::Hash;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
@@ -131,8 +132,8 @@ pub(crate) struct CurrentSignedNetworkState {
     pub(crate) hash: blake3::Hash,
     pub(crate) packet: Vec<u8>,
     pub(crate) published: bool,
-    pub(crate) members: Vec<Member>,
-    pub(crate) approved: Vec<ApprovedEntry>,
+    pub(crate) members: MemberList,
+    pub(crate) approved: ApprovedList,
     pub(crate) key: SecretKey,
 }
 
@@ -168,23 +169,37 @@ pub(crate) struct NetworkRegistry {
     /// network's accept handler (coordinator promotion) or unregister it on
     /// teardown directly.
     pub(crate) conn: Arc<ConnectionManager>,
-    /// Magic-DNS service, to clear a torn-down network's `.ray` entries.
+    /// Magic DNS service: naming tables, resolver, and OS-DNS configurator.
     pub(crate) dns: Arc<DnsService>,
-    /// The TUN interface name, shared with the daemon (which sets it once the TUN
-    /// is up), for refreshing DNS search domains after a network is torn down.
+    /// Name of the OS TUN device (desktop) or a placeholder until a packet
+    /// interface is attached. Interior-mutable because on embedders (mobile) the
+    /// interface is attached after construction via [`Daemon::attach_tun`],
+    /// while on desktop it is set once at boot.
     pub(crate) tun_name: Arc<ArcSwap<String>>,
-    /// This device's cert loaded at boot, the in-memory fallback for the paired
-    /// check when the on-disk cert read errors (see [`Self::current_device_cert`]).
-    pub(crate) device_cert: Option<control::DeviceCert>,
+    /// This device's cert as last read from disk (seeded at boot), the
+    /// in-memory fallback for the paired check when the on-disk cert read
+    /// errors (see [`Self::current_device_cert`]).
+    pub(crate) device_cert: ArcSwapOption<control::DeviceCert>,
     /// Daemon-wide shutdown token; each network's cancel is a child of it.
     pub(crate) shutdown_token: CancellationToken,
-    /// Per-device firewall, threaded into the [`MeshCtx`] handler bundle.
+    /// Per-device firewall, threaded into each peer reader.
     pub(crate) firewall: SharedFirewall,
-    /// Transport-key -> user-identity map, threaded into the [`MeshCtx`] bundle.
+    /// Transport-key -> user-identity map.
     pub(crate) device_user_map: peers::DeviceUserMap,
-    /// Sender to the single TUN writer, threaded into peer readers via [`MeshCtx`].
+    /// Sender half of the current TUN write channel, in a swappable cell.
+    /// [`Daemon::attach_tun`] creates a fresh channel on every attach and stores
+    /// the new sender here, so send-sites (peer readers, DNS injection) always
+    /// resolve the live writer via `tun_tx.load()`. This is what makes the VPN
+    /// off/on toggle work: `detach_tun` stops the writer, and the next
+    /// `attach_tun` swaps in a new sender feeding a fresh writer. On desktop the
+    /// daemon attaches exactly once, so the cell is never swapped.
     pub(crate) tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
-    /// Roster-pruned peers to skip on reconnect (see [`MeshCtx::pruned_peers`]).
+    /// Peers removed from a network's roster (via `ray kick` or a stale-entry
+    /// prune during reconverge), keyed by `(network, transport id)`. A member
+    /// closes such a peer's connection but can't see its own close code, so the
+    /// connection supervisor would re-dial the removed peer (which still lists it)
+    /// and re-form the link. The supervisor consumes an entry here to skip that
+    /// one reconnect.
     pub(crate) pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// IP -> roster member map (no connection required), so the on-demand data
     /// path can turn a destination IP into the peer to lazily dial. Populated
@@ -198,8 +213,9 @@ pub(crate) struct NetworkRegistry {
     /// The inbound QUIC router, needed to drive a freshly (re)dialed connection's
     /// control demux. Built after the registry (it depends on FileService /
     /// ConnectService, which depend on the registry), so it is set once at boot
-    /// via [`Self::set_protocol_router`] rather than passed to `new`.
-    protocol_router: OnceLock<Arc<ProtocolRouter>>,
+    /// via [`Self::set_protocol_router`] rather than passed to `new`. Weak: the
+    /// router's services hold this registry, and the daemon owns the router.
+    protocol_router: OnceLock<Weak<ProtocolRouter>>,
     /// On-demand mode: run the per-connection idle timer that closes a link idle
     /// past [`idle_timeout`](Self::idle_timeout), and never auto-reconnect an
     /// idle-closed peer (re-dialing is lazy). See [`Daemon::on_demand`](crate::daemon::Daemon).
@@ -207,8 +223,8 @@ pub(crate) struct NetworkRegistry {
     /// How long a connection may sit with no traffic (either direction) before an
     /// on-demand node idle-closes it. Read by each [`MeshConnection`]'s idle timer.
     pub(crate) idle_timeout: Duration,
-    /// Per-network exit-node allow policy, threaded into peer readers via the
-    /// [`MeshCtx`] forward context and populated on `activate()` from config.
+    /// Per-network exit-node allow policy, threaded into peer readers via
+    /// [`Self::forward_ctx`] and populated on `activate()` from config.
     pub(crate) exit_server: crate::exit_node::ExitServer,
     /// Client-side exit-node selection: the peer this node routes its non-mesh
     /// traffic through. Read by the forwarding loop (outbound) and peer readers
@@ -245,6 +261,15 @@ pub(crate) struct NetworkRegistry {
     /// run a second coordinator state for the same network. See
     /// [`NetworkRegistry::claim_registration`].
     pub(crate) restoring: Arc<DashSet<String>>,
+    /// Network keys that a join, restore or warm resume is bringing up right
+    /// now, under whatever local name. The name claim alone lets one network go
+    /// live under two names, and a join registers its accept handler by key
+    /// before its handle exists. See [`NetworkRegistry::claim_network_key`].
+    joining_keys: Arc<DashSet<EndpointId>>,
+    /// Network keys with a pending-join retry loop running, so a join queued
+    /// twice (startup resume, a repeated `ray join`, a paired primary) retries
+    /// once. See [`NetworkRegistry::spawn_pending_join_retry`].
+    pub(crate) pending_join_retries: Arc<DashSet<EndpointId>>,
     /// Why each saved-but-unregistered network's last restore attempt failed,
     /// keyed by network name. `ray status` reports it beside the network so a
     /// failed restore says what went wrong instead of sending the reader to the
@@ -323,16 +348,23 @@ fn peer_selector_for_network<'a>(network: &str, selector: &'a str) -> Option<&'a
 /// testable without a running daemon, which is the part worth pinning down: the
 /// sweep runs on a timer and on peer traffic, so starting a duplicate restore
 /// (or skipping a genuinely dead network) is the failure mode that matters.
-/// A network name held in [`NetworkRegistry::restoring`] while one path brings
-/// that network up. Dropping it releases the name, however that path ends.
-pub(crate) struct RegistrationClaim {
-    claims: Arc<DashSet<String>>,
-    name: String,
+/// A network name held in [`NetworkRegistry::restoring`], or a network key in
+/// `joining_keys`, while one path brings that network up. Dropping it releases
+/// the claim, however that path ends.
+pub(crate) struct RegistrationClaim<K: Eq + Hash = String> {
+    claims: Arc<DashSet<K>>,
+    held: K,
 }
 
-impl Drop for RegistrationClaim {
+impl<K: Eq + Hash> RegistrationClaim<K> {
+    pub(crate) fn held(&self) -> &K {
+        &self.held
+    }
+}
+
+impl<K: Eq + Hash> Drop for RegistrationClaim<K> {
     fn drop(&mut self) {
-        self.claims.remove(&self.name);
+        self.claims.remove(&self.held);
     }
 }
 
@@ -362,30 +394,30 @@ pub(crate) fn networks_joined_with_certificate(
         .collect()
 }
 
+/// The daemon-wide handles [`NetworkRegistry::new`] shares with the rest of
+/// the daemon. Named fields, because several have the same shape and a
+/// positional list made them easy to swap. See the matching registry fields.
+pub(crate) struct RegistryHandles {
+    pub(crate) transport: Arc<Transport>,
+    pub(crate) peers: PeerTable,
+    pub(crate) conn: Arc<ConnectionManager>,
+    pub(crate) dns: Arc<DnsService>,
+    pub(crate) tun_name: Arc<ArcSwap<String>>,
+    pub(crate) device_cert: Option<control::DeviceCert>,
+    pub(crate) shutdown_token: CancellationToken,
+    pub(crate) firewall: SharedFirewall,
+    pub(crate) device_user_map: peers::DeviceUserMap,
+    pub(crate) tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
+    pub(crate) disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    pub(crate) on_demand: bool,
+    pub(crate) idle_timeout: Duration,
+}
+
 impl NetworkRegistry {
-    #[allow(clippy::too_many_arguments)] // one clone per shared daemon handle
-    pub(crate) fn new(
-        networks: Arc<DashMap<String, NetworkHandle>>,
-        transport: Arc<Transport>,
-        peers: PeerTable,
-        conn: Arc<ConnectionManager>,
-        dns: Arc<DnsService>,
-        tun_name: Arc<ArcSwap<String>>,
-        device_cert: Option<control::DeviceCert>,
-        shutdown_token: CancellationToken,
-        firewall: SharedFirewall,
-        device_user_map: peers::DeviceUserMap,
-        tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
-        pruned_peers: Arc<DashSet<(String, EndpointId)>>,
-        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-        on_demand: bool,
-        idle_timeout: Duration,
-    ) -> Self {
-        Self {
-            networks,
+    pub(crate) fn new(handles: RegistryHandles) -> Self {
+        let RegistryHandles {
             transport,
             peers,
-            mesh_dialer: MeshDialer::default(),
             conn,
             dns,
             tun_name,
@@ -394,7 +426,24 @@ impl NetworkRegistry {
             firewall,
             device_user_map,
             tun_tx,
-            pruned_peers,
+            disconnect_tx,
+            on_demand,
+            idle_timeout,
+        } = handles;
+        Self {
+            networks: Arc::new(DashMap::new()),
+            transport,
+            peers,
+            mesh_dialer: MeshDialer::default(),
+            conn,
+            dns,
+            tun_name,
+            device_cert: ArcSwapOption::from(device_cert.map(Arc::new)),
+            shutdown_token,
+            firewall,
+            device_user_map,
+            tun_tx,
+            pruned_peers: Arc::new(DashSet::new()),
             route_map: peers::RosterRouteMap::new(),
             reachability: peers::Reachability::new(),
             disconnect_tx,
@@ -408,6 +457,8 @@ impl NetworkRegistry {
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
             restoring: Arc::new(DashSet::new()),
+            joining_keys: Arc::new(DashSet::new()),
+            pending_join_retries: Arc::new(DashSet::new()),
             restore_errors: Arc::new(DashMap::new()),
             restore_nudge: Arc::new(Notify::new()),
             poll_nudge: Arc::new(Notify::new()),
@@ -426,8 +477,34 @@ impl NetworkRegistry {
             .insert(name.to_string())
             .then(|| RegistrationClaim {
                 claims: Arc::clone(&self.restoring),
-                name: name.to_string(),
+                held: name.to_string(),
             })
+    }
+
+    /// Claim `key` for the one join, restore or warm resume that may bring it
+    /// up, or `None` while another holds it.
+    pub(crate) fn claim_network_key(
+        &self,
+        key: EndpointId,
+    ) -> Option<RegistrationClaim<EndpointId>> {
+        self.joining_keys.insert(key).then(|| RegistrationClaim {
+            claims: Arc::clone(&self.joining_keys),
+            held: key,
+        })
+    }
+
+    /// Whether a network with this key is live, under whatever local name.
+    /// `networks` is keyed by name, so a key lookup has to scan.
+    pub(crate) fn is_live_network_key(&self, key: EndpointId) -> bool {
+        self.networks.iter().any(|handle| handle.network_key == key)
+    }
+
+    /// The local name a network with this key is live under, if any.
+    pub(crate) fn live_name_of_key(&self, key: EndpointId) -> Option<String> {
+        self.networks
+            .iter()
+            .find(|handle| handle.network_key == key)
+            .map(|handle| handle.name.clone())
     }
 
     /// A live mesh connection to `peer`, registered or freshly dialed, sharing
@@ -525,7 +602,7 @@ impl NetworkRegistry {
     /// Seed the route map from a restored roster so the on-demand data path can
     /// lazily dial members before the first reconverge (self excluded by the
     /// caller-provided list, which should already omit us).
-    pub(crate) fn seed_route_map(&self, network: &str, members: &[Member]) {
+    pub(crate) fn seed_route_map(&self, network: &str, members: &MemberList) {
         let my_id = self.transport.identity.local_identity();
         let routes: Vec<peers::RouteMember> = members
             .iter()
@@ -541,37 +618,59 @@ impl NetworkRegistry {
     /// Install the inbound QUIC router. Called once at boot after the router is
     /// built; the network (re)connect paths use it to drive a dialed connection's
     /// control demux.
-    pub(crate) fn set_protocol_router(&self, router: Arc<ProtocolRouter>) {
-        let _ = self.protocol_router.set(router);
+    pub(crate) fn set_protocol_router(&self, router: &Arc<ProtocolRouter>) {
+        let _ = self.protocol_router.set(Arc::downgrade(router));
     }
 
-    /// The inbound QUIC router (panics if used before [`Self::set_protocol_router`]).
-    pub(crate) fn protocol_router(&self) -> &Arc<ProtocolRouter> {
-        self.protocol_router
-            .get()
-            .expect("protocol_router set at boot")
+    /// The inbound QUIC router, or `None` before [`Self::set_protocol_router`]
+    /// and once the daemon that owns it is gone.
+    pub(crate) fn protocol_router(&self) -> Option<Arc<ProtocolRouter>> {
+        self.protocol_router.get().and_then(Weak::upgrade)
     }
 
-    /// Build the [`MeshCtx`] handler bundle from the registry's own handles. This
-    /// is the same bundle `Daemon::mesh_ctx` produces; relocating the builder
-    /// here lets the network methods (create/join/coordinator spawn) assemble it
-    /// themselves instead of taking it as a threaded-in argument.
-    pub(crate) fn mesh_ctx(self: &Arc<Self>) -> MeshCtx {
-        MeshCtx {
-            identity: self.transport.identity.clone(),
-            peers: self.peers.clone(),
-            tun_tx: Arc::clone(&self.tun_tx),
-            stats: Arc::clone(&self.transport.stats),
-            blob_store: self.transport.blob_store.clone(),
+    /// Build the per-peer data-plane bundle for `forward::spawn_peer_reader`,
+    /// combining the registry's shared handles with the caller's `token`. Called
+    /// by [`MeshConnection`], which owns the reader for the connection's lifetime.
+    pub(crate) fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
+        forward::ForwardCtx {
             firewall: self.firewall.clone(),
-            hostname_table: Arc::clone(&self.dns.hostname_table),
-            reverse_table: Arc::clone(&self.dns.reverse_table),
+            tun_tx: Arc::clone(&self.tun_tx),
+            token,
+            stats: Arc::clone(&self.transport.stats),
             device_user_map: self.device_user_map.clone(),
-            pruned_peers: Arc::clone(&self.pruned_peers),
-            route_map: self.route_map.clone(),
-            disconnect_tx: self.disconnect_tx.clone(),
-            registry: Arc::clone(self),
+            exit: crate::exit_node::ExitContext {
+                server: self.exit_server.clone(),
+                client: self.exit_client.clone(),
+                my_v6: derive_ipv6(&self.transport.identity.local_identity()),
+            },
         }
+    }
+
+    /// Register a peer's connection for `network` in the peer table: add its route
+    /// (and, on the first shared network, its audit connect event). The
+    /// connection's single data reader is not started here; [`MeshConnection`] owns
+    /// it for the connection's lifetime. Returns whether the stored connection is
+    /// new (the first shared network, or a reconnect that replaced a different
+    /// connection), which the dial side uses to decide whether to drive a fresh
+    /// control demux.
+    pub(crate) fn register_peer_conn(
+        &self,
+        conn: &Connection,
+        peer_id: EndpointId,
+        network: &str,
+    ) -> bool {
+        let ipv6 = derive_ipv6(&peer_id);
+        // A fresh invite or approval can legitimately return a previously
+        // removed identity at once. Its successful authenticated registration
+        // supersedes the old one-shot reconnect suppression.
+        self.pruned_peers.remove(&(network.to_string(), peer_id));
+        // Keep the roster route map current with every peer we connect to, so a
+        // later idle teardown can re-dial it on demand (reconverge covers the
+        // roster-wide sync + removals; this is the incremental add).
+        self.route_map.sync_add(network, ipv6, peer_id);
+        // The peer table selects the lowest shared TLS session ID, so both ends
+        // keep the same physical connection regardless of who initiated it.
+        self.peers.add(ipv6, conn.clone(), peer_id, network)
     }
 
     /// Record authenticated paths without blocking an async worker on fsync.
@@ -657,11 +756,18 @@ impl NetworkRegistry {
 
     /// This device's pairing cert. The on-disk cert is authoritative: a cleanly
     /// absent file (`Ok(None)`, e.g. after `unpair_self` deletes it) means
-    /// unpaired, so only a genuine read error falls back to the in-memory copy.
+    /// unpaired, so only a genuine read error falls back to the in-memory copy,
+    /// which every successful read refreshes so it follows pairing and unpairing
+    /// at runtime.
     pub(crate) fn current_device_cert(&self) -> Option<control::DeviceCert> {
         match identity::load_device_cert() {
-            Ok(cert) => cert,
-            Err(_) => self.device_cert.clone(),
+            Ok(cert) => {
+                if self.device_cert.load().as_deref() != cert.as_ref() {
+                    self.device_cert.store(cert.clone().map(Arc::new));
+                }
+                cert
+            }
+            Err(_) => self.device_cert.load().as_deref().cloned(),
         }
     }
 
@@ -673,19 +779,19 @@ impl NetworkRegistry {
             let Ok(state) = network.state.read() else {
                 continue;
             };
-            if let Some(member) = state.members.get(&remote) {
+            if let Some(member) = state.group.members.get(&remote) {
                 standing.known = true;
                 standing.user_identity = standing.user_identity.or(member.user_identity);
             }
             standing.known = standing.known
                 || state
+                    .group
                     .members
-                    .all()
                     .iter()
                     .any(|m| m.user_identity == Some(remote))
                 || state
+                    .group
                     .approved
-                    .all()
                     .iter()
                     .any(|e| e.identity == remote || e.user_identity == Some(remote));
         }
@@ -714,7 +820,7 @@ impl NetworkRegistry {
             if state.network_secret_key.is_none() {
                 continue;
             }
-            let Some(member) = state.members.get(&device) else {
+            let Some(member) = state.group.members.get(&device) else {
                 continue;
             };
             if member.user_identity.is_none() {
@@ -740,32 +846,37 @@ impl NetworkRegistry {
     pub(crate) async fn leave_certificate_networks(
         self: &Arc<Self>,
         cert: &control::DeviceCert,
-    ) -> IpcMessage {
+    ) -> OpResult<Done> {
         let cfg = match config::load() {
             Ok(cfg) => cfg,
-            Err(error) => return ipc_err(format!("could not read saved networks: {error}")),
+            Err(error) => return op_err(format!("could not read saved networks: {error}")),
         };
         let networks = networks_joined_with_certificate(&cfg.networks, cert.user_identity);
         for name in &networks {
-            if self.networks.contains_key(name) {
-                self.leave_network(name).await;
+            // The only failure is the network going away meanwhile, which is
+            // what this wants anyway; the saved config goes next either way.
+            if self.networks.contains_key(name)
+                && let Err(error) = self.leave_network(name).await
+            {
+                tracing::debug!(network = %name, %error, "network left before unpair could");
             }
             if let Err(error) = config::delete_network(name) {
-                return ipc_err(format!("could not remove network '{name}': {error}"));
+                return op_err(format!("could not remove network '{name}': {error}"));
             }
         }
         match crate::identity::delete_device_cert() {
             Ok(()) => tracing::info!(left = networks.len(), "unpaired this device"),
             Err(e) => {
                 tracing::warn!(error = %e, "unpair: failed to delete device cert");
-                return ipc_err(format!(
+                return op_err(format!(
                     "left certificate-joined networks but failed to delete device cert: {e}"
                 ));
             }
         }
-        IpcMessage::Ok {
-            message: format!("unpaired this device (left {} network(s))", networks.len()),
-        }
+        Ok(Done(format!(
+            "unpaired this device (left {} network(s))",
+            networks.len()
+        )))
     }
 
     /// Tear down a network's runtime: cancel its tasks, drop its peers + `.ray`
@@ -788,9 +899,7 @@ impl NetworkRegistry {
             return false;
         };
         handle.cancel.cancel();
-        for task in handle.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        }
+        stop_network_tasks(name, handle.tasks, NETWORK_TASK_STOP_WAIT).await;
 
         // Drop this network from every peer's routing. A peer left sharing no
         // network at all is fully disconnected, so close its now-unused link with
@@ -828,7 +937,7 @@ impl NetworkRegistry {
     /// [`Self::announce_leave`] dials any coordinator no live link reaches.
     /// `teardown_network_runtime` then closes only the links left sharing no
     /// network at all.
-    pub(crate) async fn leave_network(self: &Arc<Self>, name: &str) -> IpcMessage {
+    pub(crate) async fn leave_network(self: &Arc<Self>, name: &str) -> OpResult<Done> {
         // Announce the leave while the peer entries still list this network
         // (before teardown drops them), and let it land before tearing down.
         if let Some(net_pubkey) = self.networks.get(name).map(|h| h.network_key) {
@@ -837,11 +946,9 @@ impl NetworkRegistry {
 
         if self.remove_network_locally(name).await {
             tracing::info!(network = %name, "left network");
-            IpcMessage::Ok {
-                message: format!("left network '{}'", name),
-            }
+            Ok(Done(format!("left network '{name}'")))
         } else {
-            ipc_err(format!("network '{}' not found", name))
+            Err(OpError::msg(format!("network '{name}' not found")))
         }
     }
 
@@ -1090,7 +1197,10 @@ impl NetworkRegistry {
     /// saved; the intent then stays, so the next start finishes saving the rules
     /// ([`finish_interrupted_rename`]).
     fn follow_rename(&self, from: &str, to: &str) -> Option<String> {
-        let rules = self.firewall.rename_network(from, to);
+        let mut rules_saved = Ok(());
+        self.firewall.rename_network(from, to, |rules| {
+            rules_saved = firewall::save_firewall(rules);
+        });
         self.exit_server.rename_network(from, to);
         self.exit_client.rename_network(from, to);
         let pruned: Vec<EndpointId> = self
@@ -1103,9 +1213,7 @@ impl NetworkRegistry {
             self.pruned_peers.remove(&(from.to_string(), peer));
             self.pruned_peers.insert((to.to_string(), peer));
         }
-        let saved = rules
-            .map_or(Ok(()), |rules| firewall::save_firewall(&rules))
-            .and_then(|()| config::clear_rename_intent());
+        let saved = rules_saved.and_then(|()| config::clear_rename_intent());
         saved.err().map(|e| {
             tracing::warn!(from, to, error = %format!("{e:#}"), "failed to save renamed network");
             format!(
@@ -1116,16 +1224,15 @@ impl NetworkRegistry {
 
     /// Look up an active network we coordinate, returning its public key and
     /// invite lock, or an error response if it's absent or we're only a member.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn coordinator_handle(
         &self,
         network: &str,
-    ) -> std::result::Result<(EndpointId, Arc<AsyncMutex<()>>), IpcMessage> {
+    ) -> OpResult<(EndpointId, Arc<AsyncMutex<()>>)> {
         let Some(handle) = self.networks.get(network) else {
-            return Err(ipc_err(format!("network '{network}' not active")));
+            return Err(OpError::msg(format!("network '{network}' not active")));
         };
         if !handle.role.is_coordinator() {
-            return Err(ipc_err(format!(
+            return Err(OpError::msg(format!(
                 "only the coordinator of '{network}' can manage invites/requests"
             )));
         }
@@ -1150,7 +1257,7 @@ impl NetworkRegistry {
     pub(crate) fn network_shared_with(&self, peer: &EndpointId) -> Option<String> {
         self.networks.iter().find_map(|h| {
             let s = h.state.read().ok()?;
-            s.members.is_member(peer).then(|| h.key().clone())
+            s.group.members.is_member(peer).then(|| h.key().clone())
         })
     }
 
@@ -1172,7 +1279,7 @@ impl NetworkRegistry {
                 return None;
             }
             let s = h.state.read().ok()?;
-            let has = s.members.is_member(peer) || s.approved.is_approved(peer);
+            let has = s.group.members.is_member(peer) || s.group.approved.is_approved(peer);
             has.then(|| h.key().clone())
         })
     }
@@ -1235,7 +1342,7 @@ impl NetworkRegistry {
     /// Mint a new network: generate its keypair, build the initial roster, seal +
     /// publish the blob, persist config, spawn coordinator tasks, and register the
     /// coordinator accept handler. `direct`/`pre_approve` back the `ray connect`
-    /// 2-peer path. Takes a `&MeshCtx` for the task spawn + handler registration.
+    /// 2-peer path.
     pub(crate) async fn create_network_inner(
         self: &Arc<Self>,
         mode: GroupMode,
@@ -1243,23 +1350,22 @@ impl NetworkRegistry {
         hostname: Option<String>,
         direct: bool,
         pre_approve: Option<(EndpointId, Option<String>)>,
-    ) -> Result<IpcMessage> {
-        let ctx = self.mesh_ctx();
+    ) -> Result<CreatedNetwork> {
         let name = match custom_name {
             Some(n) => {
                 anyhow::ensure!(
                     crate::hostname::is_valid_hostname(&n),
                     "invalid network name '{n}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
                 );
-                if self.networks.contains_key(&n) {
-                    return Ok(ipc_err(format!("network '{n}' already active")));
-                }
-                if self.name_owner(&n)? != NameOwner::Free {
-                    return Ok(ipc_err(format!(
-                        "network name '{n}' belongs to a saved network that is not active \
-                         (see `ray status`); choose another name"
-                    )));
-                }
+                anyhow::ensure!(
+                    !self.networks.contains_key(&n),
+                    "network '{n}' already active"
+                );
+                anyhow::ensure!(
+                    self.name_owner(&n)? == NameOwner::Free,
+                    "network name '{n}' belongs to a saved network that is not active \
+                     (see `ray status`); choose another name"
+                );
                 n
             }
             None => self.unclaimed_network_name(&network_name::generate_name(), None)?,
@@ -1270,11 +1376,14 @@ impl NetworkRegistry {
         // coordinator state for it, whose publisher then republishes its stale
         // roster over every admission this one makes.
         let Some(_registration) = self.claim_registration(&name) else {
-            return Ok(ipc_err(format!("network '{name}' is already being set up")));
+            anyhow::bail!("network '{name}' is already being set up");
         };
 
         let net_secret_key = SecretKey::generate();
         let net_public_key = net_secret_key.public();
+        let key_claim = self
+            .claim_network_key(net_public_key)
+            .context("a freshly generated network key is already claimed")?;
 
         let my_ip = self.transport.identity.local_ipv6();
 
@@ -1307,8 +1416,8 @@ impl NetworkRegistry {
         let revoking = self.revocation_lock.lock().await;
         let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
 
-        let member_entries = to_member_entries(net_state.members.all());
-        let approved_entries = to_approved_entries(net_state.approved.all());
+        let member_entries = to_member_entries(net_state.group.members.iter());
+        let approved_entries = to_approved_entries(net_state.group.approved.iter());
         config::save_network(&config::NetworkConfig {
             name: name.clone(),
             group_mode: mode,
@@ -1322,6 +1431,7 @@ impl NetworkRegistry {
             independent_paired_devices: vec![],
             last_group_hash: Some(last_group_hash),
             last_group_hash_published: false,
+            last_record_timestamp: None,
             transport: None,
             auto_accept_firewall: false,
             // Own-device file offers are auto-accepted by default (identity-checked).
@@ -1340,66 +1450,37 @@ impl NetworkRegistry {
             exit_node_use: None,
         })?;
         drop(revoking);
-        dns::update_hostname(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            &name,
-            &my_hostname,
-            derive_ipv6(&self.transport.identity.local_identity()),
-        )
-        .await;
+        let state = Arc::new(std::sync::RwLock::new(net_state));
         let initial_record = self
-            .publish_group_hash(
-                &name,
-                &net_secret_key,
-                last_group_hash,
-                &net_state.snapshot_commit,
-            )
+            .publish_group_hash(&name, &net_secret_key, last_group_hash, &state)
             .await;
 
-        let cancel = self.shutdown_token.child_token();
-        let state = Arc::new(std::sync::RwLock::new(net_state));
-        let invite_lock = Arc::new(AsyncMutex::new(()));
-        let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let tasks = self.spawn_coordinator_background_tasks(
-            &ctx,
-            &name,
-            &net_secret_key,
-            &state,
-            &dht_notify,
-            &cancel,
-            initial_record.as_ref().map(|_| last_group_hash),
-        );
-
-        // Insert the handle first so register_coordinator_handler can update the role.
-        let handle = NetworkHandle {
-            name: name.clone(),
-            network_key: net_public_key,
-            role: NetworkRole::Coordinator,
-            state: Arc::clone(&state),
-            dht_notify: Some(Arc::clone(&dht_notify)),
-            cancel: cancel.clone(),
-            tasks,
-            invite_lock: Arc::clone(&invite_lock),
-            // A coordinator holds the network key and publishes the record, so
-            // the version it advertises is this build's by construction.
-            incompatible: None,
-        };
-        self.networks.insert(name.clone(), handle);
-
-        self.register_coordinator_handler(
-            &ctx,
-            &name,
-            state,
-            invite_lock,
-            Some(dht_notify),
-            net_public_key,
-        );
-        self.refresh_search_domains().await;
+        // The registration claim keeps every other path from installing it.
+        let installed = self
+            .install_network(NetworkInstall {
+                name: &name,
+                network_key: net_public_key,
+                state,
+                cancel: self.shutdown_token.child_token(),
+                invite_lock: Arc::new(AsyncMutex::new(())),
+                // A coordinator holds the network key and publishes the record,
+                // so the version it advertises is this build's by construction.
+                incompatible: None,
+                authority: Some(RecordAuthority {
+                    key: net_secret_key,
+                    initially_published: initial_record.map(|_| last_group_hash),
+                }),
+                reconverge_worker: None,
+                my_hostname: None,
+                dial: None,
+                key_claim: &key_claim,
+            })
+            .await;
+        anyhow::ensure!(installed, "network '{name}' is already active");
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
 
-        Ok(IpcMessage::Created {
+        Ok(CreatedNetwork {
             name,
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
@@ -1442,8 +1523,14 @@ impl NetworkRegistry {
         }
 
         Ok(NetworkState {
-            members: member_list,
-            approved,
+            group: GroupBlob {
+                members: member_list,
+                approved,
+                suggested_firewall: SuggestedFirewall::default(),
+                name: Some(name.to_string()),
+                reusable_keys: BTreeMap::new(),
+                nullifiers: BTreeSet::new(),
+            },
             snapshot: None,
             snapshot_commit: Arc::new(AsyncMutex::new(())),
             destroyed: false,
@@ -1452,16 +1539,12 @@ impl NetworkRegistry {
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_secret_key.public(),
             network_name: Some(name.to_string()),
-            group_name: Some(name.to_string()),
             mode,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            // Seeded from persisted `revoked_devices` by `seal_and_publish`.
-            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
-            // We author this network's records; there is nothing to replay to us.
+            // Raised by each record this node publishes.
             last_record_timestamp: None,
+            last_published_record: None,
         })
     }
 
@@ -1476,6 +1559,7 @@ impl NetworkRegistry {
         {
             let cfg = config::load().unwrap_or_default();
             net_state
+                .group
                 .nullifiers
                 .extend(config::revoked_device_ids(&cfg));
         }
@@ -1500,7 +1584,7 @@ impl NetworkRegistry {
         network: &str,
         net_secret_key: &SecretKey,
         blob_hash: blake3::Hash,
-        commit: &AsyncMutex<()>,
+        state: &SharedNetworkState,
     ) -> Option<Vec<u8>> {
         let packet = match dht::encode_network_record(
             net_secret_key,
@@ -1513,31 +1597,21 @@ impl NetworkRegistry {
                 return None;
             }
         };
-        self.publish_signed_group_record(network, blob_hash, &packet, commit)
+        self.publish_signed_group_record(network, blob_hash, &packet, state)
             .await
             .then(|| packet.as_bytes().to_vec())
     }
 
-    /// Publish a record already signed under `commit` and mark it published.
-    /// Returns whether both happened; failures are logged here.
+    /// Publish a record already signed under `state`'s commit lock and mark it
+    /// published. Returns whether both happened; failures are logged here.
     pub(crate) async fn publish_signed_group_record(
         &self,
         network: &str,
         hash: blake3::Hash,
         packet: &SignedPacket,
-        commit: &AsyncMutex<()>,
+        state: &SharedNetworkState,
     ) -> bool {
-        let client = match dht::create_pkarr_client(
-            &self.transport.endpoint,
-            &self.transport.pkarr_relay_url,
-        ) {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to build pkarr client for network record");
-                return false;
-            }
-        };
-        match publish_signed_record(&client, commit, network, hash, packet).await {
+        match publish_signed_record(&self.transport.pkarr, state, network, hash, packet).await {
             Ok(marked) => {
                 if marked {
                     self.records_published.send_replace(());
@@ -1551,69 +1625,28 @@ impl NetworkRegistry {
         }
     }
 
-    /// Spawn a coordinated network's background tasks: the pkarr network publisher
-    /// and the ephemeral stale-member pruner. Dead-peer cleanup/reconnect is
-    /// daemon-wide (the connection supervisor), so no per-network disconnect task.
-    /// Returns the task handles plus the daemon-wide disconnect sender (taken from
-    /// the supplied `ctx`) the caller uses to build peer readers.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_coordinator_background_tasks(
-        &self,
-        ctx: &MeshCtx,
-        name: &str,
-        net_secret_key: &SecretKey,
-        state: &SharedNetworkState,
-        dht_notify: &Arc<tokio::sync::Notify>,
-        cancel: &CancellationToken,
-        initially_published: Option<blake3::Hash>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut tasks = Vec::new();
-
-        if let Ok(pkarr_client) =
-            dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)
-        {
-            tasks.push(spawn_network_publisher(
-                pkarr_client,
-                net_secret_key.clone(),
-                Arc::clone(state),
-                Arc::clone(&ctx.registry),
-                name.to_string(),
-                initially_published,
-                Arc::clone(dht_notify),
-                cancel.clone(),
-            ));
-        }
-
-        tasks.push(spawn_stale_member_pruner(
-            ctx.clone(),
-            name.to_string(),
-            Arc::clone(state),
-            Some(Arc::clone(dht_notify)),
-            cancel.clone(),
-        ));
-
-        tasks
-    }
-
     /// Store a network's current blob snapshot, persist its recovery pointer,
     /// and wake its single publisher. Publication stays serialized in that task,
-    /// so an older async write can never complete after a newer one.
-    pub(crate) async fn store_and_publish_group(&self, network: &str) {
+    /// so an older async write can never complete after a newer one. `false`
+    /// when the network is gone or the snapshot could not be saved.
+    #[must_use]
+    pub(crate) async fn store_and_publish_group(&self, network: &str) -> bool {
         let (state, notify) = {
             let Some(handle) = self.networks.get(network) else {
-                return;
+                return false;
             };
             (Arc::clone(&handle.state), handle.dht_notify.clone())
         };
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await
     }
 
-    /// This coordinator's current network record, serialized as a signed pkarr
-    /// packet, for handing to a (re)connecting member over the mesh so it converges
-    /// to the live roster without waiting on a fresh (possibly stale) DHT lookup.
-    /// `None` when we are not a coordinator of `network` (no secret key) or have no
-    /// snapshot yet. Mirrors the record built by [`Self::store_and_publish_group`];
-    /// the receiver verifies it against the network key before trusting it.
+    /// The record this coordinator last published for its current roster, as
+    /// signed, for handing to a (re)connecting member over the mesh so it
+    /// converges without waiting on a fresh (possibly stale) DHT lookup. `None`
+    /// when we are not a coordinator of `network` (no secret key), or have not
+    /// published the current roster yet. Never signed afresh: its timestamp
+    /// would outrank a newer edit another coordinator published. The receiver
+    /// verifies it against the network key before trusting it.
     pub(crate) async fn current_signed_record(
         &self,
         network: &str,
@@ -1632,31 +1665,28 @@ impl NetworkRegistry {
         if !snapshot_is_publishable(&self.transport.blob_store, &state, network, hash).await {
             return None;
         }
-        let (key, members, approved) = {
-            let state = state.read().unwrap();
-            (
-                state.network_secret_key.clone()?,
-                state.roster(),
-                state.approved_snapshot(),
-            )
-        };
-        let mut seed_peers: Vec<EndpointId> = self
-            .peers
-            .peers_for_network(network)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        seed_peers.push(self.transport.endpoint.id());
-        seed_peers.sort_by_key(|id| id.to_string());
-        seed_peers.dedup();
-        let packet = dht::encode_network_record(&key, &hash, &seed_peers).ok()?;
+        let state = state.read().unwrap();
+        let packet = state.last_published_record.as_ref()?;
+        let (published_hash, _) = dht::decode_network_record(packet).ok()?;
+        if published_hash != hash {
+            return None;
+        }
+        // Another coordinator published the same roster later, and our floor
+        // took its timestamp: a member that saw that record would refuse ours.
+        let published_ts = packet.timestamp().as_micros();
+        if state
+            .last_record_timestamp
+            .is_some_and(|floor| published_ts < floor)
+        {
+            return None;
+        }
         Some(CurrentSignedNetworkState {
             hash,
             packet: packet.as_bytes().to_vec(),
             published: net.last_group_hash == Some(hash) && net.last_group_hash_published,
-            members,
-            approved,
-            key,
+            members: state.roster(),
+            approved: state.approved_snapshot(),
+            key: state.network_secret_key.clone()?,
         })
     }
 
@@ -1677,8 +1707,8 @@ impl NetworkRegistry {
             for entry in self.networks.iter() {
                 let state = entry.value().state.read().unwrap();
                 if let Some(m) = state
+                    .group
                     .members
-                    .all()
                     .iter()
                     .find(|m| derive_ipv6(&m.identity) == v6)
                 {
@@ -1704,7 +1734,7 @@ impl NetworkRegistry {
         }
         for entry in self.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(id) = state.members.resolve_peer_literal(name) {
+            if let Some(id) = state.group.members.resolve_peer_literal(name) {
                 return Some(id);
             }
         }
@@ -1729,28 +1759,39 @@ impl NetworkRegistry {
             .state
             .read()
             .unwrap()
+            .group
             .members
             .resolve_peer_selector(selector)
     }
 
     /// Resolve `"self"` or a short / prefix endpoint id against every network's
-    /// roster to a full endpoint id.
+    /// roster to a full endpoint id. As with
+    /// [`MemberList::resolve_peer_selector`], a prefix must name exactly one
+    /// peer: an empty or ambiguous one resolves to nothing rather than to
+    /// whichever peer the scan meets first.
     pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
         if short == "self" {
             return Some(self.transport.endpoint.id());
         }
+        if short.is_empty() {
+            return None;
+        }
+        let mut found = None;
         for entry in self.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state
-                .members
-                .all()
-                .iter()
-                .find(|m| m.identity.to_string().starts_with(short))
-            {
-                return Some(m.identity);
+            for member in state.group.members.iter() {
+                if !member.identity.to_string().starts_with(short) {
+                    continue;
+                }
+                match found {
+                    None => found = Some(member.identity),
+                    // The same peer on another network is still one peer.
+                    Some(identity) if identity == member.identity => {}
+                    Some(_) => return None,
+                }
             }
         }
-        None
+        found
     }
 
     /// Verified memberships for authorization, independent of transport handles.
@@ -1764,13 +1805,13 @@ impl NetworkRegistry {
                     return None;
                 }
                 let state = entry.state.read().unwrap();
-                let independent_member = state.members.get(&peer).is_some_and(|member| {
+                let independent_member = state.group.members.get(&peer).is_some_and(|member| {
                     member.user_identity.is_none() && member.device_cert.is_none()
                 });
-                if state.nullifiers.contains(&peer) && !independent_member {
+                if state.group.nullifiers.contains(&peer) && !independent_member {
                     return None;
                 }
-                (state.members.is_member(&peer) || state.members.is_member(&user))
+                (state.group.members.is_member(&peer) || state.group.members.is_member(&user))
                     .then(|| SmolStr::new(entry.key()))
             })
             .collect()
@@ -1792,7 +1833,7 @@ impl NetworkRegistry {
                 .value()
                 .state
                 .read()
-                .map(|s| s.members.is_member(&identity))
+                .map(|s| s.group.members.is_member(&identity))
                 .unwrap_or(false);
             if is_member {
                 return true;
@@ -1803,14 +1844,11 @@ impl NetworkRegistry {
 
     /// Register (or replace) `network`'s accept handler with a
     /// [`CoordinatorAcceptState`], so any node holding the network key admits
-    /// fresh joiners instead of dropping their `JoinRequest`s. The daemon-wide
-    /// `ctx` (identical for every network) is supplied by the caller: the daemon
-    /// passes `self.mesh_ctx()`, a promoting control reader passes its own `ctx`.
+    /// fresh joiners instead of dropping their `JoinRequest`s.
     /// Also flips the stored role so `ray status` reports Coordinator at once.
     #[allow(clippy::too_many_arguments)] // the params are the handler's own fields
     pub(crate) fn register_coordinator_handler(
-        &self,
-        ctx: &MeshCtx,
+        self: &Arc<Self>,
         network: &str,
         state: SharedNetworkState,
         invite_lock: Arc<AsyncMutex<()>>,
@@ -1820,7 +1858,7 @@ impl NetworkRegistry {
         self.conn.register(
             network_key,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                ctx: ctx.clone(),
+                registry: Arc::clone(self),
                 network_name: network.to_string(),
                 state,
                 dht_notify,
@@ -1839,13 +1877,7 @@ impl NetworkRegistry {
     /// left untouched ([`should_promote`]). No `refresh_alpns` is needed: the mesh
     /// ALPN is static and promotion adds no network, so the advertised set and the
     /// DNS search domains are unchanged.
-    pub(crate) fn promote_to_coordinator(
-        &self,
-        ctx: &MeshCtx,
-        network: &str,
-        key: SecretKey,
-        pkarr_client: PkarrRelayClient,
-    ) -> bool {
+    pub(crate) fn promote_to_coordinator(self: &Arc<Self>, network: &str, key: SecretKey) -> bool {
         let state;
         let invite_lock;
         let notify;
@@ -1858,31 +1890,23 @@ impl NetworkRegistry {
                 return false;
             }
             notify = Arc::new(Notify::new());
-            let publisher = spawn_network_publisher(
-                pkarr_client,
-                key,
-                Arc::clone(&handle.state),
-                Arc::clone(&ctx.registry),
-                network.to_string(),
+            let tasks = coordinator_tasks(
+                self,
+                network,
+                &key,
+                &handle.state,
+                &notify,
+                &handle.cancel,
                 None,
-                Arc::clone(&notify),
-                handle.cancel.clone(),
             );
-            handle.tasks.push(publisher);
+            handle.tasks.extend(tasks);
             handle.dht_notify = Some(Arc::clone(&notify));
             handle.role = NetworkRole::Coordinator;
             state = Arc::clone(&handle.state);
             invite_lock = Arc::clone(&handle.invite_lock);
             network_key = handle.network_key;
         } // DashMap ref dropped before connection-handler registration.
-        self.register_coordinator_handler(
-            ctx,
-            network,
-            state,
-            invite_lock,
-            Some(notify),
-            network_key,
-        );
+        self.register_coordinator_handler(network, state, invite_lock, Some(notify), network_key);
         tracing::info!(
             network,
             "promoted to coordinator accept handler and publisher"
@@ -1969,7 +1993,7 @@ impl NetworkRegistry {
         for (net, state, dht_notify) in nets {
             let removed = {
                 let mut s = state.write().unwrap();
-                s.nullifiers.remove(&device)
+                s.group.nullifiers.remove(&device)
             };
             if !removed {
                 continue;
@@ -2020,9 +2044,89 @@ fn record_is_published(network: &str) -> bool {
         .is_ok_and(|net| net.is_none_or(|net| net.last_group_hash_published))
 }
 
+/// Every task a coordinated network runs: the pkarr network publisher and the
+/// ephemeral stale-member pruner. Shared
+/// by every path that makes a network coordinated, promotion included, so none
+/// of them ends up with only part of the set.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn coordinator_tasks(
+    registry: &Arc<NetworkRegistry>,
+    name: &str,
+    net_secret_key: &SecretKey,
+    state: &SharedNetworkState,
+    dht_notify: &Arc<Notify>,
+    cancel: &CancellationToken,
+    initially_published: Option<blake3::Hash>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    vec![
+        spawn_network_publisher(
+            net_secret_key.clone(),
+            Arc::clone(state),
+            Arc::clone(registry),
+            name.to_string(),
+            initially_published,
+            Arc::clone(dht_notify),
+            cancel.clone(),
+        ),
+        spawn_stale_member_pruner(
+            registry.clone(),
+            name.to_string(),
+            Arc::clone(state),
+            Some(Arc::clone(dht_notify)),
+            cancel.clone(),
+        ),
+    ]
+}
+
+/// How long teardown waits for each cancelled network task before aborting it.
+const NETWORK_TASK_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait up to `wait` for each of a cancelled network's tasks, then abort the
+/// ones still running. Dropping a `JoinHandle` detaches its task: a poller
+/// still inside a sequential blob fetch only sees the cancel between ticks,
+/// and once it returns it could persist a hash or tear down by name a network
+/// rejoined under the same name meanwhile.
+async fn stop_network_tasks(network: &str, tasks: Vec<JoinHandle<()>>, wait: Duration) {
+    for (index, mut task) in tasks.into_iter().enumerate() {
+        if tokio::time::timeout(wait, &mut task).await.is_err() {
+            tracing::debug!(
+                network,
+                task = index,
+                "network task ignored cancellation; aborting it"
+            );
+            task.abort();
+            // Settled before teardown goes on, so nothing it does lands after.
+            let _ = task.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task that ignores the network's cancel is aborted once the wait runs
+    /// out, not left running detached; one that stops in time is left to end.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_aborts_a_task_that_ignores_cancellation() {
+        let (stuck_alive, stuck_gone) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _alive = stuck_alive;
+            std::future::pending::<()>().await;
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let prompt = tokio::spawn(async move {
+            let _ = done_tx.send(());
+        });
+
+        stop_network_tasks("home", vec![stuck, prompt], Duration::from_secs(5)).await;
+
+        let gone = tokio::time::timeout(Duration::from_secs(1), stuck_gone)
+            .await
+            .expect("the stuck task is no longer running");
+        assert!(gone.is_err(), "it was aborted, dropping its sender unsent");
+        assert_eq!(done_rx.await, Ok(()), "the prompt task finished on its own");
+    }
 
     #[test]
     fn network_selector_accepts_public_key_and_invite_code() {

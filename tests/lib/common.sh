@@ -12,6 +12,7 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
 FAILS=0
 pass(){ printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS+1)); }
+skip(){ printf '  \033[33mSKIP\033[0m %s\n' "$*"; }
 # Same complaint, on stderr and without the tally. For helpers whose every caller
 # reads them through `$(...)`: on stdout the message is captured into the command
 # line the caller is building instead of leaving it empty, so the caller's own
@@ -35,7 +36,9 @@ summary(){
 # -n: never read stdin, so calling `on` inside a `while read` loop can't eat it.
 on(){ local ip="$1"; shift
   [[ -n "${E2E_TRACE:-}" ]] && echo "$(date -u +%T) -> $ip: $*" >> "$E2E_TRACE"
-  ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"
+  # ssh forwards LC_ALL by default; a locale the node lacks makes every bash
+  # there warn on stderr, which `2>&1` callers then parse as output.
+  env -u LC_ALL ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"
   local rc=$?
   [[ -n "${E2E_TRACE:-}" ]] && echo "$(date -u +%T) <- $ip rc=$rc" >> "$E2E_TRACE"
   return $rc
@@ -122,6 +125,25 @@ deploy_all(){
   for ip in "$@"; do
     echo ">> just scp $ip"
     if ( cd "$root" && just scp "$ip" ); then pass "deploy $ip"; else fail "deploy $ip"; echo "aborting"; exit 1; fi
+  done
+}
+
+# deploy_old <bin> <ip...> : install a prebuilt `ray` from a local file (an
+# older release, for mixed-version runs) on each host, the way `just scp`
+# installs the cross build. Run it after deploy_all, or on hosts deploy_all
+# skipped; other scenarios never call it. Aborts on failure.
+deploy_old(){
+  local bin="$1"; shift
+  step "deploy the older ray ($(basename "$bin")) to: $*"
+  [[ -f "$bin" ]] || { fail "older binary not found: $bin"; echo "aborting"; exit 1; }
+  local ip
+  for ip in "$@"; do
+    if rsync -az -e "ssh ${SSH_OPTS[*]} -i $KEY" "$bin" "root@$([[ $ip == *:* ]] && echo "[$ip]" || echo "$ip"):/tmp/ray-old" \
+       && on "$ip" "getent group rayfish >/dev/null || groupadd rayfish; install -m 755 /tmp/ray-old /usr/local/bin/ray && (systemctl restart rayfish 2>/dev/null || ray up)" >/dev/null; then
+      pass "deploy older ray to $ip"
+    else
+      fail "deploy older ray to $ip"; echo "aborting"; exit 1
+    fi
   done
 }
 

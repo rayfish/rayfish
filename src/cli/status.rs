@@ -38,7 +38,7 @@ pub(crate) fn format_bytes(b: u64) -> String {
 pub(crate) fn print_error(title: &str, detail: &str, hint: Option<&str>) {
     eprintln!("  {} {}", style::cross(), style::bold(title));
     if !detail.is_empty() {
-        eprintln!("    {}", style::value(detail));
+        eprintln!("    {}", style::value(&style::printable_lines(detail)));
     }
     let hint = hint.map(str::to_string).or_else(|| infer_hint(detail));
     if let Some(h) = hint {
@@ -75,15 +75,51 @@ pub(crate) fn fail_unexpected(reply: &impl std::fmt::Debug) -> ! {
     std::process::exit(1);
 }
 
+/// A daemon `Ok` message: `{"message": ...}` under `--json`, a plain line (or
+/// a checked line) otherwise.
+#[derive(serde::Serialize)]
+pub(crate) struct MessageOutput<'a> {
+    message: &'a str,
+    #[serde(skip)]
+    checked: bool,
+}
+
+impl DisplayOut for MessageOutput<'_> {
+    fn print_human(&self) {
+        // Daemon messages quote peer-supplied names (files, hosts).
+        let message = style::printable_lines(self.message);
+        if self.checked {
+            println!("  {} {}", style::check(), style::value(&message));
+        } else {
+            println!("{message}");
+        }
+    }
+}
+
+/// Print a daemon `Ok` message as a plain line, or as JSON under `--json`.
+pub(crate) fn print_message(message: &str) -> Result<()> {
+    printout(&MessageOutput {
+        message,
+        checked: false,
+    })
+}
+
+/// [`print_message`] with a check mark in front of the human form.
+pub(crate) fn print_checked_message(message: &str) -> Result<()> {
+    printout(&MessageOutput {
+        message,
+        checked: true,
+    })
+}
+
 /// Print the message of a daemon `Ok` reply, ending the command through
 /// [`fail_with`] or [`fail_unexpected`] for anything else.
 pub(crate) fn print_ok_reply(response: ipc::IpcMessage) -> Result<()> {
     match response {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Ok { message } => print_message(&message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
-    Ok(())
 }
 
 /// The same complaint as [`fail_unexpected`] as a string, for the two callers
@@ -417,6 +453,10 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
         // running daemon as down sends the reader after the wrong problem. The
         // IPC layer already tells the two apart, so keep its answer rather than
         // flattening every failure into one message.
+        // JSON callers get no styled fallback: the error goes to stderr and the
+        // command exits non-zero, as every other `--json` command does.
+        // The IPC error already says it was not authorized.
+        Err(error) if json_enabled() => return Err(error),
         Err(error) if connect_was_refused(&error) => {
             print_not_authorized();
             return Ok(());
@@ -460,7 +500,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
     ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcMessage::StatusResponse {
+        ipc::IpcMessage::StatusResponse(ipc::NodeStatus {
             endpoint_id,
             mdns_enabled,
             auto_update,
@@ -479,7 +519,7 @@ pub(crate) async fn ipc_status(show_machines: bool, with_ips: bool) -> Result<()
             connection_errors,
             lan_peers,
             ..
-        } => {
+        }) => {
             let (controllers, managed_machines) = ipc_management_overview(show_machines).await;
             let output = StatusOutput {
                 json: StatusJson {
@@ -938,7 +978,8 @@ fn user_parent_row(
 ) -> Vec<layout::Cell> {
     let active = devices.iter().filter(|d| d.state.is_active()).count();
     let reachable = devices.iter().filter(|d| !d.state.is_offline()).count();
-    let name = user_display_name(net, uid, devices, alias_by_identity);
+    let name =
+        style::printable(&user_display_name(net, uid, devices, alias_by_identity)).into_owned();
     // Glyph rolls up the group: any active device is online, else any idle device
     // is idle (presumed reachable), else offline.
     let (glyph_plain, glyph_styled) = if active > 0 {
@@ -1025,13 +1066,18 @@ fn device_row(
         up_w,
         down_w,
     } = *format;
-    let base = peer.hostname.clone().unwrap_or_else(|| {
-        if with_ips {
-            peer.ipv6.to_string()
-        } else {
-            peer.endpoint_id.fmt_short().to_string()
-        }
-    });
+    let base = peer
+        .hostname
+        .as_deref()
+        .map(style::printable)
+        .map(String::from)
+        .unwrap_or_else(|| {
+            if with_ips {
+                peer.ipv6.to_string()
+            } else {
+                peer.endpoint_id.fmt_short().to_string()
+            }
+        });
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
         None => base,
@@ -1233,9 +1279,7 @@ pub(crate) const REPORT_REPO_URL: &str = "https://github.com/rayfish/rayfish";
 /// issue so the user can attach it. The bundle is built daemon-side (logs are
 /// root-owned) and written to a path owned by the invoking user.
 pub(crate) async fn ipc_report() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::Report).await?;
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = ipc_request(ipc::IpcMessage::Report).await?;
     match resp {
         ipc::IpcMessage::ReportBundle {
             path,
@@ -1298,6 +1342,20 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
 mod grouping_tests {
 
     use super::*;
+
+    /// Daemon `Ok` messages render as one JSON object under `--json`, with no
+    /// presentation-only fields.
+    #[test]
+    fn ok_messages_serialize_as_a_message_object() {
+        let output = MessageOutput {
+            message: "done",
+            checked: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&output).unwrap(),
+            serde_json::json!({ "message": "done" })
+        );
+    }
 
     #[test]
     fn json_status_keeps_pending_joins_when_no_network_is_active() {

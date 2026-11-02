@@ -1,0 +1,986 @@
+//! How a network comes to be live and who owns what runs for it: pending-join
+//! retries, the restore sweep racing a fresh join, warm resume, promotion.
+
+use std::ffi::OsString;
+
+use super::*;
+
+/// Points the daemon's config directory at a fresh temporary one, holding the
+/// process-wide config lock, until dropped.
+struct ConfigDir {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
+    previous: Option<OsString>,
+}
+
+impl ConfigDir {
+    fn new() -> Self {
+        let lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", dir.path()) };
+        Self {
+            _lock: lock,
+            _dir: dir,
+            previous,
+        }
+    }
+}
+
+impl Drop for ConfigDir {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+}
+
+fn empty_state(net_pubkey: EndpointId, name: &str) -> SharedNetworkState {
+    let mut state = NetworkState {
+        group: GroupBlob {
+            members: MemberList::new(),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some(name.to_string()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        },
+        snapshot: None,
+        snapshot_commit: Arc::new(AsyncMutex::new(())),
+        destroyed: false,
+        converged_hash: None,
+        unconfirmed_durable_hash: None,
+        network_secret_key: None,
+        network_public_key: net_pubkey,
+        network_name: Some(name.to_string()),
+        mode: GroupMode::Restricted,
+        pending_suggestions: Vec::new(),
+        pending: HashMap::new(),
+        last_record_timestamp: None,
+        last_published_record: None,
+    };
+    state.refresh_snapshot();
+    Arc::new(std::sync::RwLock::new(state))
+}
+
+/// Install a live member handle for `name`, as a finished join leaves one.
+fn hold_live(registry: &NetworkRegistry, name: &str, net_pubkey: EndpointId) -> CancellationToken {
+    let cancel = CancellationToken::new();
+    registry.networks.insert(
+        name.to_string(),
+        NetworkHandle {
+            name: name.to_string(),
+            network_key: net_pubkey,
+            role: NetworkRole::Member,
+            state: empty_state(net_pubkey, name),
+            dht_notify: None,
+            cancel: cancel.clone(),
+            tasks: vec![],
+            invite_lock: Arc::new(AsyncMutex::new(())),
+            incompatible: None,
+        },
+    );
+    cancel
+}
+
+/// A pending join for a network that is already live, under a local name that
+/// is not its key, is stale. Startup used to look the key up in the
+/// name-keyed map, miss, and queue a join that could only fail.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn startup_drops_a_pending_join_for_a_live_network() {
+    let _config = ConfigDir::new();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    config::add_pending_join(config::PendingJoinEntry {
+        network_key: key.to_string(),
+        name: Some("home".into()),
+        transport: None,
+    })
+    .unwrap();
+    hold_live(&daemon.registry, "home", key);
+
+    daemon.registry.connect_all_networks().await;
+
+    assert!(config::load().unwrap().pending_joins.is_empty());
+    daemon.shutdown_and_close().await;
+}
+
+/// A discovery relay that has no records and reports each lookup it serves.
+async fn watching_relay() -> tokio::sync::mpsc::UnboundedReceiver<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    config::update_settings(|cfg| {
+        cfg.mdns_enabled = false;
+        cfg.discovery_dns = config::ServerOverride {
+            servers: vec![url],
+            replace: true,
+        };
+        Ok(())
+    })
+    .unwrap();
+    let (lookups, seen) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let lookups = lookups.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if request.starts_with(b"GET") {
+                    let _ = lookups.send(());
+                }
+                let reply =
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    seen
+}
+
+/// Discovery pointed at a port nothing listens on, so a publisher fails fast
+/// instead of reaching a public relay.
+fn offline_discovery() {
+    config::update_settings(|cfg| {
+        cfg.mdns_enabled = false;
+        cfg.discovery_dns = config::ServerOverride {
+            servers: vec!["http://127.0.0.1:1/pkarr".into()],
+            replace: true,
+        };
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn roster_row(identity: EndpointId, is_coordinator: bool, last_seen: Option<u64>) -> Member {
+    Member {
+        identity,
+        is_coordinator,
+        hostname: None,
+        user_identity: None,
+        device_cert: None,
+        last_seen,
+        exit_node: false,
+        exit_families: ExitFamilies::Unknown,
+    }
+}
+
+/// A member promoted by an admin grant coordinates from then on, so it runs
+/// what every coordinator runs. Promotion used to start only the publisher:
+/// an ephemeral network that lost its original coordinator kept offline
+/// members forever.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_promoted_member_prunes_stale_members() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let network_key = SecretKey::generate();
+    let me = registry.transport.identity.local_identity();
+    let stale = SecretKey::generate().public();
+    config::save_network(&config::NetworkConfig {
+        network_public_key: Some(network_key.public()),
+        ephemeral_ttl_secs: Some(3_600),
+        ..config::empty_network_config("home")
+    })
+    .unwrap();
+    hold_live(&registry, "home", network_key.public());
+    let state = Arc::clone(&registry.networks.get("home").unwrap().state);
+    {
+        let mut state = state.write().unwrap();
+        state.group.members.add(roster_row(me, true, None));
+        state.group.members.add(roster_row(stale, false, Some(1)));
+        state.network_secret_key = Some(network_key.clone());
+        state.refresh_snapshot();
+    }
+
+    // The pruner needs no transport. Stopping it first keeps the endpoint's
+    // own timers from spinning once the clock is paused.
+    daemon.shutdown_and_close().await;
+    tokio::time::pause();
+    assert!(registry.promote_to_coordinator("home", network_key));
+    // The pruner's first sweep runs a minute after it starts. Advance the
+    // clock by hand: auto-advance waits on blocking-pool work in real time.
+    // Let the pruner start its timer first, or the advance happens before it.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let mut polls = 0;
+    while state.read().unwrap().group.members.get(&stale).is_some() {
+        polls += 1;
+        assert!(
+            polls < 10_000,
+            "the promoted coordinator prunes a member offline past the TTL"
+        );
+        tokio::task::yield_now().await;
+    }
+    registry.networks.get("home").unwrap().cancel.cancel();
+}
+
+fn retry_for(key: EndpointId) -> PendingJoinRetry {
+    PendingJoinRetry {
+        key,
+        name: Some("home".into()),
+        hostname: None,
+        invite: None,
+        coordinator: None,
+        auto_accept_firewall: false,
+        auto_accept_files: false,
+        transport: None,
+    }
+}
+
+/// A join queued twice retries once. Each `ray join`, startup resume and paired
+/// primary used to start its own loop, and none of them stopped once another
+/// had landed the join: they kept retrying into "already in network".
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_queued_join_has_one_retry_loop() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+
+    let first = daemon.registry.spawn_pending_join_retry(retry_for(key));
+    assert!(first.is_some());
+    assert!(
+        daemon
+            .registry
+            .spawn_pending_join_retry(retry_for(key))
+            .is_none(),
+        "a second loop for the same network"
+    );
+    daemon.shutdown_and_close().await;
+    first.unwrap().await.unwrap();
+    assert!(
+        !daemon.registry.pending_join_retries.contains(&key),
+        "the key is released when the loop ends"
+    );
+}
+
+/// A second `ray join` for a network whose retry already runs is told so, and
+/// the saved entry keeps the running retry's options. A second `--tor` join
+/// used to report a fresh request while the running loop dropped its transport.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_second_queued_join_is_told_a_retry_runs() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+
+    let first = daemon.registry.queue_pending_join(retry_for(key));
+    let Done(message) = first;
+    assert!(
+        message.contains("waiting for coordinator approval"),
+        "{message}"
+    );
+    let second = daemon.registry.queue_pending_join(PendingJoinRetry {
+        transport: Some(config::TransportMode::Tor),
+        ..retry_for(key)
+    });
+    let Done(message) = second;
+    assert!(message.contains("already queued"), "{message}");
+    let saved = config::load().unwrap().pending_joins;
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].transport, None);
+    daemon.shutdown_and_close().await;
+}
+
+/// A retry stops once its network is live, and drops the restart marker.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_queued_join_stops_retrying_once_the_network_is_live() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    config::add_pending_join(config::PendingJoinEntry {
+        network_key: key.to_string(),
+        name: Some("home".into()),
+        transport: None,
+    })
+    .unwrap();
+    hold_live(&daemon.registry, "home", key);
+
+    let retry = daemon
+        .registry
+        .spawn_pending_join_retry(retry_for(key))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), retry)
+        .await
+        .expect("the retry ends once the network is live")
+        .unwrap();
+    assert!(config::load().unwrap().pending_joins.is_empty());
+    daemon.shutdown_and_close().await;
+}
+
+/// A fresh join of a network live under another name is refused before it
+/// dials. It used to pass the name check, and the dial replaced the live
+/// network's accept handler before `finalize_join` noticed.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_fresh_join_refuses_a_network_live_under_another_name() {
+    refuses_a_network_live_under_another_name(true).await;
+}
+
+/// A restore of a saved name is refused the same way when the network is live
+/// under another one, as after a `ray join --name lab` of a saved `home`.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_restore_refuses_a_network_live_under_another_name() {
+    refuses_a_network_live_under_another_name(false).await;
+}
+
+async fn refuses_a_network_live_under_another_name(initial: bool) {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    hold_live(&daemon.registry, "home", key);
+
+    let joined = daemon
+        .registry
+        .join_network_inner(
+            &key.to_string(),
+            Some("other"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            initial,
+        )
+        .await;
+    let Err(error) = joined else {
+        panic!("a second join of a live network");
+    };
+    assert_eq!(error.to_string(), "already in this network as 'home'");
+    daemon.shutdown_and_close().await;
+}
+
+/// Two joins of one network under two names, as with `ray join --name a` and
+/// `--name b` of the same invite, or a restore of a saved name racing a join:
+/// the second is refused while the first is still dialing, before it can
+/// register an accept handler over the first's.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_join_waits_out_another_join_of_the_same_network() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    let _first = daemon.registry.claim_network_key(key).unwrap();
+
+    for initial in [true, false] {
+        let joined = daemon
+            .registry
+            .join_network_inner(
+                &key.to_string(),
+                Some("lab"),
+                None,
+                None,
+                None,
+                false,
+                false,
+                initial,
+            )
+            .await;
+        let Err(error) = joined else {
+            panic!("a second join of a network being joined");
+        };
+        assert!(
+            error.to_string().contains("already being joined"),
+            "{error:#}"
+        );
+    }
+    assert!(daemon.registry.claim_registration("lab").is_some());
+    daemon.shutdown_and_close().await;
+}
+
+fn member_handler(registry: &Arc<NetworkRegistry>, name: &str, key: EndpointId) -> AcceptHandler {
+    AcceptHandler::Member(Arc::new(MemberAcceptState {
+        network_name: name.to_string(),
+        state: empty_state(key, name),
+        net_pubkey: key,
+        my_identity: registry.transport.endpoint.id(),
+        endpoint: registry.transport.endpoint.clone(),
+        registry: Arc::clone(registry),
+        invite_lock: Arc::new(AsyncMutex::new(())),
+        reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+    }))
+}
+
+/// A join that loses to a live network drops the handler it registered,
+/// unless a live network has the same key and so owns that handler.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn an_abandoned_join_drops_only_what_no_live_network_owns() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+
+    let losing = SecretKey::generate().public();
+    hold_live(registry, "home", SecretKey::generate().public());
+    registry
+        .conn
+        .register(losing, member_handler(registry, "home", losing));
+    let cancel = CancellationToken::new();
+    registry.abandon_join("home", losing, &cancel);
+    assert!(cancel.is_cancelled());
+    assert!(!registry.conn.is_registered(&losing));
+
+    let live = SecretKey::generate().public();
+    hold_live(registry, "work", live);
+    registry
+        .conn
+        .register(live, member_handler(registry, "work", live));
+    registry.abandon_join("work", live, &CancellationToken::new());
+    assert!(registry.conn.is_registered(&live));
+    daemon.shutdown_and_close().await;
+}
+
+/// Save `name` as a member network whose last published roster (this node plus
+/// `others`) is in the local blob store, as a warm resume finds it at startup.
+async fn cache_member_network(
+    registry: &NetworkRegistry,
+    name: &str,
+    network_key: EndpointId,
+    others: &[EndpointId],
+) -> SavedMemberNetwork {
+    let me = registry.transport.identity.local_identity();
+    let mut members = MemberList::new();
+    members.add(roster_row(me, false, None));
+    for other in others {
+        members.add(roster_row(*other, true, None));
+    }
+    let bytes = crate::membership::canonical_group_bytes(&GroupBlob {
+        members: members.clone(),
+        approved: ApprovedList::new(),
+        suggested_firewall: SuggestedFirewall::default(),
+        name: Some(name.to_string()),
+        reusable_keys: BTreeMap::new(),
+        nullifiers: BTreeSet::new(),
+    });
+    let hash = blake3::hash(&bytes);
+    registry
+        .transport
+        .blob_store
+        .blobs()
+        .add_slice(&bytes)
+        .await
+        .unwrap();
+    config::save_network(&config::NetworkConfig {
+        network_public_key: Some(network_key),
+        last_group_hash: Some(hash),
+        last_group_hash_published: true,
+        my_hostname: Some("studio".into()),
+        ..config::empty_network_config(name)
+    })
+    .unwrap();
+    SavedMemberNetwork {
+        name: name.to_string(),
+        net_pubkey: network_key.to_string(),
+        persisted_hostname: Some("studio".into()),
+        auto_accept_firewall: false,
+        auto_accept_files: false,
+        cached_hash: Some(hash),
+        cached_is_published: true,
+    }
+}
+
+/// A fresh join claims its name the way create and restore do. Without the
+/// claim a restore sweep could start on the config the join had just saved
+/// and register a second live state beside the join's.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_fresh_join_waits_out_a_restore_of_the_same_name() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let key = SecretKey::generate().public();
+    let restoring = daemon.registry.claim_registration("home").unwrap();
+
+    let joined = daemon
+        .registry
+        .join_network_inner(
+            &key.to_string(),
+            Some("home"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await;
+    let error = joined.err().expect("the name is being restored");
+    assert!(
+        format!("{error:#}").contains("already being joined or restored"),
+        "{error:#}"
+    );
+    drop(restoring);
+    daemon.shutdown_and_close().await;
+}
+
+/// Registration never replaces a live handle. A restore that lost the race to
+/// another path used to overwrite it, leaving the first handle's tasks running
+/// forever on a state nothing could reach.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resume_never_replaces_a_live_network() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let key = SecretKey::generate().public();
+    let saved = cache_member_network(&registry, "home", key, &[]).await;
+    let live_cancel = hold_live(&registry, "home", key);
+    let live_state = Arc::clone(&registry.networks.get("home").unwrap().state);
+
+    let resumed = registry.warm_resume_member_network(&saved, key).await;
+
+    assert!(resumed.is_err(), "the network is already live");
+    let handle = registry.networks.get("home").unwrap();
+    assert!(Arc::ptr_eq(&handle.state, &live_state));
+    assert!(!live_cancel.is_cancelled());
+    drop(handle);
+    daemon.shutdown_and_close().await;
+}
+
+/// A member network registered from its cached roster still reconverges when
+/// a peer says the roster changed. Warm resume used to register its accept
+/// handler with a notify nothing listened on, so every `MemberSync` and
+/// `BlobUpdated` was dropped until the next poll, and a queued rename was
+/// never retried.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resumed_member_reconverges_on_a_trigger() {
+    let _config = ConfigDir::new();
+    let mut lookups = watching_relay().await;
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let key = SecretKey::generate().public();
+    let saved = cache_member_network(&registry, "home", key, &[]).await;
+
+    assert!(
+        registry
+            .warm_resume_member_network(&saved, key)
+            .await
+            .unwrap()
+    );
+    // The group poller resolves the record once at start.
+    tokio::time::timeout(Duration::from_secs(10), lookups.recv())
+        .await
+        .expect("the poller looks the record up")
+        .unwrap();
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("a member accept handler is registered");
+    };
+    handler.reconverge_notify.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(10), lookups.recv())
+        .await
+        .expect("the trigger reconverges against the signed record")
+        .unwrap();
+    daemon.shutdown_and_close().await;
+}
+
+/// A warm resume gives up its claim on the name while the record it checks
+/// the mesh version against is unreadable. It used to hold the claim until the
+/// record was read, so on an offline boot `ray network rename` was refused as
+/// "still being restored" for as long as the boot stayed offline.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resume_releases_its_claim_while_the_record_is_unreadable() {
+    let _config = ConfigDir::new();
+    // Every lookup is a 404, so the version check keeps retrying.
+    let mut lookups = watching_relay().await;
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let key = SecretKey::generate().public();
+    cache_member_network(&registry, "home", key, &[]).await;
+
+    let restore = registry
+        .spawn_member_restore(&config::load_network("home").unwrap().unwrap())
+        .unwrap();
+    // One lookup is the group poller's first, the other the version check's.
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(10), lookups.recv())
+            .await
+            .expect("the record is looked up")
+            .unwrap();
+    }
+    assert!(registry.networks.contains_key("home"));
+    assert!(
+        registry.claim_registration("home").is_some(),
+        "the name is free while the version check retries"
+    );
+    daemon.shutdown_and_close().await;
+    restore.await.unwrap();
+}
+
+/// A warm resume marks a network whose record advertises a mesh version this
+/// build does not speak, as the cold restore of the same record does. It used
+/// to register it as healthy: `ray status` showed a network no peer on it could
+/// reach, and nothing watched for the coordinator to republish.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_resume_records_an_incompatible_mesh_version() {
+    let _config = ConfigDir::new();
+    let relay = super::super::destruction::tests::Relay::start().await;
+    config::update_settings(|cfg| {
+        cfg.mdns_enabled = false;
+        cfg.discovery_dns = config::ServerOverride {
+            servers: vec![relay.url.to_string()],
+            replace: true,
+        };
+        Ok(())
+    })
+    .unwrap();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = Arc::clone(&daemon.registry);
+    let network_key = SecretKey::generate();
+    let saved = cache_member_network(&registry, "home", network_key.public(), &[]).await;
+    let old = transport::MESH_PROTOCOL_VERSION - 3;
+    assert!(!mesh_version_is_speakable(
+        Some(old),
+        transport::MESH_PROTOCOL_VERSION
+    ));
+    let record = dht::encode_foreign_network_record(
+        &network_key,
+        &saved.cached_hash.unwrap(),
+        &[SecretKey::generate().public()],
+        old,
+    )
+    .unwrap();
+    let client = registry.transport.pkarr.clone();
+    dht::publish_record(&client, &record).await.unwrap();
+
+    // The two steps a warm restore takes, run in turn so the check's result
+    // is awaited rather than polled for.
+    assert!(
+        registry
+            .warm_resume_member_network(&saved, network_key.public())
+            .await
+            .unwrap()
+    );
+    let flagged = tokio::time::timeout(
+        Duration::from_secs(10),
+        registry.warm_resume_mismatch("home", &network_key.public().to_string()),
+    )
+    .await
+    .expect("the record is read")
+    .expect("the version is incompatible");
+    let expected = MeshVersionMismatch {
+        network: old,
+        ours: transport::MESH_PROTOCOL_VERSION,
+    };
+    assert_eq!(flagged, expected);
+    assert_eq!(
+        registry
+            .networks
+            .get("home")
+            .and_then(|h| h.incompatible.clone()),
+        Some(expected),
+        "the warm-resumed network is marked incompatible"
+    );
+    daemon.shutdown_and_close().await;
+}
+
+fn member_install<'a>(
+    name: &'a str,
+    key_claim: &'a RegistrationClaim<EndpointId>,
+    state: SharedNetworkState,
+) -> NetworkInstall<'a> {
+    let key = *key_claim.held();
+    NetworkInstall {
+        name,
+        network_key: key,
+        state,
+        cancel: CancellationToken::new(),
+        invite_lock: Arc::new(AsyncMutex::new(())),
+        incompatible: None,
+        authority: None,
+        reconverge_worker: None,
+        my_hostname: None,
+        dial: None,
+        key_claim,
+    }
+}
+
+/// A handshake that fails after registering its member handler leaves that
+/// handler on a state no network owns. Registering the network from the blob
+/// used to keep it, because a handler was already there, so every trigger
+/// woke a worker reconverging the dead state.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_member_registered_from_the_blob_replaces_a_failed_handshakes_handler() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    registry
+        .conn
+        .register(key, member_handler(registry, "home", key));
+
+    let state = empty_state(key, "home");
+    let key_claim = registry.claim_network_key(key).unwrap();
+    assert!(
+        registry
+            .install_network(member_install("home", &key_claim, Arc::clone(&state)))
+            .await
+    );
+
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("a member accept handler is registered");
+    };
+    assert!(Arc::ptr_eq(&handler.state, &state));
+    daemon.shutdown_and_close().await;
+}
+
+/// An install that loses to a live network starts nothing on its state and
+/// stops the reconverge worker its handshake started. Its tasks used to be
+/// spawned before the name was checked, so the poller's immediate first apply
+/// could write the loser's roster into the winner's saved network.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_losing_install_runs_nothing_on_its_state() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    hold_live(registry, "home", key);
+
+    let state = empty_state(key, "home");
+    let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::spawn(async move {
+        let _alive = alive;
+        std::future::pending::<()>().await;
+    });
+    let key_claim = registry.claim_network_key(key).unwrap();
+    let mut install = member_install("home", &key_claim, Arc::clone(&state));
+    install.reconverge_worker = Some(worker);
+    assert!(!registry.install_network(install).await);
+
+    assert_eq!(
+        Arc::strong_count(&state),
+        1,
+        "no task holds the losing install's state"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), stopped)
+        .await
+        .expect("the handshake's worker is stopped");
+    assert!(ended.is_err(), "the worker was aborted, not finished");
+    daemon.shutdown_and_close().await;
+}
+
+/// Installing over a live network stops what it spawned and leaves the live
+/// handle and its handler alone.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn an_install_gives_way_to_a_live_network() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    let live_cancel = hold_live(registry, "home", key);
+    let live_handler = member_handler(registry, "home", key);
+    let AcceptHandler::Member(ref live_member) = live_handler else {
+        unreachable!("member_handler builds a member handler");
+    };
+    let live_handler_state = Arc::clone(&live_member.state);
+    registry.conn.register(key, live_handler);
+    let live_state = Arc::clone(&registry.networks.get("home").unwrap().state);
+
+    let key_claim = registry.claim_network_key(key).unwrap();
+    let install = member_install("home", &key_claim, empty_state(key, "home"));
+    let cancel = install.cancel.clone();
+    assert!(!registry.install_network(install).await);
+
+    assert!(cancel.is_cancelled());
+    assert!(!live_cancel.is_cancelled());
+    assert!(Arc::ptr_eq(
+        &registry.networks.get("home").unwrap().state,
+        &live_state
+    ));
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("the live handler stays registered");
+    };
+    assert!(Arc::ptr_eq(&handler.state, &live_handler_state));
+    daemon.shutdown_and_close().await;
+}
+
+/// A controller's delegated join is admitted by the controller or not at all.
+/// The controller here holds the network's invite secret but does not
+/// coordinate it, and refuses the dial. The join used to fall through to the
+/// real coordinator, which would admit the machine on that secret.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_delegated_join_never_falls_through_to_another_coordinator() {
+    use iroh::RelayMode;
+    use iroh::endpoint::presets;
+
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let bind = |alpn: Vec<u8>| {
+        Endpoint::builder(presets::N0)
+            .alpns(vec![alpn])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+    };
+    // Speaks no mesh ALPN, so a dial to it fails at once.
+    let controller = bind(b"not-mesh".to_vec()).await.unwrap();
+    let coordinator = bind(transport::mesh_alpn()).await.unwrap();
+    for endpoint in [&controller, &coordinator] {
+        daemon
+            .transport
+            .warm_lookup
+            .add_endpoint_info(endpoint.addr());
+    }
+    let server = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            let Some(incoming) = coordinator.accept().await else {
+                return false;
+            };
+            let connection = incoming.await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            assert!(matches!(
+                control::recv_msg(&mut recv).await.unwrap(),
+                ControlMsg::JoinRequest { .. }
+            ));
+            control::send_msg(&mut send, None, &ControlMsg::JoinPending)
+                .await
+                .unwrap();
+            let _ = send.finish();
+            connection.closed().await;
+            true
+        }
+    });
+    let data = GroupBlob {
+        members: MemberList::from(vec![
+            roster_row(coordinator.id(), true, None),
+            roster_row(controller.id(), false, None),
+        ]),
+        approved: ApprovedList::new(),
+        suggested_firewall: SuggestedFirewall::default(),
+        name: Some("box".into()),
+        reusable_keys: BTreeMap::new(),
+        nullifiers: BTreeSet::new(),
+    };
+    let net_pubkey = SecretKey::generate().public();
+    let key_claim = daemon.registry.claim_network_key(net_pubkey).unwrap();
+    let context = JoinContext {
+        display_name: "box",
+        my_hostname: "studio",
+        net_pubkey,
+        group_hash: blake3::hash(b"test roster"),
+        invite: Some(vec![7; 16]),
+        auto_accept_firewall: false,
+        auto_accept_files: false,
+        invite_lock: Arc::new(AsyncMutex::new(())),
+        coordinator: Some(JoinCoordinator::Required(controller.id())),
+        mismatch: None,
+        key_claim: &key_claim,
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        daemon.registry.dial_fresh_join(&context, &data),
+    )
+    .await
+    .expect("the join ends");
+    let error = match outcome {
+        Err(error) => error,
+        Ok(established) => panic!(
+            "a delegated join reached another coordinator (queued: {})",
+            established.is_none()
+        ),
+    };
+    assert!(
+        error.to_string().contains("is not a coordinator"),
+        "{error:#}"
+    );
+    daemon.shutdown_and_close().await;
+    coordinator.close().await;
+    assert!(!server.await.unwrap(), "the real coordinator was dialed");
+    controller.close().await;
+}
+
+/// Installing a live network's key under a second name is refused, and the
+/// first install keeps its handle, accept handler and tasks. The name claim
+/// alone let both go live: two handles on one key, each with a poller, and
+/// leaving either unregistered the handler the other relied on.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_second_install_of_a_live_key_is_refused() {
+    let _config = ConfigDir::new();
+    offline_discovery();
+    let daemon = build_headless(false).await.unwrap();
+    let registry = &daemon.registry;
+    let key = SecretKey::generate().public();
+    let key_claim = registry.claim_network_key(key).unwrap();
+
+    let home_state = empty_state(key, "home");
+    let home = member_install("home", &key_claim, Arc::clone(&home_state));
+    let home_cancel = home.cancel.clone();
+    assert!(registry.install_network(home).await);
+
+    let lab_state = empty_state(key, "lab");
+    let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::spawn(async move {
+        let _alive = alive;
+        std::future::pending::<()>().await;
+    });
+    let mut lab = member_install("lab", &key_claim, Arc::clone(&lab_state));
+    lab.reconverge_worker = Some(worker);
+    let lab_cancel = lab.cancel.clone();
+    assert!(!registry.install_network(lab).await, "the key is live");
+
+    assert!(lab_cancel.is_cancelled());
+    assert!(!registry.networks.contains_key("lab"));
+    assert_eq!(
+        Arc::strong_count(&lab_state),
+        1,
+        "no task holds the losing install's state"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), stopped)
+        .await
+        .expect("the losing install's worker is stopped");
+    assert!(ended.is_err(), "the worker was aborted, not finished");
+
+    assert!(!home_cancel.is_cancelled());
+    {
+        let handle = registry.networks.get("home").expect("home stays live");
+        assert!(Arc::ptr_eq(&handle.state, &home_state));
+        assert!(!handle.tasks.is_empty());
+        assert!(handle.tasks.iter().all(|task| !task.is_finished()));
+    }
+    let Some(AcceptHandler::Member(handler)) = registry.conn.handler_for(&key) else {
+        panic!("home's member accept handler stays registered");
+    };
+    assert!(Arc::ptr_eq(&handler.state, &home_state));
+    daemon.shutdown_and_close().await;
+}

@@ -10,7 +10,7 @@ use super::super::*;
 /// Consumed by the join dial-fallback loop.
 pub(crate) fn coordinator_dial_order(
     minter: EndpointId,
-    members: &[Member],
+    members: &MemberList,
     me: EndpointId,
 ) -> Vec<EndpointId> {
     let mut order = Vec::new();
@@ -26,11 +26,66 @@ pub(crate) fn coordinator_dial_order(
     order
 }
 
+/// The coordinator a fresh join was told to dial, from an invite or pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinCoordinator {
+    /// Dial it first, then the roster's other coordinators. It is tried even
+    /// when the fetched roster does not flag it, so a stale roster cannot
+    /// strand an invite or pairing join.
+    Preferred(EndpointId),
+    /// Dial only it, and only when the signed roster flags it a coordinator.
+    /// A controller's delegated join uses this: falling through to the
+    /// network's other coordinators would let a controller that holds some
+    /// network's invite secret enroll the machine in a network it does not run.
+    Required(EndpointId),
+}
+
+impl JoinCoordinator {
+    pub(crate) fn id(self) -> EndpointId {
+        match self {
+            Self::Preferred(id) | Self::Required(id) => id,
+        }
+    }
+}
+
+/// The coordinators a fresh join dials, in order. Errors when there is no one
+/// to dial, or when a required coordinator is not one in the signed roster.
+pub(crate) fn fresh_join_dial_order(
+    coordinator: Option<JoinCoordinator>,
+    members: &MemberList,
+    me: EndpointId,
+) -> Result<Vec<EndpointId>> {
+    let order = match coordinator {
+        Some(JoinCoordinator::Required(required)) => {
+            anyhow::ensure!(
+                required != me
+                    && members
+                        .iter()
+                        .any(|m| m.identity == required && m.is_coordinator),
+                "{} is not a coordinator of this network",
+                required.fmt_short()
+            );
+            vec![required]
+        }
+        Some(JoinCoordinator::Preferred(preferred)) => {
+            let mut order = coordinator_dial_order(preferred, members, me);
+            if preferred != me && !order.contains(&preferred) {
+                order.insert(0, preferred);
+            }
+            order
+        }
+        // No minter: every roster coordinator but us, in roster order.
+        None => coordinator_dial_order(me, members, me),
+    };
+    anyhow::ensure!(!order.is_empty(), "no coordinator found in network record");
+    Ok(order)
+}
+
 /// Pick the peers to gossip single-use invite state to: every other
 /// `is_coordinator` member, excluding ourselves. Only coordinators (network-key
 /// holders) can admit, so only they need the shared invite ledger; a
 /// non-coordinator is never a target.
-pub(crate) fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<EndpointId> {
+pub(crate) fn gossip_targets(members: &MemberList, me: EndpointId) -> Vec<EndpointId> {
     members
         .iter()
         .filter(|m| m.is_coordinator && m.identity != me)

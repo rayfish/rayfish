@@ -490,7 +490,9 @@ pub(crate) async fn daemon_version() -> Option<String> {
     let mut stream = ipc::connect().await.ok()?;
     ipc::send(&mut stream, ipc::IpcMessage::Status).await.ok()?;
     match ipc::recv(&mut stream).await.ok()? {
-        ipc::IpcMessage::StatusResponse { daemon_version, .. } if !daemon_version.is_empty() => {
+        ipc::IpcMessage::StatusResponse(ipc::NodeStatus { daemon_version, .. })
+            if !daemon_version.is_empty() =>
+        {
             Some(daemon_version)
         }
         _ => None,
@@ -574,6 +576,9 @@ pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
 }
 
 pub(crate) fn cmd_uninstall_service() -> Result<()> {
+    // Before any teardown: without root, the completion removal and the
+    // service manager calls fail one by one and leave a half-removed install.
+    require_root()?;
     // Take the completion stubs with it: `ray up` installed them, so an
     // uninstall that left them behind would leave three files pointing at a
     // binary that may be going away too.

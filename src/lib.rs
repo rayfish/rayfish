@@ -59,7 +59,7 @@ pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
 
 pub mod apply;
 pub mod audit;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(feature = "desktop", unix)))]
 pub(crate) mod child;
 pub mod config;
 pub mod control;

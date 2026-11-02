@@ -567,60 +567,7 @@ pub enum IpcMessage {
         name: String,
         my_ipv6: Ipv6Addr,
     },
-    StatusResponse {
-        endpoint_id: EndpointId,
-        mdns_enabled: bool,
-        /// Whether this node opted into automatic stable updates. Reflects the
-        /// running daemon's setting (which can differ from on-disk config until a
-        /// restart). Defaulted so an older CLI/daemon pair still deserializes.
-        #[serde(default)]
-        auto_update: bool,
-        /// Whether the VPN is active (TUN up, networks connected) or on standby.
-        active: bool,
-        /// What to share for `ray connect`: the paired user identity, or this
-        /// endpoint when unpaired. `None` from daemons that predate it.
-        #[serde(default)]
-        identity: Option<EndpointId>,
-        /// The running daemon's compiled version (`CARGO_PKG_VERSION`). The CLI
-        /// compares it to its own version and hints `ray update` on a mismatch
-        /// — e.g. after a self-update where the daemon never restarted onto the
-        /// new binary. Empty when talking to a daemon predating this field.
-        #[serde(default)]
-        daemon_version: String,
-        networks: Vec<NetworkStatus>,
-        packets_rx: u64,
-        packets_tx: u64,
-        bytes_rx: u64,
-        bytes_tx: u64,
-        /// Incoming file offers awaiting `ray files accept` (global, not
-        /// per-network). Shown in the status "pending" summary.
-        #[serde(default)]
-        pending_files: usize,
-        /// Incoming `ray connect` requests awaiting `ray connections approve`
-        /// (global). Shown in the status "pending" summary.
-        #[serde(default)]
-        pending_connects: usize,
-        /// Refused outgoing direct connections, cleared by a new attempt.
-        #[serde(default)]
-        connection_errors: Vec<ConnectionErrorInfo>,
-        /// Networks this node has asked to join but has not yet been admitted
-        /// to (persisted `AppConfig.pending_joins`), minus any that are now
-        /// active. Shown in the UI as "waiting for approval".
-        #[serde(default)]
-        pending_networks: Vec<String>,
-        /// Networks saved in the daemon's config that it has not registered —
-        /// a restore that has not landed. Reported here rather than read from
-        /// config by the CLI, which resolves the *caller's* config directory
-        /// and so sees an empty one wherever the daemon's is root-owned.
-        #[serde(default)]
-        inactive_networks: Vec<InactiveNetwork>,
-        /// Nodes seen on the LAN over mDNS that we do not already share a
-        /// network with, i.e. the ones still to link up with. Peers we do share
-        /// a network with are omitted: they show in `networks` instead. Empty
-        /// when mDNS is off. `ray mdns scan` lists the full set.
-        #[serde(default)]
-        lan_peers: Vec<LanPeerInfo>,
-    },
+    StatusResponse(NodeStatus),
     /// Reply to `Ping`. `probes` holds one entry per probe attempt, in order:
     /// the measured round-trip in milliseconds, or `None` if no reply was
     /// observed. `probe_details` distinguishes timeouts from local failures.
@@ -1451,6 +1398,63 @@ pub struct InactiveNetwork {
     pub saved: Option<NetworkStatus>,
 }
 
+/// Reply to `Status`: this node's identity, networks and counters.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub endpoint_id: EndpointId,
+    pub mdns_enabled: bool,
+    /// Whether this node opted into automatic stable updates. Reflects the
+    /// running daemon's setting (which can differ from on-disk config until a
+    /// restart). Defaulted so an older CLI/daemon pair still deserializes.
+    #[serde(default)]
+    pub auto_update: bool,
+    /// Whether the VPN is active (TUN up, networks connected) or on standby.
+    pub active: bool,
+    /// What to share for `ray connect`: the paired user identity, or this
+    /// endpoint when unpaired. `None` from daemons that predate it.
+    #[serde(default)]
+    pub identity: Option<EndpointId>,
+    /// The running daemon's compiled version (`CARGO_PKG_VERSION`). The CLI
+    /// compares it to its own version and hints `ray update` on a mismatch
+    /// — e.g. after a self-update where the daemon never restarted onto the
+    /// new binary. Empty when talking to a daemon predating this field.
+    #[serde(default)]
+    pub daemon_version: String,
+    pub networks: Vec<NetworkStatus>,
+    pub packets_rx: u64,
+    pub packets_tx: u64,
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+    /// Incoming file offers awaiting `ray files accept` (global, not
+    /// per-network). Shown in the status "pending" summary.
+    #[serde(default)]
+    pub pending_files: usize,
+    /// Incoming `ray connect` requests awaiting `ray connections approve`
+    /// (global). Shown in the status "pending" summary.
+    #[serde(default)]
+    pub pending_connects: usize,
+    /// Refused outgoing direct connections, cleared by a new attempt.
+    #[serde(default)]
+    pub connection_errors: Vec<ConnectionErrorInfo>,
+    /// Networks this node has asked to join but has not yet been admitted
+    /// to (persisted `AppConfig.pending_joins`), minus any that are now
+    /// active. Shown in the UI as "waiting for approval".
+    #[serde(default)]
+    pub pending_networks: Vec<String>,
+    /// Networks saved in the daemon's config that it has not registered —
+    /// a restore that has not landed. Reported here rather than read from
+    /// config by the CLI, which resolves the *caller's* config directory
+    /// and so sees an empty one wherever the daemon's is root-owned.
+    #[serde(default)]
+    pub inactive_networks: Vec<InactiveNetwork>,
+    /// Nodes seen on the LAN over mDNS that we do not already share a
+    /// network with, i.e. the ones still to link up with. Peers we do share
+    /// a network with are omitted: they show in `networks` instead. Empty
+    /// when mDNS is off. `ray mdns scan` lists the full set.
+    #[serde(default)]
+    pub lan_peers: Vec<LanPeerInfo>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub name: String,
@@ -1878,10 +1882,25 @@ pub fn socket_path() -> PathBuf {
 #[cfg(unix)]
 pub async fn connect() -> Result<IpcFramed> {
     let path = socket_path();
-    let stream = UnixStream::connect(&path)
-        .await
-        .context("daemon not running — start it with: sudo rayfish daemon")?;
+    let stream = match UnixStream::connect(&path).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let context = connect_error_context(&error);
+            return Err(error).context(context);
+        }
+    };
     Ok(Framed::new(stream, MsgpackCodec::new()))
+}
+
+/// What a failed socket connect means to the user. A refusal is a running
+/// daemon this user may not talk to, not a missing one.
+#[cfg(unix)]
+fn connect_error_context(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        "not authorized to connect to the rayfish daemon"
+    } else {
+        "daemon not running; start it with: sudo ray up"
+    }
 }
 
 #[cfg(windows)]
@@ -1901,7 +1920,7 @@ pub async fn connect() -> Result<IpcFramed> {
                     )
                 }
                 PipeOpenError::NotFound => {
-                    return Err(error).context("daemon not running — start the Rayfish service");
+                    return Err(error).context("daemon not running; start the Rayfish service");
                 }
                 PipeOpenError::Other(code) => {
                     return Err(error).context(format!(
@@ -2154,6 +2173,16 @@ pub async fn recv_with_fds(stream: &UnixStream) -> Result<(IpcMessage, Vec<Owned
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_errors_name_the_ray_binary_and_tell_refusal_apart() {
+        use std::io::{Error, ErrorKind};
+        let missing = connect_error_context(&Error::from(ErrorKind::NotFound));
+        assert!(missing.contains("sudo ray up"), "{missing}");
+        let refused = connect_error_context(&Error::from(ErrorKind::PermissionDenied));
+        assert!(refused.contains("not authorized"), "{refused}");
+    }
 
     #[test]
     fn status_enums_display_their_status_words() {
@@ -2819,7 +2848,7 @@ mod tests {
     fn test_status_response_roundtrip() {
         let ep_id = iroh::SecretKey::generate().public();
         let peer_id = iroh::SecretKey::generate().public();
-        let resp = IpcMessage::StatusResponse {
+        let resp = IpcMessage::StatusResponse(NodeStatus {
             endpoint_id: ep_id,
             mdns_enabled: true,
             auto_update: false,
@@ -2875,20 +2904,20 @@ mod tests {
                 last_seen_secs: 4,
                 shared_network: None,
             }],
-        };
+        });
         // The IPC codec uses `to_vec_named`; positional encoding can't survive
         // NetworkStatus's `skip_serializing_if` fields (ephemeral_ttl_secs,
         // my_exit_node) sitting ahead of exit_offering.
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcMessage::StatusResponse {
+            IpcMessage::StatusResponse(NodeStatus {
                 endpoint_id,
                 networks,
                 lan_peers,
                 connection_errors,
                 ..
-            } => {
+            }) => {
                 assert_eq!(endpoint_id, ep_id);
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].peers[0].endpoint_id, peer_id);
@@ -2902,6 +2931,53 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+
+        // `StatusResponse` was a struct variant; a reader built before it
+        // wrapped `NodeStatus` still decodes the reply.
+        #[derive(Deserialize)]
+        enum OldReader {
+            StatusResponse {
+                endpoint_id: EndpointId,
+                active: bool,
+            },
+        }
+        let OldReader::StatusResponse {
+            endpoint_id,
+            active,
+        } = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(endpoint_id, ep_id);
+        assert!(active);
+    }
+
+    /// A newtype variant around a struct encodes exactly like the struct
+    /// variant it replaced.
+    #[test]
+    fn a_wrapped_struct_variant_keeps_its_encoding() {
+        #[derive(Serialize)]
+        struct Fields {
+            a: u8,
+            b: String,
+        }
+        #[derive(Serialize)]
+        enum Wrapped {
+            V(Fields),
+        }
+        #[derive(Serialize)]
+        enum Inline {
+            V { a: u8, b: String },
+        }
+        let wrapped = Wrapped::V(Fields {
+            a: 1,
+            b: "x".into(),
+        });
+        let inline = Inline::V {
+            a: 1,
+            b: "x".into(),
+        };
+        assert_eq!(
+            rmp_serde::to_vec_named(&wrapped).unwrap(),
+            rmp_serde::to_vec_named(&inline).unwrap()
+        );
     }
 
     #[test]

@@ -3,7 +3,9 @@
 //! Win32 token identity helpers shared by service bootstrap and named-pipe IPC.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle as StdOwnedHandle};
 
 use anyhow::{Context, Result};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
@@ -18,11 +20,62 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct WindowsPeerIdentity {
     pub(crate) sid: String,
     pub(crate) is_local_system: bool,
     pub(crate) is_elevated_admin: bool,
+    pub(crate) token: ClientToken,
+}
+
+/// The named-pipe client's own token, kept so the daemon can ask Windows what
+/// that user may do (`AccessCheck`) after the pipe is gone. The client opens
+/// the pipe at `SECURITY_IDENTIFICATION`, so this token identifies the caller
+/// but cannot be used to act as them.
+pub(crate) struct ClientToken {
+    handle: StdOwnedHandle,
+    sid: String,
+}
+
+impl ClientToken {
+    /// The token handle, for calls that only read it.
+    pub(crate) fn as_raw(&self) -> HANDLE {
+        self.handle.as_raw_handle()
+    }
+
+    /// The caller's user SID in string form.
+    pub(crate) fn sid(&self) -> &str {
+        &self.sid
+    }
+}
+
+impl ClientToken {
+    /// This process's own user as a named-pipe caller would appear, for tests.
+    #[cfg(test)]
+    pub(crate) fn current_user() -> Option<Self> {
+        let token = process_token(TOKEN_DUPLICATE | TOKEN_QUERY)?;
+        let sid = token_sid(token.0)?;
+        let mut duplicate = std::ptr::null_mut();
+        // SAFETY: `token` is open with TOKEN_DUPLICATE and `duplicate` is a
+        // writable out-pointer for the new handle.
+        if unsafe { DuplicateToken(token.0, SecurityIdentification, &mut duplicate) } == 0
+            || duplicate.is_null()
+        {
+            return None;
+        }
+        // SAFETY: `DuplicateToken` succeeded, so `duplicate` is a handle
+        // nothing else owns.
+        let handle = unsafe { StdOwnedHandle::from_raw_handle(duplicate) };
+        Some(Self { handle, sid })
+    }
+}
+
+impl fmt::Debug for ClientToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientToken")
+            .field("sid", &self.sid)
+            .finish_non_exhaustive()
+    }
 }
 
 struct OwnedHandle(HANDLE);
@@ -209,11 +262,18 @@ pub(crate) fn named_pipe_client_identity(pipe: HANDLE) -> Result<WindowsPeerIden
         "failed to open named-pipe client token (Win32 error {})",
         unsafe { GetLastError() }
     );
-    let token = OwnedHandle(token);
-    let sid = token_sid(token.0).context("named-pipe client token has no SID")?;
+    // SAFETY: `OpenThreadToken` succeeded, so `token` is a valid handle that
+    // nothing else owns; the `OwnedHandle` closes it exactly once.
+    let token = unsafe { StdOwnedHandle::from_raw_handle(token) };
+    let raw = token.as_raw_handle();
+    let sid = token_sid(raw).context("named-pipe client token has no SID")?;
     Ok(WindowsPeerIdentity {
         is_local_system: sid == "S-1-5-18",
-        is_elevated_admin: token_is_admin(token.0),
+        is_elevated_admin: token_is_admin(raw),
+        token: ClientToken {
+            handle: token,
+            sid: sid.clone(),
+        },
         sid,
     })
 }

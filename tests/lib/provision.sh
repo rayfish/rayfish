@@ -21,9 +21,9 @@ do_provision(){
 
   # The region column doubles as the backend marker; don't drive a docker fleet
   # from the cloud path (or silently bill new droplets alongside it).
-  if [[ -f "$SERVERS" ]] && grep -qE '^[^ ]+ [^ ]+ [^ ]+ docker$' "$SERVERS"; then
-    echo "Refusing: $SERVERS was written by the docker backend." >&2
-    echo "Tear it down first, or run with E2E_BACKEND=docker." >&2
+  if [[ -f "$SERVERS" ]] && grep -qE '^[^ ]+ [^ ]+ [^ ]+ (docker|boat)$' "$SERVERS"; then
+    echo "Refusing: $SERVERS was written by the docker or boat backend." >&2
+    echo "Tear it down first, or run with that E2E_BACKEND." >&2
     exit 1
   fi
 

@@ -17,6 +17,15 @@
 //! ever be completed by the peer it was actually sent to: a pull by one can never
 //! complete the other's entry, and a pull by an unrelated third party (anyone who
 //! learned the hash) can't complete anyone's entry at all.
+//!
+//! An aborted pull does not end a send. The receiver resumes an interrupted
+//! receive by itself, for up to a day, and can accept it again after that, so
+//! the sender keeps the entry in progress with a note until the pull completes,
+//! the receiver confirms or declines, or the send is canceled. Nothing tells
+//! the sender when the receiver gives up or cancels, which puts the offer back
+//! in its queue, so a send with no new pull for [`RESUME_WINDOW`] goes back to
+//! `Offered`: what it then is on both sides. It is not dropped, since the
+//! offer is still outstanding and has to stay cancelable here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +39,10 @@ use iroh_blobs::Hash;
 /// How long a finished transfer stays listable, so a poller can observe the
 /// terminal state before it disappears.
 const TERMINAL_TTL: Duration = Duration::from_secs(60);
+
+/// Most finished transfers kept listable at once. A burst of short transfers
+/// inside one [`TERMINAL_TTL`] otherwise keeps every one of them.
+const MAX_FINISHED: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferState {
@@ -63,12 +76,9 @@ struct Entry {
     send: Option<SendKey>,
     /// When the transfer reached a terminal state, for TTL expiry.
     finished_at: Option<Instant>,
-    /// Outgoing only: how a `Failed` entry got there. Only a pull that was
-    /// aborted partway through is worth reviving on a retried `Started`; an
-    /// offer that never reached the peer (the dial, `open_bi`, or the offer
-    /// message itself failed) has nothing to retry, because the peer never
-    /// even knew about it.
-    failure: Option<FailureKind>,
+    /// Outgoing only: when the peer's last pull stopped partway, until it
+    /// pulls again. See [`RESUME_WINDOW`].
+    interrupted_at: Option<Instant>,
 }
 
 /// Which provider events belong to an outgoing entry. An event must match both
@@ -82,19 +92,18 @@ struct SendKey {
     peer: EndpointId,
 }
 
-/// How an outgoing entry reached `Failed`. Only set on the send side: a
-/// receive's `finish(id, false)` never needs to distinguish these, since
-/// nothing ever revives a receive entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureKind {
-    /// The offer itself never reached the peer (dial, `open_bi`, or the offer
-    /// message failed). Not revivable: there is no pull to retry.
-    Offer,
-    /// The peer received the offer and started pulling, but the pull was
-    /// aborted. Revivable: a later `Started` for the same `(hash, peer)` is a
-    /// genuine retry.
-    Abort,
-}
+/// The note on a send whose pull stopped partway.
+pub(crate) const SEND_INTERRUPTED: &str = "interrupted; the recipient resumes it when it can";
+
+/// The note on a send whose interrupted pull was not resumed in time.
+pub(crate) const SEND_NOT_RESUMED: &str =
+    "the recipient stopped receiving; it can still accept the offer";
+
+/// How long an interrupted send waits for the recipient to pull again before
+/// it counts as offered rather than in progress: the receiver's own retry
+/// window, measured here as plain time since the sender cannot see the
+/// receiver's.
+const RESUME_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct TransferRegistry {
     entries: Mutex<HashMap<u64, Entry>>,
@@ -140,7 +149,9 @@ impl TransferRegistry {
     /// `register_receive`, not whatever string the caller typed at the CLI.
     pub fn register_send(&self, peer: EndpointId, filename: String, size: u64, hash: Hash) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.entries.lock().unwrap().insert(
+        let mut entries = self.entries.lock().unwrap();
+        prune_finished(&mut entries, Instant::now());
+        entries.insert(
             id,
             Entry {
                 info: TransferInfo {
@@ -156,7 +167,7 @@ impl TransferRegistry {
                 },
                 send: Some(SendKey { hash, peer }),
                 finished_at: None,
-                failure: None,
+                interrupted_at: None,
             },
         );
         self.changed();
@@ -166,7 +177,9 @@ impl TransferRegistry {
     /// An incoming transfer we drive ourselves, so it is moving from the start.
     pub fn register_receive(&self, peer: String, filename: String, size: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.entries.lock().unwrap().insert(
+        let mut entries = self.entries.lock().unwrap();
+        prune_finished(&mut entries, Instant::now());
+        entries.insert(
             id,
             Entry {
                 info: TransferInfo {
@@ -182,7 +195,7 @@ impl TransferRegistry {
                 },
                 send: None,
                 finished_at: None,
-                failure: None,
+                interrupted_at: None,
             },
         );
         self.changed();
@@ -191,15 +204,40 @@ impl TransferRegistry {
 
     pub fn note_progress(&self, id: u64, transferred: u64) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
-            e.info.transferred = transferred.min(e.info.size);
+            let transferred = transferred.min(e.info.size);
+            // New bytes mean a resumed receive is moving again, so the note
+            // left by `note_retrying` no longer describes it.
+            if transferred > e.info.transferred {
+                e.info.error = None;
+            }
+            e.info.transferred = transferred;
             e.info.state = TransferState::Transferring;
+            self.changed();
+        }
+    }
+
+    /// A receive was interrupted and will be retried. It stays
+    /// `Transferring`, with the reason in `error`, so `ray files` shows it as
+    /// still under way rather than failed.
+    pub(crate) fn note_retrying(&self, id: u64, reason: &str) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
+            e.info.error = Some(format!("interrupted, retrying: {reason}"));
+            self.changed();
+        }
+    }
+
+    /// A receive gave up, with the reason shown next to the failure.
+    fn fail_receive(&self, id: u64, reason: String) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
+            finish_entry(e, false);
+            e.info.error = Some(reason);
             self.changed();
         }
     }
 
     pub fn finish(&self, id: u64, ok: bool) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
-            finish_entry(e, ok, None);
+            finish_entry(e, ok);
             self.changed();
         }
     }
@@ -207,18 +245,16 @@ impl TransferRegistry {
     pub fn finish_receive(&self, id: u64, destination: &Path) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
             e.info.destination = Some(destination.to_path_buf());
-            finish_entry(e, true, None);
+            finish_entry(e, true);
             self.changed();
         }
     }
 
-    /// An outgoing offer failed before the peer could ever pull it: the dial,
-    /// `open_bi`, or the offer message itself failed. Distinct from `finish`
-    /// so this can be tagged not-revivable (see [`FailureKind::Offer`]):
-    /// nothing the peer does can retry a pull of an offer it never received.
+    /// An outgoing offer failed before the peer could ever pull it, or was
+    /// dropped from the queue.
     pub fn fail_offer(&self, id: u64) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
-            finish_entry(e, false, Some(FailureKind::Offer));
+            finish_entry(e, false);
             self.changed();
         }
     }
@@ -226,7 +262,7 @@ impl TransferRegistry {
     /// A recipient's explicit refusal is terminal and cannot be revived by a pull.
     pub(crate) fn decline_offer(&self, id: u64, reason: String) {
         if let Some(entry) = self.entries.lock().unwrap().get_mut(&id) {
-            finish_entry(entry, false, Some(FailureKind::Offer));
+            finish_entry(entry, false);
             entry.info.error = Some(reason);
             self.changed();
         }
@@ -246,36 +282,19 @@ impl TransferRegistry {
             return None;
         }
         let SendKey { hash, peer } = entry.send?;
-        finish_entry(entry, false, Some(FailureKind::Offer));
+        finish_entry(entry, false);
         self.changed();
         Some((hash, peer))
     }
 
-    /// A peer started pulling a blob. If the only entry for this `(hash, peer)`
-    /// pair already finished as `Failed` from an aborted pull (not an offer that
-    /// never reached the peer, see [`FailureKind`]), and it failed recently
-    /// enough to still be live (within `TERMINAL_TTL`; terminal entries are only
-    /// evicted lazily in `list_at`, so an older one could otherwise sit around
-    /// forever waiting to be revived), a fresh `Started` revives it rather than
-    /// leaving the sender stuck showing a failure for a file that is now
-    /// actually arriving: a retried pull after an aborted one still deserves to
-    /// end up `Done`.
+    /// A peer started pulling a blob, for the first time or to resume.
     pub fn provider_started(&self, hash: Hash, peer: EndpointId) {
-        self.provider_started_at(hash, peer, Instant::now());
-    }
-
-    fn provider_started_at(&self, hash: Hash, peer: EndpointId, now: Instant) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.state = TransferState::Transferring;
-            self.changed();
-        } else if let Some(id) = oldest_revivable_outgoing(&entries, hash, peer, now) {
-            let e = entries.get_mut(&id).expect("id came from this map");
-            e.finished_at = None;
-            e.failure = None;
-            e.info.transferred = 0;
-            e.info.state = TransferState::Transferring;
+            e.info.error = None;
+            e.interrupted_at = None;
             self.changed();
         }
     }
@@ -286,15 +305,28 @@ impl TransferRegistry {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.transferred = end_offset.min(e.info.size);
             e.info.state = TransferState::Transferring;
+            e.interrupted_at = None;
             self.changed();
         }
     }
 
+    /// A pull ended. A complete one finishes the send; an aborted one leaves
+    /// it in progress with [`SEND_INTERRUPTED`], since the recipient resumes
+    /// it, for up to [`RESUME_WINDOW`].
     pub fn provider_finished(&self, hash: Hash, peer: EndpointId, ok: bool) {
+        self.provider_finished_at(hash, peer, ok, Instant::now());
+    }
+
+    fn provider_finished_at(&self, hash: Hash, peer: EndpointId, ok: bool, now: Instant) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
-            finish_entry(e, ok, Some(FailureKind::Abort));
+            if ok {
+                finish_entry(e, true);
+            } else {
+                e.info.error = Some(SEND_INTERRUPTED.to_string());
+                e.interrupted_at = Some(now);
+            }
             self.changed();
         }
     }
@@ -305,10 +337,7 @@ impl TransferRegistry {
 
     fn list_at(&self, now: Instant) -> Vec<TransferInfo> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, e| match e.finished_at {
-            Some(at) => now.duration_since(at) < TERMINAL_TTL,
-            None => true,
-        });
+        prune_finished(&mut entries, now);
         let mut out: Vec<TransferInfo> = entries.values().map(|e| e.info.clone()).collect();
         out.sort_by_key(|t| t.id);
         out
@@ -343,6 +372,12 @@ impl FinishGuard {
         self.armed = false;
         self.registry.finish_receive(self.id, destination);
     }
+
+    /// Mark the transfer failed for `reason` and disarm the guard.
+    pub(crate) fn fail(mut self, reason: String) {
+        self.armed = false;
+        self.registry.fail_receive(self.id, reason);
+    }
 }
 
 impl Drop for FinishGuard {
@@ -353,20 +388,52 @@ impl Drop for FinishGuard {
     }
 }
 
+/// Drop finished entries older than [`TERMINAL_TTL`], then the oldest finished
+/// ones past [`MAX_FINISHED`], and return sends interrupted for longer than
+/// [`RESUME_WINDOW`] to `Offered`. Runs on every insert as well as every
+/// listing, so the map stays bounded when nothing polls it.
+fn prune_finished(entries: &mut HashMap<u64, Entry>, now: Instant) {
+    for e in entries.values_mut() {
+        if e.interrupted_at
+            .is_some_and(|at| now.duration_since(at) >= RESUME_WINDOW)
+        {
+            e.interrupted_at = None;
+            e.info.state = TransferState::Offered;
+            e.info.error = Some(SEND_NOT_RESUMED.to_string());
+        }
+    }
+    entries.retain(|_, e| match e.finished_at {
+        Some(at) => now.duration_since(at) < TERMINAL_TTL,
+        None => true,
+    });
+    let mut finished: Vec<(Instant, u64)> = entries
+        .values()
+        .filter_map(|e| e.finished_at.map(|at| (at, e.info.id)))
+        .collect();
+    if finished.len() <= MAX_FINISHED {
+        return;
+    }
+    finished.sort_unstable();
+    let excess = finished.len() - MAX_FINISHED;
+    for (_, id) in &finished[..excess] {
+        entries.remove(id);
+    }
+}
+
 /// A finished transfer reads as complete: a Done that showed 60/100 because the
 /// last progress event was coarse would be a worse lie than rounding up.
-///
-/// `failure` records why an outgoing entry failed (ignored when `ok` is true,
-/// and for receive entries, which never get revived): see [`FailureKind`].
-fn finish_entry(e: &mut Entry, ok: bool, failure: Option<FailureKind>) {
+fn finish_entry(e: &mut Entry, ok: bool) {
     e.info.state = if ok {
         e.info.transferred = e.info.size;
+        // An abort the provider reports late, after the recipient's next pull
+        // began, leaves its "interrupted" note on the entry that pull completes.
+        e.info.error = None;
         TransferState::Done
     } else {
         TransferState::Failed
     };
     e.finished_at = Some(Instant::now());
-    e.failure = if ok { None } else { failure };
+    e.interrupted_at = None;
 }
 
 /// The transfer a provider event belongs to: the oldest outgoing, not-yet-finished
@@ -382,32 +449,6 @@ fn oldest_live_outgoing(
     entries
         .values()
         .filter(|e| e.send == Some(SendKey { hash, peer }) && e.finished_at.is_none())
-        .map(|e| e.info.id)
-        .min()
-}
-
-/// Like [`oldest_live_outgoing`] but for an entry worth reviving on a fresh
-/// `Started` event (see `provider_started`): it must have failed on the pull
-/// path (not the offer path, which the peer never even received), and recently
-/// enough that it has not already aged past `TERMINAL_TTL`. Terminal entries
-/// are only evicted lazily inside `list_at`, so without the TTL check an entry
-/// that is logically dead but hasn't been swept yet could be revived and then
-/// never expire at all.
-fn oldest_revivable_outgoing(
-    entries: &HashMap<u64, Entry>,
-    hash: Hash,
-    peer: EndpointId,
-    now: Instant,
-) -> Option<u64> {
-    entries
-        .values()
-        .filter(|e| {
-            e.send == Some(SendKey { hash, peer })
-                && e.info.state == TransferState::Failed
-                && e.failure == Some(FailureKind::Abort)
-                && e.finished_at
-                    .is_some_and(|at| now.duration_since(at) < TERMINAL_TTL)
-        })
         .map(|e| e.info.id)
         .min()
 }
@@ -465,6 +506,30 @@ mod tests {
         assert!(changes.has_changed().unwrap());
         assert_eq!(registry.list()[0].state, TransferState::Transferring);
     }
+    #[test]
+    fn a_retrying_receive_stays_in_progress_until_bytes_move() {
+        let registry = Arc::new(TransferRegistry::new());
+        let id = registry.register_receive("peer".into(), "file".into(), 100);
+        registry.note_progress(id, 40);
+        registry.note_retrying(id, "connection to sender lost");
+        let retrying = &registry.list()[0];
+        assert_eq!(retrying.state, TransferState::Transferring);
+        assert_eq!(
+            retrying.error.as_deref(),
+            Some("interrupted, retrying: connection to sender lost")
+        );
+        // Reconnecting reports the bytes already held; only new ones clear it.
+        registry.note_progress(id, 40);
+        assert!(registry.list()[0].error.is_some());
+        registry.note_progress(id, 41);
+        assert_eq!(registry.list()[0].error, None);
+
+        registry.note_retrying(id, "the transfer stalled");
+        FinishGuard::new(Arc::clone(&registry), id).fail("gave up".into());
+        let failed = &registry.list()[0];
+        assert_eq!(failed.state, TransferState::Failed);
+        assert_eq!(failed.error.as_deref(), Some("gave up"));
+    }
     use iroh::SecretKey;
 
     fn hash(byte: u8) -> Hash {
@@ -475,6 +540,23 @@ mod tests {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
         SecretKey::from(key_bytes).public()
+    }
+
+    /// Finished transfers are pruned as new ones arrive, not only when
+    /// something lists them, so a daemon nobody polls stays bounded.
+    #[test]
+    fn finished_transfers_are_pruned_without_a_listing() {
+        let reg = TransferRegistry::new();
+        let live = reg.register_receive("peer".into(), "live".into(), 1);
+        for n in 0..MAX_FINISHED * 2 {
+            let id = reg.register_receive("peer".into(), format!("file-{n}"), 1);
+            reg.finish(id, true);
+        }
+        reg.register_receive("peer".into(), "last".into(), 1);
+        let entries = reg.entries.lock().unwrap();
+        let finished = entries.values().filter(|e| e.finished_at.is_some()).count();
+        assert!(finished <= MAX_FINISHED, "{finished} finished entries kept");
+        assert!(entries.contains_key(&live), "a live transfer was pruned");
     }
 
     #[test]
@@ -507,13 +589,69 @@ mod tests {
     }
 
     #[test]
-    fn an_aborted_send_fails() {
+    fn a_late_abort_does_not_outlive_the_pull_that_completes_the_send() {
         let reg = TransferRegistry::new();
         let a = peer(1);
         reg.register_send(a, "photo.jpg".into(), 100, hash(1));
         reg.provider_started(hash(1), a);
+        // The recipient restarted and pulls again; the dead pull's abort
+        // only arrives now.
+        reg.provider_started(hash(1), a);
         reg.provider_finished(hash(1), a, false);
-        assert_eq!(reg.list()[0].state, TransferState::Failed);
+        reg.provider_finished(hash(1), a, true);
+        let t = &reg.list()[0];
+        assert_eq!(t.state, TransferState::Done);
+        assert_eq!(t.error, None);
+    }
+
+    #[test]
+    fn an_aborted_pull_stays_in_progress_until_the_recipient_resumes_it() {
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_progress(hash(1), a, 40);
+        reg.provider_finished(hash(1), a, false);
+        let t = &reg.list()[0];
+        assert_eq!(t.state, TransferState::Transferring);
+        assert_eq!(t.transferred, 40);
+        assert_eq!(t.error.as_deref(), Some(SEND_INTERRUPTED));
+
+        // The recipient retries for hours, so the entry must outlive the
+        // listing window of finished transfers.
+        let later = Instant::now() + TERMINAL_TTL + Duration::from_secs(1);
+        assert_eq!(reg.list_at(later).len(), 1);
+
+        reg.provider_started(hash(1), a);
+        let t = &reg.list()[0];
+        assert_eq!(t.state, TransferState::Transferring);
+        assert_eq!(t.error, None);
+        reg.provider_finished(hash(1), a, true);
+        assert_eq!(reg.list()[0].state, TransferState::Done);
+    }
+
+    /// Nothing tells the sender that the recipient gave up or canceled, so an
+    /// interrupted send that is never pulled again must not stay in progress
+    /// for good. It is still an outstanding offer, cancelable here.
+    #[test]
+    fn an_interrupted_send_not_resumed_in_time_is_offered_again() {
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        let id = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_progress(hash(1), a, 40);
+        let now = Instant::now();
+        reg.provider_finished_at(hash(1), a, false, now);
+        let almost = now + RESUME_WINDOW - Duration::from_secs(1);
+        assert_eq!(reg.list_at(almost)[0].state, TransferState::Transferring);
+
+        let t = &reg.list_at(now + RESUME_WINDOW)[0];
+        assert_eq!(t.state, TransferState::Offered);
+        assert_eq!(t.error.as_deref(), Some(SEND_NOT_RESUMED));
+        // A pull later still shows, and the send can still be canceled.
+        reg.provider_started(hash(1), a);
+        assert_eq!(reg.list()[0].state, TransferState::Transferring);
+        assert_eq!(reg.cancel(id), Some((hash(1), a)));
     }
 
     #[test]
@@ -574,47 +712,6 @@ mod tests {
             reg.list()[0].state,
             TransferState::Offered,
             "id {id} must be unaffected"
-        );
-    }
-
-    #[test]
-    fn a_started_event_revives_a_failed_send_on_retry() {
-        // An aborted pull marks the send Failed; if the same peer later retries
-        // and actually completes the pull, the sender should end up Done, not
-        // stuck showing a failure for a file that did arrive.
-        let reg = TransferRegistry::new();
-        let a = peer(1);
-        reg.register_send(a, "photo.jpg".into(), 100, hash(1));
-        reg.provider_started(hash(1), a);
-        reg.provider_finished(hash(1), a, false);
-        assert_eq!(reg.list()[0].state, TransferState::Failed);
-
-        // The retry.
-        reg.provider_started(hash(1), a);
-        assert_eq!(reg.list()[0].state, TransferState::Transferring);
-        reg.provider_finished(hash(1), a, true);
-        assert_eq!(reg.list()[0].state, TransferState::Done);
-    }
-
-    #[test]
-    fn a_started_event_does_not_revive_a_failed_send_past_its_ttl() {
-        // An entry that failed long enough ago to be past TERMINAL_TTL is dead:
-        // it is only evicted lazily inside `list_at`, so one that hasn't been
-        // swept yet must still not be revived, or it would become permanently
-        // live again with no terminal event ever following.
-        let reg = TransferRegistry::new();
-        let a = peer(1);
-        reg.register_send(a, "photo.jpg".into(), 100, hash(1));
-        reg.provider_started(hash(1), a);
-        reg.provider_finished(hash(1), a, false);
-        assert_eq!(reg.list()[0].state, TransferState::Failed);
-
-        let later = Instant::now() + TERMINAL_TTL + Duration::from_secs(1);
-        reg.provider_started_at(hash(1), a, later);
-        assert!(
-            reg.list_at(later).is_empty(),
-            "a Started arriving after the entry aged out must not revive it: it is dead, \
-             so it is just evicted like any other expired terminal entry"
         );
     }
 

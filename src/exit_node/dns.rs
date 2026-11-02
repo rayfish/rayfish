@@ -3,6 +3,7 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use super::policy::is_transitable;
+use crate::dns::resolver::is_own_resolver;
 use crate::membership::{ExitFamilies, is_overlay_ip};
 use crate::transport::PUBLIC_FALLBACK_DNS;
 
@@ -20,10 +21,14 @@ pub(super) fn tunnel_upstreams(
     carries: ExitFamilies,
     configured: &crate::config::ServerOverride,
 ) -> Vec<SocketAddr> {
+    // Our own resolver address is no upstream: the resolver drops it, and a
+    // replacement made only of it would leave no override, so lookups would go
+    // to the captured system resolvers around the exit.
     let configured_servers: Vec<IpAddr> = configured
         .servers
         .iter()
         .filter_map(|s| s.parse().ok())
+        .filter(|ip| !is_own_resolver(*ip))
         .collect();
     // The gateway refuses private destinations, so a LAN resolver would only
     // time out ahead of the ones that work. Mesh resolvers do not use the exit.

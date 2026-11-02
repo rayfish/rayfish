@@ -4,9 +4,11 @@
 //! every platform: this used to live in `ssh`, which is Unix-only, so `v4bridge`
 //! reaching into it stopped the Windows build compiling.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
+use std::time::Duration;
 
 use anyhow::Result;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -40,6 +42,51 @@ pub(crate) fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     Ok(TcpListener::from_std(std_listener)?)
 }
 
+/// Pause between failed accepts so an accept loop neither dies nor spins.
+///
+/// Most accept errors are about the listener's process, not the listener:
+/// `EMFILE`/`ENFILE` when descriptors run out, `ECONNABORTED` for a client that
+/// gave up in the backlog. Ending the loop on one takes the whole service down
+/// for a single bad moment, and retrying at once on `EMFILE` is a busy loop,
+/// because the pending connection stays queued and the next accept fails the
+/// same way. So wait, doubling up to [`Self::MAX`], and start over after a
+/// success. A client giving up needs no wait (see [`Self::wait`]).
+pub(crate) struct AcceptBackoff {
+    delay: Duration,
+}
+
+impl AcceptBackoff {
+    const MIN: Duration = Duration::from_millis(5);
+    const MAX: Duration = Duration::from_secs(1);
+
+    pub(crate) const fn new() -> Self {
+        Self { delay: Self::MIN }
+    }
+
+    /// An accept succeeded: the next failure starts from the shortest wait.
+    pub(crate) fn reset(&mut self) {
+        self.delay = Self::MIN;
+    }
+
+    /// Log a failed accept and sleep before the next attempt.
+    ///
+    /// A client that reset or abandoned its connection in the backlog is
+    /// routine, not a fault of the listener: the next accept can succeed at
+    /// once, so it is logged at debug and not waited on.
+    pub(crate) async fn wait(&mut self, error: &io::Error, listener: &str) {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+        ) {
+            tracing::debug!(%error, listener, "client left before accept");
+            return;
+        }
+        tracing::warn!(%error, listener, retry_in = ?self.delay, "accept failed");
+        tokio::time::sleep(self.delay).await;
+        self.delay = (self.delay * 2).min(Self::MAX);
+    }
+}
+
 #[cfg(windows)]
 fn reserve_windows_endpoint(socket: &Socket) -> Result<()> {
     use std::io::Error as IoError;
@@ -64,12 +111,57 @@ fn reserve_windows_endpoint(socket: &Socket) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::net::Ipv4Addr;
+
+    use tokio::time::Instant;
 
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn accept_backoff_doubles_to_a_cap_and_resets() {
+        let error = io::Error::from_raw_os_error(24); // EMFILE
+        let mut backoff = AcceptBackoff::new();
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            let started = Instant::now();
+            backoff.wait(&error, "test").await;
+            waits.push(started.elapsed());
+        }
+        assert_eq!(waits[0], AcceptBackoff::MIN);
+        assert_eq!(waits[1], AcceptBackoff::MIN * 2);
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*waits.last().unwrap(), AcceptBackoff::MAX);
+
+        backoff.reset();
+        let started = Instant::now();
+        backoff.wait(&error, "test").await;
+        assert_eq!(started.elapsed(), AcceptBackoff::MIN);
+    }
+
+    /// A client that gave up in the backlog is routine: the next accept can
+    /// succeed at once, so there is no wait and the backoff does not grow.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_giving_up_is_not_backed_off() {
+        let mut backoff = AcceptBackoff::new();
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            let started = Instant::now();
+            backoff.wait(&io::Error::from(kind), "test").await;
+            assert_eq!(started.elapsed(), Duration::ZERO, "{kind:?}");
+        }
+        let started = Instant::now();
+        backoff
+            .wait(&io::Error::from_raw_os_error(24), "test")
+            .await;
+        assert_eq!(started.elapsed(), AcceptBackoff::MIN);
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn windows_listener_rejects_a_competing_reuse_address_bind() {
         let listener = bind_listener(Ipv4Addr::LOCALHOST.into(), 0)

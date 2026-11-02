@@ -73,10 +73,36 @@ pub fn encode_network_record(
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
 ) -> Result<SignedPacket> {
+    encode_network_record_at(
+        key,
+        blob_hash,
+        seed_peers,
+        crate::transport::MESH_RECORD_VERSION,
+    )
+}
+
+/// [`encode_network_record`], advertising `mesh_version` instead of ours, as a
+/// coordinator on another build publishes it.
+#[cfg(test)]
+pub(crate) fn encode_foreign_network_record(
+    key: &SecretKey,
+    blob_hash: &blake3::Hash,
+    seed_peers: &[EndpointId],
+    mesh_version: u32,
+) -> Result<SignedPacket> {
+    encode_network_record_at(key, blob_hash, seed_peers, mesh_version)
+}
+
+fn encode_network_record_at(
+    key: &SecretKey,
+    blob_hash: &blake3::Hash,
+    seed_peers: &[EndpointId],
+    mesh_version: u32,
+) -> Result<SignedPacket> {
     let mut values = vec![
         RECORD_VERSION.to_string(),
         format!("h,{blob_hash}"),
-        format!("m,{}", crate::transport::MESH_RECORD_VERSION),
+        format!("m,{mesh_version}"),
         format!("d,{}", destruction::discovery_key(key).public()),
     ];
     for peer in seed_peers {

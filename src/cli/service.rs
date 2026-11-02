@@ -156,7 +156,7 @@ pub(crate) async fn cmd_up(
                 // else leaves the claim to be rolled back on drop.
                 #[cfg(windows)]
                 operator_claim.commit();
-                println!("{message}");
+                println!("{}", style::printable_lines(&message));
             }
             ipc::IpcMessage::Error { message } => fail_with("error", &message),
             other => fail_unexpected(&other),
@@ -493,7 +493,7 @@ pub(crate) async fn cmd_stop() -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    InitSystem::require()?.stop();
+    InitSystem::require()?.stop()?;
 
     #[cfg(target_os = "macos")]
     run_cmd(

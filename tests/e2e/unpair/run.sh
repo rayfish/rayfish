@@ -73,7 +73,7 @@ INV_C="$(mint_invite "$A" "$NET" srv-c)"
 [[ -n "$INV_B" ]] && on "$B" "ray join $INV_B" 2>&1 | strip | sed 's/^/   b| /'
 [[ -n "$INV_C" ]] && on "$C" "ray join $INV_C" 2>&1 | strip | sed 's/^/   c| /'
 wait_roster "$A" srv-b srv-c
-SB="$(on "$B" 'ray status' | strip)"; SC="$(on "$C" 'ray status' | strip)"
+SB="$(on "$B" 'ray status --ips' | strip)"; SC="$(on "$C" 'ray status --ips' | strip)"
 B_IP="$(own_ip "$SB")"; C_IP="$(own_ip "$SC")"
 echo "   B_IP=$B_IP  C_IP=$C_IP"
 # Hard stop, not a skipped probe. Step 5 asserts revocation by pinging $B_IP and

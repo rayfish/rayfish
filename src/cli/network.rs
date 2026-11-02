@@ -16,18 +16,13 @@ pub(crate) async fn ipc_create(
     } else {
         None
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Create {
-            mode,
-            name,
-            hostname,
-            transport,
-        },
-    )
+    let resp = ipc_request(ipc::IpcMessage::Create {
+        mode,
+        name,
+        hostname,
+        transport,
+    })
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Created {
             name,
@@ -91,29 +86,24 @@ pub(crate) async fn ipc_join(
         ),
         Err(_) => (network_key.to_string(), None, None),
     };
-    let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::Join {
-            network_key,
-            name: name.map(|s| s.to_string()),
-            hostname,
-            transport,
-            invite,
-            coordinator,
-            auto_accept_firewall,
-            auto_accept_files,
-        },
-    )
-    .await?;
     // Joining dials the coordinator and runs the handshake daemon-side, so this
     // can take a few seconds, show a spinner while we wait.
     let spinner = progress::spinner("joining…");
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = ipc_request(ipc::IpcMessage::Join {
+        network_key,
+        name: name.map(|s| s.to_string()),
+        hostname,
+        transport,
+        invite,
+        coordinator,
+        auto_accept_firewall,
+        auto_accept_files,
+    })
+    .await?;
     spinner.finish_and_clear();
     match resp {
         ipc::IpcMessage::Ok { message } => {
-            println!("{}", message);
+            println!("{}", style::printable_lines(&message));
         }
         ipc::IpcMessage::Joined { name, my_ipv6 } => {
             let dns = format!("{name}.{DNS_DOMAIN}");
@@ -164,7 +154,7 @@ pub(crate) async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
 /// asks. `--yes` sends the confirmed request straight away.
 pub(crate) async fn ipc_kick(network: &str, peer: &str, yes: bool) -> Result<()> {
     match send_kick(network, peer, yes).await? {
-        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", style::printable_lines(&message)),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         ipc::IpcMessage::KickConfirm {
             network: net,
@@ -289,6 +279,11 @@ pub(crate) fn format_ttl(secs: u64) -> String {
 /// `ray ephemeral <net> <duration|off|show>`: set, clear, or print a network's
 /// ephemeral auto-kick TTL.
 pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
+    // Parse before connecting so a bad duration fails without a daemon round trip.
+    let ttl_secs = match arg {
+        "show" | "off" => None,
+        _ => Some(parse_ephemeral_duration(arg).map_err(anyhow::Error::msg)?),
+    };
     let mut stream = ipc::connect().await?;
     if arg == "show" {
         ipc::send(
@@ -315,17 +310,6 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
         }
         return Ok(());
     }
-    let ttl_secs = if arg == "off" {
-        None
-    } else {
-        match parse_ephemeral_duration(arg) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                print_error("error", &e, None);
-                return Ok(());
-            }
-        }
-    };
     ipc::send(
         &mut stream,
         ipc::IpcMessage::NetConfigSet {
@@ -351,12 +335,15 @@ pub(crate) fn parse_ephemeral_duration(s: &str) -> Result<u64, String> {
     let n: u64 = num
         .parse()
         .map_err(|_| format!("invalid duration '{s}' (use Nh, Nd, or Nw)"))?;
-    let secs = match unit {
-        "h" => n * 3600,
-        "d" => n * 86_400,
-        "w" => n * 604_800,
+    let unit_secs: u64 = match unit {
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 604_800,
         other => return Err(format!("unknown unit '{other}' (use h, d, or w)")),
     };
+    let secs = n
+        .checked_mul(unit_secs)
+        .ok_or_else(|| format!("duration '{s}' is too large"))?;
     if secs < 3600 {
         return Err("minimum ephemeral TTL is 1h".to_string());
     }
@@ -365,7 +352,15 @@ pub(crate) fn parse_ephemeral_duration(s: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ephemeral_duration;
+    use super::{ipc_ephemeral, parse_ephemeral_duration};
+
+    /// A bad duration is a failure, and is caught before any daemon is
+    /// contacted.
+    #[tokio::test]
+    async fn invalid_ephemeral_duration_fails_before_connecting() {
+        let error = ipc_ephemeral("net", "garbage").await.unwrap_err();
+        assert!(error.to_string().contains("invalid duration"), "{error}");
+    }
 
     #[test]
     fn parses_valid_durations() {
@@ -383,5 +378,6 @@ mod tests {
         assert!(parse_ephemeral_duration("garbage").is_err());
         assert!(parse_ephemeral_duration("5").is_err()); // no unit
         assert!(parse_ephemeral_duration("").is_err());
+        assert!(parse_ephemeral_duration("18446744073709551615w").is_err()); // overflows
     }
 }
