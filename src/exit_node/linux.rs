@@ -467,7 +467,9 @@ pub fn disable() {
 #[cfg(target_os = "linux")]
 pub(super) fn is_bypass_source(addr: IpAddr) -> bool {
     if crate::membership::is_overlay_ip(addr)
-        || matches!(addr, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4) || v4 == ipv4::CLIENT_ADDR)
+        || matches!(addr, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4)
+            || v4 == ipv4::LOCAL_CLIENT_ADDR
+            || v4 == ipv4::WIRE_CLIENT_ADDR)
     {
         return false;
     }
@@ -767,10 +769,20 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
         "-4",
         "addr",
         "replace",
-        &format!("{}/32", ipv4::CLIENT_ADDR),
+        &format!("{}/32", ipv4::LOCAL_CLIENT_ADDR),
         "dev",
         tun_name,
     ])?;
+    // Older builds put the wire address on the TUN. Best-effort: it is normally
+    // gone with the TUN that held it, and a leftover only adds a second address.
+    let _ = run_ip(&[
+        "-4",
+        "addr",
+        "del",
+        &format!("{}/32", ipv4::WIRE_CLIENT_ADDR),
+        "dev",
+        tun_name,
+    ]);
     for family in ["-4", "-6"] {
         // Give the tunnel table the prefixes another VPN serves out of a table of
         // its own, or our catch-all rule swallows them (see the fn docs).
@@ -781,7 +793,7 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
             "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
         ]);
         if family == "-4" {
-            default.extend(["src".to_string(), ipv4::CLIENT_ADDR.to_string()]);
+            default.extend(["src".to_string(), ipv4::LOCAL_CLIENT_ADDR.to_string()]);
         }
         // Behind the tunnel default, so a lookup that loses it (the TUN went
         // away, or someone flushed its route) stops here instead of falling
@@ -923,8 +935,10 @@ pub fn teardown_client_routing(tun_name: Option<&str>) {
         let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
     }
     if let Some(tun) = tun_name {
-        let address = format!("{}/32", ipv4::CLIENT_ADDR);
-        let _ = run_ip(&["-4", "addr", "del", &address, "dev", tun]);
+        for addr in [ipv4::LOCAL_CLIENT_ADDR, ipv4::WIRE_CLIENT_ADDR] {
+            let address = format!("{addr}/32");
+            let _ = run_ip(&["-4", "addr", "del", &address, "dev", tun]);
+        }
     }
     let _ = nft_load(&drop_table(CLIENT_TABLE));
     tracing::info!("exit-node client full-tunnel routing removed");

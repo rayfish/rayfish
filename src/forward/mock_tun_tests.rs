@@ -74,6 +74,7 @@ struct Harness {
     firewall: SharedFirewall,
     stats: Arc<ForwardMetrics>,
     active: Arc<AtomicBool>,
+    exit: ExitContext,
     reads_started: mpsc::Receiver<()>,
     dial_completed: mpsc::Sender<(EndpointId, bool)>,
     input: Option<mpsc::Sender<Input>>,
@@ -114,6 +115,11 @@ impl Harness {
             Arc::clone(&active),
             Arc::clone(&stats),
         );
+        // Shared by every reader, so a test can select an exit after start.
+        let exit = ExitContext {
+            my_v6: local_ipv6,
+            ..Default::default()
+        };
         let mut peers = Vec::new();
         let mut readers = Vec::new();
         for _ in 0..peer_count {
@@ -146,10 +152,7 @@ impl Harness {
                     token: token.clone(),
                     stats: Arc::clone(&stats),
                     device_user_map: DeviceUserMap::new(),
-                    exit: ExitContext {
-                        my_v6: local_ipv6,
-                        ..Default::default()
-                    },
+                    exit: exit.clone(),
                 },
             ));
             peers.push(Peer {
@@ -191,6 +194,7 @@ impl Harness {
             firewall,
             stats,
             active,
+            exit,
             reads_started,
             dial_completed,
             input: Some(input),
@@ -881,6 +885,51 @@ async fn udp_conntrack_admits_only_the_requested_return_flow() {
         h.dropped(DropReason::Firewall, 2).await;
         assert_eq!(h.stats.packets_rx.get(), 1);
         assert!(h.output.try_recv().is_err());
+        h.shutdown().await;
+    }
+}
+
+/// An IPv4 exit flow leaves on the mesh from the wire client address and its
+/// reply reaches the TUN at the local one, through the real send and receive
+/// paths, with the firewall's conntrack admitting the reply.
+#[tokio::test]
+async fn ipv4_exit_packets_carry_the_wire_address_on_the_mesh_only() {
+    use super::tests::checksummed_tcp_v4;
+    use crate::exit_node::ExitSelection;
+    use crate::membership::ExitFamilies;
+    use std::net::Ipv4Addr;
+
+    let internet = Ipv4Addr::new(8, 8, 8, 8);
+    for engine in ENGINES {
+        let mut h = Harness::new(engine, 1, policy(Action::Allow, vec![])).await;
+        let gateway = h.peers[0].ipv6;
+        h.exit.client.set(Some(ExitSelection {
+            carries: ExitFamilies::Dual,
+            peer_user: h.peers[0].endpoint.id(),
+            ipv6: gateway,
+            network: SmolStr::new("mesh"),
+        }));
+        let route = h
+            .table
+            .route_on_network(&gateway, "mesh")
+            .expect("route to the gateway");
+        let syn = checksummed_tcp_v4(ipv4::LOCAL_CLIENT_ADDR, internet, 50000, 443, 2);
+        let ctx = SendCtx {
+            active: &h.active,
+            firewall: &h.firewall,
+            peers: &h.table,
+            stats: &h.stats,
+            tun_tx: &h.tun_tx,
+        };
+        let info = firewall::parse_packet_info(&syn).expect("valid SYN");
+        send_over_route(&ctx, &route, &info, syn.clone()).await;
+        let on_wire = checksummed_tcp_v4(ipv4::WIRE_CLIENT_ADDR, internet, 50000, 443, 2);
+        h.receive_peer(0, &on_wire).await;
+
+        let reply = checksummed_tcp_v4(internet, ipv4::WIRE_CLIENT_ADDR, 443, 50000, 0x12);
+        h.inject_peer(0, &reply);
+        let delivered = checksummed_tcp_v4(internet, ipv4::LOCAL_CLIENT_ADDR, 443, 50000, 0x12);
+        assert_eq!(h.receive_tun().await, delivered);
         h.shutdown().await;
     }
 }
