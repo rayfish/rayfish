@@ -2348,6 +2348,7 @@ mod coordinator_restore_tests {
 
     fn blob(members: Vec<Member>) -> crate::membership::GroupBlob {
         crate::membership::GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.into(),
             approved: Default::default(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -2440,6 +2441,8 @@ mod coordinator_restore_tests {
             pending_hostname: Some("queued-rename".to_string()),
             transport: Some(config::TransportMode::Tor),
             auto_accept_firewall: true,
+            accept_dns: false,
+            dns_upstreams: Vec::new(),
             ephemeral_ttl_secs: Some(7_200),
             exit_allow: vec!["*".to_string()],
             ..Default::default()

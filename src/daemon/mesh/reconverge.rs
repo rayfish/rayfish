@@ -983,6 +983,7 @@ mod reconverge_tests {
     fn state_with_members(members: Vec<Member>) -> SharedNetworkState {
         Arc::new(RwLock::new(NetworkState {
             group: GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: MemberList::from(members),
                 approved: ApprovedList::new(),
                 suggested_firewall: SuggestedFirewall::default(),

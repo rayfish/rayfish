@@ -119,6 +119,8 @@ setting_keys! {
     /// alongside it, which is why they ride `NetConfigSet`/`NetConfigGet` and
     /// are unrepresentable on `ConfigSet`.
     NetworkKey {
+        DnsUpstreams = "net.dns-upstreams", "coordinator: DNS resolver IPs or mesh hostnames (comma-separated, empty to clear)";
+        AcceptDns = "net.accept-dns", "use this network's DNS resolvers (on|off)";
         AutoAcceptFirewall = "net.auto-accept-firewall", "install coordinator-suggested rules without review (on|off)";
         AutoAcceptFiles = "net.auto-accept-files", "auto-accept file offers from your own devices (on|off)";
         EphemeralTtl = "net.ephemeral-ttl", "coordinator: drop members offline longer than N seconds (>=3600, empty to disable)";

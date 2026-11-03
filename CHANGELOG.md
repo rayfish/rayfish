@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ray apply` accepts a `dns` map of network names to resolver IP addresses or mesh hostnames.
+  Members opt in with `ray config set net.accept-dns on --net <network>`.
+  The first opted-in network alphabetically wins; Magic DNS fails queries when
+  its resolvers are unavailable instead of falling back to system DNS.
+  Resolver hosts skip policies that name themselves.
+
+### Changed
+
+- Mesh protocol version 8 carries signed network DNS policy. Network members
+  must upgrade together; older builds cannot read the extended signed roster.
+
 ## [0.5.15] - 2026-11-03
 
 ### Fixed

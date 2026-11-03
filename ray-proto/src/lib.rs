@@ -4,6 +4,7 @@
 //! enum over a length-prefixed msgpack Unix socket. This crate is the single source
 //! of truth for that protocol so frontends never hand-mirror it.
 
+pub mod dns;
 pub mod firewall;
 pub mod invite;
 pub mod ipc;

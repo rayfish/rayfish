@@ -108,17 +108,15 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// again is not taken for one about the new pairing. A v6 or v5 connection
 /// carries the bare `ControlMsg::Unpaired` instead; nothing else differs from
 /// v6.
-pub const MESH_PROTOCOL_VERSION: u32 = 7;
+/// Version 8 appends network DNS policy to the signed group blob.
+/// Older builds reject the longer array, so they must upgrade before joining.
+pub const MESH_PROTOCOL_VERSION: u32 = 8;
 /// Older mesh versions this build speaks, newest first. Add a version here only
 /// after its connection-scoped wire behavior is implemented and tested.
 pub const MESH_BACKWARDS_COMPAT: &[u32] = &[6, 5];
-/// Keep the signed network record readable by v5 clients during the rollout.
-/// Once v5 support is removed, this can advance with the mesh ALPN.
-pub const MESH_RECORD_VERSION: u32 = if MESH_BACKWARDS_COMPAT.is_empty() {
-    MESH_PROTOCOL_VERSION
-} else {
-    MESH_BACKWARDS_COMPAT[MESH_BACKWARDS_COMPAT.len() - 1]
-};
+/// Group blobs now carry DNS policy. Older peers may still receive compatible
+/// control messages, but new joins must understand the signed roster format.
+pub const MESH_RECORD_VERSION: u32 = MESH_PROTOCOL_VERSION;
 pub const MESH_V6_ALPN: &[u8] = b"rayfish/mesh/6";
 pub const MESH_V5_ALPN: &[u8] = b"rayfish/mesh/5";
 

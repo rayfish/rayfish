@@ -6,6 +6,7 @@ use std::io::IsTerminal;
 use crate::*;
 use firewall::Action;
 use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey, NodeStatus};
+use ray_proto::dns::DnsUpstream;
 
 #[derive(serde::Serialize)]
 struct FirewallStateOutput<'a> {
@@ -797,7 +798,10 @@ pub(crate) async fn ipc_apply(
         status_networks.iter().map(|n| n.name.as_str()).collect();
 
     // Expand groups/aliases against live status into a pure hostname-keyed spec.
-    let mut expanded = apply::DeploySpec::default();
+    let mut expanded = apply::DeploySpec {
+        dns: spec.dns.clone(),
+        ..Default::default()
+    };
     let mut deliveries = Vec::new();
     for (net_name, fw) in &spec.networks {
         // Seed from the network's stored `ray alias` map (already canonical), then
@@ -816,7 +820,7 @@ pub(crate) async fn ipc_apply(
             .into_iter()
             .map(|hostname| hostname.parse())
             .collect::<Result<HashSet<ipc::MachineHostname>, _>>()?;
-        let (efw, empty_aliases) =
+        let (mut efw, empty_aliases) =
             apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve, &current)?;
         deliveries.extend(planned_deliveries(net_name, &net_aliases, &empty_aliases));
         for a in empty_aliases {
@@ -824,6 +828,13 @@ pub(crate) async fn ipc_apply(
                 "{}  {net_name}: alias '{a}' has no joined devices yet; resolves to no hosts",
                 style::faint("note:")
             );
+        }
+        if let Some(dns) = spec.dns.get(net_name) {
+            for host in &dns.upstreams {
+                if let DnsUpstream::Peer(host) = host {
+                    efw.entry(host.to_string()).or_default();
+                }
+            }
         }
         expanded.networks.insert(net_name.clone(), efw);
     }
@@ -887,6 +898,33 @@ pub(crate) async fn ipc_apply(
             Err(e) => {
                 network_failures = true;
                 eprintln!("{}   suggest skipped: {e:#}", style::red("  !"));
+            }
+        }
+
+        if let Some(dns) = expanded
+            .dns
+            .get(net_name)
+            .cloned()
+            .or_else(|| prune.then(apply::DeployDns::default))
+        {
+            let value = dns
+                .upstreams
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            match ipc_request(ipc::IpcMessage::NetConfigSet {
+                network: net_name.clone(),
+                key: ray_proto::settings::NetworkKey::DnsUpstreams,
+                value,
+            })
+            .await?
+            {
+                ipc::IpcMessage::Ok { message } => println!("{message}"),
+                other => {
+                    network_failures = true;
+                    eprintln!("DNS policy failed: {other:?}");
+                }
             }
         }
 

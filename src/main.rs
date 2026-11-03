@@ -419,7 +419,7 @@ async fn run() -> Result<()> {
         Command::Mdns { action, json: _ } => cmd_mdns(action).await,
         Command::Dns { action, json: _ } => cmd_dns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
-        Command::Config { action, .. } => cmd_config(action).await,
+        Command::Config { action, net, .. } => cmd_config(action, net).await,
         #[cfg(not(all(target_os = "macos", feature = "macos-app")))]
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
@@ -525,7 +525,38 @@ impl DisplayOut for ConfigOutput<'_> {
     }
 }
 
-async fn cmd_config(action: Option<ConfigAction>) -> Result<()> {
+async fn cmd_config(action: Option<ConfigAction>, network: Option<String>) -> Result<()> {
+    if let Some(network) = network {
+        let request = match action.unwrap_or(ConfigAction::Get { key: None }) {
+            ConfigAction::Get { key } => ipc::IpcMessage::NetConfigGet {
+                network,
+                key: key
+                    .map(|k| k.parse())
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?,
+            },
+            ConfigAction::Set { key, value, .. } => ipc::IpcMessage::NetConfigSet {
+                network,
+                key: key.parse().map_err(anyhow::Error::msg)?,
+                value,
+            },
+            ConfigAction::Unset { key } => ipc::IpcMessage::NetConfigSet {
+                network,
+                key: key.parse().map_err(anyhow::Error::msg)?,
+                value: String::new(),
+            },
+        };
+        match ipc_request(request).await? {
+            ipc::IpcMessage::ConfigValues { rows } => printout(&ConfigOutput {
+                values: rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
+                rows: &rows,
+            })?,
+            ipc::IpcMessage::Ok { message } => print_message(&message)?,
+            ipc::IpcMessage::Error { message } => fail_with("error", &message),
+            other => fail_unexpected(&other),
+        }
+        return Ok(());
+    }
     match action.unwrap_or(ConfigAction::Get { key: None }) {
         ConfigAction::Get { key } => {
             // Before the connect, so a bad key reads the same whether or not the

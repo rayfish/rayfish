@@ -296,6 +296,21 @@ pub const EPHEMERAL_TTL_FLOOR_SECS: u64 = 3600;
 /// draining queued file offers), neither of which happens here.
 pub fn apply_network(cfg: &mut NetworkConfig, key: NetworkKey, value: &str) -> Result<()> {
     match key {
+        NetworkKey::AcceptDns => cfg.accept_dns = parse_bool(value, false)?,
+        NetworkKey::DnsUpstreams => {
+            cfg.dns_upstreams = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                value
+                    .split(',')
+                    .map(|v| v.trim().parse())
+                    .collect::<Result<_, _>>()?
+            };
+            anyhow::ensure!(
+                cfg.dns_upstreams.len() <= 8,
+                "at most eight DNS upstreams per network"
+            );
+        }
         NetworkKey::AutoAcceptFirewall => cfg.auto_accept_firewall = parse_bool(value, false)?,
         NetworkKey::AutoAcceptFiles => cfg.auto_accept_files = parse_bool(value, true)?,
         NetworkKey::EphemeralTtl => {
@@ -318,6 +333,13 @@ pub fn apply_network(cfg: &mut NetworkConfig, key: NetworkKey, value: &str) -> R
 
 pub fn render_network(cfg: &NetworkConfig, key: NetworkKey) -> String {
     match key {
+        NetworkKey::AcceptDns => on_off(cfg.accept_dns),
+        NetworkKey::DnsUpstreams => cfg
+            .dns_upstreams
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         NetworkKey::AutoAcceptFirewall => on_off(cfg.auto_accept_firewall),
         NetworkKey::AutoAcceptFiles => on_off(cfg.auto_accept_files),
         NetworkKey::EphemeralTtl => match cfg.ephemeral_ttl_secs {
@@ -671,5 +693,25 @@ mod tests {
         apply_firewall(&mut fw, FirewallKey::DefaultIn, "allow").unwrap();
         assert_eq!(render_firewall(&fw, FirewallKey::DefaultIn), "allow");
         assert!(apply_firewall(&mut fw, FirewallKey::DefaultIn, "maybe").is_err());
+    }
+    #[test]
+    fn network_dns_requires_opt_in_and_settings_survive_restart() {
+        let mut net = NetworkConfig::default();
+        assert!(!net.accept_dns);
+        apply_network(&mut net, NetworkKey::DnsUpstreams, "1.1.1.1,dns-two").unwrap();
+        assert!(!net.accept_dns);
+        apply_network(&mut net, NetworkKey::AcceptDns, "on").unwrap();
+        let saved = toml::to_string(&net).unwrap();
+        let restored: NetworkConfig = toml::from_str(&saved).unwrap();
+        assert!(restored.accept_dns);
+        assert_eq!(
+            render_network(&restored, NetworkKey::DnsUpstreams),
+            "1.1.1.1,dns-two"
+        );
+        assert!(apply_network(&mut net, NetworkKey::DnsUpstreams, "bad.name").is_err());
+        apply_network(&mut net, NetworkKey::AcceptDns, "").unwrap();
+        assert!(!net.accept_dns);
+        apply_network(&mut net, NetworkKey::DnsUpstreams, "").unwrap();
+        assert!(net.dns_upstreams.is_empty());
     }
 }

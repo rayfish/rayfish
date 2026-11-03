@@ -161,7 +161,7 @@ pub fn write_dns_config(search_domains: &[super::SearchDomain], tun_name: &str) 
     // resolution is forwarded upstream *through the tunnel* (from the daemon)
     // instead of leaking out the physical link, where macOS scopes the query
     // and it never traverses the exit. Split (.ray only) when no exit is up.
-    if crate::exit_node::full_tunnel_active() {
+    if crate::exit_node::full_tunnel_active() || crate::dns::resolver::network_dns_active() {
         match_domains.push(CFString::new(""));
     }
     let match_val = CFArray::from_CFTypes(&match_domains);
@@ -367,7 +367,7 @@ impl DnsConfigurator for MacosDynamicStoreDns {
         tracing::info!(
             key = SC_DNS_KEY,
             interface = %self.tun_name,
-            full_tunnel = crate::exit_node::full_tunnel_active(),
+            full_tunnel = (crate::exit_node::full_tunnel_active() || crate::dns::resolver::network_dns_active()),
             "configured macOS DNS via SCDynamicStore"
         );
         Ok(())

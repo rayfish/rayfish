@@ -888,6 +888,7 @@ mod tests {
     fn state_with_snapshot(hash: blake3::Hash) -> SharedNetworkState {
         Arc::new(RwLock::new(NetworkState {
             group: GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: MemberList::new(),
                 approved: ApprovedList::new(),
                 suggested_firewall: SuggestedFirewall::default(),
