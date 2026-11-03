@@ -1,6 +1,6 @@
 [package]
 name = "rayfish"
-version = "0.5.14"
+version = "0.5.15"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
