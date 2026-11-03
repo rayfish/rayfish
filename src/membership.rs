@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use anyhow::{Result, bail};
 use iroh::EndpointId;
 use ray_proto::SuggestedFirewall;
+use ray_proto::ipc::MachineHostname;
 use serde::{Deserialize, Serialize};
 
 use crate::control::DeviceCert;
@@ -518,6 +519,9 @@ pub struct GroupBlob {
     /// Serde-default empty for back-compat with pre-nullifier blobs.
     #[serde(default)]
     pub nullifiers: BTreeSet<EndpointId>,
+    /// Coordinator-selected resolver hostnames. Members opt in locally.
+    #[serde(default)]
+    pub dns_upstreams: Vec<MachineHostname>,
 }
 
 impl ReusableKey {
@@ -953,6 +957,7 @@ mod tests {
             name: Option<String>,
             reusable_keys: BTreeMap<String, ReusableKey>,
             nullifiers: BTreeSet<EndpointId>,
+            dns_upstreams: Vec<MachineHostname>,
         }
         let string_sorted = rmp_serde::to_vec(&OldBlob {
             members: sorted_members,
@@ -961,10 +966,12 @@ mod tests {
             name: Some("lab".into()),
             reusable_keys: BTreeMap::new(),
             nullifiers: BTreeSet::new(),
+            dns_upstreams: Vec::new(),
         })
         .unwrap();
         assert_eq!(
             canonical_group_bytes(&GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: members.clone(),
                 approved: approved.clone(),
                 suggested_firewall: SuggestedFirewall::default(),
@@ -1038,6 +1045,7 @@ mod tests {
         let members = make_member_list(&[1, 2, 3]);
         let approved = ApprovedList::new();
         let a = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1046,6 +1054,7 @@ mod tests {
             nullifiers: BTreeSet::new(),
         });
         let b = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1063,6 +1072,7 @@ mod tests {
         let approved = ApprovedList::new();
         assert_eq!(
             canonical_group_bytes(&GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: m1.clone(),
                 approved: approved.clone(),
                 suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1071,6 +1081,7 @@ mod tests {
                 nullifiers: BTreeSet::new()
             }),
             canonical_group_bytes(&GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: m2.clone(),
                 approved: approved.clone(),
                 suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1086,6 +1097,7 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
         let h1 = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1095,6 +1107,7 @@ mod tests {
         });
         let members2 = make_member_list(&[1, 2, 3]);
         let h2 = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members2.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1118,6 +1131,7 @@ mod tests {
         });
 
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1135,6 +1149,7 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1143,6 +1158,7 @@ mod tests {
             nullifiers: BTreeSet::new(),
         });
         let hash = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1180,6 +1196,7 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: ray_proto::SuggestedFirewall::default(),
@@ -1210,6 +1227,7 @@ mod tests {
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1218,6 +1236,7 @@ mod tests {
             nullifiers: BTreeSet::new(),
         });
         let hash = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1249,6 +1268,7 @@ mod tests {
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1258,6 +1278,7 @@ mod tests {
         });
         assert!(!String::from_utf8_lossy(&bytes).contains("last_seen"));
         let hash = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1282,6 +1303,7 @@ mod tests {
 
         // Deterministic: BTreeMap keys canonicalize regardless of insert order.
         let a = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1290,6 +1312,7 @@ mod tests {
             nullifiers: BTreeSet::new(),
         });
         let b = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1301,6 +1324,7 @@ mod tests {
 
         // Suggestions are part of the signed content, so they change the hash.
         let h_empty = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: SuggestedFirewall::new(),
@@ -1309,6 +1333,7 @@ mod tests {
             nullifiers: BTreeSet::new(),
         });
         let h_sf = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1342,6 +1367,7 @@ mod tests {
         sf.insert("*".to_string(), hs.clone());
 
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: ApprovedList::new(),
             suggested_firewall: sf.clone(),
@@ -1491,6 +1517,7 @@ mod tests {
             });
         }
         let compact = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::from(members),
             approved: ApprovedList::new(),
             suggested_firewall: SuggestedFirewall::new(),
@@ -1726,6 +1753,7 @@ mod tests {
         keys.insert(hash, key);
 
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -1745,6 +1773,7 @@ mod tests {
         let approved = ApprovedList::new();
         let empty = BTreeMap::new();
         let h0 = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -1758,6 +1787,7 @@ mod tests {
         let mut keys = BTreeMap::new();
         keys.insert(hash.clone(), key);
         let h1 = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -1770,6 +1800,7 @@ mod tests {
         // Revoking is a content change → the hash must change again so peers reconverge.
         keys.get_mut(&hash).unwrap().revoked = true;
         let h2 = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -1791,6 +1822,7 @@ mod tests {
         let keys = BTreeMap::new();
 
         let h0 = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1801,6 +1833,7 @@ mod tests {
         let mut nullifiers = BTreeSet::new();
         nullifiers.insert(test_id(7));
         let h1 = group_blob_hash(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1813,6 +1846,7 @@ mod tests {
         // A blob encoded without the field decodes with an empty nullifier set
         // (serde default), so pre-nullifier blobs stay valid.
         let bytes = canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.clone(),
             approved: approved.clone(),
             suggested_firewall: sf.clone(),
@@ -1888,6 +1922,7 @@ mod tests {
             let mut keys = BTreeMap::new();
             keys.insert(hash, key);
             GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: MemberList::new(),
                 approved: ApprovedList::new(),
                 suggested_firewall: SuggestedFirewall::default(),
@@ -1924,5 +1959,22 @@ mod tests {
         });
         mark_coordinator(&mut list, &id);
         assert!(list.get(&id).unwrap().is_coordinator);
+    }
+    #[test]
+    fn dns_policy_is_signed_and_survives_blob_roundtrip() {
+        let mut blob = GroupBlob {
+            members: MemberList::new(),
+            approved: ApprovedList::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: None,
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            dns_upstreams: Vec::new(),
+        };
+        let before = group_blob_hash(&blob);
+        blob.dns_upstreams.push("dns-server".parse().unwrap());
+        assert_ne!(before, group_blob_hash(&blob));
+        let decoded = decode_group_blob(&canonical_group_bytes(&blob)).unwrap();
+        assert_eq!(decoded.dns_upstreams, blob.dns_upstreams);
     }
 }

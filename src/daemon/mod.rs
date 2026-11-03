@@ -1367,6 +1367,8 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
 fn net_set_message(net: &NetworkConfig, network: &str, key: NetworkKey) -> String {
     let on_off = |v: bool| if v { "enabled" } else { "disabled" };
     match key {
+        NetworkKey::AcceptDns => format!("network DNS {} for '{network}'", on_off(net.accept_dns)),
+        NetworkKey::DnsUpstreams => format!("DNS policy saved for '{network}'"),
         NetworkKey::AutoAcceptFirewall => format!(
             "auto-accept firewall suggestions {} for '{network}'",
             on_off(net.auto_accept_firewall)

@@ -429,6 +429,7 @@ impl NetworkRegistry {
     /// the data plane is down does not withdraw an offer `activate()` is about to
     /// re-advertise.
     pub(crate) async fn sync_exit_offers(&self) {
+        self.refresh_network_dns().await;
         if !self.exit_sync_enabled.load(Ordering::Relaxed) {
             tracing::debug!("exit offer sync disabled (data plane down); skipping");
             return;

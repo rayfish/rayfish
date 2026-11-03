@@ -248,6 +248,12 @@ pub struct NetworkConfig {
     /// or toggled later with `ray firewall auto-accept <net> on|off`.
     #[serde(default, alias = "allow_trusted")]
     pub auto_accept_firewall: bool,
+    /// Use signed DNS policy from this network. Local opt-in, off by default.
+    #[serde(default)]
+    pub accept_dns: bool,
+    /// Coordinator-authored resolver hostnames; the signed blob is authoritative.
+    #[serde(default)]
+    pub dns_upstreams: Vec<MachineHostname>,
     /// Auto-accept incoming file offers from our own paired devices on this
     /// network (no manual `ray files accept`). Own-devices-only (the sender's
     /// user identity must match ours), so it is safe on by default. Opt out per
@@ -493,6 +499,8 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         last_record_timestamp: None,
         transport: None,
         auto_accept_firewall: false,
+        accept_dns: false,
+        dns_upstreams: Vec::new(),
         auto_accept_files: true,
         admins: vec![],
         direct: false,

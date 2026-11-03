@@ -43,6 +43,7 @@ impl Drop for ConfigDir {
 fn empty_state(net_pubkey: EndpointId, name: &str) -> SharedNetworkState {
     let mut state = NetworkState {
         group: GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::new(),
             approved: ApprovedList::new(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -472,6 +473,7 @@ async fn cache_member_network(
         members.add(roster_row(*other, true, None));
     }
     let bytes = crate::membership::canonical_group_bytes(&GroupBlob {
+        dns_upstreams: Vec::new(),
         members: members.clone(),
         approved: ApprovedList::new(),
         suggested_firewall: SuggestedFirewall::default(),
@@ -659,7 +661,7 @@ async fn a_warm_resume_records_an_incompatible_mesh_version() {
     let registry = Arc::clone(&daemon.registry);
     let network_key = SecretKey::generate();
     let saved = cache_member_network(&registry, "home", network_key.public(), &[]).await;
-    let old = transport::MESH_PROTOCOL_VERSION - 3;
+    let old = 4;
     assert!(!mesh_version_is_speakable(
         Some(old),
         transport::MESH_PROTOCOL_VERSION
@@ -880,6 +882,7 @@ async fn a_delegated_join_never_falls_through_to_another_coordinator() {
         }
     });
     let data = GroupBlob {
+        dns_upstreams: Vec::new(),
         members: MemberList::from(vec![
             roster_row(coordinator.id(), true, None),
             roster_row(controller.id(), false, None),

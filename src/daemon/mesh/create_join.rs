@@ -1678,16 +1678,26 @@ mod tests {
     }
 
     #[test]
-    fn v5_and_v6_records_are_speakable_by_v7() {
+    fn v5_and_v6_records_are_speakable_by_current_mesh() {
         for older in [5, 6] {
-            assert!(mesh_version_is_speakable(Some(older), 7));
+            assert!(mesh_version_is_speakable(
+                Some(older),
+                transport::MESH_PROTOCOL_VERSION
+            ));
             assert!(
-                gate_mesh_version(Some(older), 7, VersionGate::Refuse)
-                    .unwrap()
-                    .is_none()
+                gate_mesh_version(
+                    Some(older),
+                    transport::MESH_PROTOCOL_VERSION,
+                    VersionGate::Refuse
+                )
+                .unwrap()
+                .is_none()
             );
         }
-        assert!(!mesh_version_is_speakable(Some(4), 7));
+        assert!(!mesh_version_is_speakable(
+            Some(4),
+            transport::MESH_PROTOCOL_VERSION
+        ));
     }
 
     fn id(seed: u8) -> EndpointId {
@@ -1806,6 +1816,7 @@ mod tests {
             }
         }
         let data = crate::membership::GroupBlob {
+            dns_upstreams: Vec::new(),
             members: members.into(),
             approved: Default::default(),
             suggested_firewall: SuggestedFirewall::default(),

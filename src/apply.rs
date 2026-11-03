@@ -62,6 +62,15 @@ pub struct DeploySpec {
     /// Network name to target hostname to firewall and SSH rules.
     #[serde(default)]
     pub networks: BTreeMap<String, DeployNetwork>,
+    /// Network DNS resolvers, addressed by hostname within that network.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dns: BTreeMap<String, DeployDns>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployDns {
+    pub upstreams: Vec<MachineHostname>,
 }
 
 /// Rules for one target host. SSH grants name connecting peers and the local
@@ -163,6 +172,16 @@ fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
 /// aliases and hostnames only. Expansion is one level deep, so a nested group
 /// name would otherwise be published as a literal hostname.
 fn validate_names(spec: &DeploySpec) -> Result<()> {
+    for (network, dns) in &spec.dns {
+        anyhow::ensure!(
+            spec.networks.contains_key(network),
+            "DNS network '{network}' is missing from networks"
+        );
+        anyhow::ensure!(
+            dns.upstreams.len() <= 8,
+            "at most eight DNS upstreams per network"
+        );
+    }
     for (name, members) in &spec.groups {
         anyhow::ensure!(
             !spec.aliases.contains_key(name),
@@ -285,6 +304,17 @@ pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 # all of that user's joined device hostnames. A group is a named set of aliases
 # and/or literal hostnames. Both can be used as a rule subject or peer. An alias
 # only resolves once the user has joined; literal hostnames work pre-join.
+
+# Optional network DNS. Each member opts in with:
+# ray config set net.accept-dns on --net gaming
+# The first opted-in network alphabetically wins. Unreachable resolvers fail
+# queries without falling back to system DNS. Empty upstreams clear the policy.
+# Resolvers must listen on their mesh IPv6 address, UDP port 53, and permit
+# clients through their firewall. DNS outside Rayfish (such as browser DoH)
+# is controlled by the application.
+dns:
+  gaming:
+    upstreams: [dns-server]
 
 aliases:
   # Fill in a real identity, e.g.:
@@ -1603,6 +1633,17 @@ networks: {}
         assert_eq!(
             mc.get("*").unwrap().allows.get("*").map(|s| s.as_str()),
             Some("tcp:6969")
+        );
+    }
+    #[test]
+    fn dns_policy_roundtrips_and_rejects_unknown_networks() {
+        let spec =
+            parse("networks:\n  lab: {}\ndns:\n  lab:\n    upstreams: [dns-server]\n").unwrap();
+        assert_eq!(spec.dns["lab"].upstreams[0].as_ref(), "dns-server");
+        assert_eq!(parse(&to_yaml(&spec).unwrap()).unwrap(), spec);
+        assert!(parse("networks: {}\ndns:\n  lab:\n    upstreams: [dns-server]\n").is_err());
+        assert!(
+            parse("networks:\n  lab: {}\ndns:\n  lab:\n    upstreams: ['bad.name']\n").is_err()
         );
     }
 }

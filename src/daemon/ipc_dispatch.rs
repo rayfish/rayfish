@@ -413,6 +413,9 @@ impl Daemon {
         key: NetworkKey,
         value: &str,
     ) -> OpResult<Done> {
+        if key == NetworkKey::DnsUpstreams && !self.registry.dns_policy_authorized(network) {
+            return op_err("only a coordinator can publish DNS policy".to_string());
+        }
         let mut validation_error = None;
         let updated = config::update_network(network, |net| {
             settings::apply_network(net, key, value).inspect_err(|e| {
@@ -429,6 +432,13 @@ impl Daemon {
         };
         // Run the live re-materialization the key implies, then confirm.
         match key {
+            NetworkKey::DnsUpstreams => {
+                return self
+                    .registry
+                    .publish_dns_policy(network, net.dns_upstreams.clone())
+                    .await;
+            }
+            NetworkKey::AcceptDns => self.registry.refresh_network_dns().await,
             NetworkKey::AutoAcceptFirewall => self.registry.reapply_suggested_firewall(network),
             NetworkKey::AutoAcceptFiles if net.auto_accept_files => {
                 self.files.drain_auto_acceptable().await
@@ -442,11 +452,14 @@ impl Daemon {
 
     /// Read one or every per-network setting.
     fn net_config_get(&self, network: &str, key: Option<NetworkKey>) -> IpcMessage {
-        let net = match config::load_network(network) {
+        let mut net = match config::load_network(network) {
             Ok(Some(n)) => n,
             Ok(None) => return ipc_err(format!("network '{network}' not found")),
             Err(e) => return ipc_err(format!("failed to load network: {e}")),
         };
+        if let Some(handle) = self.registry.networks.get(network) {
+            net.dns_upstreams = handle.state.read().unwrap().group.dns_upstreams.clone();
+        }
         let keys: Vec<NetworkKey> = match key {
             Some(k) => vec![k],
             None => NetworkKey::ALL.to_vec(),

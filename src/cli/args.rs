@@ -555,6 +555,9 @@ pub(crate) enum Command {
     ///
     /// `ray config get` lists every key, `ray config set --help` describes them.
     Config {
+        /// Read or write per-network settings
+        #[arg(long, global = true)]
+        net: Option<String>,
         #[command(subcommand)]
         action: Option<ConfigAction>,
         /// Emit machine-readable JSON instead of styled text

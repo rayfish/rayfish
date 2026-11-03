@@ -901,6 +901,7 @@ mod mesh_hello_reply_tests {
             exit_families: ExitFamilies::Unknown,
         };
         let fallback = crate::membership::GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::from(vec![coordinator.clone()]),
             approved: ApprovedList::new(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -1348,6 +1349,8 @@ mod persist_config_tests {
             last_record_timestamp: None,
             transport: None,
             auto_accept_firewall: true,
+            accept_dns: false,
+            dns_upstreams: Vec::new(),
             auto_accept_files: true,
             admins: vec![],
             direct: false,

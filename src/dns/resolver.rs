@@ -56,6 +56,16 @@ fn is_loopable_upstream(ip: IpAddr) -> bool {
     }
 }
 
+static NETWORK_DNS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn network_dns_active() -> bool {
+    NETWORK_DNS_ACTIVE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_network_dns_active(active: bool) -> bool {
+    NETWORK_DNS_ACTIVE.swap(active, Ordering::Relaxed) != active
+}
+
 pub struct Resolver {
     table: HostnameTable,
     reverse: ReverseLookupTable,
@@ -64,6 +74,7 @@ pub struct Resolver {
     /// lookups leave by the exit node rather than around it. See
     /// [`set_tunnel_upstreams`](Resolver::set_tunnel_upstreams).
     tunnel_upstreams: ArcSwapOption<Vec<SocketAddr>>,
+    network_upstreams: ArcSwapOption<Vec<SocketAddr>>,
     /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
     /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
     overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
@@ -108,10 +119,17 @@ impl Resolver {
             reverse,
             upstreams: ArcSwap::from_pointee(Vec::new()),
             tunnel_upstreams: ArcSwapOption::empty(),
+            network_upstreams: ArcSwapOption::empty(),
             overlay_forwards: DashMap::new(),
             defer_off_mesh: AtomicBool::new(false),
             short_names: AtomicBool::new(false),
         }
+    }
+
+    /// Override exit and captured resolvers with an opted-in network policy.
+    /// An empty set deliberately fails queries until a resolver joins again.
+    pub(crate) fn set_network_upstreams(&self, servers: Option<Vec<SocketAddr>>) {
+        self.network_upstreams.store(servers.map(Arc::new));
     }
 
     /// Override captured resolvers while an exit is selected. Remove our own
@@ -217,13 +235,20 @@ impl Resolver {
         // flattens whatever the other resolver does natively (its own split
         // DNS, its own encrypted upstreams) into one plain UDP query, and is
         // the only reason two resolvers pointed at each other can loop.
-        if self.defer_off_mesh.load(Ordering::Relaxed) && self.tunnel_upstreams.load().is_none() {
+        if self.defer_off_mesh.load(Ordering::Relaxed)
+            && self.tunnel_upstreams.load().is_none()
+            && self.network_upstreams.load().is_none()
+        {
             // `.ray` is ours to answer, misses included: passing those on would
             // hand a mesh name to the other resolver for the same failure.
             return crate::dns::nxdomain_if_in_zone(query).or_else(|| refused(query));
         }
         if let Some(forwarded) = self.forward(query).await {
             return Some(forwarded);
+        }
+        // A selected network never falls back to captured resolvers.
+        if self.network_upstreams.load().is_some() {
+            return servfail(query);
         }
         // Nobody to ask. A `.ray` name is still ours to fail.
         crate::dns::nxdomain_if_in_zone(query)
@@ -283,8 +308,9 @@ impl Resolver {
 
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
         let upstreams = self
-            .tunnel_upstreams
+            .network_upstreams
             .load_full()
+            .or_else(|| self.tunnel_upstreams.load_full())
             .unwrap_or_else(|| self.upstreams.load_full());
         if upstreams.is_empty() {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
@@ -1437,5 +1463,26 @@ mod tests {
 
         // An ordinary upstream is neither, so the guard stays off its path.
         assert!(!is_loopable_upstream(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+    #[tokio::test]
+    async fn network_dns_overrides_exit_and_system_and_restores_on_clear() {
+        let system = Ipv4Addr::new(192, 0, 2, 1);
+        let network = Ipv4Addr::new(192, 0, 2, 2);
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        r.set_upstream_addrs([fake_upstream(system).await]);
+        r.set_tunnel_upstreams(Some(vec![fake_upstream(system).await]));
+        r.set_defer_off_mesh(true);
+        r.set_network_upstreams(Some(vec![fake_upstream(network).await]));
+        let query = build_a_query("example.com");
+        assert!(response_has_a(&r.resolve(&query).await.unwrap(), network));
+        r.set_network_upstreams(Some(Vec::new()));
+        let answer = r.resolve(&query).await.unwrap();
+        assert!(!response_has_a(&answer, system));
+        assert_eq!(
+            Packet::parse(&answer).unwrap().rcode(),
+            simple_dns::RCODE::ServerFailure
+        );
+        r.set_network_upstreams(None);
+        assert!(response_has_a(&r.resolve(&query).await.unwrap(), system));
     }
 }
