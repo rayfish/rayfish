@@ -85,10 +85,16 @@ macos-ipc-test:
     target/macos-tests/tunnel-ipc-tests
 
 # Test live menu updates and closing the dashboard without touching the VPN.
-macos-ui-test:
+macos-ui-test: macos-network-test
     mkdir -p target/macos-tests
     xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/RayfishMenu.swift macos/Rayfish/App/RayfishWindow.swift macos/Rayfish/App/ShellCommandInstaller.swift macos/Tests/AppUITests.swift -o target/macos-tests/app-ui-tests
     target/macos-tests/app-ui-tests
+
+# Check network form validation and persistent errors without the installed VPN.
+macos-network-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/RayfishTheme.swift macos/Rayfish/App/NetworkSheet.swift macos/Tests/NetworkFormTests.swift -o target/macos-tests/network-form-tests
+    target/macos-tests/network-form-tests
 
 # Check notification deduplication and tunnel ownership without the installed VPN.
 macos-notification-test:

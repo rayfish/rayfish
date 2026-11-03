@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		28B4D19D733344A7A144070B /* NetworkSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81541B7A48A74A80BD5901C9 /* NetworkSheet.swift */; };
 		06642DCA858987EA27C2BA74 /* RayfishNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1BD3D661631EB1DA93E7F2 /* RayfishNotifications.swift */; };
 		10CF514C0F2FBA56B5D6CE1B /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = F551764865C525E7C133EBD7 /* main.swift */; };
 		23D81022C3F25F3820D49E9C /* Sparkle-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = 628A5267D8E8C4292351B74E /* Sparkle-LICENSE.txt */; };
@@ -63,6 +64,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		81541B7A48A74A80BD5901C9 /* NetworkSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkSheet.swift; sourceTree = "<group>"; };
 		04F957D1BDEDFDAB48E32699 /* TunnelPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelPreferences.swift; sourceTree = "<group>"; };
 		224C89EE4A7C4B10E79D1104 /* SystemExtensionInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemExtensionInstaller.swift; sourceTree = "<group>"; };
 		26C97C969BAC3B6E6C4CAC12 /* LegacyDaemon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyDaemon.swift; sourceTree = "<group>"; };
@@ -162,6 +164,7 @@
 		787A37291A10D53183D58F8A /* App */ = {
 			isa = PBXGroup;
 			children = (
+				81541B7A48A74A80BD5901C9 /* NetworkSheet.swift */,
 				8F0349A261081B23823F30AB /* FilesView.swift */,
 				586C1EF82AFF3A4027DD6CCB /* RayfishApp.swift */,
 				9620AE970096D458C784D916 /* RayfishMenu.swift */,
@@ -342,6 +345,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				28B4D19D733344A7A144070B /* NetworkSheet.swift in Sources */,
 				DED3C3C6A18BDF9A381CF37E /* FilesView.swift in Sources */,
 				A599B9CD1B8A1E701D5A0B0E /* LegacyDaemon.swift in Sources */,
 				C500E290BEBBD70E1B6C2463 /* ProviderMessage.swift in Sources */,
