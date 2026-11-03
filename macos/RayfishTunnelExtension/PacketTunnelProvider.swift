@@ -157,8 +157,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             completionHandler?(try JSONEncoder().encode(response))
         } catch {
-            RayfishLog.tunnel.error("Command failed: \(error.localizedDescription, privacy: .private)")
-            let response = ProviderResponse(success: false, error: error.localizedDescription, status: nil, inviteCode: nil)
+            // UniFFI's LocalizedError reflects the Swift enum, including its
+            // module and escaped payload. Send the core's message to the app.
+            let message: String
+            if let appleError = error as? AppleError, case let .Network(reason) = appleError {
+                message = reason
+            } else {
+                message = error.localizedDescription
+            }
+            RayfishLog.tunnel.error("Command failed: \(message, privacy: .private)")
+            let response = ProviderResponse(success: false, error: message, status: nil, inviteCode: nil)
             completionHandler?(try? JSONEncoder().encode(response))
         }
     }

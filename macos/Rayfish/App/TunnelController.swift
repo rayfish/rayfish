@@ -297,12 +297,12 @@ final class TunnelController: ObservableObject {
         throw TunnelIPCError.timedOut
     }
 
-    func create(name: String?, hostname: String?) async {
-        _ = await perform(ProviderRequest(action: .create, name: name, hostname: hostname))
+    func create(name: String?, hostname: String?) async -> Bool {
+        await perform(ProviderRequest(action: .create, name: name, hostname: hostname)) != nil
     }
 
-    func join(code: String, hostname: String?) async {
-        _ = await perform(ProviderRequest(action: .join, code: code, hostname: hostname))
+    func join(code: String, hostname: String?) async -> Bool {
+        await perform(ProviderRequest(action: .join, code: code, hostname: hostname)) != nil
     }
 
     func invite(network: String) async -> String? {

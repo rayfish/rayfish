@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS: validate network and Mac names while typing, explain invalid names
+  beside each field, and keep create/join errors visible until editing or retrying.
+- macOS: show network errors without internal Swift type names and escaping.
+
 ## [0.5.15] - 2026-11-03
 
 ### Fixed
