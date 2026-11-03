@@ -25,6 +25,9 @@ IP:
 - **ICMP flood** — `ping -f -c 10000` (as fast as the link accepts)
 - **iperf3 UDP** — `iperf3 -u -b 50M -t 10`, reading `lost_percent`
 
+One additional WebSocket test sends repeated small replies and messages up to
+1 MiB from srv-b to srv-a. Every frame is checked; a 10-second stall fails.
+
 A probe **FAILs** only when the rayfish-path loss exceeds the direct-path loss by
 more than `MARGIN` percentage points (default `0.5`), so genuine internet drops
 on the underlying link aren't blamed on rayfish. Direct loss is always reported.

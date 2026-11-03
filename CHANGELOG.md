@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux connections could stall during bursts of mesh traffic on some paths.
+
 ## [0.5.14] - 2026-11-02
 
 ### Added

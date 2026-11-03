@@ -556,9 +556,10 @@ pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.
         .send_fairness(false)
-        // Keep GSO on (default) explicitly so a future change can't silently
-        // regress it.
-        .enable_segmentation_offload(true)
+        // After a GSO send fails, existing iroh connections can keep using it
+        // and stall on Linux: https://github.com/n0-computer/iroh/issues/4555
+        // Disable it here until the transport handles the failure correctly.
+        .enable_segmentation_offload(!cfg!(target_os = "linux"))
         // Keep the unreliable datagram queue small. When it fills, noQ discards
         // older datagrams rather than making the forwarding path wait and add
         // latency behind stale traffic.

@@ -192,6 +192,23 @@ for i in "${!HOSTS[@]}"; do
   done
 done
 
+step "4. mixed-size WebSocket bursts from srv-b to srv-a"
+STREAM_PORT=38923
+STREAM_REMOTE=/tmp/rayfish-stream-test.py
+if on "${PUBS[1]}" "ray firewall add in allow --proto tcp --port $STREAM_PORT >/dev/null" \
+  && scp "${SSH_OPTS[@]}" -i "$KEY" "$DIR/stream.py" "root@[${PUBS[0]}]:$STREAM_REMOTE" >/dev/null \
+  && scp "${SSH_OPTS[@]}" -i "$KEY" "$DIR/stream.py" "root@[${PUBS[1]}]:$STREAM_REMOTE" >/dev/null \
+  && on "${PUBS[1]}" "systemctl stop rayfish-stream-test 2>/dev/null; systemctl reset-failed rayfish-stream-test 2>/dev/null; systemd-run --unit=rayfish-stream-test --quiet python3 $STREAM_REMOTE server ${VPNS[1]}" \
+  && retry_until 30 "on '${PUBS[1]}' 'ss -ltnH | grep -q :$STREAM_PORT'" \
+  && on "${PUBS[0]}" "python3 $STREAM_REMOTE client ${VPNS[1]}"; then
+  pass "mixed-size WebSocket transfer completed"
+else
+  fail "mixed-size WebSocket transfer stalled or lost data"
+  on "${PUBS[1]}" 'journalctl -u rayfish-stream-test -n 20 --no-pager' || true
+fi
+on "${PUBS[1]}" "systemctl stop rayfish-stream-test 2>/dev/null; rm -f $STREAM_REMOTE" || true
+on "${PUBS[0]}" "rm -f $STREAM_REMOTE" || true
+
 # ---------------------------------------------------------------------------
 step "report"
 REPORT="$RESDIR/$STAMP.md"
