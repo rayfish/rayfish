@@ -698,7 +698,7 @@ mod tests {
     fn network_dns_requires_opt_in_and_settings_survive_restart() {
         let mut net = NetworkConfig::default();
         assert!(!net.accept_dns);
-        apply_network(&mut net, NetworkKey::DnsUpstreams, "dns-one,dns-two").unwrap();
+        apply_network(&mut net, NetworkKey::DnsUpstreams, "1.1.1.1,dns-two").unwrap();
         assert!(!net.accept_dns);
         apply_network(&mut net, NetworkKey::AcceptDns, "on").unwrap();
         let saved = toml::to_string(&net).unwrap();
@@ -706,7 +706,7 @@ mod tests {
         assert!(restored.accept_dns);
         assert_eq!(
             render_network(&restored, NetworkKey::DnsUpstreams),
-            "dns-one,dns-two"
+            "1.1.1.1,dns-two"
         );
         assert!(apply_network(&mut net, NetworkKey::DnsUpstreams, "bad.name").is_err());
         apply_network(&mut net, NetworkKey::AcceptDns, "").unwrap();

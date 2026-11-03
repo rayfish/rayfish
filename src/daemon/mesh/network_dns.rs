@@ -1,6 +1,7 @@
 //! Signed network DNS policy and the local choice to use it.
 
 use super::super::*;
+use ray_proto::dns::DnsUpstream;
 use std::net::{IpAddr, SocketAddr};
 
 impl NetworkRegistry {
@@ -13,7 +14,7 @@ impl NetworkRegistry {
     pub(crate) async fn publish_dns_policy(
         self: &Arc<Self>,
         network: &str,
-        servers: Vec<ipc::MachineHostname>,
+        servers: Vec<DnsUpstream>,
     ) -> OpResult<Done> {
         let Some(handle) = self.networks.get(network) else {
             return op_err(format!("network '{network}' not found"));
@@ -60,9 +61,13 @@ impl NetworkRegistry {
             // its OS lookups back through the service it provides to the mesh.
             if roster.iter().any(|m| {
                 m.identity == self.transport.endpoint.id()
-                    && m.hostname
-                        .as_ref()
-                        .is_some_and(|h| state.group.dns_upstreams.iter().any(|s| s.as_ref() == h))
+                    && m.hostname.as_ref().is_some_and(|h| {
+                        state
+                            .group
+                            .dns_upstreams
+                            .iter()
+                            .any(|s| matches!(s, DnsUpstream::Peer(host) if host.as_ref() == h))
+                    })
             }) {
                 continue;
             }
@@ -70,8 +75,9 @@ impl NetworkRegistry {
                 .group
                 .dns_upstreams
                 .iter()
-                .filter_map(|host| {
-                    roster
+                .filter_map(|upstream| match upstream {
+                    DnsUpstream::Ip(ip) => Some(SocketAddr::new(*ip, 53)),
+                    DnsUpstream::Peer(host) => roster
                         .iter()
                         .find(|m| m.hostname.as_deref() == Some(host.as_ref()))
                         .map(|m| {
@@ -79,7 +85,7 @@ impl NetworkRegistry {
                                 IpAddr::V6(crate::membership::derive_ipv6(&m.identity)),
                                 53,
                             )
-                        })
+                        }),
                 })
                 .collect();
             selected = Some(addresses);

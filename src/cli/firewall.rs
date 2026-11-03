@@ -6,6 +6,7 @@ use std::io::IsTerminal;
 use crate::*;
 use firewall::Action;
 use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey, NodeStatus};
+use ray_proto::dns::DnsUpstream;
 
 #[derive(serde::Serialize)]
 struct FirewallStateOutput<'a> {
@@ -830,7 +831,9 @@ pub(crate) async fn ipc_apply(
         }
         if let Some(dns) = spec.dns.get(net_name) {
             for host in &dns.upstreams {
-                efw.entry(host.to_string()).or_default();
+                if let DnsUpstream::Peer(host) = host {
+                    efw.entry(host.to_string()).or_default();
+                }
             }
         }
         expanded.networks.insert(net_name.clone(), efw);

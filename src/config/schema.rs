@@ -3,6 +3,7 @@
 //! DNS overrides.
 
 use super::*;
+use ray_proto::dns::DnsUpstream;
 
 /// How Rayfish integrates its resolver with the host.
 ///
@@ -251,9 +252,9 @@ pub struct NetworkConfig {
     /// Use signed DNS policy from this network. Local opt-in, off by default.
     #[serde(default)]
     pub accept_dns: bool,
-    /// Coordinator-authored resolver hostnames; the signed blob is authoritative.
+    /// Coordinator-authored resolver addresses or hostnames; the signed blob is authoritative.
     #[serde(default)]
-    pub dns_upstreams: Vec<MachineHostname>,
+    pub dns_upstreams: Vec<DnsUpstream>,
     /// Auto-accept incoming file offers from our own paired devices on this
     /// network (no manual `ray files accept`). Own-devices-only (the sender's
     /// user identity must match ours), so it is safe on by default. Opt out per

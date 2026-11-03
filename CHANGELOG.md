@@ -8,7 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `ray apply` accepts a `dns` map of network names to resolver hostnames.
+- `ray apply` accepts a `dns` map of network names to resolver IP addresses or mesh hostnames.
   Members opt in with `ray config set net.accept-dns on --net <network>`.
   The first opted-in network alphabetically wins; Magic DNS fails queries when
   its resolvers are unavailable instead of falling back to system DNS.

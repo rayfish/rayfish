@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use anyhow::{Result, bail};
 use iroh::EndpointId;
 use ray_proto::SuggestedFirewall;
-use ray_proto::ipc::MachineHostname;
+use ray_proto::dns::DnsUpstream;
 use serde::{Deserialize, Serialize};
 
 use crate::control::DeviceCert;
@@ -519,9 +519,9 @@ pub struct GroupBlob {
     /// Serde-default empty for back-compat with pre-nullifier blobs.
     #[serde(default)]
     pub nullifiers: BTreeSet<EndpointId>,
-    /// Coordinator-selected resolver hostnames. Members opt in locally.
+    /// Coordinator-selected resolver addresses or hostnames. Members opt in locally.
     #[serde(default)]
-    pub dns_upstreams: Vec<MachineHostname>,
+    pub dns_upstreams: Vec<DnsUpstream>,
 }
 
 impl ReusableKey {
@@ -957,7 +957,7 @@ mod tests {
             name: Option<String>,
             reusable_keys: BTreeMap<String, ReusableKey>,
             nullifiers: BTreeSet<EndpointId>,
-            dns_upstreams: Vec<MachineHostname>,
+            dns_upstreams: Vec<DnsUpstream>,
         }
         let string_sorted = rmp_serde::to_vec(&OldBlob {
             members: sorted_members,

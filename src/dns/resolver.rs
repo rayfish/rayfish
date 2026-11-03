@@ -129,7 +129,14 @@ impl Resolver {
     /// Override exit and captured resolvers with an opted-in network policy.
     /// An empty set deliberately fails queries until a resolver joins again.
     pub(crate) fn set_network_upstreams(&self, servers: Option<Vec<SocketAddr>>) {
-        self.network_upstreams.store(servers.map(Arc::new));
+        self.network_upstreams.store(servers.map(|servers| {
+            Arc::new(
+                servers
+                    .into_iter()
+                    .filter(|server| !is_own_resolver(server.ip()))
+                    .collect(),
+            )
+        }));
     }
 
     /// Override captured resolvers while an exit is selected. Remove our own
@@ -1484,5 +1491,15 @@ mod tests {
         );
         r.set_network_upstreams(None);
         assert!(response_has_a(&r.resolve(&query).await.unwrap(), system));
+    }
+    #[tokio::test]
+    async fn a_network_policy_pointing_at_magic_dns_fails_without_looping() {
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        r.set_network_upstreams(Some(vec![SocketAddr::from((MAGIC_DNS_V6, 53))]));
+        let answer = r.resolve(&build_a_query("example.com")).await.unwrap();
+        assert_eq!(
+            Packet::parse(&answer).unwrap().rcode(),
+            simple_dns::RCODE::ServerFailure
+        );
     }
 }

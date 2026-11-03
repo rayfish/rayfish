@@ -31,6 +31,7 @@ use std::iter::once;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use ray_proto::dns::DnsUpstream;
 use ray_proto::ipc::MachineHostname;
 use ray_proto::policy::{HostSuggestions, SuggestedFirewall};
 use serde::{Deserialize, Serialize};
@@ -62,7 +63,7 @@ pub struct DeploySpec {
     /// Network name to target hostname to firewall and SSH rules.
     #[serde(default)]
     pub networks: BTreeMap<String, DeployNetwork>,
-    /// Network DNS resolvers, addressed by hostname within that network.
+    /// Network DNS resolvers, addressed by IP or hostname within that network.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dns: BTreeMap<String, DeployDns>,
 }
@@ -70,7 +71,7 @@ pub struct DeploySpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeployDns {
-    pub upstreams: Vec<MachineHostname>,
+    pub upstreams: Vec<DnsUpstream>,
 }
 
 /// Rules for one target host. SSH grants name connecting peers and the local
@@ -315,6 +316,8 @@ pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 dns:
   gaming:
     upstreams: [dns-server]
+  minecraft:
+    upstreams: [1.1.1.1] # Public resolvers work too; IPv6 addresses are accepted.
 
 aliases:
   # Fill in a real identity, e.g.:
@@ -1639,11 +1642,21 @@ networks: {}
     fn dns_policy_roundtrips_and_rejects_unknown_networks() {
         let spec =
             parse("networks:\n  lab: {}\ndns:\n  lab:\n    upstreams: [dns-server]\n").unwrap();
-        assert_eq!(spec.dns["lab"].upstreams[0].as_ref(), "dns-server");
+        assert_eq!(spec.dns["lab"].upstreams[0].to_string(), "dns-server");
         assert_eq!(parse(&to_yaml(&spec).unwrap()).unwrap(), spec);
         assert!(parse("networks: {}\ndns:\n  lab:\n    upstreams: [dns-server]\n").is_err());
         assert!(
             parse("networks:\n  lab: {}\ndns:\n  lab:\n    upstreams: ['bad.name']\n").is_err()
         );
+    }
+    #[test]
+    fn public_dns_addresses_roundtrip_without_becoming_members() {
+        let spec = parse("networks:\n  lab: {}\ndns:\n  lab:\n    upstreams: [1.1.1.1, '2606:4700:4700::1111']\n").unwrap();
+        assert_eq!(
+            spec.dns["lab"].upstreams[0],
+            DnsUpstream::Ip("1.1.1.1".parse().unwrap())
+        );
+        assert_eq!(parse(&to_yaml(&spec).unwrap()).unwrap(), spec);
+        assert!(expected_hosts(&spec).is_empty());
     }
 }
