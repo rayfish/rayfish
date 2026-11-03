@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux exit nodes no longer report no internet uplink when the host uses policy routing or split default routes.
+
 ## [0.5.15] - 2026-11-03
 
 ### Fixed

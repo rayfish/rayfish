@@ -1518,6 +1518,56 @@ pub(super) fn parse_table_routes(show: &str) -> Vec<MirroredRoute> {
         .collect()
 }
 
+pub(super) fn has_v4_uplink() -> bool {
+    has_uplink(Ipv4Addr::new(1, 1, 1, 1).into())
+}
+
+pub(super) fn has_v6_uplink() -> bool {
+    has_uplink(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111).into())
+}
+
+/// Ask the kernel for the route gateway traffic would use, including policy
+/// rules and split defaults. The mark matches `server_nft_ruleset`, so a gateway
+/// that also uses an exit still probes its own uplink. This sends no packets.
+fn has_uplink(destination: IpAddr) -> bool {
+    let family = if destination.is_ipv4() { "-4" } else { "-6" };
+    let out = Command::new("ip")
+        .args([
+            "-N",
+            family,
+            "route",
+            "get",
+            &destination.to_string(),
+            "mark",
+            &SOCKET_MARK.to_string(),
+        ])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            route_is_uplink(&String::from_utf8_lossy(&out.stdout), destination)
+        }
+        Ok(out) => {
+            tracing::debug!(%destination, error = %String::from_utf8_lossy(&out.stderr).trim(), "exit-node uplink route unavailable");
+            false
+        }
+        Err(error) => {
+            tracing::debug!(%destination, %error, "could not inspect exit-node uplink route");
+            false
+        }
+    }
+}
+
+fn route_is_uplink(out: &str, destination: IpAddr) -> bool {
+    let fields: Vec<&str> = out.split_whitespace().collect();
+    // Local and non-unicast answers start with their type instead of the address.
+    if fields.first().and_then(|field| field.parse().ok()) != Some(destination) {
+        return false;
+    }
+    fields.windows(2).any(|pair| pair[0] == "dev" && pair[1] != "lo")
+        // `-N` keeps this numeric even if the operator named our routing table.
+        && !fields.windows(2).any(|pair| pair == ["table", EXIT_TABLE])
+}
+
 /// `ip <args>` stdout, or `None` when it could not be run or failed. The read-only
 /// counterpart to [`run_ip`], which reports the failure instead.
 #[cfg(target_os = "linux")]
