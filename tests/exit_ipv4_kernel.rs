@@ -10,6 +10,7 @@ use rayfish::config::{AppConfig, ServerOverride};
 use rayfish::exit_node::{
     ExitServer, disable, install_client_routing, ipv4, teardown_client_routing,
 };
+use rayfish::membership::ExitFamilies;
 use rayfish::tun::{self, TunRead, TunWrite};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -321,5 +322,117 @@ while True:
         !String::from_utf8_lossy(&routes.stdout).contains(ipv4::SERVER_PREFIX),
         "gateway pool removed"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an isolated network namespace and CAP_NET_ADMIN"]
+fn gateway_uplinks_follow_policy_routing() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("RAYFISH_ISOLATED_KERNEL_TEST").as_deref() == Ok("1"),
+        "run tests/exit-ipv4-kernel.sh"
+    );
+    // Each test needs its own routing tables, including when the suite runs in parallel.
+    if std::env::var("RAYFISH_UPLINK_TEST_CHILD").as_deref() != Ok("1") {
+        let status = Command::new("unshare")
+            .args(["--net"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--ignored",
+                "--exact",
+                "gateway_uplinks_follow_policy_routing",
+                "--nocapture",
+            ])
+            .env("RAYFISH_UPLINK_TEST_CHILD", "1")
+            .status()?;
+        anyhow::ensure!(status.success(), "isolated uplink regression failed");
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    rayfish::config::set_config_dir_override(dir.path().to_owned());
+    run(&["ip", "link", "add", "uplink", "type", "dummy"])?;
+    run(&["ip", "link", "set", "uplink", "up"])?;
+    run(&["ip", "addr", "add", "192.0.2.1/24", "dev", "uplink"])?;
+    run(&[
+        "ip",
+        "-6",
+        "addr",
+        "add",
+        "2001:db8:1::1/64",
+        "dev",
+        "uplink",
+        "nodad",
+    ])?;
+    run(&["ip", "link", "add", "exit0", "type", "dummy"])?;
+    run(&["ip", "link", "set", "exit0", "up"])?;
+    let server = ExitServer::new();
+    server.reload([("example", &["*".to_owned()][..])]);
+    let check = |expected| -> Result<()> {
+        if let Some(error) = server.apply_os("exit0") {
+            anyhow::bail!("{error}");
+        }
+        let actual = ExitFamilies::from_uplinks(server.offers_v4(), server.offers_v6());
+        anyhow::ensure!(actual == expected, "expected {expected:?}, got {actual:?}");
+        Ok(())
+    };
+    check(ExitFamilies::Neither)?;
+    let gateways = [("-4", "192.0.2.2"), ("-6", "2001:db8:1::2")];
+    for (family, gateway) in gateways {
+        run(&["ip", family, "route", "add", "default", "via", gateway])?;
+    }
+    check(ExitFamilies::Dual)?;
+    for (family, gateway) in gateways {
+        run(&[
+            "ip", family, "route", "add", "default", "via", gateway, "table", "123",
+        ])?;
+        run(&["ip", family, "route", "del", "default", "via", gateway])?;
+    }
+    // A default in an unused table is not an uplink.
+    check(ExitFamilies::Neither)?;
+    for (family, _) in gateways {
+        run(&["ip", family, "rule", "add", "pref", "90", "lookup", "123"])?;
+    }
+    check(ExitFamilies::Dual)?;
+    for (family, gateway) in gateways {
+        run(&["ip", family, "route", "del", "default", "table", "123"])?;
+        let prefixes = if family == "-4" {
+            ["0.0.0.0/1", "128.0.0.0/1"]
+        } else {
+            ["::/1", "8000::/1"]
+        };
+        for prefix in prefixes {
+            run(&[
+                "ip", family, "route", "add", prefix, "via", gateway, "dev", "uplink", "onlink",
+                "table", "123",
+            ])?;
+        }
+    }
+    check(ExitFamilies::Dual)?;
+    for (family, _) in gateways {
+        run(&["ip", family, "rule", "add", "pref", "80", "blackhole"])?;
+    }
+    check(ExitFamilies::Neither)?;
+    for (family, _) in gateways {
+        run(&["ip", family, "rule", "del", "pref", "80"])?;
+        run(&["ip", family, "rule", "del", "pref", "90"])?;
+        run(&[
+            "ip", family, "route", "add", "default", "dev", "exit0", "table", "29793",
+        ])?;
+        run(&[
+            "ip", family, "rule", "add", "pref", "102", "lookup", "29793",
+        ])?;
+        run(&[
+            "ip", family, "rule", "add", "pref", "100", "fwmark", "0x7261", "lookup", "123",
+        ])?;
+    }
+    // Gateway packets carry the same mark as the transport, bypassing the client tunnel.
+    check(ExitFamilies::Dual)?;
+    for (family, _) in gateways {
+        run(&["ip", family, "rule", "del", "pref", "100"])?;
+    }
+    // The client tunnel by itself cannot provide gateway egress.
+    check(ExitFamilies::Neither)?;
+    disable();
     Ok(())
 }
